@@ -1,7 +1,21 @@
 <script setup>
-import { ref, onUnmounted } from 'vue';
-import { Building2, Shield, LogOut, CheckCircle2, AlertTriangle, MapPin, ArrowRight, Server, Mail, User, Phone, Languages, BadgeCheck, Database, FolderTree, Mic } from 'lucide-vue-next';
-import axios from 'axios';
+import { computed, onMounted, ref, watch } from 'vue';
+import { Building2, Shield, LogOut, CheckCircle2, AlertTriangle, MapPin, Mail, User, Phone, Languages, BadgeCheck, Database, FolderTree, Mic } from 'lucide-vue-next';
+
+const props = defineProps({
+  theme: {
+    type: String,
+    required: true,
+  },
+  toggleTheme: {
+    type: Function,
+    required: true,
+  },
+  homeSignal: {
+    type: Number,
+    required: true,
+  },
+});
 
 const emit = defineEmits(['logout']);
 
@@ -16,14 +30,17 @@ const planType = ref('pilot');
 const storesPii = ref(true);
 const recordCalls = ref(true);
 const createResourceGroup = ref(true);
-const plivoAutoProvision = ref(false);
+const twilioAutoProvision = ref(false);
 
 const isCreating = ref(false);
-const showSuccess = ref(false);
 const errorMsg = ref('');
 const provisionResult = ref(null);
 const activeOrganizationId = ref(null);
-let statusPoller = null;
+const loadingStartedAt = ref(0);
+const MIN_LOADING_MS = 1800;
+const organizations = ref([]);
+const orgSummary = ref({ count: 0, total_minutes: 0, total_cost_usd: 0 });
+const showCreateOrg = ref(false);
 
 // Matches backend ALLOWED_REGIONS exactly
 const REGIONS = [
@@ -38,10 +55,73 @@ const REGIONS = [
 
 const liveSteps = ref([]);
 
+const screenMode = computed(() => {
+  if (!showCreateOrg.value && !isCreating.value && !provisionResult.value && !errorMsg.value) return 'list';
+  if (isCreating.value) return 'loading';
+  if (provisionResult.value || errorMsg.value) return 'result';
+  return 'form';
+});
+
+const latestStep = computed(() => {
+  if (!liveSteps.value.length) return null;
+  const running = [...liveSteps.value].reverse().find((step) => step.status === 'running');
+  return running || liveSteps.value[liveSteps.value.length - 1];
+});
+
+const currentProvisioningState = computed(() => {
+  if (errorMsg.value && !provisionResult.value) return 'Provisioning failed';
+  if (provisionResult.value?.status === 'success') return 'Provisioned';
+  if (provisionResult.value?.status === 'partial') return 'Partially provisioned';
+  if (provisionResult.value?.status === 'failed') return 'Provisioning failed';
+  if (latestStep.value?.message) return latestStep.value.message;
+  if (latestStep.value?.name) return `Running ${formatStepName(latestStep.value.name)}`;
+  if (isCreating.value) return 'Initializing tenant provisioning';
+  return '';
+});
+
+const finalProvisionState = computed(() => {
+  if (!provisionResult.value) return '';
+  if (provisionResult.value.status === 'success') return 'Provisioned';
+  if (provisionResult.value.status === 'partial') return 'Partially Provisioned';
+  return 'Provisioning Failed';
+});
+
+function formatStepName(name) {
+  return name.replaceAll('_', ' ').toUpperCase();
+}
+
+function formatCurrency(value) {
+  return new Intl.NumberFormat('en-IN', {
+    style: 'currency',
+    currency: 'INR',
+    minimumFractionDigits: 2,
+  }).format(value || 0);
+}
+
+const loadOrganizations = async () => {
+  try {
+    const token = localStorage.getItem('access_token');
+    const response = await fetch('http://localhost:8000/superadmin/tenants', {
+      headers: {
+        'Authorization': `Bearer ${token}`,
+      },
+    });
+    if (!response.ok) {
+      return;
+    }
+    const data = await response.json();
+    organizations.value = data.organizations || [];
+    orgSummary.value = data.summary || { count: 0, total_minutes: 0, total_cost_usd: 0 };
+  } catch (_) {
+    // dashboard list is best-effort
+  }
+};
+
 const handleCreateOrg = async () => {
   if (!organizationName.value || !adminEmail.value || !adminName.value) return;
   
   isCreating.value = true;
+  loadingStartedAt.value = Date.now();
   errorMsg.value = '';
   provisionResult.value = null;
   liveSteps.value = [];
@@ -60,7 +140,7 @@ const handleCreateOrg = async () => {
       stores_pii: storesPii.value,
       record_calls: recordCalls.value,
       create_resource_group: createResourceGroup.value,
-      plivo_auto_provision: plivoAutoProvision.value
+      twilio_auto_provision: twilioAutoProvision.value
     });
     
     const response = await fetch('http://localhost:8000/superadmin/tenants/provision/stream', {
@@ -79,7 +159,6 @@ const handleCreateOrg = async () => {
       return;
     }
 
-    showSuccess.value = true;
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
@@ -118,43 +197,16 @@ const handleCreateOrg = async () => {
   } catch (error) {
     errorMsg.value = error.message || 'Failed to provision organization';
   } finally {
-    isCreating.value = false;
-  }
-};
-
-const refreshProvisionStatus = async () => {
-  if (!activeOrganizationId.value) return;
-  try {
-    const token = localStorage.getItem('access_token');
-    const response = await axios.get(`http://localhost:8000/superadmin/tenants/provision/${activeOrganizationId.value}/status`, {
-      headers: { Authorization: `Bearer ${token}` }
-    });
-    provisionResult.value = response.data;
-  } catch (error) {
-    // best-effort sync
-  }
-};
-
-const startStatusPolling = () => {
-  stopStatusPolling();
-  statusPoller = setInterval(async () => {
-    await refreshProvisionStatus();
-    const state = provisionResult.value?.status;
-    if (state === 'success' || state === 'partial' || state === 'failed') {
-      stopStatusPolling();
+    const elapsed = Date.now() - loadingStartedAt.value;
+    if (elapsed < MIN_LOADING_MS) {
+      await new Promise((resolve) => setTimeout(resolve, MIN_LOADING_MS - elapsed));
     }
-  }, 3000);
-};
-
-const stopStatusPolling = () => {
-  if (statusPoller) {
-    clearInterval(statusPoller);
-    statusPoller = null;
+    isCreating.value = false;
+    await loadOrganizations();
   }
 };
 
 const resetForm = () => {
-  stopStatusPolling();
   organizationName.value = '';
   adminEmail.value = '';
   adminName.value = '';
@@ -166,25 +218,40 @@ const resetForm = () => {
   storesPii.value = true;
   recordCalls.value = true;
   createResourceGroup.value = true;
-  plivoAutoProvision.value = false;
-  showSuccess.value = false;
+  twilioAutoProvision.value = false;
   provisionResult.value = null;
   errorMsg.value = '';
   activeOrganizationId.value = null;
+  liveSteps.value = [];
+  showCreateOrg.value = false;
 };
 
 const handleLogout = () => {
-  stopStatusPolling();
   emit('logout');
 };
 
-onUnmounted(() => {
-  stopStatusPolling();
+const openCreateOrg = (event) => {
+  provisionResult.value = null;
+  errorMsg.value = '';
+  liveSteps.value = [];
+  showCreateOrg.value = true;
+};
+
+onMounted(async () => {
+  await loadOrganizations();
+});
+
+watch(() => props.homeSignal, () => {
+  if (isCreating.value) return;
+  provisionResult.value = null;
+  errorMsg.value = '';
+  liveSteps.value = [];
+  showCreateOrg.value = false;
 });
 </script>
 
 <template>
-  <div class="dashboard-container">
+  <div class="dashboard-container" :class="`theme-${props.theme}`">
     <div class="dashboard-header">
       <div class="header-left">
         <Shield :size="32" color="var(--success-color)" />
@@ -193,112 +260,145 @@ onUnmounted(() => {
           <span class="status-badge">SECURE SESSION ACTIVE</span>
         </div>
       </div>
-      <button class="logout-btn" @click="handleLogout">
-        <LogOut :size="16" />
-        TERMINATE SESSION
-      </button>
+      <div class="header-actions">
+        <button class="theme-toggle" @click="props.toggleTheme">
+          {{ props.theme === 'dark' ? 'LIGHT MODE' : 'DARK MODE' }}
+        </button>
+        <button class="logout-btn" @click="handleLogout">
+          <LogOut :size="16" />
+          TERMINATE SESSION
+        </button>
+      </div>
     </div>
 
-    <div class="dashboard-content">
-      <div class="panel provision-panel">
-        <div class="panel-header">
-          <h3>PROVISION NEW ORGANIZATION</h3>
-          <p>Deploy a new secure Azure tenant environment.</p>
-          <div class="api-hint">POST /superadmin/tenants/provision</div>
+    <Transition name="console-swap" mode="out-in">
+      <div v-if="screenMode === 'list'" key="dashboard" class="dashboard-content">
+        <section class="orgs-panel top-panel">
+        <div class="orgs-panel-header">
+          <div>
+            <span class="stage-eyebrow">ORGANIZATION DASHBOARD</span>
+            <h3>Usage And Cost Tracker</h3>
+          </div>
+          <div class="orgs-actions">
+            <div class="summary-strip">
+              <div class="summary-chip">
+                <span class="summary-label">ORGS</span>
+                <strong>{{ orgSummary.count }}</strong>
+              </div>
+              <div class="summary-chip">
+                <span class="summary-label">MINUTES</span>
+                <strong>{{ orgSummary.total_minutes }}</strong>
+              </div>
+              <div class="summary-chip">
+                <span class="summary-label">SPEND</span>
+                <strong>{{ formatCurrency(orgSummary.total_cost_usd) }}</strong>
+              </div>
+            </div>
+            <button type="button" class="create-org-btn" @click="openCreateOrg">
+              CREATE NEW ORG
+            </button>
+          </div>
         </div>
-        <!-- LIVE PROGRESS: Show steps as they stream in -->
-        <div v-if="isCreating || (showSuccess && !provisionResult && liveSteps.length)" class="provision-result">
-          <div class="success-alert" style="border-color: #3b82f6; background: rgba(59, 130, 246, 0.1);">
-            <Server :size="24" color="#3b82f6" />
-            <div class="alert-text">
-              <strong style="color: #3b82f6;">PROVISIONING IN PROGRESS</strong>
-              <p>Creating Azure resources...</p>
-            </div>
-          </div>
 
-          <div class="steps-section">
-            <h4>LIVE PROGRESS</h4>
-            <div v-for="step in liveSteps" :key="step.name" class="step-item">
-              <span class="step-status" :class="step.status">{{ step.status.toUpperCase() }}</span>
-              <span class="step-name">{{ step.name }}</span>
-              <span v-if="step.message" class="step-msg">{{ step.message }}</span>
+        <div v-if="organizations.length" class="org-grid">
+          <article v-for="org in organizations" :key="org.organization_id" class="org-card">
+            <div class="org-card-top">
+              <div>
+                <h4>{{ org.organization_name }}</h4>
+                <p>{{ org.organization_profile.admin_name || 'No admin assigned' }}</p>
+              </div>
+              <span class="org-status" :class="org.provisioning_status">
+                {{ (org.provisioning_status || 'pending').toUpperCase() }}
+              </span>
             </div>
-          </div>
+
+            <div class="org-card-meta">
+              <span>{{ org.environment?.toUpperCase() }}</span>
+              <span>{{ org.region }}</span>
+              <span>{{ org.organization_profile.language }}</span>
+            </div>
+
+            <div class="tracker-band">
+              <div class="tracker-metric">
+                <span class="tracker-label">Revenue</span>
+                <strong>{{ formatCurrency(org.money_tracker?.revenue_usd) }}</strong>
+              </div>
+              <div class="tracker-divider"></div>
+              <div class="tracker-metric">
+                <span class="tracker-label">Cost</span>
+                <strong>{{ formatCurrency(org.money_tracker?.cost_usd) }}</strong>
+              </div>
+              <div class="tracker-divider"></div>
+              <div class="tracker-metric">
+                <span class="tracker-label">Margin</span>
+                <strong>{{ formatCurrency(org.money_tracker?.margin_usd) }}</strong>
+              </div>
+              <div class="tracker-divider"></div>
+              <div class="tracker-metric">
+                <span class="tracker-label">Billing</span>
+                <strong>{{ org.billing_status?.toUpperCase() }}</strong>
+              </div>
+            </div>
+
+            <div class="usage-grid">
+              <div class="usage-metric">
+                <span class="usage-label">Total Minutes</span>
+                <strong>{{ org.usage_tracker?.minutes || 0 }}</strong>
+              </div>
+              <div class="usage-metric">
+                <span class="usage-label">LLM Tokens</span>
+                <strong>{{ org.usage_tracker?.llm_total_tokens || 0 }}</strong>
+              </div>
+              <div class="usage-metric">
+                <span class="usage-label">API Calls</span>
+                <strong>{{ org.usage_tracker?.llm_api_calls || 0 }}</strong>
+              </div>
+              <div class="usage-metric">
+                <span class="usage-label">Voice Usage</span>
+                <strong>{{ org.usage_tracker?.voice_minutes || 0 }}</strong>
+              </div>
+              <div class="usage-meter">
+                <div class="usage-meter-head">
+                  <span>Storage</span>
+                  <span>{{ org.usage_tracker?.storage_gb || 0 }} GB</span>
+                </div>
+                <div class="meter-track"><div class="meter-fill blue" :style="{ width: `${Math.min((org.usage_tracker?.storage_gb || 0) * 10, 100)}%` }"></div></div>
+              </div>
+              <div class="usage-meter">
+                <div class="usage-meter-head">
+                  <span>Infrastructure</span>
+                  <span>{{ org.usage_tracker?.infrastructure_units || 0 }} units</span>
+                </div>
+                <div class="meter-track"><div class="meter-fill green" :style="{ width: `${Math.min((org.usage_tracker?.infrastructure_units || 0) * 12, 100)}%` }"></div></div>
+              </div>
+            </div>
+          </article>
         </div>
 
-        <!-- SUCCESS: Show provisioning result -->
-        <div v-if="showSuccess && provisionResult" class="provision-result">
-          <div :class="provisionResult.status === 'success' ? 'success-alert' : 'warning-alert'">
-            <CheckCircle2 v-if="provisionResult.status === 'success'" :size="24" color="var(--success-color)" />
-            <AlertTriangle v-else :size="24" color="#f59e0b" />
-            <div class="alert-text">
-              <strong>{{ provisionResult.status === 'success' ? 'PROVISIONING COMPLETE' : 'PARTIAL PROVISIONING' }}</strong>
-              <p>Tenant ID: <code>{{ provisionResult.tenant_id }}</code></p>
-            </div>
-          </div>
-
-          <div v-if="provisionResult.azure" class="azure-info">
-            <div class="info-row"><span class="info-label">RESOURCE GROUP</span><code>{{ provisionResult.azure.resource_group }}</code></div>
-            <div class="info-row"><span class="info-label">REGION</span><code>{{ provisionResult.azure.region }}</code></div>
-          </div>
-
-          <div v-if="provisionResult.organization_profile" class="azure-info">
-            <div class="info-row"><span class="info-label">ORG</span><code>{{ provisionResult.organization_name }}</code></div>
-            <div v-if="provisionResult.organization_profile.admin_name" class="info-row"><span class="info-label">ADMIN</span><code>{{ provisionResult.organization_profile.admin_name }}</code></div>
-            <div v-if="provisionResult.organization_profile.admin_email" class="info-row"><span class="info-label">ADMIN EMAIL</span><code>{{ provisionResult.organization_profile.admin_email }}</code></div>
-            <div v-if="provisionResult.organization_profile.call_type" class="info-row"><span class="info-label">CALL TYPE</span><code>{{ provisionResult.organization_profile.call_type }}</code></div>
-            <div v-if="provisionResult.organization_profile.language" class="info-row"><span class="info-label">LANGUAGE</span><code>{{ provisionResult.organization_profile.language }}</code></div>
-            <div v-if="provisionResult.organization_profile.plan_type" class="info-row"><span class="info-label">PLAN</span><code>{{ provisionResult.organization_profile.plan_type }}</code></div>
-          </div>
-
-          <div v-if="provisionResult.resources" class="azure-info">
-            <div v-if="provisionResult.resources.qdrant_collection" class="info-row"><span class="info-label">QDRANT</span><code>{{ provisionResult.resources.qdrant_collection }}</code></div>
-            <div v-if="provisionResult.resources.redis_namespace" class="info-row"><span class="info-label">REDIS NAMESPACE</span><code>{{ provisionResult.resources.redis_namespace }}</code></div>
-            <div v-if="provisionResult.resources.redis_host" class="info-row"><span class="info-label">DEDICATED REDIS</span><code>{{ provisionResult.resources.redis_host }}</code></div>
-            <div v-if="provisionResult.resources.blob_prefix" class="info-row"><span class="info-label">BLOB PREFIX</span><code>{{ provisionResult.resources.blob_prefix }}</code></div>
-            <div v-if="provisionResult.resources.key_vault" class="info-row"><span class="info-label">KEY VAULT</span><code>{{ provisionResult.resources.key_vault }}</code></div>
-            <div v-if="provisionResult.resources.llm_provider" class="info-row"><span class="info-label">LLM PROVIDER</span><code>{{ provisionResult.resources.llm_provider }}</code></div>
-            <div v-if="provisionResult.resources.llm_model" class="info-row"><span class="info-label">LLM MODEL</span><code>{{ provisionResult.resources.llm_model }}</code></div>
-            <div v-if="provisionResult.resources.llm_endpoint" class="info-row"><span class="info-label">LLM ENDPOINT</span><code>{{ provisionResult.resources.llm_endpoint }}</code></div>
-            <div v-if="provisionResult.resources.llm_status" class="info-row"><span class="info-label">LLM STATUS</span><code>{{ provisionResult.resources.llm_status }}</code></div>
-            <div v-if="provisionResult.resources.plivo_status" class="info-row"><span class="info-label">PLIVO</span><code>{{ provisionResult.resources.plivo_status }}</code></div>
-          </div>
-
-          <div class="steps-section">
-            <h4>PROVISIONING STEPS</h4>
-            <div v-for="step in provisionResult.steps" :key="step.name" class="step-item">
-              <span class="step-status" :class="step.status">{{ step.status.toUpperCase() }}</span>
-              <span class="step-name">{{ step.name }}</span>
-              <span v-if="step.message" class="step-msg">{{ step.message }}</span>
-            </div>
-          </div>
-
-          <div v-if="provisionResult.next_steps && provisionResult.next_steps.length" class="next-steps-section">
-            <h4>NEXT STEPS</h4>
-            <ul class="next-steps-list">
-              <li v-for="ns in provisionResult.next_steps" :key="ns">
-                <ArrowRight :size="12" />
-                {{ ns }}
-              </li>
-            </ul>
-          </div>
-
-          <button class="auth-button" @click="resetForm" style="margin-top: 1rem;">
-            <span class="btn-content">PROVISION ANOTHER</span>
+        <div v-else class="empty-orgs">
+          <span class="stage-eyebrow">NO ORGANIZATIONS YET</span>
+          <p>Provision an account to start tracking usage minutes and spend.</p>
+          <button type="button" class="create-org-btn empty-cta" @click="openCreateOrg">
+            CREATE NEW ORG
           </button>
         </div>
+        </section>
+      </div>
 
-        <!-- ERROR (only when no result at all) -->
-        <div v-if="errorMsg && !provisionResult" class="error-alert">
-          <AlertTriangle :size="20" color="var(--danger-color)" />
-          <span>{{ errorMsg }}</span>
-          <button class="auth-button" @click="resetForm" style="margin-top: 1rem; width: 100%;">
-            <span class="btn-content">TRY AGAIN</span>
-          </button>
-        </div>
-
-        <!-- FORM -->
-        <form v-if="!showSuccess && !errorMsg" @submit.prevent="handleCreateOrg" class="provision-form">
+      <div v-else key="create" class="dashboard-content create-page">
+        <section class="panel provision-panel">
+          <div class="create-page-heading">
+            <span class="stage-eyebrow">ORGANIZATION CREATION</span>
+            <h3>{{ screenMode === 'form' ? 'Provision New Organization' : currentProvisioningState }}</h3>
+            <p>Create and initialize a new tenant environment. Click `NOKVO` in the header to return to the dashboard.</p>
+          </div>
+          <div class="create-page-divider"></div>
+          <div class="panel-header" v-if="screenMode === 'form'">
+            <h3>PROVISION NEW ORGANIZATION</h3>
+            <p>Deploy a new secure Azure tenant environment.</p>
+            <div class="api-hint">POST /superadmin/tenants/provision</div>
+          </div>
+          <form v-if="screenMode === 'form'" @submit.prevent="handleCreateOrg" class="provision-form">
           <div class="form-row">
             <div class="input-group">
               <label for="org-name">
@@ -465,10 +565,10 @@ onUnmounted(() => {
               <FolderTree :size="14" />
               <span class="tier-name">CREATE RESOURCE GROUP</span>
             </label>
-            <label class="tier-option" :class="{ 'selected': plivoAutoProvision }">
-              <input type="checkbox" v-model="plivoAutoProvision" class="sr-only" />
+            <label class="tier-option" :class="{ 'selected': twilioAutoProvision }">
+              <input type="checkbox" v-model="twilioAutoProvision" class="sr-only" />
               <Phone :size="14" />
-              <span class="tier-name">PLIVO AUTO PROVISION</span>
+              <span class="tier-name">TWILIO AUTO PROVISION</span>
             </label>
           </div>
 
@@ -478,50 +578,67 @@ onUnmounted(() => {
             </span>
             <div class="scanner"></div>
           </button>
-        </form>
-      </div>
+          </form>
 
-      <div class="side-panels">
-        <div class="panel stats-panel">
-          <h3>SYSTEM STATUS</h3>
-          <div class="stat-grid">
-            <div class="stat-box">
-              <span class="stat-label">CLOUD</span>
-              <span class="stat-value text-success">AZURE</span>
+          <section v-else-if="screenMode === 'loading'" class="stage-screen">
+            <div class="stage-visual">
+              <div class="call-rings">
+                <span></span>
+                <span></span>
+                <span></span>
+              </div>
+              <div class="call-core">
+                <Phone :size="26" />
+              </div>
             </div>
-            <div class="stat-box">
-              <span class="stat-label">DEFAULT REGION</span>
-              <span class="stat-value">Central India</span>
+            <div class="stage-copy">
+              <span class="stage-eyebrow">ACCOUNT INITIALIZATION</span>
+              <h3>{{ currentProvisioningState }}</h3>
+              <p v-if="latestStep">{{ formatStepName(latestStep.name) }} · {{ latestStep.status.toUpperCase() }}</p>
+              <p v-else>Preparing tenant resources and provider services.</p>
             </div>
-            <div class="stat-box">
-              <span class="stat-label">ENCRYPTION</span>
-              <span class="stat-value text-success">AES-256</span>
+            <div v-if="liveSteps.length" class="status-step-strip centered">
+              <div v-for="step in liveSteps.slice(-5)" :key="step.name" class="status-step-chip">
+                <span class="step-status" :class="step.status">{{ step.status.toUpperCase() }}</span>
+                <span class="status-chip-name">{{ formatStepName(step.name) }}</span>
+              </div>
             </div>
-            <div class="stat-box">
-              <span class="stat-label">VECTOR DB</span>
-              <span class="stat-value text-success">QDRANT</span>
+          </section>
+
+          <section v-else class="stage-screen result-screen">
+            <div class="stage-visual result-visual">
+              <CheckCircle2 v-if="provisionResult?.status === 'success'" :size="34" color="var(--success-color)" />
+              <AlertTriangle v-else :size="34" :color="provisionResult?.status === 'partial' ? '#f59e0b' : 'var(--danger-color)'" />
             </div>
-          </div>
-        </div>
-        
-        <div class="panel log-panel">
-          <h3>PROVISIONING SERVICES</h3>
-          <ul class="log-list">
-            <li><span class="log-badge badge-active">ACTIVE</span> Azure Resource Groups</li>
-            <li><span class="log-badge badge-active">ACTIVE</span> Azure Blob Storage</li>
-            <li><span class="log-badge badge-active">ACTIVE</span> Azure Key Vault</li>
-            <li><span class="log-badge badge-active">ACTIVE</span> Qdrant Vector DB</li>
-            <li><span class="log-badge badge-active">ACTIVE</span> Redis Cache</li>
-            <li><span class="log-badge badge-pending">PENDING</span> Plivo Telephony</li>
-          </ul>
-        </div>
+            <div class="stage-copy">
+              <span class="stage-eyebrow">FINAL STATE</span>
+              <h3>{{ finalProvisionState || 'Provisioning Failed' }}</h3>
+              <p v-if="provisionResult?.tenant_id">Tenant ID: <code>{{ provisionResult.tenant_id }}</code></p>
+              <p v-else>{{ errorMsg }}</p>
+            </div>
+            <button type="button" class="auth-button stage-action" @click="resetForm">
+              <span class="btn-content">PROVISION ANOTHER</span>
+              <div class="scanner"></div>
+            </button>
+          </section>
+        </section>
       </div>
-    </div>
+    </Transition>
   </div>
 </template>
 
 <style scoped>
 .dashboard-container {
+  --success-color: #34d399;
+  --danger-color: #f87171;
+  --accent-color: #60a5fa;
+  --accent-glow: rgba(96, 165, 250, 0.35);
+  --text-primary: #f8fafc;
+  --text-secondary: #cbd5e1;
+  --text-muted: #94a3b8;
+  --border-color: rgba(148, 163, 184, 0.16);
+  --border-focus: rgba(96, 165, 250, 0.55);
+  --bg-input: rgba(15, 23, 42, 0.82);
   background: rgba(17, 24, 39, 0.7);
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
@@ -535,6 +652,27 @@ onUnmounted(() => {
   position: relative;
   overflow: hidden;
   animation: fadeIn 0.5s ease-out;
+}
+
+.theme-light {
+  --success-color: #059669;
+  --danger-color: #dc2626;
+  --accent-color: #2563eb;
+  --accent-glow: rgba(37, 99, 235, 0.22);
+  --text-primary: #0f172a;
+  --text-secondary: #334155;
+  --text-muted: #64748b;
+  --border-color: rgba(15, 23, 42, 0.12);
+  --border-focus: rgba(37, 99, 235, 0.38);
+  --bg-input: rgba(255, 255, 255, 0.92);
+  background: rgba(241, 245, 249, 0.86);
+  border-color: rgba(148, 163, 184, 0.18);
+  box-shadow: 0 20px 45px -18px rgba(15, 23, 42, 0.18);
+}
+
+.theme-light::before,
+.theme-light::after {
+  border-color: rgba(15, 23, 42, 0.12);
 }
 
 .dashboard-container::before, .dashboard-container::after {
@@ -564,6 +702,12 @@ onUnmounted(() => {
   gap: 1rem;
 }
 
+.header-actions {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+}
+
 .header-title h2 {
   font-size: 1.2rem;
   color: var(--text-primary);
@@ -580,6 +724,23 @@ onUnmounted(() => {
   padding: 0.2rem 0.5rem;
   border-radius: 4px;
   letter-spacing: 1px;
+}
+
+.theme-toggle {
+  background: transparent;
+  border: 1px solid var(--border-color);
+  color: var(--text-secondary);
+  padding: 0.5rem 0.9rem;
+  font-size: 0.7rem;
+  letter-spacing: 1.4px;
+  cursor: pointer;
+  transition: all 0.25s ease;
+}
+
+.theme-toggle:hover {
+  color: var(--accent-color);
+  border-color: var(--accent-color);
+  box-shadow: 0 0 16px var(--accent-glow);
 }
 
 .logout-btn {
@@ -603,15 +764,301 @@ onUnmounted(() => {
 }
 
 .dashboard-content {
-  display: grid;
-  grid-template-columns: 1.5fr 1fr;
-  gap: 2rem;
+  display: block;
 }
 
-@media (max-width: 768px) {
-  .dashboard-content {
-    grid-template-columns: 1fr;
-  }
+.console-swap-enter-active,
+.console-swap-leave-active {
+  transition:
+    opacity 0.22s ease,
+    transform 0.22s ease,
+    filter 0.22s ease;
+}
+
+.console-swap-enter-from {
+  opacity: 0;
+  transform: translateX(18px);
+  filter: saturate(0.92);
+}
+
+.console-swap-leave-to {
+  opacity: 0;
+  transform: translateX(-18px);
+  filter: saturate(0.92);
+}
+
+.orgs-panel {
+  margin-top: 1.5rem;
+  padding-top: 1.5rem;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.top-panel {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: none;
+}
+
+.orgs-panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+
+.orgs-panel-header h3 {
+  margin: 0.2rem 0 0;
+  font-size: 1rem;
+  color: var(--text-primary);
+  letter-spacing: 1px;
+}
+
+.orgs-actions {
+  display: flex;
+  align-items: flex-end;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.create-org-btn {
+  background: rgba(15, 23, 42, 0.82);
+  border: 1px solid rgba(59, 130, 246, 0.28);
+  color: var(--text-primary);
+  padding: 0.8rem 1rem;
+  font-size: 0.72rem;
+  letter-spacing: 1.6px;
+  cursor: pointer;
+  transition: all 0.25s ease;
+}
+
+.create-org-btn:hover {
+  border-color: var(--accent-color);
+  color: var(--accent-color);
+  box-shadow: 0 0 18px rgba(59, 130, 246, 0.16);
+}
+
+.summary-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+}
+
+.summary-chip {
+  min-width: 110px;
+  padding: 0.7rem 0.8rem;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  border-radius: 0;
+}
+
+.summary-label {
+  font-size: 0.62rem;
+  letter-spacing: 1.6px;
+  color: var(--text-muted);
+}
+
+.summary-chip strong {
+  color: var(--text-primary);
+  font-size: 0.92rem;
+  font-weight: 600;
+}
+
+.org-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 1rem;
+}
+
+.org-card {
+  background: linear-gradient(180deg, rgba(2, 6, 23, 0.75), rgba(15, 23, 42, 0.58));
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  padding: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
+  border-radius: 0;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+
+.org-card-top {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.8rem;
+  align-items: flex-start;
+}
+
+.org-card-top h4 {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: 0.95rem;
+  letter-spacing: 0.4px;
+}
+
+.org-card-top p {
+  margin: 0.25rem 0 0;
+  color: var(--text-secondary);
+  font-size: 0.76rem;
+}
+
+.org-status {
+  font-size: 0.6rem;
+  padding: 0.18rem 0.45rem;
+  border-radius: 2px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: var(--text-secondary);
+  letter-spacing: 0.7px;
+}
+
+.org-status.success {
+  color: var(--success-color);
+  border-color: rgba(16, 185, 129, 0.3);
+  background: rgba(16, 185, 129, 0.12);
+}
+
+.org-status.partial {
+  color: #f59e0b;
+  border-color: rgba(245, 158, 11, 0.3);
+  background: rgba(245, 158, 11, 0.12);
+}
+
+.org-status.failed {
+  color: var(--danger-color);
+  border-color: rgba(239, 68, 68, 0.3);
+  background: rgba(239, 68, 68, 0.12);
+}
+
+.org-status.pending {
+  color: #93c5fd;
+  border-color: rgba(59, 130, 246, 0.3);
+  background: rgba(59, 130, 246, 0.12);
+}
+
+.org-card-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.org-card-meta span {
+  font-size: 0.64rem;
+  letter-spacing: 0.9px;
+  color: var(--text-secondary);
+  padding: 0.18rem 0.4rem;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.tracker-band {
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+  flex-wrap: wrap;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  padding: 0.85rem;
+  border-radius: 0;
+}
+
+.tracker-metric {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.tracker-label {
+  font-size: 0.62rem;
+  color: var(--text-muted);
+  letter-spacing: 1.5px;
+}
+
+.tracker-metric strong {
+  font-size: 1rem;
+  color: var(--text-primary);
+}
+
+.tracker-divider {
+  width: 1px;
+  align-self: stretch;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.usage-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.7rem;
+}
+
+.usage-metric,
+.usage-meter {
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  padding: 0.7rem;
+  border-radius: 0;
+}
+
+.usage-label {
+  display: block;
+  font-size: 0.62rem;
+  color: var(--text-muted);
+  letter-spacing: 1.2px;
+  margin-bottom: 0.18rem;
+}
+
+.usage-metric strong {
+  color: var(--text-primary);
+  font-size: 0.9rem;
+}
+
+.usage-meter {
+  grid-column: span 2;
+}
+
+.usage-meter-head {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.68rem;
+  color: var(--text-secondary);
+  margin-bottom: 0.45rem;
+}
+
+.meter-track {
+  height: 8px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  overflow: hidden;
+}
+
+.meter-fill {
+  height: 100%;
+}
+
+.meter-fill.blue {
+  background: linear-gradient(90deg, rgba(59, 130, 246, 0.55), rgba(96, 165, 250, 0.95));
+}
+
+.meter-fill.green {
+  background: linear-gradient(90deg, rgba(16, 185, 129, 0.55), rgba(52, 211, 153, 0.95));
+}
+
+.empty-orgs {
+  padding: 1.2rem 0;
+  text-align: center;
+}
+
+.empty-orgs p {
+  margin: 0.4rem 0 0;
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+}
+
+.empty-cta {
+  margin-top: 1rem;
 }
 
 .panel {
@@ -619,6 +1066,80 @@ onUnmounted(() => {
   border: 1px solid rgba(255, 255, 255, 0.05);
   padding: 1.5rem;
   position: relative;
+}
+
+.create-page {
+  max-width: 980px;
+  margin: 0 auto;
+}
+
+.create-page-heading {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  padding: 1.4rem 1.4rem 0;
+}
+
+.create-page-heading h3 {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: 1.25rem;
+  letter-spacing: 0.8px;
+}
+
+.create-page-heading p {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 0.82rem;
+}
+
+.create-page-divider {
+  height: 1px;
+  background: var(--border-color);
+  margin: 1rem 1.4rem 0;
+}
+
+.provision-panel {
+  max-width: 980px;
+  margin: 0 auto;
+  border-radius: 0;
+  box-shadow: 0 24px 60px rgba(2, 6, 23, 0.18);
+  background:
+    linear-gradient(180deg, rgba(15, 23, 42, 0.96), rgba(15, 23, 42, 0.9)),
+    linear-gradient(135deg, rgba(59, 130, 246, 0.08), transparent 38%);
+  border-color: rgba(148, 163, 184, 0.16);
+  padding: 0;
+}
+
+.theme-light .panel,
+.theme-light .org-card,
+.theme-light .summary-chip,
+.theme-light .tracker-band,
+.theme-light .usage-metric,
+.theme-light .usage-meter,
+.theme-light .status-step-chip {
+  background: rgba(255, 255, 255, 0.68);
+  border-color: rgba(148, 163, 184, 0.18);
+}
+
+.theme-light .provision-panel {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(248, 250, 252, 0.96)),
+    linear-gradient(135deg, rgba(37, 99, 235, 0.05), transparent 42%);
+  border-color: rgba(148, 163, 184, 0.22);
+  box-shadow: 0 24px 60px rgba(15, 23, 42, 0.12);
+}
+
+.theme-light .call-core,
+.theme-light .result-visual {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.95), rgba(226, 232, 240, 0.92));
+  color: var(--accent-color);
+}
+
+
+.theme-light .call-rings span {
+  border-color: rgba(37, 99, 235, 0.22);
+  background: radial-gradient(circle, rgba(37, 99, 235, 0.08), transparent 70%);
 }
 
 .panel-header h3 {
@@ -643,6 +1164,22 @@ onUnmounted(() => {
   padding: 0.2rem 0.5rem;
   letter-spacing: 0.5px;
   margin-bottom: 1rem;
+}
+
+.panel-header,
+.provision-form,
+.stage-screen {
+  padding-left: 1.4rem;
+  padding-right: 1.4rem;
+}
+
+.panel-header {
+  padding-top: 1.15rem;
+}
+
+.provision-form,
+.stage-screen {
+  padding-bottom: 1.4rem;
 }
 
 .field-tag {
@@ -825,140 +1362,127 @@ input:focus + .input-glow, input:focus ~ .input-glow { opacity: 1; }
 .auth-button:hover:not(:disabled) .scanner { opacity: 0.5; animation: scanline 2s linear infinite; }
 .authenticating .btn-content { color: var(--accent-color); text-shadow: 0 0 8px var(--accent-glow); }
 
-.success-alert {
-  background: rgba(16, 185, 129, 0.1);
-  border: 1px solid var(--success-color);
-  padding: 1.5rem;
-  display: flex;
-  align-items: center;
-  gap: 1rem;
-  margin-top: 1rem;
-  animation: fadeIn 0.3s ease-out;
-}
-
-.warning-alert {
-  background: rgba(245, 158, 11, 0.1);
-  border: 1px solid #f59e0b;
-  padding: 1.5rem;
-  display: flex;
-  align-items: center;
-  gap: 1rem;
-  margin-top: 1rem;
-  animation: fadeIn 0.3s ease-out;
-}
-
-.warning-alert .alert-text strong {
-  color: #f59e0b;
-}
-
-.alert-text strong {
-  display: block;
-  color: var(--success-color);
-  font-size: 0.9rem;
-  letter-spacing: 1px;
-  margin-bottom: 0.2rem;
-}
-
-.alert-text p {
-  margin: 0;
-  font-size: 0.8rem;
-  color: var(--text-secondary);
-}
-
-.error-alert {
-  background: rgba(239, 68, 68, 0.1);
-  border: 1px solid var(--danger-color);
-  color: var(--danger-color);
-  padding: 1rem;
-  display: flex;
-  align-items: center;
-  gap: 0.8rem;
-  margin-bottom: 1rem;
-  font-size: 0.85rem;
-  animation: fadeIn 0.3s ease-out;
-}
-
-/* Side Panels */
-.side-panels {
+.stage-screen {
+  min-height: 560px;
   display: flex;
   flex-direction: column;
-  gap: 1.5rem;
-}
-
-.side-panels h3 {
-  font-size: 0.85rem;
-  color: var(--text-primary);
-  letter-spacing: 2px;
-  margin-bottom: 1rem;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-  padding-bottom: 0.5rem;
-}
-
-.stat-grid {
-  display: grid;
-  grid-template-columns: 1fr;
-  gap: 0.8rem;
-}
-
-.stat-box {
-  display: flex;
-  justify-content: space-between;
   align-items: center;
-  background: rgba(255, 255, 255, 0.02);
-  padding: 0.8rem;
-  border: 1px solid rgba(255, 255, 255, 0.05);
+  justify-content: center;
+  gap: 1.5rem;
+  padding: 2rem 1rem;
+  text-align: center;
+  animation: fadeIn 0.35s ease-out;
 }
 
-.stat-label {
-  font-size: 0.7rem;
-  color: var(--text-secondary);
-  letter-spacing: 1px;
+.stage-visual {
+  position: relative;
+  width: 180px;
+  height: 180px;
+  display: grid;
+  place-items: center;
 }
 
-.stat-value {
-  font-size: 0.9rem;
+.call-rings {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+}
+
+.call-rings span {
+  position: absolute;
+  border-radius: 999px;
+  border: 1px solid rgba(59, 130, 246, 0.28);
+  background: radial-gradient(circle, rgba(59, 130, 246, 0.1), transparent 70%);
+  animation: callPulse 2.4s ease-out infinite;
+}
+
+.call-rings span:nth-child(1) {
+  width: 72px;
+  height: 72px;
+}
+
+.call-rings span:nth-child(2) {
+  width: 112px;
+  height: 112px;
+  animation-delay: 0.4s;
+}
+
+.call-rings span:nth-child(3) {
+  width: 152px;
+  height: 152px;
+  animation-delay: 0.8s;
+}
+
+.call-core,
+.result-visual {
+  width: 72px;
+  height: 72px;
+  border-radius: 999px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: linear-gradient(180deg, rgba(30, 41, 59, 0.92), rgba(15, 23, 42, 0.92));
+  border: 1px solid rgba(59, 130, 246, 0.28);
+  color: #93c5fd;
+  box-shadow: 0 0 30px rgba(59, 130, 246, 0.15);
+}
+
+.stage-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  max-width: 480px;
+}
+
+.stage-eyebrow {
+  font-size: 0.68rem;
+  letter-spacing: 2px;
+  color: var(--text-muted);
+}
+
+.stage-copy h3 {
+  margin: 0;
+  font-size: 1.35rem;
   color: var(--text-primary);
+  letter-spacing: 1px;
   font-weight: 500;
 }
 
-.text-success { color: var(--success-color); }
-
-.log-list {
-  list-style: none;
-  padding: 0;
+.stage-copy p {
   margin: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 0.6rem;
-}
-
-.log-list li {
-  font-size: 0.75rem;
+  font-size: 0.82rem;
   color: var(--text-secondary);
+}
+
+.result-screen {
+  min-height: 440px;
+}
+
+.stage-action {
+  max-width: 320px;
+}
+
+.status-step-strip {
   display: flex;
+  flex-wrap: wrap;
   gap: 0.5rem;
+  justify-content: center;
 }
 
-.log-badge {
-  font-size: 0.6rem;
-  padding: 0.15rem 0.4rem;
-  letter-spacing: 0.5px;
-  border-radius: 2px;
-  font-weight: 600;
-  min-width: 52px;
-  text-align: center;
+.status-step-chip {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  padding: 0.38rem 0.45rem;
 }
 
-.badge-active {
-  background: rgba(16, 185, 129, 0.15);
-  color: var(--success-color);
-  border: 1px solid rgba(16, 185, 129, 0.3);
-}
-
-.badge-pending {
-  background: rgba(245, 158, 11, 0.15);
-  color: #f59e0b;
-  border: 1px solid rgba(245, 158, 11, 0.3);
+.status-chip-name {
+  font-size: 0.68rem;
+  color: var(--text-secondary);
+  letter-spacing: 0.8px;
 }
 
 /* Select Input */
@@ -978,39 +1502,6 @@ input:focus + .input-glow, input:focus ~ .input-glow { opacity: 1; }
 }
 .select-input:focus { border-color: var(--border-focus); }
 .select-input option { background: #111827; color: var(--text-primary); }
-
-/* Provisioning Result */
-.provision-result {
-  animation: fadeIn 0.4s ease-out;
-}
-
-.provision-result code {
-  background: rgba(0,0,0,0.3);
-  padding: 0.15rem 0.4rem;
-  font-size: 0.75rem;
-  letter-spacing: 0.5px;
-  color: var(--accent-color);
-}
-
-.steps-section {
-  margin-top: 1.2rem;
-}
-
-.steps-section h4, .next-steps-section h4 {
-  font-size: 0.75rem;
-  color: var(--text-secondary);
-  letter-spacing: 1.5px;
-  margin-bottom: 0.6rem;
-}
-
-.step-item {
-  display: flex;
-  align-items: center;
-  gap: 0.8rem;
-  padding: 0.4rem 0;
-  border-bottom: 1px solid rgba(255,255,255,0.03);
-  font-size: 0.8rem;
-}
 
 .step-status {
   font-size: 0.6rem;
@@ -1052,31 +1543,16 @@ input:focus + .input-glow, input:focus ~ .input-glow { opacity: 1; }
   50% { opacity: 0.5; }
 }
 
-.step-name {
-  color: var(--text-secondary);
-}
-
-.next-steps-section {
-  margin-top: 1.2rem;
-}
-
-.next-steps-list {
-  list-style: none;
-  padding: 0;
-  margin: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 0.4rem;
-}
-
-.next-steps-list li {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  font-size: 0.78rem;
-  color: var(--text-secondary);
-}
-
 @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes callPulse {
+  0% {
+    opacity: 0.9;
+    transform: scale(0.92);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1.16);
+  }
+}
 @keyframes scanline { 0% { top: 0; } 100% { top: 100%; } }
 </style>

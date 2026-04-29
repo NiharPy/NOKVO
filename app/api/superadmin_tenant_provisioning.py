@@ -7,9 +7,14 @@ from app.db.session import get_db
 from app.models.organization import Organization
 from app.services.azure_tenant_provisioning_service import AzureTenantProvisioningService
 from app.models.tenant_resources import TenantResources
+from app.models.tenant_usage_event import TenantUsageEvent
+from app.models.audit import SuperAdminAuditLog
+from app.schemas.tenant_usage import TenantUsageEventCreate
+from app.services.tenant_billing_service import TenantBillingService
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from uuid import UUID
+from decimal import Decimal
 import json
 import asyncio
 
@@ -31,7 +36,275 @@ def _organization_profile(org: Organization) -> dict:
         "stores_pii": org.stores_pii,
         "record_calls": org.record_calls,
         "create_resource_group": org.create_resource_group,
-        "plivo_auto_provision": org.plivo_auto_provision,
+        "twilio_auto_provision": org.twilio_auto_provision,
+    }
+
+
+def _tenant_cost_breakdown(tenant: TenantResources | None) -> dict:
+    if not tenant:
+        return {
+            "provisioned_monthly_cost_usd": 0.0,
+            "usage_cost_usd": 0.0,
+            "total_cost_usd": 0.0,
+        }
+    provisioned = TenantBillingService.monthly_provisioned_cost(tenant)
+    total = Decimal(str(tenant.total_cost_usd or 0))
+    usage = total - provisioned
+    if usage < 0:
+        usage = Decimal("0")
+    return {
+        "provisioned_monthly_cost_usd": float(provisioned),
+        "usage_cost_usd": float(usage),
+        "total_cost_usd": float(total),
+    }
+
+
+def _usage_aggregate(events: list[TenantUsageEvent], tenant: TenantResources | None) -> dict:
+    llm_input_tokens = sum(event.llm_input_tokens or 0 for event in events)
+    llm_output_tokens = sum(event.llm_output_tokens or 0 for event in events)
+    llm_api_calls = sum(event.llm_api_calls or 0 for event in events)
+    stt_minutes = sum(float(event.stt_minutes or 0) for event in events)
+    telephony_minutes = sum(float(event.telephony_minutes or 0) for event in events)
+    tts_characters = sum(event.tts_characters or 0 for event in events)
+    storage_gb = sum(float(event.storage_gb or 0) for event in events)
+    infrastructure_units = sum(event.infrastructure_units or 0 for event in events)
+    return {
+        "minutes": sum(event.minutes or 0 for event in events),
+        "llm_input_tokens": llm_input_tokens,
+        "llm_output_tokens": llm_output_tokens,
+        "llm_total_tokens": llm_input_tokens + llm_output_tokens,
+        "llm_api_calls": llm_api_calls,
+        "voice_minutes": telephony_minutes,
+        "stt_minutes": stt_minutes,
+        "tts_characters": tts_characters,
+        "storage_gb": round(storage_gb, 3),
+        "infrastructure_units": infrastructure_units + (
+            1 if tenant and tenant.qdrant_collection_name else 0
+        ) + (
+            1 if tenant and tenant.redis_namespace else 0
+        ) + (
+            1 if tenant and tenant.blob_prefix else 0
+        ) + (
+            1 if tenant and tenant.key_vault_name else 0
+        ),
+    }
+
+
+@router.get("")
+async def list_tenants(
+    db: AsyncSession = Depends(get_db),
+    current_user: SuperAdminUser = Depends(RequireRole(["founder", "engineering", "billing", "readonly"]))
+):
+    org_rows = await db.execute(select(Organization).order_by(Organization.created_at.desc()))
+    organizations = org_rows.scalars().all()
+
+    tenant_rows = await db.execute(select(TenantResources))
+    tenant_map = {str(row.organization_id): row for row in tenant_rows.scalars().all()}
+    usage_rows = await db.execute(select(TenantUsageEvent))
+    usage_map: dict[str, list[TenantUsageEvent]] = {}
+    for row in usage_rows.scalars().all():
+        usage_map.setdefault(str(row.organization_id), []).append(row)
+
+    items = []
+    for org in organizations:
+        tenant = tenant_map.get(str(org.id))
+        usage = _usage_aggregate(usage_map.get(str(org.id), []), tenant)
+        cost_breakdown = _tenant_cost_breakdown(tenant)
+        revenue_usd = round(cost_breakdown["total_cost_usd"] * 1.35, 2)
+        margin_usd = round(revenue_usd - cost_breakdown["total_cost_usd"], 2)
+        items.append({
+            "organization_id": str(org.id),
+            "organization_name": org.name,
+            "organization_profile": _organization_profile(org),
+            "environment": org.environment,
+            "region": org.region,
+            "created_at": org.created_at,
+            "tenant_id": tenant.tenant_id if tenant else None,
+            "provisioning_status": tenant.provisioning_status if tenant else "pending",
+            "usage_minutes": tenant.usage_minutes if tenant else 0,
+            "total_cost_usd": float(tenant.total_cost_usd or 0) if tenant else 0.0,
+            "billing_status": "overdue" if cost_breakdown["total_cost_usd"] > 0 and (tenant.provisioning_status if tenant else "pending") == "partial" else "current",
+            "money_tracker": {
+                "revenue_usd": revenue_usd,
+                "cost_usd": cost_breakdown["total_cost_usd"],
+                "margin_usd": margin_usd,
+                "outstanding_balance_usd": round(max(cost_breakdown["usage_cost_usd"], 0), 2),
+            },
+            "usage_tracker": usage,
+            "cost_breakdown": cost_breakdown,
+        })
+
+    return {
+        "organizations": items,
+        "summary": {
+            "count": len(items),
+            "total_minutes": sum(item["usage_minutes"] for item in items),
+            "total_cost_usd": round(sum(item["total_cost_usd"] for item in items), 2),
+        },
+    }
+
+
+@router.post("/{organization_id}/usage-events")
+async def record_usage_event(
+    organization_id: UUID,
+    payload: TenantUsageEventCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: SuperAdminUser = Depends(RequireRole(["founder", "engineering", "billing"]))
+):
+    tenant_res_query = await db.execute(select(TenantResources).where(TenantResources.organization_id == organization_id))
+    tenant_res = tenant_res_query.scalars().first()
+    if not tenant_res:
+        raise HTTPException(status_code=404, detail="Tenant resources not found for organization")
+
+    minutes = payload.minutes
+    stt_minutes = payload.stt_minutes
+    telephony_minutes = payload.telephony_minutes
+    tts_characters = payload.tts_characters
+    llm_api_calls = payload.llm_api_calls
+    llm_input_tokens = payload.llm_input_tokens
+    llm_output_tokens = payload.llm_output_tokens
+    storage_gb = payload.storage_gb
+    infrastructure_units = payload.infrastructure_units
+
+    usage_cost = TenantBillingService.usage_cost(
+        minutes=minutes,
+        stt_minutes=stt_minutes,
+        telephony_minutes=telephony_minutes,
+        tts_characters=tts_characters,
+        llm_api_calls=llm_api_calls,
+        llm_input_tokens=llm_input_tokens,
+        llm_output_tokens=llm_output_tokens,
+        storage_gb=storage_gb,
+        infrastructure_units=infrastructure_units,
+    )
+
+    event = TenantUsageEvent(
+        organization_id=organization_id,
+        tenant_id=tenant_res.tenant_id,
+        event_type=payload.event_type,
+        minutes=minutes,
+        stt_minutes=stt_minutes,
+        telephony_minutes=telephony_minutes,
+        tts_characters=tts_characters,
+        llm_api_calls=llm_api_calls,
+        llm_input_tokens=llm_input_tokens,
+        llm_output_tokens=llm_output_tokens,
+        storage_gb=storage_gb,
+        infrastructure_units=infrastructure_units,
+        cost_usd=usage_cost,
+        metadata_=payload.metadata or {},
+    )
+    db.add(event)
+
+    tenant_res.usage_minutes = (tenant_res.usage_minutes or 0) + minutes
+    tenant_res.total_cost_usd = Decimal(str(tenant_res.total_cost_usd or 0)) + usage_cost
+
+    db.add(
+        SuperAdminAuditLog(
+            superadmin_id=current_user.id,
+            action="tenant_usage_event_recorded",
+            risk_level="low",
+            target_type="organization",
+            target_id=str(organization_id),
+            metadata_={
+                "tenant_id": tenant_res.tenant_id,
+                "event_type": event.event_type,
+                "minutes": minutes,
+                "cost_usd": float(usage_cost),
+            },
+        )
+    )
+    await db.commit()
+    await db.refresh(event)
+
+    return {
+        "event_id": str(event.id),
+        "organization_id": str(organization_id),
+        "tenant_id": tenant_res.tenant_id,
+        "minutes": event.minutes,
+        "cost_usd": float(event.cost_usd),
+        "cost_breakdown": TenantBillingService.event_cost_breakdown(payload.model_dump()),
+        "usage_totals": {
+            "usage_minutes": tenant_res.usage_minutes,
+            "total_cost_usd": float(tenant_res.total_cost_usd or 0),
+        },
+    }
+
+
+@router.get("/{organization_id}/usage-events")
+async def list_usage_events(
+    organization_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: SuperAdminUser = Depends(RequireRole(["founder", "engineering", "billing", "readonly"]))
+):
+    tenant_res_query = await db.execute(select(TenantResources).where(TenantResources.organization_id == organization_id))
+    tenant_res = tenant_res_query.scalars().first()
+    if not tenant_res:
+        raise HTTPException(status_code=404, detail="Tenant resources not found for organization")
+
+    rows = await db.execute(
+        select(TenantUsageEvent)
+        .where(TenantUsageEvent.organization_id == organization_id)
+        .order_by(TenantUsageEvent.created_at.desc())
+    )
+    events = rows.scalars().all()
+
+    return {
+        "organization_id": str(organization_id),
+        "tenant_id": tenant_res.tenant_id,
+        "cost_breakdown": _tenant_cost_breakdown(tenant_res),
+        "usage_minutes": tenant_res.usage_minutes or 0,
+        "events": [
+            {
+                "id": str(event.id),
+                "event_type": event.event_type,
+                "minutes": event.minutes,
+                "stt_minutes": float(event.stt_minutes or 0),
+                "telephony_minutes": float(event.telephony_minutes or 0),
+                "tts_characters": event.tts_characters,
+                "llm_api_calls": event.llm_api_calls,
+                "llm_input_tokens": event.llm_input_tokens,
+                "llm_output_tokens": event.llm_output_tokens,
+                "storage_gb": float(event.storage_gb or 0),
+                "infrastructure_units": event.infrastructure_units,
+                "cost_usd": float(event.cost_usd or 0),
+                "metadata": event.metadata_ or {},
+                "created_at": event.created_at,
+            }
+            for event in events
+        ],
+    }
+
+
+@router.post("/{organization_id}/usage/recalculate")
+async def recalculate_usage_totals(
+    organization_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: SuperAdminUser = Depends(RequireRole(["founder", "engineering", "billing"]))
+):
+    tenant_res_query = await db.execute(select(TenantResources).where(TenantResources.organization_id == organization_id))
+    tenant_res = tenant_res_query.scalars().first()
+    if not tenant_res:
+        raise HTTPException(status_code=404, detail="Tenant resources not found for organization")
+
+    rows = await db.execute(select(TenantUsageEvent).where(TenantUsageEvent.organization_id == organization_id))
+    events = rows.scalars().all()
+
+    total_minutes = sum(event.minutes or 0 for event in events)
+    usage_cost = sum(Decimal(str(event.cost_usd or 0)) for event in events)
+    provisioned_cost = TenantBillingService.monthly_provisioned_cost(tenant_res)
+
+    tenant_res.usage_minutes = total_minutes
+    tenant_res.total_cost_usd = provisioned_cost + usage_cost
+    await db.commit()
+
+    return {
+        "organization_id": str(organization_id),
+        "tenant_id": tenant_res.tenant_id,
+        "usage_minutes": tenant_res.usage_minutes,
+        "provisioned_monthly_cost_usd": float(provisioned_cost),
+        "usage_cost_usd": float(usage_cost),
+        "total_cost_usd": float(tenant_res.total_cost_usd or 0),
     }
 
 @router.post("/provision", status_code=status.HTTP_201_CREATED)
@@ -43,7 +316,7 @@ async def provision_tenant(
     """
     Provision a new tenant environment for an organization.
     Creates Azure Resource Group, Blob prefixes, Key Vault refs,
-    Qdrant collection, Redis namespace, and Plivo placeholder.
+    Qdrant collection, Redis namespace, and Twilio provisioning.
     Only accessible by founder and engineering roles.
     """
     # Validate region
@@ -77,7 +350,7 @@ async def provision_tenant(
             stores_pii=org_in.stores_pii,
             record_calls=org_in.record_calls,
             create_resource_group=org_in.create_resource_group,
-            plivo_auto_provision=org_in.plivo_auto_provision,
+            twilio_auto_provision=org_in.twilio_auto_provision,
             industry=org_in.industry,
             country_code=org_in.country_code
         )
@@ -93,7 +366,9 @@ async def provision_tenant(
             environment=org.environment,
             region=region,
             industry=org.industry,
-            country_code=org.country_code
+            country_code=org.country_code,
+            language=org.language,
+            twilio_auto_provision=org.twilio_auto_provision,
         )
     except Exception as e:
         raise HTTPException(
@@ -145,7 +420,7 @@ async def provision_tenant_stream(
             stores_pii=org_in.stores_pii,
             record_calls=org_in.record_calls,
             create_resource_group=org_in.create_resource_group,
-            plivo_auto_provision=org_in.plivo_auto_provision,
+            twilio_auto_provision=org_in.twilio_auto_provision,
             industry=org_in.industry,
             country_code=org_in.country_code
         )
@@ -175,6 +450,8 @@ async def provision_tenant_stream(
                     region=region,
                     industry=org_industry,
                     country_code=org_country,
+                    language=org.language,
+                    twilio_auto_provision=org.twilio_auto_provision,
                     on_step=on_step
                 )
                 result["organization_profile"] = _organization_profile(org)
@@ -238,6 +515,8 @@ async def get_provision_status(
         "organization_name": org.name,
         "organization_profile": _organization_profile(org),
         "status": tenant_res.provisioning_status,
+        "usage_minutes": tenant_res.usage_minutes or 0,
+        "cost_breakdown": _tenant_cost_breakdown(tenant_res),
         "azure": {
             "resource_group": tenant_res.azure_resource_group_name,
             "region": tenant_res.azure_region,
@@ -247,12 +526,27 @@ async def get_provision_status(
             "qdrant_url_ref": tenant_res.qdrant_url_ref,
             "redis_namespace": tenant_res.redis_namespace,
             "redis_host": tenant_res.redis_host,
+            "redis_mode": (tenant_res.provider_status or {}).get("redis_mode", "shared"),
             "blob_prefix": tenant_res.blob_prefix,
             "key_vault": tenant_res.key_vault_name,
-            "plivo_status": tenant_res.plivo_status,
+            "twilio_status": tenant_res.twilio_status,
+            "twilio_provider": (tenant_res.provider_status or {}).get("twilio_provider"),
+            "twilio_subaccount_id": (tenant_res.provider_status or {}).get("twilio_subaccount_id"),
+            "twilio_error": (tenant_res.provider_status or {}).get("twilio_error"),
+            "stt_provider": (tenant_res.provider_status or {}).get("stt_provider"),
+            "stt_model": (tenant_res.provider_status or {}).get("stt_model"),
+            "stt_endpoint": (tenant_res.provider_status or {}).get("stt_endpoint"),
+            "stt_status": (tenant_res.provider_status or {}).get("stt_status"),
+            "tts_provider": (tenant_res.provider_status or {}).get("tts_provider"),
+            "tts_model": (tenant_res.provider_status or {}).get("tts_model"),
+            "tts_status": (tenant_res.provider_status or {}).get("tts_status"),
+            "tts_speaker": (tenant_res.provider_status or {}).get("tts_speaker"),
             "llm_provider": (tenant_res.provider_status or {}).get("llm_provider"),
             "llm_model": (tenant_res.provider_status or {}).get("llm_model"),
             "llm_status": (tenant_res.provider_status or {}).get("llm_status"),
+            "llm_api_key_ref": (tenant_res.provider_status or {}).get("llm_api_key_ref"),
+            "llm_api_key_stored": (tenant_res.provider_status or {}).get("llm_api_key_stored"),
+            "llm_error": (tenant_res.provider_status or {}).get("llm_error"),
             "llm_system_prompt": (tenant_res.provider_status or {}).get("llm_system_prompt"),
         },
         "steps": tenant_res.provisioning_steps or [],
@@ -260,6 +554,6 @@ async def get_provision_status(
             "Connect client database",
             "Connect CRM",
             "Upload knowledge documents to blob storage",
-            "Assign or connect Plivo number",
+            "Assign or connect Twilio number",
         ],
     }

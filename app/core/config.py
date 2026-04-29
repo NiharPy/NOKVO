@@ -47,7 +47,38 @@ class Settings(BaseSettings):
     # Provisioning Flags
     CREATE_STORAGE_PER_TENANT: bool = False
     CREATE_KEYVAULT_PER_TENANT: bool = False
-    PLIVO_AUTO_PROVISION: bool = False
+    TWILIO_AUTO_PROVISION: bool = False
+    TWILIO_ACCOUNT_SID: str = ""
+    TWILIO_AUTH_TOKEN: str = ""
+    TWILIO_BASE_URL: str = "https://api.twilio.com/2010-04-01"
+    SONIOX_API_KEY: str = ""
+    SONIOX_STT_WEBSOCKET_URL: str = "wss://stt-rt.soniox.com/transcribe-websocket"
+    SONIOX_STT_MODEL: str = "stt-rt-v4"
+    SONIOX_STT_AUDIO_FORMAT: str = "auto"
+    SARVAM_API_KEY: str = ""
+    SARVAM_TTS_MODEL: str = "bulbul:v3"
+    SARVAM_TTS_REST_URL: str = "https://api.sarvam.ai/text-to-speech"
+    SARVAM_TTS_STREAM_URL: str = "wss://api.sarvam.ai/text-to-speech/stream"
+    SARVAM_TTS_SPEAKER: str = ""
+    SARVAM_TTS_SAMPLE_RATE: int = 24000
+    SARVAM_TTS_AUDIO_FORMAT: str = "wav"
+
+    # Billing and Usage Tracking
+    ORGANIZATION_BASE_MONTHLY_COST_USD: float = 5.00
+    QDRANT_COLLECTION_MONTHLY_COST_USD: float = 8.00
+    SHARED_REDIS_NAMESPACE_MONTHLY_COST_USD: float = 2.00
+    BLOB_PREFIX_MONTHLY_COST_USD: float = 1.50
+    KEY_VAULT_REFERENCE_MONTHLY_COST_USD: float = 1.00
+    AZURE_OPENAI_MONTHLY_COST_USD: float = 12.00
+    SONIOX_STT_MONTHLY_COST_USD: float = 4.00
+    SARVAM_TTS_MONTHLY_COST_USD: float = 4.00
+    TWILIO_SUBACCOUNT_MONTHLY_COST_USD: float = 3.00
+    COST_PER_VOICE_MINUTE_USD: float = 0.0200
+    COST_PER_STT_MINUTE_USD: float = 0.0120
+    COST_PER_TWILIO_MINUTE_USD: float = 0.0130
+    COST_PER_TTS_1K_CHARS_USD: float = 0.0180
+    COST_PER_LLM_INPUT_1K_TOKENS_USD: float = 0.0030
+    COST_PER_LLM_OUTPUT_1K_TOKENS_USD: float = 0.0120
     
     # Provider APIs
     QDRANT_URL: str = ":memory:"

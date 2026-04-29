@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, DateTime, ForeignKey, Boolean, Integer
+from sqlalchemy import Column, String, DateTime, ForeignKey, Boolean, Integer, Numeric
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from app.db.session import Base
 from sqlalchemy.sql import func
@@ -27,8 +27,10 @@ class TenantResources(Base):
     key_vault_name = Column(String)
     secret_refs = Column(JSONB, default=dict)
     
-    plivo_status = Column(String)
-    plivo_phone_number = Column(String, nullable=True)
+    twilio_status = Column(String)
+    twilio_phone_number = Column(String, nullable=True)
+    usage_minutes = Column(Integer, nullable=False, default=0)
+    total_cost_usd = Column(Numeric(12, 2), nullable=False, default=0)
     
     provider_status = Column(JSONB, default=dict)
     provisioning_status = Column(String, nullable=False) # 'pending', 'success', 'partial', 'failed'

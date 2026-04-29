@@ -2,6 +2,7 @@
 
 :root {
   --bg-dark: #0a0e17;
+  --bg-light: #eef4fb;
   --bg-card: #111827;
   --bg-input: #0f131a;
   --text-primary: #e2e8f0;
@@ -21,6 +22,7 @@
   padding: 0;
 }
 
+html,
 body {
   font-family: 'Space Grotesk', sans-serif;
   background-color: var(--bg-dark);
@@ -34,12 +36,37 @@ body {
   background-position: center center;
   display: flex;
   flex-direction: column;
+  transition: background-color 0.25s ease, color 0.25s ease;
 }
 
 #app {
   min-height: 100vh;
   display: flex;
   flex-direction: column;
+}
+
+body[data-theme='light'] {
+  --bg-card: #ffffff;
+  --bg-input: rgba(255, 255, 255, 0.92);
+  --text-primary: #0f172a;
+  --text-secondary: #334155;
+  --text-muted: #64748b;
+  --accent-color: #2563eb;
+  --accent-glow: rgba(37, 99, 235, 0.22);
+  --border-color: rgba(15, 23, 42, 0.12);
+  --border-focus: rgba(37, 99, 235, 0.38);
+  --danger-color: #dc2626;
+  --success-color: #059669;
+  background-color: var(--bg-light);
+  background-image:
+    linear-gradient(rgba(15, 23, 42, 0.04) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(15, 23, 42, 0.04) 1px, transparent 1px),
+    radial-gradient(circle at top left, rgba(37, 99, 235, 0.12), transparent 32%),
+    radial-gradient(circle at bottom right, rgba(14, 165, 233, 0.1), transparent 28%);
+}
+
+body[data-theme='dark'] {
+  background-color: var(--bg-dark);
 }
 
 /* Animations */

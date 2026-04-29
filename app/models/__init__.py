@@ -5,6 +5,7 @@ from app.models.audit import SuperAdminAuditLog
 from app.models.approval import SuperAdminApprovalRequest
 from app.models.organization import Organization
 from app.models.tenant_resources import TenantResources
+from app.models.tenant_usage_event import TenantUsageEvent
 
 # For Alembic to discover all models
-__all__ = ["Base", "SuperAdminUser", "SuperAdminSession", "SuperAdminAuditLog", "SuperAdminApprovalRequest", "Organization", "TenantResources"]
+__all__ = ["Base", "SuperAdminUser", "SuperAdminSession", "SuperAdminAuditLog", "SuperAdminApprovalRequest", "Organization", "TenantResources", "TenantUsageEvent"]

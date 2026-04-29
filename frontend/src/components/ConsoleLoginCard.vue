@@ -5,6 +5,21 @@ import axios from 'axios';
 import QrcodeVue from 'qrcode.vue';
 import SuperAdminDashboard from './SuperAdminDashboard.vue';
 
+defineProps({
+  theme: {
+    type: String,
+    required: true,
+  },
+  toggleTheme: {
+    type: Function,
+    required: true,
+  },
+  homeSignal: {
+    type: Number,
+    required: true,
+  },
+});
+
 const email = ref('');
 const password = ref('');
 const totpCode = ref('');
@@ -133,7 +148,7 @@ onMounted(async () => {
 </script>
 
 <template>
-  <SuperAdminDashboard v-if="authStep === 'success'" @logout="handleLogout" />
+  <SuperAdminDashboard v-if="authStep === 'success'" :theme="theme" :toggle-theme="toggleTheme" :home-signal="homeSignal" @logout="handleLogout" />
   <div v-else class="login-card">
     <div class="card-header">
       <div class="shield-container">
@@ -310,6 +325,17 @@ onMounted(async () => {
   overflow: hidden;
 }
 
+.theme-light .login-card {
+  background: rgba(241, 245, 249, 0.88);
+  border-color: rgba(148, 163, 184, 0.18);
+  box-shadow: 0 20px 45px -18px rgba(15, 23, 42, 0.18);
+}
+
+.theme-light .login-card::before,
+.theme-light .login-card::after {
+  border-color: rgba(15, 23, 42, 0.12);
+}
+
 .login-card::before, .login-card::after {
   content: '';
   position: absolute;
@@ -389,6 +415,11 @@ onMounted(async () => {
   position: relative;
   overflow: hidden;
 }
+
+.theme-light .status-box {
+  border-color: rgba(15, 23, 42, 0.1);
+  background: rgba(255, 255, 255, 0.72);
+}
 .status-box::before {
   content: '';
   position: absolute;
@@ -460,11 +491,19 @@ input:focus + .input-glow { opacity: 1; }
   transition: all 0.3s ease;
   width: 100%;
 }
+
+.theme-light .auth-button {
+  background: rgba(255, 255, 255, 0.9);
+}
 .btn-content { display: flex; align-items: center; justify-content: center; gap: 0.8rem; position: relative; z-index: 2; }
 .auth-button:hover:not(:disabled) {
   background: rgba(30, 41, 59, 0.8);
   border-color: var(--accent-color);
   box-shadow: 0 0 20px rgba(59, 130, 246, 0.2);
+}
+
+.theme-light .auth-button:hover:not(:disabled) {
+  background: rgba(239, 246, 255, 0.96);
 }
 .auth-button:disabled { opacity: 0.7; cursor: not-allowed; }
 
@@ -483,8 +522,10 @@ input:focus + .input-glow { opacity: 1; }
 .mfa-form { animation: fadeIn 0.3s ease-out; }
 .mfa-instruction { text-align: center; font-size: 0.85rem; color: var(--text-secondary); line-height: 1.5; margin-bottom: 0.5rem; }
 .qr-container { display: flex; justify-content: center; margin: 1rem 0; padding: 1rem; background: rgba(255,255,255,0.05); border-radius: 8px; border: 1px solid var(--border-color); }
+.theme-light .qr-container { background: rgba(255,255,255,0.82); }
 .secret-text { text-align: center; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 1rem; }
 .secret-text code { background: rgba(0,0,0,0.3); padding: 0.2rem 0.4rem; letter-spacing: 1px; color: var(--text-primary); }
+.theme-light .secret-text code { background: rgba(226, 232, 240, 0.9); }
 
 .btn-group { display: flex; gap: 1rem; margin-top: 0.5rem; }
 .back-button {
@@ -498,6 +539,7 @@ input:focus + .input-glow { opacity: 1; }
   transition: all 0.3s ease;
 }
 .back-button:hover:not(:disabled) { background: rgba(255,255,255,0.05); color: var(--text-primary); }
+.theme-light .back-button:hover:not(:disabled) { background: rgba(226, 232, 240, 0.72); }
 .mfa-btn { flex: 2; margin-top: 0; }
 
 .success-box {
@@ -527,5 +569,6 @@ input:focus + .input-glow { opacity: 1; }
 .emergency-override a:hover { color: var(--text-secondary); }
 .card-footer { margin-top: 3rem; text-align: center; }
 .footer-divider { border: none; border-top: 1px solid rgba(255, 255, 255, 0.1); margin-bottom: 1.5rem; }
+.theme-light .footer-divider { border-top-color: rgba(15, 23, 42, 0.12); }
 .footer-text { font-size: 0.65rem; color: var(--text-muted); letter-spacing: 1px; }
 </style>

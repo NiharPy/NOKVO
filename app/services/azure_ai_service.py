@@ -109,14 +109,15 @@ class AzureAIService:
                 pieces.append(f"body={body}")
 
         if not pieces:
-            pieces.append(str(error))
+            pieces.append(f"message={str(error) or repr(error)}")
 
         return f"Azure OpenAI provisioning failed ({status_code}): " + " | ".join(pieces)
 
     @staticmethod
     async def provision_ai_resource(
-        rg_name: str, tenant_id: str, slug: str, region: str, 
-        organization_name: str, industry: str, country_code: str
+        rg_name: str, tenant_id: str, slug: str, region: str,
+        organization_name: str, industry: str, country_code: str,
+        secret_refs: dict | None = None,
     ) -> dict:
         """
         Create an Azure OpenAI account in a supported Azure OpenAI region and
@@ -130,6 +131,7 @@ class AzureAIService:
                 "deployment_name": GPT_DEPLOYMENT_NAME,
                 "model": GPT_MODEL_NAME,
                 "region": ai_region,
+                "api_key_ref": (secret_refs.get("llm_api_key") or {}).get("secret_name") if secret_refs else AzureKeyVaultService._secret_name(tenant_id, "llm-api-key"),
                 "system_prompt": DEFAULT_SYSTEM_PROMPT,
                 "status": "skipped",
             }
@@ -191,6 +193,17 @@ class AzureAIService:
                 resource_group_name=rg_name,
                 account_name=account_name,
             )
+            llm_api_key = getattr(keys, "key1", None) or getattr(keys, "primary_key", None)
+            api_key_ref = (secret_refs.get("llm_api_key") or {}).get("secret_name") if secret_refs else None
+            if not api_key_ref:
+                api_key_ref = AzureKeyVaultService._secret_name(tenant_id, "llm-api-key")
+            if llm_api_key:
+                await AzureKeyVaultService.set_secret_value(
+                    api_key_ref,
+                    llm_api_key,
+                    tenant_id,
+                    "llm_api_key",
+                )
 
             return {
                 "account_name": account_name,
@@ -198,12 +211,13 @@ class AzureAIService:
                 "model": GPT_MODEL_NAME,
                 "region": ai_region,
                 "endpoint": account.properties.endpoint,
-                "api_key_ref": AzureKeyVaultService._secret_name(tenant_id, "llm-api-key"),
+                "api_key_ref": api_key_ref,
                 "system_prompt": DEFAULT_SYSTEM_PROMPT,
+                "api_key_stored": bool(llm_api_key),
                 "status": "provisioned",
             }
 
         except HttpResponseError as e:
             raise RuntimeError(AzureAIService._format_http_error(e))
         except Exception as e:
-            raise RuntimeError(f"Failed to provision Azure AI resource: {str(e)}")
+            raise RuntimeError(f"Failed to provision Azure AI resource: {str(e) or repr(e)}")

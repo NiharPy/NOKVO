@@ -17,7 +17,17 @@ class TenantResourcesResponse(BaseModel):
     redis_namespace: Optional[str] = None
     blob_prefix: Optional[str] = None
     key_vault: Optional[str] = None
-    plivo_status: Optional[str] = None
+    stt_provider: Optional[str] = None
+    stt_model: Optional[str] = None
+    stt_endpoint: Optional[str] = None
+    stt_status: Optional[str] = None
+    tts_provider: Optional[str] = None
+    tts_model: Optional[str] = None
+    tts_status: Optional[str] = None
+    tts_speaker: Optional[str] = None
+    twilio_status: Optional[str] = None
+    twilio_provider: Optional[str] = None
+    twilio_subaccount_id: Optional[str] = None
 
 class TenantProvisioningResult(BaseModel):
     tenant_id: str

@@ -1,13 +1,39 @@
 <script setup>
+import { onMounted, ref, watch } from 'vue';
 import SecureHeader from './components/SecureHeader.vue';
 import ConsoleLoginCard from './components/ConsoleLoginCard.vue';
+
+const theme = ref(localStorage.getItem('nokvo_dashboard_theme') || 'light');
+const homeSignal = ref(0);
+
+const applyTheme = (value) => {
+  document.documentElement.dataset.theme = value;
+  document.body.dataset.theme = value;
+};
+
+const toggleTheme = () => {
+  theme.value = theme.value === 'dark' ? 'light' : 'dark';
+};
+
+const handleHome = () => {
+  homeSignal.value += 1;
+};
+
+watch(theme, (value) => {
+  localStorage.setItem('nokvo_dashboard_theme', value);
+  applyTheme(value);
+}, { immediate: true });
+
+onMounted(() => {
+  applyTheme(theme.value);
+});
 </script>
 
 <template>
-  <div class="app-container">
-    <SecureHeader />
+  <div class="app-container" :class="`theme-${theme}`">
+    <SecureHeader :theme="theme" :toggle-theme="toggleTheme" @home="handleHome" />
     <main class="main-content">
-      <ConsoleLoginCard />
+      <ConsoleLoginCard :theme="theme" :toggle-theme="toggleTheme" :home-signal="homeSignal" />
     </main>
   </div>
 </template>

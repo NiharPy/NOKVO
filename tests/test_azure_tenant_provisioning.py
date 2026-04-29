@@ -99,7 +99,7 @@ def enterprise_payload(org_name: str, region: str = "centralindia", environment:
         "stores_pii": True,
         "record_calls": True,
         "create_resource_group": True,
-        "plivo_auto_provision": False,
+        "twilio_auto_provision": False,
     }
 
 
@@ -111,7 +111,9 @@ MOCK_PATCHES = [
     "app.services.azure_blob_service.AzureBlobService.provision_blob_storage",
     "app.services.qdrant_service.QdrantService.provision_collection",
     "app.services.redis_tenant_service.RedisTenantService.provision_redis",
-    "app.services.plivo_service.PlivoService.provision_plivo",
+    "app.services.twilio_service.TwilioService.provision_subaccount",
+    "app.services.soniox_stt_service.SonioxSTTService.provision_stt",
+    "app.services.sarvam_tts_service.SarvamTTSService.provision_tts",
 ]
 
 
@@ -129,7 +131,9 @@ def get_mocked_returns(tenant_id_prefix="mock"):
         },
         f"tenant_{tenant_id_prefix}_knowledge",
         f"tenant:{tenant_id_prefix}",
-        {"plivo_subaccount_id": None, "phone_number_status": "pending"},
+        {"twilio_provider": "twilio", "subaccount_id": None, "phone_number_status": "pending", "subaccount_status": "skipped"},
+        {"stt_provider": "soniox", "stt_status": "provisioned", "stt_model": "stt-rt-v4", "stt_endpoint": "wss://stt-rt.soniox.com/transcribe-websocket"},
+        {"tts_provider": "sarvam", "tts_status": "provisioned", "tts_model": "bulbul:v3", "tts_speaker": "Shubh"},
     ]
 
 
@@ -149,7 +153,9 @@ async def test_founder_can_provision(client, founder):
          patch(MOCK_PATCHES[2], new_callable=AsyncMock, return_value={"storage_account_name": "sa", "container_name": "c", "blob_prefix": "p/"}) as m_blob, \
          patch(MOCK_PATCHES[3], new_callable=AsyncMock, return_value="tenant_x_knowledge") as m_qdrant, \
          patch(MOCK_PATCHES[4], new_callable=AsyncMock, return_value="tenant:x") as m_redis, \
-         patch(MOCK_PATCHES[5], new_callable=AsyncMock, return_value={"phone_number_status": "pending"}) as m_plivo:
+         patch(MOCK_PATCHES[5], new_callable=AsyncMock, return_value={"phone_number_status": "pending"}) as m_twilio, \
+         patch(MOCK_PATCHES[6], new_callable=AsyncMock, return_value={"stt_provider": "soniox", "stt_status": "provisioned", "stt_model": "stt-rt-v4", "stt_endpoint": "wss://stt-rt.soniox.com/transcribe-websocket"}) as m_stt, \
+         patch(MOCK_PATCHES[7], new_callable=AsyncMock, return_value={"tts_provider": "sarvam", "tts_status": "provisioned", "tts_model": "bulbul:v3", "tts_speaker": "Shubh"}) as m_tts:
 
         resp = await client.post(
             "/superadmin/tenants/provision",
@@ -163,6 +169,8 @@ async def test_founder_can_provision(client, founder):
     assert data["tenant_id"]
     assert data["organization_profile"]["admin_email"] == "admin@acme.com"
     assert "qdrant_url_ref" in data["resources"]
+    assert data["resources"]["stt_provider"] == "soniox"
+    assert data["resources"]["tts_provider"] == "sarvam"
     assert "steps" in data
     assert "next_steps" in data
 
@@ -182,7 +190,9 @@ async def test_engineering_can_provision(client, engineer):
          patch(MOCK_PATCHES[2], new_callable=AsyncMock, return_value={"storage_account_name": "s", "container_name": "c", "blob_prefix": "p/"}) as m3, \
          patch(MOCK_PATCHES[3], new_callable=AsyncMock, return_value="col") as m4, \
          patch(MOCK_PATCHES[4], new_callable=AsyncMock, return_value="ns") as m5, \
-         patch(MOCK_PATCHES[5], new_callable=AsyncMock, return_value={"phone_number_status": "pending"}) as m6:
+         patch(MOCK_PATCHES[5], new_callable=AsyncMock, return_value={"phone_number_status": "pending"}) as m6, \
+         patch(MOCK_PATCHES[6], new_callable=AsyncMock, return_value={"stt_provider": "soniox", "stt_status": "provisioned"}) as m7, \
+         patch(MOCK_PATCHES[7], new_callable=AsyncMock, return_value={"tts_provider": "sarvam", "tts_status": "provisioned"}) as m8:
 
         resp = await client.post(
             "/superadmin/tenants/provision",
@@ -245,7 +255,9 @@ async def test_duplicate_provisioning_returns_existing(client, founder):
          patch(MOCK_PATCHES[2], new_callable=AsyncMock, return_value={"storage_account_name": "s", "container_name": "c", "blob_prefix": "p/"}) as m3, \
          patch(MOCK_PATCHES[3], new_callable=AsyncMock, return_value="col") as m4, \
          patch(MOCK_PATCHES[4], new_callable=AsyncMock, return_value="ns") as m5, \
-         patch(MOCK_PATCHES[5], new_callable=AsyncMock, return_value={"phone_number_status": "pending"}) as m6:
+         patch(MOCK_PATCHES[5], new_callable=AsyncMock, return_value={"phone_number_status": "pending"}) as m6, \
+         patch(MOCK_PATCHES[6], new_callable=AsyncMock, return_value={"stt_provider": "soniox", "stt_status": "provisioned"}) as m7, \
+         patch(MOCK_PATCHES[7], new_callable=AsyncMock, return_value={"tts_provider": "sarvam", "tts_status": "provisioned"}) as m8:
 
         resp1 = await client.post(
             "/superadmin/tenants/provision",
@@ -278,7 +290,9 @@ async def test_partial_failure_stored(client, founder):
          patch(MOCK_PATCHES[2], new_callable=AsyncMock, side_effect=RuntimeError("Blob down")) as m3, \
          patch(MOCK_PATCHES[3], new_callable=AsyncMock, return_value="col") as m4, \
          patch(MOCK_PATCHES[4], new_callable=AsyncMock, return_value="ns") as m5, \
-         patch(MOCK_PATCHES[5], new_callable=AsyncMock, return_value={"phone_number_status": "pending"}) as m6:
+         patch(MOCK_PATCHES[5], new_callable=AsyncMock, return_value={"phone_number_status": "pending"}) as m6, \
+         patch(MOCK_PATCHES[6], new_callable=AsyncMock, return_value={"stt_provider": "soniox", "stt_status": "provisioned"}) as m7, \
+         patch(MOCK_PATCHES[7], new_callable=AsyncMock, return_value={"tts_provider": "sarvam", "tts_status": "provisioned"}) as m8:
 
         resp = await client.post(
             "/superadmin/tenants/provision",
@@ -308,7 +322,9 @@ async def test_secret_refs_not_exposed(client, founder):
          patch(MOCK_PATCHES[2], new_callable=AsyncMock, return_value={"storage_account_name": "s", "container_name": "c", "blob_prefix": "p/"}) as m3, \
          patch(MOCK_PATCHES[3], new_callable=AsyncMock, return_value="col") as m4, \
          patch(MOCK_PATCHES[4], new_callable=AsyncMock, return_value="ns") as m5, \
-         patch(MOCK_PATCHES[5], new_callable=AsyncMock, return_value={"phone_number_status": "pending"}) as m6:
+         patch(MOCK_PATCHES[5], new_callable=AsyncMock, return_value={"phone_number_status": "pending"}) as m6, \
+         patch(MOCK_PATCHES[6], new_callable=AsyncMock, return_value={"stt_provider": "soniox", "stt_status": "provisioned"}) as m7, \
+         patch(MOCK_PATCHES[7], new_callable=AsyncMock, return_value={"tts_provider": "sarvam", "tts_status": "provisioned"}) as m8:
 
         resp = await client.post(
             "/superadmin/tenants/provision",
@@ -338,7 +354,9 @@ async def test_resource_group_step_called(client, founder):
          patch(MOCK_PATCHES[2], new_callable=AsyncMock, return_value={"storage_account_name": "s", "container_name": "c", "blob_prefix": "p/"}) as m3, \
          patch(MOCK_PATCHES[3], new_callable=AsyncMock, return_value="col") as m4, \
          patch(MOCK_PATCHES[4], new_callable=AsyncMock, return_value="ns") as m5, \
-         patch(MOCK_PATCHES[5], new_callable=AsyncMock, return_value={"phone_number_status": "pending"}) as m6:
+         patch(MOCK_PATCHES[5], new_callable=AsyncMock, return_value={"phone_number_status": "pending"}) as m6, \
+         patch(MOCK_PATCHES[6], new_callable=AsyncMock, return_value={"stt_provider": "soniox", "stt_status": "provisioned"}) as m7, \
+         patch(MOCK_PATCHES[7], new_callable=AsyncMock, return_value={"tts_provider": "sarvam", "tts_status": "provisioned"}) as m8:
 
         resp = await client.post(
             "/superadmin/tenants/provision",

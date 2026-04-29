@@ -139,12 +139,12 @@ class AzureKeyVaultService:
                 "secret_name": AzureKeyVaultService._secret_name(tenant_id, "tts-api-key"),
                 **rotation,
             },
-            "plivo_auth_id": {
-                "secret_name": AzureKeyVaultService._secret_name(tenant_id, "plivo-auth-id"),
+            "twilio_account_sid": {
+                "secret_name": AzureKeyVaultService._secret_name(tenant_id, "twilio-account-sid"),
                 **rotation,
             },
-            "plivo_auth_token": {
-                "secret_name": AzureKeyVaultService._secret_name(tenant_id, "plivo-auth-token"),
+            "twilio_auth_token": {
+                "secret_name": AzureKeyVaultService._secret_name(tenant_id, "twilio-auth-token"),
                 **rotation,
             },
             "db_connection_string": {
@@ -202,3 +202,27 @@ class AzureKeyVaultService:
             return refs
         except Exception as e:
             raise RuntimeError(f"Failed to provision Key Vault secrets: {str(e)}")
+
+    @staticmethod
+    async def set_secret_value(secret_name: str, secret_value: str, tenant_id: str, secret_role: str) -> None:
+        kv_name = settings.AZURE_SHARED_KEY_VAULT_NAME
+        if not kv_name:
+            return
+
+        kv_url = f"https://{kv_name}.vault.azure.net/"
+        credential = AzureAuth.get_credential()
+        client = SecretClient(vault_url=kv_url, credential=credential)
+        rotation = AzureKeyVaultService._rotation_metadata()
+        client.set_secret(
+            secret_name,
+            secret_value,
+            enabled=True,
+            content_type="runtime-credential",
+            tags={
+                "tenant_id": tenant_id,
+                "secret_role": secret_role,
+                "rotation_interval_days": str(rotation["rotation_interval_days"]),
+                "next_rotation_due_at": rotation["next_rotation_due_at"],
+            },
+            expires_on=datetime.fromisoformat(rotation["next_rotation_due_at"]),
+        )

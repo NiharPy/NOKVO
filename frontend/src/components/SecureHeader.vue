@@ -1,20 +1,36 @@
 <script setup>
 import { ShieldCheck } from 'lucide-vue-next';
+
+defineProps({
+  theme: {
+    type: String,
+    required: true,
+  },
+  toggleTheme: {
+    type: Function,
+    required: true,
+  },
+});
+
+const emit = defineEmits(['home']);
 </script>
 
 <template>
   <header class="secure-header">
     <div class="header-left">
-      <div class="logo">
+      <button class="logo" @click="emit('home')">
         <span class="logo-bold">NOKVO</span>
-        <span class="logo-sub">NODE ALPHA-7</span>
-      </div>
+        <span class="logo-sub">ORBITAL-V1</span>
+      </button>
     </div>
     <div class="header-right">
       <nav class="nav-links">
         <a href="#">STATUS</a>
         <a href="#">SUPPORT</a>
       </nav>
+      <button class="theme-toggle" @click="toggleTheme">
+        {{ theme === 'dark' ? 'LIGHT MODE' : 'DARK MODE' }}
+      </button>
       <div class="status-icon">
         <ShieldCheck :size="24" color="var(--text-secondary)" strokeWidth="1.5" />
       </div>
@@ -35,6 +51,11 @@ import { ShieldCheck } from 'lucide-vue-next';
   display: flex;
   align-items: baseline;
   gap: 0.5rem;
+  background: transparent;
+  border: none;
+  color: inherit;
+  padding: 0;
+  cursor: pointer;
 }
 
 .logo-bold {
@@ -59,6 +80,22 @@ import { ShieldCheck } from 'lucide-vue-next';
 .nav-links {
   display: flex;
   gap: 1.5rem;
+}
+
+.theme-toggle {
+  background: transparent;
+  border: 1px solid var(--border-color);
+  color: var(--text-secondary);
+  padding: 0.55rem 0.85rem;
+  font-size: 0.72rem;
+  letter-spacing: 1.3px;
+  transition: all 0.25s ease;
+}
+
+.theme-toggle:hover {
+  color: var(--accent-color);
+  border-color: var(--accent-color);
+  box-shadow: 0 0 16px var(--accent-glow);
 }
 
 .nav-links a {

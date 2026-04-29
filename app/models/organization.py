@@ -19,7 +19,7 @@ class Organization(Base):
     stores_pii = Column(Boolean, nullable=False, default=True)
     record_calls = Column(Boolean, nullable=False, default=True)
     create_resource_group = Column(Boolean, nullable=False, default=True)
-    plivo_auto_provision = Column(Boolean, nullable=False, default=False)
+    twilio_auto_provision = Column(Boolean, nullable=False, default=False)
     industry = Column(String, nullable=True)
     country_code = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())

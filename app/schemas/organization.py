@@ -17,7 +17,11 @@ class OrganizationCreate(BaseModel):
     stores_pii: bool = True
     record_calls: bool = True
     create_resource_group: bool = True
-    plivo_auto_provision: bool = False
+    twilio_auto_provision: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("twilio_auto_provision", "plivo_auto_provision"),
+        serialization_alias="twilio_auto_provision",
+    )
     industry: Optional[str] = "Customer Support"
     country_code: Optional[str] = "IN"
 
