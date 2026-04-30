@@ -24,7 +24,7 @@ class TenantResourcesResponse(BaseModel):
     tts_provider: Optional[str] = None
     tts_model: Optional[str] = None
     tts_status: Optional[str] = None
-    tts_speaker: Optional[str] = None
+    tts_voice: Optional[str] = None
     twilio_status: Optional[str] = None
     twilio_provider: Optional[str] = None
     twilio_subaccount_id: Optional[str] = None

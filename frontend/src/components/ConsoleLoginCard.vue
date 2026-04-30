@@ -31,6 +31,8 @@ const authStep = ref('login');
 const tempToken = ref('');
 const totpUri = ref('');
 const totpSecret = ref('');
+const SUPERADMIN_ACCESS_TOKEN_KEY = 'superadmin_access_token';
+const SUPERADMIN_REFRESH_TOKEN_KEY = 'superadmin_refresh_token';
 
 const api = axios.create({
   baseURL: 'http://localhost:8000/api',
@@ -54,8 +56,8 @@ const handleLogin = async () => {
       await checkMfaSetup();
     } else {
       authStep.value = 'success';
-      localStorage.setItem('access_token', data.access_token);
-      localStorage.setItem('refresh_token', data.refresh_token);
+      localStorage.setItem(SUPERADMIN_ACCESS_TOKEN_KEY, data.access_token);
+      localStorage.setItem(SUPERADMIN_REFRESH_TOKEN_KEY, data.refresh_token);
     }
   } catch (err) {
     errorMsg.value = err.response?.data?.detail || 'Authentication failed';
@@ -96,8 +98,8 @@ const handleTotpVerify = async () => {
 
     const data = response.data;
     authStep.value = 'success';
-    localStorage.setItem('access_token', data.access_token);
-    localStorage.setItem('refresh_token', data.refresh_token);
+    localStorage.setItem(SUPERADMIN_ACCESS_TOKEN_KEY, data.access_token);
+    localStorage.setItem(SUPERADMIN_REFRESH_TOKEN_KEY, data.refresh_token);
   } catch (err) {
     errorMsg.value = err.response?.data?.detail || 'Invalid MFA Token';
   } finally {
@@ -114,7 +116,7 @@ const resetFlow = () => {
 
 const handleLogout = async () => {
   try {
-    const token = localStorage.getItem('access_token');
+    const token = localStorage.getItem(SUPERADMIN_ACCESS_TOKEN_KEY);
     if (token) {
       await api.post('/auth/logout', {}, {
         headers: { Authorization: `Bearer ${token}` }
@@ -123,8 +125,8 @@ const handleLogout = async () => {
   } catch (err) {
     console.error("Logout error", err);
   } finally {
-    localStorage.removeItem('access_token');
-    localStorage.removeItem('refresh_token');
+    localStorage.removeItem(SUPERADMIN_ACCESS_TOKEN_KEY);
+    localStorage.removeItem(SUPERADMIN_REFRESH_TOKEN_KEY);
     resetFlow();
   }
 };
@@ -132,7 +134,7 @@ const handleLogout = async () => {
 import { onMounted } from 'vue';
 
 onMounted(async () => {
-  const token = localStorage.getItem('access_token');
+  const token = localStorage.getItem(SUPERADMIN_ACCESS_TOKEN_KEY);
   if (token) {
     try {
       await api.get('/auth/me', {
@@ -140,8 +142,8 @@ onMounted(async () => {
       });
       authStep.value = 'success';
     } catch (err) {
-      localStorage.removeItem('access_token');
-      localStorage.removeItem('refresh_token');
+      localStorage.removeItem(SUPERADMIN_ACCESS_TOKEN_KEY);
+      localStorage.removeItem(SUPERADMIN_REFRESH_TOKEN_KEY);
     }
   }
 });

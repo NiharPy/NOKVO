@@ -226,3 +226,15 @@ class AzureKeyVaultService:
             },
             expires_on=datetime.fromisoformat(rotation["next_rotation_due_at"]),
         )
+
+    @staticmethod
+    async def get_secret_value(secret_name: str) -> str | None:
+        kv_name = settings.AZURE_SHARED_KEY_VAULT_NAME
+        if not kv_name:
+            return None
+
+        kv_url = f"https://{kv_name}.vault.azure.net/"
+        credential = AzureAuth.get_credential()
+        client = SecretClient(vault_url=kv_url, credential=credential)
+        secret = client.get_secret(secret_name)
+        return secret.value

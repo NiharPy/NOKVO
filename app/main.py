@@ -28,9 +28,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-from app.api import auth, superadmin_tenant_provisioning
+from app.api import auth, organization_auth, superadmin_tenant_provisioning
 
 app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
+app.include_router(organization_auth.router, prefix="/api/org-auth", tags=["organization-auth"])
 app.include_router(superadmin_tenant_provisioning.router, prefix="/superadmin/tenants", tags=["tenant-provisioning"])
 
 @app.get("/health")

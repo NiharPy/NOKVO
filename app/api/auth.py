@@ -60,7 +60,12 @@ async def login(request: Request, login_data: LoginRequest, db: AsyncSession = D
     
     if user.mfa_required:
         # Issue a temporary token that requires MFA step
-        access_token = security.create_access_token(subject=user.id, mfa_completed=False, expires_delta=timedelta(minutes=5))
+        access_token = security.create_access_token(
+            subject=user.id,
+            mfa_completed=False,
+            expires_delta=timedelta(minutes=5),
+            extra_claims={"principal_type": "superadmin", "role": user.role},
+        )
         return {"access_token": access_token, "refresh_token": "pending_mfa", "token_type": "bearer"}
     else:
         # If no MFA required (should be rare for superadmin), issue full tokens
@@ -73,7 +78,12 @@ async def login(request: Request, login_data: LoginRequest, db: AsyncSession = D
             user_agent=request.headers.get("user-agent"),
             expires_at=datetime.now(timezone.utc) + timedelta(hours=4)
         )
-        access_token = security.create_access_token(subject=user.id, mfa_completed=True, session_id=str(session.id))
+        access_token = security.create_access_token(
+            subject=user.id,
+            mfa_completed=True,
+            session_id=str(session.id),
+            extra_claims={"principal_type": "superadmin", "role": user.role},
+        )
         
         db.add(session)
         user.last_login_at = datetime.now(timezone.utc)
@@ -124,7 +134,12 @@ async def verify_totp(request: Request, data: TOTPVerifyRequest, current_user: S
         user_agent=request.headers.get("user-agent"),
         expires_at=datetime.now(timezone.utc) + timedelta(hours=4)
     )
-    access_token = security.create_access_token(subject=current_user.id, mfa_completed=True, session_id=str(session.id))
+    access_token = security.create_access_token(
+        subject=current_user.id,
+        mfa_completed=True,
+        session_id=str(session.id),
+        extra_claims={"principal_type": "superadmin", "role": current_user.role},
+    )
     
     db.add(session)
     current_user.last_login_at = datetime.now(timezone.utc)
@@ -168,7 +183,14 @@ async def refresh_token(request: Request, data: RefreshRequest, db: AsyncSession
         user_agent=request.headers.get("user-agent"),
         expires_at=datetime.now(timezone.utc) + timedelta(hours=4)
     )
-    access_token = security.create_access_token(subject=session.superadmin_id, mfa_completed=True, session_id=str(new_session.id))
+    user_result = await db.execute(select(SuperAdminUser).where(SuperAdminUser.id == session.superadmin_id))
+    user = user_result.scalars().first()
+    access_token = security.create_access_token(
+        subject=session.superadmin_id,
+        mfa_completed=True,
+        session_id=str(new_session.id),
+        extra_claims={"principal_type": "superadmin", "role": user.role if user else None},
+    )
     
     db.add(new_session)
     await log_audit(db, session.superadmin_id, "token_refreshed", "low", request)

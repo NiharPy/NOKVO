@@ -18,6 +18,14 @@ class Settings(BaseSettings):
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
     REFRESH_TOKEN_EXPIRE_HOURS: int = 4
+
+    # Google OAuth
+    GOOGLE_OAUTH_CLIENT_ID: str = ""
+    GOOGLE_OAUTH_CLIENT_SECRET: str = ""
+    ZOHO_CLIENT_ID: str = ""
+    ZOHO_CLIENT_SECRET: str = ""
+    ZOHO_REDIRECT_URI: str = ""
+    ZOHO_ACCOUNTS_URL: str = "https://accounts.zoho.com"
     
     # WebAuthn
     RP_ID: str = "localhost"
@@ -55,13 +63,12 @@ class Settings(BaseSettings):
     SONIOX_STT_WEBSOCKET_URL: str = "wss://stt-rt.soniox.com/transcribe-websocket"
     SONIOX_STT_MODEL: str = "stt-rt-v4"
     SONIOX_STT_AUDIO_FORMAT: str = "auto"
-    SARVAM_API_KEY: str = ""
-    SARVAM_TTS_MODEL: str = "bulbul:v3"
-    SARVAM_TTS_REST_URL: str = "https://api.sarvam.ai/text-to-speech"
-    SARVAM_TTS_STREAM_URL: str = "wss://api.sarvam.ai/text-to-speech/stream"
-    SARVAM_TTS_SPEAKER: str = ""
-    SARVAM_TTS_SAMPLE_RATE: int = 24000
-    SARVAM_TTS_AUDIO_FORMAT: str = "wav"
+    SONIOX_TTS_MODEL: str = "tts-rt-v1-preview"
+    SONIOX_TTS_REST_URL: str = "https://tts-rt.soniox.com/tts"
+    SONIOX_TTS_STREAM_URL: str = "wss://tts-rt.soniox.com/tts-websocket"
+    SONIOX_TTS_VOICE: str = "Adrian"
+    SONIOX_TTS_SAMPLE_RATE: int = 24000
+    SONIOX_TTS_AUDIO_FORMAT: str = "wav"
 
     # Billing and Usage Tracking
     ORGANIZATION_BASE_MONTHLY_COST_USD: float = 5.00
@@ -71,7 +78,7 @@ class Settings(BaseSettings):
     KEY_VAULT_REFERENCE_MONTHLY_COST_USD: float = 1.00
     AZURE_OPENAI_MONTHLY_COST_USD: float = 12.00
     SONIOX_STT_MONTHLY_COST_USD: float = 4.00
-    SARVAM_TTS_MONTHLY_COST_USD: float = 4.00
+    SONIOX_TTS_MONTHLY_COST_USD: float = 4.00
     TWILIO_SUBACCOUNT_MONTHLY_COST_USD: float = 3.00
     COST_PER_VOICE_MINUTE_USD: float = 0.0200
     COST_PER_STT_MINUTE_USD: float = 0.0120

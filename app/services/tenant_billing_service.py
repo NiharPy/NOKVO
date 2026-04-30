@@ -31,8 +31,8 @@ class TenantBillingService:
             total += TenantBillingService._money(settings.AZURE_OPENAI_MONTHLY_COST_USD)
         if provider_status.get("stt_provider") == "soniox":
             total += TenantBillingService._money(settings.SONIOX_STT_MONTHLY_COST_USD)
-        if provider_status.get("tts_provider") == "sarvam":
-            total += TenantBillingService._money(settings.SARVAM_TTS_MONTHLY_COST_USD)
+        if provider_status.get("tts_provider") == "soniox":
+            total += TenantBillingService._money(settings.SONIOX_TTS_MONTHLY_COST_USD)
         if provider_status.get("twilio_provider") == "twilio":
             total += TenantBillingService._money(settings.TWILIO_SUBACCOUNT_MONTHLY_COST_USD)
 

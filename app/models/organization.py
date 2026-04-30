@@ -11,6 +11,7 @@ class Organization(Base):
     name = Column(String, nullable=False)
     admin_email = Column(String, nullable=True)
     admin_name = Column(String, nullable=True)
+    email_domain = Column(String, nullable=True)
     region = Column(String, nullable=False)
     environment = Column(String, nullable=False)
     call_type = Column(String, nullable=True)

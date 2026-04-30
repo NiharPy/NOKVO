@@ -41,6 +41,7 @@ const MIN_LOADING_MS = 1800;
 const organizations = ref([]);
 const orgSummary = ref({ count: 0, total_minutes: 0, total_cost_usd: 0 });
 const showCreateOrg = ref(false);
+const SUPERADMIN_ACCESS_TOKEN_KEY = 'superadmin_access_token';
 
 // Matches backend ALLOWED_REGIONS exactly
 const REGIONS = [
@@ -100,7 +101,7 @@ function formatCurrency(value) {
 
 const loadOrganizations = async () => {
   try {
-    const token = localStorage.getItem('access_token');
+    const token = localStorage.getItem(SUPERADMIN_ACCESS_TOKEN_KEY);
     const response = await fetch('http://localhost:8000/superadmin/tenants', {
       headers: {
         'Authorization': `Bearer ${token}`,
@@ -127,7 +128,7 @@ const handleCreateOrg = async () => {
   liveSteps.value = [];
   
   try {
-    const token = localStorage.getItem('access_token');
+    const token = localStorage.getItem(SUPERADMIN_ACCESS_TOKEN_KEY);
     const body = JSON.stringify({
       organization_name: organizationName.value,
       admin_email: adminEmail.value,

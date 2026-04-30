@@ -13,7 +13,7 @@ from app.services.azure_blob_service import AzureBlobService
 from app.services.azure_keyvault_service import AzureKeyVaultService
 from app.services.twilio_service import TwilioService
 from app.services.soniox_stt_service import SonioxSTTService
-from app.services.sarvam_tts_service import SarvamTTSService
+from app.services.soniox_tts_service import SonioxTTSService
 from app.services.azure_ai_service import AzureAIService
 from app.services.tenant_billing_service import TenantBillingService
 
@@ -77,6 +77,7 @@ class AzureTenantProvisioningService:
             tenant_id = existing.tenant_id if existing else str(uuid.uuid4())
             slug = AzureTenantProvisioningService._generate_slug(organization_name)
             rg_name = f"rg-nokvo-{slug}-{environment}"
+            existing_provider_status = dict(existing.provider_status or {}) if existing and existing.provider_status else {}
             
             steps = list(existing.provisioning_steps) if existing and existing.provisioning_steps else []
             
@@ -158,10 +159,10 @@ class AzureTenantProvisioningService:
                 ),
             )
 
-            # 8. Sarvam TTS
+            # 8. Soniox TTS
             tts_res = await run_step(
-                "sarvam_tts",
-                lambda: SarvamTTSService.provision_tts(
+                "soniox_tts",
+                lambda: SonioxTTSService.provision_tts(
                     tenant_id=tenant_id,
                     language=language,
                     secret_refs=kv_res,
@@ -184,35 +185,41 @@ class AzureTenantProvisioningService:
                 "qdrant_status": "provisioned" if qdrant_res else "pending",
                 "qdrant_collection": qdrant_res,
                 "qdrant_url_ref": QdrantService.cluster_ref() if qdrant_res else None,
-                "llm_status": ai_res.get("status", "pending") if ai_res else ("failed" if get_step_status("azure_openai_gpt4o_mini") == "failed" else "pending"),
+                "llm_status": ai_res.get("status", "pending") if ai_res else (
+                    "failed" if get_step_status("azure_openai_gpt4o_mini") == "failed"
+                    else existing_provider_status.get("llm_status", "pending")
+                ),
                 "llm_provider": "azure_openai",
-                "llm_model": ai_res.get("model") if ai_res else "gpt-4.1-mini",
-                "llm_endpoint": ai_res.get("endpoint") if ai_res else None,
-                "llm_account": ai_res.get("account_name") if ai_res else None,
-                "llm_api_key_ref": ai_res.get("api_key_ref") if ai_res else (kv_res.get("llm_api_key", {}) if kv_res else {}).get("secret_name"),
-                "llm_api_key_stored": ai_res.get("api_key_stored", False) if ai_res else False,
-                "llm_system_prompt": ai_res.get("system_prompt") if ai_res else None,
+                "llm_model": ai_res.get("model") if ai_res else existing_provider_status.get("llm_model", "gpt-4.1-mini"),
+                "llm_endpoint": ai_res.get("endpoint") if ai_res else existing_provider_status.get("llm_endpoint"),
+                "llm_account": ai_res.get("account_name") if ai_res else existing_provider_status.get("llm_account"),
+                "llm_api_key_ref": ai_res.get("api_key_ref") if ai_res else (
+                    (kv_res.get("llm_api_key", {}) if kv_res else {}).get("secret_name")
+                    or existing_provider_status.get("llm_api_key_ref")
+                ),
+                "llm_api_key_stored": ai_res.get("api_key_stored", False) if ai_res else existing_provider_status.get("llm_api_key_stored", False),
+                "llm_system_prompt": ai_res.get("system_prompt") if ai_res else existing_provider_status.get("llm_system_prompt"),
                 "llm_error": get_step_message("azure_openai_gpt4o_mini") if get_step_status("azure_openai_gpt4o_mini") == "failed" else None,
-                "stt_status": stt_res.get("stt_status", "pending_credentials") if stt_res else "pending_credentials",
-                "stt_provider": stt_res.get("stt_provider") if stt_res else "soniox",
-                "stt_model": stt_res.get("stt_model") if stt_res else settings.SONIOX_STT_MODEL,
-                "stt_endpoint": stt_res.get("stt_endpoint") if stt_res else settings.SONIOX_STT_WEBSOCKET_URL,
-                "stt_audio_format": stt_res.get("stt_audio_format") if stt_res else settings.SONIOX_STT_AUDIO_FORMAT,
-                "stt_transport": stt_res.get("stt_transport") if stt_res else "websocket",
-                "stt_api_key_ref": stt_res.get("stt_api_key_ref") if stt_res else None,
-                "stt_language_hints": stt_res.get("stt_language_hints") if stt_res else [],
-                "tts_status": tts_res.get("tts_status", "pending_credentials") if tts_res else "pending_credentials",
-                "tts_provider": tts_res.get("tts_provider") if tts_res else "sarvam",
-                "tts_model": tts_res.get("tts_model") if tts_res else settings.SARVAM_TTS_MODEL,
-                "tts_api_key_ref": tts_res.get("tts_api_key_ref") if tts_res else None,
-                "tts_rest_endpoint": tts_res.get("tts_rest_endpoint") if tts_res else settings.SARVAM_TTS_REST_URL,
-                "tts_stream_endpoint": tts_res.get("tts_stream_endpoint") if tts_res else settings.SARVAM_TTS_STREAM_URL,
-                "tts_target_language_code": tts_res.get("tts_target_language_code") if tts_res else (language or "en-IN"),
-                "tts_speaker": tts_res.get("tts_speaker") if tts_res else settings.SARVAM_TTS_SPEAKER,
-                "tts_sample_rate": tts_res.get("tts_sample_rate") if tts_res else settings.SARVAM_TTS_SAMPLE_RATE,
-                "tts_audio_format": tts_res.get("tts_audio_format") if tts_res else settings.SARVAM_TTS_AUDIO_FORMAT,
-                "twilio_provider": twilio_res.get("twilio_provider") if twilio_res else None,
-                "twilio_subaccount_id": twilio_res.get("subaccount_id") if twilio_res else None,
+                "stt_status": stt_res.get("stt_status", "pending_credentials") if stt_res else existing_provider_status.get("stt_status", "pending_credentials"),
+                "stt_provider": stt_res.get("stt_provider") if stt_res else existing_provider_status.get("stt_provider", "soniox"),
+                "stt_model": stt_res.get("stt_model") if stt_res else existing_provider_status.get("stt_model", settings.SONIOX_STT_MODEL),
+                "stt_endpoint": stt_res.get("stt_endpoint") if stt_res else existing_provider_status.get("stt_endpoint", settings.SONIOX_STT_WEBSOCKET_URL),
+                "stt_audio_format": stt_res.get("stt_audio_format") if stt_res else existing_provider_status.get("stt_audio_format", settings.SONIOX_STT_AUDIO_FORMAT),
+                "stt_transport": stt_res.get("stt_transport") if stt_res else existing_provider_status.get("stt_transport", "websocket"),
+                "stt_api_key_ref": stt_res.get("stt_api_key_ref") if stt_res else existing_provider_status.get("stt_api_key_ref"),
+                "stt_language_hints": stt_res.get("stt_language_hints") if stt_res else existing_provider_status.get("stt_language_hints", []),
+                "tts_status": tts_res.get("tts_status", "pending_credentials") if tts_res else existing_provider_status.get("tts_status", "pending_credentials"),
+                "tts_provider": tts_res.get("tts_provider") if tts_res else existing_provider_status.get("tts_provider", "soniox"),
+                "tts_model": tts_res.get("tts_model") if tts_res else existing_provider_status.get("tts_model", settings.SONIOX_TTS_MODEL),
+                "tts_api_key_ref": tts_res.get("tts_api_key_ref") if tts_res else existing_provider_status.get("tts_api_key_ref"),
+                "tts_rest_endpoint": tts_res.get("tts_rest_endpoint") if tts_res else existing_provider_status.get("tts_rest_endpoint", settings.SONIOX_TTS_REST_URL),
+                "tts_stream_endpoint": tts_res.get("tts_stream_endpoint") if tts_res else existing_provider_status.get("tts_stream_endpoint", settings.SONIOX_TTS_STREAM_URL),
+                "tts_target_language_code": tts_res.get("tts_target_language_code") if tts_res else existing_provider_status.get("tts_target_language_code", (language or "en-IN")),
+                "tts_voice": tts_res.get("tts_voice") if tts_res else existing_provider_status.get("tts_voice", settings.SONIOX_TTS_VOICE),
+                "tts_sample_rate": tts_res.get("tts_sample_rate") if tts_res else existing_provider_status.get("tts_sample_rate", settings.SONIOX_TTS_SAMPLE_RATE),
+                "tts_audio_format": tts_res.get("tts_audio_format") if tts_res else existing_provider_status.get("tts_audio_format", settings.SONIOX_TTS_AUDIO_FORMAT),
+                "twilio_provider": twilio_res.get("twilio_provider") if twilio_res else existing_provider_status.get("twilio_provider"),
+                "twilio_subaccount_id": twilio_res.get("subaccount_id") if twilio_res else existing_provider_status.get("twilio_subaccount_id"),
                 "twilio_subaccount_status": twilio_res.get("subaccount_status") if twilio_res else ("failed" if get_step_status("twilio_subaccount") == "failed" else "pending"),
                 "twilio_error": twilio_res.get("error") if twilio_res else get_step_message("twilio_subaccount"),
                 "crm_status": "not_connected",
@@ -235,6 +242,7 @@ class AzureTenantProvisioningService:
                 if redis_res: record.redis_namespace = redis_res
                 record.redis_host = None
                 record.redis_port = None
+                record.key_vault_name = settings.AZURE_SHARED_KEY_VAULT_NAME
                 if blob_res:
                     record.storage_account_name = blob_res.get("storage_account_name")
                     record.storage_container_name = blob_res.get("container_name")
@@ -272,6 +280,7 @@ class AzureTenantProvisioningService:
                 await db.flush()
                 record.total_cost_usd = TenantBillingService.monthly_provisioned_cost(record)
                 
+            steps[:] = [s for s in steps if s["name"] != "postgres_record"]
             steps.append({"name": "postgres_record", "status": "success", "message": "Record saved to DB."})
             await db.commit()
             
@@ -302,7 +311,7 @@ class AzureTenantProvisioningService:
                     "tts_provider": provider_status.get("tts_provider"),
                     "tts_model": provider_status.get("tts_model"),
                     "tts_status": provider_status.get("tts_status"),
-                    "tts_speaker": provider_status.get("tts_speaker"),
+                    "tts_voice": provider_status.get("tts_voice"),
                     "llm_provider": "Azure OpenAI",
                     "llm_model": provider_status.get("llm_model"),
                     "llm_endpoint": provider_status.get("llm_endpoint"),
@@ -314,8 +323,7 @@ class AzureTenantProvisioningService:
                     "Connect client database",
                     "Connect CRM",
                     "Upload knowledge documents to blob storage",
-                    "Provide Sarvam API key if TTS is pending",
-                    "Provide Soniox API key if STT is pending",
+                    "Provide Soniox API key if STT or TTS is pending",
                     "Assign or connect Twilio number"
                 ]
             }

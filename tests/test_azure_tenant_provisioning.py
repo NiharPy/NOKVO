@@ -9,6 +9,7 @@ from app.db import session as db_session
 from app.models.user import SuperAdminUser
 from app.models.session import SuperAdminSession
 from app.models.organization import Organization
+from app.models.organization_user import OrganizationUser
 from app.models.tenant_resources import TenantResources
 from app.core.security import get_password_hash, create_access_token
 from app.services.azure_ai_service import AzureAIService
@@ -113,7 +114,7 @@ MOCK_PATCHES = [
     "app.services.redis_tenant_service.RedisTenantService.provision_redis",
     "app.services.twilio_service.TwilioService.provision_subaccount",
     "app.services.soniox_stt_service.SonioxSTTService.provision_stt",
-    "app.services.sarvam_tts_service.SarvamTTSService.provision_tts",
+    "app.services.soniox_tts_service.SonioxTTSService.provision_tts",
 ]
 
 
@@ -133,7 +134,7 @@ def get_mocked_returns(tenant_id_prefix="mock"):
         f"tenant:{tenant_id_prefix}",
         {"twilio_provider": "twilio", "subaccount_id": None, "phone_number_status": "pending", "subaccount_status": "skipped"},
         {"stt_provider": "soniox", "stt_status": "provisioned", "stt_model": "stt-rt-v4", "stt_endpoint": "wss://stt-rt.soniox.com/transcribe-websocket"},
-        {"tts_provider": "sarvam", "tts_status": "provisioned", "tts_model": "bulbul:v3", "tts_speaker": "Shubh"},
+        {"tts_provider": "soniox", "tts_status": "provisioned", "tts_model": "tts-rt-v1-preview", "tts_voice": "Adrian"},
     ]
 
 
@@ -155,7 +156,7 @@ async def test_founder_can_provision(client, founder):
          patch(MOCK_PATCHES[4], new_callable=AsyncMock, return_value="tenant:x") as m_redis, \
          patch(MOCK_PATCHES[5], new_callable=AsyncMock, return_value={"phone_number_status": "pending"}) as m_twilio, \
          patch(MOCK_PATCHES[6], new_callable=AsyncMock, return_value={"stt_provider": "soniox", "stt_status": "provisioned", "stt_model": "stt-rt-v4", "stt_endpoint": "wss://stt-rt.soniox.com/transcribe-websocket"}) as m_stt, \
-         patch(MOCK_PATCHES[7], new_callable=AsyncMock, return_value={"tts_provider": "sarvam", "tts_status": "provisioned", "tts_model": "bulbul:v3", "tts_speaker": "Shubh"}) as m_tts:
+         patch(MOCK_PATCHES[7], new_callable=AsyncMock, return_value={"tts_provider": "soniox", "tts_status": "provisioned", "tts_model": "tts-rt-v1-preview", "tts_voice": "Adrian"}) as m_tts:
 
         resp = await client.post(
             "/superadmin/tenants/provision",
@@ -168,11 +169,25 @@ async def test_founder_can_provision(client, founder):
     assert data["status"] in ["success", "partial"]
     assert data["tenant_id"]
     assert data["organization_profile"]["admin_email"] == "admin@acme.com"
+    assert data["organization_profile"]["email_domain"] == "acme.com"
     assert "qdrant_url_ref" in data["resources"]
     assert data["resources"]["stt_provider"] == "soniox"
-    assert data["resources"]["tts_provider"] == "sarvam"
+    assert data["resources"]["tts_provider"] == "soniox"
     assert "steps" in data
     assert "next_steps" in data
+
+    async with db_session.AsyncSessionLocal() as db:
+        org_res = await db.execute(select(Organization).where(Organization.name == org_name))
+        org = org_res.scalars().first()
+        member_res = await db.execute(
+            select(OrganizationUser).where(
+                OrganizationUser.organization_id == org.id,
+                OrganizationUser.email == "admin@acme.com",
+            )
+        )
+        member = member_res.scalars().first()
+        assert member is not None
+        assert member.role == "admin"
 
     await cleanup_org(org_name)
 
@@ -192,11 +207,11 @@ async def test_engineering_can_provision(client, engineer):
          patch(MOCK_PATCHES[4], new_callable=AsyncMock, return_value="ns") as m5, \
          patch(MOCK_PATCHES[5], new_callable=AsyncMock, return_value={"phone_number_status": "pending"}) as m6, \
          patch(MOCK_PATCHES[6], new_callable=AsyncMock, return_value={"stt_provider": "soniox", "stt_status": "provisioned"}) as m7, \
-         patch(MOCK_PATCHES[7], new_callable=AsyncMock, return_value={"tts_provider": "sarvam", "tts_status": "provisioned"}) as m8:
+         patch(MOCK_PATCHES[7], new_callable=AsyncMock, return_value={"tts_provider": "soniox", "tts_status": "provisioned"}) as m8:
 
         resp = await client.post(
             "/superadmin/tenants/provision",
-            json={"name": org_name, "region": "centralindia", "environment": "production"},
+            json=enterprise_payload(org_name),
             headers={"Authorization": f"Bearer {token}"},
         )
 
@@ -211,7 +226,7 @@ async def test_support_role_rejected(client, support):
 
     resp = await client.post(
         "/superadmin/tenants/provision",
-        json={"name": "Should Fail Org", "region": "centralindia", "environment": "production"},
+        json=enterprise_payload("Should Fail Org"),
         headers={"Authorization": f"Bearer {token}"},
     )
 
@@ -224,7 +239,7 @@ async def test_unauthenticated_rejected(client):
     """Test that unauthenticated requests are rejected."""
     resp = await client.post(
         "/superadmin/tenants/provision",
-        json={"name": "No Auth Org", "region": "centralindia", "environment": "production"},
+        json=enterprise_payload("No Auth Org"),
     )
     assert resp.status_code == 401
 
@@ -257,16 +272,16 @@ async def test_duplicate_provisioning_returns_existing(client, founder):
          patch(MOCK_PATCHES[4], new_callable=AsyncMock, return_value="ns") as m5, \
          patch(MOCK_PATCHES[5], new_callable=AsyncMock, return_value={"phone_number_status": "pending"}) as m6, \
          patch(MOCK_PATCHES[6], new_callable=AsyncMock, return_value={"stt_provider": "soniox", "stt_status": "provisioned"}) as m7, \
-         patch(MOCK_PATCHES[7], new_callable=AsyncMock, return_value={"tts_provider": "sarvam", "tts_status": "provisioned"}) as m8:
+         patch(MOCK_PATCHES[7], new_callable=AsyncMock, return_value={"tts_provider": "soniox", "tts_status": "provisioned"}) as m8:
 
         resp1 = await client.post(
             "/superadmin/tenants/provision",
-            json={"name": org_name, "region": "centralindia", "environment": "production"},
+            json=enterprise_payload(org_name),
             headers={"Authorization": f"Bearer {token}"},
         )
         resp2 = await client.post(
             "/superadmin/tenants/provision",
-            json={"name": org_name, "region": "centralindia", "environment": "production"},
+            json=enterprise_payload(org_name),
             headers={"Authorization": f"Bearer {token}"},
         )
 
@@ -292,11 +307,11 @@ async def test_partial_failure_stored(client, founder):
          patch(MOCK_PATCHES[4], new_callable=AsyncMock, return_value="ns") as m5, \
          patch(MOCK_PATCHES[5], new_callable=AsyncMock, return_value={"phone_number_status": "pending"}) as m6, \
          patch(MOCK_PATCHES[6], new_callable=AsyncMock, return_value={"stt_provider": "soniox", "stt_status": "provisioned"}) as m7, \
-         patch(MOCK_PATCHES[7], new_callable=AsyncMock, return_value={"tts_provider": "sarvam", "tts_status": "provisioned"}) as m8:
+         patch(MOCK_PATCHES[7], new_callable=AsyncMock, return_value={"tts_provider": "soniox", "tts_status": "provisioned"}) as m8:
 
         resp = await client.post(
             "/superadmin/tenants/provision",
-            json={"name": org_name, "region": "centralindia", "environment": "production"},
+            json=enterprise_payload(org_name),
             headers={"Authorization": f"Bearer {token}"},
         )
 
@@ -324,11 +339,11 @@ async def test_secret_refs_not_exposed(client, founder):
          patch(MOCK_PATCHES[4], new_callable=AsyncMock, return_value="ns") as m5, \
          patch(MOCK_PATCHES[5], new_callable=AsyncMock, return_value={"phone_number_status": "pending"}) as m6, \
          patch(MOCK_PATCHES[6], new_callable=AsyncMock, return_value={"stt_provider": "soniox", "stt_status": "provisioned"}) as m7, \
-         patch(MOCK_PATCHES[7], new_callable=AsyncMock, return_value={"tts_provider": "sarvam", "tts_status": "provisioned"}) as m8:
+         patch(MOCK_PATCHES[7], new_callable=AsyncMock, return_value={"tts_provider": "soniox", "tts_status": "provisioned"}) as m8:
 
         resp = await client.post(
             "/superadmin/tenants/provision",
-            json={"name": org_name, "region": "centralindia", "environment": "production"},
+            json=enterprise_payload(org_name),
             headers={"Authorization": f"Bearer {token}"},
         )
 
@@ -356,11 +371,11 @@ async def test_resource_group_step_called(client, founder):
          patch(MOCK_PATCHES[4], new_callable=AsyncMock, return_value="ns") as m5, \
          patch(MOCK_PATCHES[5], new_callable=AsyncMock, return_value={"phone_number_status": "pending"}) as m6, \
          patch(MOCK_PATCHES[6], new_callable=AsyncMock, return_value={"stt_provider": "soniox", "stt_status": "provisioned"}) as m7, \
-         patch(MOCK_PATCHES[7], new_callable=AsyncMock, return_value={"tts_provider": "sarvam", "tts_status": "provisioned"}) as m8:
+         patch(MOCK_PATCHES[7], new_callable=AsyncMock, return_value={"tts_provider": "soniox", "tts_status": "provisioned"}) as m8:
 
         resp = await client.post(
             "/superadmin/tenants/provision",
-            json={"name": org_name, "region": "centralindia", "environment": "production"},
+            json=enterprise_payload(org_name),
             headers={"Authorization": f"Bearer {token}"},
         )
 
@@ -384,6 +399,7 @@ async def test_azure_ai_resource_is_pinned_to_central_india():
     with patch("app.services.azure_ai_service.settings.AZURE_SUBSCRIPTION_ID", "sub-123"), \
          patch("app.services.azure_ai_service.settings.AZURE_OPENAI_REGION", "swedencentral"), \
          patch("app.services.azure_ai_service.AzureAuth.get_credential", return_value=MagicMock()), \
+         patch("app.services.azure_ai_service.AzureKeyVaultService.set_secret_value", new_callable=AsyncMock), \
          patch("app.services.azure_ai_service.CognitiveServicesManagementClient", return_value=fake_client):
         result = await AzureAIService.provision_ai_resource(
             rg_name="rg-nokvo-test",

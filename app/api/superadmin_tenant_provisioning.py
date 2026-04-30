@@ -1,10 +1,12 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Request
 from fastapi.responses import StreamingResponse
 from app.api.deps import RequireRole
+from app.core.email_policy import extract_email_domain, normalize_email, validate_work_email
 from app.models.user import SuperAdminUser
 from app.schemas.organization import OrganizationCreate
 from app.db.session import get_db
 from app.models.organization import Organization
+from app.models.organization_user import OrganizationUser
 from app.services.azure_tenant_provisioning_service import AzureTenantProvisioningService
 from app.models.tenant_resources import TenantResources
 from app.models.tenant_usage_event import TenantUsageEvent
@@ -30,6 +32,7 @@ def _organization_profile(org: Organization) -> dict:
     return {
         "admin_email": org.admin_email,
         "admin_name": org.admin_name,
+        "email_domain": org.email_domain,
         "call_type": org.call_type,
         "language": org.language,
         "plan_type": org.plan_type,
@@ -88,6 +91,46 @@ def _usage_aggregate(events: list[TenantUsageEvent], tenant: TenantResources | N
             1 if tenant and tenant.key_vault_name else 0
         ),
     }
+
+
+async def _ensure_organization_admin_user(
+    db: AsyncSession,
+    org: Organization,
+) -> None:
+    if not org.admin_email:
+        raise HTTPException(status_code=400, detail="Organization admin email is required")
+
+    normalized_admin_email = validate_work_email(org.admin_email)
+    email_domain = extract_email_domain(normalized_admin_email)
+    org.admin_email = normalized_admin_email
+    org.email_domain = email_domain
+
+    result = await db.execute(
+        select(OrganizationUser).where(
+            OrganizationUser.organization_id == org.id,
+            OrganizationUser.email == normalized_admin_email,
+        )
+    )
+    admin_user = result.scalars().first()
+    if admin_user:
+        admin_user.role = "admin"
+        admin_user.full_name = org.admin_name or admin_user.full_name
+        if admin_user.status == "disabled":
+            admin_user.status = "invited"
+        db.add(admin_user)
+        return
+
+    db.add(
+        OrganizationUser(
+            organization_id=org.id,
+            email=normalized_admin_email,
+            full_name=org.admin_name,
+            role="admin",
+            status="invited",
+            auth_provider="google",
+            email_verified=False,
+        )
+    )
 
 
 @router.get("")
@@ -326,6 +369,8 @@ async def provision_tenant(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid region '{region}'. Allowed: {', '.join(ALLOWED_REGIONS)}"
         )
+    admin_email = validate_work_email(org_in.admin_email)
+    admin_domain = extract_email_domain(admin_email)
 
     # Create Organization record if not exists
     existing_org = await db.execute(
@@ -340,8 +385,9 @@ async def provision_tenant(
     if not org:
         org = Organization(
             name=org_in.organization_name,
-            admin_email=org_in.admin_email,
+            admin_email=admin_email,
             admin_name=org_in.admin_name,
+            email_domain=admin_domain,
             region=region,
             environment=org_in.environment,
             call_type=org_in.call_type,
@@ -357,6 +403,19 @@ async def provision_tenant(
         db.add(org)
         await db.commit()
         await db.refresh(org)
+    else:
+        if org.admin_email and normalize_email(org.admin_email) != admin_email:
+            raise HTTPException(
+                status_code=409,
+                detail="Organization already exists with a different admin work email",
+            )
+        org.admin_email = admin_email
+        org.admin_name = org_in.admin_name
+        org.email_domain = admin_domain
+        db.add(org)
+
+    await _ensure_organization_admin_user(db, org)
+    await db.commit()
 
     # Trigger Azure Tenant Provisioning
     try:
@@ -396,6 +455,8 @@ async def provision_tenant_stream(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid region '{region}'. Allowed: {', '.join(ALLOWED_REGIONS)}"
         )
+    admin_email = validate_work_email(org_in.admin_email)
+    admin_domain = extract_email_domain(admin_email)
 
     # Create Organization record if not exists
     existing_org = await db.execute(
@@ -410,8 +471,9 @@ async def provision_tenant_stream(
     if not org:
         org = Organization(
             name=org_in.organization_name,
-            admin_email=org_in.admin_email,
+            admin_email=admin_email,
             admin_name=org_in.admin_name,
+            email_domain=admin_domain,
             region=region,
             environment=org_in.environment,
             call_type=org_in.call_type,
@@ -427,6 +489,19 @@ async def provision_tenant_stream(
         db.add(org)
         await db.commit()
         await db.refresh(org)
+    else:
+        if org.admin_email and normalize_email(org.admin_email) != admin_email:
+            raise HTTPException(
+                status_code=409,
+                detail="Organization already exists with a different admin work email",
+            )
+        org.admin_email = admin_email
+        org.admin_name = org_in.admin_name
+        org.email_domain = admin_domain
+        db.add(org)
+
+    await _ensure_organization_admin_user(db, org)
+    await db.commit()
 
     # Capture org details before the generator runs (db session may close)
     org_id = org.id
@@ -540,7 +615,7 @@ async def get_provision_status(
             "tts_provider": (tenant_res.provider_status or {}).get("tts_provider"),
             "tts_model": (tenant_res.provider_status or {}).get("tts_model"),
             "tts_status": (tenant_res.provider_status or {}).get("tts_status"),
-            "tts_speaker": (tenant_res.provider_status or {}).get("tts_speaker"),
+            "tts_voice": (tenant_res.provider_status or {}).get("tts_voice"),
             "llm_provider": (tenant_res.provider_status or {}).get("llm_provider"),
             "llm_model": (tenant_res.provider_status or {}).get("llm_model"),
             "llm_status": (tenant_res.provider_status or {}).get("llm_status"),
