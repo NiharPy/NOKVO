@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 from uuid import UUID
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, EmailStr, Field, field_validator
@@ -295,3 +295,333 @@ class OrganizationCRMStatusResponse(BaseModel):
     module_count: int = 0
     action_count: int = 0
     folder_path: Optional[str] = None
+
+
+class OrganizationERPProviderResponse(BaseModel):
+    value: str
+    label: str
+    group: str
+    supported: bool
+
+
+class OrganizationERPFieldResponse(BaseModel):
+    name: str
+    label: str
+    type: str
+    required: bool = False
+
+
+class OrganizationERPModuleResponse(BaseModel):
+    api_name: str
+    label: str
+    object_type: str
+    fields: list[OrganizationERPFieldResponse]
+    record_count: int = 0
+    sample_records: list[dict[str, Any]] = Field(default_factory=list)
+    status: str = "unknown"
+    last_error: Optional[str] = None
+
+
+class OrganizationERPActionResponse(BaseModel):
+    module: str
+    name: str
+    method: str
+    endpoint: str
+    description: str
+
+
+class OrganizationERPConnectRequest(BaseModel):
+    provider: str
+    base_url: str = "http://localhost:9000"
+    company_name: Optional[str] = None
+    timeout_seconds: int = 20
+    max_items_per_module: int = 25
+
+    @field_validator("provider")
+    @classmethod
+    def validate_provider(cls, value: str) -> str:
+        value = value.strip().lower()
+        if not value:
+            raise ValueError("ERP provider is required")
+        return value
+
+    @field_validator("base_url")
+    @classmethod
+    def validate_base_url(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Tally URL is required")
+        return value
+
+    @field_validator("timeout_seconds")
+    @classmethod
+    def validate_timeout(cls, value: int) -> int:
+        return max(3, min(value, 60))
+
+    @field_validator("max_items_per_module")
+    @classmethod
+    def validate_max_items(cls, value: int) -> int:
+        return max(1, min(value, 100))
+
+
+class OrganizationERPConnectResponse(BaseModel):
+    provider: str
+    account_name: str
+    status: str
+    secret_ref: str
+    folder_path: str
+    indexed_points: int
+    module_count: int
+    action_count: int
+    modules: list[OrganizationERPModuleResponse]
+    actions: list[OrganizationERPActionResponse]
+
+
+class OrganizationERPStatusResponse(BaseModel):
+    provider: Optional[str] = None
+    status: str
+    secret_ref: Optional[str] = None
+    account_name: Optional[str] = None
+    indexed_points: int = 0
+    module_count: int = 0
+    action_count: int = 0
+    folder_path: Optional[str] = None
+    last_error: Optional[str] = None
+
+
+class OrganizationTallyXMLRequest(BaseModel):
+    xml_payload: str
+
+    @field_validator("xml_payload")
+    @classmethod
+    def validate_xml_payload(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("XML payload is required")
+        if "<ENVELOPE" not in value.upper():
+            raise ValueError("Tally XML payload must include an ENVELOPE")
+        return value
+
+
+class OrganizationTallyXMLResponse(BaseModel):
+    response_xml: str
+
+
+TOOLKIT_INTEGRATION_TYPES = {"database", "crm", "zoho_desk", "erp", "shipping"}
+
+
+class OrganizationToolkitGenerateRequest(BaseModel):
+    integration_type: str
+    provider: str
+    nlp_prompt: str
+    system_prompt: Optional[str] = None
+
+    @field_validator("integration_type")
+    @classmethod
+    def validate_integration_type(cls, value: str) -> str:
+        value = value.strip().lower()
+        if value not in TOOLKIT_INTEGRATION_TYPES:
+            raise ValueError(f"Integration type must be one of: {', '.join(sorted(TOOLKIT_INTEGRATION_TYPES))}")
+        return value
+
+    @field_validator("provider", "nlp_prompt")
+    @classmethod
+    def validate_required_text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("This field is required")
+        return value
+
+
+class OrganizationToolkitDraftResponse(BaseModel):
+    id: str
+    status: str
+    integration_type: str
+    provider: str
+    nlp_prompt: str
+    tool: dict[str, Any]
+    context_summary: dict[str, Any] = Field(default_factory=dict)
+    created_at: str
+    reviewed_at: Optional[str] = None
+    reviewed_by: Optional[str] = None
+    review_notes: Optional[str] = None
+
+
+class OrganizationToolkitReviewRequest(BaseModel):
+    notes: Optional[str] = None
+
+
+class OrganizationToolkitRegistryResponse(BaseModel):
+    integration_type: str
+    provider: str
+    tools: list[dict[str, Any]] = Field(default_factory=list)
+    drafts: list[OrganizationToolkitDraftResponse] = Field(default_factory=list)
+
+
+class OrganizationShippingProviderResponse(BaseModel):
+    value: str
+    label: str
+    group: str
+    supported: bool
+
+
+class OrganizationShippingModuleResponse(BaseModel):
+    api_name: str
+    label: str
+    fields: list[str]
+    description: str
+
+
+class OrganizationShippingActionResponse(BaseModel):
+    module: str
+    name: str
+    method: str
+    endpoint: str
+    description: str
+
+
+class OrganizationShippingConnectRequest(BaseModel):
+    provider: str
+    email: EmailStr
+    password: str
+    base_url: str = "https://apiv2.shiprocket.in/v1/external"
+
+    @field_validator("provider")
+    @classmethod
+    def validate_provider(cls, value: str) -> str:
+        value = value.strip().lower()
+        if not value:
+            raise ValueError("Shipping provider is required")
+        return value
+
+    @field_validator("password")
+    @classmethod
+    def validate_password(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Shiprocket API password is required")
+        return value
+
+    @field_validator("base_url")
+    @classmethod
+    def validate_base_url(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Shiprocket API base URL is required")
+        return value
+
+
+class OrganizationShippingConnectResponse(BaseModel):
+    provider: str
+    account_name: str
+    status: str
+    secret_ref: str
+    folder_path: str
+    indexed_points: int
+    module_count: int
+    action_count: int
+    modules: list[OrganizationShippingModuleResponse]
+    actions: list[OrganizationShippingActionResponse]
+
+
+class OrganizationShippingStatusResponse(BaseModel):
+    provider: Optional[str] = None
+    status: str
+    secret_ref: Optional[str] = None
+    account_name: Optional[str] = None
+    indexed_points: int = 0
+    module_count: int = 0
+    action_count: int = 0
+    folder_path: Optional[str] = None
+    last_error: Optional[str] = None
+
+
+class OrganizationShiprocketServiceabilityRequest(BaseModel):
+    pickup_postcode: int
+    delivery_postcode: int
+    weight: Optional[float] = None
+    cod: Optional[int] = None
+    order_id: Optional[str] = None
+
+
+class OrganizationShiprocketCreateOrderRequest(BaseModel):
+    payload: dict[str, Any]
+
+
+class OrganizationShiprocketAssignAWBRequest(BaseModel):
+    shipment_id: int
+    courier_id: Optional[int] = None
+    status: Optional[str] = None
+
+
+class OrganizationShiprocketPickupRequest(BaseModel):
+    shipment_id: list[int] | int
+
+
+class OrganizationShiprocketTrackRequest(BaseModel):
+    order_id: Optional[str] = None
+    awb_code: Optional[str] = None
+
+
+class OrganizationShiprocketAPIResponse(BaseModel):
+    raw: dict[str, Any] = Field(default_factory=dict)
+
+
+class OrganizationZohoDeskConnectResponse(BaseModel):
+    status: str
+    account_name: str
+    org_id: Optional[str] = None
+    indexed_points: int
+    module_count: int
+    action_count: int
+    folder_path: str
+
+
+class OrganizationZohoDeskStatusResponse(BaseModel):
+    status: str
+    account_name: Optional[str] = None
+    org_id: Optional[str] = None
+    indexed_points: int = 0
+    module_count: int = 0
+    action_count: int = 0
+    folder_path: Optional[str] = None
+
+
+class OrganizationZohoDeskTicketCreateRequest(BaseModel):
+    subject: str
+    department_id: str
+    description: Optional[str] = None
+    contact_id: Optional[str] = None
+    email: Optional[EmailStr] = None
+    phone: Optional[str] = None
+    status: Optional[str] = None
+    priority: Optional[str] = None
+    custom_fields: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("subject", "department_id")
+    @classmethod
+    def validate_required_strings(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("This field is required")
+        return value
+
+
+class OrganizationZohoDeskTicketUpdateRequest(BaseModel):
+    subject: Optional[str] = None
+    description: Optional[str] = None
+    contact_id: Optional[str] = None
+    email: Optional[EmailStr] = None
+    phone: Optional[str] = None
+    status: Optional[str] = None
+    priority: Optional[str] = None
+    custom_fields: dict[str, Any] = Field(default_factory=dict)
+
+
+class OrganizationZohoDeskTicketResponse(BaseModel):
+    id: str
+    status: Optional[str] = None
+    subject: Optional[str] = None
+    department_id: Optional[str] = None
+    web_url: Optional[str] = None
+    raw: dict[str, Any] = Field(default_factory=dict)

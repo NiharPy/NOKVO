@@ -13,8 +13,10 @@ import {
   Settings2,
   Shield,
   SunMedium,
+  Ticket,
   UserPlus,
   Users,
+  Wrench,
 } from 'lucide-vue-next';
 import QrcodeVue from 'qrcode.vue';
 
@@ -22,6 +24,7 @@ const API_BASE_URL = 'http://localhost:8000/api';
 const ORG_ACCESS_TOKEN_KEY = 'org_access_token';
 const ORG_REFRESH_TOKEN_KEY = 'org_refresh_token';
 const ORG_THEME_MODE_KEY = 'org_theme_mode';
+const TOOLKIT_REGISTRY_PREVIEW_LIMIT = 4;
 
 const authConfig = ref(null);
 const orgShellRef = ref(null);
@@ -45,8 +48,25 @@ const databaseProviders = ref([]);
 const databaseStatus = ref({ status: 'not_connected', provider: null, selected_sources: [], indexed_points: 0 });
 const crmProviders = ref([]);
 const crmStatus = ref({ status: 'not_connected', provider: null, indexed_points: 0, module_count: 0, action_count: 0 });
+const erpProviders = ref([]);
+const erpStatus = ref({ status: 'not_connected', provider: null, indexed_points: 0, module_count: 0, action_count: 0 });
+const shippingProviders = ref([]);
+const shippingStatus = ref({ status: 'not_connected', provider: null, indexed_points: 0, module_count: 0, action_count: 0 });
+const toolkitDraft = ref(null);
+const toolkitRegistry = ref({ tools: [], drafts: [] });
+const zohoDeskStatus = ref({
+  status: 'not_connected',
+  account_name: null,
+  org_id: null,
+  indexed_points: 0,
+  module_count: 0,
+  action_count: 0,
+  folder_path: null,
+});
 const databaseModalOpen = ref(false);
 const crmModalOpen = ref(false);
+const erpModalOpen = ref(false);
+const shippingModalOpen = ref(false);
 const databaseForm = ref({
   provider: 'postgresql',
   connection_string: '',
@@ -59,10 +79,33 @@ const crmForm = ref({
   access_token: '',
   refresh_token: '',
 });
+const erpForm = ref({
+  provider: 'tally',
+  base_url: 'http://localhost:9000',
+  company_name: '',
+  timeout_seconds: 20,
+  max_items_per_module: 25,
+});
+const shippingForm = ref({
+  provider: 'shiprocket',
+  email: '',
+  password: '',
+  base_url: 'https://apiv2.shiprocket.in/v1/external',
+});
+const toolkitForm = ref({
+  integration_type: 'shipping',
+  provider: 'shiprocket',
+  nlp_prompt: '',
+  system_prompt: '',
+});
 const databaseSchema = ref([]);
 const isScanningDatabase = ref(false);
 const isIndexingDatabase = ref(false);
 const isConnectingCrm = ref(false);
+const isConnectingErp = ref(false);
+const isConnectingShipping = ref(false);
+const isGeneratingToolkit = ref(false);
+const isReviewingToolkit = ref(false);
 const isLoadingMembers = ref(false);
 const isSavingMember = ref(false);
 const updatingMemberId = ref(null);
@@ -70,6 +113,7 @@ const dashboardQuery = ref('');
 const showInvitedOnly = ref(false);
 const memberSortMode = ref('name');
 const themeMode = ref('light');
+const currentPage = ref('dashboard');
 const inviteForm = ref({
   email: '',
   full_name: '',
@@ -123,12 +167,100 @@ const organizationUsageWidth = computed(() => `${Math.round(organizationUsageRat
 const memberFilterLabel = computed(() => (showInvitedOnly.value ? 'Invited only' : 'All members'));
 const memberSortLabel = computed(() => (memberSortMode.value === 'name' ? 'Sort: Name' : 'Sort: Role'));
 const themeToggleLabel = computed(() => (themeMode.value === 'dark' ? 'Light mode' : 'Dark mode'));
+const dashboardSearchPlaceholder = computed(() =>
+  currentPage.value === 'tickets'
+    ? 'Search tickets, Desk status, namespace...'
+    : currentPage.value === 'toolkit'
+      ? 'Search tools, integrations, registry...'
+      : 'Search members, roles, statuses...',
+);
 const crmProviderLabel = computed(() => {
   const match = crmProviders.value.find((provider) => provider.value === crmStatus.value.provider);
   return match?.label || crmStatus.value.provider || 'Not connected';
 });
+const erpProviderLabel = computed(() => {
+  const match = erpProviders.value.find((provider) => provider.value === erpStatus.value.provider);
+  return match?.label || erpStatus.value.provider || 'Not connected';
+});
+const shippingProviderLabel = computed(() => {
+  const match = shippingProviders.value.find((provider) => provider.value === shippingStatus.value.provider);
+  return match?.label || shippingStatus.value.provider || 'Not connected';
+});
+const zohoDeskStatusLabel = computed(() => {
+  if (zohoDeskStatus.value.status === 'indexed') {
+    return 'Indexed';
+  }
+  if (zohoDeskStatus.value.status === 'not_connected') {
+    return 'Not connected';
+  }
+  return zohoDeskStatus.value.status || 'Unknown';
+});
 const activeCrmProvider = computed(() => crmForm.value.provider);
 const isZohoCrmProvider = computed(() => activeCrmProvider.value === 'zoho');
+const connectedToolkitIntegrations = computed(() => {
+  const options = [];
+  if (['schema_scanned', 'indexed'].includes(databaseStatus.value.status) && databaseStatus.value.provider) {
+    options.push({
+      value: `database:${databaseStatus.value.provider}`,
+      integration_type: 'database',
+      provider: databaseStatus.value.provider,
+      label: `Database - ${databaseStatus.value.provider}`,
+      detail: databaseStatus.value.database_name || `${databaseStatus.value.selected_sources?.length || 0} sources`,
+    });
+  }
+  if (crmStatus.value.status === 'indexed' && crmStatus.value.provider) {
+    options.push({
+      value: `crm:${crmStatus.value.provider}`,
+      integration_type: 'crm',
+      provider: crmStatus.value.provider,
+      label: `CRM - ${crmProviderLabel.value}`,
+      detail: crmStatus.value.account_name || `${crmStatus.value.module_count || 0} modules`,
+    });
+  }
+  if (zohoDeskStatus.value.status === 'indexed') {
+    options.push({
+      value: 'zoho_desk:zoho',
+      integration_type: 'zoho_desk',
+      provider: 'zoho',
+      label: 'Zoho Desk',
+      detail: zohoDeskStatus.value.account_name || `${zohoDeskStatus.value.action_count || 0} actions`,
+    });
+  }
+  if (erpStatus.value.status === 'indexed' && erpStatus.value.provider) {
+    options.push({
+      value: `erp:${erpStatus.value.provider}`,
+      integration_type: 'erp',
+      provider: erpStatus.value.provider,
+      label: `ERP - ${erpProviderLabel.value}`,
+      detail: erpStatus.value.account_name || `${erpStatus.value.module_count || 0} modules`,
+    });
+  }
+  if (shippingStatus.value.status === 'indexed' && shippingStatus.value.provider) {
+    options.push({
+      value: `shipping:${shippingStatus.value.provider}`,
+      integration_type: 'shipping',
+      provider: shippingStatus.value.provider,
+      label: `Shipping - ${shippingProviderLabel.value}`,
+      detail: shippingStatus.value.account_name || `${shippingStatus.value.action_count || 0} actions`,
+    });
+  }
+  return options;
+});
+const selectedToolkitIntegrationValue = computed({
+  get() {
+    return `${toolkitForm.value.integration_type}:${toolkitForm.value.provider}`;
+  },
+  set(value) {
+    const option = connectedToolkitIntegrations.value.find((item) => item.value === value);
+    if (!option) {
+      return;
+    }
+    toolkitForm.value.integration_type = option.integration_type;
+    toolkitForm.value.provider = option.provider;
+    toolkitDraft.value = null;
+    fetchToolkitRegistry();
+  },
+});
 const filteredMembers = computed(() => {
   const query = dashboardQuery.value.trim().toLowerCase();
   let visibleMembers = [...members.value];
@@ -154,6 +286,49 @@ const filteredMembers = computed(() => {
 
   return visibleMembers;
 });
+const filteredToolkitTools = computed(() => {
+  const query = dashboardQuery.value.trim().toLowerCase();
+  const tools = [...(toolkitRegistry.value.tools || [])];
+  if (!query) {
+    return tools;
+  }
+  return tools.filter((tool) =>
+    [
+      tool.name,
+      tool.title,
+      tool.description,
+      tool.integration_type,
+      tool.provider,
+      tool?.mcp?.tool_name,
+    ]
+      .filter(Boolean)
+      .some((value) => String(value).toLowerCase().includes(query)),
+  );
+});
+const filteredToolkitDrafts = computed(() => {
+  const query = dashboardQuery.value.trim().toLowerCase();
+  const drafts = [...(toolkitRegistry.value.drafts || [])];
+  if (!query) {
+    return drafts;
+  }
+  return drafts.filter((draft) =>
+    [
+      draft.status,
+      draft.nlp_prompt,
+      draft.tool?.name,
+      draft.tool?.title,
+      draft.tool?.description,
+      draft.integration_type,
+      draft.provider,
+    ]
+      .filter(Boolean)
+      .some((value) => String(value).toLowerCase().includes(query)),
+  );
+});
+const visibleToolkitTools = computed(() => filteredToolkitTools.value.slice(0, TOOLKIT_REGISTRY_PREVIEW_LIMIT));
+const visibleToolkitDrafts = computed(() => filteredToolkitDrafts.value.slice(0, TOOLKIT_REGISTRY_PREVIEW_LIMIT));
+const hiddenToolkitToolCount = computed(() => Math.max(0, filteredToolkitTools.value.length - visibleToolkitTools.value.length));
+const hiddenToolkitDraftCount = computed(() => Math.max(0, filteredToolkitDrafts.value.length - visibleToolkitDrafts.value.length));
 const schemaSelectionCount = computed(() =>
   databaseSchema.value.reduce(
     (total, table) => total + table.columns.filter((column) => column.selected).length,
@@ -237,10 +412,15 @@ async function apiRequest(path, options = {}) {
     headers.set('Authorization', `Bearer ${token}`);
   }
 
-  const response = await fetch(`${API_BASE_URL}${path}`, {
-    ...options,
-    headers,
-  });
+  let response;
+  try {
+    response = await fetch(`${API_BASE_URL}${path}`, {
+      ...options,
+      headers,
+    });
+  } catch (error) {
+    throw new Error(`API server unavailable at ${API_BASE_URL}. Start the backend and try again.`);
+  }
 
   if (
     response.status === 401 &&
@@ -305,14 +485,35 @@ function clearSession() {
   databaseStatus.value = { status: 'not_connected', provider: null, selected_sources: [], indexed_points: 0 };
   crmProviders.value = [];
   crmStatus.value = { status: 'not_connected', provider: null, indexed_points: 0, module_count: 0, action_count: 0 };
+  erpProviders.value = [];
+  erpStatus.value = { status: 'not_connected', provider: null, indexed_points: 0, module_count: 0, action_count: 0 };
+  shippingProviders.value = [];
+  shippingStatus.value = { status: 'not_connected', provider: null, indexed_points: 0, module_count: 0, action_count: 0 };
+  toolkitDraft.value = null;
+  toolkitRegistry.value = { tools: [], drafts: [] };
+  zohoDeskStatus.value = {
+    status: 'not_connected',
+    account_name: null,
+    org_id: null,
+    indexed_points: 0,
+    module_count: 0,
+    action_count: 0,
+    folder_path: null,
+  };
   databaseModalOpen.value = false;
   crmModalOpen.value = false;
+  erpModalOpen.value = false;
+  shippingModalOpen.value = false;
   databaseSchema.value = [];
   databaseForm.value = { provider: 'postgresql', connection_string: '', row_limit: 50 };
   crmForm.value = { provider: 'zoho', account_url: '', api_domain: 'https://www.zohoapis.com', access_token: '', refresh_token: '' };
+  erpForm.value = { provider: 'tally', base_url: 'http://localhost:9000', company_name: '', timeout_seconds: 20, max_items_per_module: 25 };
+  shippingForm.value = { provider: 'shiprocket', email: '', password: '', base_url: 'https://apiv2.shiprocket.in/v1/external' };
+  toolkitForm.value = { integration_type: 'shipping', provider: 'shiprocket', nlp_prompt: '', system_prompt: '' };
   dashboardQuery.value = '';
   showInvitedOnly.value = false;
   memberSortMode.value = 'name';
+  currentPage.value = 'dashboard';
 }
 
 function applyTheme(mode) {
@@ -388,6 +589,11 @@ async function handleTotpVerify() {
     await fetchDatabaseStatus();
     await fetchCrmProviders();
     await fetchCrmStatus();
+    await fetchErpProviders();
+    await fetchErpStatus();
+    await fetchShippingProviders();
+    await fetchShippingStatus();
+    await fetchZohoDeskStatus();
   } catch (error) {
     errorMsg.value = error.message;
     infoMsg.value = '';
@@ -443,6 +649,30 @@ async function fetchCrmProviders() {
   }
 }
 
+async function fetchErpProviders() {
+  if (!canManageDatabase.value) {
+    erpProviders.value = [];
+    return;
+  }
+  try {
+    erpProviders.value = await apiRequest('/org-auth/erp/providers');
+  } catch (error) {
+    errorMsg.value = error.message;
+  }
+}
+
+async function fetchShippingProviders() {
+  if (!canManageDatabase.value) {
+    shippingProviders.value = [];
+    return;
+  }
+  try {
+    shippingProviders.value = await apiRequest('/org-auth/shipping/providers');
+  } catch (error) {
+    errorMsg.value = error.message;
+  }
+}
+
 async function fetchDatabaseStatus() {
   if (!canManageDatabase.value) {
     databaseStatus.value = { status: 'not_connected', provider: null, selected_sources: [], indexed_points: 0 };
@@ -462,6 +692,50 @@ async function fetchCrmStatus() {
   }
   try {
     crmStatus.value = await apiRequest('/org-auth/crm/status');
+  } catch (error) {
+    errorMsg.value = error.message;
+  }
+}
+
+async function fetchErpStatus() {
+  if (!canManageDatabase.value) {
+    erpStatus.value = { status: 'not_connected', provider: null, indexed_points: 0, module_count: 0, action_count: 0 };
+    return;
+  }
+  try {
+    erpStatus.value = await apiRequest('/org-auth/erp/status');
+  } catch (error) {
+    errorMsg.value = error.message;
+  }
+}
+
+async function fetchShippingStatus() {
+  if (!canManageDatabase.value) {
+    shippingStatus.value = { status: 'not_connected', provider: null, indexed_points: 0, module_count: 0, action_count: 0 };
+    return;
+  }
+  try {
+    shippingStatus.value = await apiRequest('/org-auth/shipping/status');
+  } catch (error) {
+    errorMsg.value = error.message;
+  }
+}
+
+async function fetchZohoDeskStatus() {
+  if (!canManageDatabase.value) {
+    zohoDeskStatus.value = {
+      status: 'not_connected',
+      account_name: null,
+      org_id: null,
+      indexed_points: 0,
+      module_count: 0,
+      action_count: 0,
+      folder_path: null,
+    };
+    return;
+  }
+  try {
+    zohoDeskStatus.value = await apiRequest('/org-auth/crm/zoho-desk/status');
   } catch (error) {
     errorMsg.value = error.message;
   }
@@ -491,6 +765,70 @@ function openCrmModal() {
 
 function closeCrmModal() {
   crmModalOpen.value = false;
+}
+
+function openErpModal() {
+  if (!canManageDatabase.value) {
+    return;
+  }
+  erpModalOpen.value = true;
+  errorMsg.value = '';
+  infoMsg.value = '';
+}
+
+function closeErpModal() {
+  erpModalOpen.value = false;
+}
+
+function openShippingModal() {
+  if (!canManageDatabase.value) {
+    return;
+  }
+  shippingModalOpen.value = true;
+  errorMsg.value = '';
+  infoMsg.value = '';
+}
+
+function closeShippingModal() {
+  shippingModalOpen.value = false;
+}
+
+function ensureToolkitIntegrationSelection() {
+  if (!canManageDatabase.value) {
+    return false;
+  }
+  const options = connectedToolkitIntegrations.value;
+  if (!options.length) {
+    toolkitRegistry.value = { tools: [], drafts: [] };
+    toolkitDraft.value = null;
+    return false;
+  }
+  const current = selectedToolkitIntegrationValue.value;
+  const hasCurrent = options.some((option) => option.value === current);
+  if (!hasCurrent) {
+    const firstOption = options[0];
+    toolkitForm.value.integration_type = firstOption.integration_type;
+    toolkitForm.value.provider = firstOption.provider;
+    toolkitDraft.value = null;
+  }
+  return true;
+}
+
+function switchPage(page) {
+  currentPage.value = page;
+  if (page !== 'dashboard') {
+    dashboardQuery.value = '';
+  }
+  if (page === 'toolkit') {
+    if (ensureToolkitIntegrationSelection()) {
+      fetchToolkitRegistry();
+    }
+  }
+}
+
+function openZohoCrmModal() {
+  crmForm.value.provider = 'zoho';
+  openCrmModal();
 }
 
 function toggleMemberFilter() {
@@ -585,6 +923,151 @@ async function connectCrmIntegration() {
     errorMsg.value = error.message;
   } finally {
     isConnectingCrm.value = false;
+  }
+}
+
+async function connectErpIntegration() {
+  if (!erpForm.value.base_url) {
+    errorMsg.value = 'Tally URL is required.';
+    return;
+  }
+
+  isConnectingErp.value = true;
+  errorMsg.value = '';
+  infoMsg.value = '';
+  try {
+    const payload = await apiRequest('/org-auth/erp/connect', {
+      method: 'POST',
+      body: JSON.stringify({
+        provider: erpForm.value.provider,
+        base_url: erpForm.value.base_url,
+        company_name: erpForm.value.company_name || null,
+        timeout_seconds: erpForm.value.timeout_seconds,
+        max_items_per_module: erpForm.value.max_items_per_module,
+      }),
+    });
+    erpStatus.value = {
+      ...erpStatus.value,
+      provider: payload.provider,
+      status: payload.status,
+      account_name: payload.account_name,
+      indexed_points: payload.indexed_points,
+      module_count: payload.module_count,
+      action_count: payload.action_count,
+      folder_path: payload.folder_path,
+      secret_ref: payload.secret_ref,
+      last_error: null,
+    };
+    infoMsg.value = `ERP schema indexed for ${payload.account_name}.`;
+    await fetchErpStatus();
+    closeErpModal();
+  } catch (error) {
+    errorMsg.value = error.message;
+  } finally {
+    isConnectingErp.value = false;
+  }
+}
+
+async function connectShippingIntegration() {
+  if (!shippingForm.value.email || !shippingForm.value.password) {
+    errorMsg.value = 'Shiprocket API email and password are required.';
+    return;
+  }
+
+  isConnectingShipping.value = true;
+  errorMsg.value = '';
+  infoMsg.value = '';
+  try {
+    const payload = await apiRequest('/org-auth/shipping/connect', {
+      method: 'POST',
+      body: JSON.stringify(shippingForm.value),
+    });
+    shippingStatus.value = {
+      ...shippingStatus.value,
+      provider: payload.provider,
+      status: payload.status,
+      account_name: payload.account_name,
+      indexed_points: payload.indexed_points,
+      module_count: payload.module_count,
+      action_count: payload.action_count,
+      folder_path: payload.folder_path,
+      secret_ref: payload.secret_ref,
+      last_error: null,
+    };
+    infoMsg.value = `Shipping integration indexed for ${payload.account_name}.`;
+    await fetchShippingStatus();
+    closeShippingModal();
+  } catch (error) {
+    errorMsg.value = error.message;
+  } finally {
+    isConnectingShipping.value = false;
+  }
+}
+
+async function fetchToolkitRegistry() {
+  if (!ensureToolkitIntegrationSelection() || !toolkitForm.value.integration_type || !toolkitForm.value.provider) {
+    return;
+  }
+  try {
+    const query = new URLSearchParams({
+      integration_type: toolkitForm.value.integration_type,
+      provider: toolkitForm.value.provider,
+    });
+    toolkitRegistry.value = await apiRequest(`/org-auth/toolkit/registry?${query.toString()}`);
+  } catch (error) {
+    errorMsg.value = error.message;
+  }
+}
+
+async function generateToolkitDraft() {
+  if (!ensureToolkitIntegrationSelection()) {
+    errorMsg.value = 'Connect an integration before generating a toolkit draft.';
+    return;
+  }
+  if (!toolkitForm.value.nlp_prompt) {
+    errorMsg.value = 'Describe the tool you want to generate.';
+    return;
+  }
+  isGeneratingToolkit.value = true;
+  errorMsg.value = '';
+  infoMsg.value = '';
+  try {
+    toolkitDraft.value = await apiRequest('/org-auth/toolkit/generate', {
+      method: 'POST',
+      body: JSON.stringify({
+        integration_type: toolkitForm.value.integration_type,
+        provider: toolkitForm.value.provider,
+        nlp_prompt: toolkitForm.value.nlp_prompt,
+        system_prompt: toolkitForm.value.system_prompt || null,
+      }),
+    });
+    infoMsg.value = 'Toolkit draft generated. Review it before approval.';
+    await fetchToolkitRegistry();
+  } catch (error) {
+    errorMsg.value = error.message;
+  } finally {
+    isGeneratingToolkit.value = false;
+  }
+}
+
+async function reviewToolkitDraft(action) {
+  if (!toolkitDraft.value?.id) {
+    return;
+  }
+  isReviewingToolkit.value = true;
+  errorMsg.value = '';
+  infoMsg.value = '';
+  try {
+    toolkitDraft.value = await apiRequest(`/org-auth/toolkit/drafts/${toolkitDraft.value.id}/${action}`, {
+      method: 'POST',
+      body: JSON.stringify({ notes: action === 'approve' ? 'Approved from organization portal.' : 'Rejected from organization portal.' }),
+    });
+    infoMsg.value = action === 'approve' ? 'Tool added to MCP registry.' : 'Toolkit draft rejected.';
+    await fetchToolkitRegistry();
+  } catch (error) {
+    errorMsg.value = error.message;
+  } finally {
+    isReviewingToolkit.value = false;
   }
 }
 
@@ -745,6 +1228,11 @@ async function bootstrapOrganizationSession() {
     await fetchDatabaseStatus();
     await fetchCrmProviders();
     await fetchCrmStatus();
+    await fetchErpProviders();
+    await fetchErpStatus();
+    await fetchShippingProviders();
+    await fetchShippingStatus();
+    await fetchZohoDeskStatus();
   } catch (_) {
     clearSession();
     authState.value = 'login';
@@ -1002,11 +1490,38 @@ onBeforeUnmount(() => {
             <input
               v-model="dashboardQuery"
               type="text"
-              placeholder="Search members, roles, statuses..."
+              :placeholder="dashboardSearchPlaceholder"
             />
           </div>
 
           <div class="dashboard-nav-actions">
+            <button
+              type="button"
+              class="nav-page-button"
+              :class="{ active: currentPage === 'dashboard' }"
+              @click="switchPage('dashboard')"
+            >
+              <Database :size="17" />
+              <span>Dashboard</span>
+            </button>
+            <button
+              type="button"
+              class="nav-page-button"
+              :class="{ active: currentPage === 'tickets' }"
+              @click="switchPage('tickets')"
+            >
+              <Ticket :size="17" />
+              <span>Tickets</span>
+            </button>
+            <button
+              type="button"
+              class="nav-page-button"
+              :class="{ active: currentPage === 'toolkit' }"
+              @click="switchPage('toolkit')"
+            >
+              <Wrench :size="17" />
+              <span>Toolkit</span>
+            </button>
             <button type="button" class="nav-icon-button" @click="toggleMemberFilter">
               <Filter :size="18" />
             </button>
@@ -1031,7 +1546,7 @@ onBeforeUnmount(() => {
         </nav>
       </div>
 
-      <section class="dashboard-header">
+      <section v-if="currentPage === 'dashboard'" class="dashboard-header">
         <div>
           <h2>Dashboard</h2>
           <p>Manage workspace access, database ingestion, and organization health from one place.</p>
@@ -1055,14 +1570,36 @@ onBeforeUnmount(() => {
             <Plus :size="16" />
             Connect CRM
           </button>
-          <button type="button" class="dashboard-secondary-button" @click="handleLogout">
+          <button
+            v-if="canManageDatabase"
+            type="button"
+            class="dashboard-secondary-button"
+            @click="openErpModal"
+          >
+            <Plus :size="16" />
+            Connect ERP
+          </button>
+          <button
+            v-if="canManageDatabase"
+            type="button"
+            class="dashboard-secondary-button"
+            @click="openShippingModal"
+          >
+            <Plus :size="16" />
+            Connect Shipping
+          </button>
+          <button
+            type="button"
+            class="dashboard-secondary-button"
+            @click="handleLogout"
+          >
             <LogOut :size="16" />
             Log Out
           </button>
         </div>
       </section>
 
-      <section class="dashboard-summary-bar">
+      <section v-if="currentPage === 'dashboard'" class="dashboard-summary-bar">
         <div class="summary-pill-group">
           <div class="summary-pill">
             <span>Domain</span>
@@ -1075,6 +1612,14 @@ onBeforeUnmount(() => {
           <div class="summary-pill">
             <span>Database</span>
             <strong>{{ databaseStatus.provider || 'Pending' }}</strong>
+          </div>
+          <div class="summary-pill">
+            <span>ERP</span>
+            <strong>{{ erpStatus.provider || 'Pending' }}</strong>
+          </div>
+          <div class="summary-pill">
+            <span>Shipping</span>
+            <strong>{{ shippingStatus.provider || 'Pending' }}</strong>
           </div>
           <div class="summary-pill">
             <span>Role</span>
@@ -1096,7 +1641,7 @@ onBeforeUnmount(() => {
       <div v-if="errorMsg" class="message error dashboard-message">{{ errorMsg }}</div>
       <div v-else-if="infoMsg" class="message info dashboard-message">{{ infoMsg }}</div>
 
-      <section class="dashboard-section">
+      <section v-if="currentPage === 'dashboard'" class="dashboard-section">
         <div class="dashboard-section-head">
           <div>
             <span class="section-kicker">Overview</span>
@@ -1194,7 +1739,7 @@ onBeforeUnmount(() => {
           </button>
         </article>
 
-        <article class="dashboard-card compact-card">
+        <article class="dashboard-card compact-card access-card">
           <div class="compact-card-head">
             <div class="compact-icon-shell">
               <Shield :size="18" />
@@ -1230,6 +1775,48 @@ onBeforeUnmount(() => {
               <Globe2 :size="18" />
             </div>
             <div>
+              <h3>ERP Sync</h3>
+              <p>{{ erpProviderLabel }}</p>
+            </div>
+          </div>
+          <dl class="dashboard-detail-list">
+            <div>
+              <dt>Status</dt>
+              <dd>{{ erpStatus.status || 'not_connected' }}</dd>
+            </div>
+            <div>
+              <dt>Modules</dt>
+              <dd>{{ erpStatus.module_count || 0 }}</dd>
+            </div>
+            <div>
+              <dt>Actions</dt>
+              <dd>{{ erpStatus.action_count || 0 }}</dd>
+            </div>
+            <div>
+              <dt>Indexed Points</dt>
+              <dd>{{ erpStatus.indexed_points || 0 }}</dd>
+            </div>
+          </dl>
+          <div class="crm-sync-emphasis">
+            <span>Namespace</span>
+            <strong>{{ erpStatus.folder_path || 'integrations/erp/pending' }}</strong>
+          </div>
+          <button
+            v-if="canManageDatabase"
+            type="button"
+            class="dashboard-inline-button"
+            @click="openErpModal"
+          >
+            Connect Tally
+          </button>
+        </article>
+
+        <article class="dashboard-card compact-card crm-sync-card">
+          <div class="compact-card-head">
+            <div class="compact-icon-shell">
+              <Globe2 :size="18" />
+            </div>
+            <div>
               <h3>CRM Sync</h3>
               <p>{{ crmProviderLabel }}</p>
             </div>
@@ -1252,20 +1839,66 @@ onBeforeUnmount(() => {
               <dd>{{ crmStatus.indexed_points || 0 }}</dd>
             </div>
           </dl>
+          <div class="crm-sync-emphasis">
+            <span>Namespace</span>
+            <strong>{{ crmStatus.folder_path || 'integrations/crm/pending' }}</strong>
+          </div>
           <button
             v-if="canManageDatabase"
             type="button"
             class="dashboard-inline-button"
             @click="openCrmModal"
           >
-            Connect CRM
+              Connect CRM
+          </button>
+        </article>
+
+        <article class="dashboard-card compact-card">
+          <div class="compact-card-head">
+            <div class="compact-icon-shell">
+              <Globe2 :size="18" />
+            </div>
+            <div>
+              <h3>Shipping Sync</h3>
+              <p>{{ shippingProviderLabel }}</p>
+            </div>
+          </div>
+          <dl class="dashboard-detail-list">
+            <div>
+              <dt>Status</dt>
+              <dd>{{ shippingStatus.status || 'not_connected' }}</dd>
+            </div>
+            <div>
+              <dt>Modules</dt>
+              <dd>{{ shippingStatus.module_count || 0 }}</dd>
+            </div>
+            <div>
+              <dt>Actions</dt>
+              <dd>{{ shippingStatus.action_count || 0 }}</dd>
+            </div>
+            <div>
+              <dt>Indexed Points</dt>
+              <dd>{{ shippingStatus.indexed_points || 0 }}</dd>
+            </div>
+          </dl>
+          <div class="crm-sync-emphasis">
+            <span>Namespace</span>
+            <strong>{{ shippingStatus.folder_path || 'integrations/shipping/pending' }}</strong>
+          </div>
+          <button
+            v-if="canManageDatabase"
+            type="button"
+            class="dashboard-inline-button"
+            @click="openShippingModal"
+          >
+            Connect Shiprocket
           </button>
         </article>
 
         </div>
       </section>
 
-      <section class="dashboard-section">
+      <section v-if="currentPage === 'dashboard'" class="dashboard-section">
         <div class="dashboard-section-head">
           <div>
             <span class="section-kicker">Operations</span>
@@ -1402,6 +2035,212 @@ onBeforeUnmount(() => {
         </article>
         </div>
       </section>
+
+      <section v-if="currentPage === 'tickets'" class="dashboard-section tickets-page">
+        <div class="dashboard-section-head">
+          <div>
+            <span class="section-kicker">Zoho Desk</span>
+            <h3>Tickets</h3>
+          </div>
+          <p>Ticket operations use the Zoho OAuth grant created when CRM is connected.</p>
+        </div>
+
+        <div class="dashboard-grid tickets-grid">
+          <article class="dashboard-card ticket-console-card">
+            <div class="compact-card-head">
+              <div class="compact-icon-shell">
+                <Ticket :size="18" />
+              </div>
+              <div>
+                <h3>Desk Ticket Console</h3>
+                <p>{{ crmStatus.provider === 'zoho' ? 'Zoho OAuth grant available' : 'Connect Zoho CRM to enable Desk tickets' }}</p>
+              </div>
+            </div>
+
+            <dl class="dashboard-detail-list">
+              <div>
+                <dt>Desk Status</dt>
+                <dd>{{ zohoDeskStatusLabel }}</dd>
+              </div>
+              <div>
+                <dt>Account</dt>
+                <dd>{{ zohoDeskStatus.account_name || crmStatus.account_name || 'Not connected' }}</dd>
+              </div>
+              <div>
+                <dt>Indexed Actions</dt>
+                <dd>{{ zohoDeskStatus.action_count || 0 }}</dd>
+              </div>
+              <div>
+                <dt>Namespace</dt>
+                <dd>{{ zohoDeskStatus.folder_path || 'integrations/zoho-desk' }}</dd>
+              </div>
+            </dl>
+
+            <div class="ticket-page-note">
+              <strong>{{ crmStatus.provider === 'zoho' ? 'Ready for ticket workflows' : 'Zoho CRM required' }}</strong>
+              <p>
+                {{ crmStatus.provider === 'zoho'
+                  ? 'Create and update ticket actions are available through the Zoho Desk API using the connected CRM OAuth grant.'
+                  : 'Use Connect CRM on the dashboard to authorize Zoho once, then return here for ticket workflows.' }}
+              </p>
+            </div>
+
+            <button
+              v-if="crmStatus.provider !== 'zoho' && canManageDatabase"
+              type="button"
+              class="dashboard-inline-button"
+              @click="openZohoCrmModal"
+            >
+              Connect Zoho CRM
+            </button>
+          </article>
+        </div>
+      </section>
+
+      <section v-if="currentPage === 'toolkit'" class="dashboard-section toolkit-page">
+        <div class="dashboard-section-head">
+          <div>
+            <span class="section-kicker">MCP Registry</span>
+            <h3>Toolkit Generator</h3>
+          </div>
+          <p>Generate draft MCP tools from indexed integration context, review the JSON, and register approved tools for the selected integration.</p>
+        </div>
+
+        <div v-if="canManageDatabase && connectedToolkitIntegrations.length" class="dashboard-grid toolkit-page-grid">
+          <article class="dashboard-card toolkit-builder-card">
+            <div class="compact-card-head">
+              <div class="compact-icon-shell">
+                <Wrench :size="18" />
+              </div>
+              <div>
+                <h3>Tool Draft</h3>
+                <p>Only the selected integration's embeddings and stored snapshots are sent to the generator.</p>
+              </div>
+            </div>
+
+            <div class="db-form-block">
+              <label class="db-label" for="toolkit-connected-integration">Connected Integration</label>
+              <select id="toolkit-connected-integration" v-model="selectedToolkitIntegrationValue" class="db-input">
+                <option
+                  v-for="integration in connectedToolkitIntegrations"
+                  :key="integration.value"
+                  :value="integration.value"
+                >
+                  {{ integration.label }} - {{ integration.detail }}
+                </option>
+              </select>
+            </div>
+
+            <div class="db-form-block">
+              <label class="db-label" for="toolkit-prompt">Natural Language Tool Request</label>
+              <textarea
+                id="toolkit-prompt"
+                v-model="toolkitForm.nlp_prompt"
+                class="db-input toolkit-textarea"
+                placeholder="Example: Create a tool that checks Shiprocket courier serviceability and returns the cheapest courier option."
+              ></textarea>
+            </div>
+
+            <div class="db-form-block">
+              <label class="db-label" for="toolkit-system-prompt">System Prompt Override (optional)</label>
+              <textarea
+                id="toolkit-system-prompt"
+                v-model="toolkitForm.system_prompt"
+                class="db-input toolkit-textarea compact"
+                placeholder="Leave blank to use the default intelligent MCP tool creator prompt."
+              ></textarea>
+            </div>
+
+            <div class="db-actions">
+              <button type="button" class="primary-button" :disabled="isGeneratingToolkit" @click="generateToolkitDraft">
+                {{ isGeneratingToolkit ? 'Generating...' : 'Generate Draft' }}
+              </button>
+            </div>
+          </article>
+
+          <article class="dashboard-card toolkit-registry-card">
+            <div class="members-card-head">
+              <div>
+                <h3>Registry</h3>
+                <p>{{ toolkitForm.integration_type }} / {{ toolkitForm.provider }}</p>
+              </div>
+              <span class="status-chip">{{ visibleToolkitTools.length }} / {{ filteredToolkitTools.length }} tools</span>
+            </div>
+
+            <div class="toolkit-registry-summary">
+              <strong>Pending Drafts</strong>
+              <span>{{ visibleToolkitDrafts.length }} / {{ filteredToolkitDrafts.length }} shown</span>
+            </div>
+
+            <div class="toolkit-list">
+              <div v-if="!filteredToolkitDrafts.length" class="empty-state compact">No pending drafts for this integration.</div>
+              <button
+                v-for="draft in visibleToolkitDrafts"
+                :key="draft.id"
+                type="button"
+                class="toolkit-list-row"
+                @click="toolkitDraft = draft"
+              >
+                <span>
+                  <strong>{{ draft.tool?.title || draft.tool?.name }}</strong>
+                  <small>{{ draft.nlp_prompt }}</small>
+                </span>
+                <span class="status-chip">{{ draft.status }}</span>
+              </button>
+              <div v-if="hiddenToolkitDraftCount" class="toolkit-list-more">
+                {{ hiddenToolkitDraftCount }} more drafts hidden by the compact registry view.
+              </div>
+            </div>
+
+            <div class="toolkit-list registered">
+              <div v-if="!filteredToolkitTools.length" class="empty-state compact">No approved tools registered yet.</div>
+              <div v-for="tool in visibleToolkitTools" :key="tool.name" class="toolkit-list-row static">
+                <span>
+                  <strong>{{ tool.title || tool.name }}</strong>
+                  <small>{{ tool.description }}</small>
+                </span>
+                <span class="status-chip">{{ tool?.mcp?.tool_name || tool.name }}</span>
+              </div>
+              <div v-if="hiddenToolkitToolCount" class="toolkit-list-more">
+                {{ hiddenToolkitToolCount }} more registered tools hidden by the compact registry view.
+              </div>
+            </div>
+          </article>
+
+          <article v-if="toolkitDraft" class="dashboard-card wide-card toolkit-review-card">
+            <div class="members-card-head">
+              <div>
+                <h3>{{ toolkitDraft.tool?.title || toolkitDraft.tool?.name }}</h3>
+                <p>{{ toolkitDraft.tool?.description }}</p>
+              </div>
+              <span class="status-chip">{{ toolkitDraft.status }}</span>
+            </div>
+            <pre>{{ JSON.stringify(toolkitDraft.tool, null, 2) }}</pre>
+            <div v-if="toolkitDraft.status === 'draft'" class="db-actions">
+              <button type="button" class="ghost-button" :disabled="isReviewingToolkit" @click="reviewToolkitDraft('reject')">Reject</button>
+              <button type="button" class="primary-button" :disabled="isReviewingToolkit" @click="reviewToolkitDraft('approve')">
+                {{ isReviewingToolkit ? 'Saving...' : 'Approve And Register' }}
+              </button>
+            </div>
+          </article>
+        </div>
+
+        <article v-else class="dashboard-card ticket-console-card">
+          <div class="compact-card-head">
+            <div class="compact-icon-shell">
+              <Shield :size="18" />
+            </div>
+            <div>
+              <h3>{{ canManageDatabase ? 'Connect An Integration' : 'Admin Access Required' }}</h3>
+              <p>
+                {{ canManageDatabase
+                  ? 'Toolkit generation is available after Database, CRM, Zoho Desk, ERP, or Shipping is connected and indexed.'
+                  : 'Toolkit generation and MCP registry changes are limited to organization admins.' }}
+              </p>
+            </div>
+          </div>
+        </article>
+      </section>
     </main>
 
     <footer class="portal-footer">
@@ -1505,7 +2344,7 @@ onBeforeUnmount(() => {
         <div class="db-modal-header">
           <div>
             <h3>Connect CRM</h3>
-            <p>Connect Zoho or Freshworks CRM. NOKVO will scan the CRM schema and store schema plus action embeddings inside the tenant CRM namespace in Qdrant.</p>
+            <p>Connect Zoho or Freshworks CRM. Zoho OAuth also grants Desk access and indexes Desk metadata into its own namespace when available.</p>
           </div>
           <button type="button" class="ghost-button compact" @click="closeCrmModal">Close</button>
         </div>
@@ -1530,11 +2369,11 @@ onBeforeUnmount(() => {
           <div v-if="isZohoCrmProvider" class="crm-oauth-panel">
             <div class="crm-oauth-copy">
               <strong>Zoho OAuth</strong>
-              <p>Redirect the organization admin to Zoho, approve scopes once, then NOKVO will exchange tokens, scan CRM metadata, and index schema plus action context automatically.</p>
+              <p>Redirect the organization admin to Zoho and approve scopes once. NOKVO will exchange tokens, scan CRM metadata, and store the same OAuth grant for Zoho Desk sync.</p>
             </div>
             <div class="crm-oauth-scopes">
               <span>Scopes</span>
-              <small>CRM modules, CRM settings, org read, secure search, Desk tickets, Desk basic read</small>
+              <small>CRM modules, CRM settings, org read, secure search, Desk tickets, Desk basic read, Desk settings read</small>
             </div>
             <button type="button" class="primary-button crm-oauth-button" :disabled="isConnectingCrm" @click="beginZohoOAuth">
               {{ isConnectingCrm ? 'Redirecting...' : 'Continue with Zoho' }}
@@ -1578,6 +2417,161 @@ onBeforeUnmount(() => {
         </div>
       </section>
     </div>
+
+    <div v-if="erpModalOpen" class="db-modal-shell">
+      <div class="db-modal-backdrop" @click="closeErpModal"></div>
+      <section class="db-modal">
+        <div class="db-modal-header">
+          <div>
+            <h3>Connect ERP</h3>
+            <p>Connect TallyPrime or Tally ERP over its XML HTTP server. NOKVO will scan common masters, vouchers, and supported ERP actions into an ERP namespace.</p>
+          </div>
+          <button type="button" class="ghost-button compact" @click="closeErpModal">Close</button>
+        </div>
+
+        <div class="db-form-block">
+          <label class="db-label">ERP Provider</label>
+          <div class="provider-grid provider-grid-dual">
+            <label
+              v-for="provider in erpProviders"
+              :key="provider.value"
+              class="provider-option"
+              :class="{ active: erpForm.provider === provider.value, muted: !provider.supported }"
+            >
+              <input v-model="erpForm.provider" type="radio" :value="provider.value" class="sr-only" />
+              <span class="provider-name">{{ provider.label }}</span>
+              <small>{{ provider.group }}</small>
+            </label>
+          </div>
+        </div>
+
+        <div class="crm-form-grid">
+          <div class="db-form-block">
+            <label class="db-label" for="erp-base-url">Tally HTTP URL</label>
+            <input
+              id="erp-base-url"
+              v-model="erpForm.base_url"
+              class="db-input"
+              type="text"
+              placeholder="http://localhost:9000"
+            />
+          </div>
+          <div class="db-form-block">
+            <label class="db-label" for="erp-company-name">Company Name (optional)</label>
+            <input
+              id="erp-company-name"
+              v-model="erpForm.company_name"
+              class="db-input"
+              type="text"
+              placeholder="Leave blank to use loaded company"
+            />
+          </div>
+          <div class="db-form-block">
+            <label class="db-label" for="erp-timeout">Timeout Seconds</label>
+            <input
+              id="erp-timeout"
+              v-model.number="erpForm.timeout_seconds"
+              class="db-input"
+              type="number"
+              min="3"
+              max="60"
+            />
+          </div>
+          <div class="db-form-block">
+            <label class="db-label" for="erp-max-items">Sample Records Per Module</label>
+            <input
+              id="erp-max-items"
+              v-model.number="erpForm.max_items_per_module"
+              class="db-input"
+              type="number"
+              min="1"
+              max="100"
+            />
+          </div>
+        </div>
+
+        <p class="db-note">TallyPrime must be running with HTTP server enabled, usually on port 9000, and a company must be loaded. The connection details are encrypted in Key Vault.</p>
+
+        <div class="db-actions">
+          <button type="button" class="ghost-button" @click="closeErpModal">Cancel</button>
+          <button type="button" class="primary-button" :disabled="isConnectingErp" @click="connectErpIntegration">
+            {{ isConnectingErp ? 'Scanning Tally...' : 'Connect Tally ERP' }}
+          </button>
+        </div>
+      </section>
+    </div>
+
+    <div v-if="shippingModalOpen" class="db-modal-shell">
+      <div class="db-modal-backdrop" @click="closeShippingModal"></div>
+      <section class="db-modal">
+        <div class="db-modal-header">
+          <div>
+            <h3>Connect Shipping</h3>
+            <p>Connect Shiprocket using an API user from the Shiprocket panel. NOKVO will index shipping actions for serviceability, order creation, AWB, pickup, and tracking.</p>
+          </div>
+          <button type="button" class="ghost-button compact" @click="closeShippingModal">Close</button>
+        </div>
+
+        <div class="db-form-block">
+          <label class="db-label">Shipping Provider</label>
+          <div class="provider-grid provider-grid-dual">
+            <label
+              v-for="provider in shippingProviders"
+              :key="provider.value"
+              class="provider-option"
+              :class="{ active: shippingForm.provider === provider.value, muted: !provider.supported }"
+            >
+              <input v-model="shippingForm.provider" type="radio" :value="provider.value" class="sr-only" />
+              <span class="provider-name">{{ provider.label }}</span>
+              <small>{{ provider.group }}</small>
+            </label>
+          </div>
+        </div>
+
+        <div class="crm-form-grid">
+          <div class="db-form-block">
+            <label class="db-label" for="shipping-email">Shiprocket API Email</label>
+            <input
+              id="shipping-email"
+              v-model="shippingForm.email"
+              class="db-input"
+              type="email"
+              placeholder="api-user@example.com"
+            />
+          </div>
+          <div class="db-form-block">
+            <label class="db-label" for="shipping-password">Shiprocket API Password</label>
+            <input
+              id="shipping-password"
+              v-model="shippingForm.password"
+              class="db-input"
+              type="password"
+              placeholder="API user password"
+            />
+          </div>
+          <div class="db-form-block">
+            <label class="db-label" for="shipping-base-url">API Base URL</label>
+            <input
+              id="shipping-base-url"
+              v-model="shippingForm.base_url"
+              class="db-input"
+              type="text"
+              placeholder="https://apiv2.shiprocket.in/v1/external"
+            />
+          </div>
+        </div>
+
+        <p class="db-note">Create a Shiprocket API user from Settings > API. Use that API user's email and password, not necessarily your normal panel login. Credentials are encrypted in Key Vault.</p>
+
+        <div class="db-actions">
+          <button type="button" class="ghost-button" @click="closeShippingModal">Cancel</button>
+          <button type="button" class="primary-button" :disabled="isConnectingShipping" @click="connectShippingIntegration">
+            {{ isConnectingShipping ? 'Connecting Shiprocket...' : 'Connect Shiprocket' }}
+          </button>
+        </div>
+      </section>
+    </div>
+
   </section>
 </template>
 
@@ -2246,6 +3240,7 @@ onBeforeUnmount(() => {
 
 .nav-icon-button,
 .org-avatar-button,
+.nav-page-button,
 .theme-toggle-button,
 .dashboard-secondary-button,
 .dashboard-chip-button,
@@ -2276,8 +3271,25 @@ onBeforeUnmount(() => {
   white-space: nowrap;
 }
 
+.nav-page-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.72rem 0.9rem;
+  font-size: 0.8rem;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.nav-page-button.active {
+  background: #1b1c15;
+  border-color: #1b1c15;
+  color: #ffffff;
+}
+
 .nav-icon-button:hover,
 .org-avatar-button:hover,
+.nav-page-button:hover,
 .dashboard-secondary-button:hover,
 .dashboard-chip-button:hover,
 .dashboard-inline-button:hover,
@@ -2326,6 +3338,16 @@ onBeforeUnmount(() => {
   padding: 0.88rem 1.15rem;
   font-size: 0.84rem;
   font-weight: 700;
+}
+
+.dashboard-primary-button:disabled,
+.dashboard-secondary-button:disabled,
+.dashboard-chip-button:disabled,
+.dashboard-inline-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+  transform: none;
+  box-shadow: none;
 }
 
 .dashboard-primary-button {
@@ -2429,6 +3451,15 @@ onBeforeUnmount(() => {
 
 .overview-grid .compact-card {
   min-height: 16rem;
+}
+
+.overview-grid .crm-sync-card {
+  grid-column: span 2;
+  min-height: 18.5rem;
+}
+
+.overview-grid .access-card {
+  grid-column: span 1;
 }
 
 .control-grid {
@@ -2634,6 +3665,188 @@ onBeforeUnmount(() => {
   margin-top: 1.3rem;
   width: 100%;
   border-radius: 0.85rem;
+}
+
+.crm-sync-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+
+.crm-sync-emphasis {
+  margin-top: 1.25rem;
+  padding-top: 1rem;
+  border-top: 1px solid rgba(196, 199, 199, 0.28);
+}
+
+.crm-sync-emphasis span {
+  display: block;
+  margin-bottom: 0.3rem;
+  color: #5f5f53;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.crm-sync-emphasis strong {
+  display: block;
+  font-family: Manrope, sans-serif;
+  font-size: 0.96rem;
+  line-height: 1.55;
+  word-break: break-word;
+}
+
+.tickets-grid {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.toolkit-page-grid {
+  grid-template-columns: minmax(0, 1.15fr) minmax(20rem, 0.85fr);
+  align-items: start;
+}
+
+.toolkit-builder-card,
+.toolkit-registry-card {
+  min-height: 34rem;
+}
+
+.ticket-console-card {
+  max-width: 48rem;
+}
+
+.ticket-page-note {
+  margin-top: 1.3rem;
+  padding: 1rem;
+  border-radius: 1rem;
+  background: #efeee3;
+  border: 1px solid rgba(196, 199, 199, 0.45);
+}
+
+.ticket-page-note strong {
+  display: block;
+  font-family: Manrope, sans-serif;
+  margin-bottom: 0.35rem;
+}
+
+.ticket-page-note p {
+  color: #5f5f53;
+  font-size: 0.92rem;
+  line-height: 1.65;
+}
+
+.toolkit-textarea {
+  min-height: 8rem;
+  resize: vertical;
+}
+
+.toolkit-textarea.compact {
+  min-height: 5.5rem;
+}
+
+.toolkit-review-card {
+  margin-top: 1.2rem;
+  padding: 1rem;
+  border-radius: 1rem;
+  border: 1px solid rgba(196, 199, 199, 0.42);
+  background: rgba(239, 238, 227, 0.72);
+}
+
+.toolkit-page .toolkit-review-card {
+  margin-top: 0;
+}
+
+.toolkit-review-card pre {
+  margin-top: 1rem;
+  max-height: 22rem;
+  overflow: auto;
+  padding: 1rem;
+  border-radius: 0.85rem;
+  background: rgba(27, 28, 21, 0.92);
+  color: #f8f7ee;
+  font-size: 0.78rem;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+
+.toolkit-registry-summary {
+  margin-top: 1rem;
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.9rem 1rem;
+  border-radius: 0.85rem;
+  background: rgba(255, 255, 255, 0.72);
+  border: 1px solid rgba(196, 199, 199, 0.35);
+}
+
+.toolkit-registry-summary span {
+  color: #5f5f53;
+  font-size: 0.9rem;
+}
+
+.toolkit-list {
+  display: grid;
+  gap: 0.75rem;
+  margin-top: 1rem;
+}
+
+.toolkit-list.registered {
+  padding-top: 1rem;
+  border-top: 1px solid rgba(196, 199, 199, 0.35);
+}
+
+.toolkit-list-row {
+  width: 100%;
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1rem;
+  padding: 0.95rem;
+  border: 1px solid rgba(196, 199, 199, 0.42);
+  border-radius: 0.9rem;
+  background: rgba(255, 255, 255, 0.68);
+  color: inherit;
+  text-align: left;
+}
+
+.toolkit-list-row:not(.static) {
+  cursor: pointer;
+}
+
+.toolkit-list-row:not(.static):hover {
+  border-color: rgba(27, 28, 21, 0.28);
+  background: rgba(255, 255, 255, 0.92);
+}
+
+.toolkit-list-row strong,
+.toolkit-list-row small {
+  display: block;
+}
+
+.toolkit-list-row strong {
+  font-family: Manrope, sans-serif;
+  font-size: 0.95rem;
+  line-height: 1.35;
+}
+
+.toolkit-list-row small {
+  margin-top: 0.25rem;
+  color: #5f5f53;
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+
+.toolkit-list-more {
+  padding: 0.2rem 0.1rem;
+  color: #5f5f53;
+  font-size: 0.8rem;
+  line-height: 1.4;
+}
+
+.empty-state.compact {
+  padding: 0.7rem 0;
+  font-size: 0.9rem;
 }
 
 .members-summary {
@@ -2877,6 +4090,7 @@ onBeforeUnmount(() => {
 .org-shell.dark .db-modal,
 .org-shell.dark .nav-icon-button,
 .org-shell.dark .org-avatar-button,
+.org-shell.dark .nav-page-button,
 .org-shell.dark .theme-toggle-button,
 .org-shell.dark .dashboard-secondary-button,
 .org-shell.dark .dashboard-chip-button,
@@ -2971,6 +4185,12 @@ onBeforeUnmount(() => {
   background: #f2f1e5;
 }
 
+.org-shell.dark .nav-page-button.active {
+  background: #f2f1e5;
+  color: #131511;
+  border-color: #f2f1e5;
+}
+
 .org-shell.dark .provider-option.active {
   background: linear-gradient(180deg, rgba(67, 74, 61, 0.98), rgba(45, 50, 41, 0.98));
   box-shadow:
@@ -2983,6 +4203,43 @@ onBeforeUnmount(() => {
 .org-shell.dark .crm-oauth-panel {
   background: linear-gradient(180deg, rgba(36, 40, 33, 0.98), rgba(24, 27, 22, 0.96));
   border-color: rgba(144, 150, 136, 0.55);
+}
+
+.org-shell.dark .ticket-page-note {
+  background: rgba(33, 37, 30, 0.92);
+  border-color: rgba(102, 108, 92, 0.35);
+}
+
+.org-shell.dark .ticket-page-note p {
+  color: #d0d0c3;
+}
+
+.org-shell.dark .toolkit-review-card,
+.org-shell.dark .toolkit-registry-summary {
+  background: rgba(33, 37, 30, 0.92);
+  border-color: rgba(102, 108, 92, 0.35);
+}
+
+.org-shell.dark .toolkit-registry-summary span {
+  color: #d0d0c3;
+}
+
+.org-shell.dark .toolkit-list-row {
+  background: rgba(33, 37, 30, 0.84);
+  border-color: rgba(102, 108, 92, 0.35);
+}
+
+.org-shell.dark .toolkit-list-row:not(.static):hover {
+  border-color: rgba(221, 220, 205, 0.28);
+  background: rgba(40, 45, 35, 0.95);
+}
+
+.org-shell.dark .toolkit-list-row small {
+  color: #d0d0c3;
+}
+
+.org-shell.dark .toolkit-list-more {
+  color: #d0d0c3;
 }
 
 .org-shell.dark .crm-oauth-copy p,
@@ -3015,6 +4272,8 @@ onBeforeUnmount(() => {
   }
 
   .overview-grid .organization-card,
+  .overview-grid .crm-sync-card,
+  .overview-grid .access-card,
   .control-grid .invite-card,
   .control-grid .workspace-card {
     grid-column: auto;

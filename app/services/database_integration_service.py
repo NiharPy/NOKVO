@@ -184,6 +184,7 @@ class DatabaseIntegrationService:
             vector = TextEmbeddingService.embed_text(record["text"])
             payload = {
                 "source_type": "database_schema_selection",
+                "integration_type": "database",
                 "provider": provider,
                 "table": record.get("table"),
                 "columns": record.get("columns", []),
@@ -192,6 +193,14 @@ class DatabaseIntegrationService:
             }
             points.append({"id": point_id, "vector": vector, "payload": payload})
 
+        await QdrantService.delete_points_by_filter(
+            tenant_res,
+            {"integration_type": "database"},
+        )
+        await QdrantService.delete_points_by_filter(
+            tenant_res,
+            {"source_type": "database_schema_selection"},
+        )
         if points:
             await QdrantService.upsert_points(tenant_res, points)
 

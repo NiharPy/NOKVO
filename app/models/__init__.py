@@ -8,6 +8,7 @@ from app.models.organization_session import OrganizationSession
 from app.models.organization_user import OrganizationUser
 from app.models.tenant_resources import TenantResources
 from app.models.tenant_usage_event import TenantUsageEvent
+from app.models.mcp_tool_registry import MCPToolRegistryEntry
 
 # For Alembic to discover all models
 __all__ = [
@@ -21,4 +22,5 @@ __all__ = [
     "OrganizationSession",
     "TenantResources",
     "TenantUsageEvent",
+    "MCPToolRegistryEntry",
 ]

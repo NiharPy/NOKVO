@@ -1,7 +1,7 @@
 import re
 import uuid
 from qdrant_client import QdrantClient
-from qdrant_client.http.models import Distance, Filter, FieldCondition, MatchValue, PointStruct, VectorParams
+from qdrant_client.http.models import Distance, Filter, FieldCondition, FilterSelector, MatchValue, PointStruct, VectorParams
 from app.core.config import settings
 from app.models.audit import SuperAdminAuditLog
 from app.models.tenant_resources import TenantResources
@@ -109,6 +109,7 @@ class QdrantService:
         tenant_res: TenantResources,
         query_vector: list[float],
         limit: int = 10,
+        payload_filters: dict | None = None,
         db: AsyncSession | None = None,
         superadmin_id: uuid.UUID | None = None,
     ):
@@ -118,14 +119,7 @@ class QdrantService:
             collection_name=collection_name,
             query=query_vector,
             limit=limit,
-            query_filter=Filter(
-                must=[
-                    FieldCondition(
-                        key="tenant_id",
-                        match=MatchValue(value=tenant_res.tenant_id),
-                    )
-                ]
-            ),
+            query_filter=QdrantService._payload_filter(tenant_res, payload_filters),
         )
         results = getattr(response, "points", [])
         await QdrantService._audit(
@@ -136,6 +130,44 @@ class QdrantService:
             {"tenant_id": tenant_res.tenant_id, "limit": limit, "results_count": len(results)},
         )
         return results
+
+    @staticmethod
+    def _payload_filter(tenant_res: TenantResources, payload_filters: dict | None = None) -> Filter:
+        must_conditions = [
+            FieldCondition(
+                key="tenant_id",
+                match=MatchValue(value=tenant_res.tenant_id),
+            )
+        ]
+        for key, value in (payload_filters or {}).items():
+            if value is None:
+                continue
+            must_conditions.append(
+                FieldCondition(
+                    key=key,
+                    match=MatchValue(value=value),
+                )
+            )
+        return Filter(must=must_conditions)
+
+    @staticmethod
+    async def delete_points_by_filter(
+        tenant_res: TenantResources,
+        payload_filters: dict,
+        db: AsyncSession | None = None,
+        superadmin_id: uuid.UUID | None = None,
+    ) -> None:
+        collection_name = QdrantService._required_collection(tenant_res)
+        client = QdrantService._client()
+        query_filter = QdrantService._payload_filter(tenant_res, payload_filters)
+        client.delete(collection_name=collection_name, points_selector=FilterSelector(filter=query_filter))
+        await QdrantService._audit(
+            db,
+            superadmin_id,
+            "qdrant_delete_by_filter",
+            tenant_res,
+            {"tenant_id": tenant_res.tenant_id, "payload_filters": payload_filters},
+        )
 
     @staticmethod
     async def delete_points(

@@ -21,12 +21,38 @@ from app.core import security
 from app.models.organization import Organization
 from app.models.organization_session import OrganizationSession
 from app.models.organization_user import OrganizationUser
+from app.models.mcp_tool_registry import MCPToolRegistryEntry
 from app.models.tenant_resources import TenantResources
 from app.schemas.organization_auth import (
     OrganizationCRMConnectRequest,
     OrganizationCRMConnectResponse,
     OrganizationCRMProviderResponse,
     OrganizationCRMStatusResponse,
+    OrganizationERPConnectRequest,
+    OrganizationERPConnectResponse,
+    OrganizationERPProviderResponse,
+    OrganizationERPStatusResponse,
+    OrganizationShippingConnectRequest,
+    OrganizationShippingConnectResponse,
+    OrganizationShippingProviderResponse,
+    OrganizationShippingStatusResponse,
+    OrganizationShiprocketAPIResponse,
+    OrganizationShiprocketAssignAWBRequest,
+    OrganizationShiprocketCreateOrderRequest,
+    OrganizationShiprocketPickupRequest,
+    OrganizationShiprocketServiceabilityRequest,
+    OrganizationShiprocketTrackRequest,
+    OrganizationTallyXMLRequest,
+    OrganizationTallyXMLResponse,
+    OrganizationToolkitDraftResponse,
+    OrganizationToolkitGenerateRequest,
+    OrganizationToolkitRegistryResponse,
+    OrganizationToolkitReviewRequest,
+    OrganizationZohoDeskConnectResponse,
+    OrganizationZohoDeskStatusResponse,
+    OrganizationZohoDeskTicketCreateRequest,
+    OrganizationZohoDeskTicketResponse,
+    OrganizationZohoDeskTicketUpdateRequest,
     OrganizationDatabaseConnectRequest,
     OrganizationDatabaseConnectResponse,
     OrganizationDatabaseIndexRequest,
@@ -43,9 +69,14 @@ from app.schemas.organization_auth import (
     OrganizationUserResponse,
 )
 from app.services.crm_integration_service import CRMIntegrationService
+from app.services.erp_integration_service import ERPIntegrationService
+from app.services.zoho_desk_service import ZohoDeskService
 from app.schemas.token import RefreshRequest, Token
 from app.services.database_integration_service import DatabaseIntegrationService
 from app.services.google_oauth_service import GoogleOAuthError, GoogleOAuthService
+from app.services.shipping_integration_service import ShippingIntegrationService
+from app.services.toolkit_generator_service import ToolkitGeneratorService
+from app.services.qdrant_service import QdrantService
 
 
 router = APIRouter()
@@ -103,6 +134,96 @@ def _crm_oauth_redirect_url(status_value: str, provider: str, message: str = "")
     if message:
         query += f"&message={quote_plus(message)}"
     return f"{base}/?{query}"
+
+
+def _toolkit_state(provider_status: dict) -> tuple[dict, list]:
+    registry = dict(provider_status.get("mcp_tool_registry") or {})
+    drafts = list(provider_status.get("toolkit_drafts") or [])
+    return registry, drafts
+
+
+def _toolkit_matches(item: dict, integration_type: str | None, provider: str | None) -> bool:
+    if integration_type and item.get("integration_type") != integration_type:
+        return False
+    if provider and item.get("provider") != provider:
+        return False
+    return True
+
+
+def _toolkit_integration_connected(provider_status: dict, integration_type: str, provider: str) -> bool:
+    integration_type = integration_type.strip().lower()
+    provider = provider.strip().lower()
+    if integration_type == "database":
+        return provider_status.get("db_status") in {"schema_scanned", "indexed"} and provider_status.get("db_provider") == provider
+    if integration_type == "crm":
+        return provider_status.get("crm_status") == "indexed" and provider_status.get("crm_provider") == provider
+    if integration_type == "zoho_desk":
+        return provider_status.get("zoho_desk_status") == "indexed" and provider in {"zoho", "zoho_desk", "desk"}
+    if integration_type == "erp":
+        return provider_status.get("erp_status") == "indexed" and provider_status.get("erp_provider") == provider
+    if integration_type == "shipping":
+        return provider_status.get("shipping_status") == "indexed" and provider_status.get("shipping_provider") == provider
+    return False
+
+
+def _append_toolkit_audit_event(
+    provider_status: dict,
+    action: str,
+    user_id: uuid.UUID,
+    integration_type: str,
+    provider: str,
+    tool_name: str | None = None,
+    draft_id: str | None = None,
+    metadata: dict | None = None,
+) -> None:
+    events = list(provider_status.get("toolkit_audit_events") or [])
+    events.append(
+        {
+            "action": action,
+            "user_id": str(user_id),
+            "integration_type": integration_type,
+            "provider": provider,
+            "tool_name": tool_name,
+            "draft_id": draft_id,
+            "metadata": metadata or {},
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    provider_status["toolkit_audit_events"] = events[-200:]
+
+
+async def _get_registered_tool_definitions(
+    db: AsyncSession,
+    organization_id: uuid.UUID,
+    integration_type: str,
+    provider: str,
+    provider_status: dict | None = None,
+) -> list[dict]:
+    result = await db.execute(
+        select(MCPToolRegistryEntry)
+        .where(
+            MCPToolRegistryEntry.organization_id == organization_id,
+            MCPToolRegistryEntry.integration_type == integration_type,
+            MCPToolRegistryEntry.provider == provider,
+            MCPToolRegistryEntry.status == "active",
+        )
+        .order_by(MCPToolRegistryEntry.tool_name.asc())
+    )
+    entries = result.scalars().all()
+    tools: list[dict] = []
+    for entry in entries:
+        tool = dict(entry.tool_definition or {})
+        tool.setdefault("registry_id", str(entry.id))
+        tool.setdefault("approved_at", entry.approved_at.isoformat() if entry.approved_at else None)
+        tool.setdefault("approved_by", str(entry.approved_by) if entry.approved_by else None)
+        tool.setdefault("version", entry.version)
+        tools.append(tool)
+    if tools:
+        return tools
+
+    legacy_registry = (provider_status or {}).get("mcp_tool_registry") or {}
+    key = ToolkitGeneratorService.integration_registry_key(integration_type, provider)
+    return list(legacy_registry.get(key, [])) if isinstance(legacy_registry, dict) else []
 
 
 def _build_org_access_token(user: OrganizationUser, session_id: str) -> str:
@@ -224,6 +345,20 @@ async def get_organization_crm_providers(
     return [OrganizationCRMProviderResponse(**item) for item in CRMIntegrationService.provider_options()]
 
 
+@router.get("/erp/providers", response_model=list[OrganizationERPProviderResponse])
+async def get_organization_erp_providers(
+    current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin"])),
+):
+    return [OrganizationERPProviderResponse(**item) for item in ERPIntegrationService.provider_options()]
+
+
+@router.get("/shipping/providers", response_model=list[OrganizationShippingProviderResponse])
+async def get_organization_shipping_providers(
+    current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin"])),
+):
+    return [OrganizationShippingProviderResponse(**item) for item in ShippingIntegrationService.provider_options()]
+
+
 @router.get("/crm/zoho/authorize")
 async def get_organization_zoho_authorize_url(
     current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin"])),
@@ -240,6 +375,7 @@ async def get_organization_zoho_authorize_url(
             "ZohoSearch.securesearch.READ",
             "Desk.tickets.ALL",
             "Desk.basic.READ",
+            "Desk.settings.READ",
         ]
     )
     auth_url = (
@@ -494,6 +630,66 @@ async def get_organization_crm_status(
     )
 
 
+@router.get("/erp/status", response_model=OrganizationERPStatusResponse)
+async def get_organization_erp_status(
+    current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin"])),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
+    provider_status = tenant_res.provider_status or {}
+    secret_ref = ((tenant_res.secret_refs or {}).get("erp_connection") or {}).get("secret_name")
+    return OrganizationERPStatusResponse(
+        provider=provider_status.get("erp_provider"),
+        status=provider_status.get("erp_status", "not_connected"),
+        secret_ref=secret_ref,
+        account_name=provider_status.get("erp_account_name"),
+        indexed_points=int(provider_status.get("erp_indexed_points", 0) or 0),
+        module_count=int(provider_status.get("erp_module_count", 0) or 0),
+        action_count=int(provider_status.get("erp_action_count", 0) or 0),
+        folder_path=provider_status.get("erp_folder_path"),
+        last_error=provider_status.get("erp_last_error"),
+    )
+
+
+@router.get("/shipping/status", response_model=OrganizationShippingStatusResponse)
+async def get_organization_shipping_status(
+    current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin"])),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
+    provider_status = tenant_res.provider_status or {}
+    secret_ref = ((tenant_res.secret_refs or {}).get("shipping_connection") or {}).get("secret_name")
+    return OrganizationShippingStatusResponse(
+        provider=provider_status.get("shipping_provider"),
+        status=provider_status.get("shipping_status", "not_connected"),
+        secret_ref=secret_ref,
+        account_name=provider_status.get("shipping_account_name"),
+        indexed_points=int(provider_status.get("shipping_indexed_points", 0) or 0),
+        module_count=int(provider_status.get("shipping_module_count", 0) or 0),
+        action_count=int(provider_status.get("shipping_action_count", 0) or 0),
+        folder_path=provider_status.get("shipping_folder_path"),
+        last_error=provider_status.get("shipping_last_error"),
+    )
+
+
+@router.get("/crm/zoho-desk/status", response_model=OrganizationZohoDeskStatusResponse)
+async def get_organization_zoho_desk_status(
+    current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin"])),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
+    provider_status = tenant_res.provider_status or {}
+    return OrganizationZohoDeskStatusResponse(
+        status=provider_status.get("zoho_desk_status", "not_connected"),
+        account_name=provider_status.get("zoho_desk_account_name"),
+        org_id=provider_status.get("zoho_desk_org_id"),
+        indexed_points=int(provider_status.get("zoho_desk_indexed_points", 0) or 0),
+        module_count=int(provider_status.get("zoho_desk_module_count", 0) or 0),
+        action_count=int(provider_status.get("zoho_desk_action_count", 0) or 0),
+        folder_path=provider_status.get("zoho_desk_folder_path"),
+    )
+
+
 @router.post("/database/connect", response_model=OrganizationDatabaseConnectResponse)
 async def connect_organization_database(
     payload: OrganizationDatabaseConnectRequest,
@@ -504,6 +700,8 @@ async def connect_organization_database(
 
     try:
         scan_result = await DatabaseIntegrationService.scan_schema(payload.provider, payload.connection_string)
+        await QdrantService.delete_points_by_filter(tenant_res, {"integration_type": "database"})
+        await QdrantService.delete_points_by_filter(tenant_res, {"source_type": "database_schema_selection"})
         secret_ref = await DatabaseIntegrationService.store_connection_secret(
             tenant_res,
             scan_result.provider,
@@ -595,6 +793,190 @@ async def connect_organization_crm(
     )
 
 
+@router.post("/erp/connect", response_model=OrganizationERPConnectResponse)
+async def connect_organization_erp(
+    payload: OrganizationERPConnectRequest,
+    current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin"])),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
+    credentials = {
+        "base_url": payload.base_url,
+        "company_name": payload.company_name,
+        "timeout_seconds": payload.timeout_seconds,
+        "max_items_per_module": payload.max_items_per_module,
+    }
+
+    try:
+        scan_result = await ERPIntegrationService.scan_schema(payload.provider, credentials)
+        secret_ref = await ERPIntegrationService.store_connection_secret(
+            tenant_res,
+            scan_result.provider,
+            credentials,
+        )
+        index_result = await ERPIntegrationService.index_schema_embeddings(tenant_res, scan_result)
+    except Exception as exc:
+        provider_status = dict(tenant_res.provider_status or {})
+        provider_status.update(
+            {
+                "erp_status": "error",
+                "erp_provider": payload.provider,
+                "erp_last_error": str(exc),
+            }
+        )
+        tenant_res.provider_status = provider_status
+        db.add(tenant_res)
+        await db.commit()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    provider_status = dict(tenant_res.provider_status or {})
+    provider_status.update(
+        {
+            "erp_status": "indexed",
+            "erp_provider": scan_result.provider,
+            "erp_account_name": scan_result.account_name,
+            "erp_module_count": len(scan_result.modules),
+            "erp_action_count": len(scan_result.actions),
+            "erp_schema_snapshot": scan_result.modules,
+            "erp_action_snapshot": scan_result.actions,
+            "erp_folder_path": scan_result.folder_path,
+            "erp_indexed_points": index_result["indexed_points"],
+            "erp_connected_at": datetime.now(timezone.utc).isoformat(),
+            "erp_last_error": None,
+        }
+    )
+    tenant_res.provider_status = provider_status
+    db.add(tenant_res)
+    await db.commit()
+
+    return OrganizationERPConnectResponse(
+        provider=scan_result.provider,
+        account_name=scan_result.account_name,
+        status="indexed",
+        secret_ref=secret_ref,
+        folder_path=scan_result.folder_path,
+        indexed_points=index_result["indexed_points"],
+        module_count=len(scan_result.modules),
+        action_count=len(scan_result.actions),
+        modules=scan_result.modules,
+        actions=scan_result.actions,
+    )
+
+
+@router.post("/shipping/connect", response_model=OrganizationShippingConnectResponse)
+async def connect_organization_shipping(
+    payload: OrganizationShippingConnectRequest,
+    current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin"])),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
+    credentials = {
+        "email": str(payload.email),
+        "password": payload.password,
+        "base_url": payload.base_url,
+    }
+
+    try:
+        scan_result = await ShippingIntegrationService.scan_schema(payload.provider, credentials)
+        secret_ref = await ShippingIntegrationService.store_connection_secret(
+            tenant_res,
+            scan_result.provider,
+            credentials,
+        )
+        index_result = await ShippingIntegrationService.index_schema_embeddings(tenant_res, scan_result)
+    except Exception as exc:
+        provider_status = dict(tenant_res.provider_status or {})
+        provider_status.update(
+            {
+                "shipping_status": "error",
+                "shipping_provider": payload.provider,
+                "shipping_last_error": str(exc),
+            }
+        )
+        tenant_res.provider_status = provider_status
+        db.add(tenant_res)
+        await db.commit()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    provider_status = dict(tenant_res.provider_status or {})
+    provider_status.update(
+        {
+            "shipping_status": "indexed",
+            "shipping_provider": scan_result.provider,
+            "shipping_account_name": scan_result.account_name,
+            "shipping_module_count": len(scan_result.modules),
+            "shipping_action_count": len(scan_result.actions),
+            "shipping_schema_snapshot": scan_result.modules,
+            "shipping_action_snapshot": scan_result.actions,
+            "shipping_folder_path": scan_result.folder_path,
+            "shipping_indexed_points": index_result["indexed_points"],
+            "shipping_connected_at": datetime.now(timezone.utc).isoformat(),
+            "shipping_last_error": None,
+        }
+    )
+    tenant_res.provider_status = provider_status
+    db.add(tenant_res)
+    await db.commit()
+
+    return OrganizationShippingConnectResponse(
+        provider=scan_result.provider,
+        account_name=scan_result.account_name,
+        status="indexed",
+        secret_ref=secret_ref,
+        folder_path=scan_result.folder_path,
+        indexed_points=index_result["indexed_points"],
+        module_count=len(scan_result.modules),
+        action_count=len(scan_result.actions),
+        modules=scan_result.modules,
+        actions=scan_result.actions,
+    )
+
+
+@router.post("/crm/zoho-desk/connect", response_model=OrganizationZohoDeskConnectResponse)
+async def connect_organization_zoho_desk(
+    current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin"])),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
+
+    try:
+        provider, credentials = await CRMIntegrationService.load_connection_secret(tenant_res)
+        if provider != "zoho":
+            raise RuntimeError("Zoho CRM must be connected before Zoho Desk can be integrated")
+        _, scan_result = await ZohoDeskService.connect_and_scan(credentials)
+        index_result = await ZohoDeskService.index_desk_embeddings(tenant_res, scan_result)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    provider_status = dict(tenant_res.provider_status or {})
+    provider_status.update(
+        {
+            "zoho_desk_status": "indexed",
+            "zoho_desk_account_name": scan_result.account_name,
+            "zoho_desk_org_id": scan_result.org_id,
+            "zoho_desk_module_count": len(scan_result.modules),
+            "zoho_desk_action_count": len(scan_result.actions),
+            "zoho_desk_folder_path": scan_result.folder_path,
+            "zoho_desk_indexed_points": index_result["indexed_points"],
+            "zoho_desk_connected_at": datetime.now(timezone.utc).isoformat(),
+            "zoho_desk_last_error": None,
+        }
+    )
+    tenant_res.provider_status = provider_status
+    db.add(tenant_res)
+    await db.commit()
+
+    return OrganizationZohoDeskConnectResponse(
+        status="indexed",
+        account_name=scan_result.account_name,
+        org_id=scan_result.org_id,
+        indexed_points=index_result["indexed_points"],
+        module_count=len(scan_result.modules),
+        action_count=len(scan_result.actions),
+        folder_path=scan_result.folder_path,
+    )
+
+
 @router.get("/crm/zoho/callback")
 async def zoho_crm_oauth_callback(
     code: str | None = None,
@@ -634,6 +1016,15 @@ async def zoho_crm_oauth_callback(
         scan_result = await CRMIntegrationService.scan_schema("zoho", credentials)
         secret_ref = await CRMIntegrationService.store_connection_secret(tenant_res, "zoho", credentials)
         index_result = await CRMIntegrationService.index_schema_embeddings(tenant_res, scan_result)
+        zoho_desk_scan_result = None
+        zoho_desk_index_result = None
+        zoho_desk_last_error = None
+        try:
+            _, zoho_desk_scan_result = await ZohoDeskService.connect_and_scan(credentials)
+            zoho_desk_index_result = await ZohoDeskService.index_desk_embeddings(tenant_res, zoho_desk_scan_result)
+        except Exception as desk_exc:
+            zoho_desk_last_error = str(desk_exc)
+            print("[Zoho OAuth] Desk auto-index skipped", {"error": zoho_desk_last_error})
 
         provider_status = dict(tenant_res.provider_status or {})
         provider_status.update(
@@ -652,6 +1043,27 @@ async def zoho_crm_oauth_callback(
                 "crm_last_error": None,
             }
         )
+        if zoho_desk_scan_result and zoho_desk_index_result:
+            provider_status.update(
+                {
+                    "zoho_desk_status": "indexed",
+                    "zoho_desk_account_name": zoho_desk_scan_result.account_name,
+                    "zoho_desk_org_id": zoho_desk_scan_result.org_id,
+                    "zoho_desk_module_count": len(zoho_desk_scan_result.modules),
+                    "zoho_desk_action_count": len(zoho_desk_scan_result.actions),
+                    "zoho_desk_folder_path": zoho_desk_scan_result.folder_path,
+                    "zoho_desk_indexed_points": zoho_desk_index_result["indexed_points"],
+                    "zoho_desk_connected_at": datetime.now(timezone.utc).isoformat(),
+                    "zoho_desk_last_error": None,
+                }
+            )
+        elif zoho_desk_last_error:
+            provider_status.update(
+                {
+                    "zoho_desk_status": "not_connected",
+                    "zoho_desk_last_error": zoho_desk_last_error,
+                }
+            )
         tenant_res.provider_status = provider_status
         db.add(tenant_res)
         await db.commit()
@@ -663,6 +1075,425 @@ async def zoho_crm_oauth_callback(
     redirect_url = _crm_oauth_redirect_url("success", "zoho")
     print("[Zoho OAuth] callback succeeded", {"redirect_url": redirect_url})
     return RedirectResponse(redirect_url, status_code=302)
+
+
+@router.post("/crm/zoho-desk/tickets", response_model=OrganizationZohoDeskTicketResponse)
+async def create_organization_zoho_desk_ticket(
+    payload: OrganizationZohoDeskTicketCreateRequest,
+    current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin", "manager"])),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
+    provider_status = dict(tenant_res.provider_status or {})
+    org_id = provider_status.get("zoho_desk_org_id")
+    if provider_status.get("zoho_desk_status") != "indexed":
+        raise HTTPException(status_code=409, detail="Zoho Desk is not connected for this organization")
+
+    try:
+        provider, credentials = await CRMIntegrationService.load_connection_secret(tenant_res)
+        if provider != "zoho":
+            raise RuntimeError("Zoho CRM credentials are not available for Zoho Desk")
+        request_payload = {
+            "subject": payload.subject,
+            "departmentId": payload.department_id,
+            "description": payload.description,
+            "contactId": payload.contact_id,
+            "email": str(payload.email) if payload.email else None,
+            "phone": payload.phone,
+            "status": payload.status,
+            "priority": payload.priority,
+            "cf": payload.custom_fields or {},
+        }
+        request_payload = {key: value for key, value in request_payload.items() if value not in (None, "", {})}
+        ticket = await ZohoDeskService.create_ticket(credentials, org_id, request_payload)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return OrganizationZohoDeskTicketResponse(
+        id=str(ticket.get("id") or ""),
+        status=ticket.get("status"),
+        subject=ticket.get("subject"),
+        department_id=str(ticket.get("departmentId")) if ticket.get("departmentId") is not None else None,
+        web_url=ticket.get("webUrl") or ticket.get("portalUrl"),
+        raw=ticket,
+    )
+
+
+@router.patch("/crm/zoho-desk/tickets/{ticket_id}", response_model=OrganizationZohoDeskTicketResponse)
+async def update_organization_zoho_desk_ticket(
+    ticket_id: str,
+    payload: OrganizationZohoDeskTicketUpdateRequest,
+    current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin", "manager"])),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
+    provider_status = dict(tenant_res.provider_status or {})
+    org_id = provider_status.get("zoho_desk_org_id")
+    if provider_status.get("zoho_desk_status") != "indexed":
+        raise HTTPException(status_code=409, detail="Zoho Desk is not connected for this organization")
+
+    try:
+        provider, credentials = await CRMIntegrationService.load_connection_secret(tenant_res)
+        if provider != "zoho":
+            raise RuntimeError("Zoho CRM credentials are not available for Zoho Desk")
+        request_payload = {
+            "subject": payload.subject,
+            "description": payload.description,
+            "contactId": payload.contact_id,
+            "email": str(payload.email) if payload.email else None,
+            "phone": payload.phone,
+            "status": payload.status,
+            "priority": payload.priority,
+            "cf": payload.custom_fields or {},
+        }
+        request_payload = {key: value for key, value in request_payload.items() if value not in (None, "", {})}
+        ticket = await ZohoDeskService.update_ticket(credentials, org_id, ticket_id, request_payload)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return OrganizationZohoDeskTicketResponse(
+        id=str(ticket.get("id") or ticket_id),
+        status=ticket.get("status"),
+        subject=ticket.get("subject"),
+        department_id=str(ticket.get("departmentId")) if ticket.get("departmentId") is not None else None,
+        web_url=ticket.get("webUrl") or ticket.get("portalUrl"),
+        raw=ticket,
+    )
+
+
+@router.post("/erp/tally/xml", response_model=OrganizationTallyXMLResponse)
+async def execute_organization_tally_xml(
+    payload: OrganizationTallyXMLRequest,
+    current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin"])),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
+
+    try:
+        provider, credentials = await ERPIntegrationService.load_connection_secret(tenant_res)
+        if provider != "tally":
+            raise RuntimeError("Tally ERP must be connected before executing Tally XML")
+        response_xml = await ERPIntegrationService.execute_tally_xml(credentials, payload.xml_payload)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return OrganizationTallyXMLResponse(response_xml=response_xml)
+
+
+async def _load_shiprocket_credentials(tenant_res: TenantResources) -> dict:
+    provider, credentials = await ShippingIntegrationService.load_connection_secret(tenant_res)
+    if provider != "shiprocket":
+        raise RuntimeError("Shiprocket must be connected before using shipping operations")
+    return credentials
+
+
+@router.post("/shipping/shiprocket/serviceability", response_model=OrganizationShiprocketAPIResponse)
+async def check_shiprocket_serviceability(
+    payload: OrganizationShiprocketServiceabilityRequest,
+    current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin", "manager"])),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
+    try:
+        credentials = await _load_shiprocket_credentials(tenant_res)
+        result = await ShippingIntegrationService.check_serviceability(credentials, payload.model_dump(exclude_none=True))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return OrganizationShiprocketAPIResponse(raw=result)
+
+
+@router.post("/shipping/shiprocket/orders", response_model=OrganizationShiprocketAPIResponse)
+async def create_shiprocket_order(
+    payload: OrganizationShiprocketCreateOrderRequest,
+    current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin", "manager"])),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
+    try:
+        credentials = await _load_shiprocket_credentials(tenant_res)
+        result = await ShippingIntegrationService.create_order(credentials, payload.payload)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return OrganizationShiprocketAPIResponse(raw=result)
+
+
+@router.post("/shipping/shiprocket/awb", response_model=OrganizationShiprocketAPIResponse)
+async def assign_shiprocket_awb(
+    payload: OrganizationShiprocketAssignAWBRequest,
+    current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin", "manager"])),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
+    request_payload = payload.model_dump(exclude_none=True)
+    try:
+        credentials = await _load_shiprocket_credentials(tenant_res)
+        result = await ShippingIntegrationService.assign_awb(credentials, request_payload)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return OrganizationShiprocketAPIResponse(raw=result)
+
+
+@router.post("/shipping/shiprocket/pickup", response_model=OrganizationShiprocketAPIResponse)
+async def generate_shiprocket_pickup(
+    payload: OrganizationShiprocketPickupRequest,
+    current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin", "manager"])),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
+    shipment_id = payload.shipment_id if isinstance(payload.shipment_id, list) else [payload.shipment_id]
+    try:
+        credentials = await _load_shiprocket_credentials(tenant_res)
+        result = await ShippingIntegrationService.generate_pickup(credentials, {"shipment_id": shipment_id})
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return OrganizationShiprocketAPIResponse(raw=result)
+
+
+@router.post("/shipping/shiprocket/track", response_model=OrganizationShiprocketAPIResponse)
+async def track_shiprocket_shipment(
+    payload: OrganizationShiprocketTrackRequest,
+    current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin", "manager"])),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
+    try:
+        credentials = await _load_shiprocket_credentials(tenant_res)
+        result = await ShippingIntegrationService.track(
+            credentials,
+            order_id=payload.order_id,
+            awb_code=payload.awb_code,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return OrganizationShiprocketAPIResponse(raw=result)
+
+
+@router.post("/toolkit/generate", response_model=OrganizationToolkitDraftResponse)
+async def generate_toolkit_tool(
+    payload: OrganizationToolkitGenerateRequest,
+    current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin"])),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
+    provider_status = dict(tenant_res.provider_status or {})
+    if not _toolkit_integration_connected(provider_status, payload.integration_type, payload.provider):
+        raise HTTPException(status_code=409, detail="Toolkit tools can only be generated for connected integrations")
+    draft = await ToolkitGeneratorService.generate_tool(
+        tenant_res,
+        payload.integration_type,
+        payload.provider,
+        payload.nlp_prompt,
+        payload.system_prompt,
+    )
+
+    _, drafts = _toolkit_state(provider_status)
+    drafts.append(draft)
+    provider_status["toolkit_drafts"] = drafts[-100:]
+    _append_toolkit_audit_event(
+        provider_status,
+        "toolkit_draft_generated",
+        current_user.id,
+        draft["integration_type"],
+        draft["provider"],
+        tool_name=(draft.get("tool") or {}).get("name"),
+        draft_id=draft["id"],
+        metadata=draft.get("context_summary", {}),
+    )
+    tenant_res.provider_status = provider_status
+    db.add(tenant_res)
+    await db.commit()
+    return OrganizationToolkitDraftResponse(**draft)
+
+
+@router.get("/toolkit/registry", response_model=OrganizationToolkitRegistryResponse)
+async def get_toolkit_registry(
+    integration_type: str,
+    provider: str,
+    current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin"])),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
+    provider_status = dict(tenant_res.provider_status or {})
+    _, drafts = _toolkit_state(provider_status)
+    integration_type = integration_type.strip().lower()
+    provider = provider.strip().lower()
+    if not _toolkit_integration_connected(provider_status, integration_type, provider):
+        return OrganizationToolkitRegistryResponse(
+            integration_type=integration_type,
+            provider=provider,
+            tools=[],
+            drafts=[],
+        )
+    matching_drafts = [
+        OrganizationToolkitDraftResponse(**draft)
+        for draft in drafts
+        if draft.get("status") == "draft" and _toolkit_matches(draft, integration_type, provider)
+    ]
+    tools = await _get_registered_tool_definitions(
+        db,
+        current_user.organization_id,
+        integration_type,
+        provider,
+        provider_status,
+    )
+    return OrganizationToolkitRegistryResponse(
+        integration_type=integration_type,
+        provider=provider,
+        tools=tools,
+        drafts=matching_drafts,
+    )
+
+
+@router.post("/toolkit/drafts/{draft_id}/approve", response_model=OrganizationToolkitDraftResponse)
+async def approve_toolkit_draft(
+    draft_id: str,
+    payload: OrganizationToolkitReviewRequest,
+    current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin"])),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
+    provider_status = dict(tenant_res.provider_status or {})
+    _, drafts = _toolkit_state(provider_status)
+    selected = None
+    for draft in drafts:
+        if draft.get("id") == draft_id:
+            selected = draft
+            break
+    if not selected:
+        raise HTTPException(status_code=404, detail="Toolkit draft not found")
+    if selected.get("status") != "draft":
+        raise HTTPException(status_code=409, detail="Toolkit draft has already been reviewed")
+    if not _toolkit_integration_connected(provider_status, selected["integration_type"], selected["provider"]):
+        raise HTTPException(status_code=409, detail="Toolkit tools can only be approved for connected integrations")
+
+    selected["status"] = "approved"
+    selected["reviewed_at"] = datetime.now(timezone.utc).isoformat()
+    selected["reviewed_by"] = str(current_user.id)
+    selected["review_notes"] = payload.notes
+    selected["tool"] = ToolkitGeneratorService._sanitize_tool(
+        dict(selected["tool"]),
+        selected["integration_type"],
+        selected["provider"],
+        selected.get("nlp_prompt") or "",
+        {"snapshot_context": [], "embedding_context": []},
+    )
+    tool = dict(selected["tool"])
+    tool_name = ToolkitGeneratorService._normalize_tool_name((tool.get("mcp") or {}).get("tool_name") or tool.get("name"))
+    tool.setdefault("mcp", {})
+    tool["mcp"]["tool_name"] = tool_name
+    tool["approved_at"] = selected["reviewed_at"]
+    tool["approved_by"] = selected["reviewed_by"]
+    tool["tenant_scope"] = {
+        "organization_id": str(current_user.organization_id),
+        "tenant_id": tenant_res.tenant_id,
+    }
+    tool["review"] = {
+        "status": "approved",
+        "required": True,
+        "reviewed_by": str(current_user.id),
+        "reviewed_at": selected["reviewed_at"],
+        "notes": payload.notes,
+    }
+
+    existing_result = await db.execute(
+        select(MCPToolRegistryEntry).where(
+            MCPToolRegistryEntry.organization_id == current_user.organization_id,
+            MCPToolRegistryEntry.integration_type == selected["integration_type"],
+            MCPToolRegistryEntry.provider == selected["provider"],
+            MCPToolRegistryEntry.tool_name == tool_name,
+        )
+    )
+    registry_entry = existing_result.scalars().first()
+    if registry_entry:
+        registry_entry.title = tool.get("title") or tool.get("name")
+        registry_entry.description = tool.get("description")
+        registry_entry.tool_definition = tool
+        registry_entry.status = "active"
+        registry_entry.version = (registry_entry.version or 1) + 1
+        registry_entry.draft_id = selected["id"]
+        registry_entry.approved_by = current_user.id
+        registry_entry.approved_at = datetime.fromisoformat(selected["reviewed_at"])
+    else:
+        registry_entry = MCPToolRegistryEntry(
+            id=uuid.uuid4(),
+            organization_id=current_user.organization_id,
+            tenant_id=tenant_res.tenant_id,
+            integration_type=selected["integration_type"],
+            provider=selected["provider"],
+            tool_name=tool_name,
+            title=tool.get("title") or tool.get("name"),
+            description=tool.get("description"),
+            tool_definition=tool,
+            status="active",
+            version=1,
+            draft_id=selected["id"],
+            approved_by=current_user.id,
+            approved_at=datetime.fromisoformat(selected["reviewed_at"]),
+        )
+    db.add(registry_entry)
+
+    tool["registry_id"] = str(registry_entry.id)
+    selected["tool"] = tool
+    registry_entry.tool_definition = tool
+
+    provider_status.pop("mcp_tool_registry", None)
+    provider_status["toolkit_drafts"] = drafts
+    _append_toolkit_audit_event(
+        provider_status,
+        "toolkit_tool_approved",
+        current_user.id,
+        selected["integration_type"],
+        selected["provider"],
+        tool_name=tool_name,
+        draft_id=selected["id"],
+        metadata={"registry_id": str(registry_entry.id), "version": registry_entry.version},
+    )
+    tenant_res.provider_status = provider_status
+    db.add(tenant_res)
+    await db.commit()
+    return OrganizationToolkitDraftResponse(**selected)
+
+
+@router.post("/toolkit/drafts/{draft_id}/reject", response_model=OrganizationToolkitDraftResponse)
+async def reject_toolkit_draft(
+    draft_id: str,
+    payload: OrganizationToolkitReviewRequest,
+    current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin"])),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
+    provider_status = dict(tenant_res.provider_status or {})
+    _, drafts = _toolkit_state(provider_status)
+    selected = None
+    for draft in drafts:
+        if draft.get("id") == draft_id:
+            selected = draft
+            break
+    if not selected:
+        raise HTTPException(status_code=404, detail="Toolkit draft not found")
+    if selected.get("status") != "draft":
+        raise HTTPException(status_code=409, detail="Toolkit draft has already been reviewed")
+
+    selected["status"] = "rejected"
+    selected["reviewed_at"] = datetime.now(timezone.utc).isoformat()
+    selected["reviewed_by"] = str(current_user.id)
+    selected["review_notes"] = payload.notes
+    provider_status.pop("mcp_tool_registry", None)
+    provider_status["toolkit_drafts"] = drafts
+    _append_toolkit_audit_event(
+        provider_status,
+        "toolkit_draft_rejected",
+        current_user.id,
+        selected["integration_type"],
+        selected["provider"],
+        tool_name=(selected.get("tool") or {}).get("name"),
+        draft_id=selected["id"],
+        metadata={"notes": payload.notes},
+    )
+    tenant_res.provider_status = provider_status
+    db.add(tenant_res)
+    await db.commit()
+    return OrganizationToolkitDraftResponse(**selected)
 
 
 @router.post("/database/index", response_model=OrganizationDatabaseIndexResponse)

@@ -13,14 +13,48 @@ from app.models.organization_user import OrganizationUser
 from app.models.tenant_resources import TenantResources
 from app.models.session import SuperAdminSession
 from app.models.user import SuperAdminUser
-from app.services.crm_integration_service import CRMScanResult
+from app.services.crm_integration_service import CRMIntegrationService, CRMScanResult
 from app.services.database_integration_service import DatabaseScanResult
+from app.services.erp_integration_service import ERPScanResult
+from app.services.shipping_integration_service import ShippingScanResult
 
 
 pytestmark = pytest.mark.asyncio
 
 FOUNDER_EMAIL = "org_auth_founder@nokvo.ai"
 PASSWORD = "TestPassword123!"
+
+
+async def test_zoho_hydrate_refreshes_saved_access_token_before_reuse():
+    request_calls = []
+
+    async def fake_request_json(method, url, headers, payload=None, allow_404=False, form_payload=None):
+        request_calls.append(
+            {
+                "method": method,
+                "url": url,
+                "headers": headers,
+                "payload": payload,
+                "allow_404": allow_404,
+                "form_payload": form_payload,
+            }
+        )
+        return {"access_token": "fresh-access-token", "api_domain": "https://www.zohoapis.in"}
+
+    with patch.object(CRMIntegrationService, "_request_json", new=AsyncMock(side_effect=fake_request_json)):
+        credentials = await CRMIntegrationService._hydrate_zoho_credentials(
+            {
+                "access_token": "expired-access-token",
+                "refresh_token": "stored-refresh-token",
+                "api_domain": "https://www.zohoapis.in",
+            }
+        )
+
+    assert credentials["access_token"] == "fresh-access-token"
+    assert credentials["refresh_token"] == "stored-refresh-token"
+    assert credentials["api_domain"] == "https://www.zohoapis.in"
+    assert request_calls[0]["form_payload"]["grant_type"] == "refresh_token"
+    assert request_calls[0]["form_payload"]["refresh_token"] == "stored-refresh-token"
 
 
 async def ensure_founder_user() -> SuperAdminUser:
@@ -560,6 +594,310 @@ async def test_admin_can_connect_crm_and_index_schema(client):
     assert crm_status_response.status_code == 200
     assert crm_status_response.json()["provider"] == "zoho"
     assert crm_status_response.json()["indexed_points"] == 2
+
+    await cleanup_org(org_name)
+
+
+async def test_admin_can_connect_tally_erp_and_index_schema(client):
+    founder = await ensure_founder_user()
+    org_name = "ERP Connect Org"
+    await cleanup_org(org_name)
+
+    response = await provision_org(client, founder, org_name)
+    assert response.status_code == 201
+    organization_id = response.json()["organization_id"]
+
+    async with db_session.AsyncSessionLocal() as db:
+        tenant = TenantResources(
+            id=uuid.uuid4(),
+            organization_id=uuid.UUID(organization_id),
+            tenant_id="tenant-org-auth-erp",
+            qdrant_collection_name="tenant_org_auth_erp_knowledge",
+            provisioning_status="success",
+            provider_status={},
+        )
+        db.add(tenant)
+        await db.commit()
+
+    verify_response = await complete_org_login(
+        client,
+        email="admin@orgauthco.com",
+        full_name="Org Admin",
+        hosted_domain="orgauthco.com",
+    )
+    admin_token = verify_response.json()["access_token"]
+
+    erp_scan_result = ERPScanResult(
+        provider="tally",
+        account_name="Demo Company",
+        folder_path="integrations/erp/tally",
+        modules=[
+            {
+                "api_name": "ledgers",
+                "label": "Ledgers",
+                "object_type": "Ledger",
+                "fields": [{"name": "Name", "label": "Name", "type": "text", "required": True}],
+                "record_count": 1,
+                "sample_records": [{"name": "Cash"}],
+                "status": "available",
+                "last_error": None,
+            }
+        ],
+        actions=[
+            {
+                "module": "ledgers",
+                "name": "create_ledger",
+                "method": "IMPORT",
+                "endpoint": "Import Data / All Masters / LEDGER",
+                "description": "Create a ledger",
+            }
+        ],
+    )
+
+    with patch(
+        "app.api.organization_auth.ERPIntegrationService.scan_schema",
+        new=AsyncMock(return_value=erp_scan_result),
+    ), patch(
+        "app.api.organization_auth.ERPIntegrationService.store_connection_secret",
+        new=AsyncMock(return_value="tenant-erp-secret"),
+    ), patch(
+        "app.api.organization_auth.ERPIntegrationService.index_schema_embeddings",
+        new=AsyncMock(return_value={
+            "indexed_points": 2,
+            "module_count": 1,
+            "action_count": 1,
+            "folder_path": "integrations/erp/tally",
+            "indexed_paths": ["integrations/erp/tally/schema/ledgers", "integrations/erp/tally/actions/ledgers"],
+        }),
+    ):
+        erp_response = await client.post(
+            "/api/org-auth/erp/connect",
+            json={
+                "provider": "tally",
+                "base_url": "http://localhost:9000",
+                "company_name": "Demo Company",
+                "timeout_seconds": 5,
+                "max_items_per_module": 10,
+            },
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+
+    assert erp_response.status_code == 200
+    erp_payload = erp_response.json()
+    assert erp_payload["provider"] == "tally"
+    assert erp_payload["status"] == "indexed"
+    assert erp_payload["indexed_points"] == 2
+    assert erp_payload["modules"][0]["api_name"] == "ledgers"
+
+    erp_status_response = await client.get(
+        "/api/org-auth/erp/status",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert erp_status_response.status_code == 200
+    assert erp_status_response.json()["provider"] == "tally"
+    assert erp_status_response.json()["indexed_points"] == 2
+
+    await cleanup_org(org_name)
+
+
+async def test_admin_can_connect_shiprocket_and_index_actions(client):
+    founder = await ensure_founder_user()
+    org_name = "Shiprocket Connect Org"
+    await cleanup_org(org_name)
+
+    response = await provision_org(client, founder, org_name)
+    assert response.status_code == 201
+    organization_id = response.json()["organization_id"]
+
+    async with db_session.AsyncSessionLocal() as db:
+        tenant = TenantResources(
+            id=uuid.uuid4(),
+            organization_id=uuid.UUID(organization_id),
+            tenant_id="tenant-org-auth-shiprocket",
+            qdrant_collection_name="tenant_org_auth_shiprocket_knowledge",
+            provisioning_status="success",
+            provider_status={},
+        )
+        db.add(tenant)
+        await db.commit()
+
+    verify_response = await complete_org_login(
+        client,
+        email="admin@orgauthco.com",
+        full_name="Org Admin",
+        hosted_domain="orgauthco.com",
+    )
+    admin_token = verify_response.json()["access_token"]
+
+    shipping_scan_result = ShippingScanResult(
+        provider="shiprocket",
+        account_name="shiprocket-api@example.com",
+        folder_path="integrations/shipping/shiprocket",
+        modules=[
+            {
+                "api_name": "orders",
+                "label": "Orders",
+                "fields": ["order_id"],
+                "description": "Create adhoc orders",
+            }
+        ],
+        actions=[
+            {
+                "module": "orders",
+                "name": "create_adhoc_order",
+                "method": "POST",
+                "endpoint": "/orders/create/adhoc",
+                "description": "Create an order",
+            }
+        ],
+    )
+
+    with patch(
+        "app.api.organization_auth.ShippingIntegrationService.scan_schema",
+        new=AsyncMock(return_value=shipping_scan_result),
+    ), patch(
+        "app.api.organization_auth.ShippingIntegrationService.store_connection_secret",
+        new=AsyncMock(return_value="tenant-shipping-secret"),
+    ), patch(
+        "app.api.organization_auth.ShippingIntegrationService.index_schema_embeddings",
+        new=AsyncMock(return_value={
+            "indexed_points": 2,
+            "module_count": 1,
+            "action_count": 1,
+            "folder_path": "integrations/shipping/shiprocket",
+            "indexed_paths": ["integrations/shipping/shiprocket/schema/orders"],
+        }),
+    ):
+        shipping_response = await client.post(
+            "/api/org-auth/shipping/connect",
+            json={
+                "provider": "shiprocket",
+                "email": "shiprocket-api@example.com",
+                "password": "secret",
+                "base_url": "https://apiv2.shiprocket.in/v1/external",
+            },
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+
+    assert shipping_response.status_code == 200
+    assert shipping_response.json()["provider"] == "shiprocket"
+    assert shipping_response.json()["indexed_points"] == 2
+
+    shipping_status_response = await client.get(
+        "/api/org-auth/shipping/status",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert shipping_status_response.status_code == 200
+    assert shipping_status_response.json()["provider"] == "shiprocket"
+
+    await cleanup_org(org_name)
+
+
+async def test_admin_can_connect_zoho_desk_and_manage_ticket(client):
+    founder = await ensure_founder_user()
+    org_name = "Zoho Desk Org"
+    await cleanup_org(org_name)
+
+    response = await provision_org(client, founder, org_name)
+    assert response.status_code == 201
+    organization_id = response.json()["organization_id"]
+
+    async with db_session.AsyncSessionLocal() as db:
+        tenant = TenantResources(
+            id=uuid.uuid4(),
+            organization_id=uuid.UUID(organization_id),
+            tenant_id="tenant-org-auth-desk",
+            qdrant_collection_name="tenant_org_auth_desk_knowledge",
+            provisioning_status="success",
+            provider_status={},
+        )
+        db.add(tenant)
+        await db.commit()
+
+    verify_response = await complete_org_login(
+        client,
+        email="admin@orgauthco.com",
+        full_name="Org Admin",
+        hosted_domain="orgauthco.com",
+    )
+    admin_token = verify_response.json()["access_token"]
+
+    desk_scan_result = {
+        "status": "indexed",
+        "account_name": "Desk Portal",
+        "org_id": "2389290",
+        "indexed_points": 6,
+        "module_count": 2,
+        "action_count": 4,
+        "folder_path": "integrations/zoho-desk",
+    }
+
+    with patch(
+        "app.api.organization_auth.CRMIntegrationService.load_connection_secret",
+        new=AsyncMock(return_value=("zoho", {"access_token": "token", "api_domain": "https://www.zohoapis.in"})),
+    ), patch(
+        "app.api.organization_auth.ZohoDeskService.connect_and_scan",
+        new=AsyncMock(return_value=(
+            {"access_token": "token", "api_domain": "https://www.zohoapis.in"},
+            type(
+                "DeskScan",
+                (),
+                {
+                    "account_name": "Desk Portal",
+                    "org_id": "2389290",
+                    "modules": [{"api_name": "tickets", "label": "Tickets"}],
+                    "actions": [{"module": "tickets", "name": "create_ticket"}],
+                    "folder_path": "integrations/zoho-desk",
+                },
+            )(),
+        )),
+    ), patch(
+        "app.api.organization_auth.ZohoDeskService.index_desk_embeddings",
+        new=AsyncMock(return_value={
+            "indexed_points": 6,
+            "module_count": 2,
+            "action_count": 4,
+            "folder_path": "integrations/zoho-desk",
+        }),
+    ):
+        connect_response = await client.post(
+            "/api/org-auth/crm/zoho-desk/connect",
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+
+    assert connect_response.status_code == 200
+    assert connect_response.json()["org_id"] == "2389290"
+    assert connect_response.json()["indexed_points"] == 6
+
+    with patch(
+        "app.api.organization_auth.CRMIntegrationService.load_connection_secret",
+        new=AsyncMock(return_value=("zoho", {"access_token": "token", "api_domain": "https://www.zohoapis.in"})),
+    ), patch(
+        "app.api.organization_auth.ZohoDeskService.create_ticket",
+        new=AsyncMock(return_value={"id": "9001", "status": "Open", "subject": "Callback requested", "departmentId": "1"}),
+    ):
+        ticket_response = await client.post(
+            "/api/org-auth/crm/zoho-desk/tickets",
+            json={"subject": "Callback requested", "department_id": "1", "description": "Customer requested callback"},
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+    assert ticket_response.status_code == 200
+    assert ticket_response.json()["id"] == "9001"
+
+    with patch(
+        "app.api.organization_auth.CRMIntegrationService.load_connection_secret",
+        new=AsyncMock(return_value=("zoho", {"access_token": "token", "api_domain": "https://www.zohoapis.in"})),
+    ), patch(
+        "app.api.organization_auth.ZohoDeskService.update_ticket",
+        new=AsyncMock(return_value={"id": "9001", "status": "Closed", "subject": "Callback requested", "departmentId": "1"}),
+    ):
+        update_response = await client.patch(
+            "/api/org-auth/crm/zoho-desk/tickets/9001",
+            json={"status": "Closed"},
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+    assert update_response.status_code == 200
+    assert update_response.json()["status"] == "Closed"
 
     await cleanup_org(org_name)
 

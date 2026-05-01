@@ -219,6 +219,10 @@ class CRMIntegrationService:
                 )
             )
 
+        await QdrantService.delete_points_by_filter(
+            tenant_res,
+            {"integration_type": "crm"},
+        )
         if points:
             await QdrantService.upsert_points(tenant_res, points)
 
@@ -329,6 +333,7 @@ class CRMIntegrationService:
                 "api_domain": token_payload.get("api_domain"),
                 "has_access_token": bool(token_payload.get("access_token")),
                 "has_refresh_token": bool(token_payload.get("refresh_token")),
+                "scope": token_payload.get("scope"),
                 "error": token_payload.get("error"),
             },
         )
@@ -343,12 +348,14 @@ class CRMIntegrationService:
     async def _hydrate_zoho_credentials(credentials: dict[str, Any]) -> dict[str, Any]:
         access_token = (credentials.get("access_token") or "").strip()
         refresh_token = (credentials.get("refresh_token") or "").strip()
-        if access_token:
-            credentials["api_domain"] = CRMIntegrationService._normalize_zoho_api_domain(credentials.get("api_domain"))
-            return credentials
         if not refresh_token:
+            if access_token:
+                credentials["api_domain"] = CRMIntegrationService._normalize_zoho_api_domain(credentials.get("api_domain"))
+                return credentials
             raise RuntimeError("Zoho access token or refresh token is required")
 
+        # Zoho access tokens are short-lived. Refresh whenever possible so later
+        # Desk operations do not reuse an expired token saved during CRM OAuth.
         token_payload = await CRMIntegrationService._request_json(
             "POST",
             f"{settings.ZOHO_ACCOUNTS_URL.rstrip('/')}/oauth/v2/token",
@@ -367,6 +374,7 @@ class CRMIntegrationService:
                 "keys": sorted(token_payload.keys()),
                 "api_domain": token_payload.get("api_domain"),
                 "has_access_token": bool(token_payload.get("access_token")),
+                "scope": token_payload.get("scope"),
                 "error": token_payload.get("error"),
             },
         )
