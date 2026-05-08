@@ -11,6 +11,7 @@ class QdrantService:
     _INDEXED_COLLECTIONS: set[str] = set()
     TOOLKIT_PAYLOAD_INDEX_FIELDS = [
         "organization_id",
+        "tenant_id",
         "tenant_integration_id",
         "provider_connection_id",
         "context_snapshot_id",
@@ -19,6 +20,8 @@ class QdrantService:
         "provider",
         "status",
         "source_kind",
+        "resource",
+        "resource_type",
     ]
 
     @staticmethod
@@ -102,7 +105,7 @@ class QdrantService:
         point_structs = []
         for point in points:
             payload = dict(point.get("payload", {}) or {})
-            payload["tenant_id"] = tenant_res.tenant_id
+            payload = QdrantService._scope_payload(tenant_res, payload)
             if payload.get("context_snapshot_id") and not payload.get("selected_context_snapshot_id"):
                 payload["selected_context_snapshot_id"] = payload["context_snapshot_id"]
             if payload.get("selected_context_snapshot_id") and not payload.get("context_snapshot_id"):
@@ -178,6 +181,46 @@ class QdrantService:
                 )
             )
         return Filter(must=must_conditions)
+
+    @staticmethod
+    def _scope_payload(tenant_res: TenantResources, payload: dict) -> dict:
+        scoped = dict(payload or {})
+        provider_status = dict(tenant_res.provider_status or {})
+        integration_type = str(scoped.get("integration_type") or "")
+        provider = str(scoped.get("provider") or "")
+        prefix = "db" if integration_type == "database" else integration_type
+        scoped["tenant_id"] = tenant_res.tenant_id
+        scoped.setdefault("organization_id", str(tenant_res.organization_id))
+        if integration_type:
+            scoped.setdefault("tenant_integration_id", provider_status.get(f"{prefix}_tenant_integration_id") or f"{tenant_res.tenant_id}:{integration_type}:{provider}")
+            scoped.setdefault("provider_connection_id", provider_status.get(f"{prefix}_provider_connection_id") or f"{tenant_res.tenant_id}:{integration_type}:{provider}:connection")
+            scoped.setdefault("context_snapshot_id", provider_status.get(f"{prefix}_context_snapshot_id"))
+            scoped.setdefault("selected_context_snapshot_id", scoped.get("context_snapshot_id"))
+        scoped.setdefault("source_kind", scoped.get("source_type") or "connector_template")
+        scoped.setdefault("resource", QdrantService._resource_name(scoped))
+        scoped.setdefault("resource_type", QdrantService._resource_type(scoped))
+        return scoped
+
+    @staticmethod
+    def _resource_name(payload: dict) -> str:
+        if payload.get("table"):
+            table_name = str(payload.get("table"))
+            if "." in table_name:
+                return table_name
+            schema = str(payload.get("schema") or payload.get("schema_name") or "public")
+            return f"{schema}.{table_name}"
+        return str(payload.get("endpoint") or payload.get("action") or payload.get("module") or payload.get("name") or "")
+
+    @staticmethod
+    def _resource_type(payload: dict) -> str:
+        source_kind = str(payload.get("source_kind") or payload.get("source_type") or "")
+        if "schema" in source_kind or payload.get("table"):
+            return "table"
+        if payload.get("endpoint"):
+            return "endpoint"
+        if payload.get("action"):
+            return "action"
+        return "object"
 
     @staticmethod
     async def delete_points_by_filter(

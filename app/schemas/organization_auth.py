@@ -413,6 +413,7 @@ TOOLKIT_INTEGRATION_TYPES = {"database", "crm", "zoho_desk", "erp", "shipping", 
 class OrganizationToolkitGenerateRequest(BaseModel):
     integration_type: str
     provider: str
+    builder_key: Optional[str] = None
     nlp_prompt: str
     system_prompt: Optional[str] = None
 
@@ -456,6 +457,23 @@ class OrganizationToolkitRegistryResponse(BaseModel):
     provider: str
     tools: list[dict[str, Any]] = Field(default_factory=list)
     drafts: list[OrganizationToolkitDraftResponse] = Field(default_factory=list)
+
+
+class OrganizationToolkitBuilderResponse(BaseModel):
+    builder_key: str
+    integration_type: str
+    provider: str
+    execution_backend: str
+    resource_model: str
+    label: str
+    description: str
+    detail: Optional[str] = None
+    supported_operations: list[str] = Field(default_factory=list)
+    connected: bool = True
+
+
+class OrganizationToolkitBuildersResponse(BaseModel):
+    builders: list[OrganizationToolkitBuilderResponse] = Field(default_factory=list)
 
 
 class OrganizationShippingProviderResponse(BaseModel):

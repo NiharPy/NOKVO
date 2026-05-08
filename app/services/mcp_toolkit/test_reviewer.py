@@ -98,6 +98,7 @@ def valid_insert_generation() -> dict:
                     "blocked_statements": ["DROP", "ALTER", "CREATE", "TRUNCATE", "UPDATE", "DELETE", "SELECT"],
                     "allowed_tables": ["public.customers"],
                     "allowed_columns": {"public.customers": ["full_name", "phone"]},
+                    "parameter_binding": {"style": "named", "sources": ["input.full_name", "input.phone", "input.idempotency_key"]},
                     "idempotency": {"required": True, "source": "input.idempotency_key"},
                     "explain_validation": {"required_before_publish": True},
                 },
@@ -134,7 +135,10 @@ def valid_insert_generation() -> dict:
         },
         "retrieval": {
             "status": "passed",
+            "status_reason": None,
             "confidence": 0.91,
+            "fallback_used": False,
+            "publish_blockers": [],
             "query_variants": ["create customers"],
             "scope_filter": {
                 "organization_id": "org_1",
@@ -148,6 +152,7 @@ def valid_insert_generation() -> dict:
             "retrieved_context_ids": ["ctx_customers"],
             "rejected_context_ids": [],
             "warnings": [],
+            "errors": [],
             "rejected_chunks": [],
         },
     }
@@ -176,7 +181,7 @@ def test_reviewer_rejects_sql_statement_inside_blocked_statements():
     generation = valid_insert_generation()
     generation["tool"]["execution"]["mapping"]["blocked_statements"].append("INSERT")
 
-    assert_rejected_with(generation, "SQL_STATEMENT_BLOCKED")
+    assert_rejected_with(generation, "SQL_BLOCKED_STATEMENT_USED")
 
 
 def test_reviewer_rejects_tool_name_table_mismatch():
@@ -199,7 +204,7 @@ def test_reviewer_rejects_unused_input_fields():
     generation = valid_insert_generation()
     generation["tool"]["input_schema"]["properties"]["limit"] = {"type": "integer", "minimum": 1, "maximum": 100}
 
-    assert_rejected_with(generation, "UNUSED_INPUT_FIELDS")
+    assert_rejected_with(generation, "UNUSED_INPUT_FIELD")
 
 
 def test_reviewer_rejects_output_fields_not_matching_execution():
@@ -326,6 +331,7 @@ def test_reviewer_rejects_raw_pii_fields_in_read_output_schema():
                     "blocked_statements": ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE"],
                     "allowed_tables": ["public.customers"],
                     "allowed_columns": {"public.customers": ["customer_id", "phone"]},
+                    "parameter_binding": {"style": "named", "sources": ["input.phone_number", "input.limit"]},
                     "explain_validation": {"required_before_publish": True},
                 },
             },
@@ -365,7 +371,10 @@ def test_reviewer_rejects_raw_pii_fields_in_read_output_schema():
         },
         "retrieval": {
             "status": "passed",
+            "status_reason": None,
             "confidence": 0.91,
+            "fallback_used": False,
+            "publish_blockers": [],
             "query_variants": ["lookup customers by phone"],
             "scope_filter": {
                 "organization_id": "org_1",
@@ -379,6 +388,7 @@ def test_reviewer_rejects_raw_pii_fields_in_read_output_schema():
             "retrieved_context_ids": ["ctx_customers"],
             "rejected_context_ids": [],
             "warnings": [],
+            "errors": [],
             "rejected_chunks": [],
         },
     }
@@ -391,7 +401,7 @@ def test_reviewer_rejects_fallback_title_description():
     generation["tool"]["title"] = "Postgresql generated tool"
     generation["tool"]["description"] = "Draft generated from indexed integration context. Configure Azure OpenAI for richer tool synthesis."
 
-    assert_rejected_with(generation, "FALLBACK_TITLE_DESCRIPTION")
+    assert_rejected_with(generation, "FALLBACK_TITLE_USED")
 
 
 def test_reviewer_rejects_bare_table_name_tool_name():
@@ -400,7 +410,11 @@ def test_reviewer_rejects_bare_table_name_tool_name():
     generation["tool"]["mcp"]["tool_name"] = "customers"
     generation["tool_plan"]["name"] = "customers"
 
-    assert_rejected_with(generation, "BAD_OPERATION_NAME_PREFIX")
+    result = Reviewer.validate(generation, VERIFIED_CONTEXT)
+    assert result["validation"]["status"] == "failed"
+    codes = validation_codes(result)
+    assert "BAD_OPERATION_NAME_PREFIX" in codes
+    assert "GENERIC_TABLE_NAME_USED" in codes
 
 
 def test_reviewer_accepts_semantically_consistent_insert_tool():
@@ -410,3 +424,186 @@ def test_reviewer_accepts_semantically_consistent_insert_tool():
 
     assert result["validation"]["status"] == "passed"
     assert result["review"]["status"] == "draft"
+
+
+def test_reviewer_rejects_unbound_limit_parameter():
+    generation = deepcopy(valid_insert_generation())
+    generation["tool"]["name"] = "lookup_customer_by_phone"
+    generation["tool"]["title"] = "Lookup Customer By Phone"
+    generation["tool"]["description"] = "Lookup customer by phone."
+    generation["tool"]["mcp"]["tool_name"] = "lookup_customer_by_phone"
+    generation["tool"]["execution"]["mode"] = "read_only"
+    generation["tool"]["execution"]["mapping"] = {
+        "sql_template": "SELECT public.customers.customer_id FROM public.customers WHERE public.customers.phone = :phone LIMIT :limit",
+        "allowed_statements": ["SELECT"],
+        "blocked_statements": ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE"],
+        "allowed_tables": ["public.customers"],
+        "allowed_columns": {"public.customers": ["customer_id", "phone"]},
+        "parameter_binding": {"style": "named", "sources": ["input.phone"]},
+        "explain_validation": {"required_before_publish": True},
+    }
+    generation["tool"]["input_schema"]["properties"] = {
+        "phone": {"type": "string", "minLength": 7, "maxLength": 20},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+    }
+    generation["tool"]["input_schema"]["required"] = ["phone"]
+    generation["tool"]["output_schema"]["properties"]["data"] = {
+        "type": "object",
+        "properties": {
+            "records": {"type": "array", "items": {"type": "object", "properties": {"customer_id": {"type": "integer"}}, "additionalProperties": False}},
+            "count": {"type": "integer"},
+        },
+        "required": ["records", "count"],
+        "additionalProperties": False,
+    }
+    generation["tool_plan"] = {
+        "name": "lookup_customer_by_phone",
+        "operation_type": "read",
+        "exact_resources_used": ["public.customers"],
+        "output_fields": [{"name": "customer_id", "type": "integer"}],
+        "approval_policy": {"human_approval_required": False},
+    }
+
+    assert_rejected_with(generation, "UNBOUND_SQL_PARAMETER")
+
+
+def test_reviewer_rejects_read_output_sql_mismatch_for_call_logs_count():
+    generation = deepcopy(valid_insert_generation())
+    generation["tool"]["name"] = "lookup_customer_details_by_phone"
+    generation["tool"]["title"] = "Lookup Customer Details By Phone"
+    generation["tool"]["description"] = "Lookup customer details by phone."
+    generation["tool"]["mcp"]["tool_name"] = "lookup_customer_details_by_phone"
+    generation["tool"]["execution"]["mode"] = "read_only"
+    generation["tool"]["execution"]["mapping"] = {
+        "sql_template": "SELECT public.customers.customer_id, RIGHT(CAST(public.customers.phone AS TEXT), 4) AS phone_last4 FROM public.customers WHERE public.customers.phone = :phone LIMIT :limit",
+        "allowed_statements": ["SELECT"],
+        "blocked_statements": ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE"],
+        "allowed_tables": ["public.customers"],
+        "allowed_columns": {"public.customers": ["customer_id", "phone"]},
+        "parameter_binding": {"style": "named", "sources": ["input.phone", "input.limit"]},
+        "explain_validation": {"required_before_publish": True},
+    }
+    generation["tool"]["input_schema"]["properties"] = {
+        "phone": {"type": "string", "minLength": 7, "maxLength": 20},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+    }
+    generation["tool"]["input_schema"]["required"] = ["phone"]
+    generation["tool"]["output_schema"]["properties"]["data"] = {
+        "type": "object",
+        "properties": {
+            "records": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "customer_id": {"type": "integer"},
+                        "phone_last4": {"type": "string"},
+                        "call_logs_count": {"type": "integer"},
+                    },
+                    "additionalProperties": False,
+                },
+            },
+            "count": {"type": "integer"},
+        },
+        "required": ["records", "count"],
+        "additionalProperties": False,
+    }
+    generation["tool_plan"] = {
+        "name": "lookup_customer_details_by_phone",
+        "operation_type": "read",
+        "exact_resources_used": ["public.customers"],
+        "output_fields": [{"name": "customer_id", "type": "integer"}, {"name": "phone_last4", "type": "string"}, {"name": "call_logs_count", "type": "integer"}],
+        "approval_policy": {"human_approval_required": False},
+    }
+
+    assert_rejected_with(generation, "READ_OUTPUT_SQL_MISMATCH")
+
+
+def test_reviewer_rejects_allowed_tables_with_unused_call_logs():
+    generation = deepcopy(valid_insert_generation())
+    generation["tool"]["execution"]["mode"] = "read_only"
+    generation["tool"]["execution"]["mapping"] = {
+        "sql_template": "SELECT public.customers.customer_id FROM public.customers WHERE public.customers.phone = :phone LIMIT :limit",
+        "allowed_statements": ["SELECT"],
+        "blocked_statements": ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE"],
+        "allowed_tables": ["public.customers", "public.call_logs"],
+        "allowed_columns": {"public.customers": ["customer_id", "phone"], "public.call_logs": ["call_log_id"]},
+        "parameter_binding": {"style": "named", "sources": ["input.phone", "input.limit"]},
+        "explain_validation": {"required_before_publish": True},
+    }
+    generation["tool"]["input_schema"]["properties"] = {
+        "phone": {"type": "string", "minLength": 7, "maxLength": 20},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+    }
+    generation["tool"]["input_schema"]["required"] = ["phone"]
+    generation["tool"]["output_schema"]["properties"]["data"] = {
+        "type": "object",
+        "properties": {
+            "records": {"type": "array", "items": {"type": "object", "properties": {"customer_id": {"type": "integer"}}, "additionalProperties": False}},
+            "count": {"type": "integer"},
+        },
+        "required": ["records", "count"],
+        "additionalProperties": False,
+    }
+    generation["tool_plan"] = {
+        "name": "lookup_customer_by_phone",
+        "operation_type": "read",
+        "exact_resources_used": ["public.customers", "public.call_logs"],
+        "output_fields": [{"name": "customer_id", "type": "integer"}],
+        "approval_policy": {"human_approval_required": False},
+    }
+
+    assert_rejected_with(generation, "SQL_ALLOWED_TABLE_MISMATCH")
+
+
+def test_reviewer_rejects_mutation_intent_downgraded_to_read():
+    generation = deepcopy(valid_insert_generation())
+    generation["tool"]["name"] = "lookup_customer_by_phone"
+    generation["tool"]["title"] = "Lookup Customer By Phone"
+    generation["tool"]["description"] = "Lookup customer by phone."
+    generation["tool"]["mcp"]["tool_name"] = "lookup_customer_by_phone"
+    generation["tool"]["execution"]["mode"] = "read_only"
+    generation["tool"]["execution"]["mapping"] = {
+        "sql_template": "SELECT public.customers.customer_id FROM public.customers WHERE public.customers.phone = :phone_number LIMIT :limit",
+        "allowed_statements": ["SELECT"],
+        "blocked_statements": ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE"],
+        "allowed_tables": ["public.customers"],
+        "allowed_columns": {"public.customers": ["customer_id", "phone"]},
+        "parameter_binding": {"style": "named", "sources": ["input.phone_number", "input.limit"]},
+        "explain_validation": {"required_before_publish": True},
+    }
+    generation["tool"]["input_schema"]["properties"] = {
+        "phone_number": {"type": "string", "minLength": 7, "maxLength": 20},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+    }
+    generation["tool"]["input_schema"]["required"] = ["phone_number"]
+    generation["tool"]["output_schema"]["properties"]["data"] = {
+        "type": "object",
+        "properties": {
+            "records": {"type": "array", "items": {"type": "object", "properties": {"customer_id": {"type": "integer"}}, "additionalProperties": False}},
+            "count": {"type": "integer"},
+        },
+        "required": ["records", "count"],
+        "additionalProperties": False,
+    }
+    generation["tool_plan"] = {
+        "name": "lookup_customer_by_phone",
+        "operation_type": "read",
+        "workflow_type": None,
+        "exact_resources_used": ["public.customers"],
+        "output_fields": [{"name": "customer_id", "type": "integer"}],
+        "approval_policy": {"human_approval_required": False},
+        "intent_signals": {
+            "normalized_prompt": "retrieve customer details using phone number and change username",
+            "read_detected": True,
+            "create_detected": False,
+            "update_detected": True,
+            "delete_detected": False,
+            "workflow_detected": True,
+            "operation_type": "workflow",
+            "workflow_type": "read_then_update",
+            "target_field": "username",
+        },
+    }
+
+    assert_rejected_with(generation, "MUTATION_INTENT_DOWNGRADED_TO_READ")

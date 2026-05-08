@@ -194,6 +194,10 @@ def test_qdrant_missing_index_creates_low_confidence_warning_and_validation_fail
     retrieval = EmbeddingRetriever.rank_filter_verify(request, chunks, ["customer by phone"], scope_filter)
 
     assert retrieval["status"] == "low_confidence"
+    assert retrieval["confidence"] >= 0.80
+    assert retrieval["fallback_used"] is True
+    assert retrieval["status_reason"] == "fallback_context_used_after_qdrant_index_failure"
+    assert retrieval["publish_blockers"] == ["QDRANT_INDEX_MISSING", "FALLBACK_RETRIEVAL_USED"]
     assert any("QDRANT_INDEX_MISSING_FALLBACK_USED" in warning for warning in retrieval["warnings"])
 
     result = ToolkitGeneratorService._sanitize_tool({}, "database", "postgresql", "Create a tool to find customer by phone", db_context(CUSTOMERS))

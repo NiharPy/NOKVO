@@ -8,6 +8,7 @@ import re
 from typing import Any, Literal
 
 from app.models.tenant_resources import TenantResources
+from app.services.mcp_toolkit.capability_registry import ProviderCapabilityRegistry
 from app.services.mcp_toolkit.pii_policy import PIIPolicyBuilder
 from app.services.mcp_toolkit.safety_classifier import SafetyClassifier
 from app.services.qdrant_service import QdrantService
@@ -26,6 +27,7 @@ class EmbeddingRetrievalRequest:
     integration_type: str
     provider: str
     user_prompt: str
+    tenant_id: str | None = None
     normalized_intent: str | None = None
     operation_type: str | None = None
     candidate_entities: list[str] = field(default_factory=list)
@@ -35,29 +37,28 @@ class EmbeddingRetrievalRequest:
 
 @dataclass(slots=True)
 class RetrievedEmbeddingContext:
+    status: RetrievalStatus
+    status_reason: str | None
+    confidence: float
+    fallback_used: bool
+    publish_blockers: list[str]
     selected_context: dict[str, Any]
     query_variants: list[str]
     retrieved_chunks: list[dict[str, Any]]
     ranked_chunks: list[dict[str, Any]]
     verified_resources: list[dict[str, Any]]
     rejected_chunks: list[dict[str, Any]]
-    confidence: float
     retrieval_status: RetrievalStatus
     missing_context: list[str]
     scope_filter: dict[str, Any]
+    warnings: list[str] = field(default_factory=list)
+    errors: list[dict[str, Any]] = field(default_factory=list)
 
 
 class EmbeddingRetriever:
     ALLOWED_SOURCE_KINDS = {
-        "database": {"db_schema_snapshot", "db_table", "db_column", "db_relationship", "db_constraint", "db_index", "approved_query_template"},
-        "crm": {"crm_object_schema", "crm_field_schema", "crm_action_template", "connector_template", "oauth_scope_metadata"},
-        "erp": {"erp_object_schema", "erp_action_template", "connector_template", "business_operation_metadata"},
-        "his": {"his_object_schema", "his_action_template", "patient_safety_policy", "appointment_module_metadata", "billing_module_metadata", "lab_module_metadata"},
-        "ecommerce": {"ecommerce_object_schema", "ecommerce_action_template", "order_metadata", "customer_metadata", "product_metadata", "refund_metadata"},
-        "payments": {"ecommerce_object_schema", "ecommerce_action_template", "payment_metadata", "refund_metadata", "transaction_metadata", "connector_template"},
-        "custom_api": {"openapi_spec", "api_endpoint", "api_operation", "request_schema", "response_schema", "auth_policy"},
-        "shipping": {"ecommerce_object_schema", "ecommerce_action_template", "connector_template", "api_endpoint", "api_operation"},
-        "zoho_desk": {"crm_object_schema", "crm_field_schema", "crm_action_template", "connector_template", "oauth_scope_metadata"},
+        capability.integration_type: set(capability.allowed_source_kinds)
+        for capability in ProviderCapabilityRegistry.list_capabilities()
     }
     SYNONYMS = {
         "customer": ["customer", "customers", "contact", "contacts", "account", "accounts", "patient", "patients", "client", "clients", "customer_id"],
@@ -95,10 +96,11 @@ class EmbeddingRetriever:
         operation_type: str | None = None,
     ) -> dict[str, Any]:
         request = EmbeddingRetrievalRequest(
-            organization_id=str(context.get("organization_id") or "local_organization"),
-            tenant_integration_id=str(context.get("tenant_integration_id") or f"local:{integration_type}:{provider}"),
-            provider_connection_id=str(context.get("provider_connection_id") or f"local:{integration_type}:{provider}:connection"),
-            selected_context_snapshot_id=str(context.get("selected_context_snapshot_id") or EmbeddingRetriever.snapshot_id(context.get("snapshot_context", []))),
+            organization_id=str(context.get("organization_id") or ""),
+            tenant_id=str(context.get("tenant_id") or "") or None,
+            tenant_integration_id=str(context.get("tenant_integration_id") or ""),
+            provider_connection_id=str(context.get("provider_connection_id") or ""),
+            selected_context_snapshot_id=str(context.get("selected_context_snapshot_id") or ""),
             integration_type=integration_type,
             provider=provider,
             user_prompt=user_prompt,
@@ -108,6 +110,8 @@ class EmbeddingRetriever:
             candidate_inputs=EmbeddingRetriever.extract_candidate_inputs(user_prompt),
         )
         scope_filter = EmbeddingRetriever.scope_filter(request)
+        if not EmbeddingRetriever._scope_complete(scope_filter):
+            return EmbeddingRetriever._failed_result(request, scope_filter, ["selected connected integration context is required"])
         if not context.get("snapshot_context") and not context.get("embedding_context"):
             return EmbeddingRetriever._failed_result(request, scope_filter, ["selected integration context required"])
         query_variants = EmbeddingRetriever.query_variants(request.user_prompt, request.integration_type, request.operation_type, request.candidate_entities)
@@ -119,9 +123,11 @@ class EmbeddingRetriever:
     def scope_filter(request: EmbeddingRetrievalRequest) -> dict[str, Any]:
         return {
             "organization_id": request.organization_id,
+            "tenant_id": request.tenant_id,
             "tenant_integration_id": request.tenant_integration_id,
             "provider_connection_id": request.provider_connection_id,
             "selected_context_snapshot_id": request.selected_context_snapshot_id,
+            "context_snapshot_id": request.selected_context_snapshot_id,
             "integration_type": request.integration_type,
             "provider": request.provider,
             "status": ["active", "approved"],
@@ -171,6 +177,15 @@ class EmbeddingRetriever:
                     "customer_id relationships orders support_tickets call_logs",
                 ]
             )
+        if re.search(r"\b(change|update|modify|set)\b", text) and re.search(r"\buser\s*name\b|\busername\b", text):
+            variants.extend(
+                [
+                    "update customer username",
+                    "customers phone username full_name display_name",
+                    "customer identity fields phone full_name username",
+                    "update customer profile by customer_id",
+                ]
+            )
         if re.search(r"\border\b", text) and re.search(r"\bstatus\b", text):
             variants.extend(
                 [
@@ -215,9 +230,11 @@ class EmbeddingRetriever:
                         "tenant_integration_id": request.tenant_integration_id,
                         "provider_connection_id": request.provider_connection_id,
                         "selected_context_snapshot_id": request.selected_context_snapshot_id,
+                        "context_snapshot_id": request.selected_context_snapshot_id,
                         "integration_type": request.integration_type,
                         "provider": request.provider,
                         "status": ["active", "approved"],
+                        "source_kind": sorted(EmbeddingRetriever.ALLOWED_SOURCE_KINDS.get(request.integration_type, set())),
                     },
                 )
             except Exception as exc:
@@ -326,7 +343,7 @@ class EmbeddingRetriever:
         query_variants: list[str],
         scope_filter: dict[str, Any],
     ) -> dict[str, Any]:
-        allowed_source_kinds = EmbeddingRetriever.ALLOWED_SOURCE_KINDS.get(request.integration_type, set())
+        allowed_source_kinds = ProviderCapabilityRegistry.allowed_source_kinds(request.integration_type, request.provider) or EmbeddingRetriever.ALLOWED_SOURCE_KINDS.get(request.integration_type, set())
         verified_chunks: list[dict[str, Any]] = []
         rejected_chunks: list[dict[str, Any]] = []
         for chunk in chunks:
@@ -342,6 +359,7 @@ class EmbeddingRetriever:
             verified_chunks.append(chunk)
 
         ranked_chunks = sorted(verified_chunks, key=lambda item: item.get("retrieval_score", 0.0), reverse=True)[: request.top_k]
+        candidate_resources = list(dict.fromkeys(chunk.get("resource") for chunk in ranked_chunks if chunk.get("resource")))
         verified_resources = EmbeddingRetriever._verified_resources(request, ranked_chunks)
         if EmbeddingRetriever._ambiguous_prompt(request):
             verified_resources = []
@@ -349,21 +367,35 @@ class EmbeddingRetriever:
         selected_chunks = [chunk for chunk in ranked_chunks if chunk.get("resource") in selected_resources]
         confidence = round(max([chunk.get("retrieval_score", 0.0) for chunk in selected_chunks] or [0.0]), 3)
         backend_errors = [chunk for chunk in rejected_chunks if chunk.get("reason") in {"QDRANT_INDEX_MISSING", "RETRIEVAL_BACKEND_ERROR"}]
+        fallback_used = bool(backend_errors and verified_resources)
+        status_reason = None
+        publish_blockers: list[str] = []
         if not verified_resources:
             status: RetrievalStatus = "failed"
             missing_context = ["verified resources required"]
+            status_reason = "verified_resources_missing"
         elif confidence >= 0.80:
             status = "passed"
             missing_context = []
         elif confidence >= 0.60:
             status = "low_confidence"
             missing_context = ["retrieved resources need admin context confirmation"]
+            status_reason = "retrieval_confidence_below_publish_threshold"
         else:
             status = "failed"
             missing_context = ["retrieval confidence below threshold"]
+            status_reason = "retrieval_confidence_below_minimum_threshold"
         if backend_errors:
             status = "low_confidence" if verified_resources else "failed"
             missing_context = list(dict.fromkeys([*missing_context, "scoped Qdrant retrieval backend error requires resolution"]))
+            if any(chunk.get("reason") == "QDRANT_INDEX_MISSING" for chunk in backend_errors):
+                status_reason = "fallback_context_used_after_qdrant_index_failure" if verified_resources else "qdrant_index_missing"
+                publish_blockers.append("QDRANT_INDEX_MISSING")
+            else:
+                status_reason = "fallback_context_used_after_scoped_retrieval_failure" if verified_resources else "retrieval_backend_error"
+                publish_blockers.append("RETRIEVAL_BACKEND_ERROR")
+            if verified_resources:
+                publish_blockers.append("FALLBACK_RETRIEVAL_USED")
 
         source_context = [EmbeddingRetriever._source_context_entry(chunk) for chunk in selected_chunks]
         selected_context = {
@@ -371,12 +403,18 @@ class EmbeddingRetriever:
             "embedding_context": [],
             "source_context": source_context,
         }
+        warnings = EmbeddingRetriever._warnings(status, rejected_chunks, fallback_used)
+        errors = EmbeddingRetriever._errors_from_rejected_chunks(rejected_chunks)
         return {
             "status": status,
+            "status_reason": status_reason,
             "retrieval_status": status,
             "confidence": confidence,
+            "fallback_used": fallback_used,
+            "publish_blockers": list(dict.fromkeys(publish_blockers)),
             "query_variants": query_variants,
             "scope_filter": scope_filter,
+            "candidate_resources": candidate_resources,
             "selected_context": selected_context,
             "retrieved_chunks": chunks,
             "ranked_chunks": ranked_chunks,
@@ -385,7 +423,8 @@ class EmbeddingRetriever:
             "missing_context": missing_context,
             "retrieved_context_ids": [chunk["context_id"] for chunk in ranked_chunks],
             "rejected_context_ids": [chunk["context_id"] for chunk in rejected_chunks],
-            "warnings": EmbeddingRetriever._warnings(status, rejected_chunks, bool(verified_resources)),
+            "warnings": warnings,
+            "errors": errors,
             "source_context": source_context,
         }
 
@@ -706,6 +745,25 @@ class EmbeddingRetriever:
         return warnings
 
     @staticmethod
+    def _errors_from_rejected_chunks(rejected_chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        counts: dict[str, int] = {}
+        messages = {
+            "QDRANT_INDEX_MISSING": "Qdrant payload index is missing for one or more scoped retrieval keys.",
+            "RETRIEVAL_BACKEND_ERROR": "Scoped retrieval backend returned an unresolved error.",
+            "PROVIDER_MISMATCH": "Retrieved chunk provider did not match the selected integration provider.",
+            "CONTEXT_SNAPSHOT_MISMATCH": "Retrieved chunk snapshot did not match the selected context snapshot.",
+            "TENANT_SCOPE_MISMATCH": "Retrieved chunk scope did not match the selected integration.",
+        }
+        for chunk in rejected_chunks:
+            code = str(chunk.get("reason") or "")
+            if code in messages:
+                counts[code] = counts.get(code, 0) + 1
+        return [
+            {"code": code, "message": messages[code], "occurrence_count": count}
+            for code, count in sorted(counts.items())
+        ]
+
+    @staticmethod
     def _retrieval_backend_error_code(message: str) -> str:
         lowered = message.lower()
         if "payload" in lowered and "index" in lowered:
@@ -728,10 +786,14 @@ class EmbeddingRetriever:
     def _failed_result(request: EmbeddingRetrievalRequest, scope_filter: dict[str, Any], missing_context: list[str]) -> dict[str, Any]:
         return {
             "status": "failed",
+            "status_reason": "selected_integration_context_missing",
             "retrieval_status": "failed",
             "confidence": 0.0,
+            "fallback_used": False,
+            "publish_blockers": ["SELECTED_INTEGRATION_REQUIRED"],
             "query_variants": EmbeddingRetriever.query_variants(request.user_prompt, request.integration_type, request.operation_type, request.candidate_entities),
             "scope_filter": scope_filter,
+            "candidate_resources": [],
             "selected_context": {"snapshot_context": [], "embedding_context": [], "source_context": []},
             "retrieved_chunks": [],
             "ranked_chunks": [],
@@ -741,5 +803,6 @@ class EmbeddingRetriever:
             "retrieved_context_ids": [],
             "rejected_context_ids": [],
             "warnings": missing_context,
+            "errors": [{"code": "SELECTED_INTEGRATION_REQUIRED", "message": missing_context[0], "occurrence_count": 1}] if missing_context else [],
             "source_context": [],
         }

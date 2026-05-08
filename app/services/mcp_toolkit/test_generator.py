@@ -21,8 +21,17 @@ class TestGenerator:
             {"name": "permission", "type": "security", "expected_error": "PERMISSION_DENIED for unauthorized role"},
             {"name": "approval_required", "type": "approval", "expected": "human approval required" if plan.approval_policy.get("human_approval_required") else "admin publish approval required"},
             {"name": "timeout_error_handling", "type": "resilience", "expected_error": "TIMEOUT with safe structured error"},
+            {"name": "audit_event_emitted", "type": "audit", "expected": "audit event contains organization_id, tenant_integration_id, provider_connection_id, tool_name, version, actor_id, and trace_id"},
         ]
-        return {"test_run_required": True, "generated_tests": tests, "status": "not_run"}
+        if plan.workflow_type:
+            tests.extend(
+                [
+                    {"name": "workflow_step_order", "type": "workflow", "expected": "workflow executes all steps in declared order"},
+                    {"name": "workflow_partial_failure", "type": "workflow", "expected": "partial failure triggers compensation or safe rollback guidance"},
+                    {"name": "workflow_idempotency", "type": "workflow", "expected": "idempotency key required for workflow mutation"},
+                ]
+            )
+        return {"test_run_required": True, "generated_tests": tests, "test_run_results": [], "status": "not_run"}
 
     @staticmethod
     def _sample_input(input_schema: dict[str, Any]) -> dict[str, Any]:

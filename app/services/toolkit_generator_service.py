@@ -13,6 +13,7 @@ import uuid
 from app.core.config import settings
 from app.models.tenant_resources import TenantResources
 from app.services.database_integration_service import DatabaseIntegrationService
+from app.services.mcp_toolkit.capability_registry import ProviderCapabilityRegistry
 from app.services.mcp_toolkit.embedding_retriever import EmbeddingRetrievalRequest, EmbeddingRetriever
 from app.services.mcp_toolkit.context_retriever import ContextRetriever
 from app.services.mcp_toolkit.name_utils import normalize_tool_name
@@ -68,6 +69,71 @@ class ToolkitGeneratorService:
     @staticmethod
     def integration_registry_key(integration_type: str, provider: str) -> str:
         return f"{integration_type.strip().lower()}:{provider.strip().lower()}"
+
+    @staticmethod
+    def provider_capability(integration_type: str, provider: str):
+        return ProviderCapabilityRegistry.resolve(integration_type, provider)
+
+    @staticmethod
+    def builder_key(integration_type: str, provider: str) -> str:
+        capability = ProviderCapabilityRegistry.require(integration_type, provider)
+        return capability.builder_key
+
+    @staticmethod
+    def connected_toolkit_builders(provider_status: dict[str, Any]) -> list[dict[str, Any]]:
+        builders: list[dict[str, Any]] = []
+        for capability in ProviderCapabilityRegistry.list_capabilities():
+            if not ToolkitGeneratorService.is_integration_connected(provider_status, capability.integration_type, capability.provider):
+                continue
+            detail = ToolkitGeneratorService._builder_detail(provider_status, capability.integration_type, capability.provider)
+            builders.append(
+                {
+                    "builder_key": capability.builder_key,
+                    "integration_type": capability.integration_type,
+                    "provider": capability.provider,
+                    "execution_backend": capability.execution_backend,
+                    "resource_model": capability.resource_model,
+                    "label": capability.builder_label,
+                    "description": capability.builder_description,
+                    "detail": detail,
+                    "supported_operations": list(capability.supported_operations),
+                    "connected": True,
+                }
+            )
+        return builders
+
+    @staticmethod
+    def is_integration_connected(provider_status: dict[str, Any], integration_type: str, provider: str) -> bool:
+        integration_type = integration_type.strip().lower()
+        provider = provider.strip().lower()
+        if integration_type == "database":
+            return provider_status.get("db_status") in {"schema_scanned", "indexed"} and provider_status.get("db_provider") == provider
+        if integration_type == "crm":
+            return provider_status.get("crm_status") == "indexed" and provider_status.get("crm_provider") == provider
+        if integration_type == "zoho_desk":
+            return provider_status.get("zoho_desk_status") == "indexed" and provider in {"zoho", "zoho_desk", "desk"}
+        if integration_type == "erp":
+            return provider_status.get("erp_status") == "indexed" and provider_status.get("erp_provider") == provider
+        if integration_type == "shipping":
+            return provider_status.get("shipping_status") == "indexed" and provider_status.get("shipping_provider") == provider
+        if integration_type == "ecommerce":
+            return provider_status.get("ecommerce_status") == "indexed" and provider_status.get("ecommerce_provider") == provider
+        if integration_type == "his":
+            return provider_status.get("his_status") == "indexed" and provider_status.get("his_provider") == provider
+        if integration_type == "custom_api":
+            return provider_status.get("custom_api_status") == "indexed" and provider_status.get("custom_api_provider") == provider
+        return False
+
+    @staticmethod
+    def _builder_detail(provider_status: dict[str, Any], integration_type: str, provider: str) -> str:
+        if integration_type == "database":
+            return provider_status.get("db_database_name") or f"{len(provider_status.get('db_selected_sources') or [])} sources"
+        prefix = ToolkitGeneratorService._status_prefix(integration_type)
+        return (
+            provider_status.get(f"{prefix}_account_name")
+            or f"{provider_status.get(f'{prefix}_module_count') or 0} modules"
+            or provider
+        )
 
     @staticmethod
     def _normalize_tool_name(value: str) -> str:
@@ -851,7 +917,10 @@ class ToolkitGeneratorService:
         integration_type: str,
         provider: str,
         prompt: str,
+        actor_id: str = "system",
+        actor_role: str = "admin",
     ) -> dict[str, Any]:
+        capability = ProviderCapabilityRegistry.require(integration_type, provider)
         provider_status = dict(tenant_res.provider_status or {})
         snapshot_context = ToolkitGeneratorService._snapshot_context(provider_status, integration_type, provider)
         selected_context_snapshot_id = (
@@ -888,8 +957,17 @@ class ToolkitGeneratorService:
             "tenant_integration_id": str(tenant_integration_id),
             "provider_connection_id": str(provider_connection_id),
             "selected_context_snapshot_id": str(selected_context_snapshot_id),
+            "actor_id": actor_id,
+            "actor_role": actor_role,
             "integration_type": integration_type,
             "provider": provider,
+            "builder_key": capability.builder_key,
+            "provider_capability": {
+                "execution_backend": capability.execution_backend,
+                "resource_model": capability.resource_model,
+                "supported_operations": list(capability.supported_operations),
+                "allowed_source_kinds": list(capability.allowed_source_kinds),
+            },
             "embedding_context": selected_context.get("embedding_context", []),
             "snapshot_context": selected_context.get("snapshot_context", []),
             "source_context": selected_context.get("source_context", []),
@@ -1030,13 +1108,20 @@ class ToolkitGeneratorService:
         provider: str,
         nlp_prompt: str,
         system_prompt: str | None = None,
+        actor_id: str = "system",
+        actor_role: str = "admin",
+        builder_key: str | None = None,
     ) -> dict[str, Any]:
         integration_type = integration_type.strip().lower()
         provider = provider.strip().lower()
-        context = await ToolkitGeneratorService.build_context(tenant_res, integration_type, provider, nlp_prompt)
+        capability = ProviderCapabilityRegistry.require(integration_type, provider)
+        if builder_key and builder_key != capability.builder_key:
+            raise RuntimeError(f"Builder key {builder_key} does not match selected integration capability {capability.builder_key}")
+        context = await ToolkitGeneratorService.build_context(tenant_res, integration_type, provider, nlp_prompt, actor_id=actor_id, actor_role=actor_role)
         user_payload = {
             "task": nlp_prompt,
             "selected_integration": {"integration_type": integration_type, "provider": provider},
+            "selected_builder": {"builder_key": capability.builder_key, "execution_backend": capability.execution_backend, "resource_model": capability.resource_model},
             "available_context": context,
             "hard_rules": [
                 "Use only the supplied integration context.",
@@ -1064,6 +1149,7 @@ class ToolkitGeneratorService:
             "status": "draft",
             "integration_type": integration_type,
             "provider": provider,
+            "builder_key": capability.builder_key,
             "nlp_prompt": nlp_prompt,
             "tool": tool,
             "context_summary": {

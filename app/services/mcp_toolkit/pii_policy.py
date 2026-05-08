@@ -60,10 +60,41 @@ class PIIPolicyBuilder:
         return name
 
     @staticmethod
-    def build(integration_type: str, schema_context: dict[str, Any] | None = None, output_fields: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    def build(
+        integration_type: str,
+        schema_context: dict[str, Any] | None = None,
+        output_fields: list[dict[str, Any]] | None = None,
+        input_fields: list[dict[str, Any]] | None = None,
+        exact_resources: list[str] | None = None,
+    ) -> dict[str, Any]:
         fields: dict[str, dict[str, str]] = {}
+        exact_resource_set = set(exact_resources or [])
+        output_sources = {
+            str(field.get("source"))
+            for field in output_fields or []
+            if field.get("source")
+        }
+        output_names = {
+            str(field.get("raw_name") or field.get("name") or "")
+            for field in output_fields or []
+            if field.get("raw_name") or field.get("name")
+        }
+        input_names = {
+            str(field.get("name") or "")
+            for field in input_fields or []
+            if field.get("name")
+        }
         for table in (schema_context or {}).get("tables", []):
+            if exact_resource_set and table.get("fqn") not in exact_resource_set:
+                continue
             for column in table.get("columns", []):
+                if output_sources or output_names or input_names:
+                    if (
+                        column["fqn"] not in output_sources
+                        and column["name"] not in output_names
+                        and column["name"] not in input_names
+                    ):
+                        continue
                 classification = PIIPolicyBuilder.classify_field(column["name"], column.get("type", ""))
                 fields[column["fqn"]] = {
                     "classification": classification,
@@ -74,7 +105,11 @@ class PIIPolicyBuilder:
             name = str(field.get("name") or "")
             if not name:
                 continue
+            raw_name = str(field.get("raw_name") or "")
+            source_name = str(field.get("source") or "")
             classification = PIIPolicyBuilder.classify_field(name, str(field.get("type") or ""))
+            if source_name and raw_name and raw_name != name and classification == "person_name":
+                continue
             fields.setdefault(
                 name,
                 {

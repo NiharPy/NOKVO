@@ -7,7 +7,7 @@ class ContextRetriever:
     """Normalizes trusted integration context already retrieved by the platform."""
 
     @staticmethod
-    def database_schema(context: dict[str, Any]) -> dict[str, Any]:
+    def database_schema(context: dict[str, Any], allowed_resources: set[str] | None = None) -> dict[str, Any]:
         tables: dict[str, dict[str, Any]] = {}
         for item in context.get("snapshot_context", []):
             payload = item.get("payload", {})
@@ -20,6 +20,8 @@ class ContextRetriever:
             if not table_name:
                 continue
             fqn = f"{schema}.{table_name}"
+            if allowed_resources and fqn not in allowed_resources:
+                continue
             table = tables.setdefault(
                 fqn,
                 {
@@ -58,6 +60,55 @@ class ContextRetriever:
             "tables": table_list,
             "allowed_tables": [table["fqn"] for table in table_list],
             "allowed_columns": {table["fqn"]: [column["name"] for column in table["columns"]] for table in table_list},
+        }
+
+    @staticmethod
+    def verified_resources(context: dict[str, Any]) -> list[dict[str, Any]]:
+        retrieval = context.get("retrieval") or {}
+        resources = retrieval.get("verified_resources") or context.get("verified_resources") or []
+        return [item for item in resources if isinstance(item, dict) and item.get("name")]
+
+    @staticmethod
+    def verified_database_schema(context: dict[str, Any]) -> dict[str, Any]:
+        resources = ContextRetriever.verified_resources(context)
+        table_resources = {item["name"] for item in resources if item.get("resource_type") == "table" and item.get("name")}
+        if not table_resources:
+            return {"tables": [], "allowed_tables": [], "allowed_columns": {}}
+        schema = ContextRetriever.database_schema(context, allowed_resources=table_resources)
+        if schema["tables"]:
+            return schema
+        tables = []
+        for resource in resources:
+            if resource.get("resource_type") != "table":
+                continue
+            columns = []
+            for column in resource.get("columns") or []:
+                if not isinstance(column, dict) or not column.get("name"):
+                    continue
+                columns.append(
+                    {
+                        "name": str(column["name"]),
+                        "type": str(column.get("type") or "unknown"),
+                        "nullable": bool(column.get("nullable")) if column.get("nullable") is not None else True,
+                        "fqn": f"{resource['name']}.{column['name']}",
+                    }
+                )
+            schema_name, table_name = str(resource["name"]).split(".", 1) if "." in str(resource["name"]) else ("public", str(resource["name"]))
+            tables.append(
+                {
+                    "schema": schema_name,
+                    "table": table_name,
+                    "fqn": str(resource["name"]),
+                    "columns": columns,
+                    "primary_key": [column["name"] for column in resource.get("columns") or [] if isinstance(column, dict) and column.get("is_primary_key")],
+                    "foreign_keys": [],
+                    "indexes": [],
+                }
+            )
+        return {
+            "tables": tables,
+            "allowed_tables": [table["fqn"] for table in tables],
+            "allowed_columns": {table["fqn"]: [column["name"] for column in table["columns"]] for table in tables},
         }
 
     @staticmethod

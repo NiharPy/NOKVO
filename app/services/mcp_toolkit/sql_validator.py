@@ -38,7 +38,7 @@ class SQLValidator:
 
         first_token = SQLValidator.first_token(statement_sql)
         if first_token == "WITH":
-            statement = "SELECT" if SQLValidator.main_select_sql(statement_sql) else ""
+            statement = SQLValidator.cte_statement_type(statement_sql)
         else:
             statement = first_token if first_token in SQLValidator.STATEMENTS else ""
         if not statement:
@@ -177,6 +177,36 @@ class SQLValidator:
         return ""
 
     @staticmethod
+    def cte_statement_type(sql: str) -> str:
+        cleaned = SQLValidator.clean_sql(sql).rstrip(";")
+        if not re.match(r"\s*WITH\b", cleaned, flags=re.IGNORECASE):
+            return ""
+        depth = 0
+        quote: str | None = None
+        index = 0
+        while index < len(cleaned):
+            char = cleaned[index]
+            if quote:
+                if char == quote:
+                    quote = None
+                index += 1
+                continue
+            if char in {"'", '"'}:
+                quote = char
+                index += 1
+                continue
+            if char == "(":
+                depth += 1
+            elif char == ")" and depth:
+                depth -= 1
+            if depth == 0:
+                match = re.match(r"(SELECT|INSERT|UPDATE|DELETE)\b", cleaned[index:], flags=re.IGNORECASE)
+                if match:
+                    return match.group(1).upper()
+            index += 1
+        return ""
+
+    @staticmethod
     def select_list(sql: str) -> str:
         main = SQLValidator.main_select_sql(sql)
         match = re.match(r"\s*SELECT\s+", main, flags=re.IGNORECASE)
@@ -234,7 +264,7 @@ class SQLValidator:
 
     @staticmethod
     def _validate_update(sql: str) -> str:
-        match = re.search(r"\bUPDATE\s+[a-zA-Z_][\w]*\.[a-zA-Z_][\w]*\s+SET\s+(.+?)(?:\s+WHERE\s+|$)", sql, flags=re.IGNORECASE | re.DOTALL)
+        match = re.search(r"\bUPDATE\s+[a-zA-Z_][\w]*\.[a-zA-Z_][\w]*(?:\s+[a-zA-Z_][\w]*)?\s+SET\s+(.+?)(?:\s+WHERE\s+|$)", sql, flags=re.IGNORECASE | re.DOTALL)
         if not match:
             return "UPDATE must use fully qualified table and SET assignments."
         assignments = SQLValidator._split_sql_list(match.group(1))

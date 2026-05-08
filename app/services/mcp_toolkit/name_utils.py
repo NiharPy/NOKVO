@@ -32,6 +32,8 @@ def operation_prefixes(operation_type: str) -> tuple[str, ...]:
         return UPDATE_PREFIXES
     if operation_type == "delete":
         return DELETE_PREFIXES
+    if operation_type == "workflow":
+        return UPDATE_PREFIXES + CREATE_PREFIXES + DELETE_PREFIXES
     return ()
 
 

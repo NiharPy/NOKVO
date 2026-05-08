@@ -11,10 +11,12 @@ from app.services.mcp_toolkit.safety_classifier import SafetyClassifier
 
 class ToolPlanGenerator:
     @staticmethod
-    def generate(intent: ToolIntent, verified_resources: list[str]) -> ToolPlan:
+    def generate(intent: ToolIntent, verified_resources: list[dict[str, Any]]) -> ToolPlan:
         action_text = SafetyClassifier.action_text(intent.purpose)
-        name = ToolPlanGenerator._name_for_intent(intent, verified_resources, action_text)
-        if intent.operation_type != "read" and not name.startswith(("create_", "update_", "delete_", "cancel_", "refund_")):
+        trusted_resources = [item for item in verified_resources if item.get("name") in set(intent.target_resources)] or verified_resources
+        resource_names = [str(item.get("name") or "") for item in trusted_resources if item.get("name")]
+        name = ToolPlanGenerator._name_for_intent(intent, resource_names, action_text)
+        if intent.operation_type not in {"read", "workflow"} and not name.startswith(("create_", "update_", "delete_", "cancel_", "refund_")):
             name = f"{intent.operation_type}_{name}"
         title = humanize_tool_name(name)
         approval_policy = {
@@ -26,15 +28,15 @@ class ToolPlanGenerator:
         return ToolPlan(
             name=name,
             title=title,
-            description=ToolPlanGenerator._description_for_intent(intent, title, verified_resources),
+            description=ToolPlanGenerator._description_for_intent(intent, title, resource_names),
             integration_type=intent.integration_type,
             provider=intent.provider,
             operation_type=intent.operation_type,
             risk_level=intent.risk_level,
             required_permissions=ToolPlanGenerator._permissions(intent),
-            exact_resources_used=verified_resources,
+            exact_resources_used=resource_names,
             input_fields=intent.required_inputs,
-            output_fields=ToolPlanGenerator._output_fields_for_operation(intent.operation_type, intent.expected_outputs, verified_resources, action_text),
+            output_fields=ToolPlanGenerator._output_fields_for_operation(intent.operation_type, intent.expected_outputs, resource_names, action_text, intent.target_field),
             preconditions=intent.business_preconditions,
             postconditions=["return sanitized structured response", "write audit log with organization_id and trace_id"],
             error_cases=[
@@ -48,9 +50,15 @@ class ToolPlanGenerator:
             audit_policy={
                 "enabled": True,
                 "events": ["tool_requested", "tool_validated", "tool_executed", "tool_failed"],
-                "include": ["organization_id", "tenant_id", "integration_id", "provider_connection_id", "tool_name", "version", "trace_id", "actor_id"],
+                "include": ["organization_id", "tenant_id", "tenant_integration_id", "provider_connection_id", "context_snapshot_id", "tool_name", "version", "trace_id", "actor_id", "actor_role"],
                 "exclude": ["raw_credentials", "tokens", "secrets", "passwords", "connection_strings"],
             },
+            workflow_type=intent.workflow_type,
+            target_field=intent.target_field,
+            resolved_target_column=intent.resolved_target_column,
+            trusted_resources_used=resource_names,
+            intent_signals=intent.intent_signals,
+            trusted_resources=trusted_resources,
             missing_context=intent.missing_context,
         )
 
@@ -62,7 +70,26 @@ class ToolPlanGenerator:
         return base + [f"{intent.integration_type}:{intent.provider}:{intent.operation_type}", "approval:request"]
 
     @staticmethod
-    def _output_fields_for_operation(operation_type: str, output_fields: list[dict[str, Any]], verified_resources: list[str], action_text: str = "") -> list[dict[str, Any]]:
+    def _output_fields_for_operation(
+        operation_type: str,
+        output_fields: list[dict[str, Any]],
+        verified_resources: list[str],
+        action_text: str = "",
+        target_field: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if operation_type in {"update", "workflow"} and target_field == "username":
+            fields = [
+                {"name": "affected_count", "type": "integer"},
+                {"name": "idempotency_key", "type": "string"},
+            ]
+            for field in output_fields:
+                name = str(field.get("name") or "")
+                if name in {"customer_id", "customer_code", "updated_username", "username", "user_name", "phone"}:
+                    transformed = dict(field)
+                    transformed["raw_name"] = field.get("raw_name") or field.get("name")
+                    transformed["name"] = "updated_username" if name in {"username", "user_name"} else PIIPolicyBuilder.output_field_name(name, str(field.get("type") or ""))
+                    fields.append(transformed)
+            return fields
         if operation_type != "read":
             id_field = {
                 "create": "created_id",
@@ -116,6 +143,8 @@ class ToolPlanGenerator:
     @staticmethod
     def _name_for_intent(intent: ToolIntent, verified_resources: list[str], action_text: str) -> str:
         text = action_text.lower()
+        if intent.operation_type in {"workflow", "update"} and re.search(r"\bcustomer\b", text) and re.search(r"\bphone\b", text) and re.search(r"\buser\s*name\b|\busername\b", text):
+            return "update_customer_username_by_phone"
         if intent.operation_type == "read" and re.search(r"\bcustomer\b", text) and re.search(r"\bphone\b", text):
             if re.search(r"\b(call|calls|call\s+history|history)\b", text):
                 return "lookup_customer_call_history_by_phone"
@@ -207,6 +236,8 @@ class ToolPlanGenerator:
             key = ToolPlanGenerator._lookup_key(intent)
             suffix = f" by {key.replace('_', ' ')}" if key else ""
             return f"{title}: read-only lookup{suffix} using {resources}."
+        if intent.operation_type == "workflow":
+            return f"{title}: read-then-update workflow using {resources} with explicit human approval and audit controls."
         if intent.operation_type == "create":
             return f"{title}: create a new record using {resources} with reviewed inputs and approval controls."
         if intent.operation_type == "update":

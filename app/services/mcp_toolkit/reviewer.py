@@ -21,6 +21,7 @@ class Reviewer:
         tool = generation.get("tool") or {}
         plan = generation.get("tool_plan") or {}
         execution = tool.get("execution") or {}
+        execution_type = str(execution.get("type") or "")
         mapping = execution.get("mapping") or {}
         errors: list[dict[str, str]] = []
         warnings: list[dict[str, str]] = []
@@ -31,7 +32,7 @@ class Reviewer:
         Reviewer._check(Reviewer._snake_case(tool.get("name")), "BAD_TOOL_NAME", "Tool name must be action-based snake_case.", errors, required_changes)
         Reviewer._check(
             not Reviewer._contains_fallback_text(tool),
-            "FALLBACK_TITLE_DESCRIPTION",
+            "FALLBACK_TITLE_USED",
             "Tool title/description must not contain fallback generator phrases.",
             errors,
             required_changes,
@@ -56,8 +57,21 @@ class Reviewer:
             errors,
             required_changes,
         )
+        intent_signals = plan.get("intent_signals") or {}
+        if intent_signals.get("read_detected") and (intent_signals.get("update_detected") or intent_signals.get("create_detected") or intent_signals.get("delete_detected")):
+            Reviewer._check(
+                operation_type in {"workflow", "update", "create", "delete"},
+                "MUTATION_INTENT_DOWNGRADED_TO_READ",
+                "Prompt contains both read and mutation intent; generated tool must not be read-only.",
+                errors,
+                required_changes,
+            )
+        if operation_type == "workflow":
+            Reviewer._check(bool(plan.get("workflow_type")), "MULTI_STEP_WORKFLOW_DETECTED", "Workflow prompts must declare an explicit workflow_type.", errors, required_changes)
+        if any("username column" in str(item).lower() for item in tool.get("missing_context") or []):
+            Reviewer._check(False, "MISSING_TARGET_FIELD_CONFIRMATION", "Username target field is missing or ambiguous and requires admin confirmation.", errors, required_changes)
 
-        if tool.get("integration_type") == "database":
+        if execution_type == "database_sql":
             sql = str(mapping.get("sql_template") or "")
             allowed_tables = set(mapping.get("allowed_tables") or [])
             verified_tables = set(verified_context.get("allowed_tables") or [])
@@ -78,7 +92,7 @@ class Reviewer:
             )
             Reviewer._check(
                 not is_table_name_only(str(tool.get("name") or ""), list(plan_resources)),
-                "TABLE_NAME_ONLY_TOOL_NAME",
+                "GENERIC_TABLE_NAME_USED",
                 "tool.name must not be a bare table name.",
                 errors,
                 required_changes,
@@ -112,7 +126,7 @@ class Reviewer:
                 )
                 Reviewer._check(
                     sql_info["statement"] not in blocked_statements,
-                    "SQL_STATEMENT_BLOCKED",
+                    "SQL_BLOCKED_STATEMENT_USED",
                     "SQL first statement must not appear in blocked_statements.",
                     errors,
                     required_changes,
@@ -122,6 +136,14 @@ class Reviewer:
                     sql_info["statement"] == expected_statement,
                     "OPERATION_SQL_MISMATCH",
                     f"operation_type {operation_type} must generate {expected_statement} SQL.",
+                    errors,
+                    required_changes,
+                )
+            if operation_type == "workflow":
+                Reviewer._check(
+                    sql_info["statement"] in {"INSERT", "UPDATE", "DELETE"},
+                    "MUTATION_SQL_BLOCKED_DUE_TO_MISSING_TARGET_FIELD" if any("username field" in str(item).lower() for item in tool.get("missing_context") or []) else "MUTATION_INTENT_DOWNGRADED_TO_READ",
+                    "Workflow SQL generation is blocked until the target mutation field is explicitly confirmed." if any("username field" in str(item).lower() for item in tool.get("missing_context") or []) else "Workflow prompt included mutation intent but generated SQL is not a mutation statement.",
                     errors,
                     required_changes,
                 )
@@ -164,6 +186,7 @@ class Reviewer:
             )
             Reviewer._validate_database_inputs(input_schema, sql_info, mapping, errors, required_changes)
             Reviewer._validate_database_outputs(output_schema, plan, sql_info, verified_context, errors, required_changes)
+            Reviewer._validate_database_resource_subset(sql, sql_info, generation.get("retrieval") or {}, verified_context, errors, required_changes)
             Reviewer._validate_insert_required_columns(sql_info, verified_context, errors, required_changes)
             if execution.get("mode") == "read_only":
                 Reviewer._check(sql_info["statement"] == "SELECT", "READ_SQL_NOT_SELECT", "Read-only database tools may only execute SELECT.", errors, required_changes)
@@ -174,12 +197,35 @@ class Reviewer:
                 if sql.upper().lstrip().startswith(("UPDATE", "DELETE")):
                     Reviewer._check(bool(re.search(r"\bWHERE\b", sql, re.IGNORECASE)), "MUTATION_WITHOUT_WHERE", "UPDATE/DELETE SQL must include strict WHERE clause.", errors, required_changes)
             Reviewer._check(bool(allowed_tables), "EMPTY_ALLOWED_TABLES", "Database tools must define least-privilege allowed_tables.", errors, required_changes)
-            Reviewer._check(allowed_tables.issubset(verified_tables), "UNVERIFIED_TABLE", "allowed_tables must be verified by scanned schema context.", errors, required_changes)
+            Reviewer._check(
+                allowed_tables.issubset(verified_tables),
+                "SQL_UNVERIFIED_TABLE_USED",
+                "allowed_tables must be verified by scanned schema context.",
+                errors,
+                required_changes,
+            )
             Reviewer._check(bool(mapping.get("allowed_columns")), "MISSING_ALLOWED_COLUMNS", "Database tools must define allowed_columns.", errors, required_changes)
             Reviewer._check(bool(mapping.get("explain_validation", {}).get("required_before_publish")), "MISSING_EXPLAIN_VALIDATION", "Database SQL requires EXPLAIN validation before publish.", errors, required_changes)
+        elif execution_type == "database_nosql":
+            collection = str(mapping.get("collection") or "")
+            allowed_collections = set(mapping.get("allowed_collections") or [])
+            input_props = set((input_schema.get("properties") or {}).keys())
+            filter_fields = set(mapping.get("filter_fields") or [])
+            Reviewer._check(bool(collection), "MISSING_COLLECTION", "MongoDB tools must define a verified collection.", errors, required_changes)
+            Reviewer._check(collection in allowed_collections, "UNVERIFIED_RESOURCE_USED", "MongoDB collection must be present in allowed_collections.", errors, required_changes)
+            Reviewer._check(bool(allowed_collections), "EMPTY_ALLOWED_COLLECTIONS", "MongoDB tools must define least-privilege allowed_collections.", errors, required_changes)
+            Reviewer._check(filter_fields.issubset(input_props), "MISSING_INPUT_SCHEMA_FIELD", "MongoDB filter fields must exist in input_schema.", errors, required_changes)
+            if execution.get("mode") == "read_only":
+                Reviewer._check(bool((mapping.get("query") or {}).get("filter")), "MISSING_MONGO_FILTER", "MongoDB read tools require a verified filter shape.", errors, required_changes)
+            else:
+                Reviewer._check(bool((mapping.get("idempotency") or {}).get("required")), "IDEMPOTENCY_REQUIRED", "MongoDB mutation tools require idempotency.", errors, required_changes)
+                Reviewer._check(bool(mapping.get("update_filter") or mapping.get("insert_document")), "MISSING_MUTATION_FILTER", "MongoDB mutation tools must define a bounded insert or update filter.", errors, required_changes)
         else:
             Reviewer._check(bool(mapping.get("endpoint") or mapping.get("connector_action")), "MISSING_VERIFIED_CONNECTOR_ACTION", "API tools must use verified connector templates/actions.", errors, required_changes)
             Reviewer._check(mapping.get("tenant_secret_ref") == "tenant_provider_connection_secret_ref", "BAD_SECRET_REFERENCE", "API tools must reference tenant secrets only.", errors, required_changes)
+            if execution.get("mode") != "read_only":
+                Reviewer._check(bool((mapping.get("idempotency") or {}).get("required")), "IDEMPOTENCY_REQUIRED", "Mutation connector/API tools require idempotency.", errors, required_changes)
+            Reviewer._check(bool(mapping.get("rate_limit") or execution_type in {"erp_xml", "his_action"}), "RATE_LIMIT_REQUIRED", "Provider-backed tools must include rate limit or backend execution controls.", errors, required_changes)
 
         Reviewer._check(tool.get("review", {}).get("required") is True, "REVIEW_NOT_REQUIRED", "All generated tools require admin review.", errors, required_changes)
         Reviewer._check(tool.get("tests", {}).get("test_run_required") is True, "TEST_RUN_NOT_REQUIRED", "test_run_required must be true.", errors, required_changes)
@@ -190,15 +236,17 @@ class Reviewer:
             errors.append({"code": "MISSING_VERIFIED_CONTEXT", "message": "No verified resource is available for this tool."})
             required_changes.append("Rescan or select integration resources before generating this tool.")
 
+        errors = Reviewer._dedupe_errors(errors)
+        warnings = Reviewer._dedupe_errors(warnings)
         status = "failed" if errors else "passed"
-        review_status = "rejected" if errors else "draft"
+        review_status = Reviewer._review_status(errors, generation)
         return {
             "validation": {"status": status, "errors": errors, "warnings": warnings, "checks": checks},
             "review": {
                 "status": review_status,
                 "required": True,
                 "reviewer_role": "admin",
-                "reason": "Automatic reviewer rejected unsafe or incomplete draft." if errors else "Draft passed automatic checks and awaits admin review.",
+                "reason": Reviewer._review_reason(review_status),
                 "required_changes": list(dict.fromkeys(required_changes)),
             },
         }
@@ -239,6 +287,8 @@ class Reviewer:
             Reviewer._check(False, "RETRIEVAL_FAILED", "Embedding retrieval failed; executable SQL/API must not be generated.", errors, required_changes)
         elif retrieval.get("status") == "low_confidence" or float(retrieval.get("confidence") or 0.0) < 0.80:
             Reviewer._check(False, "RETRIEVAL_LOW_CONFIDENCE", "Embedding retrieval confidence is below production threshold.", errors, required_changes)
+        if retrieval.get("fallback_used"):
+            Reviewer._check(False, "FALLBACK_RETRIEVAL_USED", "Fallback context was used and cannot publish without explicit admin approval.", errors, required_changes)
         retrieval_warnings = [str(item) for item in retrieval.get("warnings") or []]
         for warning in retrieval_warnings:
             warnings.append({"code": Reviewer._retrieval_warning_code(warning), "message": warning})
@@ -304,6 +354,38 @@ class Reviewer:
         required_changes.append(message)
 
     @staticmethod
+    def _dedupe_errors(items: list[dict[str, str]]) -> list[dict[str, Any]]:
+        deduped: dict[tuple[str, str], dict[str, Any]] = {}
+        for item in items:
+            code = str(item.get("code") or "")
+            message = str(item.get("message") or "")
+            key = (code, message)
+            if key not in deduped:
+                deduped[key] = {"code": code, "message": message, "occurrence_count": 0}
+            deduped[key]["occurrence_count"] += 1
+        return list(deduped.values())
+
+    @staticmethod
+    def _review_status(errors: list[dict[str, Any]], generation: dict[str, Any]) -> str:
+        if not errors:
+            return "draft"
+        codes = {error.get("code") for error in errors}
+        if codes & {"RETRIEVAL_LOW_CONFIDENCE", "MISSING_TARGET_FIELD_CONFIRMATION", "MULTI_STEP_WORKFLOW_DETECTED"}:
+            return "needs_context_confirmation"
+        retrieval = generation.get("retrieval") or {}
+        if retrieval.get("fallback_used") or retrieval.get("status") == "low_confidence":
+            return "needs_context_confirmation"
+        return "rejected"
+
+    @staticmethod
+    def _review_reason(review_status: str) -> str:
+        if review_status == "draft":
+            return "Draft passed automatic checks and awaits admin review."
+        if review_status == "needs_context_confirmation":
+            return "Draft requires explicit admin context confirmation before it can be reviewed further."
+        return "Automatic reviewer rejected unsafe or incomplete draft."
+
+    @staticmethod
     def _statement_list(value: Any) -> list[str]:
         if not isinstance(value, list):
             return []
@@ -314,13 +396,14 @@ class Reviewer:
         cleaned = SQLValidator.clean_sql(sql).rstrip(";")
         first = SQLValidator._split_statements(cleaned)[0] if SQLValidator._split_statements(cleaned) else ""
         token = SQLValidator.first_token(first)
-        statement = "SELECT" if token == "WITH" and SQLValidator.main_select_sql(first) else token if token in {"SELECT", "INSERT", "UPDATE", "DELETE"} else ""
+        statement = SQLValidator.cte_statement_type(first) if token == "WITH" else token if token in {"SELECT", "INSERT", "UPDATE", "DELETE"} else ""
         main_select = SQLValidator.main_select_sql(first) if statement == "SELECT" else first
         table = ""
         tables: list[str] = []
         insert_columns: list[str] = []
         selected_columns: list[str] = []
         updated_columns: list[str] = []
+        returning_columns: list[str] = []
         if statement == "SELECT":
             table_match = re.search(r"\bFROM\s+([a-zA-Z_][\w]*\.[a-zA-Z_][\w]*)\b", first, flags=re.IGNORECASE)
             table = table_match.group(1) if table_match else ""
@@ -334,16 +417,25 @@ class Reviewer:
                 table = table_match.group(1)
                 tables = [table]
                 insert_columns = [Reviewer._clean_column_name(item) for item in (table_match.group(2) or "").split(",") if Reviewer._clean_column_name(item)]
+            returning_match = re.search(r"\bRETURNING\s+(.+)$", first, flags=re.IGNORECASE | re.DOTALL)
+            if returning_match:
+                returning_columns = Reviewer._extract_column_names(returning_match.group(1), table)
         elif statement == "UPDATE":
-            table_match = re.search(r"\bUPDATE\s+([a-zA-Z_][\w]*\.[a-zA-Z_][\w]*)\s+SET\s+(.+?)(?:\s+WHERE\s+|$)", first, flags=re.IGNORECASE | re.DOTALL)
+            table_match = re.search(r"\bUPDATE\s+([a-zA-Z_][\w]*\.[a-zA-Z_][\w]*)(?:\s+[a-zA-Z_][\w]*)?\s+SET\s+(.+?)(?:\s+WHERE\s+|$)", first, flags=re.IGNORECASE | re.DOTALL)
             if table_match:
                 table = table_match.group(1)
                 tables = [table]
                 updated_columns = [Reviewer._clean_column_name(item.split("=", 1)[0]) for item in table_match.group(2).split(",") if Reviewer._clean_column_name(item.split("=", 1)[0])]
+            returning_match = re.search(r"\bRETURNING\s+(.+)$", first, flags=re.IGNORECASE | re.DOTALL)
+            if returning_match:
+                returning_columns = Reviewer._extract_column_names(returning_match.group(1), table)
         elif statement == "DELETE":
             table_match = re.search(r"\bDELETE\s+FROM\s+([a-zA-Z_][\w]*\.[a-zA-Z_][\w]*)\b", first, flags=re.IGNORECASE)
             table = table_match.group(1) if table_match else ""
             tables = [table] if table else []
+            returning_match = re.search(r"\bRETURNING\s+(.+)$", first, flags=re.IGNORECASE | re.DOTALL)
+            if returning_match:
+                returning_columns = Reviewer._extract_column_names(returning_match.group(1), table)
         params = sorted(set(re.findall(r"(?<!:):([a-zA-Z_][\w]*)\b", first)))
         return {
             "statement": statement,
@@ -353,6 +445,7 @@ class Reviewer:
             "insert_columns": insert_columns,
             "selected_columns": selected_columns,
             "updated_columns": updated_columns,
+            "returning_columns": returning_columns,
         }
 
     @staticmethod
@@ -466,6 +559,7 @@ class Reviewer:
             "create": {"create", "add", "insert", "open", "raise", "generate"},
             "update": {"update", "modify", "patch", "change", "set", "assign"},
             "delete": {"delete", "remove", "deactivate", "cancel"},
+            "workflow": {"update", "modify", "patch", "change", "set", "assign", "workflow"},
         }
         return bool(tokens & verbs.get(operation_type, set()))
 
@@ -483,10 +577,17 @@ class Reviewer:
         idempotency_source = ((mapping.get("idempotency") or {}).get("source") or "")
         if idempotency_source.startswith("input."):
             allowed_non_sql.add(idempotency_source.split(".", 1)[1])
+        binding_sources = {
+            source.split(".", 1)[1]
+            for source in ((mapping.get("parameter_binding") or {}).get("sources") or [])
+            if isinstance(source, str) and source.startswith("input.")
+        }
         unused = sorted(properties - sql_params - allowed_non_sql)
         missing = sorted(sql_params - properties)
-        Reviewer._check(not unused, "UNUSED_INPUT_FIELDS", f"Input fields are not used by SQL/API mapping: {', '.join(unused)}.", errors, required_changes)
-        Reviewer._check(not missing, "SQL_PARAM_MISSING_INPUT", f"SQL parameters are missing from input_schema: {', '.join(missing)}.", errors, required_changes)
+        unbound = sorted(sql_params - binding_sources)
+        Reviewer._check(not unused, "UNUSED_INPUT_FIELD", f"Input fields are not used by SQL/API mapping: {', '.join(unused)}.", errors, required_changes)
+        Reviewer._check(not missing, "MISSING_INPUT_SCHEMA_FIELD", f"SQL parameters are missing from input_schema: {', '.join(missing)}.", errors, required_changes)
+        Reviewer._check(not unbound, "UNBOUND_SQL_PARAMETER", f"SQL parameters are not bound in parameter_binding.sources: {', '.join(unbound)}.", errors, required_changes)
 
     @staticmethod
     def _validate_database_outputs(
@@ -510,10 +611,36 @@ class Reviewer:
             Reviewer._check(plan_output_names.issubset(selected | {"success", "message"}), "PLAN_OUTPUT_SQL_MISMATCH", "tool_plan.output_fields must match selected SQL columns.", errors, required_changes)
         elif statement in {"INSERT", "UPDATE", "DELETE"}:
             allowed = set(Reviewer.MUTATION_OUTPUT_FIELDS)
+            allowed.update(plan_output_names)
+            returned = set(sql_info.get("returning_columns") or [])
             Reviewer._check("affected_count" in data_props, "MUTATION_OUTPUT_MISSING_AFFECTED_COUNT", "Mutation output_schema.data must include affected_count.", errors, required_changes)
             Reviewer._check("records" not in data_props, "MUTATION_OUTPUT_HAS_RECORDS", "Mutation output_schema.data must not return unrelated records.", errors, required_changes)
             Reviewer._check(data_props.issubset(allowed), "MUTATION_OUTPUT_SCHEMA_MISMATCH", "Mutation output_schema.data fields must match mutation execution.", errors, required_changes)
-            Reviewer._check(plan_output_names.issubset(allowed | {"success", "message"}), "MUTATION_PLAN_OUTPUT_MISMATCH", "Mutation tool_plan.output_fields must not contain unrelated table fields.", errors, required_changes)
+            Reviewer._check(plan_output_names.issubset(returned | {"affected_count", "idempotency_key", "provider_reference", "created_id", "updated_id", "deleted_id"}), "MUTATION_PLAN_OUTPUT_MISMATCH", "Mutation tool_plan.output_fields must match SQL RETURNING fields or mutation metadata.", errors, required_changes)
+
+    @staticmethod
+    def _validate_database_resource_subset(
+        sql: str,
+        sql_info: dict[str, Any],
+        retrieval: dict[str, Any],
+        verified_context: dict[str, Any],
+        errors: list[dict[str, str]],
+        required_changes: list[str],
+    ) -> None:
+        verified_resources = {item.get("name"): item for item in retrieval.get("verified_resources") or [] if isinstance(item, dict) and item.get("name")}
+        verified_tables = set(verified_resources)
+        sql_tables = set(sql_info.get("tables") or [])
+        Reviewer._check(sql_tables.issubset(verified_tables), "SQL_UNVERIFIED_TABLE_USED", "SQL referenced an unverified table.", errors, required_changes)
+        table_columns = {table.get("fqn"): {column.get("name") for column in table.get("columns") or []} for table in verified_context.get("tables") or [] if table.get("fqn")}
+        referenced_columns: dict[str, set[str]] = {}
+        for table_name, column_name in re.findall(r"([a-zA-Z_][\w]*\.[a-zA-Z_][\w]*)\.([a-zA-Z_][\w]*)", sql or ""):
+            referenced_columns.setdefault(table_name, set()).add(column_name)
+        for table_name, columns in referenced_columns.items():
+            if table_name not in table_columns:
+                Reviewer._check(False, "SQL_UNVERIFIED_TABLE_USED", f"SQL used table {table_name} outside verified_resources.", errors, required_changes)
+                continue
+            unknown = sorted(columns - table_columns[table_name])
+            Reviewer._check(not unknown, "SQL_UNVERIFIED_COLUMN_USED", f"SQL used unverified columns for {table_name}: {', '.join(unknown)}.", errors, required_changes)
 
     @staticmethod
     def _validate_pii_output_schema(tool: dict[str, Any], errors: list[dict[str, str]], required_changes: list[str]) -> None:

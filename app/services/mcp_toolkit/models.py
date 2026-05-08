@@ -5,12 +5,69 @@ from typing import Any, Literal
 
 
 IntegrationType = Literal["database", "crm", "erp", "ecommerce", "his", "payments", "custom_api", "zoho_desk", "shipping"]
-OperationType = Literal["read", "create", "update", "delete", "workflow"]
+OperationType = Literal["read", "create", "update", "delete", "workflow", "ambiguous"]
 RiskLevel = Literal["low", "medium", "high", "critical"]
-ReviewStatus = Literal["draft", "rejected", "approved"]
+ReviewStatus = Literal["draft", "needs_context_confirmation", "rejected", "approved"]
 ValidationStatus = Literal["passed", "failed"]
 TestStatus = Literal["not_run", "passed", "failed"]
 RetrievalStatus = Literal["passed", "low_confidence", "failed"]
+
+
+@dataclass(slots=True)
+class VerifiedColumn:
+    name: str
+    type: str
+    nullable: bool
+    is_primary_key: bool
+    is_searchable: bool
+    pii_classification: str
+
+
+@dataclass(slots=True)
+class VerifiedRelationship:
+    from_: str
+    to: str
+    source: str
+    confidence: float
+    approved_by: str | None = None
+
+
+@dataclass(slots=True)
+class VerifiedResource:
+    resource_type: str
+    name: str
+    provider: str
+    integration_type: str
+    organization_id: str
+    tenant_integration_id: str
+    provider_connection_id: str
+    context_snapshot_id: str
+    source_context_ids: list[str]
+    confidence: float
+    columns: list[dict[str, Any]] | None = None
+    relationships: list[dict[str, Any]] | None = None
+    endpoint: dict[str, Any] | None = None
+    action: dict[str, Any] | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class RetrievedEmbeddingContext:
+    status: RetrievalStatus
+    status_reason: str | None
+    confidence: float
+    fallback_used: bool
+    publish_blockers: list[str]
+    query_variants: list[str]
+    scope_filter: dict[str, Any]
+    candidate_resources: list[str]
+    verified_resources: list[dict[str, Any]]
+    retrieved_context_ids: list[str]
+    rejected_context_ids: list[str]
+    rejected_chunks: list[dict[str, Any]]
+    warnings: list[str]
+    errors: list[dict[str, Any]]
+    source_context: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -26,6 +83,10 @@ class ToolIntent:
     business_preconditions: list[str]
     risk_level: RiskLevel
     human_approval_needed: bool
+    workflow_type: str | None = None
+    target_field: str | None = None
+    resolved_target_column: str | None = None
+    intent_signals: dict[str, Any] = field(default_factory=dict)
     missing_context: list[str] = field(default_factory=list)
 
 
@@ -47,6 +108,12 @@ class ToolPlan:
     error_cases: list[dict[str, str]]
     approval_policy: dict[str, Any]
     audit_policy: dict[str, Any]
+    workflow_type: str | None = None
+    target_field: str | None = None
+    resolved_target_column: str | None = None
+    trusted_resources_used: list[str] = field(default_factory=list)
+    intent_signals: dict[str, Any] = field(default_factory=dict)
+    trusted_resources: list[dict[str, Any]] = field(default_factory=list)
     missing_context: list[str] = field(default_factory=list)
 
 
@@ -109,6 +176,7 @@ class ReviewResult:
 class ToolTestSuite:
     test_run_required: bool
     generated_tests: list[dict[str, Any]]
+    test_run_results: list[dict[str, Any]] = field(default_factory=list)
     status: TestStatus = "not_run"
 
 

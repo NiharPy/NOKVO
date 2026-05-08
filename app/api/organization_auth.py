@@ -45,6 +45,8 @@ from app.schemas.organization_auth import (
     OrganizationTallyXMLRequest,
     OrganizationTallyXMLResponse,
     OrganizationToolkitDraftResponse,
+    OrganizationToolkitBuilderResponse,
+    OrganizationToolkitBuildersResponse,
     OrganizationToolkitGenerateRequest,
     OrganizationToolkitRegistryResponse,
     OrganizationToolkitReviewRequest,
@@ -151,19 +153,7 @@ def _toolkit_matches(item: dict, integration_type: str | None, provider: str | N
 
 
 def _toolkit_integration_connected(provider_status: dict, integration_type: str, provider: str) -> bool:
-    integration_type = integration_type.strip().lower()
-    provider = provider.strip().lower()
-    if integration_type == "database":
-        return provider_status.get("db_status") in {"schema_scanned", "indexed"} and provider_status.get("db_provider") == provider
-    if integration_type == "crm":
-        return provider_status.get("crm_status") == "indexed" and provider_status.get("crm_provider") == provider
-    if integration_type == "zoho_desk":
-        return provider_status.get("zoho_desk_status") == "indexed" and provider in {"zoho", "zoho_desk", "desk"}
-    if integration_type == "erp":
-        return provider_status.get("erp_status") == "indexed" and provider_status.get("erp_provider") == provider
-    if integration_type == "shipping":
-        return provider_status.get("shipping_status") == "indexed" and provider_status.get("shipping_provider") == provider
-    return False
+    return ToolkitGeneratorService.is_integration_connected(provider_status, integration_type, provider)
 
 
 def _append_toolkit_audit_event(
@@ -1278,12 +1268,18 @@ async def generate_toolkit_tool(
     provider_status = dict(tenant_res.provider_status or {})
     if not _toolkit_integration_connected(provider_status, payload.integration_type, payload.provider):
         raise HTTPException(status_code=409, detail="Toolkit tools can only be generated for connected integrations")
+    capability = ToolkitGeneratorService.provider_capability(payload.integration_type, payload.provider)
+    if capability is None:
+        raise HTTPException(status_code=400, detail="No toolkit builder capability is registered for this provider")
+    if payload.builder_key and payload.builder_key != capability.builder_key:
+        raise HTTPException(status_code=409, detail="Selected toolkit builder does not match the connected integration")
     draft = await ToolkitGeneratorService.generate_tool(
         tenant_res,
         payload.integration_type,
         payload.provider,
         payload.nlp_prompt,
         payload.system_prompt,
+        builder_key=payload.builder_key,
     )
 
     _, drafts = _toolkit_state(provider_status)
@@ -1303,6 +1299,17 @@ async def generate_toolkit_tool(
     db.add(tenant_res)
     await db.commit()
     return OrganizationToolkitDraftResponse(**draft)
+
+
+@router.get("/toolkit/builders", response_model=OrganizationToolkitBuildersResponse)
+async def get_toolkit_builders(
+    current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin"])),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
+    provider_status = dict(tenant_res.provider_status or {})
+    builders = [OrganizationToolkitBuilderResponse(**item) for item in ToolkitGeneratorService.connected_toolkit_builders(provider_status)]
+    return OrganizationToolkitBuildersResponse(builders=builders)
 
 
 @router.get("/toolkit/registry", response_model=OrganizationToolkitRegistryResponse)

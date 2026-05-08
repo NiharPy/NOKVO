@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from app.services.mcp_toolkit.capability_registry import ProviderCapability
+from app.services.mcp_toolkit.compilers import ExecutionCompilerRegistry
 from app.services.mcp_toolkit.context_retriever import ContextRetriever
 from app.services.mcp_toolkit.models import ToolPlan
 from app.services.mcp_toolkit.pii_policy import PIIPolicyBuilder
@@ -36,14 +38,17 @@ class ExecutionGenerator:
     OPERATION_SQL_STATEMENT = {"read": "SELECT", "create": "INSERT", "update": "UPDATE", "delete": "DELETE"}
 
     @staticmethod
-    def generate(plan: ToolPlan, context: dict[str, Any]) -> dict[str, Any]:
-        if plan.integration_type == "database":
-            return ExecutionGenerator._database(plan, context)
-        return ExecutionGenerator._api(plan, context)
+    def generate(plan: ToolPlan, context: dict[str, Any], capability: ProviderCapability | None = None) -> dict[str, Any]:
+        if capability is None:
+            if plan.integration_type == "database":
+                return ExecutionGenerator._database(plan, context)
+            return ExecutionGenerator._api(plan, context)
+        fallback = ExecutionGenerator._database(plan, context) if capability.execution_backend == "database_sql" else ExecutionGenerator._api(plan, context)
+        return ExecutionCompilerRegistry.compile(plan, context, capability, fallback)
 
     @staticmethod
     def _database(plan: ToolPlan, context: dict[str, Any]) -> dict[str, Any]:
-        schema_context = ContextRetriever.database_schema(context)
+        schema_context = ContextRetriever.verified_database_schema(context)
         relationships = ExecutionGenerator.relationships(schema_context)
         sql_statement = ExecutionGenerator.OPERATION_SQL_STATEMENT.get(plan.operation_type, "SELECT")
         mapping: dict[str, Any] = {
@@ -62,6 +67,15 @@ class ExecutionGenerator:
         if plan.operation_type == "read":
             mapping["sql_template"] = ExecutionGenerator.fixed_select_sql(plan, schema_context)
             mapping["dry_run_strategy"] = "run EXPLAIN and execute only with LIMIT using bound parameters"
+        elif plan.operation_type == "workflow":
+            mapping["allowed_statements"] = ["UPDATE"]
+            mapping["blocked_statements"] = [stmt for stmt in BLOCKED_READ_STATEMENTS if stmt != "UPDATE"]
+            mapping["sql_template"] = ExecutionGenerator.fixed_workflow_sql(plan, schema_context)
+            mapping["preconditions"] = plan.preconditions
+            mapping["requires_human_approval"] = True
+            mapping["strict_where_required"] = True
+            mapping["idempotency"] = {"required": True, "source": "input.idempotency_key"}
+            mapping["rollback_or_deactivation"] = "admin must define compensating action before publish"
         else:
             mapping["sql_template"] = ExecutionGenerator.fixed_mutation_sql(plan, schema_context)
             mapping["preconditions"] = plan.preconditions
@@ -192,6 +206,40 @@ class ExecutionGenerator:
             return f"UPDATE {table['fqn']} SET {assignments} WHERE {id_column} = :{id_column}"
         if plan.operation_type == "delete" and id_column:
             return f"DELETE FROM {table['fqn']} WHERE {id_column} = :{id_column}"
+        return ""
+
+    @staticmethod
+    def fixed_workflow_sql(plan: ToolPlan, schema_context: dict[str, Any]) -> str:
+        target = plan.exact_resources_used[0] if plan.exact_resources_used else None
+        table = next((item for item in schema_context.get("tables", []) if item["fqn"] == target), None)
+        if not table:
+            return ""
+        columns = {column["name"] for column in table.get("columns", [])}
+        resolved_target_name = (plan.resolved_target_column or "").split(".")[-1]
+        username_column = resolved_target_name if resolved_target_name in columns else next((name for name in ("username", "user_name") if name in columns), None)
+        phone_column = next((name for name in ("phone", "mobile", "phone_number", "msisdn") if name in columns), None)
+        id_column = ExecutionGenerator._identifier_column(table)
+        if plan.workflow_type == "read_then_update" and username_column and phone_column and id_column:
+            returning = [f"c.{id_column}"]
+            if "customer_code" in columns:
+                returning.append("c.customer_code")
+            if phone_column in columns:
+                returning.append(f"RIGHT(CAST(c.{phone_column} AS TEXT), 4) AS phone_last4")
+            returning.append(f"c.{username_column} AS updated_username")
+            returning_list = ", ".join(returning)
+            return (
+                "WITH matched_customer AS ("
+                f"SELECT c.{id_column} "
+                f"FROM {table['fqn']} c "
+                f"WHERE c.{phone_column} = :phone_number "
+                "LIMIT 1"
+                ") "
+                f"UPDATE {table['fqn']} c "
+                f"SET {username_column} = :new_username "
+                "FROM matched_customer mc "
+                f"WHERE c.{id_column} = mc.{id_column} "
+                f"RETURNING {returning_list}"
+            )
         return ""
 
     @staticmethod

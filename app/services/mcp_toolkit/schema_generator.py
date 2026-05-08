@@ -57,6 +57,7 @@ class SchemaGenerator:
                 "create": "created_id",
                 "update": "updated_id",
                 "delete": "deleted_id",
+                "workflow": "updated_id",
             }.get(plan.operation_type)
             mutation_properties = {
                 "operation": {"type": "string", "enum": [plan.operation_type]},
@@ -66,6 +67,11 @@ class SchemaGenerator:
             }
             if mutation_id_field:
                 mutation_properties[mutation_id_field] = {"type": "string", "nullable": True}
+            for field in plan.output_fields:
+                name = field.get("name")
+                if not name or name in mutation_properties:
+                    continue
+                mutation_properties[name] = {"type": field.get("type") or "string", "nullable": True}
             data_schema = {
                 "type": "object",
                 "properties": mutation_properties,

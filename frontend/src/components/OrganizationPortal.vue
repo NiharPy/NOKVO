@@ -54,6 +54,7 @@ const shippingProviders = ref([]);
 const shippingStatus = ref({ status: 'not_connected', provider: null, indexed_points: 0, module_count: 0, action_count: 0 });
 const toolkitDraft = ref(null);
 const toolkitRegistry = ref({ tools: [], drafts: [] });
+const toolkitBuilders = ref([]);
 const zohoDeskStatus = ref({
   status: 'not_connected',
   account_name: null,
@@ -93,6 +94,7 @@ const shippingForm = ref({
   base_url: 'https://apiv2.shiprocket.in/v1/external',
 });
 const toolkitForm = ref({
+  builder_key: '',
   integration_type: 'shipping',
   provider: 'shiprocket',
   nlp_prompt: '',
@@ -246,15 +248,39 @@ const connectedToolkitIntegrations = computed(() => {
   }
   return options;
 });
+const toolkitBuilderOptions = computed(() => {
+  if (toolkitBuilders.value.length) {
+    return toolkitBuilders.value;
+  }
+  return connectedToolkitIntegrations.value.map((integration) => ({
+    builder_key: `${integration.integration_type}:${integration.provider}`,
+    integration_type: integration.integration_type,
+    provider: integration.provider,
+    execution_backend: integration.integration_type === 'database' ? 'database_sql' : 'connector_action',
+    resource_model: integration.integration_type,
+    label: `${integration.label} Builder`,
+    description: `Generate MCP tools scoped to ${integration.label}.`,
+    detail: integration.detail,
+    supported_operations: ['read', 'create', 'update', 'workflow'],
+    connected: true,
+    value: integration.value,
+  }));
+});
+const selectedToolkitBuilder = computed(() =>
+  toolkitBuilderOptions.value.find((builder) => builder.builder_key === toolkitForm.value.builder_key)
+  || toolkitBuilderOptions.value.find((builder) => `${builder.integration_type}:${builder.provider}` === `${toolkitForm.value.integration_type}:${toolkitForm.value.provider}`)
+  || null,
+);
 const selectedToolkitIntegrationValue = computed({
   get() {
-    return `${toolkitForm.value.integration_type}:${toolkitForm.value.provider}`;
+    return toolkitForm.value.builder_key || `${toolkitForm.value.integration_type}:${toolkitForm.value.provider}`;
   },
   set(value) {
-    const option = connectedToolkitIntegrations.value.find((item) => item.value === value);
+    const option = toolkitBuilderOptions.value.find((item) => item.builder_key === value || item.value === value);
     if (!option) {
       return;
     }
+    toolkitForm.value.builder_key = option.builder_key;
     toolkitForm.value.integration_type = option.integration_type;
     toolkitForm.value.provider = option.provider;
     toolkitDraft.value = null;
@@ -491,6 +517,7 @@ function clearSession() {
   shippingStatus.value = { status: 'not_connected', provider: null, indexed_points: 0, module_count: 0, action_count: 0 };
   toolkitDraft.value = null;
   toolkitRegistry.value = { tools: [], drafts: [] };
+  toolkitBuilders.value = [];
   zohoDeskStatus.value = {
     status: 'not_connected',
     account_name: null,
@@ -509,7 +536,7 @@ function clearSession() {
   crmForm.value = { provider: 'zoho', account_url: '', api_domain: 'https://www.zohoapis.com', access_token: '', refresh_token: '' };
   erpForm.value = { provider: 'tally', base_url: 'http://localhost:9000', company_name: '', timeout_seconds: 20, max_items_per_module: 25 };
   shippingForm.value = { provider: 'shiprocket', email: '', password: '', base_url: 'https://apiv2.shiprocket.in/v1/external' };
-  toolkitForm.value = { integration_type: 'shipping', provider: 'shiprocket', nlp_prompt: '', system_prompt: '' };
+  toolkitForm.value = { builder_key: '', integration_type: 'shipping', provider: 'shiprocket', nlp_prompt: '', system_prompt: '' };
   dashboardQuery.value = '';
   showInvitedOnly.value = false;
   memberSortMode.value = 'name';
@@ -594,6 +621,7 @@ async function handleTotpVerify() {
     await fetchShippingProviders();
     await fetchShippingStatus();
     await fetchZohoDeskStatus();
+    await fetchToolkitBuilders();
   } catch (error) {
     errorMsg.value = error.message;
     infoMsg.value = '';
@@ -797,16 +825,17 @@ function ensureToolkitIntegrationSelection() {
   if (!canManageDatabase.value) {
     return false;
   }
-  const options = connectedToolkitIntegrations.value;
+  const options = toolkitBuilderOptions.value;
   if (!options.length) {
     toolkitRegistry.value = { tools: [], drafts: [] };
     toolkitDraft.value = null;
     return false;
   }
   const current = selectedToolkitIntegrationValue.value;
-  const hasCurrent = options.some((option) => option.value === current);
+  const hasCurrent = options.some((option) => option.builder_key === current || option.value === current);
   if (!hasCurrent) {
     const firstOption = options[0];
+    toolkitForm.value.builder_key = firstOption.builder_key;
     toolkitForm.value.integration_type = firstOption.integration_type;
     toolkitForm.value.provider = firstOption.provider;
     toolkitDraft.value = null;
@@ -821,8 +850,23 @@ function switchPage(page) {
   }
   if (page === 'toolkit') {
     if (ensureToolkitIntegrationSelection()) {
+      fetchToolkitBuilders();
       fetchToolkitRegistry();
     }
+  }
+}
+
+async function fetchToolkitBuilders() {
+  if (!canManageDatabase.value) {
+    toolkitBuilders.value = [];
+    return;
+  }
+  try {
+    const payload = await apiRequest('/org-auth/toolkit/builders');
+    toolkitBuilders.value = payload.builders || [];
+    ensureToolkitIntegrationSelection();
+  } catch (_) {
+    toolkitBuilders.value = [];
   }
 }
 
@@ -1035,6 +1079,7 @@ async function generateToolkitDraft() {
     toolkitDraft.value = await apiRequest('/org-auth/toolkit/generate', {
       method: 'POST',
       body: JSON.stringify({
+        builder_key: toolkitForm.value.builder_key || null,
         integration_type: toolkitForm.value.integration_type,
         provider: toolkitForm.value.provider,
         nlp_prompt: toolkitForm.value.nlp_prompt,
@@ -1233,6 +1278,7 @@ async function bootstrapOrganizationSession() {
     await fetchShippingProviders();
     await fetchShippingStatus();
     await fetchZohoDeskStatus();
+    await fetchToolkitBuilders();
   } catch (_) {
     clearSession();
     authState.value = 'login';
@@ -2106,29 +2152,54 @@ onBeforeUnmount(() => {
           <p>Generate draft MCP tools from indexed integration context, review the JSON, and register approved tools for the selected integration.</p>
         </div>
 
-        <div v-if="canManageDatabase && connectedToolkitIntegrations.length" class="dashboard-grid toolkit-page-grid">
+        <div v-if="canManageDatabase && toolkitBuilderOptions.length" class="dashboard-grid toolkit-page-grid">
           <article class="dashboard-card toolkit-builder-card">
             <div class="compact-card-head">
               <div class="compact-icon-shell">
                 <Wrench :size="18" />
               </div>
               <div>
-                <h3>Tool Draft</h3>
-                <p>Only the selected integration's embeddings and stored snapshots are sent to the generator.</p>
+                <h3>Integration Toolkit Builder</h3>
+                <p>Each builder is scoped to one connected integration and its provider capability.</p>
               </div>
             </div>
 
             <div class="db-form-block">
-              <label class="db-label" for="toolkit-connected-integration">Connected Integration</label>
+              <label class="db-label" for="toolkit-connected-integration">Toolkit Builder</label>
+              <div class="toolkit-list">
+                <button
+                  v-for="builder in toolkitBuilderOptions"
+                  :key="builder.builder_key"
+                  type="button"
+                  class="toolkit-list-row"
+                  @click="selectedToolkitIntegrationValue = builder.builder_key"
+                >
+                  <span>
+                    <strong>{{ builder.label }}</strong>
+                    <small>{{ builder.detail }} · {{ builder.execution_backend }}</small>
+                  </span>
+                  <span class="status-chip">{{ builder.resource_model }}</span>
+                </button>
+              </div>
               <select id="toolkit-connected-integration" v-model="selectedToolkitIntegrationValue" class="db-input">
                 <option
-                  v-for="integration in connectedToolkitIntegrations"
-                  :key="integration.value"
-                  :value="integration.value"
+                  v-for="builder in toolkitBuilderOptions"
+                  :key="builder.builder_key"
+                  :value="builder.builder_key"
                 >
-                  {{ integration.label }} - {{ integration.detail }}
+                  {{ builder.label }} - {{ builder.detail }}
                 </option>
               </select>
+            </div>
+
+            <div v-if="selectedToolkitBuilder" class="toolkit-registry-summary">
+              <strong>{{ selectedToolkitBuilder.label }}</strong>
+              <span>{{ selectedToolkitBuilder.execution_backend }} / {{ selectedToolkitBuilder.resource_model }}</span>
+            </div>
+
+            <div v-if="selectedToolkitBuilder" class="ticket-page-note">
+              <strong>{{ selectedToolkitBuilder.description }}</strong>
+              <p>Supported operations: {{ (selectedToolkitBuilder.supported_operations || []).join(', ') }}</p>
             </div>
 
             <div class="db-form-block">
@@ -2137,7 +2208,9 @@ onBeforeUnmount(() => {
                 id="toolkit-prompt"
                 v-model="toolkitForm.nlp_prompt"
                 class="db-input toolkit-textarea"
-                placeholder="Example: Create a tool that checks Shiprocket courier serviceability and returns the cheapest courier option."
+                :placeholder="selectedToolkitBuilder?.execution_backend === 'database_sql'
+                  ? 'Example: Build a tool to retrieve customer details using phone number.'
+                  : 'Example: Create a tool that checks Shiprocket courier serviceability and returns the cheapest courier option.'"
               ></textarea>
             </div>
 
@@ -2162,7 +2235,7 @@ onBeforeUnmount(() => {
             <div class="members-card-head">
               <div>
                 <h3>Registry</h3>
-                <p>{{ toolkitForm.integration_type }} / {{ toolkitForm.provider }}</p>
+                <p>{{ selectedToolkitBuilder?.label || `${toolkitForm.integration_type} / ${toolkitForm.provider}` }}</p>
               </div>
               <span class="status-chip">{{ visibleToolkitTools.length }} / {{ filteredToolkitTools.length }} tools</span>
             </div>
@@ -2234,7 +2307,7 @@ onBeforeUnmount(() => {
               <h3>{{ canManageDatabase ? 'Connect An Integration' : 'Admin Access Required' }}</h3>
               <p>
                 {{ canManageDatabase
-                  ? 'Toolkit generation is available after Database, CRM, Zoho Desk, ERP, or Shipping is connected and indexed.'
+                  ? 'Toolkit generation is available after an integration-specific builder becomes available from a connected and indexed integration.'
                   : 'Toolkit generation and MCP registry changes are limited to organization admins.' }}
               </p>
             </div>
