@@ -15,6 +15,7 @@ import redis
 from sqlalchemy import text as sql_text
 
 from app.models.tenant_resources import TenantResources
+from app.services.mcp_toolkit.sql_validator import SQLValidator
 from app.services.azure_keyvault_service import AzureKeyVaultService
 from app.services.qdrant_service import QdrantService
 from app.services.text_embedding_service import TextEmbeddingService
@@ -154,6 +155,25 @@ class DatabaseIntegrationService:
         if not connection_string:
             raise RuntimeError("Database connection secret is incomplete")
         return provider, connection_string
+
+    @staticmethod
+    async def explain_sql(provider: str, connection_string: str, sql: str, mapping: dict[str, Any]) -> dict[str, Any]:
+        provider = DatabaseIntegrationService._parse_provider(provider)
+        if provider not in POSTGRES_FAMILY:
+            return {"status": "skipped", "message": f"EXPLAIN validation is not implemented for {provider}."}
+        explain_sql, args, sample_bindings = SQLValidator.postgres_explain_query(sql, mapping)
+        connect_kwargs = DatabaseIntegrationService._build_postgres_connect_kwargs(connection_string)
+        conn = await asyncpg.connect(**connect_kwargs)
+        try:
+            rows = await conn.fetch(explain_sql, *args)
+        finally:
+            await conn.close()
+        return {
+            "status": "passed",
+            "statement": "EXPLAIN <generated parameterized SQL>",
+            "sample_bindings": sample_bindings,
+            "plan_rows": len(rows),
+        }
 
     @staticmethod
     async def index_selected_columns(

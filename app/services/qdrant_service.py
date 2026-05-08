@@ -1,13 +1,26 @@
 import re
 import uuid
 from qdrant_client import QdrantClient
-from qdrant_client.http.models import Distance, Filter, FieldCondition, FilterSelector, MatchValue, PointStruct, VectorParams
+from qdrant_client.http.models import Distance, Filter, FieldCondition, FilterSelector, MatchAny, MatchValue, PayloadSchemaType, PointStruct, VectorParams
 from app.core.config import settings
 from app.models.audit import SuperAdminAuditLog
 from app.models.tenant_resources import TenantResources
 from sqlalchemy.ext.asyncio import AsyncSession
 
 class QdrantService:
+    _INDEXED_COLLECTIONS: set[str] = set()
+    TOOLKIT_PAYLOAD_INDEX_FIELDS = [
+        "organization_id",
+        "tenant_integration_id",
+        "provider_connection_id",
+        "context_snapshot_id",
+        "selected_context_snapshot_id",
+        "integration_type",
+        "provider",
+        "status",
+        "source_kind",
+    ]
+
     @staticmethod
     def cluster_ref() -> str:
         return settings.QDRANT_URL
@@ -69,6 +82,7 @@ class QdrantService:
                         distance=Distance.COSINE,
                     ),
                 )
+            QdrantService.ensure_payload_indexes(collection_name, client)
             
             return collection_name
         except Exception as e:
@@ -84,10 +98,16 @@ class QdrantService:
     ) -> None:
         collection_name = QdrantService._required_collection(tenant_res)
         client = QdrantService._client()
+        QdrantService.ensure_payload_indexes(collection_name, client)
         point_structs = []
         for point in points:
             payload = dict(point.get("payload", {}) or {})
             payload["tenant_id"] = tenant_res.tenant_id
+            if payload.get("context_snapshot_id") and not payload.get("selected_context_snapshot_id"):
+                payload["selected_context_snapshot_id"] = payload["context_snapshot_id"]
+            if payload.get("selected_context_snapshot_id") and not payload.get("context_snapshot_id"):
+                payload["context_snapshot_id"] = payload["selected_context_snapshot_id"]
+            payload.setdefault("status", "active")
             point_structs.append(
                 PointStruct(
                     id=point["id"],
@@ -115,6 +135,7 @@ class QdrantService:
     ):
         collection_name = QdrantService._required_collection(tenant_res)
         client = QdrantService._client()
+        QdrantService.ensure_payload_indexes(collection_name, client)
         response = client.query_points(
             collection_name=collection_name,
             query=query_vector,
@@ -142,6 +163,14 @@ class QdrantService:
         for key, value in (payload_filters or {}).items():
             if value is None:
                 continue
+            if isinstance(value, (list, tuple, set)):
+                must_conditions.append(
+                    FieldCondition(
+                        key=key,
+                        match=MatchAny(any=list(value)),
+                    )
+                )
+                continue
             must_conditions.append(
                 FieldCondition(
                     key=key,
@@ -159,6 +188,7 @@ class QdrantService:
     ) -> None:
         collection_name = QdrantService._required_collection(tenant_res)
         client = QdrantService._client()
+        QdrantService.ensure_payload_indexes(collection_name, client)
         query_filter = QdrantService._payload_filter(tenant_res, payload_filters)
         client.delete(collection_name=collection_name, points_selector=FilterSelector(filter=query_filter))
         await QdrantService._audit(
@@ -178,6 +208,7 @@ class QdrantService:
     ) -> None:
         collection_name = QdrantService._required_collection(tenant_res)
         client = QdrantService._client()
+        QdrantService.ensure_payload_indexes(collection_name, client)
         client.delete(collection_name=collection_name, points_selector=point_ids)
         await QdrantService._audit(
             db,
@@ -186,3 +217,22 @@ class QdrantService:
             tenant_res,
             {"tenant_id": tenant_res.tenant_id, "point_ids": point_ids},
         )
+
+    @staticmethod
+    def ensure_payload_indexes(collection_name: str, client: QdrantClient | None = None) -> None:
+        if collection_name in QdrantService._INDEXED_COLLECTIONS:
+            return
+        client = client or QdrantService._client()
+        for field_name in QdrantService.TOOLKIT_PAYLOAD_INDEX_FIELDS:
+            try:
+                client.create_payload_index(
+                    collection_name=collection_name,
+                    field_name=field_name,
+                    field_schema=PayloadSchemaType.KEYWORD,
+                )
+            except Exception as exc:
+                message = str(exc).lower()
+                if "already exists" in message or "exists" in message:
+                    continue
+                raise RuntimeError(f"Failed to create Qdrant payload index for {field_name}: {exc}") from exc
+        QdrantService._INDEXED_COLLECTIONS.add(collection_name)

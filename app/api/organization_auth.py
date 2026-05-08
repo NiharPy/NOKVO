@@ -1327,7 +1327,7 @@ async def get_toolkit_registry(
     matching_drafts = [
         OrganizationToolkitDraftResponse(**draft)
         for draft in drafts
-        if draft.get("status") == "draft" and _toolkit_matches(draft, integration_type, provider)
+        if draft.get("status") in {"draft", "approved"} and _toolkit_matches(draft, integration_type, provider)
     ]
     tools = await _get_registered_tool_definitions(
         db,
@@ -1366,34 +1366,86 @@ async def approve_toolkit_draft(
     if not _toolkit_integration_connected(provider_status, selected["integration_type"], selected["provider"]):
         raise HTTPException(status_code=409, detail="Toolkit tools can only be approved for connected integrations")
 
-    selected["status"] = "approved"
-    selected["reviewed_at"] = datetime.now(timezone.utc).isoformat()
-    selected["reviewed_by"] = str(current_user.id)
-    selected["review_notes"] = payload.notes
-    selected["tool"] = ToolkitGeneratorService._sanitize_tool(
+    approval_context = await ToolkitGeneratorService.build_context(
+        tenant_res,
+        selected["integration_type"],
+        selected["provider"],
+        selected.get("nlp_prompt") or "",
+    )
+    generation_result = ToolkitGeneratorService._sanitize_tool(
         dict(selected["tool"]),
         selected["integration_type"],
         selected["provider"],
         selected.get("nlp_prompt") or "",
-        {"snapshot_context": [], "embedding_context": []},
+        approval_context,
     )
-    tool = dict(selected["tool"])
-    tool_name = ToolkitGeneratorService._normalize_tool_name((tool.get("mcp") or {}).get("tool_name") or tool.get("name"))
-    tool.setdefault("mcp", {})
-    tool["mcp"]["tool_name"] = tool_name
-    tool["approved_at"] = selected["reviewed_at"]
-    tool["approved_by"] = selected["reviewed_by"]
-    tool["tenant_scope"] = {
-        "organization_id": str(current_user.organization_id),
-        "tenant_id": tenant_res.tenant_id,
-    }
-    tool["review"] = {
+    if generation_result.get("validation", {}).get("status") != "passed":
+        selected["tool"] = generation_result
+        selected["status"] = "draft"
+        provider_status["toolkit_drafts"] = drafts
+        tenant_res.provider_status = provider_status
+        db.add(tenant_res)
+        await db.commit()
+        raise HTTPException(status_code=409, detail="Toolkit draft failed automatic validation and cannot be approved")
+    if generation_result.get("review", {}).get("status") == "rejected":
+        selected["tool"] = generation_result
+        selected["status"] = "draft"
+        provider_status["toolkit_drafts"] = drafts
+        tenant_res.provider_status = provider_status
+        db.add(tenant_res)
+        await db.commit()
+        raise HTTPException(status_code=409, detail="Toolkit draft was rejected by automatic reviewer")
+
+    selected["status"] = "approved"
+    selected["reviewed_at"] = datetime.now(timezone.utc).isoformat()
+    selected["reviewed_by"] = str(current_user.id)
+    selected["review_notes"] = payload.notes
+    generation_result["review"] = {
         "status": "approved",
         "required": True,
+        "reviewer_role": "admin",
         "reviewed_by": str(current_user.id),
         "reviewed_at": selected["reviewed_at"],
         "notes": payload.notes,
+        "reason": "Admin approved draft for test-run/publish gate.",
+        "required_changes": [],
     }
+    generation_result["tool"]["review"] = generation_result["review"]
+    generation_result["tool"]["status"] = "approved"
+    generation_result["tool"]["approved_at"] = selected["reviewed_at"]
+    generation_result["tool"]["approved_by"] = selected["reviewed_by"]
+    generation_result["tool"]["tenant_scope"] = {
+        "organization_id": str(current_user.organization_id),
+        "tenant_id": tenant_res.tenant_id,
+    }
+    generation_result["tool"]["version"]["reviewed_by"] = str(current_user.id)
+    generation_result["tool"]["version"]["approved_by"] = str(current_user.id)
+    generation_result["tool"]["version"]["updated_at"] = selected["reviewed_at"]
+    generation_result["tool"]["version"]["status"] = "approved"
+    generation_result["publish_gate"] = ToolkitGeneratorService.publish_gate(generation_result, admin_approval_exists=True)
+    selected["tool"] = generation_result
+    tool = dict(generation_result["tool"])
+    tool_name = ToolkitGeneratorService._normalize_tool_name((tool.get("mcp") or {}).get("tool_name") or tool.get("name"))
+    tool.setdefault("mcp", {})
+    tool["mcp"]["tool_name"] = tool_name
+
+    if not generation_result["publish_gate"].get("can_publish"):
+        provider_status.pop("mcp_tool_registry", None)
+        provider_status["toolkit_drafts"] = drafts
+        _append_toolkit_audit_event(
+            provider_status,
+            "toolkit_tool_admin_approved_pending_publish_gate",
+            current_user.id,
+            selected["integration_type"],
+            selected["provider"],
+            tool_name=tool_name,
+            draft_id=selected["id"],
+            metadata={"publish_gate": generation_result["publish_gate"]},
+        )
+        tenant_res.provider_status = provider_status
+        db.add(tenant_res)
+        await db.commit()
+        return OrganizationToolkitDraftResponse(**selected)
 
     existing_result = await db.execute(
         select(MCPToolRegistryEntry).where(

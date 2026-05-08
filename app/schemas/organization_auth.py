@@ -407,7 +407,7 @@ class OrganizationTallyXMLResponse(BaseModel):
     response_xml: str
 
 
-TOOLKIT_INTEGRATION_TYPES = {"database", "crm", "zoho_desk", "erp", "shipping"}
+TOOLKIT_INTEGRATION_TYPES = {"database", "crm", "zoho_desk", "erp", "shipping", "ecommerce", "his", "payments", "custom_api"}
 
 
 class OrganizationToolkitGenerateRequest(BaseModel):

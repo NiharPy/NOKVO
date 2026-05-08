@@ -981,7 +981,7 @@ Purpose:
 
 - Converts an admin's natural-language prompt into a draft MCP tool definition.
 - Uses only the selected integration's indexed Qdrant context and stored integration snapshots.
-- Requires admin approval before the generated tool is added to the MCP registry.
+- Requires automatic validation, admin approval, generated tests, and publish-gate checks before a generated tool can be added to the MCP registry.
 - Registry is tenant-specific and integration-specific, stored in `mcp_tool_registry_entries`.
 
 Global Azure OpenAI configuration:
@@ -1007,10 +1007,11 @@ Generation flow:
 4. Backend embeds the prompt and searches the tenant Qdrant collection.
 5. Backend filters context to the selected integration/provider where possible.
 6. Backend adds stored snapshots from `tenant_resources.provider_status`.
-7. Backend sends only that context to the global Azure OpenAI deployment.
-8. Backend stores the result as a draft in `provider_status["toolkit_drafts"]`.
-9. Admin reviews JSON.
-10. Approval upserts the tool into `mcp_tool_registry_entries` for the organization, integration type, provider, and tool name.
+7. Backend sends only that context to the global Azure OpenAI deployment using the token-efficient MCP generator prompt.
+8. Backend normalizes the model draft through the production pipeline: intent parser, context retriever, tool plan, schema generator, execution generator, safety/PII policy, reviewer, tests, and publish gate.
+9. Backend stores the `ToolGenerationResult` as a draft in `provider_status["toolkit_drafts"]`.
+10. Admin approval records human review only. It does not directly publish the tool.
+11. Registry insertion is allowed only when `review.status=approved`, `validation.status=passed`, `tests.status=passed`, admin approval exists, version metadata exists, audit policy exists, and rollback/deactivation support exists.
 
 Draft fields:
 
@@ -1030,24 +1031,28 @@ Draft fields:
 
 Immediate safeguards now enforced:
 
+- The generator is modularized under `app/services/mcp_toolkit/` into intent parsing, context retrieval, plan generation, schema generation, execution generation, safety classification, PII policy, reviewer, test generation, publish gate, and registry helpers.
+- Every generation returns the top-level `ToolGenerationResult` shape: `tool`, `tool_plan`, `validation`, `review`, `tests`, and `publish_gate`.
+- All generated tools start as draft/reviewable objects and `test_run_required=true`.
 - Azure OpenAI request handling uses a simple Responses API payload first and retries with a simpler string input if Azure rejects the request shape.
 - Tool names are normalized to short snake_case names and are safe for MCP registry lookup.
-- Empty or malformed `input_schema` values are replaced with a concrete object schema.
-- Every tool receives an `output_schema` with `success`, `data`, `message`, and metadata fields.
-- Every tool receives an `execution` contract.
-- Database tools receive a `database_sql` execution contract with explicit mode, allowed statements, blocked destructive statements, allowed table context, and PII redaction requirements.
-- Database write tools are allowed for parameterized `INSERT`, `UPDATE`, and `DELETE` only when marked `write_requires_admin_approval`, `requires_admin_confirmation`, and `test_run_required`.
-- Destructive schema/admin SQL prompts are converted to `unsupported_tool_request`.
-- Approval re-sanitizes drafts before publishing, so legacy drafts cannot bypass current rules.
-- Approved tools are stored in `mcp_tool_registry_entries`, scoped by organization, tenant, integration type, provider, and tool name.
+- Empty or malformed `input_schema` values are replaced with strict schemas using `additionalProperties: false` and concrete field constraints.
+- Every tool receives a structured `output_schema` with exact `data` shape plus `success`, `message`, `error_code`, and `trace_id`.
+- Every tool receives an execution contract with tenant scope, least-privilege permissions, audit policy, pre-execution validation, safe error codes, and PII output policy.
+- Database read tools generate fixed-purpose `SELECT` SQL only, never `SELECT *`, never dynamic table names, and always include `LIMIT`.
+- Database write tools are allowed only for explicit business `INSERT`, `UPDATE`, or `DELETE` requests with parameter binding, approval policy, preconditions, strict `WHERE` for update/delete, idempotency, and rollback/deactivation notes.
+- Database tools include allowed tables, allowed columns, relationship discovery, search strategy, hard execution limits, and EXPLAIN validation before publish.
+- API/CRM/ERP/HIS/ecommerce/payment/custom API tools must use verified connector actions/templates or approved specs from stored context. Missing context creates a rejected blocked draft instead of hallucinated endpoints.
+- Destructive schema/admin SQL prompts are rejected.
+- Approval re-sanitizes drafts with current integration context before admin review is recorded, so legacy drafts cannot bypass current rules.
+- Active published tools are stored in `mcp_tool_registry_entries`, scoped by organization, tenant, integration type, provider, and tool name.
 - Draft generation, approval, and rejection append audit events to `provider_status["toolkit_audit_events"]`.
-- Publishing remains admin-only through the Toolkit approval endpoints.
+- Publishing is blocked until validation, generated tests, admin approval, version metadata, audit policy, and rollback/deactivation requirements pass.
 
 Next build:
 
-- Relationship discovery should enrich database context with foreign keys, primary keys, and likely joins before tool generation.
-- Test-run mode should validate a draft against sample inputs without mutating external systems.
-- PII redaction should become an executable output post-processor instead of only a tool contract rule.
+- Add an executable test-run endpoint to move `tests.status` from `not_run` to `passed` only after static SQL/API validation and safe dry-run execution.
+- PII redaction should become an enforced runtime output post-processor in the MCP execution server.
 - Tool approval UI should display schema, execution mapping, safety notes, version, and audit history as separate review panels.
 - Audit logs should move from `provider_status["toolkit_audit_events"]` into a dedicated organization audit table.
 - Tool versioning should retain every published version, not only the active row version counter.
@@ -1062,6 +1067,15 @@ Enterprise-grade later:
 
 Tool JSON fields:
 
+- top-level `tool`
+- top-level `tool_plan`
+- top-level `validation`
+- top-level `review`
+- top-level `tests`
+- top-level `publish_gate`
+
+Nested MCP tool fields:
+
 - `name`
 - `title`
 - `description`
@@ -1069,14 +1083,19 @@ Tool JSON fields:
 - `provider`
 - `mcp`
 - `input_schema`
+- `output_schema`
+- `execution`
+- `safety`
+- `review`
+- `tests`
+- `version`
 - `execution_plan`
 - `source_context`
-- `safety_notes`
 
 Fallback behavior:
 
 - If Azure OpenAI is not configured or returns an error, the backend creates a conservative fallback draft from available integration snapshots.
-- Fallback drafts still require admin approval.
+- Fallback drafts still pass through the same automatic reviewer and publish gate.
 - This allows the workflow to be tested before the Azure key is configured.
 
 ## 17. Security Model

@@ -12,94 +12,31 @@ import uuid
 
 from app.core.config import settings
 from app.models.tenant_resources import TenantResources
+from app.services.database_integration_service import DatabaseIntegrationService
+from app.services.mcp_toolkit.embedding_retriever import EmbeddingRetrievalRequest, EmbeddingRetriever
+from app.services.mcp_toolkit.context_retriever import ContextRetriever
+from app.services.mcp_toolkit.name_utils import normalize_tool_name
+from app.services.mcp_toolkit.pipeline import MCPToolkitPipeline
+from app.services.mcp_toolkit.publish_gate import PublishGate
 from app.services.qdrant_service import QdrantService
 from app.services.text_embedding_service import TextEmbeddingService
 
 
-TOOLKIT_SYSTEM_PROMPT = """You are an intelligent MCP tool creator for NOKVO agents.
+TOOLKIT_SYSTEM_PROMPT = """You are the MCP Tool Generator for a multi-tenant enterprise AI agent platform. Convert the natural-language request into a narrow, production-grade MCP tool draft. Be strict, not creative.
 
-You only create tools from the integration context supplied in this request. The context is retrieved from the tenant's indexed integration embeddings and stored integration snapshots. Do not invent external APIs, credentials, hidden data, or tools outside the selected integration.
+Use only verified context supplied in the request: scanned DB schema, connector templates, OpenAPI/provider specs, or explicit admin context. Never invent tables, columns, API endpoints, provider fields, auth flows, credentials, or business rules. Never include secrets.
 
-Return a single valid JSON object only. No markdown. No prose outside JSON. The JSON must match:
-{
-  "name": "snake_case_tool_name",
-  "title": "Human readable title",
-  "description": "What the tool does",
-  "integration_type": "crm|zoho_desk|erp|shipping|database",
-  "provider": "provider name",
-  "mcp": {
-    "server": "tenant-integration-mcp",
-    "tool_name": "snake_case_tool_name",
-    "transport": "stdio-or-http-compatible",
-    "registry_scope": "organization_integration"
-  },
-  "input_schema": {
-    "type": "object",
-    "properties": {
-      "example_parameter": {
-        "type": "string",
-        "description": "Concrete input needed by the selected integration action"
-      }
-    },
-    "required": []
-  },
-  "output_schema": {
-    "type": "object",
-    "properties": {
-      "success": {"type": "boolean"},
-      "data": {"type": "object"},
-      "message": {"type": "string"}
-    },
-    "required": ["success"]
-  },
-  "execution": {
-    "type": "integration_action|database_sql",
-    "mode": "read_only|write_requires_admin_approval|required_review",
-    "mapping": {}
-  },
-  "execution_plan": [
-    "Step-by-step plan using only available integration actions"
-  ],
-  "source_context": [
-    "Short references to the relevant modules/actions used"
-  ],
-  "safety_notes": [
-    "Validation, permission, or review notes"
-  ]
-}
+Default to least privilege. Every tool must be typed, tenant-scoped, auditable, testable, reviewable, and blocked from publish until validation, tests, and admin approval pass.
 
-Prefer narrow tools that do one operational task well. If the prompt asks for a tool that cannot be created from the supplied context, return a JSON object with name "unsupported_tool_request" and explain why in description and safety_notes.
+Database rules: no SELECT *, no generic table-selection tools, bound parameters only, fully qualified schema.table, exact verified tables/columns only, LIMIT for reads, SELECT only for read-only tools, block mutation/admin statements for reads, writes require approval policy, preconditions, strict WHERE for UPDATE/DELETE, idempotency where applicable, rollback/deactivation notes, and EXPLAIN validation before publish.
 
-Database tools may be read-only or write-capable. Read-only tools should use SELECT. Write-capable database tools may use only parameterized INSERT, UPDATE, or DELETE and must set execution.mode to "write_requires_admin_approval". Never generate DROP, ALTER, CREATE, TRUNCATE, GRANT, REVOKE, COPY, EXECUTE, CALL, MERGE, REPLACE, VACUUM, ANALYZE, COMMIT, ROLLBACK, or transaction-control SQL. If the request needs destructive schema/admin SQL, return unsupported_tool_request.
+API rules: use only verified connector templates/specs, tenant secret references only, no embedded secrets, exact endpoint/method/params, timeout/retry/rate-limit, idempotency for mutations.
 
-Hard rules:
-1. Generate specific, action-based snake_case tool names.
-2. The name, title, description, input_schema, output_schema, execution plan, and execution mapping must all describe the same capability.
-3. Never generate empty input_schema properties unless the tool truly requires no input.
-4. Every input referenced by execution logic must exist in input_schema.
-5. Every generated tool must include a structured output_schema. Avoid generic data object unless the output is genuinely unknown.
-6. Database tools are read-only by default. Generate write-capable database tools only when the user explicitly asks for insert, update, or delete.
-7. Database tools must use parameterized SQL only.
-8. Never use SELECT *.
-9. Never use dynamic table names from user input.
-10. Every SQL query must include LIMIT or a hard execution limit.
-11. Use fully qualified schema.table names consistently.
-12. Use only tables and columns present in the indexed schema context.
-13. Include allowed_tables and allowed_columns.
-14. Include relationship discovery with join keys and confidence scores.
-15. Include search_strategy for lookup tools, including match priority, normalization, and confidence scoring.
-16. Include limits: max_entity_matches, max_rows_per_table, max_total_rows, timeout_seconds, and max_response_size_bytes.
-17. Include tenant isolation rules using only the current tenant's stored integration secret reference.
-18. Never include raw credentials, connection strings, API keys, tokens, or secrets.
-19. Include field-level PII classification and redaction policy.
-20. Include role-based permissions.
-21. Include audit logging metadata.
-22. Include pre-execution validation rules.
-23. Include safe error handling with structured error codes.
-24. Include test cases for valid, invalid, edge, and security scenarios.
-25. Generated tools must default to draft status and require admin review before publishing.
-26. If schema context is insufficient, return a review_required draft with missing_context listed. Do not invent tables or columns.
-"""
+Schemas: strict input_schema with additionalProperties false and length/pattern/enum constraints where possible. output_schema must define exact fields and include success, data, message, error_code, trace_id.
+
+Safety: classify risk low/medium/high/critical. Low read-only may run after publish. Medium writes require business checks/audit. High requires human/supervisor approval. Critical requires explicit admin policy and may be blocked. Mask phone/email/address/tokens/keys/secrets/passwords/connection strings unless explicitly approved; prefer phone_last4/email_masked/address_summary.
+
+Return only valid JSON. No markdown or prose. The platform will normalize your draft into ToolGenerationResult and reject unsafe output."""
 
 
 DML_SQL_PATTERN = re.compile(r"\b(insert|update|delete)\b", flags=re.IGNORECASE)
@@ -134,12 +71,7 @@ class ToolkitGeneratorService:
 
     @staticmethod
     def _normalize_tool_name(value: str) -> str:
-        normalized = re.sub(r"[^a-zA-Z0-9]+", "_", value or "").strip("_").lower()
-        if not normalized:
-            return f"generated_tool_{uuid.uuid4().hex[:8]}"
-        if normalized[0].isdigit():
-            normalized = f"tool_{normalized}"
-        return normalized[:64]
+        return normalize_tool_name(value)
 
     @staticmethod
     def _default_input_schema(integration_type: str, nlp_prompt: str, context: dict[str, Any]) -> dict[str, Any]:
@@ -452,10 +384,11 @@ class ToolkitGeneratorService:
 
     @staticmethod
     def _default_permissions(execution_mode: str) -> dict[str, Any]:
+        write_mode = execution_mode in {"write_requires_admin_approval", "write_requires_human_approval"}
         return {
-            "roles_allowed": ["admin"] if execution_mode == "write_requires_admin_approval" else ["admin", "manager"],
+            "roles_allowed": ["admin"] if write_mode else ["admin", "manager"],
             "requires_admin_review": True,
-            "requires_execution_confirmation": execution_mode == "write_requires_admin_approval",
+            "requires_execution_confirmation": write_mode,
         }
 
     @staticmethod
@@ -512,7 +445,7 @@ class ToolkitGeneratorService:
             {"name": "missing_required_or_empty_input", "type": "invalid", "input": {}, "expected_error": "VALIDATION_ERROR"},
             {"name": "edge_limit_boundary", "type": "edge", "input": {**sample_input, "limit": 1}, "expected": "bounded response"},
             {"name": "security_injection_attempt", "type": "security", "input": {field: "'; DROP TABLE users; --" for field in fields[:1]}, "expected_error": "POLICY_VIOLATION"},
-            {"name": "permission_check", "type": "security", "input": sample_input, "expected_error": "PERMISSION_DENIED" if execution_mode == "write_requires_admin_approval" else "success for allowed roles"},
+            {"name": "permission_check", "type": "security", "input": sample_input, "expected_error": "PERMISSION_DENIED" if execution_mode in {"write_requires_admin_approval", "write_requires_human_approval"} else "success for allowed roles"},
         ]
 
     @staticmethod
@@ -528,6 +461,10 @@ class ToolkitGeneratorService:
         if isinstance(value, list):
             return [ToolkitGeneratorService._redact_sensitive_values(item) for item in value]
         return value
+
+    @staticmethod
+    def publish_gate(result: dict[str, Any], admin_approval_exists: bool = False) -> dict[str, Any]:
+        return PublishGate.evaluate(result, admin_approval_exists=admin_approval_exists)
 
     @staticmethod
     def _ensure_parameter_sources_exist(input_schema: dict[str, Any], execution: dict[str, Any]) -> None:
@@ -550,7 +487,7 @@ class ToolkitGeneratorService:
         input_schema = ToolkitGeneratorService._default_input_schema("database", nlp_prompt, context)
         return {
             "type": "database_sql",
-            "mode": "write_requires_admin_approval" if write_requested else "read_only",
+            "mode": "write_requires_human_approval" if write_requested else "read_only",
             "mapping": {
                 "sql_template": (
                     "/* Admin must review and replace with parameterized INSERT/UPDATE/DELETE over allowed schema.table and columns only. */"
@@ -583,7 +520,7 @@ class ToolkitGeneratorService:
                 "tenant_isolation": "Use only the tenant's stored database connection secret and selected schema context.",
                 "pii_redaction": "Mask email, phone, address, token, key, and secret-like values before returning data.",
                 "requires_admin_confirmation": write_requested,
-                "test_run_required": write_requested,
+                "test_run_required": True,
                 "dry_run_strategy": "Validate SQL statement type, allowed tables, parameters, and estimated affected rows before execution." if write_requested else "Run with LIMIT and no mutation.",
                 "limits": {
                     "max_entity_matches": 10,
@@ -614,7 +551,7 @@ class ToolkitGeneratorService:
         write_capable = method not in {"", "GET", "READ"} or bool(re.search(r"\b(create|update|delete|assign|generate|import|post|patch)\b", action_name, flags=re.IGNORECASE))
         return {
             "type": "integration_action",
-            "mode": "write_requires_admin_approval" if write_capable else "required_review",
+            "mode": "write_requires_human_approval" if write_capable else "read_only",
             "mapping": {
                 "provider": provider,
                 "action": action_name,
@@ -623,7 +560,7 @@ class ToolkitGeneratorService:
                 "tenant_isolation": "Use only the tenant-scoped connection secret for this integration.",
                 "pii_redaction": "Mask email, phone, address, token, key, and secret-like values unless explicitly required.",
                 "requires_admin_confirmation": write_capable,
-                "test_run_required": write_capable,
+                "test_run_required": True,
             },
         }
 
@@ -672,7 +609,7 @@ class ToolkitGeneratorService:
                 input_schema,
             )
             if DML_SQL_PATTERN.search(sql_template) or ToolkitGeneratorService._database_write_requested(nlp_prompt):
-                fallback["mode"] = "write_requires_admin_approval"
+                fallback["mode"] = "write_requires_human_approval"
                 fallback["mapping"]["allowed_statements"] = ["INSERT", "UPDATE", "DELETE"]
                 fallback["mapping"]["requires_admin_confirmation"] = True
                 fallback["mapping"]["test_run_required"] = True
@@ -694,82 +631,78 @@ class ToolkitGeneratorService:
 
     @staticmethod
     def _sanitize_tool(tool: dict[str, Any], integration_type: str, provider: str, nlp_prompt: str, context: dict[str, Any]) -> dict[str, Any]:
-        if not isinstance(tool, dict):
-            tool = {}
-        name = ToolkitGeneratorService._normalize_tool_name(tool.get("name") or tool.get("title") or nlp_prompt)
-        tool["name"] = name
-        tool.setdefault("title", name.replace("_", " ").title())
-        tool.setdefault("description", f"Generated {integration_type}/{provider} MCP tool draft.")
-        tool["integration_type"] = integration_type
-        tool["provider"] = provider
-        tool.setdefault("mcp", {})
-        tool["mcp"]["tool_name"] = ToolkitGeneratorService._normalize_tool_name(tool["mcp"].get("tool_name") or name)
-        tool["mcp"].setdefault("server", "tenant-integration-mcp")
-        tool["mcp"].setdefault("transport", "stdio-or-http-compatible")
-        tool["mcp"].setdefault("registry_scope", "organization_integration")
-        tool["input_schema"] = ToolkitGeneratorService._sanitize_schema(
-            tool.get("input_schema"),
-            ToolkitGeneratorService._default_input_schema(integration_type, nlp_prompt, context),
+        model_tool = tool.get("tool") if isinstance(tool, dict) and isinstance(tool.get("tool"), dict) else tool
+        result = MCPToolkitPipeline.generate(
+            nlp_prompt=nlp_prompt,
+            integration_type=integration_type,
+            provider=provider,
+            context=context,
+            model_tool=model_tool if isinstance(model_tool, dict) else None,
         )
-        tool["output_schema"] = ToolkitGeneratorService._sanitize_schema(
-            tool.get("output_schema"),
-            ToolkitGeneratorService._default_output_schema(integration_type),
-        )
-        tool["execution"] = ToolkitGeneratorService._sanitize_execution(
-            tool.get("execution"),
-            integration_type,
-            provider,
-            nlp_prompt,
-            context,
-        )
-        tool.setdefault("execution_plan", [])
-        tool.setdefault("source_context", [])
-        tool.setdefault("safety_notes", [])
-        if not isinstance(tool["execution_plan"], list):
-            tool["execution_plan"] = []
-        if not isinstance(tool["source_context"], list):
-            tool["source_context"] = []
-        if not isinstance(tool["safety_notes"], list):
-            tool["safety_notes"] = []
-        tool["safety_notes"].extend(
-            note
-            for note in [
-                "Admin review is required before publishing.",
-                "Tool execution must stay within the selected tenant and integration.",
-                "PII and secrets must be redacted from outputs unless explicitly approved.",
-            ]
-            if note not in tool["safety_notes"]
-        )
-        if integration_type == "database":
-            if ToolkitGeneratorService._database_dangerous_requested(nlp_prompt):
-                tool["name"] = "unsupported_tool_request"
-                tool["mcp"]["tool_name"] = "unsupported_tool_request"
-                tool["description"] = "Destructive database schema/admin operations are not allowed for generated tools."
-                tool["execution"]["mapping"]["sql_template"] = ""
-                tool["safety_notes"].append("Rejected because destructive schema/admin SQL is not allowed.")
-            elif tool["name"] == "unsupported_tool_request":
-                recovered_name = ToolkitGeneratorService._normalize_tool_name(tool.get("title") or nlp_prompt)
-                tool["name"] = recovered_name
-                tool["mcp"]["tool_name"] = recovered_name
-                if not tool.get("description") or "not allowed" in str(tool.get("description")).lower():
-                    tool["description"] = f"Generated database tool for {provider}."
-                tool["safety_notes"] = [
-                    note
-                    for note in tool["safety_notes"]
-                    if "Rejected because destructive schema/admin SQL is not allowed." not in note
-                ]
-            elif tool["execution"].get("mode") == "write_requires_admin_approval":
-                tool["safety_notes"].append("Database write tools require admin approval, test-run validation, and explicit execution confirmation.")
-            else:
-                tool["safety_notes"].append("Database read tools are constrained to SELECT operations.")
-        elif tool["execution"].get("mode") == "write_requires_admin_approval":
-            tool["safety_notes"].append("Write-capable integration tools require admin approval, test-run validation, and explicit execution confirmation.")
-        tool["review"] = {
-            "status": "draft",
-            "required": True,
-            "reviewer_role": "admin",
-        }
-        return tool
+        if integration_type == "database" and ToolkitGeneratorService._database_dangerous_requested(nlp_prompt):
+            result["validation"]["status"] = "failed"
+            result["validation"]["errors"].append(
+                {"code": "DESTRUCTIVE_DATABASE_OPERATION", "message": "Destructive database schema/admin operations are not allowed for generated tools."}
+            )
+            result["review"] = {
+                "status": "rejected",
+                "required": True,
+                "reviewer_role": "admin",
+                "reason": "Destructive database schema/admin operation requested.",
+                "required_changes": ["Request a narrow read-only lookup or a reviewed INSERT/UPDATE/DELETE business operation instead."],
+            }
+            result["tool"]["review"] = result["review"]
+            result["tool"]["status"] = "rejected"
+            result["tool"]["execution"]["mapping"]["sql_template"] = ""
+            result["publish_gate"] = PublishGate.evaluate(result, admin_approval_exists=False)
+        return result
+
+    @staticmethod
+    async def _run_database_explain_validation(tenant_res: TenantResources, result: dict[str, Any]) -> dict[str, Any]:
+        tool = result.get("tool") or {}
+        execution = tool.get("execution") or {}
+        mapping = execution.get("mapping") or {}
+        sql_template = str(mapping.get("sql_template") or "")
+        if tool.get("integration_type") != "database" or execution.get("type") != "database_sql" or not sql_template:
+            return result
+        try:
+            secret_provider, connection_string = await DatabaseIntegrationService.load_connection_secret(tenant_res)
+            explain_result = await DatabaseIntegrationService.explain_sql(
+                str(tool.get("provider") or secret_provider),
+                connection_string,
+                sql_template,
+                mapping,
+            )
+            mapping["explain_validation"] = {
+                **(mapping.get("explain_validation") or {}),
+                **explain_result,
+                "required_before_publish": True,
+            }
+            validation_checks = result.setdefault("validation", {}).setdefault("checks", {})
+            validation_checks["sql_explain"] = "passed" if explain_result.get("status") in {"passed", "skipped"} else "failed"
+        except Exception as exc:
+            mapping["explain_validation"] = {
+                **(mapping.get("explain_validation") or {}),
+                "required_before_publish": True,
+                "status": "failed",
+                "error": str(exc),
+            }
+            result.setdefault("validation", {}).setdefault("errors", []).append(
+                {"code": "SQL_EXPLAIN_FAILED", "message": f"PostgreSQL EXPLAIN failed: {exc}"}
+            )
+            result["validation"]["status"] = "failed"
+            result["review"] = {
+                "status": "rejected",
+                "required": True,
+                "reviewer_role": "admin",
+                "reason": "PostgreSQL EXPLAIN validation failed.",
+                "required_changes": ["Fix the generated SQL or rescan the database schema before review."],
+            }
+            result["tool"]["review"] = result["review"]
+            result["tool"]["status"] = "rejected"
+            result["tool"]["version"]["status"] = "rejected"
+        result["publish_gate"] = PublishGate.evaluate(result, admin_approval_exists=False)
+        return result
 
     @staticmethod
     def _extract_json_object(text: str) -> dict[str, Any]:
@@ -920,20 +853,67 @@ class ToolkitGeneratorService:
         prompt: str,
     ) -> dict[str, Any]:
         provider_status = dict(tenant_res.provider_status or {})
-        embedding_context = await ToolkitGeneratorService._embedding_context(
-            tenant_res,
-            prompt,
-            integration_type,
-            provider,
-        )
         snapshot_context = ToolkitGeneratorService._snapshot_context(provider_status, integration_type, provider)
+        selected_context_snapshot_id = (
+            provider_status.get(f"{ToolkitGeneratorService._status_prefix(integration_type)}_context_snapshot_id")
+            or EmbeddingRetriever.snapshot_id(snapshot_context)
+        )
+        tenant_integration_id = (
+            provider_status.get(f"{ToolkitGeneratorService._status_prefix(integration_type)}_tenant_integration_id")
+            or f"{tenant_res.tenant_id}:{integration_type}:{provider}"
+        )
+        provider_connection_id = (
+            provider_status.get(f"{ToolkitGeneratorService._status_prefix(integration_type)}_provider_connection_id")
+            or ToolkitGeneratorService._provider_connection_id(tenant_res, integration_type, provider)
+        )
+        retrieval_request = EmbeddingRetrievalRequest(
+            organization_id=str(tenant_res.organization_id),
+            tenant_integration_id=str(tenant_integration_id),
+            provider_connection_id=str(provider_connection_id),
+            selected_context_snapshot_id=str(selected_context_snapshot_id),
+            integration_type=integration_type,
+            provider=provider,
+            user_prompt=prompt,
+            normalized_intent=None,
+            operation_type=None,
+            candidate_entities=EmbeddingRetriever.extract_candidate_entities(prompt),
+            candidate_inputs=EmbeddingRetriever.extract_candidate_inputs(prompt),
+            top_k=20,
+        )
+        retrieval = await EmbeddingRetriever.retrieve(tenant_res, retrieval_request, snapshot_context)
+        selected_context = retrieval.get("selected_context") or {}
         return {
             "tenant_id": tenant_res.tenant_id,
+            "organization_id": str(tenant_res.organization_id),
+            "tenant_integration_id": str(tenant_integration_id),
+            "provider_connection_id": str(provider_connection_id),
+            "selected_context_snapshot_id": str(selected_context_snapshot_id),
             "integration_type": integration_type,
             "provider": provider,
-            "embedding_context": embedding_context[:12],
-            "snapshot_context": snapshot_context[:30],
+            "embedding_context": selected_context.get("embedding_context", []),
+            "snapshot_context": selected_context.get("snapshot_context", []),
+            "source_context": selected_context.get("source_context", []),
+            "retrieval": retrieval,
         }
+
+    @staticmethod
+    def _status_prefix(integration_type: str) -> str:
+        if integration_type == "database":
+            return "db"
+        return integration_type
+
+    @staticmethod
+    def _provider_connection_id(tenant_res: TenantResources, integration_type: str, provider: str) -> str:
+        secret_refs = tenant_res.secret_refs or {}
+        key = {
+            "database": "db_connection_string",
+            "crm": "crm_connection",
+            "erp": "erp_connection",
+            "shipping": "shipping_connection",
+            "zoho_desk": "crm_connection",
+        }.get(integration_type)
+        secret_name = ((secret_refs.get(key) or {}).get("secret_name") if key else None) or ""
+        return secret_name or f"{tenant_res.tenant_id}:{integration_type}:{provider}:connection"
 
     @staticmethod
     async def _azure_generate(messages: list[dict[str, str]]) -> dict[str, Any]:
@@ -1014,16 +994,17 @@ class ToolkitGeneratorService:
             if isinstance(item.get("payload"), dict) and item.get("payload", {}).get("name")
         ]
         first_action = action_items[0] if action_items else {}
-        name_seed = first_action.get("name") or nlp_prompt
+        name_seed = nlp_prompt
+        normalized_name = ToolkitGeneratorService._normalize_tool_name(name_seed)
         return {
-            "name": ToolkitGeneratorService._normalize_tool_name(name_seed),
-            "title": f"{provider.title()} generated tool",
-            "description": "Draft generated from indexed integration context. Configure Azure OpenAI for richer tool synthesis.",
+            "name": normalized_name,
+            "title": normalized_name.replace("_", " ").title(),
+            "description": f"Generated draft for requested {integration_type}/{provider} operation: {nlp_prompt}",
             "integration_type": integration_type,
             "provider": provider,
             "mcp": {
                 "server": "tenant-integration-mcp",
-                "tool_name": ToolkitGeneratorService._normalize_tool_name(name_seed),
+                "tool_name": normalized_name,
                 "transport": "stdio-or-http-compatible",
                 "registry_scope": "organization_integration",
             },
@@ -1077,6 +1058,7 @@ class ToolkitGeneratorService:
             tool["generation_warning"] = str(exc)
 
         tool = ToolkitGeneratorService._sanitize_tool(tool, integration_type, provider, nlp_prompt, context)
+        tool = await ToolkitGeneratorService._run_database_explain_validation(tenant_res, tool)
         return {
             "id": str(uuid.uuid4()),
             "status": "draft",
