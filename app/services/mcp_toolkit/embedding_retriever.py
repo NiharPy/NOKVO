@@ -220,7 +220,7 @@ class EmbeddingRetriever:
         chunks: list[dict[str, Any]] = []
         for query in query_variants[:5]:
             try:
-                vector = TextEmbeddingService.embed_text(query)
+                vector = await TextEmbeddingService.embed_text(query)
                 points = await QdrantService.search_points(
                     tenant_res,
                     vector,

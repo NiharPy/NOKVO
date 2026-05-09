@@ -23,7 +23,23 @@ class QdrantService:
         "source_type",
         "resource",
         "resource_type",
+        "document_id",
+        "document_version_id",
+        "chunk_id",
+        "document_status",
+        "approval_status",
+        "approved_by",
+        "policy_version",
+        "language",
+        "doc_type",
+        "active",
+        "topic",
+        "sensitivity",
+        "source_title",
     ]
+    PAYLOAD_INDEX_TYPES = {
+        "active": PayloadSchemaType.BOOL,
+    }
 
     @staticmethod
     def cluster_ref() -> str:
@@ -33,7 +49,7 @@ class QdrantService:
     def _client() -> QdrantClient:
         if settings.QDRANT_URL == ":memory:":
             return QdrantClient(location=":memory:")
-        return QdrantClient(url=settings.QDRANT_URL, api_key=settings.QDRANT_API_KEY)
+        return QdrantClient(url=settings.QDRANT_URL, api_key=settings.QDRANT_API_KEY, timeout=60.0)
 
     @staticmethod
     def collection_name_for_tenant(tenant_id: str) -> str:
@@ -112,6 +128,8 @@ class QdrantService:
             if payload.get("selected_context_snapshot_id") and not payload.get("context_snapshot_id"):
                 payload["context_snapshot_id"] = payload["selected_context_snapshot_id"]
             payload.setdefault("status", "active")
+            payload.setdefault("embedding_provider", "openai")
+            payload.setdefault("embedding_model", settings.OPENAI_EMBEDDING_MODEL)
             point_structs.append(
                 PointStruct(
                     id=point["id"],
@@ -272,7 +290,7 @@ class QdrantService:
                 client.create_payload_index(
                     collection_name=collection_name,
                     field_name=field_name,
-                    field_schema=PayloadSchemaType.KEYWORD,
+                    field_schema=QdrantService.PAYLOAD_INDEX_TYPES.get(field_name, PayloadSchemaType.KEYWORD),
                 )
             except Exception as exc:
                 message = str(exc).lower()

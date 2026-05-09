@@ -405,6 +405,7 @@ class ERPIntegrationService:
         points: list[dict[str, Any]] = []
         indexed_paths: list[str] = []
 
+        records = []
         for module in scan_result.modules:
             module_name = module.get("api_name") or "module"
             folder_path = f"{scan_result.folder_path}/schema/{module_name}"
@@ -423,24 +424,20 @@ class ERPIntegrationService:
                     f"sample_records: {sample_records}",
                 ]
             )
-            points.append(
-                ERPIntegrationService._build_point(
-                    tenant_res,
-                    scan_result.provider,
-                    "erp_schema",
-                    f"schema:{module_name}",
-                    text,
-                    {
-                        "source_type": "erp_schema",
-                        "integration_type": "erp",
-                        "provider": scan_result.provider,
-                        "folder_path": folder_path,
-                        "module": module_name,
-                        "label": module.get("label"),
-                        "object_type": module.get("object_type"),
-                    },
-                )
-            )
+            records.append({
+                "point_type": "erp_schema",
+                "unique_key": f"schema:{module_name}",
+                "text": text,
+                "payload": {
+                    "source_type": "erp_schema",
+                    "integration_type": "erp",
+                    "provider": scan_result.provider,
+                    "folder_path": folder_path,
+                    "module": module_name,
+                    "label": module.get("label"),
+                    "object_type": module.get("object_type"),
+                }
+            })
 
         for action in scan_result.actions:
             action_name = action.get("name") or "action"
@@ -458,23 +455,35 @@ class ERPIntegrationService:
                     f"description: {action.get('description')}",
                 ]
             )
+            records.append({
+                "point_type": "erp_action",
+                "unique_key": f"action:{module_name}:{action_name}",
+                "text": text,
+                "payload": {
+                    "source_type": "erp_action",
+                    "integration_type": "erp",
+                    "provider": scan_result.provider,
+                    "folder_path": folder_path,
+                    "module": module_name,
+                    "action": action_name,
+                    "method": action.get("method"),
+                    "endpoint": action.get("endpoint"),
+                }
+            })
+
+        texts = [record["text"] for record in records]
+        vectors = await TextEmbeddingService.embed_texts(texts)
+
+        for index, record in enumerate(records):
             points.append(
                 ERPIntegrationService._build_point(
                     tenant_res,
                     scan_result.provider,
-                    "erp_action",
-                    f"action:{module_name}:{action_name}",
-                    text,
-                    {
-                        "source_type": "erp_action",
-                        "integration_type": "erp",
-                        "provider": scan_result.provider,
-                        "folder_path": folder_path,
-                        "module": module_name,
-                        "action": action_name,
-                        "method": action.get("method"),
-                        "endpoint": action.get("endpoint"),
-                    },
+                    record["point_type"],
+                    record["unique_key"],
+                    record["text"],
+                    vectors[index],
+                    record["payload"],
                 )
             )
 
@@ -500,12 +509,13 @@ class ERPIntegrationService:
         point_type: str,
         unique_key: str,
         text: str,
+        vector: list[float],
         payload: dict[str, Any],
     ) -> dict[str, Any]:
         point_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{tenant_res.tenant_id}:{provider}:{point_type}:{unique_key}"))
         return {
             "id": point_id,
-            "vector": TextEmbeddingService.embed_text(text),
+            "vector": vector,
             "payload": {
                 **payload,
                 "text": text,

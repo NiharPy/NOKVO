@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     RP_ID: str = "localhost"
     RP_NAME: str = "NOKVO SuperAdmin"
     EXPECTED_ORIGIN: str = "http://localhost:5173"
+    AGENT_PUBLIC_BASE_URL: str = "http://localhost:8000"
 
     # Redis (Rate Limiting & Tenant Cache)
     REDIS_URL: str = "redis://localhost:6379"
@@ -43,6 +44,9 @@ class Settings(BaseSettings):
     AZURE_OPENAI_GLOBAL_API_KEY: str = ""
     AZURE_OPENAI_GLOBAL_DEPLOYMENT: str = "gpt-5.4-mini"
     AZURE_OPENAI_GLOBAL_API_VERSION: str = "2024-10-21"
+    AZURE_OPENAI_AGENT_DEPLOYMENT: str = "gpt-4-1-mini"
+    AZURE_OPENAI_AGENT_MODEL: str = "gpt-4.1-mini"
+    AZURE_OPENAI_AGENT_API_VERSION: str = "2024-10-21"
     AZURE_MANAGED_IDENTITY_CLIENT_ID: str = ""
     AZURE_TENANT_ID: str = ""
     AZURE_CLIENT_ID: str = ""
@@ -73,6 +77,18 @@ class Settings(BaseSettings):
     SONIOX_TTS_VOICE: str = "Adrian"
     SONIOX_TTS_SAMPLE_RATE: int = 24000
     SONIOX_TTS_AUDIO_FORMAT: str = "wav"
+    AGENT_LLM_TIMEOUT_MS: int = 350
+    AGENT_RETRIEVAL_TOP_K: int = 3
+    AGENT_MAX_CONTEXT_CHARS: int = 3000
+    AGENT_MIN_RELEVANCE_SCORE: float = 0.25
+    AGENT_INTENT_CLASSIFIER_TIMEOUT_MS: int = 500
+    # Voice agent latency tuning
+    FILLER_TRIGGER_MS: int = 650          # Play filler only if the real answer is not ready quickly
+    TTS_SEGMENT_IDLE_DONE_MS: int = 750   # Treat a TTS segment as done after audio goes idle
+    TTS_SEGMENT_FIRST_AUDIO_TIMEOUT_MS: int = 2500
+    AGENT_LLM_STREAM_TOTAL_MS: int = 6000 # Max total LLM stream wait
+    AGENT_TOPIC_CONTINUITY_OVERLAP: float = 0.35  # Word overlap to reuse last chunks
+    AGENT_MAX_FIRST_SENTENCE_CHARS: int = 110     # Force TTS dispatch after this many chars
 
     # Billing and Usage Tracking
     ORGANIZATION_BASE_MONTHLY_COST_USD: float = 5.00
@@ -96,6 +112,16 @@ class Settings(BaseSettings):
     QDRANT_API_KEY: str = ""
     QDRANT_COLLECTION_PREFIX: str = "tenant"
     QDRANT_VECTOR_SIZE: int = 1536
+    
+    OPENAI_API_KEY: str = ""
+    OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-small"
+    OPENAI_EMBEDDING_BATCH_SIZE: int = 96
+    OPENAI_EMBEDDING_TIMEOUT_SECONDS: float = 20.0
+    OPENAI_EMBEDDING_ALLOW_ZERO_FALLBACK: bool = False
+
+    # Voice agent answer cache (Redis)
+    AGENT_ANSWER_CACHE_ENABLED: bool = True
+    AGENT_ANSWER_CACHE_TTL_SECONDS: int = 300
 
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=True, extra="ignore")
 

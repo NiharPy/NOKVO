@@ -8,8 +8,9 @@ import json
 from urllib.parse import quote_plus
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
-from fastapi.responses import RedirectResponse
+from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, status
+from fastapi.responses import PlainTextResponse, RedirectResponse
+import jwt
 import pyotp
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -50,6 +51,20 @@ from app.schemas.organization_auth import (
     OrganizationToolkitGenerateRequest,
     OrganizationToolkitRegistryResponse,
     OrganizationToolkitReviewRequest,
+    OrganizationAgentDocumentResponse,
+    OrganizationAgentDocumentReviewRequest,
+    OrganizationAgentDocumentUploadRequest,
+    OrganizationAgentDocumentsResponse,
+    OrganizationAgentTestAnswerResponse,
+    OrganizationAgentTestQueryRequest,
+    OrganizationAgentTestRetrievalResponse,
+    OrganizationAgentRuntimeChatRequest,
+    OrganizationAgentRuntimeChatResponse,
+    OrganizationAgentRuntimeStatusResponse,
+    OrganizationAgentPhoneLinkRequest,
+    OrganizationAgentPhoneLinkResponse,
+    OrganizationAgentLatencyTestRequest,
+    OrganizationAgentLatencyTestResponse,
     OrganizationZohoDeskConnectResponse,
     OrganizationZohoDeskStatusResponse,
     OrganizationZohoDeskTicketCreateRequest,
@@ -79,6 +94,10 @@ from app.services.google_oauth_service import GoogleOAuthError, GoogleOAuthServi
 from app.services.shipping_integration_service import ShippingIntegrationService
 from app.services.toolkit_generator_service import ToolkitGeneratorService
 from app.services.qdrant_service import QdrantService
+from app.services.agent_knowledge_service import AgentKnowledgeService
+from app.services.agent_runtime_service import AgentRuntimeService
+from app.services.agent_voice_stream_service import AgentVoiceStreamService
+from app.services.twilio_service import TwilioService
 
 
 router = APIRouter()
@@ -281,6 +300,63 @@ async def _get_tenant_resources_for_org(db: AsyncSession, organization_id: uuid.
     if not tenant_res:
         raise HTTPException(status_code=404, detail="Tenant resources not found for organization")
     return tenant_res
+
+
+def _agent_phone_link_response(tenant_res: TenantResources) -> dict:
+    link = dict((tenant_res.provider_status or {}).get("agent_phone_link") or {})
+    if not link:
+        return {
+            "status": "not_linked",
+            "phone_number": tenant_res.twilio_phone_number,
+            "latency_target_ms": 800,
+        }
+    return {
+        "status": link.get("status") or "not_linked",
+        "phone_number": link.get("phone_number") or tenant_res.twilio_phone_number,
+        "link_id": link.get("link_id"),
+        "voice_url": link.get("voice_url"),
+        "incoming_phone_number_sid": link.get("incoming_phone_number_sid"),
+        "linked_at": link.get("linked_at"),
+        "unlinked_at": link.get("unlinked_at"),
+        "latency_target_ms": int(link.get("latency_target_ms") or 800),
+    }
+
+
+async def _get_tenant_resources_by_agent_phone_link(db: AsyncSession, link_id: str) -> TenantResources | None:
+    result = await db.execute(select(TenantResources))
+    for tenant_res in result.scalars().all():
+        link = dict((tenant_res.provider_status or {}).get("agent_phone_link") or {})
+        if link.get("link_id") == link_id and link.get("status") == "linked":
+            return tenant_res
+    return None
+
+
+async def _get_websocket_organization_user(websocket: WebSocket, db: AsyncSession) -> OrganizationUser | None:
+    token = websocket.query_params.get("token") or ""
+    auth_header = websocket.headers.get("authorization") or ""
+    if not token and auth_header.lower().startswith("bearer "):
+        token = auth_header.split(" ", 1)[1].strip()
+    if not token:
+        return None
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        if payload.get("principal_type") != "organization_user":
+            return None
+        user_id = payload.get("sub")
+        organization_id = payload.get("organization_id")
+        if not user_id or not organization_id:
+            return None
+    except jwt.PyJWTError:
+        return None
+
+    result = await db.execute(
+        select(OrganizationUser).where(
+            OrganizationUser.id == user_id,
+            OrganizationUser.organization_id == organization_id,
+            OrganizationUser.status != "disabled",
+        )
+    )
+    return result.scalars().first()
 
 
 async def _resolve_organization_for_identity(
@@ -1553,6 +1629,295 @@ async def reject_toolkit_draft(
     db.add(tenant_res)
     await db.commit()
     return OrganizationToolkitDraftResponse(**selected)
+
+
+@router.get("/agent/documents", response_model=OrganizationAgentDocumentsResponse)
+async def get_agent_knowledge_documents(
+    current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin", "manager"])),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
+    return OrganizationAgentDocumentsResponse(documents=AgentKnowledgeService.list_documents(tenant_res))
+
+
+@router.post("/agent/documents/upload", response_model=OrganizationAgentDocumentResponse)
+async def upload_agent_knowledge_document(
+    payload: OrganizationAgentDocumentUploadRequest,
+    current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin"])),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    try:
+        content = base64.b64decode(payload.content_base64, validate=True)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail="Document content must be valid base64") from exc
+    if not content:
+        raise HTTPException(status_code=422, detail="Document file is empty")
+    tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
+    try:
+        document = await AgentKnowledgeService.upload_document(
+            tenant_res,
+            db,
+            current_user,
+            name=payload.name,
+            document_type=payload.document_type,
+            description=payload.description,
+            tags=payload.tags,
+            filename=payload.filename,
+            content=content,
+            content_type=payload.content_type,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return OrganizationAgentDocumentResponse(**document)
+
+
+@router.post("/agent/documents/{document_id}/approve", response_model=OrganizationAgentDocumentResponse)
+async def approve_agent_knowledge_document(
+    document_id: str,
+    payload: OrganizationAgentDocumentReviewRequest,
+    current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin"])),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
+    try:
+        document = await AgentKnowledgeService.review_document(
+            tenant_res,
+            db,
+            current_user,
+            document_id,
+            approve=True,
+            notes=payload.notes,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return OrganizationAgentDocumentResponse(**document)
+
+
+@router.post("/agent/documents/{document_id}/reject", response_model=OrganizationAgentDocumentResponse)
+async def reject_agent_knowledge_document(
+    document_id: str,
+    payload: OrganizationAgentDocumentReviewRequest,
+    current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin"])),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
+    try:
+        document = await AgentKnowledgeService.review_document(
+            tenant_res,
+            db,
+            current_user,
+            document_id,
+            approve=False,
+            notes=payload.notes,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return OrganizationAgentDocumentResponse(**document)
+
+
+@router.post("/agent/test-retrieval", response_model=OrganizationAgentTestRetrievalResponse)
+async def test_agent_knowledge_retrieval(
+    payload: OrganizationAgentTestQueryRequest,
+    current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin", "manager"])),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
+    try:
+        result = await AgentKnowledgeService.test_retrieval(tenant_res, payload.query, top_k=payload.top_k, db=db)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return OrganizationAgentTestRetrievalResponse(**result)
+
+
+@router.post("/agent/test-answer", response_model=OrganizationAgentTestAnswerResponse)
+async def test_agent_knowledge_answer(
+    payload: OrganizationAgentTestQueryRequest,
+    current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin", "manager"])),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
+    try:
+        result = await AgentRuntimeService.answer_text(
+            tenant_res,
+            payload.query,
+            top_k=payload.top_k,
+            db=db,
+            response_language=payload.response_language,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return OrganizationAgentTestAnswerResponse(**result)
+
+
+@router.get("/agent/runtime/status", response_model=OrganizationAgentRuntimeStatusResponse)
+async def get_agent_runtime_status(
+    current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin", "manager"])),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
+    return OrganizationAgentRuntimeStatusResponse(**AgentRuntimeService.runtime_status(tenant_res))
+
+
+@router.post("/agent/runtime/chat", response_model=OrganizationAgentRuntimeChatResponse)
+async def chat_with_agent_runtime(
+    payload: OrganizationAgentRuntimeChatRequest,
+    current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin", "manager"])),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
+    try:
+        result = await AgentRuntimeService.answer_text(
+            tenant_res,
+            payload.query,
+            db=db,
+            top_k=payload.top_k,
+            latency_budget_ms=payload.latency_budget_ms,
+            response_language=payload.response_language,
+            conversation_history=payload.conversation_history,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return OrganizationAgentRuntimeChatResponse(**result)
+
+
+@router.get("/agent/phone-link", response_model=OrganizationAgentPhoneLinkResponse)
+async def get_agent_phone_link(
+    current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin", "manager"])),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
+    return OrganizationAgentPhoneLinkResponse(**_agent_phone_link_response(tenant_res))
+
+
+@router.post("/agent/phone-link", response_model=OrganizationAgentPhoneLinkResponse)
+async def link_agent_phone_number(
+    payload: OrganizationAgentPhoneLinkRequest,
+    request: Request,
+    current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin"])),
+    organization: Organization = Depends(deps.get_current_organization),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
+    try:
+        await TwilioService.ensure_subaccount(tenant_res, organization.name, db)
+        public_base_url = settings.AGENT_PUBLIC_BASE_URL or str(request.base_url).rstrip("/")
+        link = await TwilioService.link_agent_phone_number(
+            tenant_res,
+            db,
+            phone_number=payload.phone_number,
+            public_base_url=public_base_url,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return OrganizationAgentPhoneLinkResponse(**link)
+
+
+@router.delete("/agent/phone-link", response_model=OrganizationAgentPhoneLinkResponse)
+async def unlink_agent_phone_number(
+    current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin"])),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
+    try:
+        await TwilioService.unlink_agent_phone_number(tenant_res, db)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return OrganizationAgentPhoneLinkResponse(**_agent_phone_link_response(tenant_res))
+
+
+@router.post("/agent/runtime/latency-test", response_model=OrganizationAgentLatencyTestResponse)
+async def test_agent_latency(
+    payload: OrganizationAgentLatencyTestRequest,
+    current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin", "manager"])),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
+    try:
+        result = await AgentRuntimeService.latency_test(
+            tenant_res,
+            payload.query,
+            db=db,
+            target_ms=payload.target_ms,
+            response_language=payload.response_language,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return OrganizationAgentLatencyTestResponse(**result)
+
+
+@router.post("/agent/twilio/voice/{link_id}", response_class=PlainTextResponse)
+async def twilio_agent_voice_webhook(
+    link_id: str,
+    request: Request,
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tenant_res = await _get_tenant_resources_by_agent_phone_link(db, link_id)
+    if not tenant_res:
+        return PlainTextResponse(
+            "<Response><Say>The NOKVO agent is not linked to this number.</Say><Hangup/></Response>",
+            media_type="application/xml",
+            status_code=404,
+        )
+    host = request.url.hostname or "localhost"
+    scheme = "wss" if request.url.scheme == "https" else "ws"
+    port = f":{request.url.port}" if request.url.port else ""
+    media_url = f"{scheme}://{host}{port}/api/org-auth/agent/twilio/media/{link_id}"
+    twiml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response>"
+        "<Connect>"
+        f'<Stream url="{media_url}">'
+        f'<Parameter name="tenant_id" value="{tenant_res.tenant_id}"/>'
+        "</Stream>"
+        "</Connect>"
+        "</Response>"
+    )
+    return PlainTextResponse(twiml, media_type="application/xml")
+
+
+@router.post("/agent/twilio/status/{link_id}")
+async def twilio_agent_status_callback(link_id: str):
+    return {"ok": True, "link_id": link_id}
+
+
+@router.websocket("/agent/twilio/media/{link_id}")
+async def twilio_agent_media_websocket(websocket: WebSocket, link_id: str):
+    async for db in deps.get_db():
+        tenant_res = await _get_tenant_resources_by_agent_phone_link(db, link_id)
+        if not tenant_res:
+            await websocket.close(code=1008)
+            return
+        await websocket.accept()
+        await websocket.send_json({"event": "connected", "protocol": "Call", "version": "1.0.0"})
+        await websocket.send_json({
+            "event": "mark",
+            "mark": {"name": "agent_link_ready"},
+        })
+        # Twilio Media Streams send telephony audio here. The browser Agent Studio
+        # runtime is already full-duplex; this endpoint establishes the phone-number
+        # link and is the integration point for production transcoding to Twilio media.
+        while True:
+            message = await websocket.receive_text()
+            payload = json.loads(message)
+            if payload.get("event") == "stop":
+                await websocket.close()
+                return
+
+
+@router.websocket("/agent/voice/ws")
+async def agent_voice_websocket(websocket: WebSocket):
+    async for db in deps.get_db():
+        current_user = await _get_websocket_organization_user(websocket, db)
+        if not current_user or current_user.role not in {"admin", "manager"}:
+            await websocket.close(code=1008)
+            return
+        tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
+        await AgentVoiceStreamService.run_session(websocket, tenant_res, db=db)
+        return
 
 
 @router.post("/database/index", response_model=OrganizationDatabaseIndexResponse)

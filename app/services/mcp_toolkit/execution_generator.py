@@ -103,6 +103,9 @@ class ExecutionGenerator:
             mapping["rollback_or_deactivation"] = "admin must define rollback or compensation before publish"
         else:
             mapping["sql_template"] = ExecutionGenerator.fixed_mutation_sql(plan, schema_context)
+            if plan.operation_type == "delete" and plan.target_entity == "customer" and mapping["sql_template"].lstrip().upper().startswith("WITH") and "UPDATE " in mapping["sql_template"].upper():
+                mapping["allowed_statements"] = ["UPDATE"]
+                mapping["blocked_statements"] = [stmt for stmt in BLOCKED_READ_STATEMENTS if stmt != "UPDATE"]
             mapping["preconditions"] = plan.preconditions
             mapping["requires_human_approval"] = True
             mapping["strict_where_required"] = plan.operation_type in {"update", "delete"}
@@ -163,6 +166,9 @@ class ExecutionGenerator:
 
     @staticmethod
     def fixed_select_sql(plan: ToolPlan, schema_context: dict[str, Any]) -> str:
+        order_customer_sql = ExecutionGenerator.fixed_order_customer_safe_lookup_sql(plan, schema_context)
+        if order_customer_sql:
+            return order_customer_sql
         target = plan.exact_resources_used[0] if plan.exact_resources_used else None
         table = next((item for item in schema_context.get("tables", []) if item["fqn"] == target), None)
         if not table:
@@ -197,6 +203,69 @@ class ExecutionGenerator:
         where_clause = f" WHERE {' AND '.join(filters)}" if filters else ""
         join_clause = f" {' '.join(joins)}" if joins else ""
         return f"SELECT {select_list} FROM {table['fqn']}{join_clause}{where_clause} LIMIT :limit"
+
+    @staticmethod
+    def fixed_order_customer_safe_lookup_sql(plan: ToolPlan, schema_context: dict[str, Any]) -> str:
+        if plan.operation_type != "read" or (plan.intent_signals or {}).get("lookup_field") != "order_id":
+            return ""
+        text = str((plan.intent_signals or {}).get("normalized_prompt") or "")
+        if not re.search(r"\bcustomer|phone|email|address|payment\b", text):
+            return ""
+        tables = [item for item in schema_context.get("tables", []) if item["fqn"] in set(plan.exact_resources_used)]
+        order_table = next((item for item in tables if "order" in str(item.get("table") or "").lower()), None)
+        customer_table = next((item for item in tables if "customer" in str(item.get("table") or "").lower()), None)
+        if not order_table or not customer_table:
+            return ""
+        order_columns = {column["name"] for column in order_table.get("columns", [])}
+        customer_columns = {column["name"] for column in customer_table.get("columns", [])}
+        if not {"order_id", "customer_id"}.issubset(order_columns) or "customer_id" not in customer_columns:
+            return ""
+        order_select = ["o.order_id", "o.customer_id"]
+        if "order_number" in order_columns:
+            order_select.insert(1, "o.order_number")
+        status_column = "order_status" if "order_status" in order_columns else "status" if "status" in order_columns else None
+        if status_column:
+            order_select.insert(-1, f"o.{status_column} AS order_status" if status_column == "status" else f"o.{status_column}")
+        if "payment_status" in order_columns:
+            order_select.insert(-1, "o.payment_status")
+        customer_select = ["c.customer_id"]
+        if "customer_code" in customer_columns:
+            customer_select.append("c.customer_code")
+        if "full_name" in customer_columns:
+            customer_select.append("c.full_name")
+        if "email" in customer_columns:
+            customer_select.append(
+                "CASE WHEN c.email IS NULL THEN NULL ELSE LEFT(c.email, 1) || '***' || SUBSTRING(c.email FROM POSITION('@' IN c.email)) END AS email_masked"
+            )
+        if "phone" in customer_columns:
+            customer_select.append("RIGHT(CAST(c.phone AS TEXT), 4) AS phone_last4")
+        if "city" in customer_columns:
+            customer_select.append("LEFT(CAST(c.city AS TEXT), 80) AS city_summary")
+        elif "address" in customer_columns:
+            customer_select.append("LEFT(CAST(c.address AS TEXT), 80) AS address_summary")
+        select_parts = []
+        for name in ("customer_id", "customer_code", "full_name", "email_masked", "phone_last4", "city_summary", "address_summary"):
+            if any(part.endswith(f"AS {name}") or part.endswith(f".{name}") or part == f"c.{name}" for part in customer_select):
+                select_parts.append(f"cb.{name}")
+        for name in ("order_id", "order_number", "order_status", "payment_status"):
+            if any(part.endswith(f"AS {name}") or part.endswith(f".{name}") or part == f"o.{name}" for part in order_select):
+                select_parts.append(f"ob.{name}")
+        return (
+            "WITH order_base AS ("
+            f"SELECT {', '.join(order_select)} "
+            f"FROM {order_table['fqn']} o "
+            "WHERE CAST(o.order_id AS TEXT) = :order_id"
+            "), "
+            "customer_base AS ("
+            f"SELECT {', '.join(customer_select)} "
+            f"FROM {customer_table['fqn']} c "
+            "JOIN order_base ob ON c.customer_id = ob.customer_id"
+            ") "
+            f"SELECT {', '.join(select_parts)} "
+            "FROM order_base ob "
+            "JOIN customer_base cb ON cb.customer_id = ob.customer_id "
+            "LIMIT :limit"
+        )
 
     @staticmethod
     def _fixed_select_sql_with_base_cte(plan: ToolPlan, table: dict[str, Any], columns: list[dict[str, Any]], related_tables: list[dict[str, Any]]) -> str:
@@ -250,6 +319,8 @@ class ExecutionGenerator:
             return ""
         columns = [column["name"] for column in table.get("columns", [])]
         id_column = next((column for column in columns if column in {"id", f"{table['table'].rstrip('s')}_id"} or column.endswith("_id")), None)
+        if plan.operation_type == "delete" and plan.target_entity == "customer":
+            return ExecutionGenerator.fixed_customer_delete_sql(plan, table, columns, id_column)
         writable = [field["name"] for field in plan.input_fields if field.get("name") in columns and field.get("name") not in {"id", "limit", id_column}]
         if plan.operation_type == "create" and writable:
             column_list = ", ".join(writable)
@@ -261,6 +332,57 @@ class ExecutionGenerator:
             return f"UPDATE {table['fqn']} SET {assignments} WHERE {id_column} = :{id_column}"
         if plan.operation_type == "delete" and id_column:
             return f"DELETE FROM {table['fqn']} WHERE {id_column} = :{id_column}"
+        return ""
+
+    @staticmethod
+    def fixed_customer_delete_sql(plan: ToolPlan, table: dict[str, Any], columns: list[str], id_column: str | None) -> str:
+        policy = ((plan.intent_signals or {}).get("delete_policy") or {})
+        if not id_column or "phone" not in columns:
+            return ""
+        if not policy.get("exists") or not policy.get("retention_policy_confirmed") or not policy.get("linked_records_policy_confirmed"):
+            return ""
+        soft_column = next((name for name in ("deleted_at", "deactivated_at", "disabled_at") if name in columns), None)
+        boolean_column = next((name for name in ("is_active", "is_deleted", "active") if name in columns), None)
+        if policy.get("soft_delete_available") or policy.get("deactivation_available"):
+            if soft_column:
+                return (
+                    "WITH matched_customer AS ("
+                    f"SELECT {id_column} "
+                    f"FROM {table['fqn']} "
+                    "WHERE phone = :phone_number"
+                    ") "
+                    f"UPDATE {table['fqn']} c "
+                    f"SET {soft_column} = now() "
+                    "FROM matched_customer mc "
+                    f"WHERE c.{id_column} = mc.{id_column} "
+                    f"RETURNING c.{id_column} AS deleted_id"
+                )
+            if boolean_column:
+                value = "true" if boolean_column == "is_deleted" else "false"
+                return (
+                    "WITH matched_customer AS ("
+                    f"SELECT {id_column} "
+                    f"FROM {table['fqn']} "
+                    "WHERE phone = :phone_number"
+                    ") "
+                    f"UPDATE {table['fqn']} c "
+                    f"SET {boolean_column} = {value} "
+                    "FROM matched_customer mc "
+                    f"WHERE c.{id_column} = mc.{id_column} "
+                    f"RETURNING c.{id_column} AS deleted_id"
+                )
+        if policy.get("hard_delete_allowed"):
+            return (
+                "WITH matched_customer AS ("
+                f"SELECT {id_column} "
+                f"FROM {table['fqn']} "
+                "WHERE phone = :phone_number"
+                ") "
+                f"DELETE FROM {table['fqn']} c "
+                "USING matched_customer mc "
+                f"WHERE c.{id_column} = mc.{id_column} "
+                f"RETURNING c.{id_column} AS deleted_id"
+            )
         return ""
 
     @staticmethod

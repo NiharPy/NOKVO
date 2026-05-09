@@ -17,6 +17,10 @@ class IntentParser:
         latest_order_policy = IntentParser._latest_order_policy(context)
         bulk_mutation_detected = classification.operation_type in {"bulk_update", "workflow_bulk_update"}
         bulk_policy = IntentParser._bulk_mutation_policy(context)
+        delete_policy = IntentParser._delete_policy(context)
+        sensitive_pii_requested = bool(re.search(r"\b(full\s+phone|full\s+phone\s+number|full\s+email|address)\b", classification.normalized_prompt))
+        payment_details_requested = bool(re.search(r"\ball\s+payment\s+details\b|\bpayment\s+details\b", classification.normalized_prompt))
+        payment_policy = IntentParser._payment_disclosure_policy(context)
         verified_resources = ContextRetriever.verified_resources(context)
         schema_context = ContextRetriever.verified_database_schema(context) if integration_type == "database" else {}
         actions = ContextRetriever.connector_actions(context) if integration_type != "database" else []
@@ -31,6 +35,12 @@ class IntentParser:
             missing_context.append("selected connected integration context is required")
         if integration_type == "database" and not target_resources:
             missing_context.append("No verified database table/column context matched the request.")
+        if payment_details_requested and not IntentParser._has_payment_details_resource(target_resources):
+            missing_context.append("Payment details resource is not verified for this selected integration context.")
+        if payment_details_requested and not payment_policy.get("approved"):
+            missing_context.append("Payment disclosure policy is required before returning payment details.")
+        if sensitive_pii_requested and not payment_policy.get("raw_pii_allowed"):
+            missing_context.append("Raw full phone, email, and address output is blocked without explicit sensitive PII disclosure policy.")
         if integration_type != "database" and not verified_resources:
             missing_context.append("No verified connector action/template/OpenAPI context is available for this provider.")
 
@@ -65,6 +75,16 @@ class IntentParser:
                 resolved_target_column = IntentParser._resolved_database_column(schema_context, target_resources, ("full_name", "name", "customer_name"))
                 if not resolved_target_column:
                     missing_context.append("No verified full_name column found in selected integration context.")
+            if classification.operation_type == "delete" and classification.target_entity == "customer":
+                if not delete_policy.get("exists"):
+                    missing_context.append("Verified customer delete policy is required before generating delete SQL.")
+                if not delete_policy.get("retention_policy_confirmed"):
+                    missing_context.append("Retention policy confirmation is required before deleting customer accounts.")
+                if not delete_policy.get("linked_records_policy_confirmed"):
+                    missing_context.append("Linked records policy confirmation is required before deleting customer accounts.")
+                soft_target = IntentParser._resolved_database_column(schema_context, target_resources, ("deleted_at", "is_deleted", "is_active", "deactivated_at", "disabled_at"))
+                if not soft_target and not delete_policy.get("hard_delete_allowed"):
+                    missing_context.append("No verified soft-delete/deactivation column found for customer account deletion.")
 
         operation_type = classification.operation_type
         if missing_context and operation_type == "ambiguous":
@@ -111,6 +131,13 @@ class IntentParser:
                 "latest_order_policy_column": latest_order_policy.get("column"),
                 "bulk_mutation_detected": bulk_mutation_detected,
                 "bulk_mutation_policy_approved": bool(bulk_policy.get("approved")),
+                "delete_policy_required": classification.operation_type == "delete" and classification.target_entity == "customer",
+                "delete_policy": delete_policy,
+                "sensitive_pii_requested": sensitive_pii_requested,
+                "payment_details_requested": payment_details_requested,
+                "payment_disclosure_policy_approved": bool(payment_policy.get("approved")),
+                "raw_pii_disclosure_policy_approved": bool(payment_policy.get("raw_pii_allowed")),
+                "lookup_field": "order_id" if any(field.get("name") == "order_id" for field in required_inputs) else None,
                 **IntentParser._bulk_status_values(classification.normalized_prompt),
             },
             missing_context=list(dict.fromkeys(missing_context)),
@@ -132,6 +159,15 @@ class IntentParser:
             if re.search(r"\b(all\s+pending\s+orders|all\s+orders|every\s+order|bulk\s+mark|mass\s+update|update\s+all\s+records|orders?\s+as\s+delivered)\b", text):
                 ordered = [name for name in names if "order" in name]
                 return ordered[:2]
+            if re.search(r"\bdelete|remove\b", text) and re.search(r"\bcustomer|account\b", text):
+                ordered = [name for name in names if "customer" in name or "account" in name]
+                return ordered[:2]
+            if re.search(r"\border[_\s-]?id\b|by\s+order\b", text) and re.search(r"\bcustomer|phone|email|address|payment\b", text):
+                ordered = [name for name in names if "order" in name]
+                ordered.extend(name for name in names if "customer" in name and name not in ordered)
+                if re.search(r"\bpayment\s+details\b", text):
+                    ordered.extend(name for name in names if "payment" in name and name not in ordered)
+                return ordered[:3]
             if re.search(r"\bcustomer\b", text) and re.search(r"\bphone\b", text) and re.search(r"\buser\s*name\b|\busername\b|\bfull\s*name\b", text):
                 ordered = [name for name in names if "customer" in name]
                 if re.search(r"\border|orders\b", text):
@@ -195,6 +231,8 @@ class IntentParser:
         ]:
             if re.search(pattern, text):
                 inputs.append({"name": label, **schema})
+        if re.search(r"\border[_\s-]?id\b|by\s+order\b", text) and re.search(r"\b(fetch|lookup|retrieve|get|customer|payment|phone|email|address)\b", text):
+            inputs = [field for field in inputs if field.get("name") not in {"phone_number", "email", "customer_name"}]
         if re.search(r"\b(list|search|find|query|fetch|get|retrieve|lookup|show|check)\b", text):
             inputs.append({"name": "limit", "type": "integer", "minimum": 1, "maximum": 100, "default": 25})
         if not inputs and schema_context.get("tables") and re.search(r"\b(find|lookup|retrieve|get|check|view|list|search|fetch|show)\b", text):
@@ -222,6 +260,19 @@ class IntentParser:
         resolved_target_column: str | None = None,
     ) -> list[dict[str, Any]]:
         tables = [table for table in schema_context.get("tables", []) if table["fqn"] in target_resources]
+        if operation_type == "read" and re.search(r"\border[_\s-]?id\b|by\s+order\b", text) and re.search(r"\bcustomer|phone|email|address|payment\b", text):
+            wanted_by_table = {
+                "orders": {"order_id", "order_number", "order_status", "status", "payment_status", "customer_id"},
+                "customers": {"customer_id", "customer_code", "full_name", "email", "phone", "city", "address"},
+            }
+            outputs: list[dict[str, Any]] = []
+            for table in tables:
+                table_name = str(table.get("table") or "")
+                wanted = wanted_by_table.get(table_name, set())
+                for column in table.get("columns", []):
+                    if column["name"] in wanted:
+                        outputs.append({"name": column["name"], "type": IntentParser._json_type(column.get("type", "")), "source": column["fqn"], "raw_name": column["name"]})
+            return outputs
         if operation_type in {"update", "workflow"} and target_field == "username":
             outputs = [{"name": "affected_count", "type": "integer"}]
             resolved_target_name = (resolved_target_column or "").split(".")[-1]
@@ -287,6 +338,12 @@ class IntentParser:
             ])
         if workflow_type:
             preconditions.append("workflow steps must execute in declared order without dropping user intent")
+        if operation_type == "delete":
+            preconditions.extend([
+                "verified delete policy must exist",
+                "soft-delete or deactivation must be preferred over hard delete",
+                "retention and linked-record policies must be confirmed",
+            ])
         if target_field == "username":
             preconditions.append("username target field must be explicitly verified in selected integration context")
         if target_field == "order_status":
@@ -321,6 +378,12 @@ class IntentParser:
                 {"name": "max_rows", "type": "integer", "minimum": 1, "maximum": 10000, "required": True, "runtime_control": "bulk_batch_limit"},
                 {"name": "effective_before", "type": "string", "format": "date-time", "required": False, "runtime_control": "optional_bulk_cutoff"},
             ]
+        if operation_type == "delete":
+            fields = {}
+            if "phone_number" not in fields and any(name in columns for name in {"phone", "mobile", "phone_number"}):
+                fields["phone_number"] = {"name": "phone_number", "type": "string", "pattern": "^[+0-9()\\-\\s]{7,20}$", "minLength": 7, "maxLength": 20, "required": True}
+            fields["idempotency_key"] = {"name": "idempotency_key", "type": "string", "minLength": 8, "maxLength": 120, "required": True}
+            return list(fields.values())
         if operation_type in {"update", "workflow"} and "phone_number" not in fields and any(name in columns for name in {"phone", "mobile", "phone_number"}):
             fields["phone_number"] = {"name": "phone_number", "type": "string", "pattern": "^[+0-9()\\-\\s]{7,20}$", "minLength": 7, "maxLength": 20}
         latest_order_requested = bool(re.search(r"\blatest\s+order\b", text))
@@ -371,6 +434,36 @@ class IntentParser:
         if re.search(r"\bpending\b", text) and re.search(r"\bdelivered\b", text):
             return {"source_status": "pending", "target_status": "delivered"}
         return {}
+
+    @staticmethod
+    def _delete_policy(context: dict[str, Any]) -> dict[str, Any]:
+        policy = context.get("admin_policy_confirmations") or {}
+        if not isinstance(policy, dict):
+            policy = {}
+        delete_policy = policy.get("delete_policy") if isinstance(policy.get("delete_policy"), dict) else {}
+        return {
+            "exists": bool(delete_policy or policy.get("delete_policy_confirmed")),
+            "hard_delete_allowed": bool(delete_policy.get("hard_delete_allowed") or policy.get("hard_delete_allowed")),
+            "soft_delete_available": bool(delete_policy.get("soft_delete_available") or policy.get("soft_delete_available")),
+            "deactivation_available": bool(delete_policy.get("deactivation_available") or policy.get("deactivation_available")),
+            "retention_policy_confirmed": bool(delete_policy.get("retention_policy_confirmed") or policy.get("retention_policy_confirmed")),
+            "linked_records_policy_confirmed": bool(delete_policy.get("linked_records_policy_confirmed") or policy.get("linked_records_policy_confirmed")),
+        }
+
+    @staticmethod
+    def _payment_disclosure_policy(context: dict[str, Any]) -> dict[str, Any]:
+        policy = context.get("admin_policy_confirmations") or {}
+        if not isinstance(policy, dict):
+            policy = {}
+        payment_policy = policy.get("payment_disclosure_policy") if isinstance(policy.get("payment_disclosure_policy"), dict) else {}
+        return {
+            "approved": bool(payment_policy.get("approved") or policy.get("payment_disclosure_policy_approved")),
+            "raw_pii_allowed": bool(payment_policy.get("raw_pii_allowed") or policy.get("raw_pii_disclosure_policy_approved")),
+        }
+
+    @staticmethod
+    def _has_payment_details_resource(target_resources: list[str]) -> bool:
+        return any("payment" in resource.lower() and not resource.lower().endswith(".orders") for resource in target_resources)
 
     @staticmethod
     def _has_verified_target_field(schema_context: dict[str, Any], target_resources: list[str], field_names: set[str]) -> bool:

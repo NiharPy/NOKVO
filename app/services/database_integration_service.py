@@ -193,6 +193,9 @@ class DatabaseIntegrationService:
         else:
             raise RuntimeError(f"{provider} indexing is not available in this backend environment yet.")
 
+        texts = [record["text"] for record in records]
+        vectors = await TextEmbeddingService.embed_texts(texts)
+
         points = []
         for index, record in enumerate(records):
             point_id = str(
@@ -201,7 +204,6 @@ class DatabaseIntegrationService:
                     f"{tenant_res.tenant_id}:{provider}:{record.get('table')}:{index}:{record['text']}",
                 )
             )
-            vector = TextEmbeddingService.embed_text(record["text"])
             payload = {
                 "source_type": "database_schema_selection",
                 "integration_type": "database",
@@ -211,7 +213,7 @@ class DatabaseIntegrationService:
                 "text": record["text"],
                 "row_preview": record.get("row_preview", {}),
             }
-            points.append({"id": point_id, "vector": vector, "payload": payload})
+            points.append({"id": point_id, "vector": vectors[index], "payload": payload})
 
         await QdrantService.delete_points_by_filter(
             tenant_res,

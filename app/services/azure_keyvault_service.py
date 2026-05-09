@@ -1,4 +1,5 @@
 from azure.keyvault.secrets import SecretClient
+from azure.keyvault.secrets.aio import SecretClient as AsyncSecretClient
 from azure.mgmt.resource import ResourceManagementClient
 from azure.mgmt.resource.resources.models import GenericResource
 from app.core.config import settings
@@ -210,22 +211,22 @@ class AzureKeyVaultService:
             return
 
         kv_url = f"https://{kv_name}.vault.azure.net/"
-        credential = AzureAuth.get_credential()
-        client = SecretClient(vault_url=kv_url, credential=credential)
+        credential = AzureAuth.get_async_credential()
         rotation = AzureKeyVaultService._rotation_metadata()
-        client.set_secret(
-            secret_name,
-            secret_value,
-            enabled=True,
-            content_type="runtime-credential",
-            tags={
-                "tenant_id": tenant_id,
-                "secret_role": secret_role,
-                "rotation_interval_days": str(rotation["rotation_interval_days"]),
-                "next_rotation_due_at": rotation["next_rotation_due_at"],
-            },
-            expires_on=datetime.fromisoformat(rotation["next_rotation_due_at"]),
-        )
+        async with AsyncSecretClient(vault_url=kv_url, credential=credential) as client:
+            await client.set_secret(
+                secret_name,
+                secret_value,
+                enabled=True,
+                content_type="runtime-credential",
+                tags={
+                    "tenant_id": tenant_id,
+                    "secret_role": secret_role,
+                    "rotation_interval_days": str(rotation["rotation_interval_days"]),
+                    "next_rotation_due_at": rotation["next_rotation_due_at"],
+                },
+                expires_on=datetime.fromisoformat(rotation["next_rotation_due_at"]),
+            )
 
     @staticmethod
     async def get_secret_value(secret_name: str) -> str | None:
@@ -234,7 +235,13 @@ class AzureKeyVaultService:
             return None
 
         kv_url = f"https://{kv_name}.vault.azure.net/"
-        credential = AzureAuth.get_credential()
-        client = SecretClient(vault_url=kv_url, credential=credential)
-        secret = client.get_secret(secret_name)
+        credential = AzureAuth.get_async_credential()
+        async with AsyncSecretClient(vault_url=kv_url, credential=credential) as client:
+            try:
+                secret = await client.get_secret(secret_name)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Key Vault lookup failed for secret '{secret_name}' "
+                    f"in vault '{kv_name}' ({kv_url}): {exc}"
+                ) from exc
         return secret.value

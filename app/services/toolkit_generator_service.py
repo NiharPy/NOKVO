@@ -883,7 +883,7 @@ class ToolkitGeneratorService:
         if provider_filter:
             filters["provider"] = provider_filter
         try:
-            query_vector = TextEmbeddingService.embed_text(prompt)
+            query_vector = await TextEmbeddingService.embed_text(prompt)
             points = await QdrantService.search_points(
                 tenant_res,
                 query_vector,

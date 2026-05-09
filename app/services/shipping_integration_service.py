@@ -265,6 +265,7 @@ class ShippingIntegrationService:
     async def index_schema_embeddings(tenant_res: TenantResources, scan_result: ShippingScanResult) -> dict[str, Any]:
         points: list[dict[str, Any]] = []
         indexed_paths: list[str] = []
+        records = []
         for module in scan_result.modules:
             module_name = module["api_name"]
             folder_path = f"{scan_result.folder_path}/schema/{module_name}"
@@ -279,22 +280,18 @@ class ShippingIntegrationService:
                     f"description: {module.get('description')}",
                 ]
             )
-            points.append(
-                ShippingIntegrationService._build_point(
-                    tenant_res,
-                    scan_result.provider,
-                    "shipping_schema",
-                    f"schema:{module_name}",
-                    text,
-                    {
-                        "source_type": "shipping_schema",
-                        "integration_type": "shipping",
-                        "provider": scan_result.provider,
-                        "folder_path": folder_path,
-                        "module": module_name,
-                    },
-                )
-            )
+            records.append({
+                "point_type": "shipping_schema",
+                "unique_key": f"schema:{module_name}",
+                "text": text,
+                "payload": {
+                    "source_type": "shipping_schema",
+                    "integration_type": "shipping",
+                    "provider": scan_result.provider,
+                    "folder_path": folder_path,
+                    "module": module_name,
+                }
+            })
         for action in scan_result.actions:
             module_name = action["module"]
             action_name = action["name"]
@@ -311,23 +308,35 @@ class ShippingIntegrationService:
                     f"description: {action.get('description')}",
                 ]
             )
+            records.append({
+                "point_type": "shipping_action",
+                "unique_key": f"action:{module_name}:{action_name}",
+                "text": text,
+                "payload": {
+                    "source_type": "shipping_action",
+                    "integration_type": "shipping",
+                    "provider": scan_result.provider,
+                    "folder_path": folder_path,
+                    "module": module_name,
+                    "action": action_name,
+                    "method": action.get("method"),
+                    "endpoint": action.get("endpoint"),
+                }
+            })
+
+        texts = [record["text"] for record in records]
+        vectors = await TextEmbeddingService.embed_texts(texts)
+
+        for index, record in enumerate(records):
             points.append(
                 ShippingIntegrationService._build_point(
                     tenant_res,
                     scan_result.provider,
-                    "shipping_action",
-                    f"action:{module_name}:{action_name}",
-                    text,
-                    {
-                        "source_type": "shipping_action",
-                        "integration_type": "shipping",
-                        "provider": scan_result.provider,
-                        "folder_path": folder_path,
-                        "module": module_name,
-                        "action": action_name,
-                        "method": action.get("method"),
-                        "endpoint": action.get("endpoint"),
-                    },
+                    record["point_type"],
+                    record["unique_key"],
+                    record["text"],
+                    vectors[index],
+                    record["payload"],
                 )
             )
         await QdrantService.delete_points_by_filter(
@@ -351,10 +360,11 @@ class ShippingIntegrationService:
         point_type: str,
         unique_key: str,
         text: str,
+        vector: list[float],
         payload: dict[str, Any],
     ) -> dict[str, Any]:
         point_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{tenant_res.tenant_id}:{provider}:{point_type}:{unique_key}"))
-        return {"id": point_id, "vector": TextEmbeddingService.embed_text(text), "payload": {**payload, "text": text}}
+        return {"id": point_id, "vector": vector, "payload": {**payload, "text": text}}
 
     @staticmethod
     async def _authorized_request(

@@ -27,9 +27,11 @@ class SafetyClassifier:
             return "high"
         if operation_type == "workflow":
             return "medium" if integration_type not in {"payments", "his"} else "high"
+        if operation_type == "delete" and re.search(r"\bcustomer|account\b", text):
+            return "high"
         if re.search(r"\b(refund|cancel|address|account|bank|kyc|invoice|shipment cancellation)\b", text):
             return "high"
-        if re.search(r"\b(payment|medical|diagnosis|prescription|legal|compliance|delete|drop|truncate|password|secret)\b", text):
+        if re.search(r"\b(payment|medical|diagnosis|prescription|legal|compliance|drop|truncate|password|secret)\b", text):
             return "critical"
         if operation_type in {"create", "update", "delete"}:
             return "medium"

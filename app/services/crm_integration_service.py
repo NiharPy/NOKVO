@@ -170,28 +170,25 @@ class CRMIntegrationService:
         points = []
         indexed_paths: list[str] = []
 
+        records = []
         for module in scan_result.modules:
             module_api_name = module.get("api_name") or module.get("name") or "module"
             schema_text = CRMIntegrationService._crm_module_schema_text(scan_result, module)
             schema_folder = f"{scan_result.folder_path}/schema/{module_api_name}"
             indexed_paths.append(schema_folder)
-            points.append(
-                CRMIntegrationService._build_point(
-                    tenant_res=tenant_res,
-                    provider=scan_result.provider,
-                    point_type="crm_schema",
-                    unique_key=f"schema:{module_api_name}",
-                    text=schema_text,
-                    payload={
-                        "source_type": "crm_schema",
-                        "integration_type": "crm",
-                        "provider": scan_result.provider,
-                        "module": module_api_name,
-                        "folder_path": schema_folder,
-                        "fields": module.get("fields", []),
-                    },
-                )
-            )
+            records.append({
+                "point_type": "crm_schema",
+                "unique_key": f"schema:{module_api_name}",
+                "text": schema_text,
+                "payload": {
+                    "source_type": "crm_schema",
+                    "integration_type": "crm",
+                    "provider": scan_result.provider,
+                    "module": module_api_name,
+                    "folder_path": schema_folder,
+                    "fields": module.get("fields", []),
+                }
+            })
 
         for action in scan_result.actions:
             module_api_name = action.get("module") or "module"
@@ -199,23 +196,35 @@ class CRMIntegrationService:
             action_text = CRMIntegrationService._crm_action_text(scan_result, action)
             action_folder = f"{scan_result.folder_path}/actions/{module_api_name}"
             indexed_paths.append(action_folder)
+            records.append({
+                "point_type": "crm_action",
+                "unique_key": f"action:{module_api_name}:{action_name}",
+                "text": action_text,
+                "payload": {
+                    "source_type": "crm_action",
+                    "integration_type": "crm",
+                    "provider": scan_result.provider,
+                    "module": module_api_name,
+                    "action": action_name,
+                    "method": action.get("method"),
+                    "endpoint": action.get("endpoint"),
+                    "folder_path": action_folder,
+                }
+            })
+
+        texts = [record["text"] for record in records]
+        vectors = await TextEmbeddingService.embed_texts(texts)
+        
+        for index, record in enumerate(records):
             points.append(
                 CRMIntegrationService._build_point(
                     tenant_res=tenant_res,
                     provider=scan_result.provider,
-                    point_type="crm_action",
-                    unique_key=f"action:{module_api_name}:{action_name}",
-                    text=action_text,
-                    payload={
-                        "source_type": "crm_action",
-                        "integration_type": "crm",
-                        "provider": scan_result.provider,
-                        "module": module_api_name,
-                        "action": action_name,
-                        "method": action.get("method"),
-                        "endpoint": action.get("endpoint"),
-                        "folder_path": action_folder,
-                    },
+                    point_type=record["point_type"],
+                    unique_key=record["unique_key"],
+                    text=record["text"],
+                    vector=vectors[index],
+                    payload=record["payload"],
                 )
             )
 
@@ -241,6 +250,7 @@ class CRMIntegrationService:
         point_type: str,
         unique_key: str,
         text: str,
+        vector: list[float],
         payload: dict[str, Any],
     ) -> dict[str, Any]:
         point_id = str(
@@ -251,7 +261,7 @@ class CRMIntegrationService:
         )
         return {
             "id": point_id,
-            "vector": TextEmbeddingService.embed_text(text),
+            "vector": vector,
             "payload": {
                 **payload,
                 "text": text,

@@ -186,6 +186,7 @@ class ZohoDeskService:
         points: list[dict[str, Any]] = []
         indexed_paths: list[str] = []
 
+        records = []
         for module in scan_result.modules:
             module_name = module.get("api_name") or "module"
             folder_path = f"{scan_result.folder_path}/schema/{module_name}"
@@ -202,22 +203,19 @@ class ZohoDeskService:
             for record in module.get("records", []) or []:
                 lines.append(f"record: {record.get('id')} | {record.get('name')}")
             text = "\n".join(lines)
-            points.append(
-                ZohoDeskService._build_point(
-                    tenant_res,
-                    "schema",
-                    module_name,
-                    text,
-                    {
-                        "source_type": "zoho_desk_schema",
-                        "integration_type": "zoho_desk",
-                        "provider": "zoho",
-                        "folder_path": folder_path,
-                        "module": module_name,
-                        "label": module.get("label"),
-                    },
-                )
-            )
+            records.append({
+                "point_type": "schema",
+                "unique_key": module_name,
+                "text": text,
+                "payload": {
+                    "source_type": "zoho_desk_schema",
+                    "integration_type": "zoho_desk",
+                    "provider": "zoho",
+                    "folder_path": folder_path,
+                    "module": module_name,
+                    "label": module.get("label"),
+                }
+            })
 
         for action in scan_result.actions:
             action_name = action.get("name") or "action"
@@ -236,22 +234,34 @@ class ZohoDeskService:
                     f"description: {action.get('description')}",
                 ]
             )
+            records.append({
+                "point_type": "action",
+                "unique_key": f"{module_name}:{action_name}",
+                "text": text,
+                "payload": {
+                    "source_type": "zoho_desk_action",
+                    "integration_type": "zoho_desk",
+                    "provider": "zoho",
+                    "folder_path": folder_path,
+                    "module": module_name,
+                    "action": action_name,
+                    "method": action.get("method"),
+                    "endpoint": action.get("endpoint"),
+                }
+            })
+
+        texts = [record["text"] for record in records]
+        vectors = await TextEmbeddingService.embed_texts(texts)
+
+        for index, record in enumerate(records):
             points.append(
                 ZohoDeskService._build_point(
                     tenant_res,
-                    "action",
-                    f"{module_name}:{action_name}",
-                    text,
-                    {
-                        "source_type": "zoho_desk_action",
-                        "integration_type": "zoho_desk",
-                        "provider": "zoho",
-                        "folder_path": folder_path,
-                        "module": module_name,
-                        "action": action_name,
-                        "method": action.get("method"),
-                        "endpoint": action.get("endpoint"),
-                    },
+                    record["point_type"],
+                    record["unique_key"],
+                    record["text"],
+                    vectors[index],
+                    record["payload"],
                 )
             )
 
@@ -276,6 +286,7 @@ class ZohoDeskService:
         point_type: str,
         unique_key: str,
         text: str,
+        vector: list[float],
         payload: dict[str, Any],
     ) -> dict[str, Any]:
         point_id = str(
@@ -286,7 +297,7 @@ class ZohoDeskService:
         )
         return {
             "id": point_id,
-            "vector": TextEmbeddingService.embed_text(text),
+            "vector": vector,
             "payload": {
                 **payload,
                 "text": text,

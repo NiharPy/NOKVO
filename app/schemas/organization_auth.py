@@ -476,6 +476,170 @@ class OrganizationToolkitBuildersResponse(BaseModel):
     builders: list[OrganizationToolkitBuilderResponse] = Field(default_factory=list)
 
 
+class OrganizationAgentDocumentResponse(BaseModel):
+    id: str
+    name: str
+    document_type: str
+    description: Optional[str] = None
+    tags: list[str] = Field(default_factory=list)
+    status: str
+    approval_status: str
+    blob_path: Optional[str] = None
+    chunk_count: int = 0
+    qdrant_point_count: int = 0
+    uploaded_by: Optional[str] = None
+    created_at: str
+    approved_at: Optional[str] = None
+    approved_by: Optional[str] = None
+    last_error: Optional[str] = None
+
+
+class OrganizationAgentDocumentsResponse(BaseModel):
+    documents: list[OrganizationAgentDocumentResponse] = Field(default_factory=list)
+
+
+class OrganizationAgentDocumentUploadRequest(BaseModel):
+    name: str
+    document_type: str = "policy"
+    description: Optional[str] = None
+    tags: str | list[str] | None = None
+    filename: str
+    content_type: Optional[str] = None
+    content_base64: str
+
+    @field_validator("name", "filename", "content_base64")
+    @classmethod
+    def validate_required_text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("This field is required")
+        return value
+
+
+class OrganizationAgentDocumentReviewRequest(BaseModel):
+    notes: Optional[str] = None
+
+
+class OrganizationAgentTestQueryRequest(BaseModel):
+    query: str
+    top_k: int = Field(default=5, ge=1, le=12)
+    response_language: str = "en"
+
+    @field_validator("query")
+    @classmethod
+    def validate_query(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Query is required")
+        return value
+
+
+class OrganizationAgentRetrievalChunk(BaseModel):
+    document_id: str
+    document_name: str
+    chunk_id: str
+    text: str
+    score: float = 0.0
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class OrganizationAgentTestRetrievalResponse(BaseModel):
+    query: str
+    chunks: list[OrganizationAgentRetrievalChunk] = Field(default_factory=list)
+    refusal: Optional[str] = None
+
+
+class OrganizationAgentTestAnswerResponse(BaseModel):
+    query: str
+    answer: str
+    refused: bool
+    citations: list[dict[str, Any]] = Field(default_factory=list)
+    chunks: list[OrganizationAgentRetrievalChunk] = Field(default_factory=list)
+    runtime: dict[str, Any] = Field(default_factory=dict)
+    intent: dict[str, Any] = Field(default_factory=dict)
+    retrieval: dict[str, Any] = Field(default_factory=dict)
+
+
+class OrganizationAgentRuntimeStatusResponse(BaseModel):
+    runtime: str
+    graph: str
+    knowledge_scope: str
+    intent_gating: bool = True
+    brains: list[str] = Field(default_factory=list)
+    supported_indian_languages: list[dict[str, str]] = Field(default_factory=list)
+    stt: dict[str, Any]
+    llm: dict[str, Any]
+    tts: dict[str, Any]
+
+
+class OrganizationAgentRuntimeChatRequest(BaseModel):
+    query: str
+    top_k: int = Field(default=5, ge=1, le=12)
+    latency_budget_ms: int = Field(default=650, ge=200, le=5000)
+    response_language: str = "en"
+    conversation_history: list[dict[str, str]] = Field(default_factory=list)
+
+    @field_validator("query")
+    @classmethod
+    def validate_query(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Query is required")
+        return value
+
+
+class OrganizationAgentRuntimeChatResponse(BaseModel):
+    query: str
+    answer: str
+    refused: bool
+    citations: list[dict[str, Any]] = Field(default_factory=list)
+    chunks: list[OrganizationAgentRetrievalChunk] = Field(default_factory=list)
+    runtime: dict[str, Any] = Field(default_factory=dict)
+    intent: dict[str, Any] = Field(default_factory=dict)
+    retrieval: dict[str, Any] = Field(default_factory=dict)
+
+
+class OrganizationAgentPhoneLinkRequest(BaseModel):
+    phone_number: str
+
+    @field_validator("phone_number")
+    @classmethod
+    def validate_phone_number(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Phone number is required")
+        return value
+
+
+class OrganizationAgentPhoneLinkResponse(BaseModel):
+    status: str
+    phone_number: Optional[str] = None
+    link_id: Optional[str] = None
+    voice_url: Optional[str] = None
+    incoming_phone_number_sid: Optional[str] = None
+    linked_at: Optional[str] = None
+    unlinked_at: Optional[str] = None
+    latency_target_ms: int = 800
+
+
+class OrganizationAgentLatencyTestRequest(BaseModel):
+    query: str
+    response_language: str = "en"
+    target_ms: int = Field(default=800, ge=200, le=5000)
+
+    @field_validator("query")
+    @classmethod
+    def validate_latency_query(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Query is required")
+        return value
+
+
+class OrganizationAgentLatencyTestResponse(OrganizationAgentRuntimeChatResponse):
+    latency: dict[str, Any]
+
+
 class OrganizationShippingProviderResponse(BaseModel):
     value: str
     label: str

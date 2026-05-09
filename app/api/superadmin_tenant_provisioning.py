@@ -13,6 +13,9 @@ from app.models.tenant_usage_event import TenantUsageEvent
 from app.models.audit import SuperAdminAuditLog
 from app.schemas.tenant_usage import TenantUsageEventCreate
 from app.services.tenant_billing_service import TenantBillingService
+from app.services.azure_keyvault_service import AzureKeyVaultService
+from app.core.azure_auth import AzureAuth
+from app.core.config import settings
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from uuid import UUID
@@ -631,4 +634,84 @@ async def get_provision_status(
             "Upload knowledge documents to blob storage",
             "Assign or connect Twilio number",
         ],
+    }
+
+
+@router.post("/{organization_id}/reprovision-llm-key", status_code=status.HTTP_200_OK)
+async def reprovision_llm_key(
+    organization_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: SuperAdminUser = Depends(RequireRole(["founder", "engineering"])),
+):
+    """
+    Reads the Azure OpenAI API key from the existing resource group and writes it
+    to Key Vault under the correct secret name. Use this when provisioning succeeded
+    but Key Vault storage was skipped (e.g. AZURE_SHARED_KEY_VAULT_NAME was unset).
+    """
+    org_res = await db.execute(select(Organization).where(Organization.id == organization_id))
+    org = org_res.scalars().first()
+    if not org:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organization not found")
+
+    tr_res = await db.execute(select(TenantResources).where(TenantResources.organization_id == organization_id))
+    tenant_res = tr_res.scalars().first()
+    if not tenant_res:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tenant resources not found — run provisioning first")
+
+    provider = tenant_res.provider_status or {}
+    account_name = provider.get("llm_account")
+    rg_name = tenant_res.azure_resource_group_name
+    secret_name = provider.get("llm_api_key_ref")
+
+    if not account_name:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="llm_account not recorded in provider_status — cannot locate Azure OpenAI resource")
+    if not rg_name:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="azure_resource_group_name is not set on tenant resources")
+    if not settings.AZURE_SUBSCRIPTION_ID:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="AZURE_SUBSCRIPTION_ID is not configured")
+    if not settings.AZURE_SHARED_KEY_VAULT_NAME:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="AZURE_SHARED_KEY_VAULT_NAME is not configured")
+
+    if not secret_name:
+        secret_name = AzureKeyVaultService._secret_name(tenant_res.tenant_id, "llm-api-key")
+
+    try:
+        from azure.mgmt.cognitiveservices import CognitiveServicesManagementClient
+        credential = AzureAuth.get_credential()
+        cog_client = CognitiveServicesManagementClient(credential, settings.AZURE_SUBSCRIPTION_ID)
+        keys = cog_client.accounts.list_keys(
+            resource_group_name=rg_name,
+            account_name=account_name,
+        )
+        llm_api_key = getattr(keys, "key1", None) or getattr(keys, "primary_key", None)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Failed to fetch API key from Azure OpenAI resource '{account_name}': {exc}",
+        )
+
+    if not llm_api_key:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Azure OpenAI resource '{account_name}' returned no API key")
+
+    await AzureKeyVaultService.set_secret_value(
+        secret_name,
+        llm_api_key,
+        tenant_res.tenant_id,
+        "llm_api_key",
+    )
+
+    updated_status = dict(provider)
+    updated_status["llm_api_key_ref"] = secret_name
+    updated_status["llm_api_key_stored"] = True
+    updated_status.pop("llm_error", None)
+    tenant_res.provider_status = updated_status
+    db.add(tenant_res)
+    await db.commit()
+
+    return {
+        "status": "ok",
+        "secret_name": secret_name,
+        "vault": settings.AZURE_SHARED_KEY_VAULT_NAME,
+        "account_name": account_name,
+        "resource_group": rg_name,
     }

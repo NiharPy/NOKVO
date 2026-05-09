@@ -19,6 +19,11 @@ class ToolPlanGenerator:
                 trusted_resources,
                 key=lambda item: (0 if "order" in str(item.get("name") or "").lower() else 1, str(item.get("name") or "")),
             )
+        if intent.operation_type == "read" and (intent.intent_signals or {}).get("lookup_field") == "order_id":
+            trusted_resources = sorted(
+                trusted_resources,
+                key=lambda item: (0 if "order" in str(item.get("name") or "").lower() else 1, str(item.get("name") or "")),
+            )
         resource_names = [str(item.get("name") or "") for item in trusted_resources if item.get("name")]
         name = ToolPlanGenerator._name_for_intent(intent, resource_names, action_text)
         if intent.operation_type not in {"read", "workflow"} and not name.startswith(("create_", "update_", "delete_", "cancel_", "refund_", "bulk_", "mark_")):
@@ -27,7 +32,7 @@ class ToolPlanGenerator:
         approval_policy = {
             "required": True,
             "human_approval_required": intent.human_approval_needed,
-            "admin_approval_required": intent.operation_type in {"bulk_update", "workflow_bulk_update"} or intent.risk_level in {"high", "critical"},
+            "admin_approval_required": intent.operation_type in {"bulk_update", "workflow_bulk_update", "delete"} or intent.risk_level in {"high", "critical"},
             "minimum_reviewer_role": "admin" if intent.risk_level in {"high", "critical"} else "manager",
             "reason": f"{intent.risk_level} risk {intent.operation_type} operation" if intent.human_approval_needed else "admin review required before publish",
         }
@@ -150,6 +155,17 @@ class ToolPlanGenerator:
             ]
         if not verified_resources:
             return output_fields
+        if re.search(r"\border[_\s-]?id\b|by\s+order\b", action_text.lower()) and re.search(r"\bcustomer|phone|email|address|payment\b", action_text.lower()):
+            filtered = []
+            for field in output_fields:
+                name = str(field.get("name") or "")
+                if name == "total_amount":
+                    continue
+                transformed = dict(field)
+                transformed["raw_name"] = field.get("raw_name") or field.get("name")
+                transformed["name"] = PIIPolicyBuilder.output_field_name(name, str(field.get("type") or ""))
+                filtered.append(transformed)
+            return filtered
         primary = verified_resources[0]
         filtered = []
         for field in output_fields:
@@ -200,7 +216,11 @@ class ToolPlanGenerator:
             return "update_latest_order_status_by_phone"
         if intent.operation_type in {"workflow", "update"} and re.search(r"\border|orders\b", text) and re.search(r"\bstatus\b", text) and re.search(r"\b(name|phone)\b", text):
             return "update_order_status_by_name_and_phone"
+        if intent.operation_type == "delete" and re.search(r"\bcustomer|account\b", text) and re.search(r"\bphone\b", text):
+            return "delete_customer_by_phone"
         if intent.operation_type == "read" and re.search(r"\bcustomer\b", text) and re.search(r"\bphone\b", text):
+            if re.search(r"\border[_\s-]?id\b|by\s+order\b", text):
+                return "lookup_customer_order_safe_details_by_order_id"
             if re.search(r"\b(call|calls|call\s+history|history)\b", text):
                 return "lookup_customer_call_history_by_phone"
             if re.search(r"\b(support|ticket|call|case)\b", text):

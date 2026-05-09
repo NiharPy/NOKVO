@@ -3,20 +3,29 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue';
 import {
   ArrowUpDown,
   Bell,
+  Bot,
+  CheckCircle2,
   Database,
   Filter,
+  FileText,
   Globe2,
   LogOut,
+  MessageSquare,
+  Mic,
   Moon,
   Plus,
+  Radio,
   Search,
   Settings2,
   Shield,
+
   SunMedium,
   Ticket,
+  UploadCloud,
   UserPlus,
   Users,
   Wrench,
+  XCircle,
 } from 'lucide-vue-next';
 import QrcodeVue from 'qrcode.vue';
 
@@ -55,6 +64,36 @@ const shippingStatus = ref({ status: 'not_connected', provider: null, indexed_po
 const toolkitDraft = ref(null);
 const toolkitRegistry = ref({ tools: [], drafts: [] });
 const toolkitBuilders = ref([]);
+const agentDocuments = ref([]);
+const agentUploadForm = ref({
+  name: '',
+  document_type: 'policy',
+  description: '',
+  tags: '',
+});
+const agentUploadFile = ref(null);
+const agentTestQuery = ref('');
+const agentTestRetrieval = ref(null);
+const agentTestAnswer = ref(null);
+const agentRuntimeStatus = ref(null);
+const agentPhoneLink = ref({ status: 'not_linked', phone_number: '' });
+const agentPhoneForm = ref({ phone_number: '' });
+const agentLatencyResult = ref(null);
+const voiceSocket = ref(null);
+const voiceRecorder = ref(null);
+const voiceMediaStream = ref(null);
+const isVoiceSessionActive = ref(false);
+const voiceTranscript = ref('');
+const voiceAgentAnswer = ref('');
+const voiceAudioChunks = ref([]);
+const voiceTtsFirstAudioMs = ref(null);
+const voiceStreamingPlaybackStarted = ref(false);
+const voiceStreamingPlaybackFailed = ref(false);
+const voiceReceivedStreamingAudio = ref(false);
+const voiceEvents = ref([]);
+const agentVoiceLanguage = ref('en');
+let voiceChunkQueue = [];
+let voiceChunkAudio = null;
 const zohoDeskStatus = ref({
   status: 'not_connected',
   account_name: null,
@@ -108,6 +147,14 @@ const isConnectingErp = ref(false);
 const isConnectingShipping = ref(false);
 const isGeneratingToolkit = ref(false);
 const isReviewingToolkit = ref(false);
+const isLoadingAgentDocuments = ref(false);
+const isUploadingAgentDocument = ref(false);
+const isReviewingAgentDocument = ref(false);
+const isTestingAgentRetrieval = ref(false);
+const isTestingAgentAnswer = ref(false);
+const isStartingVoiceSession = ref(false);
+const isLinkingAgentPhone = ref(false);
+const isTestingAgentLatency = ref(false);
 const isLoadingMembers = ref(false);
 const isSavingMember = ref(false);
 const updatingMemberId = ref(null);
@@ -174,6 +221,8 @@ const dashboardSearchPlaceholder = computed(() =>
     ? 'Search tickets, Desk status, namespace...'
     : currentPage.value === 'toolkit'
       ? 'Search tools, integrations, registry...'
+      : currentPage.value === 'agent'
+        ? 'Search documents, policies, chunks...'
       : 'Search members, roles, statuses...',
 );
 const crmProviderLabel = computed(() => {
@@ -355,6 +404,51 @@ const visibleToolkitTools = computed(() => filteredToolkitTools.value.slice(0, T
 const visibleToolkitDrafts = computed(() => filteredToolkitDrafts.value.slice(0, TOOLKIT_REGISTRY_PREVIEW_LIMIT));
 const hiddenToolkitToolCount = computed(() => Math.max(0, filteredToolkitTools.value.length - visibleToolkitTools.value.length));
 const hiddenToolkitDraftCount = computed(() => Math.max(0, filteredToolkitDrafts.value.length - visibleToolkitDrafts.value.length));
+const filteredAgentDocuments = computed(() => {
+  const query = dashboardQuery.value.trim().toLowerCase();
+  const documents = [...agentDocuments.value];
+  if (!query) {
+    return documents;
+  }
+  return documents.filter((document) =>
+    [
+      document.name,
+      document.document_type,
+      document.description,
+      document.status,
+      document.approval_status,
+      ...(document.tags || []),
+    ]
+      .filter(Boolean)
+      .some((value) => String(value).toLowerCase().includes(query)),
+  );
+});
+const approvedAgentDocumentCount = computed(() =>
+  agentDocuments.value.filter((document) => document.approval_status === 'approved').length,
+);
+const pendingAgentDocumentCount = computed(() =>
+  agentDocuments.value.filter((document) => document.approval_status === 'pending').length,
+);
+const agentKnowledgeChunkCount = computed(() =>
+  agentDocuments.value.reduce((total, document) => total + Number(document.chunk_count || 0), 0),
+);
+const agentVoiceLanguageOptions = computed(() =>
+  agentRuntimeStatus.value?.supported_indian_languages?.length
+    ? agentRuntimeStatus.value.supported_indian_languages
+    : [
+        { code: 'en', label: 'English', native_label: 'English' },
+        { code: 'hi', label: 'Hindi', native_label: 'हिन्दी' },
+        { code: 'bn', label: 'Bengali', native_label: 'বাংলা' },
+        { code: 'gu', label: 'Gujarati', native_label: 'ગુજરાતી' },
+        { code: 'kn', label: 'Kannada', native_label: 'ಕನ್ನಡ' },
+        { code: 'ml', label: 'Malayalam', native_label: 'മലയാളം' },
+        { code: 'mr', label: 'Marathi', native_label: 'मराठी' },
+        { code: 'pa', label: 'Punjabi', native_label: 'ਪੰਜਾਬੀ' },
+        { code: 'ta', label: 'Tamil', native_label: 'தமிழ்' },
+        { code: 'te', label: 'Telugu', native_label: 'తెలుగు' },
+        { code: 'ur', label: 'Urdu', native_label: 'اُردُو' },
+      ],
+);
 const schemaSelectionCount = computed(() =>
   databaseSchema.value.reduce(
     (total, table) => total + table.columns.filter((column) => column.selected).length,
@@ -429,7 +523,7 @@ async function refreshOrganizationSession() {
 
 async function apiRequest(path, options = {}) {
   const headers = new Headers(options.headers || {});
-  if (!headers.has('Content-Type') && options.body) {
+  if (!headers.has('Content-Type') && options.body && !(options.body instanceof FormData)) {
     headers.set('Content-Type', 'application/json');
   }
 
@@ -518,6 +612,33 @@ function clearSession() {
   toolkitDraft.value = null;
   toolkitRegistry.value = { tools: [], drafts: [] };
   toolkitBuilders.value = [];
+  agentDocuments.value = [];
+  agentUploadForm.value = { name: '', document_type: 'policy', description: '', tags: '' };
+  agentUploadFile.value = null;
+  agentTestQuery.value = '';
+  agentTestRetrieval.value = null;
+  agentTestAnswer.value = null;
+  agentRuntimeStatus.value = null;
+  agentPhoneLink.value = { status: 'not_linked', phone_number: '' };
+  agentPhoneForm.value = { phone_number: '' };
+  agentLatencyResult.value = null;
+  voiceSocket.value = null;
+  voiceRecorder.value = null;
+  voiceMediaStream.value = null;
+  isVoiceSessionActive.value = false;
+  voiceTranscript.value = '';
+  voiceAgentAnswer.value = '';
+  voiceAudioChunks.value = [];
+  voiceTtsFirstAudioMs.value = null;
+  voiceStreamingPlaybackStarted.value = false;
+  voiceStreamingPlaybackFailed.value = false;
+  voiceChunkQueue = [];
+  if (voiceChunkAudio) {
+    voiceChunkAudio.pause();
+    voiceChunkAudio = null;
+  }
+  voiceEvents.value = [];
+  agentVoiceLanguage.value = 'en';
   zohoDeskStatus.value = {
     status: 'not_connected',
     account_name: null,
@@ -854,6 +975,11 @@ function switchPage(page) {
       fetchToolkitRegistry();
     }
   }
+  if (page === 'agent') {
+    fetchAgentDocuments();
+    fetchAgentRuntimeStatus();
+    fetchAgentPhoneLink();
+  }
 }
 
 async function fetchToolkitBuilders() {
@@ -1113,6 +1239,509 @@ async function reviewToolkitDraft(action) {
     errorMsg.value = error.message;
   } finally {
     isReviewingToolkit.value = false;
+  }
+}
+
+function handleAgentFileChange(event) {
+  const [file] = Array.from(event.target.files || []);
+  agentUploadFile.value = file || null;
+  if (file && !agentUploadForm.value.name) {
+    agentUploadForm.value.name = file.name.replace(/\.[^.]+$/, '').replace(/[-_]+/g, ' ');
+  }
+}
+
+function readFileAsBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = String(reader.result || '');
+      resolve(result.includes(',') ? result.split(',').pop() : result);
+    };
+    reader.onerror = () => reject(new Error('Unable to read selected file.'));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function fetchAgentDocuments() {
+  if (!canManageDatabase.value) {
+    agentDocuments.value = [];
+    return;
+  }
+  isLoadingAgentDocuments.value = true;
+  try {
+    const payload = await apiRequest('/org-auth/agent/documents');
+    agentDocuments.value = payload.documents || [];
+  } catch (error) {
+    errorMsg.value = error.message;
+  } finally {
+    isLoadingAgentDocuments.value = false;
+  }
+}
+
+async function fetchAgentRuntimeStatus() {
+  if (!canManageDatabase.value) {
+    agentRuntimeStatus.value = null;
+    return;
+  }
+  try {
+    agentRuntimeStatus.value = await apiRequest('/org-auth/agent/runtime/status');
+  } catch (error) {
+    errorMsg.value = error.message;
+  }
+}
+
+async function fetchAgentPhoneLink() {
+  if (!canManageDatabase.value) {
+    agentPhoneLink.value = { status: 'not_linked', phone_number: '' };
+    return;
+  }
+  try {
+    agentPhoneLink.value = await apiRequest('/org-auth/agent/phone-link');
+    if (agentPhoneLink.value?.phone_number) {
+      agentPhoneForm.value.phone_number = agentPhoneLink.value.phone_number;
+    }
+  } catch (error) {
+    errorMsg.value = error.message;
+  }
+}
+
+async function linkAgentPhoneNumber() {
+  if (!agentPhoneForm.value.phone_number.trim()) {
+    errorMsg.value = 'Enter a Twilio phone number to link.';
+    return;
+  }
+  isLinkingAgentPhone.value = true;
+  errorMsg.value = '';
+  infoMsg.value = '';
+  try {
+    agentPhoneLink.value = await apiRequest('/org-auth/agent/phone-link', {
+      method: 'POST',
+      body: JSON.stringify({ phone_number: agentPhoneForm.value.phone_number.trim() }),
+    });
+    infoMsg.value = 'Phone number linked to the Agent runtime.';
+  } catch (error) {
+    errorMsg.value = error.message;
+  } finally {
+    isLinkingAgentPhone.value = false;
+  }
+}
+
+async function unlinkAgentPhoneNumber() {
+  isLinkingAgentPhone.value = true;
+  errorMsg.value = '';
+  infoMsg.value = '';
+  try {
+    agentPhoneLink.value = await apiRequest('/org-auth/agent/phone-link', {
+      method: 'DELETE',
+    });
+    infoMsg.value = 'Phone number unlinked from the Agent runtime.';
+  } catch (error) {
+    errorMsg.value = error.message;
+  } finally {
+    isLinkingAgentPhone.value = false;
+  }
+}
+
+async function uploadAgentDocument() {
+  if (!agentUploadForm.value.name.trim()) {
+    errorMsg.value = 'Document name is required.';
+    return;
+  }
+  if (!agentUploadFile.value) {
+    errorMsg.value = 'Choose a document or policy file first.';
+    return;
+  }
+  isUploadingAgentDocument.value = true;
+  errorMsg.value = '';
+  infoMsg.value = '';
+  try {
+    const contentBase64 = await readFileAsBase64(agentUploadFile.value);
+    await apiRequest('/org-auth/agent/documents/upload', {
+      method: 'POST',
+      body: JSON.stringify({
+        name: agentUploadForm.value.name.trim(),
+        document_type: agentUploadForm.value.document_type,
+        description: agentUploadForm.value.description || null,
+        tags: agentUploadForm.value.tags || null,
+        filename: agentUploadFile.value.name,
+        content_type: agentUploadFile.value.type || 'application/octet-stream',
+        content_base64: contentBase64,
+      }),
+    });
+    infoMsg.value = 'Document uploaded and chunked. Approve it before the agent can use it.';
+    agentUploadForm.value = { name: '', document_type: 'policy', description: '', tags: '' };
+    agentUploadFile.value = null;
+    await fetchAgentDocuments();
+  } catch (error) {
+    errorMsg.value = error.message;
+  } finally {
+    isUploadingAgentDocument.value = false;
+  }
+}
+
+async function reviewAgentDocument(document, action) {
+  if (!document?.id) {
+    return;
+  }
+  isReviewingAgentDocument.value = true;
+  errorMsg.value = '';
+  infoMsg.value = '';
+  try {
+    await apiRequest(`/org-auth/agent/documents/${document.id}/${action}`, {
+      method: 'POST',
+      body: JSON.stringify({ notes: `${action === 'approve' ? 'Approved' : 'Rejected'} from Agent Studio.` }),
+    });
+    infoMsg.value = action === 'approve'
+      ? 'Document approved. Its active chunks are now available to the agent.'
+      : 'Document rejected. Its chunks are blocked from agent retrieval.';
+    await fetchAgentDocuments();
+  } catch (error) {
+    errorMsg.value = error.message;
+  } finally {
+    isReviewingAgentDocument.value = false;
+  }
+}
+
+async function testAgentLatency() {
+  if (!agentTestQuery.value.trim()) {
+    errorMsg.value = 'Enter a test question first.';
+    return;
+  }
+  isTestingAgentLatency.value = true;
+  agentLatencyResult.value = null;
+  errorMsg.value = '';
+  try {
+    agentLatencyResult.value = await apiRequest('/org-auth/agent/runtime/latency-test', {
+      method: 'POST',
+      body: JSON.stringify({
+        query: agentTestQuery.value,
+        response_language: agentVoiceLanguage.value,
+        target_ms: 800,
+      }),
+    });
+  } catch (error) {
+    errorMsg.value = error.message;
+  } finally {
+    isTestingAgentLatency.value = false;
+  }
+}
+
+function appendVoiceEvent(event) {
+  voiceEvents.value = [
+    {
+      id: `${Date.now()}-${Math.random()}`,
+      created_at: new Date().toLocaleTimeString(),
+      ...event,
+    },
+    ...voiceEvents.value,
+  ].slice(0, 12);
+}
+
+function base64ToBytes(value) {
+  const binary = window.atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes;
+}
+
+function playVoiceAudio(force = false) {
+  if (!voiceAudioChunks.value.length || (voiceReceivedStreamingAudio.value && !force)) {
+    return;
+  }
+  const audioBlob = new Blob(voiceAudioChunks.value.map(base64ToBytes), {
+    type: `audio/${agentRuntimeStatus.value?.tts?.audio_format || 'wav'}`,
+  });
+  const audio = new Audio(URL.createObjectURL(audioBlob));
+  audio.play().catch(() => {
+    appendVoiceEvent({ type: 'audio_blocked', text: 'Browser blocked autoplay. Click Test Voice again or allow audio playback.' });
+  });
+  voiceAudioChunks.value = [];
+}
+
+function resetVoiceAudioPlayback() {
+  voiceAudioChunks.value = [];
+  voiceTtsFirstAudioMs.value = null;
+  voiceStreamingPlaybackStarted.value = false;
+  voiceStreamingPlaybackFailed.value = false;
+  voiceReceivedStreamingAudio.value = false;
+  voiceChunkQueue = [];
+  if (voiceChunkAudio) {
+    voiceChunkAudio.pause();
+    voiceChunkAudio = null;
+  }
+}
+
+function playNextVoiceChunk() {
+  if (voiceChunkAudio || voiceStreamingPlaybackFailed.value || !voiceChunkQueue.length) {
+    return;
+  }
+  const chunk = voiceChunkQueue.shift();
+  const audioBlob = new Blob([base64ToBytes(chunk)], {
+    type: `audio/${agentRuntimeStatus.value?.tts?.audio_format || 'wav'}`,
+  });
+  const objectUrl = URL.createObjectURL(audioBlob);
+  const audio = new Audio(objectUrl);
+  voiceChunkAudio = audio;
+  audio.onplay = () => {
+    voiceStreamingPlaybackStarted.value = true;
+  };
+  audio.onended = () => {
+    URL.revokeObjectURL(objectUrl);
+    voiceChunkAudio = null;
+    playNextVoiceChunk();
+  };
+  audio.onerror = () => {
+    URL.revokeObjectURL(objectUrl);
+    voiceChunkAudio = null;
+    voiceStreamingPlaybackFailed.value = true;
+    voiceChunkQueue = [];
+  };
+  audio.play().catch(() => {
+    URL.revokeObjectURL(objectUrl);
+    voiceChunkAudio = null;
+    voiceStreamingPlaybackFailed.value = true;
+    voiceChunkQueue = [];
+  });
+}
+
+function enqueueVoiceAudioChunk(base64Audio) {
+  if (voiceStreamingPlaybackFailed.value) {
+    return;
+  }
+  voiceChunkQueue.push(base64Audio);
+  playNextVoiceChunk();
+}
+
+function handleVoiceRuntimeMessage(raw) {
+  const message = JSON.parse(raw.data);
+  if (message.type === 'runtime_status') {
+    agentRuntimeStatus.value = message;
+  }
+  if (message.type === 'stt_transcript') {
+    voiceTranscript.value = message.is_final
+      ? `${voiceTranscript.value} ${message.text}`.trim()
+      : message.text;
+  }
+  if (message.type === 'stt_finished') {
+    resetVoiceAudioPlayback();
+    voiceTranscript.value = message.text || voiceTranscript.value;
+    appendVoiceEvent({ type: 'TRANSCRIPT', text: voiceTranscript.value || '(empty transcript)' });
+  }
+  if (message.type === 'agent_answer') {
+    voiceAgentAnswer.value = message.answer || '';
+    // Show intent classification debug info
+    const intent = message.intent || {};
+    if (intent.type) {
+      appendVoiceEvent({
+        type: 'INTENT',
+        text: `${intent.type} (${Math.round((intent.confidence || 0) * 100)}%) — ${intent.reason || ''}`,
+        detail: intent.should_retrieve ? 'Retrieval: used' : `Retrieval: skipped — ${intent.retrieval_skipped_reason || 'not needed'}`,
+        classifier: intent.classifier || 'unknown',
+      });
+    }
+    appendVoiceEvent({ type: message.refused ? 'REFUSAL' : 'ANSWER', text: message.answer || '' });
+  }
+  if (message.type === 'tts_warmed') {
+    const purpose = message.purpose || 'answer';
+    appendVoiceEvent({
+      type: 'TTS_WARMED',
+      text: `${purpose} TTS warmed in ${message.connected_ms ?? 'n/a'}ms`,
+      detail: `Language: ${message.language || agentVoiceLanguage.value}`,
+    });
+  }
+  if (message.type === 'tts_started') {
+    const purpose = message.purpose || 'answer';
+    appendVoiceEvent({
+      type: 'TTS_STARTED',
+      text: `${purpose} TTS request sent in ${message.request_sent_ms ?? 'n/a'}ms`,
+      detail: message.warm_connection
+        ? `Using warmed Soniox TTS stream. Initial warmup: ${message.warm_connected_ms ?? 'n/a'}ms`
+        : `Soniox websocket connected in ${message.connected_ms ?? 'n/a'}ms`,
+    });
+  }
+  if (message.type === 'tts_first_audio') {
+    const purpose = message.purpose || 'answer';
+    if (purpose === 'answer') {
+      voiceTtsFirstAudioMs.value = message.first_audio_latency_ms ?? null;
+    }
+    appendVoiceEvent({
+      type: 'TTS_FIRST_AUDIO',
+      text: `${purpose} first TTS audio in ${message.first_audio_latency_ms ?? 'n/a'}ms`,
+      detail: purpose === 'answer'
+        ? (Number(message.first_audio_latency_ms) <= 800 ? 'Within 800ms target' : 'Over 800ms target')
+        : 'Filler audio does not count as final answer latency',
+    });
+  }
+  if (message.type === 'tts_audio' && message.audio_base64) {
+    voiceReceivedStreamingAudio.value = true;
+    voiceAudioChunks.value.push(message.audio_base64);
+    enqueueVoiceAudioChunk(message.audio_base64);
+  }
+  if (message.type === 'tts_done') {
+    if (message.done_reason === 'idle_after_audio') {
+      appendVoiceEvent({
+        type: 'TTS_SEGMENT_DONE',
+        text: `${message.purpose || 'answer'} TTS segment released after audio idle`,
+      });
+    }
+    if (voiceStreamingPlaybackFailed.value) {
+      playVoiceAudio(true);
+    } else {
+      voiceAudioChunks.value = [];
+    }
+  }
+  if (message.type === 'tts_error') {
+    appendVoiceEvent({ type: 'TTS_ERROR', text: message.error_message || 'Voice synthesis unavailable' });
+  }
+  if (message.type === 'tts_warm_error') {
+    appendVoiceEvent({ type: 'TTS_WARM_ERROR', text: message.error_message || 'Unable to warm TTS stream' });
+  }
+  if (message.type === 'barge_in_detected') {
+    resetVoiceAudioPlayback();
+    appendVoiceEvent({ type: 'BARGE_IN', text: 'User interrupted — agent stopped speaking' });
+  }
+  if (message.type === 'turn_complete') {
+    const filler = message.filler_played ? ' (filler played)' : '';
+    appendVoiceEvent({ type: 'TURN_COMPLETE', text: `Turn done in ${message.total_ms ?? 'n/a'}ms${filler}`, detail: `Context: ${message.context_source ?? 'unknown'}` });
+  }
+  if (message.type?.endsWith('_error') && message.type !== 'tts_error') {
+    appendVoiceEvent({ type: message.type.toUpperCase(), text: message.error || message.error_message || 'Voice runtime error' });
+  }
+}
+
+function stopVoiceSession() {
+  if (voiceRecorder.value && voiceRecorder.value.state !== 'inactive') {
+    voiceRecorder.value.stop();
+  }
+  if (voiceMediaStream.value) {
+    voiceMediaStream.value.getTracks().forEach((track) => track.stop());
+  }
+  if (voiceSocket.value && voiceSocket.value.readyState === WebSocket.OPEN) {
+    voiceSocket.value.send(JSON.stringify({ type: 'stop' }));
+  }
+  isVoiceSessionActive.value = false;
+  voiceRecorder.value = null;
+  voiceMediaStream.value = null;
+}
+
+async function startVoiceSession() {
+  const token = localStorage.getItem(ORG_ACCESS_TOKEN_KEY);
+  if (!token) {
+    errorMsg.value = 'Sign in again before starting voice runtime.';
+    return;
+  }
+  isStartingVoiceSession.value = true;
+  errorMsg.value = '';
+  voiceTranscript.value = '';
+  voiceAgentAnswer.value = '';
+  resetVoiceAudioPlayback();
+  try {
+    const wsUrl = `${API_BASE_URL.replace(/^http/, 'ws')}/org-auth/agent/voice/ws?token=${encodeURIComponent(token)}`;
+    const socket = new WebSocket(wsUrl);
+    voiceSocket.value = socket;
+    socket.onmessage = handleVoiceRuntimeMessage;
+    socket.onerror = () => {
+      errorMsg.value = 'Voice runtime socket failed.';
+      isVoiceSessionActive.value = false;
+    };
+    socket.onclose = () => {
+      isVoiceSessionActive.value = false;
+    };
+    await new Promise((resolve, reject) => {
+      socket.onopen = resolve;
+      socket.onerror = reject;
+    });
+    socket.send(JSON.stringify({ type: 'config', language: agentVoiceLanguage.value }));
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    voiceMediaStream.value = stream;
+    const recorder = new MediaRecorder(stream);
+    voiceRecorder.value = recorder;
+    recorder.ondataavailable = async (event) => {
+      if (event.data.size && socket.readyState === WebSocket.OPEN) {
+        socket.send(await event.data.arrayBuffer());
+      }
+    };
+    recorder.start(250);
+    isVoiceSessionActive.value = true;
+    appendVoiceEvent({ type: 'voice_started', text: 'Voice session started.' });
+  } catch (error) {
+    errorMsg.value = error.message || 'Unable to start voice session.';
+    stopVoiceSession();
+  } finally {
+    isStartingVoiceSession.value = false;
+  }
+}
+
+async function sendTextToVoiceRuntime() {
+  if (!agentTestQuery.value.trim()) {
+    errorMsg.value = 'Enter a test question first.';
+    return;
+  }
+  resetVoiceAudioPlayback();
+  voiceTranscript.value = agentTestQuery.value;
+  voiceAgentAnswer.value = '';
+  let socket = voiceSocket.value;
+  if (!socket || socket.readyState === WebSocket.CLOSED || socket.readyState === WebSocket.CLOSING) {
+    const token = localStorage.getItem(ORG_ACCESS_TOKEN_KEY);
+    const wsUrl = `${API_BASE_URL.replace(/^http/, 'ws')}/org-auth/agent/voice/ws?token=${encodeURIComponent(token)}`;
+    socket = new WebSocket(wsUrl);
+    voiceSocket.value = socket;
+    socket.onmessage = handleVoiceRuntimeMessage;
+    socket.onclose = () => {
+      isVoiceSessionActive.value = false;
+      if (voiceSocket.value === socket) {
+        voiceSocket.value = null;
+      }
+    };
+    await new Promise((resolve, reject) => {
+      socket.onopen = resolve;
+      socket.onerror = reject;
+    });
+    socket.send(JSON.stringify({ type: 'config', language: agentVoiceLanguage.value }));
+    isVoiceSessionActive.value = true;
+  }
+  socket.send(JSON.stringify({ type: 'text_query', text: agentTestQuery.value, language: agentVoiceLanguage.value }));
+}
+
+async function testAgentRetrieval() {
+  if (!agentTestQuery.value.trim()) {
+    errorMsg.value = 'Enter a test question first.';
+    return;
+  }
+  isTestingAgentRetrieval.value = true;
+  agentTestRetrieval.value = null;
+  errorMsg.value = '';
+  try {
+    agentTestRetrieval.value = await apiRequest('/org-auth/agent/test-retrieval', {
+      method: 'POST',
+      body: JSON.stringify({ query: agentTestQuery.value, top_k: 5 }),
+    });
+  } catch (error) {
+    errorMsg.value = error.message;
+  } finally {
+    isTestingAgentRetrieval.value = false;
+  }
+}
+
+async function testAgentAnswer() {
+  if (!agentTestQuery.value.trim()) {
+    errorMsg.value = 'Enter a test question first.';
+    return;
+  }
+  isTestingAgentAnswer.value = true;
+  agentTestAnswer.value = null;
+  errorMsg.value = '';
+  try {
+    agentTestAnswer.value = await apiRequest('/org-auth/agent/test-answer', {
+      method: 'POST',
+      body: JSON.stringify({ query: agentTestQuery.value, top_k: 5, response_language: agentVoiceLanguage.value }),
+    });
+  } catch (error) {
+    errorMsg.value = error.message;
+  } finally {
+    isTestingAgentAnswer.value = false;
   }
 }
 
@@ -1389,6 +2018,10 @@ onMounted(async () => {
 });
 
 onBeforeUnmount(() => {
+  stopVoiceSession();
+  if (voiceSocket.value) {
+    voiceSocket.value.close();
+  }
   if (orgShellRef.value) {
     orgShellRef.value.style.removeProperty('--cursor-x');
     orgShellRef.value.style.removeProperty('--cursor-y');
@@ -1567,6 +2200,15 @@ onBeforeUnmount(() => {
             >
               <Wrench :size="17" />
               <span>Toolkit</span>
+            </button>
+            <button
+              type="button"
+              class="nav-page-button"
+              :class="{ active: currentPage === 'agent' }"
+              @click="switchPage('agent')"
+            >
+              <Bot :size="17" />
+              <span>Agent Studio</span>
             </button>
             <button type="button" class="nav-icon-button" @click="toggleMemberFilter">
               <Filter :size="18" />
@@ -2314,6 +2956,316 @@ onBeforeUnmount(() => {
           </div>
         </article>
       </section>
+
+      <section v-if="currentPage === 'agent'" class="dashboard-section agent-page">
+        <div class="dashboard-section-head">
+          <div>
+            <span class="section-kicker">Agent Knowledge</span>
+            <h3>Agent Studio</h3>
+          </div>
+          <p>Upload policies and documents, approve them for RAG, and test grounded answers before any voice streaming runtime is enabled.</p>
+        </div>
+
+        <div v-if="canManageDatabase" class="agent-hero-panel">
+          <div>
+            <span class="section-kicker">Approved Context Only</span>
+            <h2>Knowledge-first answering agent</h2>
+            <p>Raw files are stored as blob artifacts. The agent can only retrieve approved, organization-scoped Qdrant chunks and must refuse when context is missing.</p>
+          </div>
+          <div class="agent-hero-stats">
+            <span><strong>{{ approvedAgentDocumentCount }}</strong> approved docs</span>
+            <span><strong>{{ pendingAgentDocumentCount }}</strong> pending review</span>
+            <span><strong>{{ agentKnowledgeChunkCount }}</strong> chunks</span>
+          </div>
+        </div>
+
+        <div v-if="canManageDatabase" class="dashboard-grid agent-page-grid">
+          <article class="dashboard-card agent-upload-card">
+            <div class="compact-card-head">
+              <div class="compact-icon-shell">
+                <UploadCloud :size="18" />
+              </div>
+              <div>
+                <h3>Upload Knowledge</h3>
+                <p>Name the document, store the raw file in blob, then embed chunks into the organization collection.</p>
+              </div>
+            </div>
+
+            <div class="agent-upload-drop">
+              <input id="agent-document-file" type="file" @change="handleAgentFileChange" />
+              <FileText :size="24" />
+              <strong>{{ agentUploadFile?.name || 'Choose policy or document file' }}</strong>
+              <span>TXT, Markdown, CSV, JSON, text-readable DOCX/PDF supported in this pass.</span>
+            </div>
+
+            <div class="agent-form-grid">
+              <div class="db-form-block">
+                <label class="db-label" for="agent-document-name">Document Name</label>
+                <input id="agent-document-name" v-model="agentUploadForm.name" class="db-input" type="text" placeholder="Refund Policy v1" />
+              </div>
+              <div class="db-form-block">
+                <label class="db-label" for="agent-document-type">Type</label>
+                <select id="agent-document-type" v-model="agentUploadForm.document_type" class="db-input">
+                  <option value="policy">Policy</option>
+                  <option value="faq">FAQ</option>
+                  <option value="script">Call Script</option>
+                  <option value="compliance">Compliance</option>
+                  <option value="product_docs">Product Docs</option>
+                  <option value="training">Training</option>
+                  <option value="other">Other</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="db-form-block">
+              <label class="db-label" for="agent-document-description">Description</label>
+              <textarea id="agent-document-description" v-model="agentUploadForm.description" class="db-input toolkit-textarea compact" placeholder="What should agents use this document for?"></textarea>
+            </div>
+
+            <div class="db-form-block">
+              <label class="db-label" for="agent-document-tags">Tags</label>
+              <input id="agent-document-tags" v-model="agentUploadForm.tags" class="db-input" type="text" placeholder="refunds, shipping, escalation" />
+            </div>
+
+            <div class="db-actions">
+              <button type="button" class="primary-button" :disabled="isUploadingAgentDocument" @click="uploadAgentDocument">
+                {{ isUploadingAgentDocument ? 'Uploading...' : 'Upload & Index For Review' }}
+              </button>
+            </div>
+          </article>
+
+          <article class="dashboard-card agent-documents-card">
+            <div class="members-card-head">
+              <div>
+                <h3>Document Lifecycle</h3>
+                <p>Only approved chunks are retrievable. Pending and rejected documents stay blocked from the agent.</p>
+              </div>
+              <span class="status-chip">{{ filteredAgentDocuments.length }} docs</span>
+            </div>
+
+            <div class="agent-document-list">
+              <div v-if="isLoadingAgentDocuments" class="empty-state compact">Loading Agent Knowledge documents...</div>
+              <div v-else-if="!filteredAgentDocuments.length" class="empty-state compact">No documents uploaded yet.</div>
+              <div v-for="document in filteredAgentDocuments" :key="document.id" class="agent-document-row">
+                <div class="agent-document-main">
+                  <div class="agent-document-icon">
+                    <FileText :size="18" />
+                  </div>
+                  <div>
+                    <strong>{{ document.name }}</strong>
+                    <small>{{ document.document_type }} · {{ document.chunk_count }} chunks · {{ document.blob_path }}</small>
+                    <span v-if="document.last_error" class="agent-warning">{{ document.last_error }}</span>
+                  </div>
+                </div>
+                <div class="agent-document-actions">
+                  <span class="status-chip">{{ document.approval_status }}</span>
+                  <button
+                    v-if="document.approval_status === 'pending'"
+                    type="button"
+                    class="ghost-button compact"
+                    :disabled="isReviewingAgentDocument"
+                    @click="reviewAgentDocument(document, 'reject')"
+                  >
+                    <XCircle :size="15" />
+                    Reject
+                  </button>
+                  <button
+                    v-if="document.approval_status === 'pending'"
+                    type="button"
+                    class="primary-button compact"
+                    :disabled="isReviewingAgentDocument"
+                    @click="reviewAgentDocument(document, 'approve')"
+                  >
+                    <CheckCircle2 :size="15" />
+                    Approve
+                  </button>
+                </div>
+              </div>
+            </div>
+          </article>
+
+          <article class="dashboard-card wide-card agent-test-card">
+            <div class="members-card-head">
+              <div>
+                <h3>Agent Test Console</h3>
+                <p>Test retrieval and grounded answer behavior before adding Soniox STT/TTS and streaming voice.</p>
+              </div>
+              <span class="status-chip">Pre-voice runtime</span>
+            </div>
+
+            <div class="agent-console-grid">
+              <div class="db-form-block">
+                <label class="db-label" for="agent-test-query">Test Question</label>
+                <textarea id="agent-test-query" v-model="agentTestQuery" class="db-input toolkit-textarea compact" placeholder="Ask a question that should be answered only from approved documents."></textarea>
+                <div class="db-actions">
+                  <button type="button" class="ghost-button" :disabled="isTestingAgentRetrieval" @click="testAgentRetrieval">
+                    {{ isTestingAgentRetrieval ? 'Retrieving...' : 'Test Retrieval' }}
+                  </button>
+                  <button type="button" class="primary-button" :disabled="isTestingAgentAnswer" @click="testAgentAnswer">
+                    <MessageSquare :size="16" />
+                    {{ isTestingAgentAnswer ? 'Answering...' : 'Test Answer' }}
+                  </button>
+                </div>
+              </div>
+
+              <div class="agent-console-results">
+                <div class="agent-result-panel">
+                  <strong>Retrieval</strong>
+                  <p v-if="agentTestRetrieval?.refusal">{{ agentTestRetrieval.refusal }}</p>
+                  <div v-else-if="agentTestRetrieval?.chunks?.length" class="agent-chunk-list">
+                    <div v-for="chunk in agentTestRetrieval.chunks" :key="chunk.chunk_id" class="agent-chunk">
+                      <span>{{ chunk.document_name }} · score {{ chunk.score.toFixed(3) }}</span>
+                      <p>{{ chunk.text }}</p>
+                    </div>
+                  </div>
+                  <p v-else>Run retrieval to see approved chunks.</p>
+                </div>
+
+                <div class="agent-result-panel answer">
+                  <strong>Grounded Answer</strong>
+                  <p v-if="agentTestAnswer?.answer">{{ agentTestAnswer.answer }}</p>
+                  <p v-else>The answer endpoint refuses when no approved context is found.</p>
+                  <div v-if="agentTestAnswer?.intent" class="agent-debug-grid">
+                    <span>Intent</span>
+                    <strong>{{ agentTestAnswer.intent.type || 'unknown' }}</strong>
+                    <span>Retrieval</span>
+                    <strong>{{ agentTestAnswer.retrieval?.used ? 'used' : 'skipped' }}</strong>
+                    <span>Reason</span>
+                    <strong>{{ agentTestAnswer.intent.reason || agentTestAnswer.retrieval?.skipped_reason || 'n/a' }}</strong>
+                    <span>Relevant chunks</span>
+                    <strong>{{ agentTestAnswer.retrieval?.relevant_count ?? agentTestAnswer.chunks?.length ?? 0 }}</strong>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="agent-voice-panel">
+              <div class="members-card-head">
+                <div>
+                  <h3>Voice Runtime</h3>
+                  <p>Soniox STT → LangGraph grounded answer → Soniox TTS. Uses approved chunks only.</p>
+                </div>
+                <span class="status-chip">{{ agentRuntimeStatus?.graph || 'langgraph' }}</span>
+              </div>
+
+              <div class="agent-runtime-strip">
+                <span><Radio :size="15" /> STT {{ agentRuntimeStatus?.stt?.model || 'stt-rt-v4' }}</span>
+                <span>LLM {{ agentRuntimeStatus?.llm?.model || 'gpt-4.1-mini' }}</span>
+                <span>TTS {{ agentRuntimeStatus?.tts?.voice || 'Adrian' }}</span>
+              </div>
+
+              <div class="db-form-block agent-language-control">
+                <label class="db-label" for="agent-voice-language">Indian Language</label>
+                <select id="agent-voice-language" v-model="agentVoiceLanguage" class="db-input">
+                  <option
+                    v-for="language in agentVoiceLanguageOptions"
+                    :key="language.code"
+                    :value="language.code"
+                  >
+                    {{ language.label }} - {{ language.native_label }}
+                  </option>
+                </select>
+                <p class="db-note">This controls Soniox STT hints, GPT-4.1-mini response language, and Soniox TTS language.</p>
+              </div>
+
+              <div class="agent-phone-link-card">
+                <div>
+                  <span class="section-kicker">Twilio Phone Link</span>
+                  <strong>{{ agentPhoneLink?.status === 'linked' ? agentPhoneLink.phone_number : 'No phone linked' }}</strong>
+                  <small v-if="agentPhoneLink?.voice_url">{{ agentPhoneLink.voice_url }}</small>
+                  <small v-else>Link a Twilio number in this organization’s subaccount to route calls to the Agent runtime.</small>
+                </div>
+                <div class="agent-phone-actions">
+                  <input v-model="agentPhoneForm.phone_number" class="db-input" type="text" placeholder="+91XXXXXXXXXX" />
+                  <button type="button" class="primary-button compact" :disabled="isLinkingAgentPhone" @click="linkAgentPhoneNumber">
+                    {{ isLinkingAgentPhone ? 'Saving...' : 'Link Agent' }}
+                  </button>
+                  <button
+                    type="button"
+                    class="ghost-button compact"
+                    :disabled="isLinkingAgentPhone || agentPhoneLink?.status !== 'linked'"
+                    @click="unlinkAgentPhoneNumber"
+                  >
+                    Remove
+                  </button>
+                </div>
+              </div>
+
+              <div class="db-actions">
+                <button
+                  type="button"
+                  class="primary-button"
+                  :disabled="isStartingVoiceSession || isVoiceSessionActive"
+                  @click="startVoiceSession"
+                >
+                  <Mic :size="16" />
+                  {{ isStartingVoiceSession ? 'Starting...' : (isVoiceSessionActive ? 'Listening...' : 'Start Voice') }}
+                </button>
+                <button type="button" class="ghost-button" @click="sendTextToVoiceRuntime">
+                  Test Query With TTS
+                </button>
+                <button type="button" class="ghost-button" :disabled="isTestingAgentLatency" @click="testAgentLatency">
+                  {{ isTestingAgentLatency ? 'Testing...' : 'Check 800ms' }}
+                </button>
+              </div>
+
+              <div v-if="agentLatencyResult" class="agent-latency-result" :class="{ pass: agentLatencyResult.latency?.passed, fail: !agentLatencyResult.latency?.passed }">
+                <strong>
+                  {{ agentLatencyResult.latency?.answer_text_to_first_tts_audio_ms ?? 'n/a' }}ms
+                  {{ agentLatencyResult.latency?.passed ? 'within target' : 'over target' }}
+                </strong>
+                <span>
+                  Target: {{ agentLatencyResult.latency?.target_ms }}ms from answer text to first TTS audio.
+                  Text answer: {{ agentLatencyResult.latency?.final_transcript_to_answer_ms }}ms.
+                  Transcript to first audio: {{ agentLatencyResult.latency?.final_transcript_to_first_tts_audio_ms ?? 'n/a' }}ms.
+                </span>
+              </div>
+
+              <div class="agent-voice-grid">
+                <div class="agent-result-panel">
+                  <strong>Live Transcript</strong>
+                  <p>{{ voiceTranscript || 'Start voice or send the test query to see transcript text.' }}</p>
+                </div>
+                <div class="agent-result-panel">
+                  <strong>Agent Spoken Answer</strong>
+                  <p>{{ voiceAgentAnswer || 'The voice answer appears here and plays through Soniox TTS.' }}</p>
+                  <small v-if="voiceTtsFirstAudioMs !== null">
+                    First TTS audio: {{ voiceTtsFirstAudioMs }}ms
+                    {{ voiceTtsFirstAudioMs <= 800 ? '(within 800ms)' : '(over 800ms)' }}
+                  </small>
+                </div>
+              </div>
+
+              <div class="agent-event-list">
+                <div v-if="!voiceEvents.length" class="empty-state compact">No voice runtime events yet.</div>
+                <div v-for="event in voiceEvents" :key="event.id" class="agent-event-row" :class="{
+                  'event-intent': event.type === 'INTENT',
+                  'event-answer': event.type === 'ANSWER',
+                  'event-transcript': event.type === 'TRANSCRIPT',
+                  'event-error': event.type === 'TTS_ERROR' || event.type?.includes('ERROR'),
+                  'event-refusal': event.type === 'REFUSAL',
+                }">
+                  <span class="event-header">{{ event.created_at }} · <strong>{{ event.type }}</strong></span>
+                  <p>{{ event.text }}</p>
+                  <p v-if="event.detail" class="event-detail">{{ event.detail }}</p>
+                </div>
+              </div>
+            </div>
+          </article>
+        </div>
+
+        <article v-else class="dashboard-card ticket-console-card">
+          <div class="compact-card-head">
+            <div class="compact-icon-shell">
+              <Shield :size="18" />
+            </div>
+            <div>
+              <h3>Admin Access Required</h3>
+              <p>Agent Knowledge uploads, approvals, and answer tests are limited to organization admins and managers.</p>
+            </div>
+          </div>
+        </article>
+      </section>
     </main>
 
     <footer class="portal-footer">
@@ -2928,7 +3880,8 @@ onBeforeUnmount(() => {
   color: #ffffff;
 }
 
-.ghost-button.compact {
+.ghost-button.compact,
+.primary-button.compact {
   flex: unset;
   padding: 0.7rem 0.95rem;
 }
@@ -3202,7 +4155,7 @@ onBeforeUnmount(() => {
 }
 
 .dashboard-layout {
-  width: min(100%, 1200px);
+  width: min(100%, 1320px);
   padding-top: 7.5rem;
   gap: 2rem;
 }
@@ -3220,7 +4173,7 @@ onBeforeUnmount(() => {
 }
 
 .dashboard-nav {
-  width: min(100%, 1200px);
+  width: min(100%, 1320px);
   padding: 0.9rem 1.15rem;
   border-radius: 1.35rem;
   border: 1px solid rgba(196, 199, 199, 0.45);
@@ -3779,6 +4732,19 @@ onBeforeUnmount(() => {
   align-items: start;
 }
 
+.toolkit-page .dashboard-section-head {
+  padding: 1.1rem 1.2rem;
+  border: 1px solid rgba(196, 199, 199, 0.38);
+  border-radius: 1.2rem;
+  background:
+    radial-gradient(circle at 8% 20%, rgba(229, 226, 225, 0.92), transparent 34%),
+    rgba(255, 255, 255, 0.7);
+}
+
+.toolkit-page .dashboard-card {
+  border-color: rgba(173, 177, 169, 0.48);
+}
+
 .toolkit-builder-card,
 .toolkit-registry-card {
   min-height: 34rem;
@@ -3920,6 +4886,403 @@ onBeforeUnmount(() => {
 .empty-state.compact {
   padding: 0.7rem 0;
   font-size: 0.9rem;
+}
+
+.agent-page-grid {
+  grid-template-columns: minmax(0, 0.95fr) minmax(0, 1.05fr);
+  align-items: start;
+}
+
+.agent-hero-panel {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 1.5rem;
+  align-items: end;
+  padding: 1.4rem;
+  border-radius: 1.35rem;
+  border: 1px solid rgba(196, 199, 199, 0.45);
+  background:
+    radial-gradient(circle at 10% 15%, rgba(220, 233, 213, 0.9), transparent 32%),
+    linear-gradient(135deg, rgba(255, 255, 255, 0.86), rgba(239, 238, 227, 0.72));
+  box-shadow: 0 16px 42px -30px rgba(27, 28, 21, 0.24);
+}
+
+.agent-hero-panel h2 {
+  font-family: Manrope, sans-serif;
+  font-size: clamp(1.8rem, 3vw, 2.55rem);
+  letter-spacing: -0.045em;
+  line-height: 1.05;
+}
+
+.agent-hero-panel p {
+  margin-top: 0.55rem;
+  max-width: 47rem;
+  color: #444748;
+  line-height: 1.7;
+}
+
+.agent-hero-stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(7rem, 1fr));
+  gap: 0.75rem;
+}
+
+.agent-hero-stats span {
+  padding: 0.9rem;
+  border-radius: 1rem;
+  background: rgba(255, 255, 255, 0.76);
+  border: 1px solid rgba(196, 199, 199, 0.45);
+  color: #5f5f53;
+  font-size: 0.8rem;
+  font-weight: 700;
+}
+
+.agent-hero-stats strong {
+  display: block;
+  color: #1b1c15;
+  font-family: Manrope, sans-serif;
+  font-size: 1.35rem;
+}
+
+.agent-upload-card,
+.agent-documents-card {
+  min-height: 34rem;
+}
+
+.agent-upload-drop {
+  position: relative;
+  margin-top: 1.25rem;
+  min-height: 9rem;
+  border: 1px dashed rgba(116, 120, 120, 0.6);
+  border-radius: 1rem;
+  background: rgba(239, 238, 227, 0.65);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.45rem;
+  text-align: center;
+  padding: 1rem;
+  color: #444748;
+}
+
+.agent-upload-drop input {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.agent-upload-drop strong {
+  color: #1b1c15;
+  font-family: Manrope, sans-serif;
+}
+
+.agent-upload-drop span {
+  max-width: 24rem;
+  color: #5f5f53;
+  font-size: 0.82rem;
+  line-height: 1.5;
+}
+
+.agent-form-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(12rem, 0.55fr);
+  gap: 1rem;
+  margin-top: 1rem;
+}
+
+.agent-document-list {
+  display: grid;
+  gap: 0.85rem;
+  margin-top: 1.2rem;
+}
+
+.agent-document-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 1rem;
+  align-items: center;
+  padding: 0.95rem;
+  border: 1px solid rgba(196, 199, 199, 0.42);
+  border-radius: 1rem;
+  background: rgba(255, 255, 255, 0.68);
+}
+
+.agent-document-main {
+  min-width: 0;
+  display: flex;
+  gap: 0.8rem;
+  align-items: flex-start;
+}
+
+.agent-document-icon {
+  flex: 0 0 auto;
+  width: 2.35rem;
+  height: 2.35rem;
+  border-radius: 0.8rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: #efeee3;
+  border: 1px solid rgba(196, 199, 199, 0.45);
+}
+
+.agent-document-main strong,
+.agent-document-main small,
+.agent-warning {
+  display: block;
+}
+
+.agent-document-main strong {
+  font-family: Manrope, sans-serif;
+  line-height: 1.3;
+}
+
+.agent-document-main small {
+  margin-top: 0.24rem;
+  color: #5f5f53;
+  font-size: 0.78rem;
+  line-height: 1.45;
+  word-break: break-word;
+}
+
+.agent-warning {
+  margin-top: 0.35rem;
+  color: #9f5f10;
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+
+.agent-document-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.agent-console-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 0.85fr) minmax(0, 1.15fr);
+  gap: 1rem;
+  margin-top: 1.15rem;
+}
+
+.agent-console-results {
+  display: grid;
+  gap: 1rem;
+}
+
+.agent-result-panel {
+  min-height: 9rem;
+  padding: 1rem;
+  border-radius: 1rem;
+  background: rgba(239, 238, 227, 0.72);
+  border: 1px solid rgba(196, 199, 199, 0.42);
+}
+
+.agent-result-panel strong {
+  display: block;
+  margin-bottom: 0.55rem;
+  font-family: Manrope, sans-serif;
+}
+
+.agent-result-panel p {
+  color: #444748;
+  font-size: 0.9rem;
+  line-height: 1.65;
+  white-space: pre-wrap;
+}
+
+.agent-chunk-list {
+  display: grid;
+  gap: 0.7rem;
+  max-height: 18rem;
+  overflow: auto;
+}
+
+.agent-chunk {
+  padding: 0.75rem;
+  border-radius: 0.8rem;
+  background: rgba(255, 255, 255, 0.72);
+}
+
+.agent-chunk span {
+  display: block;
+  margin-bottom: 0.35rem;
+  color: #5f5f53;
+  font-size: 0.75rem;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.agent-voice-panel {
+  margin-top: 1.1rem;
+  padding-top: 1rem;
+  border-top: 1px solid rgba(196, 199, 199, 0.35);
+}
+
+.agent-runtime-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.7rem;
+  margin: 1rem 0;
+}
+
+.agent-runtime-strip span {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.55rem 0.75rem;
+  border-radius: 999px;
+  background: rgba(239, 238, 227, 0.75);
+  border: 1px solid rgba(196, 199, 199, 0.42);
+  color: #444748;
+  font-size: 0.78rem;
+  font-weight: 800;
+}
+
+.agent-language-control {
+  max-width: 28rem;
+}
+
+.agent-phone-link-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(18rem, 0.8fr);
+  gap: 1rem;
+  align-items: end;
+  margin: 1rem 0;
+  padding: 1rem;
+  border-radius: 1rem;
+  background: rgba(255, 255, 255, 0.7);
+  border: 1px solid rgba(196, 199, 199, 0.42);
+}
+
+.agent-phone-link-card strong,
+.agent-phone-link-card small {
+  display: block;
+}
+
+.agent-phone-link-card strong {
+  font-family: Manrope, sans-serif;
+  font-size: 1.05rem;
+  line-height: 1.35;
+}
+
+.agent-phone-link-card small {
+  margin-top: 0.3rem;
+  color: #5f5f53;
+  font-size: 0.8rem;
+  line-height: 1.45;
+  word-break: break-word;
+}
+
+.agent-phone-actions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 0.6rem;
+  align-items: center;
+}
+
+.agent-latency-result {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: center;
+  margin-top: 0.85rem;
+  padding: 0.85rem 1rem;
+  border-radius: 0.9rem;
+  border: 1px solid rgba(196, 199, 199, 0.42);
+  background: rgba(239, 238, 227, 0.72);
+}
+
+.agent-latency-result.pass {
+  background: rgba(220, 252, 231, 0.78);
+  border-color: rgba(34, 197, 94, 0.25);
+}
+
+.agent-latency-result.fail {
+  background: rgba(254, 226, 226, 0.78);
+  border-color: rgba(239, 68, 68, 0.25);
+}
+
+.agent-latency-result strong {
+  font-family: Manrope, sans-serif;
+}
+
+.agent-latency-result span {
+  color: #5f5f53;
+  font-size: 0.82rem;
+}
+
+.agent-voice-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+  margin-top: 1rem;
+}
+
+.agent-event-list {
+  display: grid;
+  gap: 0.65rem;
+  margin-top: 1rem;
+}
+
+.agent-event-row {
+  padding: 0.75rem 0.85rem;
+  border-radius: 0.85rem;
+  background: rgba(255, 255, 255, 0.68);
+  border: 1px solid rgba(196, 199, 199, 0.38);
+}
+
+.agent-event-row span {
+  display: block;
+  margin-bottom: 0.3rem;
+  color: #5f5f53;
+  font-size: 0.72rem;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.agent-event-row p {
+  color: #444748;
+  font-size: 0.88rem;
+  line-height: 1.5;
+}
+
+.agent-event-row .event-detail {
+  color: #7a7d7d;
+  font-size: 0.78rem;
+  font-style: italic;
+  margin-top: 0.15rem;
+}
+
+.agent-event-row.event-intent {
+  border-left: 3px solid #6366f1;
+  background: rgba(99, 102, 241, 0.06);
+}
+
+.agent-event-row.event-answer {
+  border-left: 3px solid #10b981;
+  background: rgba(16, 185, 129, 0.06);
+}
+
+.agent-event-row.event-transcript {
+  border-left: 3px solid #3b82f6;
+  background: rgba(59, 130, 246, 0.06);
+}
+
+.agent-event-row.event-error {
+  border-left: 3px solid #f59e0b;
+  background: rgba(245, 158, 11, 0.06);
+}
+
+.agent-event-row.event-refusal {
+  border-left: 3px solid #ef4444;
+  background: rgba(239, 68, 68, 0.06);
 }
 
 .members-summary {
@@ -4131,6 +5494,30 @@ onBeforeUnmount(() => {
   color: #f2f1e5;
 }
 
+.agent-debug-grid {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 0.45rem 0.75rem;
+  margin-top: 0.85rem;
+  padding-top: 0.85rem;
+  border-top: 1px solid rgba(51, 56, 45, 0.14);
+  font-size: 0.78rem;
+}
+
+.agent-debug-grid span {
+  color: #6b6f66;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.agent-debug-grid strong {
+  display: block;
+  margin: 0;
+  color: #252923;
+  font-family: Manrope, sans-serif;
+  overflow-wrap: anywhere;
+}
+
 .org-shell.dark::before {
   content: "";
   position: fixed;
@@ -4325,6 +5712,39 @@ onBeforeUnmount(() => {
   color: #f2f1e5;
 }
 
+.org-shell.dark .toolkit-page .dashboard-section-head,
+.org-shell.dark .agent-hero-panel,
+.org-shell.dark .agent-hero-stats span,
+.org-shell.dark .agent-upload-drop,
+.org-shell.dark .agent-document-row,
+.org-shell.dark .agent-result-panel,
+.org-shell.dark .agent-chunk,
+.org-shell.dark .agent-runtime-strip span,
+.org-shell.dark .agent-event-row,
+.org-shell.dark .agent-phone-link-card,
+.org-shell.dark .agent-latency-result {
+  background: rgba(28, 31, 24, 0.78);
+  color: #f2f1e5;
+  border-color: rgba(102, 108, 92, 0.45);
+}
+
+.org-shell.dark .agent-hero-panel p,
+.org-shell.dark .agent-upload-drop span,
+.org-shell.dark .agent-document-main small,
+.org-shell.dark .agent-result-panel p,
+.org-shell.dark .agent-chunk span,
+.org-shell.dark .agent-debug-grid span,
+.org-shell.dark .agent-event-row span,
+.org-shell.dark .agent-event-row p,
+.org-shell.dark .agent-phone-link-card small,
+.org-shell.dark .agent-latency-result span {
+  color: #c8c7bc;
+}
+
+.org-shell.dark .agent-debug-grid strong {
+  color: #f2f1e5;
+}
+
 .org-shell.dark .message.error {
   background: rgba(92, 36, 31, 0.92);
   color: #ffd9d4;
@@ -4363,6 +5783,21 @@ onBeforeUnmount(() => {
   }
 
   .crm-form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .agent-hero-panel,
+  .agent-page-grid,
+  .agent-console-grid,
+  .agent-form-grid,
+  .agent-document-row,
+  .agent-voice-grid,
+  .agent-phone-link-card,
+  .agent-phone-actions {
+    grid-template-columns: 1fr;
+  }
+
+  .agent-hero-stats {
     grid-template-columns: 1fr;
   }
 

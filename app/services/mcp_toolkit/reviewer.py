@@ -78,6 +78,20 @@ class Reviewer:
             Reviewer._check(False, "BULK_MUTATION_POLICY_REQUIRED", "Approved bulk mutation policy is required before generating executable UPDATE SQL.", errors, required_changes)
         if any("source and target order status" in str(item).lower() for item in tool.get("missing_context") or []):
             Reviewer._check(False, "PROMPT_VALUE_EXTRACTION_FAILED", "Bulk order status prompt must extract source and target status values.", errors, required_changes)
+        if any("delete policy" in str(item).lower() for item in tool.get("missing_context") or []):
+            Reviewer._check(False, "DELETE_POLICY_REQUIRED", "Verified customer delete policy is required before generating delete SQL.", errors, required_changes)
+        if any("retention policy" in str(item).lower() for item in tool.get("missing_context") or []):
+            Reviewer._check(False, "DELETE_POLICY_REQUIRED", "Retention policy confirmation is required before deleting customer accounts.", errors, required_changes)
+        if any("linked records policy" in str(item).lower() for item in tool.get("missing_context") or []):
+            Reviewer._check(False, "LINKED_RECORDS_POLICY_REQUIRED", "Linked records policy confirmation is required before deleting customer accounts.", errors, required_changes)
+        if any("soft-delete/deactivation column" in str(item).lower() for item in tool.get("missing_context") or []):
+            Reviewer._check(False, "SOFT_DELETE_TARGET_FIELD_REQUIRED", "No verified soft-delete/deactivation column found for customer account deletion.", errors, required_changes)
+        if any("payment details resource" in str(item).lower() for item in tool.get("missing_context") or []):
+            Reviewer._check(False, "PAYMENT_DETAILS_NOT_VERIFIED", "Payment details resource is not verified for this selected integration context.", errors, required_changes)
+        if any("payment disclosure policy" in str(item).lower() for item in tool.get("missing_context") or []):
+            Reviewer._check(False, "PAYMENT_POLICY_REQUIRED", "Payment disclosure policy is required before returning payment details.", errors, required_changes)
+        if any("raw full phone" in str(item).lower() for item in tool.get("missing_context") or []):
+            Reviewer._check(False, "SENSITIVE_PII_REQUEST_BLOCKED", "Raw full phone, email, and address output is blocked without explicit sensitive PII disclosure policy.", errors, required_changes)
 
         if execution_type == "database_sql":
             sql = str(mapping.get("sql_template") or "")
@@ -141,10 +155,11 @@ class Reviewer:
                     required_changes,
                 )
             if expected_statement:
+                soft_delete_update = operation_type == "delete" and plan.get("target_entity") == "customer" and sql_info["statement"] == "UPDATE"
                 Reviewer._check(
-                    sql_info["statement"] == expected_statement,
+                    soft_delete_update or sql_info["statement"] == expected_statement,
                     "OPERATION_SQL_MISMATCH",
-                    f"operation_type {operation_type} must generate {expected_statement} SQL.",
+                    f"operation_type {operation_type} must generate {expected_statement} SQL unless using approved soft-delete UPDATE.",
                     errors,
                     required_changes,
                 )
@@ -160,6 +175,8 @@ class Reviewer:
                 Reviewer._validate_workflow_precheck(mapping, plan, errors, required_changes)
             if operation_type in {"bulk_update", "workflow_bulk_update"}:
                 Reviewer._validate_bulk_mutation_contract(sql, tool, plan, mapping, input_schema, sql_info, errors, required_changes)
+            if operation_type == "delete":
+                Reviewer._validate_delete_contract(sql, tool, plan, mapping, input_schema, sql_info, errors, required_changes)
             if sql_info["table"]:
                 sql_tables = set(sql_info.get("tables") or [sql_info["table"]])
                 Reviewer._check(
@@ -200,6 +217,7 @@ class Reviewer:
             Reviewer._validate_database_inputs(input_schema, sql_info, mapping, errors, required_changes)
             Reviewer._validate_mutation_sql_contract(sql, plan, input_schema, sql_info, errors, required_changes)
             Reviewer._validate_database_outputs(output_schema, plan, sql_info, verified_context, errors, required_changes)
+            Reviewer._validate_sensitive_read_contract(sql, tool, plan, input_schema, sql_info, errors, required_changes)
             Reviewer._validate_database_resource_subset(sql, sql_info, generation.get("retrieval") or {}, verified_context, errors, required_changes)
             Reviewer._validate_insert_required_columns(sql_info, verified_context, errors, required_changes)
             if execution.get("mode") == "read_only":
@@ -386,7 +404,7 @@ class Reviewer:
         if not errors:
             return "draft"
         codes = {error.get("code") for error in errors}
-        if codes & {"RETRIEVAL_LOW_CONFIDENCE", "MISSING_TARGET_FIELD_CONFIRMATION", "MULTI_STEP_WORKFLOW_DETECTED", "LATEST_ORDER_POLICY_REQUIRED", "BULK_MUTATION_POLICY_REQUIRED"}:
+        if codes & {"RETRIEVAL_LOW_CONFIDENCE", "MISSING_TARGET_FIELD_CONFIRMATION", "MULTI_STEP_WORKFLOW_DETECTED", "LATEST_ORDER_POLICY_REQUIRED", "BULK_MUTATION_POLICY_REQUIRED", "DELETE_POLICY_REQUIRED", "SOFT_DELETE_TARGET_FIELD_REQUIRED", "LINKED_RECORDS_POLICY_REQUIRED", "PAYMENT_DETAILS_NOT_VERIFIED", "PAYMENT_POLICY_REQUIRED", "SENSITIVE_PII_REQUEST_BLOCKED"}:
             return "needs_context_confirmation"
         retrieval = generation.get("retrieval") or {}
         if retrieval.get("fallback_used") or retrieval.get("status") == "low_confidence":
@@ -448,7 +466,7 @@ class Reviewer:
         elif statement == "DELETE":
             table_match = re.search(r"\bDELETE\s+FROM\s+([a-zA-Z_][\w]*\.[a-zA-Z_][\w]*)\b", first, flags=re.IGNORECASE)
             table = table_match.group(1) if table_match else ""
-            tables = [table] if table else []
+            tables = list(dict.fromkeys([item for item in [table, *re.findall(r"\b(?:USING|JOIN)\s+([a-zA-Z_][\w]*\.[a-zA-Z_][\w]*)\b", first, flags=re.IGNORECASE)] if item]))
             returning_match = re.search(r"\bRETURNING\s+(.+)$", first, flags=re.IGNORECASE | re.DOTALL)
             if returning_match:
                 returning_columns = Reviewer._extract_column_names(returning_match.group(1), table)
@@ -818,6 +836,78 @@ class Reviewer:
             errors,
             required_changes,
         )
+
+    @staticmethod
+    def _validate_delete_contract(
+        sql: str,
+        tool: dict[str, Any],
+        plan: dict[str, Any],
+        mapping: dict[str, Any],
+        input_schema: dict[str, Any],
+        sql_info: dict[str, Any],
+        errors: list[dict[str, str]],
+        required_changes: list[str],
+    ) -> None:
+        if plan.get("target_entity") != "customer":
+            return
+        input_props = set((input_schema.get("properties") or {}).keys())
+        params = set(sql_info.get("params") or [])
+        policy = (plan.get("intent_signals") or {}).get("delete_policy") or {}
+        Reviewer._check("phone_number" in input_props, "MISSING_REQUIRED_INPUT_FIELD", "Customer delete by phone must require phone_number.", errors, required_changes)
+        Reviewer._check("idempotency_key" in input_props, "MISSING_REQUIRED_INPUT_FIELD", "Customer delete requires idempotency_key.", errors, required_changes)
+        Reviewer._check(bool((plan.get("approval_policy") or {}).get("human_approval_required")) and bool((plan.get("approval_policy") or {}).get("admin_approval_required")), "BULK_MUTATION_REQUIRES_ADMIN_APPROVAL", "Customer account delete requires human and admin approval.", errors, required_changes)
+        Reviewer._check(bool(policy.get("exists")), "DELETE_POLICY_REQUIRED", "Customer account deletion requires a verified delete policy.", errors, required_changes)
+        Reviewer._check(bool(policy.get("retention_policy_confirmed")), "DELETE_POLICY_REQUIRED", "Customer account deletion requires retention policy confirmation.", errors, required_changes)
+        Reviewer._check(bool(policy.get("linked_records_policy_confirmed")), "LINKED_RECORDS_POLICY_REQUIRED", "Customer account deletion requires linked records policy confirmation.", errors, required_changes)
+        soft_or_deactivation = bool(policy.get("soft_delete_available") or policy.get("deactivation_available"))
+        hard_delete_allowed = bool(policy.get("hard_delete_allowed"))
+        if not soft_or_deactivation:
+            Reviewer._check(hard_delete_allowed, "SOFT_DELETE_TARGET_FIELD_REQUIRED", "Soft-delete/deactivation target is required unless hard delete is explicitly approved.", errors, required_changes)
+        if sql:
+            Reviewer._check("phone_number" in params and bool(re.search(r"\bphone\b\s*=\s*:phone_number\b|:phone_number\b", sql, flags=re.IGNORECASE)), "DELETE_SQL_MUST_USE_LOOKUP_INPUT", "Delete SQL must use phone_number to resolve the customer.", errors, required_changes)
+            if sql_info.get("statement") == "DELETE":
+                Reviewer._check(hard_delete_allowed, "HARD_DELETE_POLICY_REQUIRED", "Hard DELETE SQL requires explicit hard_delete_allowed policy.", errors, required_changes)
+                Reviewer._check(bool(re.search(r"\bWITH\s+matched_customer\b", sql, flags=re.IGNORECASE)), "DELETE_SQL_MUST_USE_LOOKUP_INPUT", "Hard delete must resolve customer_id from phone_number in a matched_customer CTE.", errors, required_changes)
+            if sql_info.get("statement") == "UPDATE":
+                Reviewer._check(soft_or_deactivation, "SOFT_DELETE_TARGET_FIELD_REQUIRED", "Soft delete UPDATE requires verified soft-delete/deactivation policy.", errors, required_changes)
+
+    @staticmethod
+    def _validate_sensitive_read_contract(
+        sql: str,
+        tool: dict[str, Any],
+        plan: dict[str, Any],
+        input_schema: dict[str, Any],
+        sql_info: dict[str, Any],
+        errors: list[dict[str, str]],
+        required_changes: list[str],
+    ) -> None:
+        signals = plan.get("intent_signals") or {}
+        if plan.get("operation_type") != "read":
+            return
+        if not (signals.get("sensitive_pii_requested") or signals.get("payment_details_requested") or signals.get("lookup_field") == "order_id"):
+            return
+        exact_resources = set(plan.get("exact_resources_used") or [])
+        unrelated = {resource for resource in exact_resources if any(token in resource.lower() for token in ("support_ticket", "call_log"))}
+        Reviewer._check(not unrelated, "UNRELATED_RESOURCE_USED", "Sensitive order lookup must not use support_tickets or call_logs.", errors, required_changes)
+        if signals.get("lookup_field") == "order_id":
+            Reviewer._check("order_id" in set((input_schema.get("properties") or {}).keys()), "MISSING_REQUIRED_INPUT_FIELD", "Order lookup must require order_id.", errors, required_changes)
+            Reviewer._check("order_id" in set(sql_info.get("params") or []), "LOOKUP_FIELD_SQL_MISMATCH", "SQL must filter by order_id.", errors, required_changes)
+            Reviewer._check(bool(re.search(r"\border_id\b[^)]*=\s*:order_id|:order_id\b", sql, flags=re.IGNORECASE)), "LOOKUP_FIELD_SQL_MISMATCH", "SQL must use order_id in the lookup predicate.", errors, required_changes)
+        Reviewer._check("phone_number" not in (input_schema.get("properties") or {}), "LOOKUP_FIELD_SQL_MISMATCH", "Order-id lookup must not require phone_number.", errors, required_changes)
+        Reviewer._check("email" not in (input_schema.get("properties") or {}), "LOOKUP_FIELD_SQL_MISMATCH", "Order-id lookup must not require email.", errors, required_changes)
+        data_schema = ((tool.get("output_schema") or {}).get("properties") or {}).get("data") or {}
+        record_schema = (((data_schema.get("properties") or {}).get("records") or {}).get("items") or {})
+        record_props = set((record_schema.get("properties") or {}).keys())
+        raw_pii = {"phone", "email", "address", "city"}
+        Reviewer._check(not (record_props & raw_pii), "RAW_PII_OUTPUT_BLOCKED", "Raw phone/email/address fields must not be exposed by default.", errors, required_changes)
+        selected = set(sql_info.get("selected_columns") or [])
+        Reviewer._check(not (selected & raw_pii), "RAW_PII_OUTPUT_BLOCKED", "SQL must alias sensitive fields to masked outputs.", errors, required_changes)
+        if signals.get("payment_details_requested"):
+            payment_resources = {resource for resource in exact_resources if "payment" in resource.lower() and not resource.lower().endswith(".orders")}
+            Reviewer._check(bool(payment_resources), "PAYMENT_DETAILS_NOT_VERIFIED", "Prompt asks for all payment details, but no verified payment details resource is used.", errors, required_changes)
+            Reviewer._check(bool(signals.get("payment_disclosure_policy_approved")), "PAYMENT_POLICY_REQUIRED", "Payment disclosure policy is required before returning payment details.", errors, required_changes)
+            blocked_payment_fields = {"card_number", "upi_id", "bank_reference", "gateway_payload", "transaction_metadata"}
+            Reviewer._check(not (record_props & blocked_payment_fields), "RAW_PII_OUTPUT_BLOCKED", "Raw payment details must not be exposed without verified policy.", errors, required_changes)
 
     @staticmethod
     def _validate_database_outputs(

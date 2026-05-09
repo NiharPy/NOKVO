@@ -624,3 +624,165 @@ def test_bulk_mark_pending_orders_as_delivered_with_policy_generates_reviewed_up
     assert "order_number =" not in sql
     assert {"affected_count", "idempotency_key", "order_id", "order_number", "updated_order_status"}.issubset(mutation_props)
     assert result["publish_gate"]["can_publish"] is False
+
+
+def test_delete_customer_by_phone_requires_delete_policy_and_blocks_hard_delete():
+    result = ToolkitGeneratorService._sanitize_tool(
+        {},
+        "database",
+        "postgresql",
+        "Build a tool to delete a customer account using their phone number.",
+        db_context({**CUSTOMERS, "schema": "ecommerce_callcenter"}),
+    )
+
+    tool = result["tool"]
+    codes = {error["code"] for error in result["validation"]["errors"]}
+    input_props = tool["input_schema"]["properties"]
+    assert tool["name"] == "delete_customer_by_phone"
+    assert result["tool_plan"]["operation_type"] == "delete"
+    assert result["tool_plan"]["target_entity"] == "customer"
+    assert tool["safety"]["risk_level"] == "high"
+    assert tool["safety"]["approval_policy"]["human_approval_required"] is True
+    assert tool["safety"]["approval_policy"]["admin_approval_required"] is True
+    assert set(input_props) == {"phone_number", "idempotency_key"}
+    assert tool["execution"]["mapping"]["sql_template"] == ""
+    assert result["validation"]["status"] == "failed"
+    assert result["review"]["status"] == "needs_context_confirmation"
+    assert "DELETE_POLICY_REQUIRED" in codes
+    assert "SOFT_DELETE_TARGET_FIELD_REQUIRED" in codes
+    assert "LINKED_RECORDS_POLICY_REQUIRED" in codes
+    assert "UNBOUND_SQL_PARAMETER" not in codes
+
+
+def test_delete_customer_by_phone_with_soft_delete_policy_uses_phone_lookup_update():
+    result = ToolkitGeneratorService._sanitize_tool(
+        {},
+        "database",
+        "postgresql",
+        "Build a tool to delete a customer account using their phone number.",
+        db_context(
+            {
+                **CUSTOMERS,
+                "schema": "ecommerce_callcenter",
+                "columns": [
+                    {"name": "customer_id", "type": "integer", "nullable": False},
+                    {"name": "phone", "type": "text", "nullable": True},
+                    {"name": "deleted_at", "type": "timestamp", "nullable": True},
+                ],
+            },
+            admin_policy_confirmations={
+                "delete_policy": {
+                    "soft_delete_available": True,
+                    "retention_policy_confirmed": True,
+                    "linked_records_policy_confirmed": True,
+                }
+            },
+        ),
+    )
+
+    tool = result["tool"]
+    sql = tool["execution"]["mapping"]["sql_template"]
+    assert result["validation"]["status"] == "passed", result["validation"]
+    assert tool["name"] == "delete_customer_by_phone"
+    assert result["tool_plan"]["operation_type"] == "delete"
+    assert tool["execution"]["mapping"]["allowed_statements"] == ["UPDATE"]
+    assert "WITH matched_customer AS" in sql
+    assert "WHERE phone = :phone_number" in sql
+    assert "UPDATE ecommerce_callcenter.customers c" in sql
+    assert "SET deleted_at = now()" in sql
+    assert "DELETE FROM" not in sql
+    assert "RETURNING c.customer_id AS deleted_id" in sql
+    assert result["publish_gate"]["can_publish"] is False
+
+
+def test_delete_customer_by_phone_hard_delete_requires_explicit_policy_and_uses_phone_lookup():
+    result = ToolkitGeneratorService._sanitize_tool(
+        {},
+        "database",
+        "postgresql",
+        "Build a tool to delete a customer account using their phone number.",
+        db_context(
+            {**CUSTOMERS, "schema": "ecommerce_callcenter"},
+            admin_policy_confirmations={
+                "delete_policy": {
+                    "hard_delete_allowed": True,
+                    "retention_policy_confirmed": True,
+                    "linked_records_policy_confirmed": True,
+                }
+            },
+        ),
+    )
+
+    tool = result["tool"]
+    sql = tool["execution"]["mapping"]["sql_template"]
+    assert result["validation"]["status"] == "passed", result["validation"]
+    assert "WITH matched_customer AS" in sql
+    assert "WHERE phone = :phone_number" in sql
+    assert "DELETE FROM ecommerce_callcenter.customers c" in sql
+    assert "USING matched_customer mc" in sql
+    assert "RETURNING c.customer_id AS deleted_id" in sql
+
+
+def test_sensitive_customer_payment_lookup_by_order_id_masks_pii_and_blocks_payment_details():
+    customer_table = {
+        **CUSTOMERS,
+        "schema": "ecommerce_callcenter",
+        "columns": [
+            {"name": "customer_id", "type": "integer", "nullable": False},
+            {"name": "customer_code", "type": "text", "nullable": True},
+            {"name": "full_name", "type": "text", "nullable": True},
+            {"name": "email", "type": "text", "nullable": True},
+            {"name": "phone", "type": "text", "nullable": True},
+            {"name": "city", "type": "text", "nullable": True},
+        ],
+    }
+    order_table = {
+        **ECOMMERCE_ORDERS,
+        "columns": [
+            *ECOMMERCE_ORDERS["columns"],
+            {"name": "payment_status", "type": "text", "nullable": True},
+            {"name": "total_amount", "type": "numeric", "nullable": True},
+        ],
+    }
+    result = ToolkitGeneratorService._sanitize_tool(
+        {},
+        "database",
+        "postgresql",
+        "Build a tool to fetch the customer’s full phone number, email, address, and all payment details by order ID.",
+        db_context(customer_table, order_table, SUPPORT_TICKETS, CALL_LOGS),
+    )
+
+    tool = result["tool"]
+    sql = tool["execution"]["mapping"]["sql_template"]
+    input_props = tool["input_schema"]["properties"]
+    record_props = tool["output_schema"]["properties"]["data"]["properties"]["records"]["items"]["properties"]
+    codes = {error["code"] for error in result["validation"]["errors"]}
+    assert result["tool_plan"]["operation_type"] == "read"
+    assert result["tool_plan"]["target_entity"] == "order"
+    assert result["tool_plan"]["risk_level"] == "high"
+    assert result["tool_plan"]["intent_signals"]["sensitive_pii_requested"] is True
+    assert result["tool_plan"]["intent_signals"]["payment_details_requested"] is True
+    assert set(input_props) == {"order_id", "limit"}
+    assert "phone_number" not in input_props
+    assert "email" not in input_props
+    assert result["tool_plan"]["exact_resources_used"] == ["ecommerce_callcenter.orders", "ecommerce_callcenter.customers"]
+    assert not any("support_tickets" in resource for resource in result["tool_plan"]["exact_resources_used"])
+    assert not any("call_logs" in resource for resource in result["tool_plan"]["exact_resources_used"])
+    assert "WHERE CAST(o.order_id AS TEXT) = :order_id" in sql
+    assert "RIGHT(CAST(c.phone AS TEXT), 4) AS phone_last4" in sql
+    assert "AS email_masked" in sql
+    assert "AS city_summary" in sql
+    assert "c.phone," not in sql
+    assert {"email_masked", "phone_last4", "city_summary", "order_id", "order_number", "order_status", "payment_status"}.issubset(record_props)
+    assert "phone" not in record_props
+    assert "email" not in record_props
+    assert "address" not in record_props
+    assert "total_amount" not in record_props
+    assert result["validation"]["status"] == "failed"
+    assert result["review"]["status"] == "needs_context_confirmation"
+    assert "SENSITIVE_PII_REQUEST_BLOCKED" in codes
+    assert "PAYMENT_DETAILS_NOT_VERIFIED" in codes
+    assert "PAYMENT_POLICY_REQUIRED" in codes
+    assert "UNUSED_INPUT_FIELD" not in codes
+    assert "UNRELATED_RESOURCE_USED" not in codes
+    assert "LOOKUP_FIELD_SQL_MISMATCH" not in codes
