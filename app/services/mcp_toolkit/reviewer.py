@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from app.services.mcp_toolkit.intent_classifier import IntentClassifier
 from app.services.mcp_toolkit.name_utils import has_valid_operation_prefix, is_table_name_only
 from app.services.mcp_toolkit.sql_validator import SQLValidator
 
@@ -57,10 +58,10 @@ class Reviewer:
             errors,
             required_changes,
         )
-        intent_signals = plan.get("intent_signals") or {}
+        intent_signals = Reviewer._effective_intent_signals(plan)
         if intent_signals.get("read_detected") and (intent_signals.get("update_detected") or intent_signals.get("create_detected") or intent_signals.get("delete_detected")):
             Reviewer._check(
-                operation_type in {"workflow", "update", "create", "delete"},
+                operation_type in {"workflow", "update", "create", "delete", "bulk_update", "workflow_bulk_update"},
                 "MUTATION_INTENT_DOWNGRADED_TO_READ",
                 "Prompt contains both read and mutation intent; generated tool must not be read-only.",
                 errors,
@@ -68,14 +69,22 @@ class Reviewer:
             )
         if operation_type == "workflow":
             Reviewer._check(bool(plan.get("workflow_type")), "MULTI_STEP_WORKFLOW_DETECTED", "Workflow prompts must declare an explicit workflow_type.", errors, required_changes)
+        Reviewer._validate_prompt_intent_contract(tool, plan, execution, mapping, input_schema, intent_signals, errors, required_changes)
         if any("username column" in str(item).lower() for item in tool.get("missing_context") or []):
             Reviewer._check(False, "MISSING_TARGET_FIELD_CONFIRMATION", "Username target field is missing or ambiguous and requires admin confirmation.", errors, required_changes)
+        if any("latest order means" in str(item).lower() for item in tool.get("missing_context") or []):
+            Reviewer._check(False, "LATEST_ORDER_POLICY_REQUIRED", "Confirm whether latest order means the order with the greatest created_at for the customer.", errors, required_changes)
+        if any("bulk mutation policy" in str(item).lower() for item in tool.get("missing_context") or []):
+            Reviewer._check(False, "BULK_MUTATION_POLICY_REQUIRED", "Approved bulk mutation policy is required before generating executable UPDATE SQL.", errors, required_changes)
+        if any("source and target order status" in str(item).lower() for item in tool.get("missing_context") or []):
+            Reviewer._check(False, "PROMPT_VALUE_EXTRACTION_FAILED", "Bulk order status prompt must extract source and target status values.", errors, required_changes)
 
         if execution_type == "database_sql":
             sql = str(mapping.get("sql_template") or "")
+            validation_mapping = {**mapping, "input_schema": input_schema}
             allowed_tables = set(mapping.get("allowed_tables") or [])
             verified_tables = set(verified_context.get("allowed_tables") or [])
-            sql_validation = SQLValidator.validate(sql, str(tool.get("provider") or ""), mapping)
+            sql_validation = SQLValidator.validate(sql, str(tool.get("provider") or ""), validation_mapping)
             checks["sql_parser"] = sql_validation["parser"]["status"]
             checks["sql_explain"] = sql_validation["explain"]["status"]
             sql_info = Reviewer._parse_database_sql(sql)
@@ -147,6 +156,10 @@ class Reviewer:
                     errors,
                     required_changes,
                 )
+                Reviewer._validate_workflow_target_selection(sql, plan, input_schema, errors, required_changes)
+                Reviewer._validate_workflow_precheck(mapping, plan, errors, required_changes)
+            if operation_type in {"bulk_update", "workflow_bulk_update"}:
+                Reviewer._validate_bulk_mutation_contract(sql, tool, plan, mapping, input_schema, sql_info, errors, required_changes)
             if sql_info["table"]:
                 sql_tables = set(sql_info.get("tables") or [sql_info["table"]])
                 Reviewer._check(
@@ -185,6 +198,7 @@ class Reviewer:
                 required_changes,
             )
             Reviewer._validate_database_inputs(input_schema, sql_info, mapping, errors, required_changes)
+            Reviewer._validate_mutation_sql_contract(sql, plan, input_schema, sql_info, errors, required_changes)
             Reviewer._validate_database_outputs(output_schema, plan, sql_info, verified_context, errors, required_changes)
             Reviewer._validate_database_resource_subset(sql, sql_info, generation.get("retrieval") or {}, verified_context, errors, required_changes)
             Reviewer._validate_insert_required_columns(sql_info, verified_context, errors, required_changes)
@@ -231,11 +245,13 @@ class Reviewer:
         Reviewer._check(tool.get("tests", {}).get("test_run_required") is True, "TEST_RUN_NOT_REQUIRED", "test_run_required must be true.", errors, required_changes)
         Reviewer._check(bool(tool.get("safety", {}).get("pii_policy")), "MISSING_PII_POLICY", "PII policy is required.", errors, required_changes)
         Reviewer._validate_pii_output_schema(tool, errors, required_changes)
+        Reviewer._validate_pii_policy_scope(tool, plan, errors, required_changes)
         Reviewer._check(bool(tool.get("safety", {}).get("audit_policy")), "MISSING_AUDIT_POLICY", "Audit policy is required.", errors, required_changes)
         if not plan.get("exact_resources_used"):
             errors.append({"code": "MISSING_VERIFIED_CONTEXT", "message": "No verified resource is available for this tool."})
             required_changes.append("Rescan or select integration resources before generating this tool.")
 
+        Reviewer._enforce_validation_check_consistency(errors, checks)
         errors = Reviewer._dedupe_errors(errors)
         warnings = Reviewer._dedupe_errors(warnings)
         status = "failed" if errors else "passed"
@@ -370,7 +386,7 @@ class Reviewer:
         if not errors:
             return "draft"
         codes = {error.get("code") for error in errors}
-        if codes & {"RETRIEVAL_LOW_CONFIDENCE", "MISSING_TARGET_FIELD_CONFIRMATION", "MULTI_STEP_WORKFLOW_DETECTED"}:
+        if codes & {"RETRIEVAL_LOW_CONFIDENCE", "MISSING_TARGET_FIELD_CONFIRMATION", "MULTI_STEP_WORKFLOW_DETECTED", "LATEST_ORDER_POLICY_REQUIRED", "BULK_MUTATION_POLICY_REQUIRED"}:
             return "needs_context_confirmation"
         retrieval = generation.get("retrieval") or {}
         if retrieval.get("fallback_used") or retrieval.get("status") == "low_confidence":
@@ -421,10 +437,10 @@ class Reviewer:
             if returning_match:
                 returning_columns = Reviewer._extract_column_names(returning_match.group(1), table)
         elif statement == "UPDATE":
-            table_match = re.search(r"\bUPDATE\s+([a-zA-Z_][\w]*\.[a-zA-Z_][\w]*)(?:\s+[a-zA-Z_][\w]*)?\s+SET\s+(.+?)(?:\s+WHERE\s+|$)", first, flags=re.IGNORECASE | re.DOTALL)
+            table_match = re.search(r"\bUPDATE\s+([a-zA-Z_][\w]*\.[a-zA-Z_][\w]*)(?:\s+(?:AS\s+)?[a-zA-Z_][\w]*)?\s+SET\s+(.+?)(?:\s+WHERE\s+|$)", first, flags=re.IGNORECASE | re.DOTALL)
             if table_match:
                 table = table_match.group(1)
-                tables = [table]
+                tables = list(dict.fromkeys([table, *re.findall(r"\b(?:FROM|JOIN)\s+([a-zA-Z_][\w]*\.[a-zA-Z_][\w]*)\b", first, flags=re.IGNORECASE)]))
                 updated_columns = [Reviewer._clean_column_name(item.split("=", 1)[0]) for item in table_match.group(2).split(",") if Reviewer._clean_column_name(item.split("=", 1)[0])]
             returning_match = re.search(r"\bRETURNING\s+(.+)$", first, flags=re.IGNORECASE | re.DOTALL)
             if returning_match:
@@ -560,6 +576,8 @@ class Reviewer:
             "update": {"update", "modify", "patch", "change", "set", "assign"},
             "delete": {"delete", "remove", "deactivate", "cancel"},
             "workflow": {"update", "modify", "patch", "change", "set", "assign", "workflow"},
+            "bulk_update": {"bulk", "update", "mark"},
+            "workflow_bulk_update": {"bulk", "update", "mark", "workflow"},
         }
         return bool(tokens & verbs.get(operation_type, set()))
 
@@ -577,6 +595,9 @@ class Reviewer:
         idempotency_source = ((mapping.get("idempotency") or {}).get("source") or "")
         if idempotency_source.startswith("input."):
             allowed_non_sql.add(idempotency_source.split(".", 1)[1])
+        for name, schema in (input_schema.get("properties") or {}).items():
+            if isinstance(schema, dict) and schema.get("runtime_control"):
+                allowed_non_sql.add(str(name))
         binding_sources = {
             source.split(".", 1)[1]
             for source in ((mapping.get("parameter_binding") or {}).get("sources") or [])
@@ -588,6 +609,215 @@ class Reviewer:
         Reviewer._check(not unused, "UNUSED_INPUT_FIELD", f"Input fields are not used by SQL/API mapping: {', '.join(unused)}.", errors, required_changes)
         Reviewer._check(not missing, "MISSING_INPUT_SCHEMA_FIELD", f"SQL parameters are missing from input_schema: {', '.join(missing)}.", errors, required_changes)
         Reviewer._check(not unbound, "UNBOUND_SQL_PARAMETER", f"SQL parameters are not bound in parameter_binding.sources: {', '.join(unbound)}.", errors, required_changes)
+
+    @staticmethod
+    def _effective_intent_signals(plan: dict[str, Any]) -> dict[str, Any]:
+        signals = dict(plan.get("intent_signals") or {})
+        prompt = str(signals.get("normalized_prompt") or "")
+        if prompt:
+            classification = IntentClassifier.classify(prompt)
+            classified = IntentClassifier.to_dict(classification)
+            if classified.get("update_detected") or classified.get("create_detected") or classified.get("delete_detected"):
+                signals.update(classified)
+        return signals
+
+    @staticmethod
+    def _validate_prompt_intent_contract(
+        tool: dict[str, Any],
+        plan: dict[str, Any],
+        execution: dict[str, Any],
+        mapping: dict[str, Any],
+        input_schema: dict[str, Any],
+        intent_signals: dict[str, Any],
+        errors: list[dict[str, str]],
+        required_changes: list[str],
+    ) -> None:
+        has_mutation_prompt = bool(intent_signals.get("update_detected") or intent_signals.get("create_detected") or intent_signals.get("delete_detected"))
+        has_read_prompt = bool(intent_signals.get("read_detected"))
+        if not (has_read_prompt and has_mutation_prompt):
+            return
+        operation_type = str(plan.get("operation_type") or "")
+        input_props = set((input_schema.get("properties") or {}).keys())
+        blocked_statements = set(Reviewer._statement_list(mapping.get("blocked_statements")))
+        is_read_only = execution.get("mode") == "read_only" or operation_type == "read"
+        if is_read_only:
+            Reviewer._check(False, "PROMPT_TOOL_INTENT_MISMATCH", "Prompt asks for read plus mutation workflow, but generated tool is read-only.", errors, required_changes)
+            Reviewer._check(False, "MUTATION_INTENT_DOWNGRADED_TO_READ", "Mutation prompt generated read-only SQL/tool metadata.", errors, required_changes)
+        if "UPDATE" in blocked_statements and intent_signals.get("update_detected") and operation_type not in {"bulk_update", "workflow_bulk_update"}:
+            Reviewer._check(False, "MUTATION_INTENT_DOWNGRADED_TO_READ", "Mutation prompt generated a tool whose blocked_statements includes UPDATE.", errors, required_changes)
+        if intent_signals.get("bulk_mutation_detected"):
+            Reviewer._check(operation_type in {"bulk_update", "workflow_bulk_update"}, "PROMPT_TOOL_INTENT_MISMATCH", "Bulk mutation prompt must generate a bulk_update/workflow_bulk_update tool.", errors, required_changes)
+        if intent_signals.get("target_field") == "order_status":
+            latest_order_requested = bool(intent_signals.get("latest_order_requested"))
+            if intent_signals.get("bulk_mutation_detected"):
+                for required_field in ("idempotency_key", "approval_reason", "dry_run", "max_rows"):
+                    Reviewer._check(required_field in input_props, "MISSING_REQUIRED_INPUT_FIELD", f"Required bulk mutation input is missing: {required_field}.", errors, required_changes)
+                Reviewer._check(bool(intent_signals.get("source_status")) and bool(intent_signals.get("target_status")), "PROMPT_VALUE_EXTRACTION_FAILED", "Bulk order status prompt must extract pending and delivered status values.", errors, required_changes)
+                return
+            required_lookup_fields = ("phone_number",) if latest_order_requested else ("customer_name", "phone_number")
+            for required_field in required_lookup_fields:
+                Reviewer._check(required_field in input_props, "MISSING_REQUIRED_INPUT_FIELD", f"Required workflow input is missing: {required_field}.", errors, required_changes)
+            if latest_order_requested:
+                Reviewer._check("customer_name" not in input_props, "PROMPT_TOOL_INTENT_MISMATCH", "Prompt says using only phone number; customer_name must not be required.", errors, required_changes)
+            Reviewer._check("new_order_status" in input_props, "MISSING_MUTATION_TARGET_VALUE", "Order status workflow must require new_order_status.", errors, required_changes)
+            Reviewer._check("idempotency_key" in input_props, "MISSING_REQUIRED_INPUT_FIELD", "Required workflow input is missing: idempotency_key.", errors, required_changes)
+            Reviewer._check(
+                bool((plan.get("approval_policy") or {}).get("human_approval_required")) and execution.get("mode") == "write_requires_human_approval",
+                "WORKFLOW_REQUIRES_HUMAN_APPROVAL",
+                "Read-then-update order status workflows require human approval and write_requires_human_approval mode.",
+                errors,
+                required_changes,
+            )
+            if not latest_order_requested and "order_id" not in input_props and "order_number" not in input_props:
+                Reviewer._check(False, "ORDER_TARGET_AMBIGUOUS", "Order status workflow must accept order_id or order_number to disambiguate multiple matches.", errors, required_changes)
+
+    @staticmethod
+    def _validate_workflow_target_selection(
+        sql: str,
+        plan: dict[str, Any],
+        input_schema: dict[str, Any],
+        errors: list[dict[str, str]],
+        required_changes: list[str],
+    ) -> None:
+        if plan.get("target_entity") != "order" or plan.get("target_field") != "order_status":
+            return
+        intent_signals = plan.get("intent_signals") or {}
+        if intent_signals.get("latest_order_requested"):
+            Reviewer._check(bool(intent_signals.get("latest_order_policy_approved")), "LATEST_ORDER_POLICY_REQUIRED", "Latest-order update requires an approved created_at ordering policy.", errors, required_changes)
+            Reviewer._check(
+                bool(re.search(r"\bORDER\s+BY\s+\w+\.created_at\s+DESC\s*,\s*\w+\.order_id\s+DESC\b", sql, flags=re.IGNORECASE)),
+                "LATEST_ORDER_POLICY_REQUIRED",
+                "Latest-order SQL must order by created_at DESC, order_id DESC.",
+                errors,
+                required_changes,
+            )
+            return
+        input_props = set((input_schema.get("properties") or {}).keys())
+        has_disambiguator = "order_id" in input_props or "order_number" in input_props
+        has_candidate_count = bool(re.search(r"\bcandidate_count\b", sql, flags=re.IGNORECASE))
+        has_match_count_guard = bool(re.search(r"\bmatch_count\s*=\s*1\b", sql, flags=re.IGNORECASE))
+        has_limit_one = bool(re.search(r"\bLIMIT\s+1\b", sql, flags=re.IGNORECASE))
+        Reviewer._check(has_disambiguator, "ORDER_TARGET_AMBIGUOUS", "Order update workflows must accept order_id or order_number to disambiguate multiple matches.", errors, required_changes)
+        Reviewer._check(
+            has_candidate_count and has_match_count_guard and not has_limit_one,
+            "UNSAFE_MUTATION_TARGET_SELECTION",
+            "Order update workflow must count candidate orders and avoid LIMIT 1 target selection.",
+            errors,
+            required_changes,
+        )
+
+    @staticmethod
+    def _validate_workflow_precheck(
+        mapping: dict[str, Any],
+        plan: dict[str, Any],
+        errors: list[dict[str, str]],
+        required_changes: list[str],
+    ) -> None:
+        if plan.get("target_entity") != "order" or plan.get("target_field") != "order_status":
+            return
+        if (plan.get("intent_signals") or {}).get("latest_order_requested"):
+            return
+        precheck = mapping.get("precheck") if isinstance(mapping.get("precheck"), dict) else {}
+        result_mapping = precheck.get("result_mapping") if isinstance(precheck.get("result_mapping"), dict) else {}
+        precheck_sql = str(precheck.get("sql_template") or "")
+        Reviewer._check(bool(precheck.get("required")), "MUTATION_TARGET_AMBIGUOUS", "Order update workflow requires an explicit precheck before mutation.", errors, required_changes)
+        Reviewer._check(bool(precheck.get("must_pass_before_mutation")), "MUTATION_TARGET_AMBIGUOUS", "Order update workflow precheck must block mutation unless it passes.", errors, required_changes)
+        Reviewer._check("NO_MATCH" in result_mapping, "MUTATION_TARGET_AMBIGUOUS", "Order update precheck must map no-match candidates to NO_MATCH.", errors, required_changes)
+        Reviewer._check("ORDER_TARGET_AMBIGUOUS" in result_mapping, "ORDER_TARGET_AMBIGUOUS", "Order update precheck must map multiple matches to ORDER_TARGET_AMBIGUOUS.", errors, required_changes)
+        Reviewer._check("READY" in result_mapping, "MUTATION_TARGET_AMBIGUOUS", "Order update precheck must map safe target selection to READY.", errors, required_changes)
+        Reviewer._check(bool(re.search(r"\bmatch_count\s*=\s*0\b", precheck_sql, flags=re.IGNORECASE)), "MUTATION_TARGET_AMBIGUOUS", "Order update precheck must explicitly distinguish zero matches.", errors, required_changes)
+        Reviewer._check(bool(re.search(r"\bmatch_count\s*>\s*1\b", precheck_sql, flags=re.IGNORECASE)), "ORDER_TARGET_AMBIGUOUS", "Order update precheck must explicitly distinguish multiple matches.", errors, required_changes)
+
+    @staticmethod
+    def _validate_mutation_sql_contract(
+        sql: str,
+        plan: dict[str, Any],
+        input_schema: dict[str, Any],
+        sql_info: dict[str, Any],
+        errors: list[dict[str, str]],
+        required_changes: list[str],
+    ) -> None:
+        if plan.get("operation_type") not in {"update", "workflow"}:
+            return
+        input_props = set((input_schema.get("properties") or {}).keys())
+        params = set(sql_info.get("params") or [])
+        if plan.get("target_entity") == "order" and plan.get("target_field") == "order_status":
+            resolved = str(plan.get("resolved_target_column") or "").split(".")[-1] or "order_status"
+            updated_columns = set(sql_info.get("updated_columns") or [])
+            Reviewer._check(
+                resolved in updated_columns or "order_status" in updated_columns or "status" in updated_columns,
+                "TARGET_FIELD_SQL_MISMATCH",
+                "Order status workflow must update order_status/status, not another order field.",
+                errors,
+                required_changes,
+            )
+            if "new_order_status" in input_props:
+                Reviewer._check(
+                    "new_order_status" in params and bool(re.search(r"\bSET\s+[a-zA-Z_][\w]*\s*=\s*:new_order_status\b", sql, flags=re.IGNORECASE)),
+                    "UNBOUND_OR_UNUSED_MUTATION_VALUE",
+                    "new_order_status must be bound and used in the UPDATE SET clause.",
+                    errors,
+                    required_changes,
+                )
+            if "phone_number" in input_props:
+                Reviewer._check(
+                    "phone_number" in params and bool(re.search(r"\bphone\b[^)]*=\s*:phone_number|:phone_number\b", sql, flags=re.IGNORECASE)),
+                    "MUTATION_TARGET_LOOKUP_MISSING",
+                    "phone_number must be bound and used to resolve the mutation target.",
+                    errors,
+                    required_changes,
+                )
+
+    @staticmethod
+    def _validate_bulk_mutation_contract(
+        sql: str,
+        tool: dict[str, Any],
+        plan: dict[str, Any],
+        mapping: dict[str, Any],
+        input_schema: dict[str, Any],
+        sql_info: dict[str, Any],
+        errors: list[dict[str, str]],
+        required_changes: list[str],
+    ) -> None:
+        input_props = set((input_schema.get("properties") or {}).keys())
+        intent_signals = plan.get("intent_signals") or {}
+        bulk = mapping.get("bulk_mutation") if isinstance(mapping.get("bulk_mutation"), dict) else {}
+        approval_policy = (tool.get("safety") or {}).get("approval_policy") or plan.get("approval_policy") or {}
+        Reviewer._check(bool(bulk.get("detected") or intent_signals.get("bulk_mutation_detected")), "PROMPT_TOOL_INTENT_MISMATCH", "Bulk mutation prompt must be marked as bulk_mutation_detected.", errors, required_changes)
+        Reviewer._check(plan.get("target_entity") == "order", "PROMPT_TOOL_INTENT_MISMATCH", "Bulk pending/delivered mutation must target orders.", errors, required_changes)
+        Reviewer._check(plan.get("target_field") == "order_status", "TARGET_FIELD_NOT_RESOLVED", "Bulk pending/delivered mutation must resolve target_field to order_status.", errors, required_changes)
+        Reviewer._check(bool(plan.get("resolved_target_column")), "TARGET_FIELD_NOT_RESOLVED", "Bulk mutation target column must be resolved.", errors, required_changes)
+        Reviewer._check(bool(intent_signals.get("source_status")) and bool(intent_signals.get("target_status")), "PROMPT_VALUE_EXTRACTION_FAILED", "Bulk mutation must extract pending and delivered status values.", errors, required_changes)
+        for required_field in ("idempotency_key", "approval_reason", "dry_run", "max_rows"):
+            Reviewer._check(required_field in input_props, "MISSING_REQUIRED_INPUT_FIELD", f"Required bulk mutation input is missing: {required_field}.", errors, required_changes)
+        Reviewer._check("max_rows" in input_props, "BULK_MUTATION_LIMIT_REQUIRED", "Bulk mutation requires max_rows batch limit.", errors, required_changes)
+        Reviewer._check("dry_run" in input_props, "BULK_MUTATION_PREVIEW_REQUIRED", "Bulk mutation requires dry_run preview.", errors, required_changes)
+        Reviewer._check(bool(approval_policy.get("human_approval_required")) and bool(approval_policy.get("admin_approval_required")), "BULK_MUTATION_REQUIRES_ADMIN_APPROVAL", "Bulk mutation requires human and admin approval.", errors, required_changes)
+        Reviewer._check(bool(mapping.get("dry_run_required")) and bool(mapping.get("preview_required")), "BULK_MUTATION_PREVIEW_REQUIRED", "Bulk mutation mapping must require preview/dry-run.", errors, required_changes)
+        Reviewer._check(bool(mapping.get("batch_limit_required")), "BULK_MUTATION_LIMIT_REQUIRED", "Bulk mutation mapping must require batch limit.", errors, required_changes)
+        Reviewer._check(bool(mapping.get("rollback_or_deactivation")), "BULK_MUTATION_REQUIRES_ADMIN_APPROVAL", "Bulk mutation requires rollback or compensation plan.", errors, required_changes)
+        if not bulk.get("policy_approved"):
+            Reviewer._check(False, "BULK_MUTATION_POLICY_REQUIRED", "Approved bulk mutation policy is required before executable UPDATE SQL.", errors, required_changes)
+            Reviewer._check(sql_info.get("statement") == "SELECT", "BULK_MUTATION_PREVIEW_REQUIRED", "Without bulk policy, SQL must be preview-only SELECT.", errors, required_changes)
+            Reviewer._check("affected_count_preview" in set(sql_info.get("selected_columns") or []), "BULK_MUTATION_PREVIEW_REQUIRED", "Bulk preview SQL must return affected_count_preview.", errors, required_changes)
+            Reviewer._check(not re.search(r"\bUPDATE\b", sql, flags=re.IGNORECASE), "BULK_MUTATION_POLICY_REQUIRED", "Executable UPDATE SQL is blocked until bulk policy approval.", errors, required_changes)
+            return
+        Reviewer._check(sql_info.get("statement") == "UPDATE", "BULK_MUTATION_POLICY_REQUIRED", "Approved bulk mutation policy must generate the reviewed UPDATE SQL.", errors, required_changes)
+        Reviewer._check("updated_order_status" in set(sql_info.get("returning_columns") or []), "OUTPUT_SQL_RETURNING_MISMATCH", "Bulk update SQL must return updated_order_status.", errors, required_changes)
+        Reviewer._check(
+            bool(re.search(r"\bSET\s+(?:order_status|status)\s*=\s*'delivered'", sql, flags=re.IGNORECASE)),
+            "TARGET_FIELD_SQL_MISMATCH",
+            "Bulk mutation must update order_status/status to delivered.",
+            errors,
+            required_changes,
+        )
+        Reviewer._check(
+            bool(re.search(r"\bWHERE\s+(?:order_status|status)\s*=\s*'pending'", sql, flags=re.IGNORECASE)),
+            "MUTATION_TARGET_LOOKUP_MISSING",
+            "Bulk mutation must target only pending orders.",
+            errors,
+            required_changes,
+        )
 
     @staticmethod
     def _validate_database_outputs(
@@ -602,6 +832,12 @@ class Reviewer:
         plan_output_names = {str(field.get("name")) for field in plan.get("output_fields") or [] if field.get("name")}
         data_schema = (output_schema.get("properties") or {}).get("data") or {}
         data_props = set((data_schema.get("properties") or {}).keys())
+        if plan.get("operation_type") in {"bulk_update", "workflow_bulk_update"} and statement == "SELECT":
+            selected = set(sql_info.get("selected_columns") or [])
+            Reviewer._check("affected_count_preview" in data_props, "READ_OUTPUT_SQL_MISMATCH", "Bulk preview output_schema.data must include affected_count_preview.", errors, required_changes)
+            Reviewer._check("affected_count_preview" in selected, "READ_OUTPUT_SQL_MISMATCH", "Bulk preview SQL must select affected_count_preview.", errors, required_changes)
+            Reviewer._check(plan_output_names.issubset(selected | {"affected_count", "idempotency_key", "affected_count_preview"}), "PLAN_OUTPUT_SQL_MISMATCH", "Bulk preview plan outputs must match preview SQL or mutation metadata.", errors, required_changes)
+            return
         if statement == "SELECT":
             record_schema = (((data_schema.get("properties") or {}).get("records") or {}).get("items") or {})
             record_props = set((record_schema.get("properties") or {}).keys())
@@ -616,7 +852,12 @@ class Reviewer:
             Reviewer._check("affected_count" in data_props, "MUTATION_OUTPUT_MISSING_AFFECTED_COUNT", "Mutation output_schema.data must include affected_count.", errors, required_changes)
             Reviewer._check("records" not in data_props, "MUTATION_OUTPUT_HAS_RECORDS", "Mutation output_schema.data must not return unrelated records.", errors, required_changes)
             Reviewer._check(data_props.issubset(allowed), "MUTATION_OUTPUT_SCHEMA_MISMATCH", "Mutation output_schema.data fields must match mutation execution.", errors, required_changes)
-            Reviewer._check(plan_output_names.issubset(returned | {"affected_count", "idempotency_key", "provider_reference", "created_id", "updated_id", "deleted_id"}), "MUTATION_PLAN_OUTPUT_MISMATCH", "Mutation tool_plan.output_fields must match SQL RETURNING fields or mutation metadata.", errors, required_changes)
+            mutation_metadata = {"affected_count", "idempotency_key", "provider_reference", "created_id", "updated_id", "deleted_id"}
+            if plan.get("operation_type") in {"bulk_update", "workflow_bulk_update"}:
+                mutation_metadata.add("affected_count_preview")
+            missing_returning = sorted(plan_output_names - returned - mutation_metadata)
+            Reviewer._check(not missing_returning, "MUTATION_PLAN_OUTPUT_MISMATCH", "Mutation tool_plan.output_fields must match SQL RETURNING fields or mutation metadata.", errors, required_changes)
+            Reviewer._check(not missing_returning, "OUTPUT_SQL_RETURNING_MISMATCH", f"SQL RETURNING is missing fields declared by the tool plan: {', '.join(missing_returning)}.", errors, required_changes)
 
     @staticmethod
     def _validate_database_resource_subset(
@@ -669,6 +910,51 @@ class Reviewer:
             errors,
             required_changes,
         )
+
+    @staticmethod
+    def _validate_pii_policy_scope(tool: dict[str, Any], plan: dict[str, Any], errors: list[dict[str, str]], required_changes: list[str]) -> None:
+        field_policy = ((tool.get("safety") or {}).get("pii_policy") or {}).get("field_policy") or {}
+        exact_resources = set(plan.get("exact_resources_used") or [])
+        if not isinstance(field_policy, dict) or not exact_resources:
+            return
+        unused = []
+        for field_name in field_policy:
+            parts = str(field_name).split(".")
+            if len(parts) < 3:
+                continue
+            resource = ".".join(parts[:2])
+            if resource not in exact_resources:
+                unused.append(str(field_name))
+        Reviewer._check(
+            not unused,
+            "TOOL_PII_POLICY_UNUSED_RESOURCE",
+            f"PII policy contains fields outside trusted_resources_used: {', '.join(sorted(unused))}.",
+            errors,
+            required_changes,
+        )
+
+    @staticmethod
+    def _enforce_validation_check_consistency(errors: list[dict[str, str]], checks: dict[str, str]) -> None:
+        codes = {item.get("code") for item in errors}
+        contradiction = False
+        if "SQL_SYNTAX_INVALID" in codes:
+            if checks.get("sql_parser") == "passed":
+                contradiction = True
+            checks["sql_parser"] = "failed"
+            if checks.get("sql_explain") == "passed":
+                contradiction = True
+            checks["sql_explain"] = "failed"
+        if "SQL_EXPLAIN_FAILED" in codes:
+            if checks.get("sql_explain") == "passed":
+                contradiction = True
+            checks["sql_explain"] = "failed"
+        if contradiction:
+            errors.append(
+                {
+                    "code": "VALIDATION_CHECK_STATUS_CONTRADICTION",
+                    "message": "Validation checks contradicted validation errors and were normalized to failed.",
+                }
+            )
 
     @staticmethod
     def _validate_insert_required_columns(

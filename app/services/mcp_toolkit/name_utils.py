@@ -7,6 +7,7 @@ import uuid
 READ_PREFIXES = ("lookup", "get", "check", "list", "search", "retrieve")
 CREATE_PREFIXES = ("create", "add", "open", "raise", "log")
 UPDATE_PREFIXES = ("update", "change", "modify", "mark")
+BULK_UPDATE_PREFIXES = ("bulk", "bulk_update", "mark", "update")
 DELETE_PREFIXES = ("delete", "remove", "cancel")
 
 
@@ -34,6 +35,8 @@ def operation_prefixes(operation_type: str) -> tuple[str, ...]:
         return DELETE_PREFIXES
     if operation_type == "workflow":
         return UPDATE_PREFIXES + CREATE_PREFIXES + DELETE_PREFIXES
+    if operation_type in {"bulk_update", "workflow_bulk_update"}:
+        return BULK_UPDATE_PREFIXES
     return ()
 
 

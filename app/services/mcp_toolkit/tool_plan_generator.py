@@ -14,14 +14,20 @@ class ToolPlanGenerator:
     def generate(intent: ToolIntent, verified_resources: list[dict[str, Any]]) -> ToolPlan:
         action_text = SafetyClassifier.action_text(intent.purpose)
         trusted_resources = [item for item in verified_resources if item.get("name") in set(intent.target_resources)] or verified_resources
+        if intent.target_field == "order_status" and intent.operation_type in {"workflow", "update"}:
+            trusted_resources = sorted(
+                trusted_resources,
+                key=lambda item: (0 if "order" in str(item.get("name") or "").lower() else 1, str(item.get("name") or "")),
+            )
         resource_names = [str(item.get("name") or "") for item in trusted_resources if item.get("name")]
         name = ToolPlanGenerator._name_for_intent(intent, resource_names, action_text)
-        if intent.operation_type not in {"read", "workflow"} and not name.startswith(("create_", "update_", "delete_", "cancel_", "refund_")):
+        if intent.operation_type not in {"read", "workflow"} and not name.startswith(("create_", "update_", "delete_", "cancel_", "refund_", "bulk_", "mark_")):
             name = f"{intent.operation_type}_{name}"
         title = humanize_tool_name(name)
         approval_policy = {
             "required": True,
             "human_approval_required": intent.human_approval_needed,
+            "admin_approval_required": intent.operation_type in {"bulk_update", "workflow_bulk_update"} or intent.risk_level in {"high", "critical"},
             "minimum_reviewer_role": "admin" if intent.risk_level in {"high", "critical"} else "manager",
             "reason": f"{intent.risk_level} risk {intent.operation_type} operation" if intent.human_approval_needed else "admin review required before publish",
         }
@@ -54,6 +60,7 @@ class ToolPlanGenerator:
                 "exclude": ["raw_credentials", "tokens", "secrets", "passwords", "connection_strings"],
             },
             workflow_type=intent.workflow_type,
+            target_entity=intent.target_entity,
             target_field=intent.target_field,
             resolved_target_column=intent.resolved_target_column,
             trusted_resources_used=resource_names,
@@ -88,6 +95,46 @@ class ToolPlanGenerator:
                     transformed = dict(field)
                     transformed["raw_name"] = field.get("raw_name") or field.get("name")
                     transformed["name"] = "updated_username" if name in {"username", "user_name"} else PIIPolicyBuilder.output_field_name(name, str(field.get("type") or ""))
+                    fields.append(transformed)
+            return fields
+        if operation_type in {"update", "workflow"} and target_field == "order_status":
+            fields = [
+                {"name": "affected_count", "type": "integer"},
+                {"name": "idempotency_key", "type": "string"},
+            ]
+            for field in output_fields:
+                name = str(field.get("name") or "")
+                if name in {"order_id", "order_number", "customer_id", "customer_code", "phone", "updated_order_status", "order_status", "status"}:
+                    transformed = dict(field)
+                    transformed["raw_name"] = field.get("raw_name") or field.get("name")
+                    transformed["name"] = "updated_order_status" if name in {"order_status", "status"} else PIIPolicyBuilder.output_field_name(name, str(field.get("type") or ""))
+                    fields.append(transformed)
+            return fields
+        if operation_type in {"update", "workflow"} and target_field == "full_name":
+            fields = [
+                {"name": "affected_count", "type": "integer"},
+                {"name": "idempotency_key", "type": "string"},
+            ]
+            for field in output_fields:
+                name = str(field.get("name") or "")
+                if name in {"customer_id", "customer_code", "phone", "updated_full_name", "full_name", "name", "customer_name"}:
+                    transformed = dict(field)
+                    transformed["raw_name"] = field.get("raw_name") or field.get("name")
+                    transformed["name"] = "updated_full_name" if name in {"full_name", "name", "customer_name"} else PIIPolicyBuilder.output_field_name(name, str(field.get("type") or ""))
+                    fields.append(transformed)
+            return fields
+        if operation_type in {"bulk_update", "workflow_bulk_update"} and target_field == "order_status":
+            fields = [
+                {"name": "affected_count", "type": "integer"},
+                {"name": "idempotency_key", "type": "string"},
+                {"name": "affected_count_preview", "type": "integer"},
+            ]
+            for field in output_fields:
+                name = str(field.get("name") or "")
+                if name in {"order_id", "order_number", "updated_order_status", "order_status", "status"}:
+                    transformed = dict(field)
+                    transformed["raw_name"] = field.get("raw_name") or field.get("name")
+                    transformed["name"] = "updated_order_status" if name in {"order_status", "status"} else PIIPolicyBuilder.output_field_name(name, str(field.get("type") or ""))
                     fields.append(transformed)
             return fields
         if operation_type != "read":
@@ -145,6 +192,14 @@ class ToolPlanGenerator:
         text = action_text.lower()
         if intent.operation_type in {"workflow", "update"} and re.search(r"\bcustomer\b", text) and re.search(r"\bphone\b", text) and re.search(r"\buser\s*name\b|\busername\b", text):
             return "update_customer_username_by_phone"
+        if intent.operation_type in {"workflow", "update"} and re.search(r"\bcustomer|user|client\b", text) and re.search(r"\bphone\b", text) and re.search(r"\bfull\s*name\b|\bnew\s+name\b", text):
+            return "update_customer_full_name_by_phone"
+        if intent.operation_type in {"bulk_update", "workflow_bulk_update"} and re.search(r"\bpending\b", text) and re.search(r"\bdelivered\b", text) and re.search(r"\border", text):
+            return "bulk_mark_pending_orders_as_delivered"
+        if intent.operation_type in {"workflow", "update"} and re.search(r"\blatest\s+order\b", text) and re.search(r"\bstatus\b", text) and re.search(r"\bphone\b", text):
+            return "update_latest_order_status_by_phone"
+        if intent.operation_type in {"workflow", "update"} and re.search(r"\border|orders\b", text) and re.search(r"\bstatus\b", text) and re.search(r"\b(name|phone)\b", text):
+            return "update_order_status_by_name_and_phone"
         if intent.operation_type == "read" and re.search(r"\bcustomer\b", text) and re.search(r"\bphone\b", text):
             if re.search(r"\b(call|calls|call\s+history|history)\b", text):
                 return "lookup_customer_call_history_by_phone"

@@ -737,7 +737,7 @@ class ToolkitGeneratorService:
                 str(tool.get("provider") or secret_provider),
                 connection_string,
                 sql_template,
-                mapping,
+                {**mapping, "input_schema": tool.get("input_schema") or {}},
             )
             mapping["explain_validation"] = {
                 **(mapping.get("explain_validation") or {}),
@@ -756,6 +756,7 @@ class ToolkitGeneratorService:
             result.setdefault("validation", {}).setdefault("errors", []).append(
                 {"code": "SQL_EXPLAIN_FAILED", "message": f"PostgreSQL EXPLAIN failed: {exc}"}
             )
+            result.setdefault("validation", {}).setdefault("checks", {})["sql_explain"] = "failed"
             result["validation"]["status"] = "failed"
             result["review"] = {
                 "status": "rejected",

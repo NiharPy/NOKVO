@@ -5,7 +5,7 @@ from typing import Any, Literal
 
 
 IntegrationType = Literal["database", "crm", "erp", "ecommerce", "his", "payments", "custom_api", "zoho_desk", "shipping"]
-OperationType = Literal["read", "create", "update", "delete", "workflow", "ambiguous"]
+OperationType = Literal["read", "create", "update", "delete", "workflow", "bulk_update", "workflow_bulk_update", "ambiguous"]
 RiskLevel = Literal["low", "medium", "high", "critical"]
 ReviewStatus = Literal["draft", "needs_context_confirmation", "rejected", "approved"]
 ValidationStatus = Literal["passed", "failed"]
@@ -84,6 +84,7 @@ class ToolIntent:
     risk_level: RiskLevel
     human_approval_needed: bool
     workflow_type: str | None = None
+    target_entity: str | None = None
     target_field: str | None = None
     resolved_target_column: str | None = None
     intent_signals: dict[str, Any] = field(default_factory=dict)
@@ -109,6 +110,7 @@ class ToolPlan:
     approval_policy: dict[str, Any]
     audit_policy: dict[str, Any]
     workflow_type: str | None = None
+    target_entity: str | None = None
     target_field: str | None = None
     resolved_target_column: str | None = None
     trusted_resources_used: list[str] = field(default_factory=list)

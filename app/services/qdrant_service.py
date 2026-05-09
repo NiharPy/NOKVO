@@ -20,6 +20,7 @@ class QdrantService:
         "provider",
         "status",
         "source_kind",
+        "source_type",
         "resource",
         "resource_type",
     ]

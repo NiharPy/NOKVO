@@ -35,7 +35,7 @@ DANGEROUS_SQL_PATTERN = re.compile(r"\b(" + "|".join(BLOCKED_READ_STATEMENTS) + 
 
 
 class ExecutionGenerator:
-    OPERATION_SQL_STATEMENT = {"read": "SELECT", "create": "INSERT", "update": "UPDATE", "delete": "DELETE"}
+    OPERATION_SQL_STATEMENT = {"read": "SELECT", "create": "INSERT", "update": "UPDATE", "delete": "DELETE", "bulk_update": "SELECT", "workflow_bulk_update": "SELECT"}
 
     @staticmethod
     def generate(plan: ToolPlan, context: dict[str, Any], capability: ProviderCapability | None = None) -> dict[str, Any]:
@@ -71,11 +71,36 @@ class ExecutionGenerator:
             mapping["allowed_statements"] = ["UPDATE"]
             mapping["blocked_statements"] = [stmt for stmt in BLOCKED_READ_STATEMENTS if stmt != "UPDATE"]
             mapping["sql_template"] = ExecutionGenerator.fixed_workflow_sql(plan, schema_context)
+            precheck = ExecutionGenerator.workflow_precheck(plan, schema_context)
+            if precheck:
+                mapping["precheck"] = precheck
             mapping["preconditions"] = plan.preconditions
             mapping["requires_human_approval"] = True
             mapping["strict_where_required"] = True
             mapping["idempotency"] = {"required": True, "source": "input.idempotency_key"}
             mapping["rollback_or_deactivation"] = "admin must define compensating action before publish"
+        elif plan.operation_type in {"bulk_update", "workflow_bulk_update"}:
+            policy_approved = bool((plan.intent_signals or {}).get("bulk_mutation_policy_approved"))
+            mapping["allowed_statements"] = ["UPDATE"] if policy_approved else ["SELECT"]
+            mapping["blocked_statements"] = [stmt for stmt in BLOCKED_READ_STATEMENTS if stmt != ("UPDATE" if policy_approved else "SELECT")]
+            mapping["sql_template"] = ExecutionGenerator.fixed_bulk_update_sql(plan, schema_context, policy_approved)
+            mapping["preconditions"] = plan.preconditions
+            mapping["requires_human_approval"] = True
+            mapping["requires_admin_approval"] = True
+            mapping["dry_run_required"] = True
+            mapping["preview_required"] = True
+            mapping["batch_limit_required"] = True
+            mapping["audit_required"] = True
+            mapping["idempotency"] = {"required": True, "source": "input.idempotency_key"}
+            mapping["bulk_mutation"] = {
+                "detected": True,
+                "policy_required": True,
+                "policy_approved": policy_approved,
+                "preview_sql_required_before_update": True,
+                "source_status": (plan.intent_signals or {}).get("source_status"),
+                "target_status": (plan.intent_signals or {}).get("target_status"),
+            }
+            mapping["rollback_or_deactivation"] = "admin must define rollback or compensation before publish"
         else:
             mapping["sql_template"] = ExecutionGenerator.fixed_mutation_sql(plan, schema_context)
             mapping["preconditions"] = plan.preconditions
@@ -84,6 +109,36 @@ class ExecutionGenerator:
             mapping["idempotency"] = {"required": True, "source": "input.idempotency_key"}
             mapping["rollback_or_deactivation"] = "admin must define compensating action before publish"
         return {"type": "database_sql", "mode": "read_only" if plan.operation_type == "read" else "write_requires_human_approval", "mapping": mapping}
+
+    @staticmethod
+    def fixed_bulk_update_sql(plan: ToolPlan, schema_context: dict[str, Any], policy_approved: bool) -> str:
+        order_table = next((item for item in schema_context.get("tables", []) if item["fqn"] in set(plan.exact_resources_used) and "order" in str(item.get("table") or "").lower()), None)
+        if not order_table:
+            return ""
+        columns = {column["name"] for column in order_table.get("columns", [])}
+        status_column = (plan.resolved_target_column or "").split(".")[-1]
+        if status_column not in columns:
+            status_column = "order_status" if "order_status" in columns else "status" if "status" in columns else ""
+        if not status_column:
+            return ""
+        source_status = (plan.intent_signals or {}).get("source_status") or "pending"
+        target_status = (plan.intent_signals or {}).get("target_status") or "delivered"
+        if not policy_approved:
+            return (
+                "SELECT COUNT(*)::int AS affected_count_preview "
+                f"FROM {order_table['fqn']} "
+                f"WHERE {status_column} = '{source_status}'"
+            )
+        returning = ["order_id"] if "order_id" in columns else []
+        if "order_number" in columns:
+            returning.append("order_number")
+        returning.append(f"{status_column} AS updated_order_status")
+        return (
+            f"UPDATE {order_table['fqn']} "
+            f"SET {status_column} = '{target_status}' "
+            f"WHERE {status_column} = '{source_status}' "
+            f"RETURNING {', '.join(returning)}"
+        )
 
     @staticmethod
     def _api(plan: ToolPlan, context: dict[str, Any]) -> dict[str, Any]:
@@ -210,16 +265,37 @@ class ExecutionGenerator:
 
     @staticmethod
     def fixed_workflow_sql(plan: ToolPlan, schema_context: dict[str, Any]) -> str:
-        target = plan.exact_resources_used[0] if plan.exact_resources_used else None
-        table = next((item for item in schema_context.get("tables", []) if item["fqn"] == target), None)
-        if not table:
+        target_tables = [item for item in schema_context.get("tables", []) if item["fqn"] in set(plan.exact_resources_used)]
+        if not target_tables:
             return ""
+        target = plan.exact_resources_used[0] if plan.exact_resources_used else None
+        table = next((item for item in target_tables if item["fqn"] == target), target_tables[0])
         columns = {column["name"] for column in table.get("columns", [])}
         resolved_target_name = (plan.resolved_target_column or "").split(".")[-1]
         username_column = resolved_target_name if resolved_target_name in columns else next((name for name in ("username", "user_name") if name in columns), None)
+        full_name_column = resolved_target_name if plan.target_field == "full_name" and resolved_target_name in columns else next((name for name in ("full_name", "name", "customer_name") if name in columns), None)
         phone_column = next((name for name in ("phone", "mobile", "phone_number", "msisdn") if name in columns), None)
         id_column = ExecutionGenerator._identifier_column(table)
-        if plan.workflow_type == "read_then_update" and username_column and phone_column and id_column:
+        if plan.workflow_type == "read_then_update" and plan.target_field == "full_name" and full_name_column and phone_column and id_column:
+            returning = [f"c.{id_column}"]
+            if "customer_code" in columns:
+                returning.append("c.customer_code")
+            returning.append(f"RIGHT(CAST(c.{phone_column} AS TEXT), 4) AS phone_last4")
+            returning.append(f"c.{full_name_column} AS updated_full_name")
+            returning_list = ", ".join(returning)
+            return (
+                "WITH matched_customer AS ("
+                f"SELECT c.{id_column} "
+                f"FROM {table['fqn']} c "
+                f"WHERE c.{phone_column} = :phone_number"
+                ") "
+                f"UPDATE {table['fqn']} c "
+                f"SET {full_name_column} = :new_full_name "
+                "FROM matched_customer mc "
+                f"WHERE c.{id_column} = mc.{id_column} "
+                f"RETURNING {returning_list}"
+            )
+        if plan.workflow_type == "read_then_update" and plan.target_field == "username" and username_column and phone_column and id_column:
             returning = [f"c.{id_column}"]
             if "customer_code" in columns:
                 returning.append("c.customer_code")
@@ -240,7 +316,169 @@ class ExecutionGenerator:
                 f"WHERE c.{id_column} = mc.{id_column} "
                 f"RETURNING {returning_list}"
             )
+        if plan.workflow_type == "read_then_update" and plan.target_field == "order_status":
+            order_table = next((item for item in target_tables if "order" in str(item.get("table") or "").lower()), table)
+            customer_table = next((item for item in target_tables if "customer" in str(item.get("table") or "").lower()), None)
+            order_columns = {column["name"] for column in order_table.get("columns", [])}
+            customer_columns = {column["name"] for column in (customer_table or {}).get("columns", [])}
+            order_id_column = "order_id" if "order_id" in order_columns else ExecutionGenerator._identifier_column(order_table)
+            order_number_column = "order_number" if "order_number" in order_columns else None
+            status_column = resolved_target_name if resolved_target_name in order_columns else next((name for name in ("order_status", "status") if name in order_columns), None)
+            customer_id_column = next((name for name in ("customer_id",) if name in order_columns), None)
+            customer_name_column = next((name for name in ("full_name", "name", "customer_name") if name in customer_columns), None)
+            customer_phone_column = next((name for name in ("phone", "mobile", "phone_number", "msisdn") if name in customer_columns), None)
+            latest_order_requested = bool((plan.intent_signals or {}).get("latest_order_requested"))
+            latest_order_policy_approved = bool((plan.intent_signals or {}).get("latest_order_policy_approved"))
+            if latest_order_requested:
+                created_at_column = "created_at" if "created_at" in order_columns else None
+                if (
+                    latest_order_policy_approved
+                    and order_id_column
+                    and order_number_column
+                    and status_column
+                    and created_at_column
+                    and customer_table
+                    and customer_id_column
+                    and customer_phone_column
+                ):
+                    returning = [f"o.{order_id_column}", f"lo.{order_number_column}"]
+                    if "customer_code" in customer_columns:
+                        returning.append("mc.customer_code")
+                    returning.append("RIGHT(CAST(mc.phone AS TEXT), 4) AS phone_last4")
+                    returning.append(f"o.{status_column} AS updated_order_status")
+                    returning_list = ", ".join(returning)
+                    return (
+                        "WITH matched_customer AS ("
+                        f"SELECT c.customer_id, c.customer_code, c.{customer_phone_column} AS phone "
+                        f"FROM {customer_table['fqn']} c "
+                        f"WHERE c.{customer_phone_column} = :phone_number"
+                        "), "
+                        "latest_order AS ("
+                        f"SELECT o.{order_id_column}, o.{order_number_column}, o.{customer_id_column} "
+                        f"FROM {order_table['fqn']} o "
+                        f"JOIN matched_customer mc ON o.{customer_id_column} = mc.customer_id "
+                        f"ORDER BY o.{created_at_column} DESC, o.{order_id_column} DESC "
+                        "LIMIT 1"
+                        ") "
+                        f"UPDATE {order_table['fqn']} AS o "
+                        f"SET {status_column} = :new_order_status "
+                        "FROM latest_order lo "
+                        "JOIN matched_customer mc ON lo.customer_id = mc.customer_id "
+                        f"WHERE o.{order_id_column} = lo.{order_id_column} "
+                        f"RETURNING {returning_list}"
+                    )
+                return ""
+            if order_id_column and status_column and customer_table and customer_id_column and customer_name_column and customer_phone_column:
+                returning = [f"o.{order_id_column}"]
+                if order_number_column:
+                    returning.append(f"co.{order_number_column}")
+                if "customer_code" in customer_columns:
+                    returning.append("mc.customer_code")
+                if customer_phone_column in customer_columns:
+                    returning.append("RIGHT(CAST(mc.phone AS TEXT), 4) AS phone_last4")
+                returning.append(f"o.{status_column} AS updated_order_status")
+                returning_list = ", ".join(returning)
+                order_number_select = f", o.{order_number_column}" if order_number_column else ""
+                order_number_filter = f"AND (:order_number IS NULL OR o.{order_number_column} = :order_number)" if order_number_column else ""
+                return (
+                    "WITH matched_customer AS ("
+                    f"SELECT c.customer_id, c.customer_code, c.{customer_phone_column} AS phone "
+                    f"FROM {customer_table['fqn']} c "
+                    f"WHERE LOWER(c.{customer_name_column}) = LOWER(:customer_name) "
+                    f"AND c.{customer_phone_column} = :phone_number"
+                    "), "
+                    "candidate_orders AS ("
+                    f"SELECT o.{order_id_column}{order_number_select}, o.{customer_id_column} "
+                    f"FROM {order_table['fqn']} o "
+                    f"JOIN matched_customer mc ON o.{customer_id_column} = mc.customer_id "
+                    f"WHERE (:order_id IS NULL OR CAST(o.{order_id_column} AS TEXT) = :order_id) "
+                    f"{order_number_filter}"
+                    "), "
+                    "candidate_count AS ("
+                    "SELECT COUNT(*) AS match_count FROM candidate_orders"
+                    "), "
+                    "selected_order AS ("
+                    "SELECT co.order_id "
+                    "FROM candidate_orders co "
+                    "CROSS JOIN candidate_count cc "
+                    "WHERE cc.match_count = 1 "
+                    "OR :order_id IS NOT NULL "
+                    "OR :order_number IS NOT NULL"
+                    ") "
+                    f"UPDATE {order_table['fqn']} AS o "
+                    f"SET {status_column} = :new_order_status "
+                    "FROM selected_order so "
+                    f"JOIN candidate_orders co ON so.order_id = co.{order_id_column} "
+                    "JOIN matched_customer mc ON co.customer_id = mc.customer_id "
+                    f"WHERE o.{order_id_column} = so.order_id "
+                    f"RETURNING {returning_list}"
+                )
         return ""
+
+    @staticmethod
+    def workflow_precheck(plan: ToolPlan, schema_context: dict[str, Any]) -> dict[str, Any]:
+        if plan.workflow_type != "read_then_update" or plan.target_field != "order_status":
+            return {}
+        if bool((plan.intent_signals or {}).get("latest_order_requested")):
+            return {}
+        target_tables = [item for item in schema_context.get("tables", []) if item["fqn"] in set(plan.exact_resources_used)]
+        order_table = next((item for item in target_tables if "order" in str(item.get("table") or "").lower()), None)
+        customer_table = next((item for item in target_tables if "customer" in str(item.get("table") or "").lower()), None)
+        if not order_table or not customer_table:
+            return {}
+        order_columns = {column["name"] for column in order_table.get("columns", [])}
+        customer_columns = {column["name"] for column in customer_table.get("columns", [])}
+        if not {"order_id", "customer_id"}.issubset(order_columns) or "customer_id" not in customer_columns:
+            return {}
+        order_number_column = "order_number" if "order_number" in order_columns else None
+        customer_name_column = next((name for name in ("full_name", "name", "customer_name") if name in customer_columns), None)
+        customer_phone_column = next((name for name in ("phone", "mobile", "phone_number", "msisdn") if name in customer_columns), None)
+        if not customer_name_column or not customer_phone_column:
+            return {}
+        order_number_select = f", o.{order_number_column}" if order_number_column else ""
+        order_number_filter = f"AND (:order_number IS NULL OR o.{order_number_column} = :order_number)" if order_number_column else ""
+        sql = (
+            "WITH matched_customer AS ("
+            f"SELECT c.customer_id, c.customer_code, c.{customer_phone_column} AS phone "
+            f"FROM {customer_table['fqn']} c "
+            f"WHERE LOWER(c.{customer_name_column}) = LOWER(:customer_name) "
+            f"AND c.{customer_phone_column} = :phone_number"
+            "), "
+            "candidate_orders AS ("
+            f"SELECT o.order_id{order_number_select}, o.customer_id "
+            f"FROM {order_table['fqn']} o "
+            "JOIN matched_customer mc ON o.customer_id = mc.customer_id "
+            "WHERE (:order_id IS NULL OR CAST(o.order_id AS TEXT) = :order_id) "
+            f"{order_number_filter}"
+            "), "
+            "candidate_count AS ("
+            "SELECT COUNT(*)::int AS match_count FROM candidate_orders"
+            ") "
+            "SELECT "
+            "cc.match_count, "
+            "CASE "
+            "WHEN cc.match_count = 0 THEN 'NO_MATCH' "
+            "WHEN cc.match_count > 1 AND :order_id IS NULL AND :order_number IS NULL THEN 'ORDER_TARGET_AMBIGUOUS' "
+            "ELSE 'READY' "
+            "END AS precheck_status "
+            "FROM candidate_count cc"
+        )
+        return {
+            "required": True,
+            "type": "database_sql_precheck",
+            "sql_template": sql,
+            "allowed_statements": ["SELECT"],
+            "parameter_binding": {
+                "style": "named",
+                "sources": ["input.customer_name", "input.phone_number", "input.order_id", "input.order_number"],
+            },
+            "result_mapping": {
+                "NO_MATCH": {"block_update": True, "error_code": "NO_MATCH", "message": "No matching customer/order was found."},
+                "ORDER_TARGET_AMBIGUOUS": {"block_update": True, "error_code": "ORDER_TARGET_AMBIGUOUS", "message": "Multiple matching orders require order_id or order_number."},
+                "READY": {"block_update": False},
+            },
+            "must_pass_before_mutation": True,
+        }
 
     @staticmethod
     def relationships(schema_context: dict[str, Any]) -> list[dict[str, Any]]:

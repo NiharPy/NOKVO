@@ -74,6 +74,11 @@ class PIIPolicyBuilder:
             for field in output_fields or []
             if field.get("source")
         }
+        source_output_aliases = {
+            str(field.get("source")): str(field.get("name"))
+            for field in output_fields or []
+            if field.get("source") and field.get("name") and str(field.get("raw_name") or field.get("name")) != str(field.get("name"))
+        }
         output_names = {
             str(field.get("raw_name") or field.get("name") or "")
             for field in output_fields or []
@@ -99,7 +104,7 @@ class PIIPolicyBuilder:
                 fields[column["fqn"]] = {
                     "classification": classification,
                     "redaction": PIIPolicyBuilder.redaction_for(classification),
-                    "output_name": PIIPolicyBuilder.masked_output_name(column["name"], classification),
+                    "output_name": source_output_aliases.get(column["fqn"]) or PIIPolicyBuilder.masked_output_name(column["name"], classification),
                 }
         for field in output_fields or []:
             name = str(field.get("name") or "")

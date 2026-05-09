@@ -16,6 +16,7 @@ class IntentClassification:
     update_detected: bool = False
     delete_detected: bool = False
     ambiguous: bool = False
+    target_entity: str | None = None
     target_field: str | None = None
 
 
@@ -24,6 +25,7 @@ class IntentClassifier:
     CREATE_VERBS = ("create", "add", "insert", "open", "raise", "log", "submit", "generate")
     UPDATE_VERBS = ("update", "change", "modify", "set", "mark", "rename", "edit", "revise")
     DELETE_VERBS = ("delete", "remove", "cancel", "deactivate", "close")
+    BULK_PATTERNS = re.compile(r"\b(all\s+pending\s+orders|all\s+orders|every\s+order|bulk\s+mark|mass\s+update|update\s+all\s+records)\b", flags=re.IGNORECASE)
     META_PREFIX = re.compile(
         r"^(?:please\s+)?(?:create|build|generate|make|design)\s+(?:an?\s+)?(?:mcp\s+)?(?:tool|function|capability|toolkit|mcp)\s*(?:that\s+can|which\s+can|to|for)?\s*(.+)$",
         flags=re.IGNORECASE,
@@ -36,14 +38,25 @@ class IntentClassifier:
         create_detected = IntentClassifier._has_any(normalized, IntentClassifier.CREATE_VERBS)
         update_detected = IntentClassifier._has_any(normalized, IntentClassifier.UPDATE_VERBS) or bool(
             re.search(r"\b(refund|void|chargeback|reverse)\b", normalized)
+            or re.search(r"\b(?:must|should|needs?\s+to|has\s+to)\s+be\s+(?:changed|updated|modified|set)\b", normalized)
         )
         delete_detected = IntentClassifier._has_any(normalized, IntentClassifier.DELETE_VERBS)
         mutation_detected = create_detected or update_detected or delete_detected
+        latest_order_update = bool(update_detected and re.search(r"\blatest\s+order\b", normalized) and re.search(r"\bphone\b", normalized))
+        bulk_mutation_detected = bool(IntentClassifier.BULK_PATTERNS.search(normalized))
 
         workflow_type = None
         operation_type = "ambiguous"
         ambiguous = False
-        if read_detected and mutation_detected:
+        if bulk_mutation_detected and update_detected:
+            read_detected = True
+            operation_type = "bulk_update"
+            workflow_type = "preview_then_bulk_update"
+        elif latest_order_update:
+            read_detected = True
+            operation_type = "workflow"
+            workflow_type = "read_then_update"
+        elif read_detected and mutation_detected:
             operation_type = "workflow"
             if update_detected and not create_detected and not delete_detected:
                 workflow_type = "read_then_update"
@@ -67,10 +80,18 @@ class IntentClassifier:
         target_field = None
         if re.search(r"\buser\s*name\b|\busername\b", normalized):
             target_field = "username"
+        elif re.search(r"\border\s+status\b|\bstatus\s+of\s+the\s+order\b|\border\b.*\bstatus\b|\bpending\s+orders?\b|\borders?\s+as\s+delivered\b", normalized):
+            target_field = "order_status"
         elif re.search(r"\bfull\s*name\b", normalized):
             target_field = "full_name"
         elif re.search(r"\bdisplay\s*name\b", normalized):
             target_field = "display_name"
+
+        target_entity = None
+        if re.search(r"\border|orders\b", normalized):
+            target_entity = "order"
+        elif re.search(r"\bcustomer|user|client\b", normalized):
+            target_entity = "customer"
 
         risk_hints = []
         if re.search(r"\brefund\b|\bcancel\b", normalized):
@@ -90,6 +111,7 @@ class IntentClassifier:
             update_detected=update_detected,
             delete_detected=delete_detected,
             ambiguous=ambiguous,
+            target_entity=target_entity,
             target_field=target_field,
         )
 
@@ -115,5 +137,7 @@ class IntentClassifier:
             "update_detected": classification.update_detected,
             "delete_detected": classification.delete_detected,
             "ambiguous": classification.ambiguous,
+            "target_entity": classification.target_entity,
             "target_field": classification.target_field,
+            "bulk_mutation_detected": classification.operation_type in {"bulk_update", "workflow_bulk_update"},
         }

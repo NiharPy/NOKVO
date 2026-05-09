@@ -23,6 +23,8 @@ class SafetyClassifier:
     @staticmethod
     def risk_level(prompt: str, integration_type: str, operation_type: str) -> RiskLevel:
         text = (prompt or "").lower()
+        if operation_type in {"bulk_update", "workflow_bulk_update"} or re.search(r"\b(all\s+pending\s+orders|all\s+orders|every\s+order|bulk\s+mark|mass\s+update|update\s+all\s+records)\b", text):
+            return "high"
         if operation_type == "workflow":
             return "medium" if integration_type not in {"payments", "his"} else "high"
         if re.search(r"\b(refund|cancel|address|account|bank|kyc|invoice|shipment cancellation)\b", text):
@@ -37,7 +39,7 @@ class SafetyClassifier:
 
     @staticmethod
     def approval_required(risk_level: str, operation_type: str) -> bool:
-        return risk_level in {"medium", "high", "critical"} or operation_type in {"create", "update", "delete", "workflow"}
+        return risk_level in {"medium", "high", "critical"} or operation_type in {"create", "update", "delete", "workflow", "bulk_update", "workflow_bulk_update"}
 
     @staticmethod
     def execution_mode(operation_type: str, approval_required: bool) -> str:

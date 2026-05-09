@@ -84,6 +84,7 @@ class SQLValidator:
                 "message": "EXPLAIN validation is required at provider test-run for this database provider.",
                 "statement": f"EXPLAIN {parser.get('normalized_sql')}",
                 "sample_bindings": SQLValidator.safe_sample_bindings(sql, mapping),
+                "sample_binding_variants": SQLValidator.safe_sample_binding_variants(sql, mapping),
             }
 
         return {
@@ -92,17 +93,22 @@ class SQLValidator:
             "message": "PostgreSQL EXPLAIN validation prepared with safe sample bound parameters.",
             "statement": f"EXPLAIN {parser.get('normalized_sql')}",
             "sample_bindings": SQLValidator.safe_sample_bindings(sql, mapping),
+            "sample_binding_variants": SQLValidator.safe_sample_binding_variants(sql, mapping),
         }
 
     @staticmethod
     def safe_sample_bindings(sql: str, mapping: dict[str, Any]) -> dict[str, Any]:
         bindings = {}
         params = sorted(set(re.findall(r"(?<!:):([a-zA-Z_][\w]*)\b", sql or "")))
+        input_properties = SQLValidator._input_properties(mapping)
         allowed_columns = mapping.get("allowed_columns") if isinstance(mapping.get("allowed_columns"), dict) else {}
         column_names = {column.lower() for columns in allowed_columns.values() for column in (columns or [])}
         for param in params:
             lowered = param.lower()
-            if lowered == "limit":
+            schema = input_properties.get(param) if isinstance(input_properties.get(param), dict) else {}
+            if schema:
+                bindings[param] = SQLValidator._sample_value_for_schema(param, schema, prefer_null=False)
+            elif lowered == "limit":
                 bindings[param] = 1
             elif "phone" in lowered:
                 bindings[param] = "9999999999"
@@ -115,6 +121,63 @@ class SQLValidator:
             else:
                 bindings[param] = "sample"
         return bindings
+
+    @staticmethod
+    def safe_sample_binding_variants(sql: str, mapping: dict[str, Any]) -> list[dict[str, Any]]:
+        base = SQLValidator.safe_sample_bindings(sql, mapping)
+        input_properties = SQLValidator._input_properties(mapping)
+        optional_string_params = [
+            name for name, schema in input_properties.items()
+            if name in base
+            and isinstance(schema, dict)
+            and schema.get("type") == "string"
+            and schema.get("required") is False
+        ]
+        if not optional_string_params:
+            return [base]
+        null_variant = dict(base)
+        for name in optional_string_params:
+            null_variant[name] = None
+        non_null_variant = dict(base)
+        for name in optional_string_params:
+            non_null_variant[name] = SQLValidator._sample_value_for_schema(name, input_properties[name], prefer_null=False)
+        return [null_variant, non_null_variant]
+
+    @staticmethod
+    def _input_properties(mapping: dict[str, Any]) -> dict[str, Any]:
+        input_schema = mapping.get("input_schema") if isinstance(mapping.get("input_schema"), dict) else {}
+        properties = input_schema.get("properties") if isinstance(input_schema.get("properties"), dict) else {}
+        return properties or {}
+
+    @staticmethod
+    def _sample_value_for_schema(name: str, schema: dict[str, Any], prefer_null: bool = False) -> Any:
+        if prefer_null and schema.get("required") is False:
+            return None
+        value_type = schema.get("type")
+        if isinstance(value_type, list):
+            value_type = next((item for item in value_type if item != "null"), value_type[0] if value_type else "string")
+        lowered = name.lower()
+        if value_type == "integer":
+            return 1
+        if value_type == "number":
+            return 1.0
+        if value_type == "boolean":
+            return True
+        if value_type == "string":
+            if "phone" in lowered:
+                return "9999999999"
+            if "email" in lowered:
+                return "sample@example.com"
+            if lowered.endswith("_id") or lowered == "id":
+                return "1"
+            if "number" in lowered:
+                return "sample_number"
+            if "status" in lowered:
+                return "sample_status"
+            if "name" in lowered:
+                return "sample_name"
+            return "sample_string"
+        return "sample_string"
 
     @staticmethod
     def postgres_explain_query(sql: str, mapping: dict[str, Any]) -> tuple[str, list[Any], dict[str, Any]]:
@@ -264,7 +327,7 @@ class SQLValidator:
 
     @staticmethod
     def _validate_update(sql: str) -> str:
-        match = re.search(r"\bUPDATE\s+[a-zA-Z_][\w]*\.[a-zA-Z_][\w]*(?:\s+[a-zA-Z_][\w]*)?\s+SET\s+(.+?)(?:\s+WHERE\s+|$)", sql, flags=re.IGNORECASE | re.DOTALL)
+        match = re.search(r"\bUPDATE\s+[a-zA-Z_][\w]*\.[a-zA-Z_][\w]*(?:\s+(?:AS\s+)?[a-zA-Z_][\w]*)?\s+SET\s+(.+?)(?:\s+WHERE\s+|$)", sql, flags=re.IGNORECASE | re.DOTALL)
         if not match:
             return "UPDATE must use fully qualified table and SET assignments."
         assignments = SQLValidator._split_sql_list(match.group(1))

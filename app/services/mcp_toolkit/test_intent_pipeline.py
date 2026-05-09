@@ -45,6 +45,19 @@ ORDERS = {
     ],
 }
 
+ECOMMERCE_ORDERS = {
+    "schema": "ecommerce_callcenter",
+    "name": "orders",
+    "primary_key": ["order_id"],
+    "columns": [
+        {"name": "order_id", "type": "integer", "nullable": False},
+        {"name": "order_number", "type": "text", "nullable": True},
+        {"name": "customer_id", "type": "integer", "nullable": True},
+        {"name": "order_status", "type": "text", "nullable": True},
+        {"name": "created_at", "type": "timestamp", "nullable": True},
+    ],
+}
+
 SUPPORT_TICKETS = {
     "schema": "public",
     "name": "support_tickets",
@@ -331,3 +344,283 @@ def test_username_confirmation_allows_full_name_update_sql():
     assert not any(key.startswith("public.support_tickets") for key in field_policy)
     assert not any(key.startswith("public.call_logs") for key in field_policy)
     assert "ecommerce_callcenter.customers.email" not in field_policy
+
+
+def test_full_name_update_by_phone_generates_fixed_customer_workflow():
+    result = ToolkitGeneratorService._sanitize_tool(
+        {},
+        "database",
+        "postgresql",
+        "Build a tool to find a customer using their phone number and change their full name to the new name provided.",
+        db_context(
+            {
+                **CUSTOMERS,
+                "schema": "ecommerce_callcenter",
+                "columns": [
+                    {"name": "customer_id", "type": "integer", "nullable": False},
+                    {"name": "customer_code", "type": "text", "nullable": True},
+                    {"name": "full_name", "type": "text", "nullable": True},
+                    {"name": "phone", "type": "text", "nullable": True},
+                ],
+            },
+        ),
+    )
+
+    tool = result["tool"]
+    sql = tool["execution"]["mapping"]["sql_template"]
+    input_props = tool["input_schema"]["properties"]
+    mutation_props = tool["output_schema"]["properties"]["data"]["properties"]
+    field_policy = tool["safety"]["pii_policy"]["field_policy"]
+
+    assert result["validation"]["status"] == "passed", result["validation"]
+    assert tool["name"] == "update_customer_full_name_by_phone"
+    assert result["tool_plan"]["operation_type"] == "workflow"
+    assert result["tool_plan"]["workflow_type"] == "read_then_update"
+    assert result["tool_plan"]["target_entity"] == "customer"
+    assert result["tool_plan"]["target_field"] == "full_name"
+    assert result["tool_plan"]["resolved_target_column"] == "ecommerce_callcenter.customers.full_name"
+    assert result["tool_plan"]["exact_resources_used"] == ["ecommerce_callcenter.customers"]
+    assert tool["execution"]["mode"] == "write_requires_human_approval"
+    assert tool["safety"]["risk_level"] == "medium"
+    assert tool["safety"]["approval_policy"]["human_approval_required"] is True
+    assert set(input_props) == {"phone_number", "new_full_name", "idempotency_key"}
+    assert "customer_name" not in input_props
+    assert tool["execution"]["mapping"]["parameter_binding"]["sources"] == [
+        "input.phone_number",
+        "input.new_full_name",
+        "input.idempotency_key",
+    ]
+    assert sql.startswith("WITH matched_customer AS")
+    assert "FROM ecommerce_callcenter.customers c" in sql
+    assert "WHERE c.phone = :phone_number" in sql
+    assert "UPDATE ecommerce_callcenter.customers c" in sql
+    assert "SET full_name = :new_full_name" in sql
+    assert "c.full_name AS updated_full_name" in sql
+    assert "LIMIT 1" not in sql
+    assert set(result["tool_plan"]["output_fields"][index]["name"] for index in range(len(result["tool_plan"]["output_fields"]))) >= {
+        "affected_count",
+        "idempotency_key",
+        "customer_id",
+        "customer_code",
+        "phone_last4",
+        "updated_full_name",
+    }
+    assert {"affected_count", "idempotency_key", "customer_id", "customer_code", "phone_last4", "updated_full_name"}.issubset(mutation_props)
+    assert set(field_policy) == {
+        "ecommerce_callcenter.customers.customer_id",
+        "ecommerce_callcenter.customers.customer_code",
+        "ecommerce_callcenter.customers.full_name",
+        "ecommerce_callcenter.customers.phone",
+        "affected_count",
+        "idempotency_key",
+        "customer_id",
+        "customer_code",
+        "phone_last4",
+    }
+    assert field_policy["ecommerce_callcenter.customers.full_name"]["output_name"] == "updated_full_name"
+    assert field_policy["ecommerce_callcenter.customers.phone"]["output_name"] == "phone_last4"
+    assert result["publish_gate"]["can_publish"] is False
+    assert "tests.status must be passed" in result["publish_gate"]["missing_requirements"]
+    assert "review.status must be approved" in result["publish_gate"]["missing_requirements"]
+    assert "admin approval record is required" in result["publish_gate"]["missing_requirements"]
+
+
+def test_read_plus_update_order_status_prompt_generates_order_workflow():
+    result = ToolkitGeneratorService._sanitize_tool(
+        {},
+        "database",
+        "postgresql",
+        "build a tool to retrieve orders of a user using their name and phone number and the status of the order must be changed",
+        db_context(
+            {**CUSTOMERS, "schema": "ecommerce_callcenter", "columns": [{"name": "customer_id", "type": "integer", "nullable": False}, {"name": "customer_code", "type": "text", "nullable": True}, {"name": "full_name", "type": "text", "nullable": True}, {"name": "phone", "type": "text", "nullable": True}]},
+            ECOMMERCE_ORDERS,
+        ),
+    )
+
+    tool = result["tool"]
+    sql = tool["execution"]["mapping"]["sql_template"]
+    input_props = tool["input_schema"]["properties"]
+    assert result["validation"]["status"] == "passed", result["validation"]
+    assert result["tool_plan"]["operation_type"] == "workflow"
+    assert result["tool_plan"]["workflow_type"] == "read_then_update"
+    assert result["tool_plan"]["target_entity"] == "order"
+    assert result["tool_plan"]["target_field"] == "order_status"
+    assert result["tool_plan"]["resolved_target_column"] == "ecommerce_callcenter.orders.order_status"
+    assert result["tool_plan"]["exact_resources_used"] == ["ecommerce_callcenter.orders", "ecommerce_callcenter.customers"]
+    assert tool["execution"]["mode"] == "write_requires_human_approval"
+    assert tool["safety"]["risk_level"] == "medium"
+    assert tool["safety"]["approval_policy"]["human_approval_required"] is True
+    assert tool["execution"]["mapping"]["allowed_statements"] == ["UPDATE"]
+    assert "customer_name" in input_props
+    assert "phone_number" in input_props
+    assert "new_order_status" in input_props
+    assert "idempotency_key" in input_props
+    assert "order_id" in input_props
+    assert "order_number" in input_props
+    assert "candidate_count AS" in sql
+    assert "cc.match_count = 1" in sql
+    assert "CROSS JOIN candidate_count cc" in sql
+    assert "LIMIT 1" not in sql
+    assert "UPDATE ecommerce_callcenter.orders AS o" in sql
+    assert "SET order_status = :new_order_status" in sql
+    assert "LOWER(c.full_name) = LOWER(:customer_name)" in sql
+    assert "c.phone = :phone_number" in sql
+    assert "co.order_number" in sql
+    assert ":order_number IS NOT NULL" in sql
+    assert "o.order_status AS updated_order_status" in sql
+    mutation_props = tool["output_schema"]["properties"]["data"]["properties"]
+    assert "order_number" in mutation_props
+    assert "updated_order_status" in mutation_props
+    precheck = tool["execution"]["mapping"]["precheck"]
+    assert precheck["required"] is True
+    assert precheck["must_pass_before_mutation"] is True
+    assert "cc.match_count = 0 THEN 'NO_MATCH'" in precheck["sql_template"]
+    assert "cc.match_count > 1" in precheck["sql_template"]
+    assert set(precheck["result_mapping"]) == {"NO_MATCH", "ORDER_TARGET_AMBIGUOUS", "READY"}
+    assert precheck["result_mapping"]["NO_MATCH"]["block_update"] is True
+    assert precheck["result_mapping"]["ORDER_TARGET_AMBIGUOUS"]["block_update"] is True
+    assert precheck["result_mapping"]["READY"]["block_update"] is False
+    assert "records" not in mutation_props
+
+
+def test_latest_order_status_by_phone_requires_latest_order_policy():
+    result = ToolkitGeneratorService._sanitize_tool(
+        {},
+        "database",
+        "postgresql",
+        "Build a tool to update the latest order status of a customer using only their phone number.",
+        db_context(
+            {**CUSTOMERS, "schema": "ecommerce_callcenter", "columns": [{"name": "customer_id", "type": "integer", "nullable": False}, {"name": "customer_code", "type": "text", "nullable": True}, {"name": "phone", "type": "text", "nullable": True}]},
+            ECOMMERCE_ORDERS,
+        ),
+    )
+
+    tool = result["tool"]
+    input_props = tool["input_schema"]["properties"]
+    codes = {error["code"] for error in result["validation"]["errors"]}
+    assert tool["name"] == "update_latest_order_status_by_phone"
+    assert result["tool_plan"]["operation_type"] == "workflow"
+    assert result["tool_plan"]["workflow_type"] == "read_then_update"
+    assert result["tool_plan"]["target_entity"] == "order"
+    assert result["tool_plan"]["target_field"] == "order_status"
+    assert result["tool_plan"]["resolved_target_column"] == "ecommerce_callcenter.orders.order_status"
+    assert set(input_props) == {"phone_number", "new_order_status", "idempotency_key"}
+    assert "customer_name" not in input_props
+    assert tool["execution"]["mapping"]["sql_template"] == ""
+    assert result["validation"]["status"] == "failed"
+    assert result["review"]["status"] == "needs_context_confirmation"
+    assert "LATEST_ORDER_POLICY_REQUIRED" in codes
+    assert "Confirm whether latest order means the order with the greatest created_at for the customer." in tool["missing_context"]
+
+
+def test_latest_order_status_by_phone_with_policy_generates_fixed_update_sql():
+    result = ToolkitGeneratorService._sanitize_tool(
+        {},
+        "database",
+        "postgresql",
+        "Build a tool to update the latest order status of a customer using only their phone number.",
+        db_context(
+            {**CUSTOMERS, "schema": "ecommerce_callcenter", "columns": [{"name": "customer_id", "type": "integer", "nullable": False}, {"name": "customer_code", "type": "text", "nullable": True}, {"name": "phone", "type": "text", "nullable": True}]},
+            ECOMMERCE_ORDERS,
+            admin_policy_confirmations={"latest_order_policy": "created_at_desc"},
+        ),
+    )
+
+    tool = result["tool"]
+    sql = tool["execution"]["mapping"]["sql_template"]
+    input_props = tool["input_schema"]["properties"]
+    mutation_props = tool["output_schema"]["properties"]["data"]["properties"]
+    assert result["validation"]["status"] == "passed", result["validation"]
+    assert tool["name"] == "update_latest_order_status_by_phone"
+    assert result["tool_plan"]["operation_type"] == "workflow"
+    assert result["tool_plan"]["workflow_type"] == "read_then_update"
+    assert result["tool_plan"]["target_entity"] == "order"
+    assert result["tool_plan"]["target_field"] == "order_status"
+    assert result["tool_plan"]["resolved_target_column"] == "ecommerce_callcenter.orders.order_status"
+    assert result["tool_plan"]["exact_resources_used"] == ["ecommerce_callcenter.orders", "ecommerce_callcenter.customers"]
+    assert set(input_props) == {"phone_number", "new_order_status", "idempotency_key"}
+    assert "customer_name" not in input_props
+    assert "order_id" not in input_props
+    assert "order_number" not in input_props
+    assert tool["execution"]["mapping"]["parameter_binding"]["sources"] == [
+        "input.phone_number",
+        "input.new_order_status",
+        "input.idempotency_key",
+    ]
+    assert "WITH matched_customer AS" in sql
+    assert "WHERE c.phone = :phone_number" in sql
+    assert "latest_order AS" in sql
+    assert "ORDER BY o.created_at DESC, o.order_id DESC" in sql
+    assert "LIMIT 1" in sql
+    assert "UPDATE ecommerce_callcenter.orders AS o" in sql
+    assert "SET order_status = :new_order_status" in sql
+    assert "SET order_number" not in sql
+    assert "o.order_status AS updated_order_status" in sql
+    assert "customer_name" not in sql
+    assert {"affected_count", "idempotency_key", "order_id", "order_number", "customer_code", "phone_last4", "updated_order_status"}.issubset(mutation_props)
+    assert result["publish_gate"]["can_publish"] is False
+
+
+def test_bulk_mark_pending_orders_as_delivered_requires_bulk_policy_and_preview_only():
+    result = ToolkitGeneratorService._sanitize_tool(
+        {},
+        "database",
+        "postgresql",
+        "Build a tool to mark all pending orders as delivered.",
+        db_context(ECOMMERCE_ORDERS),
+    )
+
+    tool = result["tool"]
+    sql = tool["execution"]["mapping"]["sql_template"]
+    input_props = tool["input_schema"]["properties"]
+    codes = {error["code"] for error in result["validation"]["errors"]}
+    assert tool["name"] == "bulk_mark_pending_orders_as_delivered"
+    assert result["tool_plan"]["operation_type"] == "bulk_update"
+    assert result["tool_plan"]["target_entity"] == "order"
+    assert result["tool_plan"]["target_field"] == "order_status"
+    assert result["tool_plan"]["resolved_target_column"] == "ecommerce_callcenter.orders.order_status"
+    assert tool["safety"]["risk_level"] == "high"
+    assert tool["safety"]["approval_policy"]["human_approval_required"] is True
+    assert tool["safety"]["approval_policy"]["admin_approval_required"] is True
+    assert set(input_props) == {"idempotency_key", "approval_reason", "dry_run", "max_rows", "effective_before"}
+    assert "new_order_status" not in input_props
+    assert tool["execution"]["mapping"]["allowed_statements"] == ["SELECT"]
+    assert tool["execution"]["mapping"]["bulk_mutation"]["policy_approved"] is False
+    assert tool["execution"]["mapping"]["dry_run_required"] is True
+    assert tool["execution"]["mapping"]["preview_required"] is True
+    assert tool["execution"]["mapping"]["batch_limit_required"] is True
+    assert sql == "SELECT COUNT(*)::int AS affected_count_preview FROM ecommerce_callcenter.orders WHERE order_status = 'pending'"
+    assert "UPDATE" not in sql
+    assert result["validation"]["status"] == "failed"
+    assert result["review"]["status"] == "needs_context_confirmation"
+    assert "BULK_MUTATION_POLICY_REQUIRED" in codes
+    assert "BULK_MUTATION_LIMIT_REQUIRED" not in codes
+    assert "PROMPT_VALUE_EXTRACTION_FAILED" not in codes
+
+
+def test_bulk_mark_pending_orders_as_delivered_with_policy_generates_reviewed_update():
+    result = ToolkitGeneratorService._sanitize_tool(
+        {},
+        "database",
+        "postgresql",
+        "Build a tool to mark all pending orders as delivered.",
+        db_context(ECOMMERCE_ORDERS, admin_policy_confirmations={"bulk_mutation_policy": "order_status_pending_to_delivered"}),
+    )
+
+    tool = result["tool"]
+    sql = tool["execution"]["mapping"]["sql_template"]
+    mutation_props = tool["output_schema"]["properties"]["data"]["properties"]
+    assert result["validation"]["status"] == "passed", result["validation"]
+    assert tool["name"] == "bulk_mark_pending_orders_as_delivered"
+    assert result["tool_plan"]["operation_type"] == "bulk_update"
+    assert result["tool_plan"]["target_field"] == "order_status"
+    assert result["tool_plan"]["resolved_target_column"] == "ecommerce_callcenter.orders.order_status"
+    assert tool["execution"]["mapping"]["allowed_statements"] == ["UPDATE"]
+    assert tool["execution"]["mapping"]["bulk_mutation"]["policy_approved"] is True
+    assert "UPDATE ecommerce_callcenter.orders" in sql
+    assert "SET order_status = 'delivered'" in sql
+    assert "WHERE order_status = 'pending'" in sql
+    assert "RETURNING order_id, order_number, order_status AS updated_order_status" in sql
+    assert "order_number =" not in sql
+    assert {"affected_count", "idempotency_key", "order_id", "order_number", "updated_order_status"}.issubset(mutation_props)
+    assert result["publish_gate"]["can_publish"] is False
