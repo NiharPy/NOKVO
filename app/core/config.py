@@ -19,6 +19,23 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
     REFRESH_TOKEN_EXPIRE_HOURS: int = 4
 
+    # Nokvo One TOTP encryption (Fernet key; if unset, derived from SECRET_KEY).
+    NOKVO_TOTP_ENCRYPTION_KEY: str = ""
+
+    # Nokvo One signup/invite
+    NOKVO_ONE_PUBLIC_BASE_URL: str = "http://localhost:5173"
+    NOKVO_ONE_EMAIL_TOKEN_TTL_HOURS: int = 24
+    NOKVO_ONE_INVITE_TOKEN_TTL_HOURS: int = 72
+
+    # SMTP (optional — when unset, emails are logged only)
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 587
+    SMTP_USERNAME: str = ""
+    SMTP_PASSWORD: str = ""
+    SMTP_FROM_EMAIL: str = "no-reply@nokvo.ai"
+    SMTP_FROM_NAME: str = "Nokvo"
+    SMTP_USE_TLS: bool = True
+
     # Google OAuth
     GOOGLE_OAUTH_CLIENT_ID: str = ""
     GOOGLE_OAUTH_CLIENT_SECRET: str = ""
@@ -47,6 +64,14 @@ class Settings(BaseSettings):
     AZURE_OPENAI_AGENT_DEPLOYMENT: str = "gpt-4-1-mini"
     AZURE_OPENAI_AGENT_MODEL: str = "gpt-4.1-mini"
     AZURE_OPENAI_AGENT_API_VERSION: str = "2024-10-21"
+
+    # Nokvo One Azure OpenAI realtime-mini deployment.
+    # Defaults match the current GA model; override via env when Azure rotates versions.
+    AZURE_OPENAI_REALTIME_MODEL: str = "gpt-realtime-mini"
+    AZURE_OPENAI_REALTIME_MODEL_VERSION: str = "2025-08-28"
+    AZURE_OPENAI_REALTIME_DEPLOYMENT: str = "gpt-realtime-mini"
+    AZURE_OPENAI_REALTIME_SKU: str = "GlobalStandard"
+    AZURE_OPENAI_REALTIME_REGION: str = "swedencentral"
     AZURE_MANAGED_IDENTITY_CLIENT_ID: str = ""
     AZURE_TENANT_ID: str = ""
     AZURE_CLIENT_ID: str = ""

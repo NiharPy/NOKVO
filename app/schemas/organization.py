@@ -16,6 +16,7 @@ class OrganizationCreate(BaseModel):
     call_type: str = "inbound"
     language: str = "en-IN"
     plan_type: str = "pilot"
+    product_tier: str = "nokvo_prime"
     stores_pii: bool = True
     record_calls: bool = True
     create_resource_group: bool = True
@@ -41,6 +42,14 @@ class OrganizationCreate(BaseModel):
     @classmethod
     def validate_admin_email(cls, value: EmailStr) -> str:
         return validate_work_email(value)
+
+    @field_validator("product_tier")
+    @classmethod
+    def validate_product_tier(cls, value: str) -> str:
+        normalized = (value or "nokvo_prime").strip().lower()
+        if normalized not in {"nokvo_one", "nokvo_prime", "nokvo_apex"}:
+            raise ValueError("product_tier must be one of: nokvo_one, nokvo_prime, nokvo_apex")
+        return normalized
 
 class OrganizationResponse(OrganizationCreate):
     id: UUID

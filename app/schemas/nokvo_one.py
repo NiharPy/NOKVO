@@ -1,0 +1,310 @@
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any, Optional
+from uuid import UUID
+
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+
+from app.core.email_policy import validate_work_email
+from app.schemas.token import Token
+
+
+NOKVO_ONE_ORG_STATUSES = {
+    "pending_email_verification",
+    "pending_totp",
+    "pending_approval",
+    "active",
+    "suspended",
+}
+
+
+def _validate_password(value: str) -> str:
+    if value is None or len(value) < 10:
+        raise ValueError("Password must be at least 10 characters")
+    if value.strip() != value:
+        raise ValueError("Password must not start or end with whitespace")
+    has_letter = any(c.isalpha() for c in value)
+    has_digit = any(c.isdigit() for c in value)
+    if not (has_letter and has_digit):
+        raise ValueError("Password must include at least one letter and one digit")
+    return value
+
+
+# ─────────── Signup / verification ───────────
+
+
+class NokvoOneSignupRequest(BaseModel):
+    org_name: str = Field(min_length=1, max_length=200)
+    admin_name: Optional[str] = Field(default=None, max_length=200)
+    admin_email: EmailStr
+    password: str
+    region: str = "centralindia"
+    industry: Optional[str] = "Customer Support"
+    country_code: Optional[str] = "IN"
+    language: Optional[str] = "en-IN"
+
+    @field_validator("org_name")
+    @classmethod
+    def _validate_org_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Organization name is required")
+        return value
+
+    @field_validator("admin_email")
+    @classmethod
+    def _validate_admin_email(cls, value: EmailStr) -> str:
+        return validate_work_email(value)
+
+    @field_validator("password")
+    @classmethod
+    def _validate_password_field(cls, value: str) -> str:
+        return _validate_password(value)
+
+
+class NokvoOneProvisioningStepResponse(BaseModel):
+    name: str
+    status: str
+    message: Optional[str] = None
+
+
+class NokvoOneProvisioningSummary(BaseModel):
+    tenant_id: str
+    azure_resource_group_name: Optional[str]
+    azure_region: Optional[str]
+    blob_prefix: Optional[str]
+    storage_account_name: Optional[str]
+    qdrant_collection_name: Optional[str]
+    qdrant_url_ref: Optional[str]
+    redis_namespace: Optional[str]
+    llm_provider: Optional[str]
+    llm_model: Optional[str]
+    llm_deployment: Optional[str]
+    llm_endpoint: Optional[str]
+    llm_region: Optional[str]
+    llm_status: Optional[str]
+    llm_api_key_present: bool = False
+    key_vault_name: Optional[str] = None
+    key_vault_status: Optional[str] = None
+    llm_api_key_secret_ref: Optional[str] = None
+    exotel_status: Optional[str]
+    steps: list[NokvoOneProvisioningStepResponse]
+    provisioning_status: str
+
+
+class NokvoOneSignupResponse(BaseModel):
+    organization_id: UUID
+    admin_user_id: UUID
+    email: EmailStr
+    org_status: str
+    message: str = "Verification email sent. Confirm your email to continue."
+    provisioning: Optional[NokvoOneProvisioningSummary] = None
+
+
+class NokvoOneEmailVerifiedResponse(BaseModel):
+    organization_id: UUID
+    email: EmailStr
+    org_status: str
+    setup_token: str
+    message: str = "Email verified. Complete TOTP setup to continue."
+
+
+class NokvoOneTOTPSetupRequest(BaseModel):
+    setup_token: str
+
+
+class NokvoOneTOTPSetupResponse(BaseModel):
+    email: EmailStr
+    secret: str
+    uri: str
+    setup_token: str
+
+
+class NokvoOneTOTPVerifyRequest(BaseModel):
+    setup_token: str
+    code: str
+
+
+class NokvoOnePostTotpResponse(BaseModel):
+    organization_id: UUID
+    org_status: str
+    message: str = (
+        "TOTP enrolled. Your organization is now pending Nokvo One activation by a Nokvo administrator."
+    )
+
+
+# ─────────── Login ───────────
+
+
+class NokvoOneLoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+    @field_validator("email")
+    @classmethod
+    def _validate_email(cls, value: EmailStr) -> str:
+        return validate_work_email(value)
+
+
+class NokvoOneLoginTOTPRequest(BaseModel):
+    code: str
+
+
+class NokvoOneGoogleLoginRequest(BaseModel):
+    id_token: str
+
+
+# ─────────── Member invitations ───────────
+
+
+class NokvoOneMemberInviteRequest(BaseModel):
+    email: EmailStr
+    full_name: Optional[str] = Field(default=None, max_length=200)
+    role: str = "member"
+
+    @field_validator("email")
+    @classmethod
+    def _validate_email(cls, value: EmailStr) -> str:
+        return validate_work_email(value)
+
+    @field_validator("role")
+    @classmethod
+    def _validate_role(cls, value: str) -> str:
+        value = value.strip().lower()
+        if value not in {"admin", "manager", "member", "viewer"}:
+            raise ValueError("Invalid role")
+        return value
+
+
+class NokvoOneInvitationResponse(BaseModel):
+    id: UUID
+    organization_id: UUID
+    email: EmailStr
+    role: str
+    expires_at: datetime
+    accepted_at: Optional[datetime]
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class NokvoOneInvitationContextResponse(BaseModel):
+    organization_id: UUID
+    organization_name: str
+    email: EmailStr
+    role: str
+    expires_at: datetime
+
+
+class NokvoOneInvitationAcceptRequest(BaseModel):
+    token: str
+    password: str
+
+    @field_validator("password")
+    @classmethod
+    def _validate_password_field(cls, value: str) -> str:
+        return _validate_password(value)
+
+
+# ─────────── Org/user views ───────────
+
+
+class NokvoOneOrganizationResponse(BaseModel):
+    id: UUID
+    name: str
+    product_tier: str
+    status: str
+    calling_enabled: bool
+    admin_email: Optional[EmailStr]
+    email_domain: Optional[str]
+    environment: str
+    region: str
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class NokvoOneUserResponse(BaseModel):
+    id: UUID
+    organization_id: UUID
+    email: EmailStr
+    full_name: Optional[str]
+    role: str
+    status: str
+    auth_provider: str
+    email_verified: bool
+    last_login_at: Optional[datetime]
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class NokvoOneSessionResponse(Token):
+    user: NokvoOneUserResponse
+    organization: NokvoOneOrganizationResponse
+
+
+# ─────────── Agents / tools ───────────
+
+
+class NokvoOneAgentCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    description: Optional[str] = Field(default=None, max_length=1000)
+    system_prompt: Optional[str] = Field(default=None, max_length=8000)
+    tool_keys: list[str] = Field(default_factory=list)
+
+
+class NokvoOneAgentUpdate(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=120)
+    description: Optional[str] = Field(default=None, max_length=1000)
+    system_prompt: Optional[str] = Field(default=None, max_length=8000)
+    tool_keys: Optional[list[str]] = None
+
+
+class NokvoOneAgentResponse(BaseModel):
+    id: UUID
+    organization_id: UUID
+    name: str
+    description: Optional[str]
+    system_prompt: Optional[str]
+    tool_keys: list[str]
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class NokvoOnePredefinedToolResponse(BaseModel):
+    key: str
+    display_name: str
+    description: str
+    input_schema: dict[str, Any]
+    requires_confirmation: bool
+
+
+class NokvoOneAgentChatRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=4000)
+
+
+class NokvoOneAgentChatResponse(BaseModel):
+    reply: str
+    tool_calls: list[dict[str, Any]] = Field(default_factory=list)
+
+
+# ─────────── Superadmin approval ───────────
+
+
+class NokvoOneApprovalRequest(BaseModel):
+    enable_calling: bool = False
+    plan_type: Optional[str] = None
+
+
+class NokvoOnePendingOrgResponse(BaseModel):
+    id: UUID
+    name: str
+    admin_email: Optional[EmailStr]
+    admin_name: Optional[str]
+    email_domain: Optional[str]
+    status: str
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)

@@ -36,3 +36,24 @@ class AzureResourceGroupService:
             return rg_name
         except Exception as e:
             raise RuntimeError(f"Failed to create Azure Resource Group: {str(e)}")
+
+    @staticmethod
+    async def delete_resource_group(rg_name: str) -> bool:
+        """
+        Best-effort delete of a resource group. Returns True on success or if the
+        RG no longer exists (idempotent). Logs and swallows other errors so that
+        cleanup paths never raise; the caller should already be in an error flow.
+        """
+        if not settings.AZURE_SUBSCRIPTION_ID:
+            return True
+        try:
+            credential = AzureAuth.get_credential()
+            client = ResourceManagementClient(credential, settings.AZURE_SUBSCRIPTION_ID)
+            client.resource_groups.begin_delete(rg_name)
+            return True
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception(
+                "Failed to delete Azure resource group %s during rollback", rg_name
+            )
+            return False

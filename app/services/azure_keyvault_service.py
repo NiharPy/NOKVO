@@ -229,6 +229,28 @@ class AzureKeyVaultService:
             )
 
     @staticmethod
+    async def delete_secret(secret_name: str) -> bool:
+        """Best-effort delete of a single secret. Used by Nokvo One provisioner rollback. Never raises."""
+        kv_name = settings.AZURE_SHARED_KEY_VAULT_NAME
+        if not kv_name:
+            return True
+        kv_url = f"https://{kv_name}.vault.azure.net/"
+        credential = AzureAuth.get_async_credential()
+        async with AsyncSecretClient(vault_url=kv_url, credential=credential) as client:
+            try:
+                poller = await client.begin_delete_secret(secret_name)
+                await poller.wait()
+                return True
+            except Exception:
+                import logging
+                logging.getLogger(__name__).exception(
+                    "Failed to delete Key Vault secret %s in vault %s during rollback",
+                    secret_name,
+                    kv_name,
+                )
+                return False
+
+    @staticmethod
     async def get_secret_value(secret_name: str) -> str | None:
         kv_name = settings.AZURE_SHARED_KEY_VAULT_NAME
         if not kv_name:

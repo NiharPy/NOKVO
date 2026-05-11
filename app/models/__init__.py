@@ -9,6 +9,10 @@ from app.models.organization_user import OrganizationUser
 from app.models.tenant_resources import TenantResources
 from app.models.tenant_usage_event import TenantUsageEvent
 from app.models.mcp_tool_registry import MCPToolRegistryEntry
+from app.models.email_verification import EmailVerification
+from app.models.member_invitation import MemberInvitation
+from app.models.nokvo_one_tool_record import NokvoOneToolRecord
+from app.models.nokvo_one_agent import NokvoOneAgent
 
 # For Alembic to discover all models
 __all__ = [
@@ -23,4 +27,8 @@ __all__ = [
     "TenantResources",
     "TenantUsageEvent",
     "MCPToolRegistryEntry",
+    "EmailVerification",
+    "MemberInvitation",
+    "NokvoOneToolRecord",
+    "NokvoOneAgent",
 ]

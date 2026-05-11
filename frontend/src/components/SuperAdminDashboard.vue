@@ -27,6 +27,8 @@ const environment = ref('production');
 const callType = ref('inbound');
 const language = ref('en-IN');
 const planType = ref('pilot');
+const productTier = ref('nokvo_prime');
+const nokvoOnePending = ref([]);
 const storesPii = ref(true);
 const recordCalls = ref(true);
 const createResourceGroup = ref(true);
@@ -138,6 +140,7 @@ const handleCreateOrg = async () => {
       call_type: callType.value,
       language: language.value,
       plan_type: planType.value,
+      product_tier: productTier.value,
       stores_pii: storesPii.value,
       record_calls: recordCalls.value,
       create_resource_group: createResourceGroup.value,
@@ -216,6 +219,7 @@ const resetForm = () => {
   callType.value = 'inbound';
   language.value = 'en-IN';
   planType.value = 'pilot';
+  productTier.value = 'nokvo_prime';
   storesPii.value = true;
   recordCalls.value = true;
   createResourceGroup.value = true;
@@ -238,8 +242,38 @@ const openCreateOrg = (event) => {
   showCreateOrg.value = true;
 };
 
+const loadNokvoOnePending = async () => {
+  const token = localStorage.getItem(SUPERADMIN_ACCESS_TOKEN_KEY);
+  if (!token) return;
+  try {
+    const res = await fetch('http://localhost:8000/superadmin/tenants/nokvo-one/pending', {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return;
+    nokvoOnePending.value = await res.json();
+  } catch (_) {
+    // best effort
+  }
+};
+
+const approveNokvoOne = async (orgId, enableCalling) => {
+  const token = localStorage.getItem(SUPERADMIN_ACCESS_TOKEN_KEY);
+  if (!token) return;
+  const res = await fetch(
+    `http://localhost:8000/superadmin/tenants/nokvo-one/${orgId}/approve`,
+    {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enable_calling: !!enableCalling }),
+    },
+  );
+  if (res.ok) {
+    await loadNokvoOnePending();
+  }
+};
+
 onMounted(async () => {
-  await loadOrganizations();
+  await Promise.all([loadOrganizations(), loadNokvoOnePending()]);
 });
 
 watch(() => props.homeSignal, () => {
@@ -384,6 +418,34 @@ watch(() => props.homeSignal, () => {
           </button>
         </div>
         </section>
+
+        <section v-if="nokvoOnePending.length" class="orgs-panel top-panel nokvo-one-panel">
+          <div class="orgs-panel-header">
+            <div>
+              <span class="stage-eyebrow">NOKVO ONE — PENDING APPROVAL</span>
+              <h3>Self-serve organizations awaiting activation</h3>
+              <p class="orgs-summary">{{ nokvoOnePending.length }} organization(s) awaiting approval</p>
+            </div>
+            <button class="create-org-btn" @click="loadNokvoOnePending">REFRESH</button>
+          </div>
+          <div class="org-cards">
+            <article v-for="org in nokvoOnePending" :key="org.id" class="org-card">
+              <div class="org-card-header">
+                <h4>{{ org.name }}</h4>
+                <span class="status-badge" :data-status="org.status">{{ org.status }}</span>
+              </div>
+              <p class="org-meta">{{ org.admin_email }} · {{ org.email_domain }}</p>
+              <div class="org-actions">
+                <button class="create-org-btn" @click="approveNokvoOne(org.id, false)">
+                  APPROVE (no calling)
+                </button>
+                <button class="create-org-btn" @click="approveNokvoOne(org.id, true)">
+                  APPROVE + ENABLE CALLING
+                </button>
+              </div>
+            </article>
+          </div>
+        </section>
       </div>
 
       <div v-else key="create" class="dashboard-content create-page">
@@ -518,6 +580,22 @@ watch(() => props.homeSignal, () => {
                   <option value="pilot">Pilot</option>
                   <option value="growth">Growth</option>
                   <option value="enterprise">Enterprise</option>
+                </select>
+                <div class="input-glow"></div>
+              </div>
+            </div>
+
+            <div class="input-group">
+              <label for="product-tier">
+                <BadgeCheck :size="14" class="label-icon" />
+                Product Tier
+                <span class="field-tag">REQUIRED</span>
+              </label>
+              <div class="input-wrapper">
+                <select id="product-tier" v-model="productTier" class="select-input">
+                  <option value="nokvo_prime">Nokvo Prime</option>
+                  <option value="nokvo_one">Nokvo One</option>
+                  <option value="nokvo_apex" disabled>Nokvo Apex (coming soon)</option>
                 </select>
                 <div class="input-glow"></div>
               </div>

@@ -3,10 +3,16 @@ import { onMounted, ref, watch } from 'vue';
 import SecureHeader from './components/SecureHeader.vue';
 import ConsoleLoginCard from './components/ConsoleLoginCard.vue';
 import OrganizationPortal from './components/OrganizationPortal.vue';
+import NokvoOneApp from './components/NokvoOneApp.vue';
 
 const theme = ref(localStorage.getItem('nokvo_dashboard_theme') || 'light');
 const homeSignal = ref(0);
-const viewMode = ref(localStorage.getItem('nokvo_access_mode') || 'organization');
+const defaultMode = () => {
+  const path = window.location.pathname;
+  if (path.startsWith('/nokvo-one')) return 'nokvo_one';
+  return localStorage.getItem('nokvo_access_mode') || 'nokvo_one';
+};
+const viewMode = ref(defaultMode());
 
 const applyTheme = (value) => {
   document.documentElement.dataset.theme = value;
@@ -40,10 +46,12 @@ onMounted(() => {
 </script>
 
 <template>
-  <OrganizationPortal v-if="viewMode === 'organization'" @switch-mode="switchMode('superadmin')" />
+  <NokvoOneApp v-if="viewMode === 'nokvo_one'" @switch-mode="switchMode('organization')" />
+  <OrganizationPortal v-else-if="viewMode === 'organization'" @switch-mode="switchMode('superadmin')" />
   <div v-else class="app-container" :class="`theme-${theme}`">
     <SecureHeader :theme="theme" :toggle-theme="toggleTheme" @home="handleHome" />
     <div class="mode-switch-wrap">
+      <button type="button" class="mode-switch" @click="switchMode('nokvo_one')">Nokvo One</button>
       <button type="button" class="mode-switch" @click="switchMode('organization')">
         Organization Login
       </button>
@@ -72,6 +80,7 @@ onMounted(() => {
 
 .mode-switch-wrap {
   display: flex;
+  gap: 0.5rem;
   justify-content: flex-end;
   width: 100%;
   padding: 0 2rem;

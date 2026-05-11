@@ -154,6 +154,11 @@ async def get_current_organization(
     organization = result.scalars().first()
     if organization is None:
         raise HTTPException(status_code=404, detail="Organization not found")
+    if (organization.product_tier or "nokvo_prime") != "nokvo_prime":
+        raise HTTPException(
+            status_code=403,
+            detail="This endpoint is only available for Nokvo Prime organizations",
+        )
     return organization
 
 class RequireRole:
@@ -170,13 +175,82 @@ class RequireRole:
 
 
 class RequireOrganizationRole:
+    """Prime-only organization role guard. Use RequireNokvoOneOrganization for One routes."""
+
     def __init__(self, allowed_roles: list[str]):
         self.allowed_roles = allowed_roles
 
-    async def __call__(self, user: OrganizationUser = Depends(get_current_active_organization_user)) -> OrganizationUser:
+    async def __call__(
+        self,
+        db: AsyncSession = Depends(get_db),
+        user: OrganizationUser = Depends(get_current_active_organization_user),
+    ) -> OrganizationUser:
         if user.role not in self.allowed_roles:
             raise HTTPException(
                 status_code=403,
                 detail=f"Operation not permitted. Required organization role: {self.allowed_roles}"
+            )
+        org_result = await db.execute(select(Organization).where(Organization.id == user.organization_id))
+        org = org_result.scalars().first()
+        if org is None:
+            raise HTTPException(status_code=404, detail="Organization not found")
+        if (org.product_tier or "nokvo_prime") != "nokvo_prime":
+            raise HTTPException(
+                status_code=403,
+                detail="This endpoint is only available for Nokvo Prime organizations",
+            )
+        return user
+
+
+class RequireProductTier:
+    """Enforce that the calling org user's organization matches one of the allowed product tiers."""
+
+    def __init__(self, allowed_tiers: list[str]):
+        self.allowed_tiers = allowed_tiers
+
+    async def __call__(
+        self,
+        db: AsyncSession = Depends(get_db),
+        user: OrganizationUser = Depends(get_current_active_organization_user),
+    ) -> OrganizationUser:
+        result = await db.execute(select(Organization).where(Organization.id == user.organization_id))
+        org = result.scalars().first()
+        if org is None:
+            raise HTTPException(status_code=404, detail="Organization not found")
+        if (org.product_tier or "nokvo_prime") not in self.allowed_tiers:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Organization product tier '{org.product_tier}' is not permitted on this endpoint",
+            )
+        return user
+
+
+class RequireNokvoOneOrganization:
+    """Composite dep: active Nokvo One org user, optionally restricted to a set of org statuses."""
+
+    def __init__(self, allowed_statuses: list[str] | None = None, allowed_roles: list[str] | None = None):
+        self.allowed_statuses = allowed_statuses or ["active"]
+        self.allowed_roles = allowed_roles
+
+    async def __call__(
+        self,
+        db: AsyncSession = Depends(get_db),
+        user: OrganizationUser = Depends(get_current_active_organization_user),
+    ) -> OrganizationUser:
+        result = await db.execute(select(Organization).where(Organization.id == user.organization_id))
+        org = result.scalars().first()
+        if org is None:
+            raise HTTPException(status_code=404, detail="Organization not found")
+        if (org.product_tier or "nokvo_prime") != "nokvo_one":
+            raise HTTPException(status_code=403, detail="This endpoint is only available for Nokvo One organizations")
+        if org.status not in self.allowed_statuses:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Organization status '{org.status}' is not permitted on this endpoint",
+            )
+        if self.allowed_roles and user.role not in self.allowed_roles:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Operation not permitted. Required organization role: {self.allowed_roles}",
             )
         return user

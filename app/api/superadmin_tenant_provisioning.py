@@ -396,6 +396,7 @@ async def provision_tenant(
             call_type=org_in.call_type,
             language=org_in.language,
             plan_type=org_in.plan_type,
+            product_tier=org_in.product_tier,
             stores_pii=org_in.stores_pii,
             record_calls=org_in.record_calls,
             create_resource_group=org_in.create_resource_group,
@@ -482,6 +483,7 @@ async def provision_tenant_stream(
             call_type=org_in.call_type,
             language=org_in.language,
             plan_type=org_in.plan_type,
+            product_tier=org_in.product_tier,
             stores_pii=org_in.stores_pii,
             record_calls=org_in.record_calls,
             create_resource_group=org_in.create_resource_group,
@@ -715,3 +717,103 @@ async def reprovision_llm_key(
         "account_name": account_name,
         "resource_group": rg_name,
     }
+
+
+# ─────────── Nokvo One approval queue ───────────
+
+
+@router.get("/nokvo-one/pending")
+async def list_pending_nokvo_one_orgs(
+    db: AsyncSession = Depends(get_db),
+    current_user: SuperAdminUser = Depends(RequireRole(["founder", "engineering"])),
+):
+    result = await db.execute(
+        select(Organization)
+        .where(
+            Organization.product_tier == "nokvo_one",
+            Organization.status == "pending_approval",
+        )
+        .order_by(Organization.created_at.asc())
+    )
+    orgs = result.scalars().all()
+    return [
+        {
+            "id": str(org.id),
+            "name": org.name,
+            "admin_email": org.admin_email,
+            "admin_name": org.admin_name,
+            "email_domain": org.email_domain,
+            "status": org.status,
+            "calling_enabled": org.calling_enabled,
+            "created_at": org.created_at,
+        }
+        for org in orgs
+    ]
+
+
+@router.post("/nokvo-one/{organization_id}/approve")
+async def approve_nokvo_one_org(
+    organization_id: UUID,
+    body: dict | None = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: SuperAdminUser = Depends(RequireRole(["founder", "engineering"])),
+):
+    body = body or {}
+    enable_calling = bool(body.get("enable_calling", False))
+    plan_type = body.get("plan_type")
+
+    res = await db.execute(select(Organization).where(Organization.id == organization_id))
+    org = res.scalars().first()
+    if org is None:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    if org.product_tier != "nokvo_one":
+        raise HTTPException(status_code=400, detail="Organization is not a Nokvo One tenant")
+    if org.status not in {"pending_approval", "active"}:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot approve organization in status '{org.status}'",
+        )
+
+    org.status = "active"
+    if enable_calling:
+        org.calling_enabled = True
+    if plan_type:
+        org.plan_type = plan_type
+
+    # Promote any users still in pending_totp/invited (post-TOTP) to active.
+    member_res = await db.execute(
+        select(OrganizationUser).where(OrganizationUser.organization_id == org.id)
+    )
+    for member in member_res.scalars().all():
+        if member.status in {"pending_totp", "invited"}:
+            member.status = "active"
+            db.add(member)
+
+    db.add(org)
+    await db.commit()
+    await db.refresh(org)
+    return {
+        "id": str(org.id),
+        "status": org.status,
+        "calling_enabled": org.calling_enabled,
+        "plan_type": org.plan_type,
+    }
+
+
+@router.post("/nokvo-one/{organization_id}/suspend")
+async def suspend_nokvo_one_org(
+    organization_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: SuperAdminUser = Depends(RequireRole(["founder", "engineering"])),
+):
+    res = await db.execute(select(Organization).where(Organization.id == organization_id))
+    org = res.scalars().first()
+    if org is None:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    if org.product_tier != "nokvo_one":
+        raise HTTPException(status_code=400, detail="Organization is not a Nokvo One tenant")
+    org.status = "suspended"
+    org.calling_enabled = False
+    db.add(org)
+    await db.commit()
+    return {"id": str(org.id), "status": org.status}
