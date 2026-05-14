@@ -66,9 +66,15 @@ class Settings(BaseSettings):
     AZURE_OPENAI_AGENT_API_VERSION: str = "2024-10-21"
 
     # Nokvo One Azure OpenAI realtime-mini deployment.
-    # Defaults match the current GA model; override via env when Azure rotates versions.
+    # Per Azure Foundry docs (May 2026):
+    #   - gpt-realtime-mini valid versions: 2025-10-06, 2025-12-15
+    #   - Supported regions: canadacentral, centralus, eastus, eastus2, northcentralus,
+    #     francecentral, norwayeast, swedencentral, switzerlandnorth, southindia
+    #   - SKU: GlobalStandard everywhere; DataZoneStandard only in southindia.
+    # 2025-08-28 belongs to the full gpt-realtime (not the mini) — pairing it with
+    # gpt-realtime-mini returned DeploymentModelNotSupported. Use 2025-12-15 (newest mini).
     AZURE_OPENAI_REALTIME_MODEL: str = "gpt-realtime-mini"
-    AZURE_OPENAI_REALTIME_MODEL_VERSION: str = "2025-08-28"
+    AZURE_OPENAI_REALTIME_MODEL_VERSION: str = "2025-12-15"
     AZURE_OPENAI_REALTIME_DEPLOYMENT: str = "gpt-realtime-mini"
     AZURE_OPENAI_REALTIME_SKU: str = "GlobalStandard"
     AZURE_OPENAI_REALTIME_REGION: str = "swedencentral"

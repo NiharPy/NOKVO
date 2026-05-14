@@ -798,6 +798,30 @@ onBeforeUnmount(() => {
         </div>
 
         <!-- CHECK EMAIL -->
+        <!-- PROVISIONING LIVE STREAM -->
+        <div v-else-if="authState === 'provisioning_running'" class="mfa-panel">
+          <div class="mfa-head">
+            <strong>Setting up your environment</strong>
+            <span>{{ signup.admin_email }}</span>
+          </div>
+          <p class="login-help compact">
+            Provisioning your Azure resources, Qdrant collection, Redis namespace, and Exotel slot. This usually
+            takes 60–90 seconds. Don't close this tab.
+          </p>
+          <div v-if="provisioning" class="provisioning-block">
+            <ul class="provisioning-steps">
+              <li v-for="step in provisioning.steps" :key="step.name" :data-state="step.status">
+                <span class="step-marker" :data-state="step.status"></span>
+                <div>
+                  <strong>{{ stepLabel(step.name) }}</strong>
+                  <small>{{ stepDescription(step.name, step.status, provisioning) || step.status }}</small>
+                </div>
+                <span class="step-state">{{ step.status }}</span>
+              </li>
+            </ul>
+          </div>
+        </div>
+
         <div v-else-if="authState === 'check_email'" class="mfa-panel">
           <div class="mfa-head">
             <strong>Check your inbox</strong>
@@ -2654,9 +2678,19 @@ onBeforeUnmount(() => {
 }
 
 .provisioning-steps li[data-state="pending_credentials"],
-.provisioning-steps li[data-state="skipped_no_azure_subscription"] {
+.provisioning-steps li[data-state="skipped_no_azure_subscription"],
+.provisioning-steps li[data-state="skipped_no_shared_vault"] {
   border-color: rgba(217, 119, 6, 0.35);
   background: rgba(254, 243, 199, 0.55);
+}
+
+.provisioning-steps li[data-state="running"] {
+  border-color: rgba(59, 130, 246, 0.4);
+  background: rgba(219, 234, 254, 0.55);
+}
+
+.provisioning-steps li[data-state="pending"] {
+  opacity: 0.72;
 }
 
 .step-marker {
@@ -2668,8 +2702,18 @@ onBeforeUnmount(() => {
 
 .step-marker[data-state="success"] { background: #059669; }
 .step-marker[data-state="failed"] { background: #dc2626; }
+.step-marker[data-state="running"] {
+  background: #2563eb;
+  animation: stepPulse 1.2s ease-in-out infinite;
+}
 .step-marker[data-state="pending_credentials"],
-.step-marker[data-state="skipped_no_azure_subscription"] { background: #d97706; }
+.step-marker[data-state="skipped_no_azure_subscription"],
+.step-marker[data-state="skipped_no_shared_vault"] { background: #d97706; }
+
+@keyframes stepPulse {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.25); opacity: 0.65; }
+}
 
 .provisioning-steps strong {
   display: block;

@@ -3,7 +3,7 @@ Azure OpenAI realtime-mini provisioner for Nokvo One.
 
 Per Nokvo One design:
   - Creates an Azure OpenAI account in a tenant-specific resource group.
-  - Deploys gpt-4o-mini-realtime-preview (configurable).
+  - Deploys gpt-realtime-mini (model + version configurable via env).
   - Returns the endpoint + Fernet-encrypted API key.
   - Stores the key DIRECTLY on TenantResources.provider_status — no Key Vault.
   - Exposes a delete_realtime_account helper used by rollback.

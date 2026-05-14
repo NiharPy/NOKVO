@@ -262,6 +262,72 @@ def test_provisioner_rolls_back_when_redis_fails():
             p.stop()
 
 
+def test_on_step_emits_running_then_success_for_each_step():
+    """on_step callback is invoked for every step with running → success/skipped transitions."""
+    events: list[tuple[str, str]] = []
+
+    async def on_step(name, status_, _msg=None):
+        events.append((name, status_))
+
+    patches = _common_patches()
+    for p in patches:
+        p.start()
+    try:
+        _run(
+            NokvoOneProvisioningService.provision_or_raise(
+                organization_id=uuid.uuid4(),
+                organization_name="Acme Inc",
+                on_step=on_step,
+            )
+        )
+    finally:
+        for p in patches:
+            p.stop()
+
+    step_names = [n for n, _ in events]
+    # Every provisioning step must have appeared at least once.
+    for required in [
+        "resource_group",
+        "azure_openai_realtime_mini",
+        "shared_key_vault",
+        "blob_prefix",
+        "qdrant_collection",
+        "redis_namespace",
+        "exotel_placeholder",
+    ]:
+        assert required in step_names, f"missing step {required} in {step_names}"
+
+    # RG should be reported running then success (in that order).
+    rg_events = [s for n, s in events if n == "resource_group"]
+    assert rg_events[:2] == ["running", "success"]
+
+
+def test_on_step_emits_failed_then_provisioning_raises():
+    events: list[tuple[str, str]] = []
+
+    async def on_step(name, status_, _msg=None):
+        events.append((name, status_))
+
+    rg = AsyncMock(side_effect=RuntimeError("forbidden region"))
+    patches = _common_patches(rg=rg)
+    for p in patches:
+        p.start()
+    try:
+        with pytest.raises(NokvoOneProvisioningError):
+            _run(
+                NokvoOneProvisioningService.provision_or_raise(
+                    organization_id=uuid.uuid4(),
+                    organization_name="Acme",
+                    on_step=on_step,
+                )
+            )
+    finally:
+        for p in patches:
+            p.stop()
+    assert ("resource_group", "running") in events
+    assert ("resource_group", "failed") in events
+
+
 def test_provisioner_raises_when_rg_fails_immediately():
     rg = AsyncMock(side_effect=RuntimeError("subscription not configured"))
     patches = _common_patches(rg=rg)
