@@ -3,10 +3,9 @@
 Flow:
   1. Admin uploads Excel (phone + name columns) + reference document
   2. Service creates OutboundCampaign row (status=draft)
-  3. On launch: fires parallel Telnyx outbound calls, one per contact
-  4. Each call gets a unique call_link_id → voice webhook returns TeXML with
-     the campaign WebSocket URL, which injects campaign doc chunks into the agent
-  5. Per-call status updated via Telnyx status callbacks
+  3. Campaign reference text is chunked, embedded, and indexed in Qdrant
+  4. On launch: fires parallel Exotel outbound calls, one per contact
+  5. Each answered call connects to the Nokvo One Sarvam/RAG voice pipeline
 """
 from __future__ import annotations
 
@@ -21,9 +20,13 @@ from fastapi import UploadFile
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.models.outbound_campaign import CampaignStatus, OutboundCampaign
 from app.models.tenant_resources import TenantResources
-from app.services.telnyx_service import TelnyxService
+from app.services.agent_knowledge_service import AGENT_KNOWLEDGE_SOURCE_TYPE, AgentKnowledgeService
+from app.services.exotel_service import ExotelService
+from app.services.qdrant_service import QdrantService
+from app.services.text_embedding_service import TextEmbeddingService
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +112,59 @@ def _doc_to_chunks(text: str, words_per_chunk: int = 350) -> list[dict[str, Any]
 # ---------------------------------------------------------------------------
 
 class OutboundCampaignService:
+    @staticmethod
+    async def _index_campaign_script(
+        tenant_res: TenantResources,
+        campaign_id: uuid.UUID,
+        campaign_name: str,
+        doc_text: str,
+        *,
+        db: AsyncSession | None = None,
+    ) -> int:
+        chunks = AgentKnowledgeService._chunk_text(doc_text)
+        if not chunks:
+            raise ValueError("No usable text was found in the campaign script document.")
+        texts = [chunk["text"] for chunk in chunks]
+        vectors = await TextEmbeddingService.embed_texts(texts)
+        points: list[dict[str, Any]] = []
+        for index, chunk in enumerate(chunks):
+            chunk_id = f"campaign:{campaign_id}:chunk:{index}"
+            points.append(
+                {
+                    "id": str(uuid.uuid5(uuid.NAMESPACE_URL, f"{tenant_res.tenant_id}:{chunk_id}")),
+                    "vector": vectors[index],
+                    "payload": {
+                        "organization_id": str(tenant_res.organization_id),
+                        "tenant_id": tenant_res.tenant_id,
+                        "source_type": AGENT_KNOWLEDGE_SOURCE_TYPE,
+                        "source_kind": "campaign_script_chunk",
+                        "resource_type": "campaign_script_chunk",
+                        "resource": f"campaigns/{campaign_id}/script/{index}",
+                        "document_id": f"campaign:{campaign_id}:script",
+                        "document_name": f"{campaign_name} Script",
+                        "document_type": "script",
+                        "campaign_id": str(campaign_id),
+                        "chunk_id": chunk_id,
+                        "chunk_index": index,
+                        "chunk_count": len(chunks),
+                        "text": chunk["text"],
+                        "status": "active",
+                        "document_status": "ok",
+                        "approval_status": "approved",
+                        "active": True,
+                        "language": "en",
+                        "source_title": f"{campaign_name} Script",
+                        "sensitivity": "normal",
+                    },
+                }
+            )
+        await QdrantService.delete_points_by_filter(
+            tenant_res,
+            {"source_type": AGENT_KNOWLEDGE_SOURCE_TYPE, "campaign_id": str(campaign_id)},
+            db=db,
+        )
+        await QdrantService.upsert_points(tenant_res, points, db=db)
+        return len(points)
 
     # ------------------------------------------------------------------
     # CRUD
@@ -147,15 +203,16 @@ class OutboundCampaignService:
         except Exception:
             pass
 
-        # Resolve caller ID: provided → first linked Telnyx number → error
-        caller_id = from_number
+        # Resolve caller ID: provided → Exotel config → linked phone → global default.
+        exotel_cfg = dict((tenant_res.provider_status or {}).get("exotel") or {})
+        caller_id = (
+            from_number
+            or exotel_cfg.get("from_number")
+            or tenant_res.twilio_phone_number
+            or settings.EXOTEL_CALLER_ID
+        )
         if not caller_id:
-            links = TelnyxService.list_linked_numbers(tenant_res)
-            if links:
-                caller_id = links[0]["phone_number"]
-        if not caller_id:
-            raise ValueError("No phone number available as caller ID. "
-                             "Link at least one phone number to this tenant first.")
+            raise ValueError("No Exotel caller ID is configured. Link an Exotel number first.")
 
         contacts = [
             {
@@ -170,8 +227,17 @@ class OutboundCampaignService:
             for c in contacts_raw
         ]
 
+        campaign_id = uuid.uuid4()
+        indexed_points = await OutboundCampaignService._index_campaign_script(
+            tenant_res,
+            campaign_id,
+            name,
+            doc_text,
+            db=db,
+        )
+
         campaign = OutboundCampaign(
-            id=uuid.uuid4(),
+            id=campaign_id,
             tenant_id=tenant_res.tenant_id,
             name=name,
             status=CampaignStatus.draft,
@@ -184,6 +250,10 @@ class OutboundCampaignService:
         db.add(campaign)
         await db.commit()
         await db.refresh(campaign)
+        # Keep a small denormalized marker for the operator console without
+        # altering the campaign table.
+        for contact in campaign.contacts or []:
+            contact.setdefault("script_indexed_points", indexed_points)
         return campaign
 
     @staticmethod
@@ -246,15 +316,20 @@ class OutboundCampaignService:
         # Fire all calls in parallel — don't await individually
         async def _call_one(contact: dict) -> None:
             link_id = contact["call_link_id"]
-            webhook = f"{base}/api/org-auth/agent/telnyx/outbound-voice/{link_id}"
+            ws_base = base.replace("https://", "wss://").replace("http://", "ws://")
+            stream_url = f"{ws_base}/api/org-auth/agent/exotel/outbound-media/{link_id}"
+            status_callback = f"{base}/api/org-auth/agent/exotel/outbound-status/{link_id}"
             try:
-                result = await TelnyxService.initiate_call(
-                    from_number=campaign.from_number,
+                result = await ExotelService.initiate_outbound_call(
+                    tenant_res,
                     to_number=contact["phone"],
-                    webhook_url=webhook,
-                    client_state=f"{campaign.id}:{link_id}",
+                    stream_url=stream_url,
+                    status_callback=status_callback,
+                    custom_field=f"{campaign.id}:{link_id}",
+                    from_number=campaign.from_number,
                 )
-                contact["call_id"] = result.get("call_control_id") or result.get("id")
+                call = result.get("call") if isinstance(result.get("call"), dict) else result
+                contact["call_id"] = call.get("sid") or call.get("id")
                 contact["status"] = "calling"
             except Exception as exc:
                 contact["status"] = "failed"

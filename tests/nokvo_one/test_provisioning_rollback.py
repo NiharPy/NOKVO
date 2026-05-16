@@ -63,7 +63,7 @@ def _common_patches(
             rg,
         ),
         patch(
-            "app.services.nokvo_one_provisioning_service.AzureRealtimeAIService.provision_realtime_account",
+            "app.services.nokvo_one_provisioning_service.AzureOpenAIChatService.provision_chat_account",
             ai,
         ),
         patch(
@@ -136,7 +136,7 @@ def test_provisioner_rolls_back_when_key_vault_fails():
             rg_delete,
         ),
         patch(
-            "app.services.nokvo_one_provisioning_service.AzureRealtimeAIService.delete_realtime_account",
+            "app.services.nokvo_one_provisioning_service.AzureOpenAIChatService.delete_chat_account",
             ai_delete,
         ),
         patch(
@@ -177,7 +177,7 @@ def test_provisioner_rolls_back_when_qdrant_fails():
             rg_delete,
         ),
         patch(
-            "app.services.nokvo_one_provisioning_service.AzureRealtimeAIService.delete_realtime_account",
+            "app.services.nokvo_one_provisioning_service.AzureOpenAIChatService.delete_chat_account",
             ai_delete,
         ),
         patch(
@@ -225,7 +225,7 @@ def test_provisioner_rolls_back_when_redis_fails():
             rg_delete,
         ),
         patch(
-            "app.services.nokvo_one_provisioning_service.AzureRealtimeAIService.delete_realtime_account",
+            "app.services.nokvo_one_provisioning_service.AzureOpenAIChatService.delete_chat_account",
             ai_delete,
         ),
         patch(
@@ -288,7 +288,7 @@ def test_on_step_emits_running_then_success_for_each_step():
     # Every provisioning step must have appeared at least once.
     for required in [
         "resource_group",
-        "azure_openai_realtime_mini",
+        "azure_openai_chat",
         "shared_key_vault",
         "blob_prefix",
         "qdrant_collection",

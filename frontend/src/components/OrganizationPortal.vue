@@ -79,6 +79,10 @@ const agentRuntimeStatus = ref(null);
 const agentPhoneLink = ref({ status: 'not_linked', phone_number: '' });
 const agentPhoneForm = ref({ phone_number: '' });
 const agentLatencyResult = ref(null);
+const agentCampaigns = ref([]);
+const agentCampaignForm = ref({ name: '', from_number: '' });
+const agentCampaignContactsFile = ref(null);
+const agentCampaignScriptFile = ref(null);
 const voiceSocket = ref(null);
 const voiceRecorder = ref(null);
 const voiceMediaStream = ref(null);
@@ -155,6 +159,9 @@ const isTestingAgentAnswer = ref(false);
 const isStartingVoiceSession = ref(false);
 const isLinkingAgentPhone = ref(false);
 const isTestingAgentLatency = ref(false);
+const isLoadingAgentCampaigns = ref(false);
+const isCreatingAgentCampaign = ref(false);
+const launchingCampaignId = ref(null);
 const isLoadingMembers = ref(false);
 const isSavingMember = ref(false);
 const updatingMemberId = ref(null);
@@ -622,6 +629,10 @@ function clearSession() {
   agentPhoneLink.value = { status: 'not_linked', phone_number: '' };
   agentPhoneForm.value = { phone_number: '' };
   agentLatencyResult.value = null;
+  agentCampaigns.value = [];
+  agentCampaignForm.value = { name: '', from_number: '' };
+  agentCampaignContactsFile.value = null;
+  agentCampaignScriptFile.value = null;
   voiceSocket.value = null;
   voiceRecorder.value = null;
   voiceMediaStream.value = null;
@@ -979,6 +990,7 @@ function switchPage(page) {
     fetchAgentDocuments();
     fetchAgentRuntimeStatus();
     fetchAgentPhoneLink();
+    fetchAgentCampaigns();
   }
 }
 
@@ -1305,9 +1317,109 @@ async function fetchAgentPhoneLink() {
   }
 }
 
+async function fetchAgentCampaigns() {
+  if (!canManageDatabase.value) {
+    agentCampaigns.value = [];
+    return;
+  }
+  isLoadingAgentCampaigns.value = true;
+  try {
+    agentCampaigns.value = await apiRequest('/org-auth/agent/campaigns');
+  } catch (error) {
+    errorMsg.value = error.message;
+  } finally {
+    isLoadingAgentCampaigns.value = false;
+  }
+}
+
+function handleCampaignContactsFile(event) {
+  const [file] = Array.from(event.target.files || []);
+  agentCampaignContactsFile.value = file || null;
+}
+
+function handleCampaignScriptFile(event) {
+  const [file] = Array.from(event.target.files || []);
+  agentCampaignScriptFile.value = file || null;
+  if (file && !agentCampaignForm.value.name) {
+    agentCampaignForm.value.name = file.name.replace(/\.[^.]+$/, '').replace(/[-_]+/g, ' ');
+  }
+}
+
+async function createAgentCampaign() {
+  if (!agentCampaignForm.value.name.trim()) {
+    errorMsg.value = 'Campaign name is required.';
+    return;
+  }
+  if (!agentCampaignContactsFile.value || !agentCampaignScriptFile.value) {
+    errorMsg.value = 'Upload both the contact sheet and campaign script.';
+    return;
+  }
+  isCreatingAgentCampaign.value = true;
+  errorMsg.value = '';
+  infoMsg.value = '';
+  try {
+    const formData = new FormData();
+    formData.append('name', agentCampaignForm.value.name.trim());
+    if (agentCampaignForm.value.from_number.trim()) {
+      formData.append('from_number', agentCampaignForm.value.from_number.trim());
+    }
+    formData.append('contacts_file', agentCampaignContactsFile.value);
+    formData.append('script_file', agentCampaignScriptFile.value);
+    await apiRequest('/org-auth/agent/campaigns', {
+      method: 'POST',
+      body: formData,
+    });
+    infoMsg.value = 'Campaign created and script indexed in Qdrant.';
+    agentCampaignForm.value = { name: '', from_number: '' };
+    agentCampaignContactsFile.value = null;
+    agentCampaignScriptFile.value = null;
+    await fetchAgentCampaigns();
+  } catch (error) {
+    errorMsg.value = error.message;
+  } finally {
+    isCreatingAgentCampaign.value = false;
+  }
+}
+
+async function launchAgentCampaign(campaign) {
+  if (!campaign?.id) {
+    return;
+  }
+  launchingCampaignId.value = campaign.id;
+  errorMsg.value = '';
+  infoMsg.value = '';
+  try {
+    await apiRequest(`/org-auth/agent/campaigns/${campaign.id}/launch`, { method: 'POST' });
+    infoMsg.value = 'Outbound campaign launch requested through Exotel.';
+    await fetchAgentCampaigns();
+  } catch (error) {
+    errorMsg.value = error.message;
+  } finally {
+    launchingCampaignId.value = null;
+  }
+}
+
+async function cancelAgentCampaign(campaign) {
+  if (!campaign?.id) {
+    return;
+  }
+  launchingCampaignId.value = campaign.id;
+  errorMsg.value = '';
+  infoMsg.value = '';
+  try {
+    await apiRequest(`/org-auth/agent/campaigns/${campaign.id}/cancel`, { method: 'POST' });
+    infoMsg.value = 'Campaign cancelled.';
+    await fetchAgentCampaigns();
+  } catch (error) {
+    errorMsg.value = error.message;
+  } finally {
+    launchingCampaignId.value = null;
+  }
+}
+
 async function linkAgentPhoneNumber() {
   if (!agentPhoneForm.value.phone_number.trim()) {
-    errorMsg.value = 'Enter a Twilio phone number to link.';
+    errorMsg.value = 'Enter an Exotel phone number to link.';
     return;
   }
   isLinkingAgentPhone.value = true;
@@ -1368,7 +1480,7 @@ async function uploadAgentDocument() {
         content_base64: contentBase64,
       }),
     });
-    infoMsg.value = 'Document uploaded and chunked. Approve it before the agent can use it.';
+    infoMsg.value = 'Document uploaded, chunked, embedded, and indexed for the agent.';
     agentUploadForm.value = { name: '', document_type: 'policy', description: '', tags: '' };
     agentUploadFile.value = null;
     await fetchAgentDocuments();
@@ -1543,6 +1655,13 @@ function handleVoiceRuntimeMessage(raw) {
     }
     appendVoiceEvent({ type: message.refused ? 'REFUSAL' : 'ANSWER', text: message.answer || '' });
   }
+  if (message.type === 'agent_sentence') {
+    appendVoiceEvent({
+      type: 'ANSWER_SENTENCE',
+      text: message.sentence || '',
+      detail: message.cache_hit ? 'Served from semantic cache' : `First sentence: ${message.first_sentence_ms ?? 'n/a'}ms`,
+    });
+  }
   if (message.type === 'tts_warmed') {
     const purpose = message.purpose || 'answer';
     appendVoiceEvent({
@@ -1557,8 +1676,8 @@ function handleVoiceRuntimeMessage(raw) {
       type: 'TTS_STARTED',
       text: `${purpose} TTS request sent in ${message.request_sent_ms ?? 'n/a'}ms`,
       detail: message.warm_connection
-        ? `Using warmed Soniox TTS stream. Initial warmup: ${message.warm_connected_ms ?? 'n/a'}ms`
-        : `Soniox websocket connected in ${message.connected_ms ?? 'n/a'}ms`,
+        ? `Using warmed Sarvam TTS stream. Initial warmup: ${message.warm_connected_ms ?? 'n/a'}ms`
+        : `Sarvam TTS request opened in ${message.connected_ms ?? 'n/a'}ms`,
     });
   }
   if (message.type === 'tts_first_audio') {
@@ -2960,17 +3079,17 @@ onBeforeUnmount(() => {
       <section v-if="currentPage === 'agent'" class="dashboard-section agent-page">
         <div class="dashboard-section-head">
           <div>
-            <span class="section-kicker">Agent Knowledge</span>
+            <span class="section-kicker">Nokvo One Agent</span>
             <h3>Agent Studio</h3>
           </div>
-          <p>Upload policies and documents, approve them for RAG, and test grounded answers before any voice streaming runtime is enabled.</p>
+          <p>Prepare tenant knowledge off the call path, test grounded answers, and run Sarvam + Exotel voice sessions from one operator console.</p>
         </div>
 
         <div v-if="canManageDatabase" class="agent-hero-panel">
           <div>
-            <span class="section-kicker">Approved Context Only</span>
-            <h2>Knowledge-first answering agent</h2>
-            <p>Raw files are stored as blob artifacts. The agent can only retrieve approved, organization-scoped Qdrant chunks and must refuse when context is missing.</p>
+            <span class="section-kicker">Ingestion Off Hot Path</span>
+            <h2>Pre-indexed voice RAG agent</h2>
+            <p>Raw files are stored first, then parsed, chunked, embedded, and indexed into the tenant Qdrant collection before any call uses them.</p>
           </div>
           <div class="agent-hero-stats">
             <span><strong>{{ approvedAgentDocumentCount }}</strong> approved docs</span>
@@ -2987,7 +3106,7 @@ onBeforeUnmount(() => {
               </div>
               <div>
                 <h3>Upload Knowledge</h3>
-                <p>Name the document, store the raw file in blob, then embed chunks into the organization collection.</p>
+                <p>Name the document, store the raw file in blob, then embed chunks into the tenant collection.</p>
               </div>
             </div>
 
@@ -3029,7 +3148,7 @@ onBeforeUnmount(() => {
 
             <div class="db-actions">
               <button type="button" class="primary-button" :disabled="isUploadingAgentDocument" @click="uploadAgentDocument">
-                {{ isUploadingAgentDocument ? 'Uploading...' : 'Upload & Index For Review' }}
+                {{ isUploadingAgentDocument ? 'Uploading...' : 'Upload & Index' }}
               </button>
             </div>
           </article>
@@ -3038,7 +3157,7 @@ onBeforeUnmount(() => {
             <div class="members-card-head">
               <div>
                 <h3>Document Lifecycle</h3>
-                <p>Only approved chunks are retrievable. Pending and rejected documents stay blocked from the agent.</p>
+                <p>Documents move through pending, ok, empty, or error. Calls only use already indexed chunks.</p>
               </div>
               <span class="status-chip">{{ filteredAgentDocuments.length }} docs</span>
             </div>
@@ -3088,9 +3207,9 @@ onBeforeUnmount(() => {
             <div class="members-card-head">
               <div>
                 <h3>Agent Test Console</h3>
-                <p>Test retrieval and grounded answer behavior before adding Soniox STT/TTS and streaming voice.</p>
+                <p>Test retrieval, semantic cache behavior, and grounded answers before routing Exotel calls.</p>
               </div>
-              <span class="status-chip">Pre-voice runtime</span>
+              <span class="status-chip">RAG runtime</span>
             </div>
 
             <div class="agent-console-grid">
@@ -3124,7 +3243,7 @@ onBeforeUnmount(() => {
                 <div class="agent-result-panel answer">
                   <strong>Grounded Answer</strong>
                   <p v-if="agentTestAnswer?.answer">{{ agentTestAnswer.answer }}</p>
-                  <p v-else>The answer endpoint refuses when no approved context is found.</p>
+                  <p v-else>The answer endpoint refuses when no indexed tenant context is found.</p>
                   <div v-if="agentTestAnswer?.intent" class="agent-debug-grid">
                     <span>Intent</span>
                     <strong>{{ agentTestAnswer.intent.type || 'unknown' }}</strong>
@@ -3143,15 +3262,15 @@ onBeforeUnmount(() => {
               <div class="members-card-head">
                 <div>
                   <h3>Voice Runtime</h3>
-                  <p>Soniox STT → LangGraph grounded answer → Soniox TTS. Uses approved chunks only.</p>
+                  <p>Exotel media → Sarvam STT → streamed Azure OpenAI RAG → sentence-level Sarvam TTS.</p>
                 </div>
-                <span class="status-chip">{{ agentRuntimeStatus?.graph || 'langgraph' }}</span>
+                <span class="status-chip">{{ agentRuntimeStatus?.graph || 'nokvo_rag_pipeline' }}</span>
               </div>
 
               <div class="agent-runtime-strip">
-                <span><Radio :size="15" /> STT {{ agentRuntimeStatus?.stt?.model || 'stt-rt-v4' }}</span>
+                <span><Radio :size="15" /> STT {{ agentRuntimeStatus?.stt?.model || 'saaras:v3' }}</span>
                 <span>LLM {{ agentRuntimeStatus?.llm?.model || 'gpt-4.1-mini' }}</span>
-                <span>TTS {{ agentRuntimeStatus?.tts?.voice || 'Adrian' }}</span>
+                <span>TTS {{ agentRuntimeStatus?.tts?.voice || 'shubh' }}</span>
               </div>
 
               <div class="db-form-block agent-language-control">
@@ -3165,15 +3284,15 @@ onBeforeUnmount(() => {
                     {{ language.label }} - {{ language.native_label }}
                   </option>
                 </select>
-                <p class="db-note">This controls Soniox STT hints, GPT-4.1-mini response language, and Soniox TTS language.</p>
+                <p class="db-note">This controls Sarvam STT hints, GPT-4.1-mini response language, and Sarvam TTS language.</p>
               </div>
 
               <div class="agent-phone-link-card">
                 <div>
-                  <span class="section-kicker">Twilio Phone Link</span>
+                  <span class="section-kicker">Exotel Phone Link</span>
                   <strong>{{ agentPhoneLink?.status === 'linked' ? agentPhoneLink.phone_number : 'No phone linked' }}</strong>
                   <small v-if="agentPhoneLink?.voice_url">{{ agentPhoneLink.voice_url }}</small>
-                  <small v-else>Link a Twilio number in this organization’s subaccount to route calls to the Agent runtime.</small>
+                  <small v-else>Link an Exotel number to route inbound calls to the Nokvo One agent runtime.</small>
                 </div>
                 <div class="agent-phone-actions">
                   <input v-model="agentPhoneForm.phone_number" class="db-input" type="text" placeholder="+91XXXXXXXXXX" />
@@ -3188,6 +3307,60 @@ onBeforeUnmount(() => {
                   >
                     Remove
                   </button>
+                </div>
+              </div>
+
+              <div class="agent-campaign-card">
+                <div class="members-card-head">
+                  <div>
+                    <h3>Outbound Campaign Test</h3>
+                    <p>Upload contacts and a script document. The script is indexed under the campaign before Exotel calls are launched.</p>
+                  </div>
+                  <span class="status-chip">{{ agentCampaigns.length }} campaigns</span>
+                </div>
+
+                <div class="agent-campaign-form">
+                  <input v-model="agentCampaignForm.name" class="db-input" type="text" placeholder="Campaign name" />
+                  <input v-model="agentCampaignForm.from_number" class="db-input" type="text" placeholder="Caller ID (optional)" />
+                  <label class="campaign-file-input">
+                    <span>{{ agentCampaignContactsFile?.name || 'Contacts .xlsx' }}</span>
+                    <input type="file" accept=".xlsx,.xls" @change="handleCampaignContactsFile" />
+                  </label>
+                  <label class="campaign-file-input">
+                    <span>{{ agentCampaignScriptFile?.name || 'Script PDF/DOCX/TXT' }}</span>
+                    <input type="file" accept=".pdf,.doc,.docx,.txt,.md" @change="handleCampaignScriptFile" />
+                  </label>
+                  <button type="button" class="primary-button compact" :disabled="isCreatingAgentCampaign" @click="createAgentCampaign">
+                    {{ isCreatingAgentCampaign ? 'Indexing...' : 'Create Campaign' }}
+                  </button>
+                </div>
+
+                <div class="agent-campaign-list">
+                  <div v-if="isLoadingAgentCampaigns" class="empty-state compact">Loading campaigns...</div>
+                  <div v-else-if="!agentCampaigns.length" class="empty-state compact">No outbound campaigns created yet.</div>
+                  <div v-for="campaign in agentCampaigns" :key="campaign.id" class="agent-campaign-row">
+                    <div>
+                      <strong>{{ campaign.name }}</strong>
+                      <small>{{ campaign.total_count }} contacts · {{ campaign.answered_count }} answered · {{ campaign.failed_count }} failed</small>
+                    </div>
+                    <span class="status-chip">{{ campaign.status }}</span>
+                    <button
+                      type="button"
+                      class="primary-button compact"
+                      :disabled="launchingCampaignId === campaign.id || campaign.status !== 'draft'"
+                      @click="launchAgentCampaign(campaign)"
+                    >
+                      {{ launchingCampaignId === campaign.id ? 'Launching...' : 'Launch' }}
+                    </button>
+                    <button
+                      type="button"
+                      class="ghost-button compact"
+                      :disabled="launchingCampaignId === campaign.id || !['draft', 'running'].includes(campaign.status)"
+                      @click="cancelAgentCampaign(campaign)"
+                    >
+                      Cancel
+                    </button>
+                  </div>
                 </div>
               </div>
 
@@ -3228,7 +3401,7 @@ onBeforeUnmount(() => {
                 </div>
                 <div class="agent-result-panel">
                   <strong>Agent Spoken Answer</strong>
-                  <p>{{ voiceAgentAnswer || 'The voice answer appears here and plays through Soniox TTS.' }}</p>
+                  <p>{{ voiceAgentAnswer || 'The voice answer appears here and plays through Sarvam TTS.' }}</p>
                   <small v-if="voiceTtsFirstAudioMs !== null">
                     First TTS audio: {{ voiceTtsFirstAudioMs }}ms
                     {{ voiceTtsFirstAudioMs <= 800 ? '(within 800ms)' : '(over 800ms)' }}
@@ -3240,7 +3413,7 @@ onBeforeUnmount(() => {
                 <div v-if="!voiceEvents.length" class="empty-state compact">No voice runtime events yet.</div>
                 <div v-for="event in voiceEvents" :key="event.id" class="agent-event-row" :class="{
                   'event-intent': event.type === 'INTENT',
-                  'event-answer': event.type === 'ANSWER',
+                  'event-answer': event.type === 'ANSWER' || event.type === 'ANSWER_SENTENCE',
                   'event-transcript': event.type === 'TRANSCRIPT',
                   'event-error': event.type === 'TTS_ERROR' || event.type?.includes('ERROR'),
                   'event-refusal': event.type === 'REFUSAL',
@@ -5186,6 +5359,71 @@ onBeforeUnmount(() => {
   align-items: center;
 }
 
+.agent-campaign-card {
+  margin: 1rem 0;
+  padding: 1rem;
+  border-radius: 1rem;
+  background: rgba(255, 255, 255, 0.7);
+  border: 1px solid rgba(196, 199, 199, 0.42);
+}
+
+.agent-campaign-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 0.75fr);
+  gap: 0.7rem;
+  margin-top: 1rem;
+}
+
+.campaign-file-input {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  min-height: 2.6rem;
+  border: 1px dashed rgba(116, 120, 120, 0.55);
+  border-radius: 0.85rem;
+  background: rgba(239, 238, 227, 0.58);
+  padding: 0.65rem 0.8rem;
+  color: #444748;
+  font-size: 0.82rem;
+  font-weight: 800;
+  overflow: hidden;
+}
+
+.campaign-file-input input {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.agent-campaign-list {
+  display: grid;
+  gap: 0.65rem;
+  margin-top: 0.9rem;
+}
+
+.agent-campaign-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
+  gap: 0.65rem;
+  align-items: center;
+  padding: 0.75rem;
+  border-radius: 0.85rem;
+  background: rgba(255, 255, 255, 0.7);
+  border: 1px solid rgba(196, 199, 199, 0.36);
+}
+
+.agent-campaign-row strong,
+.agent-campaign-row small {
+  display: block;
+}
+
+.agent-campaign-row small {
+  margin-top: 0.18rem;
+  color: #5f5f53;
+  font-size: 0.78rem;
+}
+
 .agent-latency-result {
   display: flex;
   justify-content: space-between;
@@ -5722,6 +5960,9 @@ onBeforeUnmount(() => {
 .org-shell.dark .agent-runtime-strip span,
 .org-shell.dark .agent-event-row,
 .org-shell.dark .agent-phone-link-card,
+.org-shell.dark .agent-campaign-card,
+.org-shell.dark .agent-campaign-row,
+.org-shell.dark .campaign-file-input,
 .org-shell.dark .agent-latency-result {
   background: rgba(28, 31, 24, 0.78);
   color: #f2f1e5;
@@ -5737,6 +5978,7 @@ onBeforeUnmount(() => {
 .org-shell.dark .agent-event-row span,
 .org-shell.dark .agent-event-row p,
 .org-shell.dark .agent-phone-link-card small,
+.org-shell.dark .agent-campaign-row small,
 .org-shell.dark .agent-latency-result span {
   color: #c8c7bc;
 }
@@ -5793,7 +6035,9 @@ onBeforeUnmount(() => {
   .agent-document-row,
   .agent-voice-grid,
   .agent-phone-link-card,
-  .agent-phone-actions {
+  .agent-phone-actions,
+  .agent-campaign-form,
+  .agent-campaign-row {
     grid-template-columns: 1fr;
   }
 

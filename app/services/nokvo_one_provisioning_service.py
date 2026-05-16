@@ -3,12 +3,13 @@ All-or-nothing tenant provisioner for Nokvo One.
 
 Steps (strict order — any failure raises and rolls back in reverse):
 
-  1. Azure Resource Group (per-tenant, lightweight)
-  2. Azure OpenAI realtime-mini account + deployment in that RG
-  3. Shared blob prefix tenants/{tenant_id}/ in the shared storage account
-  4. Qdrant collection in the shared cluster
-  5. Redis namespace in shared Redis
-  6. Exotel placeholder record (credentials added later by superadmin/admin)
+  1. Azure Resource Group (per-tenant, lightweight) in South India
+  2. Azure OpenAI gpt-4.1-mini account + chat deployment in that RG (South India)
+  3. Shared Key Vault placeholders + live LLM API key + Sarvam STT/TTS keys
+  4. Shared blob prefix tenants/{tenant_id}/ in the shared storage account
+  5. Qdrant collection in the shared cluster
+  6. Redis namespace in shared Redis
+  7. Exotel placeholder record (credentials added later by superadmin/admin)
 
 On success, returns a dict ready to seed a TenantResources row. The caller (the
 signup endpoint) persists Organization + OrganizationUser + TenantResources in a
@@ -28,7 +29,7 @@ import redis.asyncio as redis_async
 from app.core.config import settings
 from app.services.azure_blob_service import AzureBlobService
 from app.services.azure_keyvault_service import AzureKeyVaultService
-from app.services.azure_realtime_ai_service import AzureRealtimeAIService
+from app.services.azure_openai_chat_service import AzureOpenAIChatService
 from app.services.azure_resource_group_service import AzureResourceGroupService
 from app.services.qdrant_service import QdrantService
 from app.services.redis_tenant_service import RedisTenantService
@@ -115,7 +116,7 @@ class NokvoOneProvisioningService:
         organization_id: uuid.UUID,
         organization_name: str,
         environment: str = "staging",
-        region: str = "centralindia",
+        region: str = "southindia",
         on_step: StepCallback | None = None,
     ) -> dict[str, Any]:
         tenant_id = str(uuid.uuid4())
@@ -130,7 +131,7 @@ class NokvoOneProvisioningService:
                     await AzureResourceGroupService.delete_resource_group(payload)
                 elif kind == "ai":
                     rg, account = payload
-                    await AzureRealtimeAIService.delete_realtime_account(rg, account)
+                    await AzureOpenAIChatService.delete_chat_account(rg, account)
                 elif kind == "key_vault_secrets":
                     for secret_name in payload:
                         await AzureKeyVaultService.delete_secret(secret_name)
@@ -157,10 +158,10 @@ class NokvoOneProvisioningService:
             await _emit(on_step, "resource_group", "failed", str(exc))
             raise NokvoOneProvisioningError("resource_group", str(exc), exc) from exc
 
-        # ── Step 2: Azure OpenAI realtime-mini ───────────────────────────────
-        await _emit(on_step, "azure_openai_realtime_mini", "running")
+        # ── Step 2: Azure OpenAI gpt-4.1-mini chat deployment ────────────────
+        await _emit(on_step, "azure_openai_chat", "running")
         try:
-            ai_result = await AzureRealtimeAIService.provision_realtime_account(
+            ai_result = await AzureOpenAIChatService.provision_chat_account(
                 rg_name=rg_name,
                 tenant_id=tenant_id,
                 slug=slug,
@@ -172,18 +173,20 @@ class NokvoOneProvisioningService:
                 )
             if ai_result.get("status") == "provisioned":
                 rollback_actions.append(("ai", (rg_name, ai_result["account_name"])))
-            await _emit(on_step, "azure_openai_realtime_mini", ai_result.get("status", "success"))
+            await _emit(on_step, "azure_openai_chat", ai_result.get("status", "success"))
         except Exception as exc:
-            await _emit(on_step, "azure_openai_realtime_mini", "failed", str(exc))
+            await _emit(on_step, "azure_openai_chat", "failed", str(exc))
             await rollback()
             if isinstance(exc, NokvoOneProvisioningError):
                 raise
-            raise NokvoOneProvisioningError("azure_openai_realtime_mini", str(exc), exc) from exc
+            raise NokvoOneProvisioningError("azure_openai_chat", str(exc), exc) from exc
 
-        # ── Step 3: Shared Key Vault placeholders + live LLM key ─────────────
+        # ── Step 3: Shared Key Vault placeholders + live LLM/STT/TTS keys ────
         kv_status = "skipped_no_shared_vault"
         kv_secret_refs: dict = {}
         llm_api_key_secret_name: str | None = None
+        stt_api_key_secret_name: str | None = None
+        tts_api_key_secret_name: str | None = None
         if settings.AZURE_SHARED_KEY_VAULT_NAME:
             await _emit(on_step, "shared_key_vault", "running")
             try:
@@ -204,6 +207,35 @@ class NokvoOneProvisioningService:
                         secret_role="llm_api_key",
                     )
                     llm_api_key_secret_name = llm_ref
+
+                # Seed Sarvam STT + TTS keys from the platform SARVAM_API_KEY so the
+                # per-tenant voice pipeline can pull credentials from Key Vault rather
+                # than fall back to global env. Admins can rotate per-tenant later.
+                sarvam_key = (settings.SARVAM_API_KEY or "").strip()
+                if sarvam_key:
+                    stt_ref = (kv_secret_refs.get("stt_api_key") or {}).get("secret_name")
+                    tts_ref = (kv_secret_refs.get("tts_api_key") or {}).get("secret_name")
+                    if stt_ref:
+                        await AzureKeyVaultService.set_secret_value(
+                            secret_name=stt_ref,
+                            secret_value=sarvam_key,
+                            tenant_id=tenant_id,
+                            secret_role="stt_api_key",
+                        )
+                        stt_api_key_secret_name = stt_ref
+                    if tts_ref:
+                        await AzureKeyVaultService.set_secret_value(
+                            secret_name=tts_ref,
+                            secret_value=sarvam_key,
+                            tenant_id=tenant_id,
+                            secret_role="tts_api_key",
+                        )
+                        tts_api_key_secret_name = tts_ref
+                else:
+                    logger.warning(
+                        "SARVAM_API_KEY is not set; STT/TTS Key Vault secrets remain as placeholders for tenant %s",
+                        tenant_id,
+                    )
                 kv_status = "provisioned"
                 await _emit(on_step, "shared_key_vault", "success")
             except Exception as exc:
@@ -261,6 +293,7 @@ class NokvoOneProvisioningService:
         }
 
         # ── Assemble TenantResources seed ────────────────────────────────────
+        sarvam_key_seeded = bool((settings.SARVAM_API_KEY or "").strip())
         provider_status = {
             "product_tier": "nokvo_one",
             "llm_provider": "azure_openai",
@@ -273,6 +306,16 @@ class NokvoOneProvisioningService:
             "llm_api_key_encrypted": ai_result.get("api_key_encrypted"),
             "llm_api_key_secret_ref": llm_api_key_secret_name,
             "llm_status": ai_result.get("status"),
+            "stt_provider": "sarvam",
+            "stt_api_key_secret_ref": stt_api_key_secret_name,
+            "stt_status": "provisioned" if stt_api_key_secret_name else (
+                "pending_credentials" if sarvam_key_seeded is False else "skipped_no_shared_vault"
+            ),
+            "tts_provider": "sarvam",
+            "tts_api_key_secret_ref": tts_api_key_secret_name,
+            "tts_status": "provisioned" if tts_api_key_secret_name else (
+                "pending_credentials" if sarvam_key_seeded is False else "skipped_no_shared_vault"
+            ),
             "key_vault_name": settings.AZURE_SHARED_KEY_VAULT_NAME or None,
             "key_vault_status": kv_status,
             "key_vault_secret_refs": {
@@ -302,7 +345,7 @@ class NokvoOneProvisioningService:
             "provisioning_status": "success",
             "provisioning_steps": [
                 {"name": "resource_group", "status": "success"},
-                {"name": "azure_openai_realtime_mini", "status": ai_result.get("status", "provisioned")},
+                {"name": "azure_openai_chat", "status": ai_result.get("status", "provisioned")},
                 {"name": "shared_key_vault", "status": kv_status},
                 {"name": "blob_prefix", "status": "success"},
                 {"name": "qdrant_collection", "status": "success"},

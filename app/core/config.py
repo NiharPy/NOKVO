@@ -78,6 +78,15 @@ class Settings(BaseSettings):
     AZURE_OPENAI_REALTIME_DEPLOYMENT: str = "gpt-realtime-mini"
     AZURE_OPENAI_REALTIME_SKU: str = "GlobalStandard"
     AZURE_OPENAI_REALTIME_REGION: str = "swedencentral"
+
+    # Nokvo One per-tenant chat deployment (gpt-4.1-mini in South India). Only used by
+    # the Nokvo One signup provisioner; other tenants are unaffected.
+    AZURE_OPENAI_CHAT_MODEL: str = "gpt-4.1-mini"
+    AZURE_OPENAI_CHAT_MODEL_VERSION: str = "2024-07-18"
+    AZURE_OPENAI_CHAT_DEPLOYMENT: str = "gpt-4-1-mini"
+    AZURE_OPENAI_CHAT_SKU: str = "GlobalStandard"
+    AZURE_OPENAI_CHAT_CAPACITY: int = 1
+    AZURE_OPENAI_CHAT_REGION: str = "southindia"
     AZURE_MANAGED_IDENTITY_CLIENT_ID: str = ""
     AZURE_TENANT_ID: str = ""
     AZURE_CLIENT_ID: str = ""
@@ -108,6 +117,33 @@ class Settings(BaseSettings):
     SONIOX_TTS_VOICE: str = "Adrian"
     SONIOX_TTS_SAMPLE_RATE: int = 24000
     SONIOX_TTS_AUDIO_FORMAT: str = "wav"
+    AGENT_VOICE_BACKEND: str = "sarvam_pipeline"
+    SARVAM_API_KEY: str = ""
+    SARVAM_STT_REST_URL: str = "https://api.sarvam.ai/speech-to-text"
+    SARVAM_STT_WEBSOCKET_URL: str = "wss://api.sarvam.ai/speech-to-text/ws"
+    SARVAM_STT_MODEL: str = "saaras:v3"
+    SARVAM_STT_MODE: str = "transcribe"
+    SARVAM_STT_SAMPLE_RATE: int = 16000
+    SARVAM_STT_AUDIO_ENCODING: str = "pcm_s16le"
+    SARVAM_TTS_REST_URL: str = "https://api.sarvam.ai/text-to-speech"
+    SARVAM_TTS_STREAM_URL: str = "https://api.sarvam.ai/text-to-speech/stream"
+    SARVAM_TTS_WEBSOCKET_URL: str = "wss://api.sarvam.ai/text-to-speech/ws"
+    SARVAM_TTS_MODEL: str = "bulbul:v3"
+    SARVAM_TTS_SPEAKER: str = "shubh"
+    SARVAM_TTS_SAMPLE_RATE: int = 24000
+    SARVAM_TTS_AUDIO_CODEC: str = "wav"
+    SARVAM_TTS_ENABLE_CACHED_RESPONSES: bool = False
+    EXOTEL_API_KEY: str = ""
+    EXOTEL_API_TOKEN: str = ""
+    EXOTEL_ACCOUNT_SID: str = ""
+    EXOTEL_SUBDOMAIN: str = "api.in.exotel.com"
+    EXOTEL_CALLER_ID: str = ""
+    EXOTEL_DEFAULT_SAMPLE_RATE: int = 8000
+    EXOTEL_STATUS_CALLBACK_EVENTS: str = "answered,terminal"
+    TELNYX_API_KEY: str = ""
+    TELNYX_BASE_URL: str = "https://api.telnyx.com/v2"
+    TELNYX_APP_ID: str = ""
+    TELNYX_MAX_PHONE_LINKS: int = 5
     AGENT_LLM_TIMEOUT_MS: int = 350
     AGENT_RETRIEVAL_TOP_K: int = 3
     AGENT_MAX_CONTEXT_CHARS: int = 3000

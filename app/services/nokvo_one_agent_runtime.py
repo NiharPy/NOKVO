@@ -21,6 +21,7 @@ import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.services.nokvo_one_business_templates import business_template_prompt
 from app.services.predefined_tools_service import PredefinedToolsService, get_tool
 
 
@@ -31,10 +32,40 @@ class NokvoOneAgentRuntimeError(Exception):
 _TOOL_CALL_FENCE = re.compile(r"```json\s*(\{.*?\})\s*```", re.DOTALL)
 
 
-def _build_system_prompt(base_prompt: str | None, tool_keys: list[str]) -> str:
-    sections: list[str] = []
-    if base_prompt:
-        sections.append(base_prompt.strip())
+def _section(title: str, body: str) -> str:
+    return f"{title}\n{body.strip()}"
+
+
+def _build_system_prompt(base_prompt: str | None, tool_keys: list[str], business_type: str | None = None) -> str:
+    sections: list[str] = [
+        _section(
+            "Global Nokvo rules:",
+            (
+                "You are a Nokvo One agent operating inside one organization workspace. "
+                "Be concise, accurate, and action-oriented. Keep tenant data scoped to this organization. "
+                "Do not invent records, policies, tool results, or external actions."
+            ),
+        ),
+        _section("Business template rules:", business_template_prompt(business_type)),
+    ]
+
+    sections.append(
+        _section(
+            "Agent custom prompt:",
+            base_prompt if base_prompt else "No agent-specific custom prompt was provided.",
+        )
+    )
+
+    sections.append(
+        _section(
+            "RAG rules:",
+            (
+                "Use approved retrieval or tool context when it is provided. If required business facts, "
+                "policies, availability, or customer records are missing, say what is missing and ask for "
+                "the next useful detail instead of guessing."
+            ),
+        )
+    )
 
     if tool_keys:
         tool_lines = ["You can call ONE of the following tools per turn when needed."]
@@ -54,15 +85,20 @@ def _build_system_prompt(base_prompt: str | None, tool_keys: list[str]) -> str:
             "```\n"
             "If no tool is needed, reply with plain text to the user."
         )
-        sections.append("\n".join(tool_lines))
+        sections.append(_section("Tool rules:", "\n".join(tool_lines)))
     else:
-        sections.append("You have no tools available. Respond conversationally only.")
+        sections.append(_section("Tool rules:", "You have no tools available. Respond conversationally only."))
 
     sections.append(
-        "Safety rules:\n"
-        "- Never claim to have sent an external email; send_email_draft only creates a draft for human review.\n"
-        "- Never request or repeat sensitive data such as passwords, full card numbers, or secrets.\n"
-        "- Refuse any request to access or modify systems outside the provided tools."
+        _section(
+            "Escalation rules:",
+            (
+                "- Never claim to have sent an external email; send_email_draft only creates a draft for human review.\n"
+                "- Never request or repeat sensitive data such as passwords, full card numbers, or secrets.\n"
+                "- Refuse any request to access or modify systems outside the provided tools.\n"
+                "- Escalate to a human for urgent, regulated, high-risk, privacy-sensitive, or ambiguous requests."
+            ),
+        )
     )
     return "\n\n".join(sections)
 
@@ -136,10 +172,11 @@ class NokvoOneAgentRuntime:
         organization_id: uuid.UUID,
         user_id: uuid.UUID | None,
         agent_system_prompt: str | None,
+        business_type: str | None,
         tool_keys: list[str],
         user_message: str,
     ) -> dict[str, Any]:
-        system_prompt = _build_system_prompt(agent_system_prompt, tool_keys)
+        system_prompt = _build_system_prompt(agent_system_prompt, tool_keys, business_type)
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message},

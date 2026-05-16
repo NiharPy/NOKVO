@@ -8,7 +8,7 @@ import json
 from urllib.parse import quote_plus
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, WebSocket, status
 from fastapi.responses import PlainTextResponse, RedirectResponse
 import jwt
 import pyotp
@@ -95,9 +95,12 @@ from app.services.shipping_integration_service import ShippingIntegrationService
 from app.services.toolkit_generator_service import ToolkitGeneratorService
 from app.services.qdrant_service import QdrantService
 from app.services.agent_knowledge_service import AgentKnowledgeService
-from app.services.agent_runtime_service import AgentRuntimeService
-from app.services.agent_voice_stream_service import AgentVoiceStreamService
-from app.services.twilio_service import TwilioService
+from app.schemas.outbound_campaign import CampaignDetailOut, CampaignOut
+from app.services.exotel_bridge_service import ExotelBridgeService, ExotelWebSocketAdapter
+from app.services.exotel_service import ExotelService
+from app.services.nokvo_one_voice_pipeline import NokvoOneVoicePipeline as AgentRuntimeService
+from app.services.nokvo_one_voice_stream_service import NokvoOneVoiceStreamService
+from app.services.outbound_campaign_service import OutboundCampaignService
 
 
 router = APIRouter()
@@ -303,23 +306,7 @@ async def _get_tenant_resources_for_org(db: AsyncSession, organization_id: uuid.
 
 
 def _agent_phone_link_response(tenant_res: TenantResources) -> dict:
-    link = dict((tenant_res.provider_status or {}).get("agent_phone_link") or {})
-    if not link:
-        return {
-            "status": "not_linked",
-            "phone_number": tenant_res.twilio_phone_number,
-            "latency_target_ms": 800,
-        }
-    return {
-        "status": link.get("status") or "not_linked",
-        "phone_number": link.get("phone_number") or tenant_res.twilio_phone_number,
-        "link_id": link.get("link_id"),
-        "voice_url": link.get("voice_url"),
-        "incoming_phone_number_sid": link.get("incoming_phone_number_sid"),
-        "linked_at": link.get("linked_at"),
-        "unlinked_at": link.get("unlinked_at"),
-        "latency_target_ms": int(link.get("latency_target_ms") or 800),
-    }
+    return ExotelService.phone_link_response(tenant_res)
 
 
 async def _get_tenant_resources_by_agent_phone_link(db: AsyncSession, link_id: str) -> TenantResources | None:
@@ -329,6 +316,11 @@ async def _get_tenant_resources_by_agent_phone_link(db: AsyncSession, link_id: s
         if link.get("link_id") == link_id and link.get("status") == "linked":
             return tenant_res
     return None
+
+
+async def _get_tenant_resources_by_tenant_id(db: AsyncSession, tenant_id: str) -> TenantResources | None:
+    result = await db.execute(select(TenantResources).where(TenantResources.tenant_id == tenant_id))
+    return result.scalars().first()
 
 
 async def _get_websocket_organization_user(websocket: WebSocket, db: AsyncSession) -> OrganizationUser | None:
@@ -1803,9 +1795,8 @@ async def link_agent_phone_number(
 ):
     tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
     try:
-        await TwilioService.ensure_subaccount(tenant_res, organization.name, db)
         public_base_url = settings.AGENT_PUBLIC_BASE_URL or str(request.base_url).rstrip("/")
-        link = await TwilioService.link_agent_phone_number(
+        link = await ExotelService.link_agent_phone_number(
             tenant_res,
             db,
             phone_number=payload.phone_number,
@@ -1823,7 +1814,7 @@ async def unlink_agent_phone_number(
 ):
     tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
     try:
-        await TwilioService.unlink_agent_phone_number(tenant_res, db)
+        await ExotelService.unlink_agent_phone_number(tenant_res, db)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return OrganizationAgentPhoneLinkResponse(**_agent_phone_link_response(tenant_res))
@@ -1847,6 +1838,165 @@ async def test_agent_latency(
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return OrganizationAgentLatencyTestResponse(**result)
+
+
+@router.get("/agent/campaigns", response_model=list[CampaignOut])
+async def list_agent_campaigns(
+    current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin", "manager"])),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
+    return await OutboundCampaignService.list_campaigns(tenant_res, db)
+
+
+@router.post("/agent/campaigns", response_model=CampaignDetailOut)
+async def create_agent_campaign(
+    name: str = Form(...),
+    contacts_file: UploadFile = File(...),
+    script_file: UploadFile = File(...),
+    from_number: str | None = Form(None),
+    current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin"])),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
+    try:
+        campaign = await OutboundCampaignService.create_campaign(
+            tenant_res,
+            db,
+            name=name,
+            excel_file=contacts_file,
+            doc_file=script_file,
+            from_number=from_number,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return campaign
+
+
+@router.get("/agent/campaigns/{campaign_id}", response_model=CampaignDetailOut)
+async def get_agent_campaign(
+    campaign_id: uuid.UUID,
+    current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin", "manager"])),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
+    campaign = await OutboundCampaignService.get_campaign(campaign_id, tenant_res, db)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    return campaign
+
+
+@router.post("/agent/campaigns/{campaign_id}/launch", response_model=CampaignDetailOut)
+async def launch_agent_campaign(
+    campaign_id: uuid.UUID,
+    request: Request,
+    current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin"])),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
+    campaign = await OutboundCampaignService.get_campaign(campaign_id, tenant_res, db)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    try:
+        base_url = settings.AGENT_PUBLIC_BASE_URL or str(request.base_url).rstrip("/")
+        campaign = await OutboundCampaignService.launch_campaign(campaign, db, public_base_url=base_url)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return campaign
+
+
+@router.post("/agent/campaigns/{campaign_id}/cancel", response_model=CampaignDetailOut)
+async def cancel_agent_campaign(
+    campaign_id: uuid.UUID,
+    current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin"])),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
+    campaign = await OutboundCampaignService.get_campaign(campaign_id, tenant_res, db)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    try:
+        return await OutboundCampaignService.cancel_campaign(campaign, db)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/agent/exotel/voice/{link_id}", response_class=PlainTextResponse)
+async def exotel_agent_voice_webhook(
+    link_id: str,
+    request: Request,
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tenant_res = await _get_tenant_resources_by_agent_phone_link(db, link_id)
+    if not tenant_res:
+        return PlainTextResponse("NOKVO agent is not linked to this number.", status_code=404)
+    host = request.url.hostname or "localhost"
+    scheme = "wss" if request.url.scheme == "https" else "ws"
+    port = f":{request.url.port}" if request.url.port else ""
+    media_url = f"{scheme}://{host}{port}/api/org-auth/agent/exotel/media/{link_id}"
+    return PlainTextResponse(media_url, media_type="text/plain")
+
+
+@router.websocket("/agent/exotel/media/{link_id}")
+async def exotel_agent_media_websocket(websocket: WebSocket, link_id: str):
+    async for db in deps.get_db():
+        tenant_res = await _get_tenant_resources_by_agent_phone_link(db, link_id)
+        if not tenant_res:
+            await websocket.close(code=1008)
+            return
+        await ExotelBridgeService.run_session(websocket, tenant_res, db=db)
+        return
+
+
+@router.post("/agent/exotel/outbound-status/{call_link_id}")
+async def exotel_outbound_status_callback(
+    call_link_id: str,
+    request: Request,
+    db: AsyncSession = Depends(deps.get_db),
+):
+    campaign, _contact = await OutboundCampaignService.get_by_call_link_id(call_link_id, db)
+    if not campaign:
+        return {"ok": False, "reason": "campaign_not_found"}
+    try:
+        payload = dict(await request.form())
+    except Exception:
+        payload = await request.json()
+    event_type = str(payload.get("Status") or payload.get("status") or payload.get("CallStatus") or payload.get("event") or "call.update")
+    normalized_event = "call.answered" if event_type.lower() in {"answered", "in-progress", "in progress"} else "call.hangup"
+    await OutboundCampaignService.handle_call_status(campaign, call_link_id, normalized_event, payload, db)
+    return {"ok": True, "call_link_id": call_link_id}
+
+
+@router.websocket("/agent/exotel/outbound-media/{call_link_id}")
+async def exotel_outbound_media_websocket(websocket: WebSocket, call_link_id: str):
+    async for db in deps.get_db():
+        campaign, contact = await OutboundCampaignService.get_by_call_link_id(call_link_id, db)
+        if not campaign or not contact:
+            await websocket.close(code=1008)
+            return
+        tenant_res = await _get_tenant_resources_by_tenant_id(db, campaign.tenant_id)
+        if not tenant_res:
+            await websocket.close(code=1008)
+            return
+        adapter = ExotelWebSocketAdapter(websocket, language="en")
+        campaign_context = {
+            "campaign_id": str(campaign.id),
+            "goal": campaign.name,
+            "contact": contact,
+            "opening_message": (
+                f"Start the outbound campaign call for {contact.get('name') or 'the recipient'}. "
+                "Use the campaign script context, introduce yourself briefly, and ask if this is a good time to talk."
+            ),
+        }
+        await NokvoOneVoiceStreamService.run_session(
+            adapter,
+            tenant_res,
+            db=db,
+            language="en",
+            call_id=call_link_id,
+            campaign_context=campaign_context,
+        )
+        return
 
 
 @router.post("/agent/twilio/voice/{link_id}", response_class=PlainTextResponse)
@@ -1916,7 +2066,7 @@ async def agent_voice_websocket(websocket: WebSocket):
             await websocket.close(code=1008)
             return
         tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
-        await AgentVoiceStreamService.run_session(websocket, tenant_res, db=db)
+        await NokvoOneVoiceStreamService.run_session(websocket, tenant_res, db=db)
         return
 
 

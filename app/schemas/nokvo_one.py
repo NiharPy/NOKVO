@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 from app.core.email_policy import validate_work_email
 from app.schemas.token import Token
+from app.services.nokvo_one_business_templates import validate_business_type
 
 
 NOKVO_ONE_ORG_STATUSES = {
@@ -39,8 +40,8 @@ class NokvoOneSignupRequest(BaseModel):
     admin_name: Optional[str] = Field(default=None, max_length=200)
     admin_email: EmailStr
     password: str
-    region: str = "centralindia"
-    industry: Optional[str] = "Customer Support"
+    region: str = "southindia"
+    industry: Optional[str] = None
     country_code: Optional[str] = "IN"
     language: Optional[str] = "en-IN"
 
@@ -61,6 +62,13 @@ class NokvoOneSignupRequest(BaseModel):
     @classmethod
     def _validate_password_field(cls, value: str) -> str:
         return _validate_password(value)
+
+    @field_validator("industry")
+    @classmethod
+    def _validate_industry(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        return validate_business_type(value)
 
 
 class NokvoOneProvisioningStepResponse(BaseModel):
@@ -219,6 +227,7 @@ class NokvoOneOrganizationResponse(BaseModel):
     email_domain: Optional[str]
     environment: str
     region: str
+    industry: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -241,6 +250,175 @@ class NokvoOneUserResponse(BaseModel):
 class NokvoOneSessionResponse(Token):
     user: NokvoOneUserResponse
     organization: NokvoOneOrganizationResponse
+
+
+class NokvoOneBusinessTemplateRequest(BaseModel):
+    business_type: str = Field(min_length=1, max_length=40)
+
+    @field_validator("business_type")
+    @classmethod
+    def _validate_business_type(cls, value: str) -> str:
+        return validate_business_type(value)
+
+
+class NokvoOneBusinessTemplateOptionResponse(BaseModel):
+    value: str
+    label: str
+    member_label: str = "Members"
+    tabs: list[str]
+    request_types: list[dict[str, str]] = Field(default_factory=list)
+    consultation_types: list[dict[str, str]] = Field(default_factory=list)
+    schemas: dict[str, list[dict[str, Any]]]
+
+
+class NokvoOneBusinessTemplateSaveResponse(BaseModel):
+    organization: NokvoOneOrganizationResponse
+    business_template: NokvoOneBusinessTemplateOptionResponse
+
+
+class NokvoOneBusinessFieldDefinition(BaseModel):
+    key: str = Field(min_length=1, max_length=80)
+    label: str = Field(min_length=1, max_length=120)
+    type: str = Field(default="text", max_length=40)
+    required: bool = False
+
+    @field_validator("key")
+    @classmethod
+    def _validate_key(cls, value: str) -> str:
+        cleaned = value.strip().lower().replace(" ", "_").replace("-", "_")
+        cleaned = "".join(ch for ch in cleaned if ch.isalnum() or ch == "_")
+        if not cleaned:
+            raise ValueError("Field key is required")
+        return cleaned
+
+    @field_validator("label", "type")
+    @classmethod
+    def _strip_text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Field value is required")
+        return value
+
+
+class NokvoOneBusinessSchemaUpdateRequest(BaseModel):
+    fields: list[NokvoOneBusinessFieldDefinition] = Field(min_length=1, max_length=25)
+
+
+class NokvoOneAssignmentSettingsResponse(BaseModel):
+    id: Optional[UUID] = None
+    organization_id: UUID
+    member_id: UUID
+    is_assignable: bool = False
+    working_days: list[str] = Field(default_factory=list)
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+    timezone: str = "Asia/Kolkata"
+    request_types: list[str] = Field(default_factory=list)
+    max_active_requests: int = 100
+    max_requests_per_day: Optional[int] = None
+    max_requests_per_hour: int = 6
+    active_request_count: int = 0
+    availability_summary: str = "Not assignable"
+
+
+class NokvoOneAssignmentSettingsUpdateRequest(BaseModel):
+    is_assignable: bool = False
+    working_days: list[str] = Field(default_factory=list, max_length=7)
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+    timezone: str = Field(default="Asia/Kolkata", min_length=1, max_length=80)
+    request_types: list[str] = Field(default_factory=list)
+    max_active_requests: int = Field(default=100, ge=1, le=100)
+    max_requests_per_day: Optional[int] = Field(default=None, ge=1, le=1000)
+    max_requests_per_hour: int = Field(default=6, ge=1, le=100)
+
+    @field_validator("timezone")
+    @classmethod
+    def _validate_timezone(cls, value: str) -> str:
+        value = (value or "Asia/Kolkata").strip()
+        if value in {"IST", "Asia/Kolkata"}:
+            return "Asia/Kolkata"
+        raise ValueError("Only IST is supported")
+
+    @field_validator("working_days")
+    @classmethod
+    def _validate_working_days(cls, value: list[str]) -> list[str]:
+        allowed = {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}
+        cleaned = []
+        for item in value:
+            day = item.strip().lower()[:3]
+            if day not in allowed:
+                raise ValueError("working_days must contain mon, tue, wed, thu, fri, sat, or sun")
+            if day not in cleaned:
+                cleaned.append(day)
+        return cleaned
+
+
+class NokvoOneClinicScheduleSettingsResponse(BaseModel):
+    id: Optional[UUID] = None
+    organization_id: UUID
+    member_id: UUID
+    appointment_duration_minutes: int = 30
+    buffer_minutes: int = 0
+    max_patients_per_hour: Optional[int] = None
+    max_patients_per_day: Optional[int] = None
+    consultation_types: list[str] = Field(default_factory=list)
+
+
+class NokvoOneClinicScheduleSettingsUpdateRequest(BaseModel):
+    appointment_duration_minutes: int = Field(default=30, ge=5, le=480)
+    buffer_minutes: int = Field(default=0, ge=0, le=180)
+    max_patients_per_hour: Optional[int] = Field(default=None, ge=1, le=100)
+    max_patients_per_day: Optional[int] = Field(default=None, ge=1, le=500)
+    consultation_types: list[str] = Field(default_factory=list)
+
+
+class NokvoOneBlockedSlotCreateRequest(BaseModel):
+    start_time: datetime
+    end_time: datetime
+    reason: Optional[str] = Field(default=None, max_length=240)
+    repeat_rule: Optional[str] = Field(default=None, max_length=240)
+
+
+class NokvoOneBlockedSlotUpdateRequest(BaseModel):
+    start_time: Optional[datetime] = None
+    end_time: Optional[datetime] = None
+    reason: Optional[str] = Field(default=None, max_length=240)
+    repeat_rule: Optional[str] = Field(default=None, max_length=240)
+
+
+class NokvoOneBlockedSlotResponse(BaseModel):
+    id: UUID
+    organization_id: UUID
+    member_id: UUID
+    start_time: datetime
+    end_time: datetime
+    reason: Optional[str]
+    repeat_rule: Optional[str]
+    created_at: datetime
+    updated_at: Optional[datetime]
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class NokvoOneRequestAssignRequest(BaseModel):
+    request_type: str = Field(min_length=1, max_length=80)
+    record_type: str = Field(default="request", max_length=40)
+    requested_time: Optional[datetime] = None
+    summary: Optional[str] = Field(default=None, max_length=2000)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class NokvoOneRequestAssignResponse(BaseModel):
+    request_id: Optional[UUID]
+    organization_id: UUID
+    selected_member_id: Optional[UUID] = None
+    request_type: str
+    assignment_status: str
+    reason: Optional[str] = None
+    active_load_count: Optional[int] = None
+    skipped_member_reasons: dict[str, list[str]] = Field(default_factory=dict)
+    timestamp: datetime
 
 
 # ─────────── Agents / tools ───────────

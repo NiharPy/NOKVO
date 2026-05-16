@@ -41,6 +41,10 @@ class ExotelWebSocketAdapter(TwilioWebSocketAdapter):
         self._pending_config: dict | None = {"type": "config", "language": language}
 
     async def accept(self) -> None:
+        try:
+            await self._ws.accept()
+        except RuntimeError:
+            pass
         # Send an initial "connected" handshake — Exotel may require this before streaming
         try:
             await self._ws.send_text(json.dumps({
@@ -149,9 +153,18 @@ class ExotelBridgeService:
         language: str = "en",
     ) -> None:
         adapter = ExotelWebSocketAdapter(websocket, language=language)
+        # Nokvo One tenants always run the Sarvam STT -> gpt-4.1-mini -> Sarvam TTS
+        # pipeline, regardless of the global AGENT_VOICE_BACKEND setting.
+        if (tenant_res.provider_status or {}).get("product_tier") == "nokvo_one":
+            from app.services.nokvo_one_voice_stream_service import NokvoOneVoiceStreamService
+            await NokvoOneVoiceStreamService.run_session(adapter, tenant_res, db=db, language=language)
+            return
         if settings.AGENT_VOICE_BACKEND == "azure_realtime":
             from app.services.agent_realtime_voice_service import AgentRealtimeVoiceService
             await AgentRealtimeVoiceService.run_session(adapter, tenant_res, db=db, language=language)
+        elif settings.AGENT_VOICE_BACKEND == "sarvam_pipeline":
+            from app.services.nokvo_one_voice_stream_service import NokvoOneVoiceStreamService
+            await NokvoOneVoiceStreamService.run_session(adapter, tenant_res, db=db, language=language)
         else:
             from app.services.agent_voice_stream_service import AgentVoiceStreamService
             await AgentVoiceStreamService.run_session(adapter, tenant_res, db=db)

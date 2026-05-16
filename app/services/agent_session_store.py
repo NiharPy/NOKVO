@@ -1,0 +1,155 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+from typing import Any
+
+import redis.asyncio as redis
+
+from app.core.config import settings
+from app.models.tenant_resources import TenantResources
+
+
+def _clean(value: str) -> str:
+    value = re.sub(r"[^\w\s]", " ", (value or "").lower())
+    return re.sub(r"\s+", " ", value).strip()
+
+
+class AgentSessionStore:
+    _client: redis.Redis | None = None
+
+    @classmethod
+    def client(cls) -> redis.Redis:
+        if cls._client is None:
+            cls._client = redis.from_url(settings.REDIS_URL, decode_responses=True)
+        return cls._client
+
+    @staticmethod
+    def namespace(tenant_res: TenantResources) -> str:
+        return tenant_res.redis_namespace or f"tenant:{tenant_res.tenant_id}"
+
+    @staticmethod
+    def _hash(value: str) -> str:
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
+
+    @staticmethod
+    def _policy_version(tenant_res: TenantResources) -> str:
+        provider_status = dict(tenant_res.provider_status or {})
+        return str(provider_status.get("agent_policy_version") or "pv_default")
+
+    @classmethod
+    def semantic_cache_key(
+        cls,
+        tenant_res: TenantResources,
+        query: str,
+        language: str,
+        *,
+        campaign_id: str | None = None,
+    ) -> str:
+        normalized = _clean(query)
+        words = sorted({word for word in normalized.split() if len(word) > 2})
+        signature = " ".join(words) if words else normalized
+        scope = f"campaign:{campaign_id}" if campaign_id else "tenant"
+        return (
+            f"{cls.namespace(tenant_res)}:agent:semantic_cache:v1:"
+            f"{cls._policy_version(tenant_res)}:{scope}:{language}:{cls._hash(signature)}"
+        )
+
+    @classmethod
+    async def get_cached_answer(
+        cls,
+        tenant_res: TenantResources,
+        query: str,
+        language: str,
+        *,
+        campaign_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        if not settings.AGENT_ANSWER_CACHE_ENABLED:
+            return None
+        try:
+            raw = await cls.client().get(cls.semantic_cache_key(tenant_res, query, language, campaign_id=campaign_id))
+            return json.loads(raw) if raw else None
+        except Exception:
+            return None
+
+    @classmethod
+    async def set_cached_answer(
+        cls,
+        tenant_res: TenantResources,
+        query: str,
+        language: str,
+        payload: dict[str, Any],
+        *,
+        campaign_id: str | None = None,
+    ) -> None:
+        if not settings.AGENT_ANSWER_CACHE_ENABLED:
+            return
+        try:
+            await cls.client().setex(
+                cls.semantic_cache_key(tenant_res, query, language, campaign_id=campaign_id),
+                int(settings.AGENT_ANSWER_CACHE_TTL_SECONDS),
+                json.dumps(payload, ensure_ascii=False),
+            )
+        except Exception:
+            return
+
+    @classmethod
+    def session_key(cls, tenant_res: TenantResources, call_id: str) -> str:
+        return f"{cls.namespace(tenant_res)}:agent:call:{call_id}:history"
+
+    @classmethod
+    async def get_history(cls, tenant_res: TenantResources, call_id: str | None) -> list[dict[str, str]]:
+        if not call_id:
+            return []
+        try:
+            raw = await cls.client().get(cls.session_key(tenant_res, call_id))
+            value = json.loads(raw) if raw else []
+            if isinstance(value, list):
+                return [
+                    {"role": str(item.get("role") or ""), "content": str(item.get("content") or "")}
+                    for item in value
+                    if isinstance(item, dict)
+                ][-12:]
+        except Exception:
+            return []
+        return []
+
+    @classmethod
+    async def append_turn(cls, tenant_res: TenantResources, call_id: str | None, user_text: str, answer: str) -> None:
+        if not call_id:
+            return
+        history = await cls.get_history(tenant_res, call_id)
+        history.extend(
+            [
+                {"role": "user", "content": user_text[:2000]},
+                {"role": "assistant", "content": answer[:2000]},
+            ]
+        )
+        history = history[-12:]
+        try:
+            await cls.client().setex(
+                cls.session_key(tenant_res, call_id),
+                max(300, int(settings.AGENT_ANSWER_CACHE_TTL_SECONDS) * 4),
+                json.dumps(history, ensure_ascii=False),
+            )
+        except Exception:
+            return
+
+    @classmethod
+    async def set_state(
+        cls,
+        tenant_res: TenantResources,
+        call_id: str,
+        data: dict[str, Any],
+        *,
+        ttl_seconds: int = 900,
+    ) -> None:
+        try:
+            await cls.client().setex(
+                f"{cls.namespace(tenant_res)}:agent:call:{call_id}:state",
+                ttl_seconds,
+                json.dumps(data, ensure_ascii=False),
+            )
+        except Exception:
+            return

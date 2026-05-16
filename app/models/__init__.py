@@ -13,6 +13,12 @@ from app.models.email_verification import EmailVerification
 from app.models.member_invitation import MemberInvitation
 from app.models.nokvo_one_tool_record import NokvoOneToolRecord
 from app.models.nokvo_one_agent import NokvoOneAgent
+from app.models.member_assignment import (
+    ClinicMemberScheduleSettings,
+    MemberBlockedSlot,
+    NokvoOneAssignmentAuditLog,
+    OrganizationMemberAssignmentSettings,
+)
 
 # For Alembic to discover all models
 __all__ = [
@@ -31,4 +37,8 @@ __all__ = [
     "MemberInvitation",
     "NokvoOneToolRecord",
     "NokvoOneAgent",
+    "OrganizationMemberAssignmentSettings",
+    "ClinicMemberScheduleSettings",
+    "MemberBlockedSlot",
+    "NokvoOneAssignmentAuditLog",
 ]

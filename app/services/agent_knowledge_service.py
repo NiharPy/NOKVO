@@ -134,58 +134,54 @@ class AgentKnowledgeService:
             except Exception:
                 return ""
         if suffix == "pdf":
-            # Minimal best-effort fallback. Production deployments should wire a PDF extraction worker.
+            try:
+                import pypdf
+
+                reader = pypdf.PdfReader(BytesIO(content))
+                return "\n\n".join(page.extract_text() or "" for page in reader.pages)
+            except Exception:
+                pass
             decoded = content.decode("utf-8", errors="ignore")
             return re.sub(r"\s+", " ", decoded)
         return content.decode("utf-8", errors="ignore")
 
     @staticmethod
-    def _chunk_text(text: str, max_chars: int = 1200, overlap: int = 160) -> list[dict]:
+    def _chunk_text(text: str, max_tokens: int = 450, overlap_tokens: int = 50) -> list[dict]:
         cleaned = re.sub(r"\r\n?", "\n", text or "").strip()
         if not cleaned:
             return []
-        paragraphs = [item.strip() for item in re.split(r"\n{2,}", cleaned) if item.strip()]
-        if len(paragraphs) == 1 and len(paragraphs[0]) > max_chars:
-            # Many extracted PDFs/DOCX files arrive as one long line. Split on
-            # sentence boundaries first, then fall back to word windows.
-            paragraphs = [
-                item.strip()
-                for item in re.split(r"(?<=[.!?])\s+", paragraphs[0])
-                if item.strip()
-            ]
-        normalized_paragraphs: list[str] = []
-        for paragraph in paragraphs:
-            if len(paragraph) <= max_chars:
-                normalized_paragraphs.append(paragraph)
-                continue
-            words = paragraph.split()
-            window = ""
-            for word in words:
-                candidate = f"{window} {word}".strip()
-                if window and len(candidate) > max_chars:
-                    normalized_paragraphs.append(window)
-                    window = word
-                else:
-                    window = candidate
-            if window:
-                normalized_paragraphs.append(window)
-        paragraphs = normalized_paragraphs
+        paragraphs = [re.sub(r"\s+", " ", item).strip() for item in re.split(r"\n{2,}", cleaned) if item.strip()]
+        if len(paragraphs) == 1 and len(paragraphs[0].split()) > max_tokens:
+            paragraphs = [item.strip() for item in re.split(r"(?<=[.!?।])\s+", paragraphs[0]) if item.strip()]
         chunks: list[dict] = []
-        current = ""
-        start = 0
+        current_words: list[str] = []
         cursor = 0
+        start = 0
+
+        def flush() -> None:
+            nonlocal current_words, start
+            if not current_words:
+                return
+            chunk_text = " ".join(current_words).strip()
+            chunks.append({"text": chunk_text, "char_start": start, "char_end": start + len(chunk_text)})
+            current_words = current_words[-overlap_tokens:] if overlap_tokens else []
+            start = max(start + len(chunk_text) - len(" ".join(current_words)), 0)
+
         for paragraph in paragraphs:
-            if current and len(current) + len(paragraph) + 2 > max_chars:
-                end = start + len(current)
-                chunks.append({"text": current.strip(), "char_start": start, "char_end": end})
-                current = current[-overlap:] if overlap and len(current) > overlap else ""
-                start = max(end - len(current), 0)
-            if not current:
-                start = cursor
-            current = f"{current}\n\n{paragraph}".strip()
-            cursor += len(paragraph) + 2
-        if current:
-            chunks.append({"text": current.strip(), "char_start": start, "char_end": start + len(current)})
+            words = paragraph.split()
+            if not words:
+                continue
+            for word in words:
+                if not current_words:
+                    start = cursor
+                if len(current_words) >= max_tokens:
+                    flush()
+                current_words.append(word)
+                cursor += len(word) + 1
+            if len(current_words) >= max_tokens:
+                flush()
+        if current_words:
+            flush()
         return chunks[:200]
 
     @staticmethod
@@ -202,7 +198,7 @@ class AgentKnowledgeService:
         text = chunk["text"]
         language = chunk.get("language") or detect_language(text)
         sensitivity = "sensitive" if _SENSITIVE_POLICY_RE.search(text) else "normal"
-        active = approval_status == "approved" and status == "active"
+        active = approval_status == "approved" and status in {"active", "ok"}
         return {
             "organization_id": str(tenant_res.organization_id),
             "tenant_id": tenant_res.tenant_id,
@@ -217,7 +213,7 @@ class AgentKnowledgeService:
             "doc_type": document["document_type"],
             "document_status": status,
             "approval_status": approval_status,
-            "status": "active" if approval_status == "approved" else "pending_approval",
+            "status": "active" if active else "pending_approval",
             "active": active,
             "chunk_id": chunk_id,
             "chunk_index": chunk_index,
@@ -401,7 +397,7 @@ class AgentKnowledgeService:
         )
         extracted_text = AgentKnowledgeService._extract_text(filename, content)
         chunks = AgentKnowledgeService._chunk_text(extracted_text)
-        status = "pending_approval" if chunks else "failed"
+        status = "pending" if chunks else "empty"
         document = {
             "id": document_id,
             "document_version_id": str(uuid.uuid4()),
@@ -410,7 +406,7 @@ class AgentKnowledgeService:
             "description": (description or "").strip()[:1000] or None,
             "tags": AgentKnowledgeService._normalize_tags(tags),
             "status": status,
-            "approval_status": "pending" if chunks else "rejected",
+            "approval_status": "approved" if chunks else "rejected",
             "blob_path": blob["blob_path"],
             "blob_name": blob["blob_name"],
             "content_type": content_type,
@@ -420,24 +416,34 @@ class AgentKnowledgeService:
             "chunks": chunks,
             "uploaded_by": str(current_user.id),
             "created_at": created_at,
-            "approved_at": None,
-            "approved_by": None,
-            "last_error": None if chunks else "No extractable text was found. Upload text, markdown, CSV, JSON, or text-readable DOCX/PDF content.",
+            "approved_at": created_at if chunks else None,
+            "approved_by": str(current_user.id) if chunks else None,
+            "last_error": None if chunks else "No usable text was found in this document.",
         }
-        if chunks:
-            document["qdrant_point_count"] = await AgentKnowledgeService._upsert_document_chunks(
-                tenant_res,
-                document,
-                "pending",
-                status,
-                db=db,
-            )
-
         provider_status = AgentKnowledgeService._provider_status(tenant_res)
+        if chunks:
+            try:
+                document["policy_version"] = AgentKnowledgeService._bump_policy_version(provider_status)
+                document["status"] = "ok"
+                document["qdrant_point_count"] = await AgentKnowledgeService._upsert_document_chunks(
+                    tenant_res,
+                    document,
+                    "approved",
+                    "ok",
+                    db=db,
+                )
+            except Exception as exc:
+                document["status"] = "error"
+                document["approval_status"] = "rejected"
+                document["approved_at"] = None
+                document["approved_by"] = None
+                document["last_error"] = str(exc)[:500]
+
         documents = AgentKnowledgeService._documents(provider_status)
         documents.append(document)
         AgentKnowledgeService._set_documents(provider_status, documents)
-        provider_status.setdefault(AGENT_POLICY_VERSION_KEY, "pv_default")
+        if not (chunks and document["status"] == "ok"):
+            provider_status.setdefault(AGENT_POLICY_VERSION_KEY, "pv_default")
         tenant_res.provider_status = provider_status
         flag_modified(tenant_res, "provider_status")
         db.add(tenant_res)
@@ -546,7 +552,7 @@ class AgentKnowledgeService:
             active_cards: list[dict] = []
             policy_version = str(provider_status.get(AGENT_POLICY_VERSION_KEY) or "pv_default")
             for document in documents:
-                if document.get("approval_status") == "approved" and document.get("status") == "active":
+                if document.get("approval_status") == "approved" and document.get("status") in {"active", "ok"}:
                     active_cards.extend(AgentKnowledgeService._build_answer_cards(document, policy_version))
             AgentKnowledgeService._set_answer_cards(provider_status, active_cards)
 
@@ -598,7 +604,7 @@ class AgentKnowledgeService:
         approved_document_ids = {
             str(document.get("id"))
             for document in AgentKnowledgeService._documents(provider_status)
-            if document.get("approval_status") == "approved" and document.get("status") == "active"
+            if document.get("approval_status") == "approved" and document.get("status") in {"active", "ok"}
         }
         if not approved_document_ids:
             return {

@@ -3,20 +3,20 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import axios from 'axios';
 import QrcodeVue from 'qrcode.vue';
 import {
-  ArrowUpDown,
   Bell,
   Bot,
+  CalendarDays,
   CheckCircle2,
   Database,
-  Filter,
   LogOut,
   MessageSquare,
   Moon,
-  Search,
+  Plus,
   Settings2,
   Shield,
   SunMedium,
   SunMedium as Sun,
+  Trash2,
   UserPlus,
   Users,
   Wrench,
@@ -39,14 +39,11 @@ const authConfig = ref(null);
 const googleLoginButtonRef = ref(null);
 const googleSignupButtonRef = ref(null);
 
-const authState = ref('login'); // login | signup | check_email | mfa_setup | mfa_verify | login_totp | accept_invite | ready
+const authState = ref('login'); // login | signup | check_email | mfa_setup | mfa_verify | login_totp | accept_invite | business_type_setup | ready
 const errorMsg = ref('');
 const infoMsg = ref('');
 const isAuthenticating = ref(false);
-const dashboardQuery = ref('');
-const currentPage = ref('dashboard'); // dashboard | members | agent
-const memberSortMode = ref('name');
-const memberFilter = ref('all');
+const currentPage = ref('dashboard'); // dashboard | members | tickets | leads | appointments | agent
 
 const signup = ref({ org_name: '', admin_name: '', admin_email: '', password: '' });
 const login = ref({ email: '', password: '' });
@@ -59,6 +56,9 @@ const loginTempToken = ref('');
 const currentUser = ref(null);
 const currentOrganization = ref(null);
 const members = ref([]);
+const assignmentSettings = ref([]);
+const clinicScheduleSettings = ref({});
+const blockedSlots = ref({});
 const agents = ref([]);
 const predefinedTools = ref([]);
 const activeAgent = ref(null);
@@ -70,6 +70,25 @@ const inviteForm = ref({ email: '', full_name: '', role: 'member' });
 const newAgent = ref({ name: '', description: '', system_prompt: '', tool_keys: [] });
 const isSavingMember = ref(false);
 const isLoadingMembers = ref(false);
+const businessTypeOptions = ref([]);
+const organizationBusinessTemplate = ref(null);
+const selectedBusinessType = ref('');
+const isSavingBusinessType = ref(false);
+const fieldEditor = ref({
+  key: null,
+  title: '',
+  fields: [],
+  isSaving: false,
+});
+const assignmentEditor = ref({
+  member: null,
+  settings: null,
+  clinic: null,
+  blockedSlot: { date: '', start_time: '', end_time: '', reason: '' },
+  isSaving: false,
+  isSavingClinic: false,
+  isSavingBlock: false,
+});
 
 const inviteToken = ref('');
 const inviteContext = ref(null);
@@ -82,6 +101,40 @@ const organizationInitial = computed(
 );
 
 const inviteDomain = computed(() => currentOrganization.value?.email_domain || '');
+const currentBusinessTemplate = computed(() =>
+  organizationBusinessTemplate.value
+  || businessTypeOptions.value.find((option) => option.value === currentOrganization.value?.industry)
+  || null,
+);
+const businessTypeLabel = computed(() => currentBusinessTemplate.value?.label || 'Not selected');
+const memberPageLabel = computed(() => currentBusinessTemplate.value?.member_label || 'Members');
+const businessTypeRequired = computed(() => !currentOrganization.value?.industry);
+const businessTemplateTabs = computed(() => currentBusinessTemplate.value?.tabs || []);
+const showAppointmentsTab = computed(() => businessTemplateTabs.value.includes('appointments'));
+const isClinicTemplate = computed(() => currentOrganization.value?.industry === 'clinics');
+const schemaFor = (key) => currentBusinessTemplate.value?.schemas?.[key] || [];
+const fieldTypes = ['text', 'phone', 'email', 'number', 'currency', 'date', 'datetime', 'select'];
+const scheduleDays = [
+  { value: 'mon', label: 'Mon', full: 'Monday' },
+  { value: 'tue', label: 'Tue', full: 'Tuesday' },
+  { value: 'wed', label: 'Wed', full: 'Wednesday' },
+  { value: 'thu', label: 'Thu', full: 'Thursday' },
+  { value: 'fri', label: 'Fri', full: 'Friday' },
+  { value: 'sat', label: 'Sat', full: 'Saturday' },
+  { value: 'sun', label: 'Sun', full: 'Sunday' },
+];
+const scheduleTimePresets = [
+  { label: 'Clinic day', start: '10:00', end: '16:00' },
+  { label: 'Office day', start: '09:00', end: '18:00' },
+  { label: 'Morning', start: '09:00', end: '13:00' },
+  { label: 'Evening', start: '14:00', end: '20:00' },
+];
+const requestTypeOptions = computed(() => currentBusinessTemplate.value?.request_types || []);
+const consultationTypeOptions = computed(() => currentBusinessTemplate.value?.consultation_types || []);
+const businessPromptPlaceholder = computed(() => {
+  if (!currentBusinessTemplate.value) return 'Business Type rules will be injected after setup. Add agent-specific tone, escalation, and workflow details here.';
+  return `${currentBusinessTemplate.value.label} rules are injected automatically. Add agent-specific tone, escalation, and workflow details here.`;
+});
 const isInviteDomainValid = computed(() => {
   if (!inviteForm.value.email) return true;
   const at = inviteForm.value.email.indexOf('@');
@@ -97,28 +150,10 @@ const inviteValidationMessage = computed(() => {
   return 'A one-time link will be emailed. The invitee sets their own password and TOTP.';
 });
 
-const memberFilterLabel = computed(() => ({ all: 'All members', invited: 'Invited', active: 'Active' }[memberFilter.value]));
-const memberSortLabel = computed(
-  () => ({ name: 'Sort: Name', email: 'Sort: Email', role: 'Sort: Role' }[memberSortMode.value]),
-);
-
 const filteredMembers = computed(() => {
-  let list = [...members.value];
-  if (memberFilter.value === 'invited') list = list.filter((m) => m.status === 'invited' || m.status === 'pending_totp');
-  if (memberFilter.value === 'active') list = list.filter((m) => m.status === 'active');
-  if (dashboardQuery.value.trim()) {
-    const q = dashboardQuery.value.toLowerCase();
-    list = list.filter((m) => (m.email || '').toLowerCase().includes(q) || (m.full_name || '').toLowerCase().includes(q));
-  }
-  const key = memberSortMode.value === 'name' ? 'full_name' : memberSortMode.value;
-  list.sort((a, b) => String(a[key] || '').localeCompare(String(b[key] || '')));
+  const list = [...members.value];
+  list.sort((a, b) => String(a.full_name || '').localeCompare(String(b.full_name || '')));
   return list;
-});
-
-const dashboardSearchPlaceholder = computed(() => {
-  if (currentPage.value === 'members') return 'Search members by name or email';
-  if (currentPage.value === 'agent') return 'Search agents';
-  return 'Search workspace';
 });
 
 const updateCursorGlow = (event) => {
@@ -135,15 +170,8 @@ const toggleThemeMode = () => {
   localStorage.setItem(THEME_KEY, themeMode.value);
 };
 
-const toggleMemberFilter = () => {
-  memberFilter.value = { all: 'invited', invited: 'active', active: 'all' }[memberFilter.value];
-};
-
-const cycleMemberSort = () => {
-  memberSortMode.value = { name: 'email', email: 'role', role: 'name' }[memberSortMode.value];
-};
-
 const switchPage = (page) => {
+  if (page === 'appointments' && !showAppointmentsTab.value) return;
   currentPage.value = page;
   errorMsg.value = '';
   infoMsg.value = '';
@@ -294,8 +322,7 @@ const handleGoogleCredential = async (response) => {
       authState.value = 'login_totp';
     } else if (data.access_token && data.user) {
       persistSession(data);
-      authState.value = 'ready';
-      await loadWorkspace();
+      await enterWorkspaceAfterAuth();
     } else {
       errorMsg.value = 'Unexpected Google sign-in response.';
     }
@@ -315,24 +342,79 @@ const fetchAuthConfig = async () => {
   }
 };
 
+const loadBusinessTypeOptions = async () => {
+  if (businessTypeOptions.value.length) return;
+  try {
+    const { data } = await api.get('/business-template/options');
+    businessTypeOptions.value = data;
+  } catch (err) {
+    errorMsg.value = extractErrorMessage(err, 'Failed to load Business Type options.');
+  }
+};
+
+const loadBusinessTemplate = async () => {
+  if (businessTypeRequired.value) {
+    organizationBusinessTemplate.value = null;
+    return;
+  }
+  try {
+    const { data } = await api.get('/business-template', { headers: authHeader() });
+    organizationBusinessTemplate.value = data;
+  } catch (err) {
+    errorMsg.value = extractErrorMessage(err, 'Failed to load Business Type fields.');
+  }
+};
+
+const enterWorkspaceAfterAuth = async () => {
+  await loadBusinessTypeOptions();
+  if (businessTypeRequired.value) {
+    selectedBusinessType.value = '';
+    authState.value = 'business_type_setup';
+    return;
+  }
+  await loadBusinessTemplate();
+  authState.value = 'ready';
+  await loadWorkspace();
+};
+
 const loadWorkspace = async () => {
   isLoadingMembers.value = true;
   try {
-    const [m, a, t, p] = await Promise.allSettled([
+    const [m, a, t, p, s] = await Promise.allSettled([
       api.get('/members/', { headers: authHeader() }),
       api.get('/agents/', { headers: authHeader() }),
       api.get('/agents/tools/predefined', { headers: authHeader() }),
       api.get('/me/provisioning', { headers: authHeader() }),
+      api.get('/members/assignment-settings', { headers: authHeader() }),
     ]);
     if (m.status === 'fulfilled') members.value = m.value.data;
     if (a.status === 'fulfilled') agents.value = a.value.data;
     if (t.status === 'fulfilled') predefinedTools.value = t.value.data;
     if (p.status === 'fulfilled') provisioning.value = p.value.data;
+    if (s.status === 'fulfilled') assignmentSettings.value = s.value.data;
+    if (isClinicTemplate.value && m.status === 'fulfilled') await loadClinicMemberSchedules(m.value.data);
   } catch (err) {
     errorMsg.value = extractErrorMessage(err, 'Failed to load workspace.');
   } finally {
     isLoadingMembers.value = false;
   }
+};
+
+const loadClinicMemberSchedules = async (memberList = members.value) => {
+  const scheduleEntries = {};
+  const slotEntries = {};
+  await Promise.allSettled(
+    memberList.map(async (member) => {
+      const [schedule, slots] = await Promise.allSettled([
+        api.get(`/members/${member.id}/clinic-schedule-settings`, { headers: authHeader() }),
+        api.get(`/members/${member.id}/blocked-slots`, { headers: authHeader() }),
+      ]);
+      if (schedule.status === 'fulfilled') scheduleEntries[member.id] = schedule.value.data;
+      if (slots.status === 'fulfilled') slotEntries[member.id] = slots.value.data;
+    }),
+  );
+  clinicScheduleSettings.value = scheduleEntries;
+  blockedSlots.value = slotEntries;
 };
 
 const restoreSession = async () => {
@@ -342,13 +424,310 @@ const restoreSession = async () => {
     const { data } = await api.get('/me', { headers: { Authorization: `Bearer ${token}` } });
     currentUser.value = data.user;
     currentOrganization.value = data.organization;
-    authState.value = 'ready';
-    await loadWorkspace();
+    await enterWorkspaceAfterAuth();
     return true;
   } catch (_) {
     localStorage.removeItem(ACCESS_TOKEN_KEY);
     localStorage.removeItem(REFRESH_TOKEN_KEY);
     return false;
+  }
+};
+
+const saveBusinessType = async () => {
+  if (!selectedBusinessType.value) return;
+  errorMsg.value = '';
+  infoMsg.value = '';
+  isSavingBusinessType.value = true;
+  try {
+    const { data } = await api.post(
+      '/business-template',
+      { business_type: selectedBusinessType.value },
+      { headers: authHeader() },
+    );
+    currentOrganization.value = data.organization;
+    if (data.business_template) {
+      organizationBusinessTemplate.value = data.business_template;
+      const idx = businessTypeOptions.value.findIndex((option) => option.value === data.business_template.value);
+      if (idx >= 0) businessTypeOptions.value[idx] = data.business_template;
+      else businessTypeOptions.value.push(data.business_template);
+    }
+    infoMsg.value = `Business Type set to ${data.business_template?.label || businessTypeLabel.value}.`;
+    authState.value = 'ready';
+    await loadWorkspace();
+  } catch (err) {
+    errorMsg.value = extractErrorMessage(err, 'Business Type could not be saved.');
+  } finally {
+    isSavingBusinessType.value = false;
+  }
+};
+
+const cloneFields = (key) => schemaFor(key).map((field) => ({ ...field }));
+
+const startFieldEdit = (key, title) => {
+  fieldEditor.value = {
+    key,
+    title,
+    fields: cloneFields(key),
+    isSaving: false,
+  };
+};
+
+const closeFieldEdit = () => {
+  fieldEditor.value = { key: null, title: '', fields: [], isSaving: false };
+};
+
+const assignmentForMember = (memberId) =>
+  assignmentSettings.value.find((item) => item.member_id === memberId) || {
+    member_id: memberId,
+    is_assignable: false,
+    working_days: [],
+    start_time: null,
+    end_time: null,
+    timezone: 'Asia/Kolkata',
+    request_types: [],
+    max_active_requests: 100,
+    max_requests_per_day: null,
+    max_requests_per_hour: 6,
+    active_request_count: 0,
+    availability_summary: 'Not assignable',
+  };
+
+const clinicForMember = (memberId) =>
+  clinicScheduleSettings.value[memberId] || {
+    member_id: memberId,
+    appointment_duration_minutes: 30,
+    buffer_minutes: 0,
+    max_patients_per_hour: null,
+    max_patients_per_day: null,
+    consultation_types: [],
+  };
+
+const todayDateInputValue = () => {
+  const now = new Date();
+  const localDate = new Date(now.getTime() - now.getTimezoneOffset() * 60000);
+  return localDate.toISOString().slice(0, 10);
+};
+
+const createEmptyBlockedSlot = () => ({ date: todayDateInputValue(), start_time: '', end_time: '', reason: '' });
+
+const normalizeTime = (value) => (value ? String(value).slice(0, 5) : '');
+
+const timeToMinutes = (value) => {
+  const normalized = normalizeTime(value);
+  const [hours, minutes] = normalized.split(':').map(Number);
+  if (!Number.isFinite(hours) || !Number.isFinite(minutes)) return null;
+  return hours * 60 + minutes;
+};
+
+const formatSimpleTime = (value) => {
+  const normalized = normalizeTime(value);
+  const minutes = timeToMinutes(normalized);
+  if (minutes === null) return '--';
+  const date = new Date(2000, 0, 1, Math.floor(minutes / 60), minutes % 60);
+  return date.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+};
+
+const timeRangeDuration = (start, end) => {
+  const startMinutes = timeToMinutes(start);
+  const endMinutes = timeToMinutes(end);
+  if (startMinutes === null || endMinutes === null) return 'Set daily working hours';
+  const diff = endMinutes - startMinutes;
+  if (diff <= 0) return 'End time must be after start time';
+  const hours = Math.floor(diff / 60);
+  const minutes = diff % 60;
+  if (!hours) return `${minutes} min window`;
+  if (!minutes) return `${hours} hr window`;
+  return `${hours} hr ${minutes} min window`;
+};
+
+const applyScheduleTimePreset = (preset) => {
+  if (!assignmentEditor.value.settings) return;
+  assignmentEditor.value.settings.start_time = preset.start;
+  assignmentEditor.value.settings.end_time = preset.end;
+};
+
+const isScheduleTimePresetActive = (preset) => {
+  const settings = assignmentEditor.value.settings;
+  if (!settings) return false;
+  return normalizeTime(settings.start_time) === preset.start && normalizeTime(settings.end_time) === preset.end;
+};
+
+const startAssignmentEdit = (member) => {
+  assignmentEditor.value = {
+    member,
+    settings: JSON.parse(JSON.stringify(assignmentForMember(member.id))),
+    clinic: JSON.parse(JSON.stringify(clinicForMember(member.id))),
+    blockedSlot: createEmptyBlockedSlot(),
+    isSaving: false,
+    isSavingClinic: false,
+    isSavingBlock: false,
+  };
+};
+
+const closeAssignmentEdit = () => {
+  assignmentEditor.value = {
+    member: null,
+    settings: null,
+    clinic: null,
+    blockedSlot: { date: '', start_time: '', end_time: '', reason: '' },
+    isSaving: false,
+    isSavingClinic: false,
+    isSavingBlock: false,
+  };
+};
+
+const toggleListValue = (list, value) => {
+  const idx = list.indexOf(value);
+  if (idx >= 0) list.splice(idx, 1);
+  else list.push(value);
+};
+
+const saveAssignmentSettings = async () => {
+  const member = assignmentEditor.value.member;
+  const settings = assignmentEditor.value.settings;
+  if (!member || !settings) return;
+  assignmentEditor.value.isSaving = true;
+  try {
+    const payload = {
+      ...settings,
+      timezone: 'Asia/Kolkata',
+      max_active_requests: settings.max_active_requests || 100,
+      max_requests_per_day: null,
+      max_requests_per_hour: settings.max_requests_per_hour || 6,
+    };
+    const { data } = await api.put(`/members/${member.id}/assignment-settings`, payload, { headers: authHeader() });
+    const idx = assignmentSettings.value.findIndex((item) => item.member_id === member.id);
+    if (idx >= 0) assignmentSettings.value[idx] = data;
+    else assignmentSettings.value.push(data);
+    assignmentEditor.value.settings = JSON.parse(JSON.stringify(data));
+    infoMsg.value = `${member.full_name || member.email} assignment settings saved.`;
+  } catch (err) {
+    errorMsg.value = extractErrorMessage(err, 'Assignment settings could not be saved.');
+  } finally {
+    assignmentEditor.value.isSaving = false;
+  }
+};
+
+const saveClinicSettings = async () => {
+  const member = assignmentEditor.value.member;
+  const clinic = assignmentEditor.value.clinic;
+  if (!member || !clinic) return;
+  assignmentEditor.value.isSavingClinic = true;
+  try {
+    const payload = {
+      ...clinic,
+      max_patients_per_hour: clinic.max_patients_per_hour || null,
+      max_patients_per_day: clinic.max_patients_per_day || null,
+    };
+    const { data } = await api.put(`/members/${member.id}/clinic-schedule-settings`, payload, { headers: authHeader() });
+    clinicScheduleSettings.value = { ...clinicScheduleSettings.value, [member.id]: data };
+    assignmentEditor.value.clinic = JSON.parse(JSON.stringify(data));
+    infoMsg.value = `${member.full_name || member.email} clinic schedule saved.`;
+  } catch (err) {
+    errorMsg.value = extractErrorMessage(err, 'Clinic schedule could not be saved.');
+  } finally {
+    assignmentEditor.value.isSavingClinic = false;
+  }
+};
+
+const addBlockedSlot = async () => {
+  const member = assignmentEditor.value.member;
+  const slot = assignmentEditor.value.blockedSlot;
+  if (!member || !slot.date || !slot.start_time || !slot.end_time) return;
+  const startDate = new Date(`${slot.date}T${slot.start_time}`);
+  const endDate = new Date(`${slot.date}T${slot.end_time}`);
+  if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime())) {
+    errorMsg.value = 'Choose a valid blocked date and time.';
+    return;
+  }
+  if (endDate <= startDate) {
+    errorMsg.value = 'Blocked time must end after it starts.';
+    return;
+  }
+  assignmentEditor.value.isSavingBlock = true;
+  try {
+    const { data } = await api.post(
+      `/members/${member.id}/blocked-slots`,
+      {
+        start_time: startDate.toISOString(),
+        end_time: endDate.toISOString(),
+        reason: slot.reason || null,
+      },
+      { headers: authHeader() },
+    );
+    blockedSlots.value = {
+      ...blockedSlots.value,
+      [member.id]: [...(blockedSlots.value[member.id] || []), data],
+    };
+    assignmentEditor.value.blockedSlot = createEmptyBlockedSlot();
+  } catch (err) {
+    errorMsg.value = extractErrorMessage(err, 'Blocked slot could not be added.');
+  } finally {
+    assignmentEditor.value.isSavingBlock = false;
+  }
+};
+
+const deleteBlockedSlot = async (slotId) => {
+  const member = assignmentEditor.value.member;
+  if (!member) return;
+  try {
+    await api.delete(`/blocked-slots/${slotId}`, { headers: authHeader() });
+    blockedSlots.value = {
+      ...blockedSlots.value,
+      [member.id]: (blockedSlots.value[member.id] || []).filter((slot) => slot.id !== slotId),
+    };
+  } catch (err) {
+    errorMsg.value = extractErrorMessage(err, 'Blocked slot could not be deleted.');
+  }
+};
+
+const formatCalendarDate = (value) => {
+  if (!value) return 'No date';
+  return new Date(value).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+};
+
+const formatCalendarTime = (value) => {
+  if (!value) return '';
+  return new Date(value).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+};
+
+const addField = () => {
+  fieldEditor.value.fields.push({
+    key: `custom_${fieldEditor.value.fields.length + 1}`,
+    label: 'New Field',
+    type: 'text',
+    required: false,
+  });
+};
+
+const removeField = (index) => {
+  if (fieldEditor.value.fields.length <= 1) return;
+  fieldEditor.value.fields.splice(index, 1);
+};
+
+const saveFieldEdit = async () => {
+  if (!fieldEditor.value.key) return;
+  fieldEditor.value.isSaving = true;
+  errorMsg.value = '';
+  try {
+    const fields = fieldEditor.value.fields.map((field) => ({
+      key: (field.key || field.label || 'field').trim().toLowerCase().replace(/[\s-]+/g, '_').replace(/[^a-z0-9_]/g, ''),
+      label: (field.label || '').trim(),
+      type: field.type || 'text',
+      required: Boolean(field.required),
+    }));
+    const { data } = await api.patch(
+      `/business-template/schemas/${fieldEditor.value.key}`,
+      { fields },
+      { headers: authHeader() },
+    );
+    organizationBusinessTemplate.value = data;
+    infoMsg.value = `${fieldEditor.value.title} updated.`;
+    closeFieldEdit();
+  } catch (err) {
+    errorMsg.value = extractErrorMessage(err, 'Fields could not be saved.');
+  } finally {
+    fieldEditor.value.isSaving = false;
   }
 };
 
@@ -532,9 +911,8 @@ const verifyLoginTotp = async () => {
       { headers: { Authorization: `Bearer ${loginTempToken.value}` } },
     );
     persistSession(data);
-    authState.value = 'ready';
     totpCode.value = '';
-    await loadWorkspace();
+    await enterWorkspaceAfterAuth();
   } catch (err) {
     errorMsg.value = extractErrorMessage(err, 'Invalid TOTP code.');
   } finally {
@@ -599,8 +977,7 @@ const inviteMember = async () => {
     await api.post('/members/invite', inviteForm.value, { headers: authHeader() });
     infoMsg.value = `Invitation sent to ${inviteForm.value.email}.`;
     inviteForm.value = { email: '', full_name: '', role: 'member' };
-    const { data } = await api.get('/members/', { headers: authHeader() });
-    members.value = data;
+    await loadWorkspace();
   } catch (err) {
     errorMsg.value = extractErrorMessage(err, 'Invite failed.');
   } finally {
@@ -668,8 +1045,14 @@ const handleLogout = async () => {
   currentUser.value = null;
   currentOrganization.value = null;
   members.value = [];
+  assignmentSettings.value = [];
+  clinicScheduleSettings.value = {};
+  blockedSlots.value = {};
   agents.value = [];
   predefinedTools.value = [];
+  organizationBusinessTemplate.value = null;
+  closeFieldEdit();
+  closeAssignmentEdit();
   authState.value = 'login';
 };
 
@@ -682,6 +1065,11 @@ onMounted(async () => {
 });
 
 watch([authState, themeMode], async () => {
+  await nextTick();
+  await renderGoogleButtons();
+});
+
+watch(authConfig, async () => {
   await nextTick();
   await renderGoogleButtons();
 });
@@ -725,8 +1113,12 @@ onBeforeUnmount(() => {
             <strong>Sign in to Nokvo One</strong>
             <span>Continue with Google or use your work email + password</span>
           </div>
-          <div v-if="authConfig?.google_login_enabled" class="google-action">
-            <div ref="googleLoginButtonRef" class="google-button-host" :class="{ disabled: isAuthenticating }"></div>
+          <div class="google-action">
+            <div v-if="authConfig?.google_login_enabled" ref="googleLoginButtonRef" class="google-button-host" :class="{ disabled: isAuthenticating }"></div>
+            <button v-else type="button" class="google-fallback-button" disabled>
+              <span class="google-mark">G</span>
+              Continue with Google
+            </button>
           </div>
           <div class="auth-divider"><span>or</span></div>
           <label class="code-label" for="nokvo-one-email">Work Email</label>
@@ -777,8 +1169,12 @@ onBeforeUnmount(() => {
             <strong>Create your Nokvo One organization</strong>
             <span>Continue with Google or self-serve with email + password. TOTP is required.</span>
           </div>
-          <div v-if="authConfig?.google_login_enabled" class="google-action">
-            <div ref="googleSignupButtonRef" class="google-button-host" :class="{ disabled: isAuthenticating }"></div>
+          <div class="google-action">
+            <div v-if="authConfig?.google_login_enabled" ref="googleSignupButtonRef" class="google-button-host" :class="{ disabled: isAuthenticating }"></div>
+            <button v-else type="button" class="google-fallback-button" disabled>
+              <span class="google-mark">G</span>
+              Continue with Google
+            </button>
           </div>
           <div class="auth-divider"><span>or</span></div>
           <label class="code-label" for="signup-org">Organization name</label>
@@ -906,6 +1302,45 @@ onBeforeUnmount(() => {
             </button>
           </div>
         </div>
+
+        <!-- BUSINESS TYPE SETUP -->
+        <div v-else-if="authState === 'business_type_setup'" class="mfa-panel">
+          <div class="mfa-head">
+            <strong>Select Business Type</strong>
+            <span>{{ currentOrganization?.name }} needs a template before the workspace opens.</span>
+          </div>
+          <div class="provider-grid business-type-grid">
+            <label
+              v-for="option in businessTypeOptions"
+              :key="option.value"
+              class="provider-option"
+              :class="{ active: selectedBusinessType === option.value }"
+            >
+              <input v-model="selectedBusinessType" type="radio" class="sr-only" :value="option.value" />
+              <strong class="provider-name">{{ option.label }}</strong>
+              <small>
+                {{ option.tabs.includes('appointments') ? 'Leads, Tickets, and Appointments' : 'Leads and Tickets' }}
+              </small>
+            </label>
+          </div>
+          <div v-if="selectedBusinessType" class="schema-preview">
+            <strong>Default workspace fields</strong>
+            <div class="schema-preview-grid">
+              <span
+                v-for="field in (businessTypeOptions.find((option) => option.value === selectedBusinessType)?.schemas?.leads || []).slice(0, 4)"
+                :key="field.key"
+              >
+                {{ field.label }}
+              </span>
+            </div>
+          </div>
+          <div class="mfa-actions">
+            <button type="button" class="ghost-button" :disabled="isSavingBusinessType" @click="handleLogout">Log out</button>
+            <button type="button" class="primary-button" :disabled="!selectedBusinessType || isSavingBusinessType" @click="saveBusinessType">
+              {{ isSavingBusinessType ? 'Saving...' : 'Continue' }}
+            </button>
+          </div>
+        </div>
       </div>
 
       <div class="footer-links">
@@ -926,11 +1361,6 @@ onBeforeUnmount(() => {
             </div>
           </div>
 
-          <div class="nav-search">
-            <Search :size="18" class="nav-search-icon" />
-            <input v-model="dashboardQuery" type="text" :placeholder="dashboardSearchPlaceholder" />
-          </div>
-
           <div class="dashboard-nav-actions">
             <button type="button" class="nav-page-button" :class="{ active: currentPage === 'dashboard' }" @click="switchPage('dashboard')">
               <Database :size="17" />
@@ -938,17 +1368,29 @@ onBeforeUnmount(() => {
             </button>
             <button type="button" class="nav-page-button" :class="{ active: currentPage === 'members' }" @click="switchPage('members')">
               <Users :size="17" />
-              <span>Members</span>
+              <span>{{ memberPageLabel }}</span>
+            </button>
+            <button type="button" class="nav-page-button" :class="{ active: currentPage === 'tickets' }" @click="switchPage('tickets')">
+              <MessageSquare :size="17" />
+              <span>Tickets</span>
+            </button>
+            <button type="button" class="nav-page-button" :class="{ active: currentPage === 'leads' }" @click="switchPage('leads')">
+              <UserPlus :size="17" />
+              <span>Leads</span>
+            </button>
+            <button
+              v-if="showAppointmentsTab"
+              type="button"
+              class="nav-page-button"
+              :class="{ active: currentPage === 'appointments' }"
+              @click="switchPage('appointments')"
+            >
+              <CalendarDays :size="17" />
+              <span>Appointments</span>
             </button>
             <button type="button" class="nav-page-button" :class="{ active: currentPage === 'agent' }" @click="switchPage('agent')">
               <Bot :size="17" />
               <span>Agent Studio</span>
-            </button>
-            <button type="button" class="nav-icon-button" @click="toggleMemberFilter">
-              <Filter :size="18" />
-            </button>
-            <button type="button" class="nav-icon-button" @click="cycleMemberSort">
-              <ArrowUpDown :size="18" />
             </button>
             <button type="button" class="nav-icon-button">
               <Bell :size="18" />
@@ -974,7 +1416,7 @@ onBeforeUnmount(() => {
           <h2>{{ currentOrganization?.name }}</h2>
           <p>
             Signed in as {{ currentUser?.email }}. Scoped to <strong>{{ currentOrganization?.email_domain }}</strong>.
-            Use predefined tools to keep agent actions safe and auditable.
+            Business Type: <strong>{{ businessTypeLabel }}</strong>. Use predefined tools to keep agent actions safe and auditable.
           </p>
         </div>
         <div class="dashboard-header-actions">
@@ -992,12 +1434,16 @@ onBeforeUnmount(() => {
             <strong>{{ currentOrganization?.email_domain }}</strong>
           </div>
           <div class="summary-pill">
-            <span>Members</span>
+            <span>{{ memberPageLabel }}</span>
             <strong>{{ members.length }}</strong>
           </div>
           <div class="summary-pill">
             <span>Agents</span>
             <strong>{{ agents.length }}</strong>
+          </div>
+          <div class="summary-pill">
+            <span>Business Type</span>
+            <strong>{{ businessTypeLabel }}</strong>
           </div>
           <div class="summary-pill">
             <span>Status</span>
@@ -1011,16 +1457,6 @@ onBeforeUnmount(() => {
             <span>Role</span>
             <strong>{{ currentUser?.role }}</strong>
           </div>
-        </div>
-        <div class="dashboard-filter-actions">
-          <button type="button" class="dashboard-chip-button" @click="toggleMemberFilter">
-            <Filter :size="16" />
-            {{ memberFilterLabel }}
-          </button>
-          <button type="button" class="dashboard-chip-button" @click="cycleMemberSort">
-            <ArrowUpDown :size="16" />
-            {{ memberSortLabel }}
-          </button>
         </div>
       </section>
 
@@ -1071,7 +1507,7 @@ onBeforeUnmount(() => {
 
             <div class="organization-metrics">
               <div>
-                <span>Members</span>
+                <span>{{ memberPageLabel }}</span>
                 <strong>{{ members.length }}</strong>
               </div>
               <div>
@@ -1112,6 +1548,10 @@ onBeforeUnmount(() => {
                 <dt>Chat Mode</dt>
                 <dd>Limited (no external sends)</dd>
               </div>
+              <div>
+                <dt>Business Type</dt>
+                <dd>{{ businessTypeLabel }}</dd>
+              </div>
             </dl>
             <button type="button" class="dashboard-inline-button" @click="switchPage('agent')">
               <Wrench :size="15" />
@@ -1131,7 +1571,7 @@ onBeforeUnmount(() => {
             </div>
             <dl class="dashboard-detail-list">
               <div>
-                <dt>Total Members</dt>
+                <dt>Total {{ memberPageLabel }}</dt>
                 <dd>{{ members.length }}</dd>
               </div>
               <div>
@@ -1145,7 +1585,7 @@ onBeforeUnmount(() => {
             </dl>
             <button type="button" class="dashboard-inline-button" @click="switchPage('members')">
               <Users :size="15" />
-              Manage Members
+              Manage {{ memberPageLabel }}
             </button>
           </article>
         </div>
@@ -1199,7 +1639,7 @@ onBeforeUnmount(() => {
                 <UserPlus :size="18" />
               </div>
               <div>
-                <h3>Invite Member</h3>
+                <h3>Invite {{ memberPageLabel }}</h3>
                 <p>Email invite link. Invitee sets their own password and TOTP.</p>
               </div>
             </div>
@@ -1263,6 +1703,10 @@ onBeforeUnmount(() => {
                 <span>Tier</span>
                 <strong>{{ currentOrganization?.product_tier }}</strong>
               </div>
+              <div>
+                <span>Business Type</span>
+                <strong>{{ businessTypeLabel }}</strong>
+              </div>
             </div>
           </article>
         </div>
@@ -1273,9 +1717,9 @@ onBeforeUnmount(() => {
         <div class="dashboard-section-head">
           <div>
             <span class="section-kicker">Access</span>
-            <h3>Organization Members</h3>
+            <h3>{{ memberPageLabel }}</h3>
           </div>
-          <p>Searchable access roster. Invitees receive a one-time link to set password + TOTP.</p>
+          <p>Manage access and assignment availability for incoming calls, leads, tickets, and appointments.</p>
         </div>
 
         <div class="dashboard-grid control-grid">
@@ -1285,7 +1729,7 @@ onBeforeUnmount(() => {
                 <UserPlus :size="18" />
               </div>
               <div>
-                <h3>Invite Member</h3>
+                <h3>Invite {{ memberPageLabel }}</h3>
                 <p>Add admins, managers, or members under the same verified domain.</p>
               </div>
             </div>
@@ -1325,7 +1769,7 @@ onBeforeUnmount(() => {
           <article class="dashboard-card wide-card members-card">
             <div class="members-card-head">
               <div>
-                <h3>Members</h3>
+                <h3>{{ memberPageLabel }}</h3>
                 <p>Use filter & sort in the top nav to slice this list.</p>
               </div>
               <div class="members-summary">
@@ -1338,10 +1782,10 @@ onBeforeUnmount(() => {
             <div v-else-if="!filteredMembers.length" class="empty-state">No members match the current filter.</div>
             <div v-else class="member-table dashboard-member-table">
               <div class="member-row member-head">
-                <span>Member</span>
+                <span>{{ memberPageLabel }}</span>
                 <span>Role</span>
                 <span>Status</span>
-                <span></span>
+                <span>Assignment</span>
               </div>
               <div v-for="m in filteredMembers" :key="m.id" class="member-row">
                 <div class="member-meta">
@@ -1350,11 +1794,145 @@ onBeforeUnmount(() => {
                 </div>
                 <span class="readonly-tag">{{ m.role }}</span>
                 <span class="readonly-tag">{{ m.status }}</span>
-                <span class="readonly-tag">{{ m.auth_provider }}</span>
+                <div class="assignment-summary-cell">
+                  <span class="readonly-tag">{{ assignmentForMember(m.id).availability_summary }}</span>
+                  <span class="readonly-tag">Current load: {{ assignmentForMember(m.id).active_request_count || 0 }}</span>
+                  <button type="button" class="ghost-button compact" @click="startAssignmentEdit(m)">Schedule</button>
+                </div>
               </div>
             </div>
           </article>
         </div>
+      </section>
+
+      <!-- TICKETS -->
+      <section v-if="currentPage === 'tickets'" class="dashboard-section">
+        <div class="dashboard-section-head">
+          <div>
+            <span class="section-kicker">{{ businessTypeLabel }}</span>
+            <h3>Tickets</h3>
+          </div>
+          <p>Choose the details your team tracks for support requests.</p>
+        </div>
+
+        <div class="dashboard-grid control-grid">
+          <article class="dashboard-card wide-card members-card">
+            <div class="members-card-head">
+              <div>
+                <h3>Ticket Fields</h3>
+                <p>These fields appear when your team captures or reviews a ticket.</p>
+              </div>
+              <div class="field-card-actions">
+                <span class="status-chip">{{ schemaFor('tickets').length }} fields</span>
+                <button type="button" class="ghost-button compact" @click="startFieldEdit('tickets', 'Ticket Fields')">Edit Fields</button>
+              </div>
+            </div>
+            <div class="schema-field-grid">
+              <div v-for="field in schemaFor('tickets')" :key="field.key" class="schema-field-row">
+                <strong>{{ field.label }}</strong>
+                <span>{{ field.type }}{{ field.required ? ' · required' : '' }}</span>
+              </div>
+            </div>
+          </article>
+
+          <article class="dashboard-card compact-card">
+            <div class="compact-card-head">
+              <div class="compact-icon-shell">
+                <MessageSquare :size="18" />
+              </div>
+              <div>
+                <h3>At A Glance</h3>
+                <p>{{ businessTypeLabel }} ticket setup</p>
+              </div>
+            </div>
+            <dl class="dashboard-detail-list">
+              <div v-for="field in schemaFor('tickets').slice(0, 5)" :key="field.key">
+                <dt>{{ field.label }}</dt>
+                <dd>{{ field.required ? 'Required' : 'Optional' }}</dd>
+              </div>
+            </dl>
+          </article>
+        </div>
+      </section>
+
+      <!-- LEADS -->
+      <section v-if="currentPage === 'leads'" class="dashboard-section">
+        <div class="dashboard-section-head">
+          <div>
+            <span class="section-kicker">{{ businessTypeLabel }}</span>
+            <h3>Leads</h3>
+          </div>
+          <p>Choose the details your team needs to qualify new customers.</p>
+        </div>
+
+        <div class="dashboard-grid control-grid">
+          <article class="dashboard-card wide-card members-card">
+            <div class="members-card-head">
+              <div>
+                <h3>Lead Fields</h3>
+                <p>These fields guide customer intake, follow-up, and agent-created leads.</p>
+              </div>
+              <div class="field-card-actions">
+                <span class="status-chip">{{ schemaFor('leads').length }} fields</span>
+                <button type="button" class="ghost-button compact" @click="startFieldEdit('leads', 'Lead Fields')">Edit Fields</button>
+              </div>
+            </div>
+            <div class="schema-field-grid">
+              <div v-for="field in schemaFor('leads')" :key="field.key" class="schema-field-row">
+                <strong>{{ field.label }}</strong>
+                <span>{{ field.type }}{{ field.required ? ' · required' : '' }}</span>
+              </div>
+            </div>
+          </article>
+
+          <article class="dashboard-card compact-card">
+            <div class="compact-card-head">
+              <div class="compact-icon-shell">
+                <UserPlus :size="18" />
+              </div>
+              <div>
+                <h3>At A Glance</h3>
+                <p>{{ businessTypeLabel }} lead setup</p>
+              </div>
+            </div>
+            <dl class="dashboard-detail-list">
+              <div v-for="field in schemaFor('leads').slice(0, 5)" :key="field.key">
+                <dt>{{ field.label }}</dt>
+                <dd>{{ field.required ? 'Required' : 'Optional' }}</dd>
+              </div>
+            </dl>
+          </article>
+        </div>
+      </section>
+
+      <!-- APPOINTMENTS -->
+      <section v-if="currentPage === 'appointments' && showAppointmentsTab" class="dashboard-section">
+        <div class="dashboard-section-head">
+          <div>
+            <span class="section-kicker">Clinics</span>
+            <h3>Appointments</h3>
+          </div>
+          <p>Choose the details needed to book and follow up on visits.</p>
+        </div>
+
+        <article class="dashboard-card wide-card members-card">
+          <div class="members-card-head">
+            <div>
+              <h3>Appointment Fields</h3>
+              <p>Clinic agents use these fields for scheduling and appointment follow-up.</p>
+            </div>
+            <div class="field-card-actions">
+              <span class="status-chip">{{ schemaFor('appointments').length }} fields</span>
+              <button type="button" class="ghost-button compact" @click="startFieldEdit('appointments', 'Appointment Fields')">Edit Fields</button>
+            </div>
+          </div>
+          <div class="schema-field-grid">
+            <div v-for="field in schemaFor('appointments')" :key="field.key" class="schema-field-row">
+              <strong>{{ field.label }}</strong>
+              <span>{{ field.type }}{{ field.required ? ' · required' : '' }}</span>
+            </div>
+          </div>
+        </article>
       </section>
 
       <!-- AGENT STUDIO -->
@@ -1396,7 +1974,8 @@ onBeforeUnmount(() => {
 
             <div class="db-form-block">
               <label class="db-label" for="agent-prompt">System Prompt</label>
-              <textarea id="agent-prompt" v-model="newAgent.system_prompt" class="db-input toolkit-textarea" placeholder="Instructions, tone, escalation rules..."></textarea>
+              <textarea id="agent-prompt" v-model="newAgent.system_prompt" class="db-input toolkit-textarea" :placeholder="businessPromptPlaceholder"></textarea>
+              <p class="form-hint">Global Nokvo rules and {{ businessTypeLabel }} template rules are injected by the backend at runtime.</p>
             </div>
 
             <div class="db-form-block">
@@ -1555,6 +2134,267 @@ onBeforeUnmount(() => {
       </section>
     </main>
 
+    <div v-if="fieldEditor.key" class="field-modal-shell">
+      <div class="field-modal-backdrop" @click="closeFieldEdit"></div>
+      <section class="field-modal">
+        <div class="members-card-head">
+          <div>
+            <h3>Edit {{ fieldEditor.title }}</h3>
+            <p>Use plain names your team recognizes. Required fields appear as must-fill details.</p>
+          </div>
+          <button type="button" class="ghost-button compact" @click="closeFieldEdit">Close</button>
+        </div>
+
+        <div class="field-editor-list">
+          <div v-for="(field, index) in fieldEditor.fields" :key="`${field.key}:${index}`" class="field-editor-row">
+            <label>
+              <span>Field Name</span>
+              <input v-model="field.label" type="text" placeholder="Customer Name" />
+            </label>
+            <label>
+              <span>Type</span>
+              <select v-model="field.type">
+                <option v-for="type in fieldTypes" :key="type" :value="type">{{ type }}</option>
+              </select>
+            </label>
+            <label class="field-required-toggle">
+              <input v-model="field.required" type="checkbox" />
+              <span>Required</span>
+            </label>
+            <button type="button" class="nav-icon-button" :disabled="fieldEditor.fields.length <= 1" @click="removeField(index)">
+              <Trash2 :size="16" />
+            </button>
+          </div>
+        </div>
+
+        <div class="field-modal-actions">
+          <button type="button" class="ghost-button compact" @click="addField">
+            <Plus :size="15" />
+            Add Field
+          </button>
+          <button type="button" class="primary-button compact" :disabled="fieldEditor.isSaving" @click="saveFieldEdit">
+            {{ fieldEditor.isSaving ? 'Saving...' : 'Save Fields' }}
+          </button>
+        </div>
+      </section>
+    </div>
+
+    <div v-if="assignmentEditor.member" class="field-modal-shell">
+      <div class="field-modal-backdrop" @click="closeAssignmentEdit"></div>
+      <section class="field-modal assignment-modal">
+        <div class="members-card-head">
+          <div>
+            <h3>Schedule {{ assignmentEditor.member.full_name || assignmentEditor.member.email }}</h3>
+            <p>Control when this person can receive incoming requests and how much work they can handle.</p>
+          </div>
+          <button type="button" class="ghost-button compact" @click="closeAssignmentEdit">Close</button>
+        </div>
+
+        <div v-if="assignmentEditor.settings" class="assignment-form-grid calendar-form-grid">
+          <div class="calendar-toolbar">
+            <label class="field-required-toggle assignment-toggle">
+              <input v-model="assignmentEditor.settings.is_assignable" type="checkbox" />
+              <span>Can receive assignments</span>
+            </label>
+            <span class="calendar-timezone">IST</span>
+          </div>
+
+          <div class="schedule-calendar-card">
+            <div class="calendar-card-head">
+              <div>
+                <strong>Weekly Availability</strong>
+                <span>
+                  {{ formatSimpleTime(assignmentEditor.settings.start_time) }} -
+                  {{ formatSimpleTime(assignmentEditor.settings.end_time) }} ·
+                  {{ timeRangeDuration(assignmentEditor.settings.start_time, assignmentEditor.settings.end_time) }}
+                </span>
+              </div>
+              <CalendarDays :size="19" />
+            </div>
+
+            <div class="week-calendar-grid">
+              <button
+                v-for="day in scheduleDays"
+                :key="day.value"
+                type="button"
+                class="week-day-card"
+                :aria-pressed="assignmentEditor.settings.working_days.includes(day.value)"
+                :class="{ active: assignmentEditor.settings.working_days.includes(day.value) }"
+                @click="toggleListValue(assignmentEditor.settings.working_days, day.value)"
+              >
+                <span>{{ day.label }}</span>
+                <strong>{{ assignmentEditor.settings.working_days.includes(day.value) ? 'Available' : 'Off' }}</strong>
+                <small v-if="assignmentEditor.settings.working_days.includes(day.value)">
+                  {{ formatSimpleTime(assignmentEditor.settings.start_time) }} - {{ formatSimpleTime(assignmentEditor.settings.end_time) }}
+                </small>
+                <small v-else>No assignments</small>
+              </button>
+            </div>
+          </div>
+
+          <div class="time-planner-card">
+            <div class="time-planner-head">
+              <div>
+                <span class="micro-label">Daily Time Window</span>
+                <strong>{{ formatSimpleTime(assignmentEditor.settings.start_time) }} - {{ formatSimpleTime(assignmentEditor.settings.end_time) }}</strong>
+              </div>
+              <span>{{ timeRangeDuration(assignmentEditor.settings.start_time, assignmentEditor.settings.end_time) }}</span>
+            </div>
+
+            <div class="time-preset-row">
+              <button
+                v-for="preset in scheduleTimePresets"
+                :key="preset.label"
+                type="button"
+                class="time-preset-button"
+                :class="{ active: isScheduleTimePresetActive(preset) }"
+                @click="applyScheduleTimePreset(preset)"
+              >
+                <span>{{ preset.label }}</span>
+                <strong>{{ formatSimpleTime(preset.start) }} - {{ formatSimpleTime(preset.end) }}</strong>
+              </button>
+            </div>
+
+            <div class="time-range-control">
+              <label class="time-input-card">
+                <span>From</span>
+                <input v-model="assignmentEditor.settings.start_time" type="time" step="900" />
+              </label>
+              <label class="time-input-card">
+                <span>To</span>
+                <input v-model="assignmentEditor.settings.end_time" type="time" step="900" />
+              </label>
+            </div>
+          </div>
+
+          <div class="capacity-planner-card">
+            <label>
+              <span>MAX REQUESTS PER HOUR</span>
+              <input v-model.number="assignmentEditor.settings.max_requests_per_hour" type="number" min="1" max="100" />
+            </label>
+            <p>Uses IST for every schedule and assignment decision.</p>
+          </div>
+
+          <div class="db-form-block">
+            <label class="db-label">Request Types Handled</label>
+            <div class="assignment-chip-grid request-types">
+              <label v-for="type in requestTypeOptions" :key="type.value" class="assignment-chip">
+                <input
+                  type="checkbox"
+                  :checked="assignmentEditor.settings.request_types.includes(type.value)"
+                  @change="toggleListValue(assignmentEditor.settings.request_types, type.value)"
+                />
+                <span>{{ type.label }}</span>
+              </label>
+            </div>
+          </div>
+
+          <div class="field-modal-actions">
+            <button type="button" class="primary-button compact" :disabled="assignmentEditor.isSaving" @click="saveAssignmentSettings">
+              {{ assignmentEditor.isSaving ? 'Saving...' : 'Save Assignment Settings' }}
+            </button>
+          </div>
+        </div>
+
+        <div v-if="isClinicTemplate && assignmentEditor.clinic" class="clinic-schedule-panel">
+          <div class="members-card-head">
+            <div>
+              <h3>Clinic Schedule</h3>
+              <p>Capacity and blocked slots prevent bookings during rounds, operations, breaks, or overload.</p>
+            </div>
+          </div>
+
+          <div class="assignment-two-col">
+            <label>
+              <span>Appointment Duration</span>
+              <input v-model.number="assignmentEditor.clinic.appointment_duration_minutes" type="number" min="5" />
+            </label>
+            <label>
+              <span>Buffer Minutes</span>
+              <input v-model.number="assignmentEditor.clinic.buffer_minutes" type="number" min="0" />
+            </label>
+            <label>
+              <span>Max Patients / Hour</span>
+              <input v-model.number="assignmentEditor.clinic.max_patients_per_hour" type="number" min="1" />
+            </label>
+            <label>
+              <span>Max Patients / Day</span>
+              <input v-model.number="assignmentEditor.clinic.max_patients_per_day" type="number" min="1" />
+            </label>
+          </div>
+
+          <div class="db-form-block">
+            <label class="db-label">Consultation Types</label>
+            <div class="assignment-chip-grid request-types">
+              <label v-for="type in consultationTypeOptions" :key="type.value" class="assignment-chip">
+                <input
+                  type="checkbox"
+                  :checked="assignmentEditor.clinic.consultation_types.includes(type.value)"
+                  @change="toggleListValue(assignmentEditor.clinic.consultation_types, type.value)"
+                />
+                <span>{{ type.label }}</span>
+              </label>
+            </div>
+          </div>
+
+          <div class="field-modal-actions">
+            <button type="button" class="primary-button compact" :disabled="assignmentEditor.isSavingClinic" @click="saveClinicSettings">
+              {{ assignmentEditor.isSavingClinic ? 'Saving...' : 'Save Clinic Schedule' }}
+            </button>
+          </div>
+
+          <div class="blocked-slot-panel">
+            <div class="members-card-head">
+              <div>
+                <h3>Blocked Calendar</h3>
+                <p>Use these for operations, rounds, breaks, or personal unavailable time.</p>
+              </div>
+            </div>
+
+            <div class="blocked-slot-form easy-block-form">
+              <label>
+                <span>Date</span>
+                <input v-model="assignmentEditor.blockedSlot.date" type="date" />
+              </label>
+              <label>
+                <span>From</span>
+                <input v-model="assignmentEditor.blockedSlot.start_time" type="time" step="900" />
+              </label>
+              <label>
+                <span>To</span>
+                <input v-model="assignmentEditor.blockedSlot.end_time" type="time" step="900" />
+              </label>
+              <label>
+                <span>Reason</span>
+                <input v-model="assignmentEditor.blockedSlot.reason" type="text" placeholder="Operation, rounds, break" />
+              </label>
+              <button type="button" class="ghost-button compact" :disabled="assignmentEditor.isSavingBlock" @click="addBlockedSlot">
+                <Plus :size="15" />
+                Add Block
+              </button>
+            </div>
+
+            <div class="blocked-slot-list calendar-event-list">
+              <div v-if="!(blockedSlots[assignmentEditor.member.id] || []).length" class="empty-state compact">No blocked slots.</div>
+              <div v-for="slot in blockedSlots[assignmentEditor.member.id] || []" :key="slot.id" class="blocked-slot-row calendar-event-card">
+                <div class="event-date-badge">
+                  <span>{{ formatCalendarDate(slot.start_time) }}</span>
+                  <strong>{{ formatCalendarTime(slot.start_time) }}</strong>
+                </div>
+                <div class="event-main">
+                  <strong>{{ slot.reason || 'Unavailable' }}</strong>
+                  <span>{{ formatCalendarTime(slot.start_time) }} - {{ formatCalendarTime(slot.end_time) }}</span>
+                </div>
+                <button type="button" class="nav-icon-button" @click="deleteBlockedSlot(slot.id)">
+                  <Trash2 :size="16" />
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+
     <footer class="portal-footer">
       <span>© Nokvo · Nokvo One</span>
       <nav class="footer-nav">
@@ -1692,6 +2532,35 @@ onBeforeUnmount(() => {
 .google-button-host.disabled {
   opacity: 0.65;
   pointer-events: none;
+}
+
+.google-fallback-button {
+  width: 100%;
+  min-height: 44px;
+  border-radius: 999px;
+  border: 1px solid #d9d8ce;
+  background: #ffffff;
+  color: #1b1c15;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.7rem;
+  font-size: 0.95rem;
+  font-weight: 700;
+  opacity: 0.72;
+}
+
+.google-mark {
+  width: 1.35rem;
+  height: 1.35rem;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid #d9d8ce;
+  font-family: Arial, sans-serif;
+  font-weight: 700;
+  color: #4285f4;
 }
 
 .auth-divider {
@@ -1850,6 +2719,11 @@ onBeforeUnmount(() => {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
+.business-type-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin: 0.4rem 0 1rem;
+}
+
 .provider-option {
   border: 1px solid #e4e3d7;
   background: #fbfaee;
@@ -1880,6 +2754,587 @@ onBeforeUnmount(() => {
 
 .provider-option small {
   color: #5f5f53;
+}
+
+.schema-preview {
+  border: 1px solid #e4e3d7;
+  background: #fbfaee;
+  border-radius: 0.95rem;
+  padding: 1rem;
+}
+
+.schema-preview strong,
+.schema-field-row strong {
+  color: #1b1c15;
+}
+
+.schema-preview-grid,
+.schema-field-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.7rem;
+  margin-top: 0.85rem;
+}
+
+.schema-preview-grid span,
+.schema-field-row {
+  border: 1px solid #e4e3d7;
+  background: rgba(255, 255, 255, 0.72);
+  border-radius: 0.8rem;
+  padding: 0.85rem;
+}
+
+.schema-field-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.schema-field-row span,
+.form-hint {
+  color: #5f5f53;
+  font-size: 0.88rem;
+}
+
+.form-hint {
+  margin: 0.55rem 0 0;
+}
+
+.field-card-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.65rem;
+  flex-wrap: wrap;
+}
+
+.field-modal-shell {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem;
+}
+
+.field-modal-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(18, 19, 16, 0.48);
+  backdrop-filter: blur(10px);
+}
+
+.field-modal {
+  position: relative;
+  z-index: 1;
+  width: min(920px, 100%);
+  max-height: min(760px, 88vh);
+  overflow: auto;
+  border-radius: 1.1rem;
+  border: 1px solid #e4e3d7;
+  background: #fffef8;
+  box-shadow: 0 28px 90px -34px rgba(27, 28, 21, 0.45);
+  padding: 1.4rem;
+}
+
+.field-editor-list {
+  display: grid;
+  gap: 0.8rem;
+  margin-top: 1rem;
+}
+
+.field-editor-row {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) 150px 120px 42px;
+  gap: 0.75rem;
+  align-items: end;
+  padding: 0.85rem;
+  border-radius: 0.9rem;
+  border: 1px solid #e4e3d7;
+  background: #fbfaee;
+}
+
+.field-editor-row label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.field-editor-row label span {
+  color: #5f5f53;
+  font-size: 0.72rem;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.field-editor-row input[type="text"],
+.field-editor-row select {
+  width: 100%;
+  border-radius: 0.75rem;
+  border: 1px solid #d9d8ce;
+  background: #ffffff;
+  color: #1b1c15;
+  padding: 0.75rem 0.8rem;
+  font-size: 0.92rem;
+}
+
+.field-required-toggle {
+  min-height: 42px;
+  flex-direction: row !important;
+  align-items: center;
+}
+
+.field-required-toggle input {
+  width: 1rem;
+  height: 1rem;
+}
+
+.field-modal-actions {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.8rem;
+  margin-top: 1rem;
+}
+
+.assignment-summary-cell {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.assignment-modal {
+  width: min(1040px, 100%);
+}
+
+.assignment-form-grid,
+.clinic-schedule-panel,
+.blocked-slot-panel {
+  display: grid;
+  gap: 1rem;
+  margin-top: 1rem;
+}
+
+.clinic-schedule-panel,
+.blocked-slot-panel {
+  border-top: 1px solid #e4e3d7;
+  padding-top: 1rem;
+}
+
+.assignment-two-col {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.8rem;
+}
+
+.assignment-form-grid label,
+.assignment-two-col label,
+.blocked-slot-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.assignment-form-grid label span,
+.assignment-two-col label span,
+.blocked-slot-form label span {
+  color: #5f5f53;
+  font-size: 0.72rem;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.assignment-form-grid input[type="text"],
+.assignment-form-grid input[type="number"],
+.assignment-form-grid input[type="time"],
+.assignment-two-col input,
+.blocked-slot-form input {
+  width: 100%;
+  border-radius: 0.75rem;
+  border: 1px solid #d9d8ce;
+  background: #ffffff;
+  color: #1b1c15;
+  padding: 0.75rem 0.8rem;
+  font-size: 0.92rem;
+}
+
+.assignment-toggle {
+  align-items: center;
+  justify-content: flex-start;
+}
+
+.calendar-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.8rem;
+  border: 1px solid #e4e3d7;
+  border-radius: 0.8rem;
+  background: #fbfaee;
+  padding: 0.75rem 0.85rem;
+}
+
+.calendar-timezone {
+  border: 1px solid #d9d8ce;
+  border-radius: 999px;
+  background: #ffffff;
+  color: #5f5f53;
+  font-size: 0.78rem;
+  font-weight: 800;
+  padding: 0.45rem 0.7rem;
+}
+
+.schedule-calendar-card {
+  overflow: hidden;
+  border: 1px solid #d9d8ce;
+  border-radius: 0.8rem;
+  background: #ffffff;
+  box-shadow: 0 14px 28px rgba(27, 28, 21, 0.08);
+}
+
+.calendar-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  border-bottom: 1px solid #e4e3d7;
+  background: #f5f4e8;
+  color: #1b1c15;
+  padding: 0.9rem 1rem;
+}
+
+.calendar-card-head div {
+  display: grid;
+  gap: 0.2rem;
+}
+
+.calendar-card-head strong {
+  font-size: 0.95rem;
+}
+
+.calendar-card-head span {
+  color: #5f5f53;
+  font-size: 0.82rem;
+  font-weight: 700;
+}
+
+.week-calendar-grid {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+}
+
+.week-day-card {
+  display: flex;
+  min-height: 112px;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: flex-start;
+  gap: 0.36rem;
+  border: 0;
+  border-right: 1px solid #e4e3d7;
+  background: #fbfaee;
+  color: #1b1c15;
+  cursor: pointer;
+  padding: 0.85rem 0.75rem;
+  text-align: left;
+  transition: background 0.18s ease, box-shadow 0.18s ease, transform 0.18s ease;
+}
+
+.week-day-card:last-child {
+  border-right: 0;
+}
+
+.week-day-card:hover {
+  background: #f1f4ea;
+  transform: translateY(-1px);
+}
+
+.week-day-card:focus-visible {
+  outline: 2px solid #34776c;
+  outline-offset: -3px;
+}
+
+.week-day-card span {
+  color: #6a6a5d;
+  font-size: 0.78rem;
+  font-weight: 900;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.week-day-card strong {
+  color: #1b1c15;
+  font-size: 0.92rem;
+}
+
+.week-day-card small {
+  color: #66675e;
+  font-size: 0.78rem;
+  line-height: 1.25;
+}
+
+.week-day-card.active {
+  background: #e8f3ef;
+  box-shadow: inset 0 -4px 0 #34776c;
+}
+
+.week-day-card.active span {
+  color: #34776c;
+}
+
+.time-planner-card {
+  display: grid;
+  gap: 0.9rem;
+  border: 1px solid #d9d8ce;
+  border-radius: 0.8rem;
+  background: #ffffff;
+  padding: 1rem;
+}
+
+.time-planner-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.time-planner-head div {
+  display: grid;
+  gap: 0.18rem;
+}
+
+.micro-label {
+  color: #5f5f53;
+  font-size: 0.72rem;
+  font-weight: 900;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.time-planner-head strong {
+  color: #1b1c15;
+  font-size: 1.28rem;
+  line-height: 1.2;
+}
+
+.time-planner-head > span {
+  border: 1px solid #d4e2de;
+  border-radius: 999px;
+  background: #ecf4f1;
+  color: #34776c;
+  font-size: 0.8rem;
+  font-weight: 800;
+  padding: 0.45rem 0.7rem;
+  white-space: nowrap;
+}
+
+.time-preset-row {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.55rem;
+}
+
+.time-preset-button {
+  display: grid;
+  gap: 0.18rem;
+  min-height: 66px;
+  border: 1px solid #e4e3d7;
+  border-radius: 0.75rem;
+  background: #fbfaee;
+  color: #1b1c15;
+  cursor: pointer;
+  padding: 0.72rem;
+  text-align: left;
+  transition: border-color 0.18s ease, background 0.18s ease, transform 0.18s ease;
+}
+
+.time-preset-button:hover {
+  background: #f1f4ea;
+  transform: translateY(-1px);
+}
+
+.time-preset-button.active {
+  border-color: #34776c;
+  background: #e8f3ef;
+  box-shadow: inset 0 0 0 1px #34776c;
+}
+
+.time-preset-button span {
+  color: #5f5f53;
+  font-size: 0.72rem;
+  font-weight: 900;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.time-preset-button strong {
+  color: #1b1c15;
+  font-size: 0.86rem;
+}
+
+.time-range-control {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+
+.time-input-card {
+  border: 1px solid #e4e3d7;
+  border-radius: 0.8rem;
+  background: #fbfaee;
+  padding: 0.75rem;
+}
+
+.time-input-card input {
+  border-radius: 0.7rem !important;
+  font-size: 1.05rem !important;
+  font-weight: 800;
+}
+
+.capacity-planner-card {
+  display: grid;
+  grid-template-columns: minmax(170px, 0.5fr) minmax(0, 1fr);
+  gap: 0.9rem;
+  align-items: center;
+  border: 1px solid #d9d8ce;
+  border-radius: 0.8rem;
+  background: #ffffff;
+  padding: 1rem;
+}
+
+.capacity-planner-card label {
+  margin: 0;
+}
+
+.capacity-planner-card input {
+  font-size: 1.25rem !important;
+  font-weight: 900;
+}
+
+.capacity-planner-card p {
+  margin: 0;
+  color: #5f5f53;
+  font-size: 0.88rem;
+  line-height: 1.45;
+}
+
+.blocked-slot-form {
+  align-items: end;
+  border: 1px solid #e4e3d7;
+  border-radius: 0.8rem;
+  background: #ffffff;
+  padding: 0.85rem;
+}
+
+.easy-block-form {
+  display: grid;
+  grid-template-columns: 1.15fr 0.8fr 0.8fr minmax(180px, 1.4fr) auto;
+  gap: 0.75rem;
+}
+
+.blocked-slot-form .ghost-button {
+  min-height: 45px;
+  justify-content: center;
+}
+
+.calendar-event-list {
+  gap: 0.75rem;
+}
+
+.calendar-event-card {
+  grid-template-columns: 82px minmax(0, 1fr) 42px;
+  border-left: 4px solid #34776c;
+  background: #ffffff;
+}
+
+.event-date-badge {
+  display: grid;
+  min-height: 58px;
+  place-items: center;
+  border: 1px solid #d4e2de;
+  border-radius: 0.7rem;
+  background: #ecf4f1;
+  text-align: center;
+}
+
+.event-date-badge span {
+  color: #34776c;
+  font-size: 0.72rem;
+  font-weight: 900;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.event-date-badge strong {
+  color: #1b1c15;
+  font-size: 0.82rem;
+}
+
+.event-main {
+  display: grid;
+  min-width: 0;
+  gap: 0.2rem;
+}
+
+.event-main strong {
+  overflow: hidden;
+  color: #1b1c15;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.event-main span {
+  color: #5f5f53;
+  font-size: 0.84rem;
+}
+
+.assignment-chip-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+}
+
+.assignment-chip {
+  display: inline-flex !important;
+  flex-direction: row !important;
+  align-items: center;
+  gap: 0.4rem;
+  border: 1px solid #e4e3d7;
+  background: #fbfaee;
+  border-radius: 999px;
+  padding: 0.55rem 0.75rem;
+}
+
+.assignment-chip span {
+  color: #1b1c15 !important;
+  font-size: 0.78rem !important;
+  letter-spacing: 0 !important;
+  text-transform: none !important;
+}
+
+.request-types .assignment-chip {
+  border-radius: 0.8rem;
+}
+
+.blocked-slot-list {
+  display: grid;
+  gap: 0.6rem;
+}
+
+.blocked-slot-row {
+  display: grid;
+  grid-template-columns: 1fr auto 42px;
+  gap: 0.7rem;
+  align-items: center;
+  border: 1px solid #e4e3d7;
+  border-radius: 0.8rem;
+  background: #fbfaee;
+  padding: 0.75rem;
+}
+
+.blocked-slot-row span {
+  color: #5f5f53;
+  font-size: 0.85rem;
 }
 
 .db-input {
@@ -1919,35 +3374,39 @@ onBeforeUnmount(() => {
 }
 
 .dashboard-layout {
-  width: min(100%, 1320px);
-  padding-top: 7.5rem;
+  width: min(calc(100% - 320px), 1320px);
+  margin-left: 300px;
+  margin-right: auto;
+  padding-top: 2rem;
   gap: 2rem;
 }
 
 .floating-top-nav {
   position: fixed;
-  top: 1.5rem;
+  top: 1.25rem;
   left: 0;
-  right: 0;
   z-index: 20;
   display: flex;
-  justify-content: center;
-  padding: 0 1.5rem;
+  align-items: flex-start;
+  justify-content: flex-start;
+  width: 268px;
+  padding: 0 1.25rem;
   pointer-events: none;
 }
 
 .dashboard-nav {
-  width: min(100%, 1320px);
-  padding: 0.9rem 1.15rem;
+  width: 100%;
+  max-height: calc(100vh - 2.5rem);
+  overflow: auto;
+  padding: 1rem;
   border-radius: 1.35rem;
   border: 1px solid rgba(196, 199, 199, 0.45);
   background: rgba(255, 255, 255, 0.82);
   backdrop-filter: blur(18px);
   box-shadow: 0 16px 45px -28px rgba(27, 28, 21, 0.28);
-  display: grid;
-  grid-template-columns: auto minmax(240px, 1fr) auto;
+  display: flex;
+  flex-direction: column;
   gap: 1rem;
-  align-items: center;
   pointer-events: auto;
 }
 
@@ -1955,6 +3414,8 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   gap: 0.8rem;
+  border-bottom: 1px solid #e4e3d7;
+  padding-bottom: 1rem;
 }
 
 .brand-mark {
@@ -1987,41 +3448,16 @@ onBeforeUnmount(() => {
   font-size: 0.78rem;
 }
 
-.nav-search {
-  position: relative;
-}
-
-.nav-search input {
-  width: 100%;
-  border-radius: 999px;
-  border: 1px solid transparent;
-  background: #efeee3;
-  color: #1b1c15;
-  padding: 0.85rem 1rem 0.85rem 2.8rem;
-  font-size: 0.95rem;
-  transition: border-color 0.2s ease, background 0.2s ease;
-}
-
-.nav-search input:focus {
-  outline: none;
-  border-color: rgba(116, 120, 120, 0.65);
-  background: #ffffff;
-}
-
-.nav-search-icon {
-  position: absolute;
-  left: 0.95rem;
-  top: 50%;
-  transform: translateY(-50%);
-  color: rgba(68, 71, 72, 0.72);
-}
-
 .dashboard-nav-actions,
-.dashboard-header-actions,
-.dashboard-filter-actions {
+.dashboard-header-actions {
   display: flex;
   align-items: center;
   gap: 0.7rem;
+}
+
+.dashboard-nav-actions {
+  align-items: stretch;
+  flex-direction: column;
 }
 
 .nav-icon-button,
@@ -2047,9 +3483,16 @@ onBeforeUnmount(() => {
   justify-content: center;
 }
 
+.dashboard-nav-actions .nav-icon-button,
+.dashboard-nav-actions .org-avatar-button {
+  width: 100%;
+  border-radius: 0.85rem;
+}
+
 .theme-toggle-button {
   display: inline-flex;
   align-items: center;
+  justify-content: flex-start;
   gap: 0.45rem;
   padding: 0.75rem 0.9rem;
   font-size: 0.8rem;
@@ -2060,6 +3503,7 @@ onBeforeUnmount(() => {
 .nav-page-button {
   display: inline-flex;
   align-items: center;
+  justify-content: flex-start;
   gap: 0.45rem;
   padding: 0.72rem 0.9rem;
   font-size: 0.8rem;
@@ -2082,6 +3526,14 @@ onBeforeUnmount(() => {
 .dashboard-primary-button:hover {
   transform: translateY(-1px);
   box-shadow: 0 10px 20px -16px rgba(27, 28, 21, 0.55);
+}
+
+.nav-icon-button:disabled,
+.ghost-button:disabled,
+.primary-button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+  transform: none;
 }
 
 .org-avatar-button {
@@ -3023,7 +4475,6 @@ onBeforeUnmount(() => {
   border-color: #f2f1e5;
 }
 
-.org-shell.dark .nav-search input,
 .org-shell.dark .db-input,
 .org-shell.dark .totp-input,
 .org-shell.dark .invite-form input,
@@ -3031,6 +4482,21 @@ onBeforeUnmount(() => {
   background: rgba(17, 19, 15, 0.92);
   color: #f2f1e5;
   border-color: rgba(102, 108, 92, 0.4);
+}
+
+.org-shell.dark .google-fallback-button {
+  background: rgba(17, 19, 15, 0.92);
+  color: #f2f1e5;
+  border-color: rgba(102, 108, 92, 0.4);
+}
+
+.org-shell.dark .google-mark {
+  background: #ffffff;
+  border-color: #ffffff;
+}
+
+.org-shell.dark .dashboard-brand {
+  border-color: rgba(102, 108, 92, 0.45);
 }
 
 .org-shell.dark .brand-copy span,
@@ -3057,7 +4523,14 @@ onBeforeUnmount(() => {
 .org-shell.dark .compact-icon-shell,
 .org-shell.dark .status-chip,
 .org-shell.dark .invite-domain-banner,
-.org-shell.dark .usage-track {
+.org-shell.dark .usage-track,
+.org-shell.dark .schema-preview,
+.org-shell.dark .schema-preview-grid span,
+.org-shell.dark .schema-field-row,
+.org-shell.dark .field-modal,
+.org-shell.dark .field-editor-row,
+.org-shell.dark .assignment-chip,
+.org-shell.dark .blocked-slot-row {
   background: rgba(33, 37, 30, 0.92);
   border-color: rgba(102, 108, 92, 0.35);
 }
@@ -3079,6 +4552,111 @@ onBeforeUnmount(() => {
 
 .org-shell.dark .provider-option small {
   color: #d0d0c3;
+}
+
+.org-shell.dark .schema-preview strong,
+.org-shell.dark .schema-field-row strong {
+  color: #f6f5ea;
+}
+
+.org-shell.dark .schema-field-row span,
+.org-shell.dark .form-hint,
+.org-shell.dark .field-editor-row label span,
+.org-shell.dark .assignment-form-grid label span,
+.org-shell.dark .assignment-two-col label span,
+.org-shell.dark .blocked-slot-row span {
+  color: #b8b7ab;
+}
+
+.org-shell.dark .field-editor-row input[type="text"],
+.org-shell.dark .field-editor-row select,
+.org-shell.dark .assignment-form-grid input[type="text"],
+.org-shell.dark .assignment-form-grid input[type="number"],
+.org-shell.dark .assignment-form-grid input[type="time"],
+.org-shell.dark .assignment-two-col input,
+.org-shell.dark .blocked-slot-form input {
+  background: rgba(17, 19, 15, 0.92);
+  color: #f2f1e5;
+  border-color: rgba(102, 108, 92, 0.4);
+}
+
+.org-shell.dark .calendar-toolbar,
+.org-shell.dark .schedule-calendar-card,
+.org-shell.dark .time-planner-card,
+.org-shell.dark .time-input-card,
+.org-shell.dark .capacity-planner-card,
+.org-shell.dark .blocked-slot-form,
+.org-shell.dark .calendar-event-card {
+  background: rgba(33, 37, 30, 0.92);
+  border-color: rgba(102, 108, 92, 0.38);
+}
+
+.org-shell.dark .calendar-timezone,
+.org-shell.dark .calendar-card-head,
+.org-shell.dark .event-date-badge,
+.org-shell.dark .time-preset-button {
+  background: rgba(17, 19, 15, 0.92);
+  border-color: rgba(102, 108, 92, 0.4);
+}
+
+.org-shell.dark .calendar-card-head,
+.org-shell.dark .calendar-card-head strong,
+.org-shell.dark .week-day-card strong,
+.org-shell.dark .time-planner-head strong,
+.org-shell.dark .time-preset-button strong,
+.org-shell.dark .event-date-badge strong,
+.org-shell.dark .event-main strong {
+  color: #f6f5ea;
+}
+
+.org-shell.dark .calendar-card-head span,
+.org-shell.dark .calendar-timezone,
+.org-shell.dark .week-day-card span,
+.org-shell.dark .week-day-card small,
+.org-shell.dark .micro-label,
+.org-shell.dark .time-preset-button span,
+.org-shell.dark .capacity-planner-card p,
+.org-shell.dark .event-main span {
+  color: #b8b7ab;
+}
+
+.org-shell.dark .week-day-card {
+  background: rgba(17, 19, 15, 0.78);
+  border-color: rgba(102, 108, 92, 0.35);
+}
+
+.org-shell.dark .week-day-card:hover {
+  background: rgba(42, 47, 38, 0.96);
+}
+
+.org-shell.dark .week-day-card.active {
+  background: rgba(52, 119, 108, 0.22);
+  box-shadow: inset 0 -4px 0 #86c5b6;
+}
+
+.org-shell.dark .time-preset-button:hover {
+  background: rgba(42, 47, 38, 0.96);
+}
+
+.org-shell.dark .time-preset-button.active {
+  border-color: #86c5b6;
+  background: rgba(52, 119, 108, 0.22);
+  box-shadow: inset 0 0 0 1px #86c5b6;
+}
+
+.org-shell.dark .time-planner-head > span {
+  background: rgba(52, 119, 108, 0.22);
+  border-color: rgba(134, 197, 182, 0.6);
+  color: #9bd8ca;
+}
+
+.org-shell.dark .week-day-card.active span,
+.org-shell.dark .event-date-badge span {
+  color: #9bd8ca;
+}
+
+.org-shell.dark .assignment-chip span {
+  color: #f2f1e5 !important;
 }
 
 .org-shell.dark .usage-fill {
@@ -3152,7 +4730,13 @@ onBeforeUnmount(() => {
   }
 
   .provider-grid,
-  .provider-grid-dual {
+  .provider-grid-dual,
+  .business-type-grid,
+  .schema-preview-grid,
+  .schema-field-grid,
+  .field-editor-row,
+  .assignment-two-col,
+  .blocked-slot-row {
     grid-template-columns: 1fr 1fr;
   }
 
@@ -3163,6 +4747,67 @@ onBeforeUnmount(() => {
 
   .member-head {
     display: none;
+  }
+
+  .week-calendar-grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  .week-day-card:nth-child(4n) {
+    border-right: 0;
+  }
+
+  .calendar-event-card {
+    grid-template-columns: 82px minmax(0, 1fr) 42px;
+  }
+
+  .time-preset-row,
+  .capacity-planner-card,
+  .easy-block-form {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .floating-top-nav {
+    width: 5.4rem;
+    padding: 0.75rem;
+  }
+
+  .dashboard-layout {
+    width: 100%;
+    margin-left: 0;
+    padding-left: 6.2rem;
+    padding-top: 1.2rem;
+  }
+
+  .dashboard-nav {
+    max-height: calc(100vh - 1.5rem);
+    padding: 0.7rem;
+  }
+
+  .dashboard-brand {
+    justify-content: center;
+    padding-bottom: 0.7rem;
+  }
+
+  .brand-copy,
+  .nav-page-button span,
+  .theme-toggle-button span {
+    display: none;
+  }
+
+  .dashboard-nav-actions {
+    align-items: center;
+  }
+
+  .nav-page-button,
+  .theme-toggle-button,
+  .dashboard-nav-actions .nav-icon-button,
+  .dashboard-nav-actions .org-avatar-button {
+    width: 2.8rem;
+    height: 2.8rem;
+    justify-content: center;
+    padding: 0;
+    border-radius: 0.9rem;
   }
 }
 
@@ -3176,18 +4821,14 @@ onBeforeUnmount(() => {
     padding: 1rem 1rem 0;
   }
 
-  .floating-top-nav {
-    top: 0.9rem;
-    padding: 0 1rem;
-  }
-
   .login-layout,
   .workspace-layout {
     padding: 1.2rem 1rem 2rem;
   }
 
   .dashboard-layout {
-    padding-top: 6.8rem;
+    padding-left: 5.7rem;
+    padding-top: 1rem;
   }
 
   .login-card,
@@ -3196,7 +4837,6 @@ onBeforeUnmount(() => {
   }
 
   .dashboard-header-actions,
-  .dashboard-filter-actions,
   .dashboard-nav-actions,
   .members-card-head {
     width: 100%;
@@ -3208,21 +4848,72 @@ onBeforeUnmount(() => {
     text-align: left;
   }
 
-  .nav-search {
-    order: 3;
-  }
-
   .theme-toggle-button {
-    width: auto;
+    width: 2.8rem;
   }
 
   .dashboard-nav {
-    padding: 0.95rem;
+    padding: 0.65rem;
   }
 
   .organization-metrics,
-  .workspace-profile-grid {
+  .workspace-profile-grid,
+  .business-type-grid,
+  .schema-preview-grid,
+  .schema-field-grid,
+  .field-editor-row,
+  .assignment-two-col,
+  .blocked-slot-row {
     grid-template-columns: 1fr;
+  }
+
+  .field-modal-shell {
+    padding: 0.8rem;
+  }
+
+  .field-modal-actions {
+    flex-direction: column;
+  }
+
+  .calendar-toolbar {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .week-calendar-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .week-day-card:nth-child(2n) {
+    border-right: 0;
+  }
+
+  .time-planner-head {
+    flex-direction: column;
+  }
+
+  .time-planner-head > span {
+    white-space: normal;
+  }
+
+  .time-preset-row,
+  .time-range-control,
+  .capacity-planner-card,
+  .easy-block-form {
+    grid-template-columns: 1fr;
+  }
+
+  .calendar-event-card {
+    grid-template-columns: 1fr;
+  }
+
+  .event-date-badge {
+    min-height: auto;
+    justify-items: start;
+    grid-template-columns: auto auto;
+    gap: 0.55rem;
+    padding: 0.65rem;
+    text-align: left;
   }
 }
 </style>

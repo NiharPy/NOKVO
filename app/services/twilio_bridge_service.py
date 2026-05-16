@@ -60,7 +60,12 @@ def _parse_tts_audio(audio_bytes: bytes) -> tuple[np.ndarray, int]:
                 return np.frombuffer(raw, dtype=np.int16).copy(), rate
         except Exception:
             pass
-    return np.frombuffer(audio_bytes, dtype=np.int16).copy(), settings.SONIOX_TTS_SAMPLE_RATE
+    fallback_rate = (
+        settings.SARVAM_TTS_SAMPLE_RATE
+        if settings.AGENT_VOICE_BACKEND == "sarvam_pipeline"
+        else settings.SONIOX_TTS_SAMPLE_RATE
+    )
+    return np.frombuffer(audio_bytes, dtype=np.int16).copy(), fallback_rate
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +81,7 @@ class TwilioWebSocketAdapter:
     _BACKEND_INPUT_RATE: dict[str, int] = {
         "azure_realtime": 24000,
         "soniox_pipeline": 16000,
+        "sarvam_pipeline": 16000,
     }
 
     def __init__(self, ws: WebSocket) -> None:
@@ -160,6 +166,12 @@ class TwilioBridgeService:
     @staticmethod
     async def run_session(websocket: WebSocket, tenant_res: TenantResources, *, db=None) -> None:
         adapter = TwilioWebSocketAdapter(websocket)
+        # Nokvo One tenants always run the Sarvam STT -> gpt-4.1-mini -> Sarvam TTS
+        # pipeline, regardless of the global AGENT_VOICE_BACKEND setting.
+        if (tenant_res.provider_status or {}).get("product_tier") == "nokvo_one":
+            from app.services.nokvo_one_voice_stream_service import NokvoOneVoiceStreamService
+            await NokvoOneVoiceStreamService.run_session(adapter, tenant_res, db=db)
+            return
         if settings.AGENT_VOICE_BACKEND == "azure_realtime":
             from app.services.agent_realtime_voice_service import AgentRealtimeVoiceService
             await AgentRealtimeVoiceService.run_session(adapter, tenant_res, db=db)

@@ -28,6 +28,14 @@ class TelnyxBridgeService:
         campaign_chunks: list[dict] | None = None,
     ) -> None:
         adapter = TelnyxWebSocketAdapter(websocket)
+        # Nokvo One tenants always run the Sarvam STT -> gpt-4.1-mini -> Sarvam TTS
+        # pipeline, regardless of the global AGENT_VOICE_BACKEND setting.
+        if (tenant_res.provider_status or {}).get("product_tier") == "nokvo_one":
+            from app.services.nokvo_one_voice_stream_service import NokvoOneVoiceStreamService
+            await NokvoOneVoiceStreamService.run_session(
+                adapter, tenant_res, db=db, campaign_context={"chunks": campaign_chunks} if campaign_chunks else None
+            )
+            return
         if settings.AGENT_VOICE_BACKEND == "azure_realtime":
             from app.services.agent_realtime_voice_service import AgentRealtimeVoiceService
             await AgentRealtimeVoiceService.run_session(adapter, tenant_res, db=db)

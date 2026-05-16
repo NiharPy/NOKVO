@@ -157,12 +157,18 @@ async def chat_with_agent(
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
 
+    org_res = await db.execute(select(Organization).where(Organization.id == user.organization_id))
+    organization = org_res.scalars().first()
+    if organization is None:
+        raise HTTPException(status_code=404, detail="Organization not found")
+
     try:
         result = await NokvoOneAgentRuntime.chat_turn(
             db,
             organization_id=user.organization_id,
             user_id=user.id,
             agent_system_prompt=agent.system_prompt,
+            business_type=organization.industry,
             tool_keys=list(agent.tool_keys or []),
             user_message=payload.message,
         )

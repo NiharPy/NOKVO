@@ -15,6 +15,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request,
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.api import deps
 from app.core import security
@@ -32,6 +33,10 @@ from app.models.organization_session import OrganizationSession
 from app.models.organization_user import OrganizationUser
 from app.models.tenant_resources import TenantResources
 from app.schemas.nokvo_one import (
+    NokvoOneBusinessTemplateOptionResponse,
+    NokvoOneBusinessTemplateRequest,
+    NokvoOneBusinessTemplateSaveResponse,
+    NokvoOneBusinessSchemaUpdateRequest,
     NokvoOneEmailVerifiedResponse,
     NokvoOneGoogleLoginRequest,
     NokvoOneLoginRequest,
@@ -54,6 +59,12 @@ from app.services.google_oauth_service import GoogleOAuthError, GoogleOAuthServi
 from app.services.nokvo_one_provisioning_service import (
     NokvoOneProvisioningError,
     NokvoOneProvisioningService,
+)
+from app.services.nokvo_one_business_templates import (
+    apply_schema_overrides,
+    business_type_config,
+    business_type_options,
+    normalize_business_type,
 )
 
 
@@ -105,6 +116,41 @@ def _issue_login_temp_token(user: OrganizationUser, organization_id: uuid.UUID) 
     )
 
 
+def _organization_response(organization: Organization) -> NokvoOneOrganizationResponse:
+    return NokvoOneOrganizationResponse(
+        id=organization.id,
+        name=organization.name,
+        product_tier=organization.product_tier,
+        status=organization.status,
+        calling_enabled=organization.calling_enabled,
+        admin_email=organization.admin_email,
+        email_domain=organization.email_domain,
+        environment=organization.environment,
+        region=organization.region,
+        industry=normalize_business_type(organization.industry),
+    )
+
+
+async def _tenant_resources_for_org(db: AsyncSession, organization_id: uuid.UUID) -> TenantResources:
+    res = await db.execute(select(TenantResources).where(TenantResources.organization_id == organization_id))
+    tenant_res = res.scalars().first()
+    if tenant_res is None:
+        raise HTTPException(status_code=404, detail="Tenant resources not found for organization")
+    return tenant_res
+
+
+def _resolved_business_template(
+    organization: Organization,
+    tenant_res: TenantResources | None = None,
+) -> NokvoOneBusinessTemplateOptionResponse:
+    config = business_type_config(organization.industry)
+    if config is None:
+        raise HTTPException(status_code=409, detail="Business Type is not selected")
+    provider_status = dict((tenant_res.provider_status if tenant_res else {}) or {})
+    overrides = provider_status.get("business_template_schema_overrides") or {}
+    return NokvoOneBusinessTemplateOptionResponse(**apply_schema_overrides(config, overrides))
+
+
 async def _issue_full_session(
     db: AsyncSession, request: Request, user: OrganizationUser, organization: Organization
 ) -> NokvoOneSessionResponse:
@@ -141,7 +187,7 @@ async def _issue_full_session(
         refresh_token=raw_refresh,
         token_type="bearer",
         user=NokvoOneUserResponse.model_validate(user),
-        organization=NokvoOneOrganizationResponse.model_validate(organization),
+        organization=_organization_response(organization),
     )
 
 
@@ -319,7 +365,7 @@ async def nokvo_one_signup(
         )
 
     new_org_id = uuid.uuid4()
-    region = payload.region or "centralindia"
+    region = payload.region or "southindia"
     org_name = payload.org_name.strip()
 
     async def event_stream() -> AsyncGenerator[bytes, None]:
@@ -383,7 +429,7 @@ async def nokvo_one_signup(
                 record_calls=False,
                 create_resource_group=False,
                 twilio_auto_provision=False,
-                industry=payload.industry,
+                industry=None,
                 country_code=payload.country_code,
             )
             db.add(organization)
@@ -738,7 +784,7 @@ async def nokvo_one_google_login(
         provision = await _provision_or_503(
             organization_id=new_org_id,
             organization_name=org_name,
-            region="centralindia",
+            region="southindia",
             environment="staging",
         )
 
@@ -748,7 +794,7 @@ async def nokvo_one_google_login(
             admin_email=email,
             admin_name=identity.get("full_name"),
             email_domain=domain,
-            region="centralindia",
+            region="southindia",
             environment="staging",
             call_type="inbound",
             language="en-IN",
@@ -760,7 +806,7 @@ async def nokvo_one_google_login(
             record_calls=False,
             create_resource_group=False,
             twilio_auto_provision=False,
-            industry="Customer Support",
+            industry=None,
             country_code="IN",
         )
         db.add(organization)
@@ -961,8 +1007,95 @@ async def nokvo_one_me(
         refresh_token="",
         token_type="bearer",
         user=NokvoOneUserResponse.model_validate(user),
-        organization=NokvoOneOrganizationResponse.model_validate(organization),
+        organization=_organization_response(organization),
     )
+
+
+@router.get("/business-template/options", response_model=list[NokvoOneBusinessTemplateOptionResponse])
+async def nokvo_one_business_template_options():
+    return [NokvoOneBusinessTemplateOptionResponse(**item) for item in business_type_options()]
+
+
+@router.get("/business-template", response_model=NokvoOneBusinessTemplateOptionResponse)
+async def nokvo_one_current_business_template(
+    user: OrganizationUser = Depends(
+        deps.RequireNokvoOneOrganization(
+            allowed_statuses=["pending_approval", "active", "suspended"]
+        )
+    ),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    org_res = await db.execute(select(Organization).where(Organization.id == user.organization_id))
+    organization = org_res.scalars().first()
+    if organization is None:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    tenant_res = await _tenant_resources_for_org(db, organization.id)
+    return _resolved_business_template(organization, tenant_res)
+
+
+@router.post("/business-template", response_model=NokvoOneBusinessTemplateSaveResponse)
+async def nokvo_one_save_business_template(
+    payload: NokvoOneBusinessTemplateRequest,
+    user: OrganizationUser = Depends(
+        deps.RequireNokvoOneOrganization(
+            allowed_statuses=["pending_approval", "active", "suspended"],
+            allowed_roles=["admin", "manager"],
+        )
+    ),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    org_res = await db.execute(select(Organization).where(Organization.id == user.organization_id))
+    organization = org_res.scalars().first()
+    if organization is None:
+        raise HTTPException(status_code=404, detail="Organization not found")
+
+    organization.industry = payload.business_type
+    db.add(organization)
+    await db.commit()
+    await db.refresh(organization)
+
+    tenant_res = await _tenant_resources_for_org(db, organization.id)
+    return NokvoOneBusinessTemplateSaveResponse(
+        organization=_organization_response(organization),
+        business_template=_resolved_business_template(organization, tenant_res),
+    )
+
+
+@router.patch("/business-template/schemas/{schema_key}", response_model=NokvoOneBusinessTemplateOptionResponse)
+async def nokvo_one_update_business_template_schema(
+    schema_key: str,
+    payload: NokvoOneBusinessSchemaUpdateRequest,
+    user: OrganizationUser = Depends(
+        deps.RequireNokvoOneOrganization(
+            allowed_statuses=["pending_approval", "active", "suspended"],
+            allowed_roles=["admin", "manager"],
+        )
+    ),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    schema_key = schema_key.strip().lower()
+    org_res = await db.execute(select(Organization).where(Organization.id == user.organization_id))
+    organization = org_res.scalars().first()
+    if organization is None:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    config = business_type_config(organization.industry)
+    if config is None:
+        raise HTTPException(status_code=409, detail="Business Type is not selected")
+    if schema_key not in (config.get("schemas") or {}):
+        raise HTTPException(status_code=400, detail="This field group is not available for the selected Business Type")
+
+    tenant_res = await _tenant_resources_for_org(db, organization.id)
+    provider_status = dict(tenant_res.provider_status or {})
+    overrides = dict(provider_status.get("business_template_schema_overrides") or {})
+    overrides[schema_key] = [field.model_dump() for field in payload.fields]
+    provider_status["business_template_schema_overrides"] = overrides
+    tenant_res.provider_status = provider_status
+    flag_modified(tenant_res, "provider_status")
+    db.add(tenant_res)
+    await db.commit()
+    await db.refresh(tenant_res)
+
+    return _resolved_business_template(organization, tenant_res)
 
 
 @router.get("/me/provisioning", response_model=NokvoOneProvisioningSummary)
@@ -974,13 +1107,5 @@ async def nokvo_one_provisioning_state(
     ),
     db: AsyncSession = Depends(deps.get_db),
 ):
-    res = await db.execute(
-        select(TenantResources).where(TenantResources.organization_id == user.organization_id)
-    )
-    tr = res.scalars().first()
-    if tr is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Tenant resources have not been provisioned for this organization",
-        )
+    tr = await _tenant_resources_for_org(db, user.organization_id)
     return _summary_from_tenant_resources(tr)
