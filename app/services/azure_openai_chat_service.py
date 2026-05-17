@@ -1,13 +1,14 @@
 """
-Azure OpenAI chat (gpt-4.1-mini) provisioner for Nokvo One.
+Azure OpenAI chat (gpt-4.1-mini) + embedding (text-embedding-3-small) provisioner
+for Nokvo One.
 
-Replaces the prior gpt-realtime-mini provisioner. Voice is now handled by the
-Sarvam STT -> gpt-4.1-mini -> Sarvam TTS pipeline, so the per-tenant Azure OpenAI
-account only needs a standard chat deployment.
+Voice is handled by the Sarvam STT -> gpt-4.1-mini -> Sarvam TTS pipeline; the
+per-tenant Azure OpenAI account hosts the chat model plus the text embedding
+model used by the tenant's Knowledge Base.
 
   - Creates an Azure OpenAI account in a tenant-specific resource group.
-  - Deploys gpt-4.1-mini in South India (configurable via env).
-  - Returns the endpoint + Fernet-encrypted API key.
+  - Deploys gpt-4.1-mini and text-embedding-3-small in South India (configurable).
+  - Returns the endpoint + Fernet-encrypted API key plus embedding deployment info.
   - Stores the raw key on the result transiently so the orchestrator can push it
     into shared Key Vault, then strips it before persisting provider_status.
   - Exposes a delete helper used by rollback.
@@ -130,6 +131,12 @@ class AzureOpenAIChatService:
                 "model_version": settings.AZURE_OPENAI_CHAT_MODEL_VERSION,
                 "region": region,
                 "endpoint": None,
+                "embedding_deployment_name": settings.AZURE_OPENAI_EMBEDDING_DEPLOYMENT,
+                "embedding_model": settings.AZURE_OPENAI_EMBEDDING_MODEL,
+                "embedding_model_version": settings.AZURE_OPENAI_EMBEDDING_MODEL_VERSION,
+                "embedding_region": region,
+                "embedding_api_version": settings.AZURE_OPENAI_EMBEDDING_API_VERSION,
+                "embedding_status": "skipped_no_azure_subscription",
                 "api_key_encrypted": None,
                 "status": "skipped_no_azure_subscription",
             }
@@ -184,6 +191,27 @@ class AzureOpenAIChatService:
                 deployment=deployment_payload,
             ).result()
 
+            embedding_deployment = Deployment(
+                sku=Sku(
+                    name=settings.AZURE_OPENAI_EMBEDDING_SKU,
+                    capacity=settings.AZURE_OPENAI_EMBEDDING_CAPACITY,
+                ),
+                properties=DeploymentProperties(
+                    model=DeploymentModel(
+                        format="OpenAI",
+                        name=settings.AZURE_OPENAI_EMBEDDING_MODEL,
+                        version=settings.AZURE_OPENAI_EMBEDDING_MODEL_VERSION,
+                    ),
+                    version_upgrade_option="OnceCurrentVersionExpired",
+                ),
+            )
+            client.deployments.begin_create_or_update(
+                resource_group_name=rg_name,
+                account_name=account_name,
+                deployment_name=settings.AZURE_OPENAI_EMBEDDING_DEPLOYMENT,
+                deployment=embedding_deployment,
+            ).result()
+
             keys = client.accounts.list_keys(resource_group_name=rg_name, account_name=account_name)
             raw_api_key = getattr(keys, "key1", None) or getattr(keys, "primary_key", None)
             if not raw_api_key:
@@ -196,6 +224,12 @@ class AzureOpenAIChatService:
                 "model_version": settings.AZURE_OPENAI_CHAT_MODEL_VERSION,
                 "region": region,
                 "endpoint": account.properties.endpoint,
+                "embedding_deployment_name": settings.AZURE_OPENAI_EMBEDDING_DEPLOYMENT,
+                "embedding_model": settings.AZURE_OPENAI_EMBEDDING_MODEL,
+                "embedding_model_version": settings.AZURE_OPENAI_EMBEDDING_MODEL_VERSION,
+                "embedding_region": region,
+                "embedding_api_version": settings.AZURE_OPENAI_EMBEDDING_API_VERSION,
+                "embedding_status": "provisioned",
                 "api_key_encrypted": encrypt_secret(raw_api_key),
                 # Transient: the orchestrator writes this to shared Key Vault then strips
                 # it before persisting provider_status. Never goes to Postgres.

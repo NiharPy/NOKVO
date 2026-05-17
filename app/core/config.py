@@ -81,12 +81,28 @@ class Settings(BaseSettings):
 
     # Nokvo One per-tenant chat deployment (gpt-4.1-mini in South India). Only used by
     # the Nokvo One signup provisioner; other tenants are unaffected.
+    # gpt-4.1-mini's only Azure version is 2025-04-14 (verified against the
+    # Cognitive Services models catalog for southindia). 2024-07-18 belongs to
+    # gpt-4o-mini and was rejected with DeploymentModelNotSupported.
     AZURE_OPENAI_CHAT_MODEL: str = "gpt-4.1-mini"
-    AZURE_OPENAI_CHAT_MODEL_VERSION: str = "2024-07-18"
+    AZURE_OPENAI_CHAT_MODEL_VERSION: str = "2025-04-14"
     AZURE_OPENAI_CHAT_DEPLOYMENT: str = "gpt-4-1-mini"
     AZURE_OPENAI_CHAT_SKU: str = "GlobalStandard"
     AZURE_OPENAI_CHAT_CAPACITY: int = 1
     AZURE_OPENAI_CHAT_REGION: str = "southindia"
+
+    # Nokvo One per-tenant text embedding deployment (text-embedding-3-small in
+    # South India). Deployed onto the same Azure OpenAI account as the chat model
+    # during signup so the tenant's knowledge base embeds against its own
+    # endpoint rather than the shared platform OpenAI key.
+    # SKU note: southindia only offers GlobalStandard for text-embedding-3-small.
+    AZURE_OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-small"
+    AZURE_OPENAI_EMBEDDING_MODEL_VERSION: str = "1"
+    AZURE_OPENAI_EMBEDDING_DEPLOYMENT: str = "text-embedding-3-small"
+    AZURE_OPENAI_EMBEDDING_SKU: str = "GlobalStandard"
+    AZURE_OPENAI_EMBEDDING_CAPACITY: int = 1
+    AZURE_OPENAI_EMBEDDING_REGION: str = "southindia"
+    AZURE_OPENAI_EMBEDDING_API_VERSION: str = "2024-02-15-preview"
     AZURE_MANAGED_IDENTITY_CLIENT_ID: str = ""
     AZURE_TENANT_ID: str = ""
     AZURE_CLIENT_ID: str = ""

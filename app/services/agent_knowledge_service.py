@@ -260,7 +260,7 @@ class AgentKnowledgeService:
             )["text"]
             for i, chunk in enumerate(chunks_list)
         ]
-        vectors = await TextEmbeddingService.embed_texts(texts)
+        vectors = await TextEmbeddingService.embed_texts_for_tenant(tenant_res, texts)
 
         points: list[dict[str, Any]] = []
         for index, chunk in enumerate(chunks_list):
@@ -629,7 +629,7 @@ class AgentKnowledgeService:
         if language != "en":
             filters["language"] = [language, "en"]
 
-        vector = await TextEmbeddingService.embed_text(query)
+        vector = await TextEmbeddingService.embed_text_for_tenant(tenant_res, query)
         results = await QdrantService.search_points(
             tenant_res,
             vector,

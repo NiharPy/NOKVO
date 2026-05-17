@@ -9,8 +9,9 @@ const theme = ref(localStorage.getItem('nokvo_dashboard_theme') || 'light');
 const homeSignal = ref(0);
 const defaultMode = () => {
   const path = window.location.pathname;
-  if (path.startsWith('/nokvo-one')) return 'nokvo_one';
-  return localStorage.getItem('nokvo_access_mode') || 'nokvo_one';
+  if (path.startsWith('/organization')) return 'organization';
+  if (path.startsWith('/console')) return 'console';
+  return 'nokvo_one';
 };
 const viewMode = ref(defaultMode());
 

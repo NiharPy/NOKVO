@@ -4,7 +4,8 @@ All-or-nothing tenant provisioner for Nokvo One.
 Steps (strict order — any failure raises and rolls back in reverse):
 
   1. Azure Resource Group (per-tenant, lightweight) in South India
-  2. Azure OpenAI gpt-4.1-mini account + chat deployment in that RG (South India)
+  2. Azure OpenAI account in that RG (South India) with gpt-4.1-mini chat +
+     text-embedding-3-small embedding deployments
   3. Shared Key Vault placeholders + live LLM API key + Sarvam STT/TTS keys
   4. Shared blob prefix tenants/{tenant_id}/ in the shared storage account
   5. Qdrant collection in the shared cluster
@@ -121,7 +122,12 @@ class NokvoOneProvisioningService:
     ) -> dict[str, Any]:
         tenant_id = str(uuid.uuid4())
         slug = _slug(organization_name)
-        rg_name = f"rg-nokvo1-{slug}-{environment}"[:90]
+        # Suffix with 6 chars of the tenant_id so retries (e.g. after a delete
+        # that's still in flight on Azure) never collide with the prior RG name.
+        # Without this, Azure rejects with "ResourceGroupBeingDeleted" because
+        # deprovisioning a RG with Cognitive Services accounts can take minutes.
+        rg_suffix = tenant_id.replace("-", "")[:6]
+        rg_name = f"rg-nokvo1-{slug}-{rg_suffix}-{environment}"[:90]
 
         rollback_actions: list[tuple[str, Any]] = []
 
@@ -158,7 +164,7 @@ class NokvoOneProvisioningService:
             await _emit(on_step, "resource_group", "failed", str(exc))
             raise NokvoOneProvisioningError("resource_group", str(exc), exc) from exc
 
-        # ── Step 2: Azure OpenAI gpt-4.1-mini chat deployment ────────────────
+        # ── Step 2: Azure OpenAI gpt-4.1-mini chat + text-embedding-3-small ──
         await _emit(on_step, "azure_openai_chat", "running")
         try:
             ai_result = await AzureOpenAIChatService.provision_chat_account(
@@ -174,6 +180,7 @@ class NokvoOneProvisioningService:
             if ai_result.get("status") == "provisioned":
                 rollback_actions.append(("ai", (rg_name, ai_result["account_name"])))
             await _emit(on_step, "azure_openai_chat", ai_result.get("status", "success"))
+            await _emit(on_step, "azure_openai_embedding", ai_result.get("embedding_status", "success"))
         except Exception as exc:
             await _emit(on_step, "azure_openai_chat", "failed", str(exc))
             await rollback()
@@ -306,6 +313,16 @@ class NokvoOneProvisioningService:
             "llm_api_key_encrypted": ai_result.get("api_key_encrypted"),
             "llm_api_key_secret_ref": llm_api_key_secret_name,
             "llm_status": ai_result.get("status"),
+            "embedding_provider": "azure_openai",
+            "embedding_model": ai_result.get("embedding_model"),
+            "embedding_model_version": ai_result.get("embedding_model_version"),
+            "embedding_deployment": ai_result.get("embedding_deployment_name"),
+            "embedding_account": ai_result.get("account_name"),
+            "embedding_endpoint": ai_result.get("endpoint"),
+            "embedding_region": ai_result.get("embedding_region"),
+            "embedding_api_version": ai_result.get("embedding_api_version"),
+            "embedding_api_key_secret_ref": llm_api_key_secret_name,
+            "embedding_status": ai_result.get("embedding_status"),
             "stt_provider": "sarvam",
             "stt_api_key_secret_ref": stt_api_key_secret_name,
             "stt_status": "provisioned" if stt_api_key_secret_name else (
@@ -346,6 +363,7 @@ class NokvoOneProvisioningService:
             "provisioning_steps": [
                 {"name": "resource_group", "status": "success"},
                 {"name": "azure_openai_chat", "status": ai_result.get("status", "provisioned")},
+                {"name": "azure_openai_embedding", "status": ai_result.get("embedding_status", "provisioned")},
                 {"name": "shared_key_vault", "status": kv_status},
                 {"name": "blob_prefix", "status": "success"},
                 {"name": "qdrant_collection", "status": "success"},

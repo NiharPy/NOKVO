@@ -4,19 +4,23 @@ import axios from 'axios';
 import QrcodeVue from 'qrcode.vue';
 import {
   Bell,
+  BookOpen,
   Bot,
   CalendarDays,
   CheckCircle2,
   Database,
+  FileText,
   LogOut,
   MessageSquare,
   Moon,
   Plus,
+  Search,
   Settings2,
   Shield,
   SunMedium,
   SunMedium as Sun,
   Trash2,
+  Upload,
   UserPlus,
   Users,
   Wrench,
@@ -43,7 +47,7 @@ const authState = ref('login'); // login | signup | check_email | mfa_setup | mf
 const errorMsg = ref('');
 const infoMsg = ref('');
 const isAuthenticating = ref(false);
-const currentPage = ref('dashboard'); // dashboard | members | tickets | leads | appointments | agent
+const currentPage = ref('dashboard'); // dashboard | members | tickets | leads | appointments | agent | knowledge_base
 
 const signup = ref({ org_name: '', admin_name: '', admin_email: '', password: '' });
 const login = ref({ email: '', password: '' });
@@ -66,6 +70,31 @@ const chatLog = ref([]);
 const chatInput = ref('');
 const emailDrafts = ref([]);
 const provisioning = ref(null);
+const kbDocuments = ref([]);
+const kbForm = ref({
+  name: '',
+  document_type: 'policy',
+  description: '',
+  tags: '',
+  file: null,
+});
+const kbUploadInputRef = ref(null);
+const isLoadingKb = ref(false);
+const isUploadingKb = ref(false);
+const kbError = ref('');
+const kbInfo = ref('');
+const kbQuery = ref('');
+const kbResults = ref([]);
+const isSearchingKb = ref(false);
+const kbDocumentTypes = [
+  { value: 'policy', label: 'Policy' },
+  { value: 'faq', label: 'FAQ' },
+  { value: 'script', label: 'Script' },
+  { value: 'compliance', label: 'Compliance' },
+  { value: 'product_docs', label: 'Product Docs' },
+  { value: 'training', label: 'Training' },
+  { value: 'other', label: 'Other' },
+];
 const inviteForm = ref({ email: '', full_name: '', role: 'member' });
 const newAgent = ref({ name: '', description: '', system_prompt: '', tool_keys: [] });
 const isSavingMember = ref(false);
@@ -175,6 +204,9 @@ const switchPage = (page) => {
   currentPage.value = page;
   errorMsg.value = '';
   infoMsg.value = '';
+  if (page === 'knowledge_base') {
+    loadKnowledgeDocuments();
+  }
 };
 
 const resetLoginState = () => {
@@ -1036,6 +1068,178 @@ const discardDraft = async (id) => {
   await loadEmailDrafts();
 };
 
+const isAdmin = computed(() => currentUser.value?.role === 'admin');
+
+const kbApi = axios.create({ baseURL: 'http://localhost:8000/api/nokvo-one/knowledge-base' });
+
+const loadKnowledgeDocuments = async () => {
+  isLoadingKb.value = true;
+  kbError.value = '';
+  try {
+    const { data } = await kbApi.get('/documents', { headers: authHeader() });
+    kbDocuments.value = data.documents || [];
+  } catch (err) {
+    kbError.value = extractErrorMessage(err, 'Failed to load Knowledge Base documents.');
+  } finally {
+    isLoadingKb.value = false;
+  }
+};
+
+const handleKbFileChange = (event) => {
+  const file = event.target.files?.[0] || null;
+  kbForm.value.file = file;
+  if (file && !kbForm.value.name) {
+    kbForm.value.name = file.name.replace(/\.[^/.]+$/, '');
+  }
+};
+
+const handleKbDrop = (event) => {
+  const file = event.dataTransfer?.files?.[0] || null;
+  if (!file) return;
+  kbForm.value.file = file;
+  if (!kbForm.value.name) {
+    kbForm.value.name = file.name.replace(/\.[^/.]+$/, '');
+  }
+};
+
+const clearKbFile = () => {
+  kbForm.value.file = null;
+  if (kbUploadInputRef.value) kbUploadInputRef.value.value = '';
+};
+
+const formatRelativeDate = (iso) => {
+  if (!iso) return '';
+  const ts = new Date(iso).getTime();
+  if (Number.isNaN(ts)) return '';
+  const diff = (Date.now() - ts) / 1000;
+  if (diff < 60) return 'just now';
+  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+  if (diff < 86400 * 30) return `${Math.floor(diff / 86400)}d ago`;
+  return new Date(iso).toLocaleDateString();
+};
+
+const kbStats = computed(() => {
+  const docs = kbDocuments.value || [];
+  const total = docs.length;
+  let approved = 0;
+  let pending = 0;
+  let chunks = 0;
+  let vectors = 0;
+  let bytes = 0;
+  let errors = 0;
+  for (const d of docs) {
+    if (d.approval_status === 'approved') approved += 1;
+    else pending += 1;
+    chunks += Number(d.chunk_count || 0);
+    vectors += Number(d.qdrant_point_count || 0);
+    if (d.last_error) errors += 1;
+    if (d.size_bytes) bytes += Number(d.size_bytes);
+  }
+  return { total, approved, pending, chunks, vectors, bytes, errors };
+});
+
+const fileToBase64 = (file) => new Promise((resolve, reject) => {
+  const reader = new FileReader();
+  reader.onload = () => {
+    const result = String(reader.result || '');
+    const idx = result.indexOf(',');
+    resolve(idx >= 0 ? result.slice(idx + 1) : result);
+  };
+  reader.onerror = () => reject(reader.error);
+  reader.readAsDataURL(file);
+});
+
+const uploadKnowledgeDocument = async () => {
+  if (!kbForm.value.file) {
+    kbError.value = 'Choose a file to upload first.';
+    return;
+  }
+  if (!kbForm.value.name.trim()) {
+    kbError.value = 'Document name is required.';
+    return;
+  }
+  isUploadingKb.value = true;
+  kbError.value = '';
+  kbInfo.value = '';
+  try {
+    const content_base64 = await fileToBase64(kbForm.value.file);
+    const payload = {
+      name: kbForm.value.name.trim(),
+      document_type: kbForm.value.document_type,
+      description: kbForm.value.description.trim() || null,
+      tags: kbForm.value.tags.trim() || null,
+      filename: kbForm.value.file.name,
+      content_type: kbForm.value.file.type || null,
+      content_base64,
+    };
+    await kbApi.post('/documents/upload', payload, { headers: authHeader() });
+    kbForm.value = { name: '', document_type: 'policy', description: '', tags: '', file: null };
+    if (kbUploadInputRef.value) kbUploadInputRef.value.value = '';
+    kbInfo.value = 'Document uploaded, chunked, and embedded.';
+    await loadKnowledgeDocuments();
+  } catch (err) {
+    kbError.value = extractErrorMessage(err, 'Failed to upload document.');
+  } finally {
+    isUploadingKb.value = false;
+  }
+};
+
+const approveKnowledgeDocument = async (documentId) => {
+  kbError.value = '';
+  try {
+    await kbApi.post(`/documents/${documentId}/approve`, { notes: null }, { headers: authHeader() });
+    await loadKnowledgeDocuments();
+  } catch (err) {
+    kbError.value = extractErrorMessage(err, 'Failed to approve document.');
+  }
+};
+
+const rejectKnowledgeDocument = async (documentId) => {
+  kbError.value = '';
+  try {
+    await kbApi.post(`/documents/${documentId}/reject`, { notes: null }, { headers: authHeader() });
+    await loadKnowledgeDocuments();
+  } catch (err) {
+    kbError.value = extractErrorMessage(err, 'Failed to reject document.');
+  }
+};
+
+const testKnowledgeRetrieval = async () => {
+  if (!kbQuery.value.trim()) {
+    kbError.value = 'Type a query to search the knowledge base.';
+    return;
+  }
+  isSearchingKb.value = true;
+  kbError.value = '';
+  kbResults.value = [];
+  try {
+    const { data } = await kbApi.post(
+      '/test-retrieval',
+      { query: kbQuery.value.trim(), top_k: 5 },
+      { headers: authHeader() },
+    );
+    kbResults.value = data.chunks || [];
+    if (!kbResults.value.length && data.refusal) {
+      kbInfo.value = data.refusal;
+    } else {
+      kbInfo.value = '';
+    }
+  } catch (err) {
+    kbError.value = extractErrorMessage(err, 'Retrieval test failed.');
+  } finally {
+    isSearchingKb.value = false;
+  }
+};
+
+const formatBytes = (bytes) => {
+  const n = Number(bytes);
+  if (!n || Number.isNaN(n)) return '';
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+};
+
 const handleLogout = async () => {
   try {
     await api.post('/logout', {}, { headers: authHeader() });
@@ -1051,6 +1255,11 @@ const handleLogout = async () => {
   agents.value = [];
   predefinedTools.value = [];
   organizationBusinessTemplate.value = null;
+  kbDocuments.value = [];
+  kbResults.value = [];
+  kbQuery.value = '';
+  kbInfo.value = '';
+  kbError.value = '';
   closeFieldEdit();
   closeAssignmentEdit();
   authState.value = 'login';
@@ -1391,6 +1600,15 @@ onBeforeUnmount(() => {
             <button type="button" class="nav-page-button" :class="{ active: currentPage === 'agent' }" @click="switchPage('agent')">
               <Bot :size="17" />
               <span>Agent Studio</span>
+            </button>
+            <button
+              type="button"
+              class="nav-page-button"
+              :class="{ active: currentPage === 'knowledge_base' }"
+              @click="switchPage('knowledge_base')"
+            >
+              <BookOpen :size="17" />
+              <span>Knowledge Base</span>
             </button>
             <button type="button" class="nav-icon-button">
               <Bell :size="18" />
@@ -2128,6 +2346,274 @@ onBeforeUnmount(() => {
                   </div>
                 </div>
               </div>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <!-- KNOWLEDGE BASE -->
+      <section v-if="currentPage === 'knowledge_base'" class="dashboard-section kb-section">
+        <div class="kb-hero">
+          <div class="kb-hero-copy">
+            <span class="section-kicker">Knowledge Base</span>
+            <h3>Documents your agent answers from.</h3>
+            <p>
+              Uploads are stored in your tenant blob, chunked, and embedded with
+              <strong>text-embedding-3-small</strong> on your dedicated Azure OpenAI
+              deployment in <strong>South India</strong>. Only approved documents
+              ever serve answers.
+            </p>
+            <div class="kb-hero-pill-row">
+              <span class="kb-pill kb-pill-soft">
+                <span class="kb-pill-dot"></span>
+                Azure OpenAI · South India
+              </span>
+              <span class="kb-pill kb-pill-soft">text-embedding-3-small</span>
+              <span class="kb-pill kb-pill-soft">1536-dim · cosine</span>
+            </div>
+          </div>
+          <div class="kb-hero-stats">
+            <div class="kb-stat-card">
+              <span class="kb-stat-label">Documents</span>
+              <strong class="kb-stat-value">{{ kbStats.total }}</strong>
+              <span class="kb-stat-meta">{{ kbStats.approved }} approved · {{ kbStats.pending }} pending</span>
+            </div>
+            <div class="kb-stat-card">
+              <span class="kb-stat-label">Chunks</span>
+              <strong class="kb-stat-value">{{ kbStats.chunks }}</strong>
+              <span class="kb-stat-meta">{{ kbStats.vectors }} vectors in Qdrant</span>
+            </div>
+            <div class="kb-stat-card">
+              <span class="kb-stat-label">Storage</span>
+              <strong class="kb-stat-value">{{ formatBytes(kbStats.bytes) || '—' }}</strong>
+              <span class="kb-stat-meta">{{ kbStats.errors }} with errors</span>
+            </div>
+          </div>
+        </div>
+
+        <div v-if="kbError" class="message error dashboard-message">{{ kbError }}</div>
+        <div v-else-if="kbInfo" class="message info dashboard-message">{{ kbInfo }}</div>
+
+        <div class="kb-grid">
+          <article v-if="isAdmin" class="dashboard-card kb-card kb-upload-card">
+            <div class="kb-card-head">
+              <div class="kb-card-icon kb-card-icon-primary">
+                <Upload :size="18" />
+              </div>
+              <div>
+                <h4>Upload Document</h4>
+                <p>PDF, DOCX, TXT, or Markdown · embeds on save.</p>
+              </div>
+            </div>
+
+            <label
+              class="kb-dropzone"
+              :class="{ 'has-file': kbForm.file, 'is-busy': isUploadingKb }"
+              @dragover.prevent
+              @drop.prevent="handleKbDrop"
+            >
+              <input
+                ref="kbUploadInputRef"
+                class="kb-dropzone-input"
+                type="file"
+                accept=".pdf,.docx,.txt,.md,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain,text/markdown"
+                @change="handleKbFileChange"
+              />
+              <div v-if="!kbForm.file" class="kb-dropzone-empty">
+                <div class="kb-dropzone-icon">
+                  <Upload :size="22" />
+                </div>
+                <strong>Drop file or click to browse</strong>
+                <span>PDF, DOCX, TXT, MD — up to ~10MB</span>
+              </div>
+              <div v-else class="kb-dropzone-filled">
+                <div class="kb-dropzone-icon">
+                  <FileText :size="20" />
+                </div>
+                <div class="kb-dropzone-file">
+                  <strong>{{ kbForm.file.name }}</strong>
+                  <span>{{ formatBytes(kbForm.file.size) }} · {{ kbForm.file.type || 'unknown type' }}</span>
+                </div>
+                <button
+                  type="button"
+                  class="kb-link-button"
+                  @click.prevent.stop="clearKbFile"
+                >
+                  Replace
+                </button>
+              </div>
+            </label>
+
+            <div class="kb-form-grid">
+              <label class="kb-field">
+                <span>Name</span>
+                <input v-model="kbForm.name" type="text" placeholder="Refund policy v2" />
+              </label>
+              <label class="kb-field">
+                <span>Type</span>
+                <select v-model="kbForm.document_type">
+                  <option v-for="opt in kbDocumentTypes" :key="opt.value" :value="opt.value">
+                    {{ opt.label }}
+                  </option>
+                </select>
+              </label>
+              <label class="kb-field kb-field-wide">
+                <span>Description</span>
+                <input v-model="kbForm.description" type="text" placeholder="Optional summary" />
+              </label>
+              <label class="kb-field kb-field-wide">
+                <span>Tags</span>
+                <input v-model="kbForm.tags" type="text" placeholder="refunds, returns, escalation" />
+              </label>
+            </div>
+
+            <div class="kb-card-actions">
+              <button
+                type="button"
+                class="primary-button compact"
+                :disabled="isUploadingKb || !kbForm.file"
+                @click="uploadKnowledgeDocument"
+              >
+                <Upload :size="15" />
+                {{ isUploadingKb ? 'Embedding…' : 'Upload & Embed' }}
+              </button>
+              <span class="kb-card-hint">{{ isUploadingKb ? 'Chunking and calling Azure OpenAI…' : 'Approved by default if text is extractable.' }}</span>
+            </div>
+          </article>
+
+          <article v-else class="dashboard-card kb-card kb-readonly-card">
+            <div class="kb-card-head">
+              <div class="kb-card-icon">
+                <Shield :size="18" />
+              </div>
+              <div>
+                <h4>Read-only access</h4>
+                <p>Only admins can upload or approve Knowledge Base documents. Ask an admin to add new sources.</p>
+              </div>
+            </div>
+          </article>
+
+          <article class="dashboard-card kb-card kb-search-card">
+            <div class="kb-card-head">
+              <div class="kb-card-icon">
+                <Search :size="18" />
+              </div>
+              <div>
+                <h4>Test Retrieval</h4>
+                <p>Embed a query and inspect the chunks your agent would surface.</p>
+              </div>
+            </div>
+
+            <div class="kb-search-bar">
+              <Search :size="15" class="kb-search-bar-icon" />
+              <input
+                v-model="kbQuery"
+                type="text"
+                placeholder="What is the refund window?"
+                @keyup.enter="testKnowledgeRetrieval"
+              />
+              <button
+                type="button"
+                class="primary-button compact kb-search-submit"
+                :disabled="isSearchingKb || !kbQuery.trim()"
+                @click="testKnowledgeRetrieval"
+              >
+                {{ isSearchingKb ? 'Searching…' : 'Search' }}
+              </button>
+            </div>
+
+            <div v-if="kbResults.length" class="kb-results">
+              <div v-for="(chunk, idx) in kbResults" :key="chunk.chunk_id" class="kb-result-card">
+                <div class="kb-result-head">
+                  <span class="kb-result-rank">#{{ idx + 1 }}</span>
+                  <strong>{{ chunk.document_name }}</strong>
+                  <span class="kb-pill kb-pill-score">{{ chunk.score.toFixed(3) }}</span>
+                </div>
+                <p class="kb-result-text">{{ chunk.text.slice(0, 320) }}{{ chunk.text.length > 320 ? '…' : '' }}</p>
+              </div>
+            </div>
+            <div v-else-if="!isSearchingKb && kbQuery" class="kb-search-empty">
+              No results yet — try a different phrasing or upload more documents.
+            </div>
+          </article>
+        </div>
+
+        <div class="kb-list-head">
+          <div>
+            <span class="section-kicker">Indexed</span>
+            <h4>{{ kbDocuments.length }} document{{ kbDocuments.length === 1 ? '' : 's' }}</h4>
+            <p>Pending uploads still embed; only approved documents serve answers in production.</p>
+          </div>
+          <button
+            type="button"
+            class="ghost-button compact"
+            :disabled="isLoadingKb"
+            @click="loadKnowledgeDocuments"
+          >
+            <Database :size="15" />
+            {{ isLoadingKb ? 'Loading…' : 'Refresh' }}
+          </button>
+        </div>
+
+        <div v-if="!kbDocuments.length && !isLoadingKb" class="kb-empty">
+          <div class="kb-empty-icon">
+            <BookOpen :size="28" />
+          </div>
+          <strong>No documents yet.</strong>
+          <span>Upload your first policy or FAQ to start grounding the agent.</span>
+        </div>
+
+        <div v-else class="kb-doc-list">
+          <article
+            v-for="doc in kbDocuments"
+            :key="doc.id"
+            class="kb-doc-card"
+            :class="`kb-doc-status-${doc.approval_status}`"
+          >
+            <div class="kb-doc-icon">
+              <FileText :size="18" />
+            </div>
+            <div class="kb-doc-body">
+              <div class="kb-doc-title-row">
+                <strong>{{ doc.name }}</strong>
+                <span class="kb-pill kb-pill-type">{{ doc.document_type }}</span>
+                <span
+                  class="kb-pill"
+                  :class="`kb-pill-status-${doc.approval_status}`"
+                >
+                  {{ doc.approval_status }}
+                </span>
+              </div>
+              <p v-if="doc.description" class="kb-doc-desc">{{ doc.description }}</p>
+              <div class="kb-doc-meta">
+                <span><strong>{{ doc.chunk_count }}</strong> chunks</span>
+                <span><strong>{{ doc.qdrant_point_count }}</strong> vectors</span>
+                <span v-if="doc.created_at">added {{ formatRelativeDate(doc.created_at) }}</span>
+                <span v-if="doc.tags && doc.tags.length" class="kb-doc-tags">
+                  <span v-for="tag in doc.tags.slice(0, 4)" :key="tag" class="kb-tag">{{ tag }}</span>
+                </span>
+              </div>
+              <p v-if="doc.last_error" class="kb-doc-error">{{ doc.last_error }}</p>
+            </div>
+            <div v-if="isAdmin" class="kb-doc-actions">
+              <button
+                v-if="doc.approval_status !== 'approved' && doc.chunk_count > 0"
+                type="button"
+                class="primary-button compact"
+                @click="approveKnowledgeDocument(doc.id)"
+              >
+                <CheckCircle2 :size="15" />
+                Approve
+              </button>
+              <button
+                v-if="doc.approval_status === 'approved'"
+                type="button"
+                class="ghost-button compact"
+                @click="rejectKnowledgeDocument(doc.id)"
+              >
+                <XCircle :size="15" />
+                Revoke
+              </button>
             </div>
           </article>
         </div>
@@ -4914,6 +5400,662 @@ onBeforeUnmount(() => {
     gap: 0.55rem;
     padding: 0.65rem;
     text-align: left;
+  }
+}
+
+/* ───────────────── Knowledge Base ───────────────── */
+.kb-section {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+}
+
+.kb-hero {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
+  gap: 1.75rem;
+  padding: 1.85rem 2rem;
+  border-radius: 1.4rem;
+  border: 1px solid rgba(196, 199, 199, 0.45);
+  background:
+    radial-gradient(120% 120% at 0% 0%, rgba(255, 255, 255, 0.85), rgba(245, 244, 232, 0.6) 55%, rgba(229, 226, 225, 0.4) 100%);
+  box-shadow: 0 22px 56px -38px rgba(27, 28, 21, 0.28);
+  overflow: hidden;
+}
+
+.kb-hero::after {
+  content: "";
+  position: absolute;
+  inset: auto -6rem -6rem auto;
+  width: 18rem;
+  height: 18rem;
+  border-radius: 999px;
+  background: radial-gradient(circle, rgba(59, 130, 246, 0.18), rgba(59, 130, 246, 0) 70%);
+  pointer-events: none;
+}
+
+.kb-hero-copy h3 {
+  font-family: Manrope, sans-serif;
+  font-size: 1.7rem;
+  line-height: 1.15;
+  margin-top: 0.4rem;
+}
+
+.kb-hero-copy p {
+  margin-top: 0.7rem;
+  max-width: 36rem;
+  color: #4a4a3e;
+  font-size: 0.95rem;
+  line-height: 1.7;
+}
+
+.kb-hero-pill-row {
+  margin-top: 1.1rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.kb-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.35rem 0.7rem;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  background: #efeee3;
+  color: #2a2a1f;
+  border: 1px solid rgba(196, 199, 199, 0.55);
+}
+
+.kb-pill-soft {
+  background: rgba(255, 255, 255, 0.7);
+  color: #3a3a2c;
+}
+
+.kb-pill-dot {
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: 999px;
+  background: #059669;
+  box-shadow: 0 0 0 4px rgba(5, 150, 105, 0.18);
+}
+
+.kb-pill-type {
+  background: rgba(15, 23, 42, 0.06);
+  color: #1b1c15;
+}
+
+.kb-pill-status-approved {
+  background: rgba(5, 150, 105, 0.12);
+  color: #047857;
+  border-color: rgba(5, 150, 105, 0.3);
+}
+
+.kb-pill-status-pending {
+  background: rgba(217, 119, 6, 0.12);
+  color: #b45309;
+  border-color: rgba(217, 119, 6, 0.3);
+}
+
+.kb-pill-status-rejected {
+  background: rgba(220, 38, 38, 0.12);
+  color: #b91c1c;
+  border-color: rgba(220, 38, 38, 0.3);
+}
+
+.kb-pill-score {
+  background: rgba(59, 130, 246, 0.12);
+  color: #1d4ed8;
+  border-color: rgba(59, 130, 246, 0.3);
+  font-variant-numeric: tabular-nums;
+}
+
+.kb-hero-stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.75rem;
+  align-self: stretch;
+  position: relative;
+}
+
+.kb-stat-card {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  padding: 1rem 1.1rem;
+  border-radius: 1rem;
+  border: 1px solid rgba(196, 199, 199, 0.55);
+  background: rgba(255, 255, 255, 0.78);
+  min-height: 7.5rem;
+}
+
+.kb-stat-label {
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: #5f5f53;
+}
+
+.kb-stat-value {
+  font-family: Manrope, sans-serif;
+  font-size: 1.85rem;
+  line-height: 1;
+  margin-top: 0.4rem;
+  color: #1b1c15;
+  font-variant-numeric: tabular-nums;
+}
+
+.kb-stat-meta {
+  margin-top: 0.55rem;
+  color: #5f5f53;
+  font-size: 0.74rem;
+}
+
+.kb-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 1.25rem;
+}
+
+.kb-card {
+  display: flex;
+  flex-direction: column;
+  gap: 1.1rem;
+}
+
+.kb-card-head {
+  display: flex;
+  gap: 0.85rem;
+  align-items: flex-start;
+}
+
+.kb-card-icon {
+  flex: 0 0 auto;
+  width: 2.4rem;
+  height: 2.4rem;
+  border-radius: 0.8rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: #efeee3;
+  border: 1px solid rgba(196, 199, 199, 0.55);
+  color: #1b1c15;
+}
+
+.kb-card-icon-primary {
+  background: #1d1c0f;
+  color: #fffef8;
+  border-color: #1d1c0f;
+}
+
+.kb-card-head h4 {
+  font-family: Manrope, sans-serif;
+  font-size: 1.05rem;
+  line-height: 1.2;
+  margin: 0;
+}
+
+.kb-card-head p {
+  margin: 0.18rem 0 0;
+  color: #5f5f53;
+  font-size: 0.85rem;
+  line-height: 1.55;
+}
+
+.kb-dropzone {
+  position: relative;
+  display: block;
+  padding: 1.5rem;
+  border-radius: 1rem;
+  border: 1.5px dashed rgba(27, 28, 21, 0.25);
+  background: rgba(239, 238, 227, 0.4);
+  cursor: pointer;
+  transition: border-color 0.2s ease, background 0.2s ease, transform 0.15s ease;
+}
+
+.kb-dropzone:hover {
+  border-color: rgba(27, 28, 21, 0.55);
+  background: rgba(239, 238, 227, 0.7);
+}
+
+.kb-dropzone.has-file {
+  border-style: solid;
+  border-color: rgba(27, 28, 21, 0.4);
+  background: rgba(255, 255, 255, 0.9);
+}
+
+.kb-dropzone.is-busy {
+  pointer-events: none;
+  opacity: 0.7;
+}
+
+.kb-dropzone-input {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.kb-dropzone-empty,
+.kb-dropzone-filled {
+  display: flex;
+  align-items: center;
+  gap: 0.9rem;
+  text-align: left;
+}
+
+.kb-dropzone-empty {
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0;
+}
+
+.kb-dropzone-empty strong {
+  font-family: Manrope, sans-serif;
+  font-size: 0.98rem;
+}
+
+.kb-dropzone-empty span {
+  color: #5f5f53;
+  font-size: 0.8rem;
+}
+
+.kb-dropzone-icon {
+  width: 2.6rem;
+  height: 2.6rem;
+  border-radius: 0.85rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: #fffef8;
+  border: 1px solid rgba(196, 199, 199, 0.55);
+  color: #1b1c15;
+  flex: 0 0 auto;
+}
+
+.kb-dropzone-file {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.18rem;
+}
+
+.kb-dropzone-file strong {
+  font-family: Manrope, sans-serif;
+  font-size: 0.95rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.kb-dropzone-file span {
+  color: #5f5f53;
+  font-size: 0.78rem;
+}
+
+.kb-link-button {
+  position: relative;
+  z-index: 1;
+  background: transparent;
+  border: none;
+  color: #1d4ed8;
+  font-weight: 700;
+  font-size: 0.8rem;
+  cursor: pointer;
+  padding: 0.3rem 0.5rem;
+  border-radius: 0.5rem;
+}
+
+.kb-link-button:hover {
+  background: rgba(59, 130, 246, 0.08);
+}
+
+.kb-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.85rem 0.9rem;
+}
+
+.kb-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.kb-field-wide {
+  grid-column: 1 / -1;
+}
+
+.kb-field > span {
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: #5f5f53;
+}
+
+.kb-field input,
+.kb-field select,
+.kb-search-bar input {
+  width: 100%;
+  padding: 0.7rem 0.85rem;
+  border-radius: 0.7rem;
+  border: 1px solid rgba(196, 199, 199, 0.6);
+  background: rgba(255, 255, 255, 0.85);
+  font-size: 0.92rem;
+  color: #1b1c15;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.kb-field input:focus,
+.kb-field select:focus,
+.kb-search-bar input:focus {
+  outline: none;
+  border-color: rgba(27, 28, 21, 0.6);
+  box-shadow: 0 0 0 3px rgba(27, 28, 21, 0.08);
+}
+
+.kb-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.85rem;
+  flex-wrap: wrap;
+}
+
+.kb-card-hint {
+  color: #5f5f53;
+  font-size: 0.78rem;
+}
+
+.kb-readonly-card {
+  align-items: flex-start;
+}
+
+.kb-search-bar {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 0.4rem 0.4rem 2.4rem;
+  border-radius: 0.9rem;
+  border: 1px solid rgba(196, 199, 199, 0.6);
+  background: rgba(255, 255, 255, 0.9);
+}
+
+.kb-search-bar-icon {
+  position: absolute;
+  left: 0.95rem;
+  color: #5f5f53;
+  pointer-events: none;
+}
+
+.kb-search-bar input {
+  flex: 1;
+  border: none;
+  background: transparent;
+  padding: 0.55rem 0.2rem;
+}
+
+.kb-search-bar input:focus {
+  box-shadow: none;
+}
+
+.kb-search-submit {
+  flex: 0 0 auto;
+}
+
+.kb-results {
+  display: grid;
+  gap: 0.65rem;
+}
+
+.kb-result-card {
+  padding: 0.85rem 1rem;
+  border-radius: 0.85rem;
+  border: 1px solid rgba(196, 199, 199, 0.5);
+  background: rgba(255, 255, 255, 0.78);
+}
+
+.kb-result-head {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-bottom: 0.4rem;
+}
+
+.kb-result-rank {
+  font-family: Manrope, sans-serif;
+  font-weight: 800;
+  font-size: 0.78rem;
+  color: #5f5f53;
+}
+
+.kb-result-head strong {
+  flex: 1;
+  font-family: Manrope, sans-serif;
+  font-size: 0.95rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.kb-result-text {
+  color: #444748;
+  font-size: 0.86rem;
+  line-height: 1.55;
+  margin: 0;
+}
+
+.kb-search-empty {
+  color: #5f5f53;
+  font-size: 0.85rem;
+  padding: 0.4rem 0.2rem;
+}
+
+.kb-list-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.kb-list-head h4 {
+  font-family: Manrope, sans-serif;
+  font-size: 1.25rem;
+  line-height: 1.2;
+  margin: 0.3rem 0 0.2rem;
+}
+
+.kb-list-head p {
+  margin: 0;
+  color: #5f5f53;
+  font-size: 0.85rem;
+}
+
+.kb-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 2.4rem 1.5rem;
+  border-radius: 1.2rem;
+  border: 1px dashed rgba(196, 199, 199, 0.7);
+  background: rgba(255, 255, 255, 0.55);
+  text-align: center;
+}
+
+.kb-empty-icon {
+  width: 3.2rem;
+  height: 3.2rem;
+  border-radius: 1rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: #efeee3;
+  color: #1b1c15;
+  border: 1px solid rgba(196, 199, 199, 0.55);
+  margin-bottom: 0.5rem;
+}
+
+.kb-empty strong {
+  font-family: Manrope, sans-serif;
+  font-size: 1rem;
+}
+
+.kb-empty span {
+  color: #5f5f53;
+  font-size: 0.85rem;
+}
+
+.kb-doc-list {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.kb-doc-card {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 1.1rem;
+  align-items: center;
+  padding: 1rem 1.2rem;
+  border-radius: 1.1rem;
+  border: 1px solid rgba(196, 199, 199, 0.5);
+  background: rgba(255, 255, 255, 0.78);
+  transition: border-color 0.2s ease, box-shadow 0.2s ease, transform 0.15s ease;
+}
+
+.kb-doc-card:hover {
+  border-color: rgba(27, 28, 21, 0.35);
+  box-shadow: 0 14px 32px -28px rgba(27, 28, 21, 0.4);
+}
+
+.kb-doc-status-approved {
+  border-left: 3px solid #059669;
+}
+
+.kb-doc-status-pending {
+  border-left: 3px solid #d97706;
+}
+
+.kb-doc-status-rejected {
+  border-left: 3px solid #dc2626;
+}
+
+.kb-doc-icon {
+  width: 2.5rem;
+  height: 2.5rem;
+  border-radius: 0.85rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: #efeee3;
+  border: 1px solid rgba(196, 199, 199, 0.55);
+  color: #1b1c15;
+}
+
+.kb-doc-body {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.kb-doc-title-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+}
+
+.kb-doc-title-row strong {
+  font-family: Manrope, sans-serif;
+  font-size: 1rem;
+  line-height: 1.3;
+}
+
+.kb-doc-desc {
+  margin: 0;
+  color: #4a4a3e;
+  font-size: 0.85rem;
+  line-height: 1.55;
+}
+
+.kb-doc-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.8rem;
+  color: #5f5f53;
+  font-size: 0.78rem;
+}
+
+.kb-doc-meta strong {
+  color: #1b1c15;
+  font-weight: 800;
+}
+
+.kb-doc-tags {
+  display: inline-flex;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+}
+
+.kb-tag {
+  background: rgba(15, 23, 42, 0.06);
+  padding: 0.18rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  color: #1b1c15;
+}
+
+.kb-doc-error {
+  margin: 0.25rem 0 0;
+  color: #b91c1c;
+  font-size: 0.78rem;
+}
+
+.kb-doc-actions {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+@media (max-width: 980px) {
+  .kb-hero {
+    grid-template-columns: 1fr;
+    padding: 1.4rem 1.4rem;
+  }
+  .kb-hero-stats {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+  .kb-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 640px) {
+  .kb-hero-stats {
+    grid-template-columns: 1fr;
+  }
+  .kb-doc-card {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+  .kb-doc-actions {
+    grid-column: 1 / -1;
+    justify-content: flex-start;
+  }
+  .kb-form-grid {
+    grid-template-columns: 1fr;
   }
 }
 </style>

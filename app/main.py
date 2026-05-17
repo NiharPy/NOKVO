@@ -38,6 +38,7 @@ from app.api import (
     nokvo_one_auth,
     nokvo_one_members,
     nokvo_one_agents,
+    nokvo_one_knowledge_base,
     nokvo_one_requests,
 )
 
@@ -48,6 +49,11 @@ app.include_router(nokvo_one_auth.router, prefix="/api/nokvo-one", tags=["nokvo-
 app.include_router(nokvo_one_requests.router, prefix="/api/nokvo-one", tags=["nokvo-one-requests"])
 app.include_router(nokvo_one_members.router, prefix="/api/nokvo-one/members", tags=["nokvo-one-members"])
 app.include_router(nokvo_one_agents.router, prefix="/api/nokvo-one/agents", tags=["nokvo-one-agents"])
+app.include_router(
+    nokvo_one_knowledge_base.router,
+    prefix="/api/nokvo-one/knowledge-base",
+    tags=["nokvo-one-knowledge-base"],
+)
 
 @app.get("/health")
 async def health_check():
