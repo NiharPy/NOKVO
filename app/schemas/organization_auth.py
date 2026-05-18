@@ -516,6 +516,25 @@ class OrganizationAgentDocumentUploadRequest(BaseModel):
         return value
 
 
+class OrganizationAgentSinglePromptSetupRequest(BaseModel):
+    prompt: str = Field(min_length=20, max_length=8000)
+
+    @field_validator("prompt")
+    @classmethod
+    def validate_prompt(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Prompt is required")
+        return value
+
+
+class OrganizationAgentSinglePromptSetupResponse(BaseModel):
+    enabled: bool = True
+    prompt: str = ""
+    updated_at: Optional[str] = None
+    updated_by: Optional[str] = None
+
+
 class OrganizationAgentDocumentReviewRequest(BaseModel):
     notes: Optional[str] = None
 

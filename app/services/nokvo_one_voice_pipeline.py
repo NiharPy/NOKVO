@@ -17,6 +17,7 @@ from app.services.agent_knowledge_service import (
     AGENT_CHUNK_SOURCE_KIND,
     AGENT_KNOWLEDGE_SOURCE_TYPE,
     AGENT_POLICY_CARDS_KEY,
+    AGENT_SINGLE_PROMPT_CONFIG_KEY,
     AgentKnowledgeService,
 )
 from app.services.agent_session_store import AgentSessionStore
@@ -741,6 +742,15 @@ class NokvoOneVoicePipeline:
         return out
 
     @staticmethod
+    def _single_prompt_guidance(tenant_res: TenantResources) -> str:
+        provider_status = dict(tenant_res.provider_status or {})
+        config = provider_status.get(AGENT_SINGLE_PROMPT_CONFIG_KEY) or {}
+        if not isinstance(config, dict) or not config.get("enabled"):
+            return ""
+        prompt = str(config.get("prompt") or "").strip()
+        return prompt[:8000]
+
+    @staticmethod
     def _messages(
         query: str,
         chunks: list[dict[str, Any]],
@@ -749,6 +759,7 @@ class NokvoOneVoicePipeline:
         history: list[dict[str, str]],
         company_name: str | None = None,
         campaign_goal: str | None = None,
+        single_prompt_guidance: str | None = None,
     ) -> list[dict[str, str]]:
         language_label = SarvamVoiceService.language_label(language)
         context_parts: list[str] = []
@@ -767,7 +778,16 @@ class NokvoOneVoicePipeline:
             if campaign_goal
             else "This is an inbound support conversation unless campaign context says otherwise."
         )
-        brand = company_name or "the tenant"
+        custom_guidance = (single_prompt_guidance or "").strip()
+        brand = "the configured business" if custom_guidance else (company_name or "the tenant")
+        custom_guidance_section = (
+            "# ADMIN SINGLE-PROMPT VOICE AGENT GUIDANCE\n"
+            f"{custom_guidance}\n\n"
+            "This tenant-provided prompt is part of the agent's active configuration. Use explicit business facts from it together with retrieved tenant context. "
+            "If approved retrieved documents conflict with this prompt, prefer the retrieved documents. It does not override safety, language, or no-hallucination rules.\n\n"
+            if custom_guidance
+            else ""
+        )
 
         # Order matters: language directive sits at the very top AND is
         # repeated at the bottom — LLMs weight start and end of long prompts
@@ -796,6 +816,7 @@ class NokvoOneVoicePipeline:
             "  [warm]Of course.[/warm] [neutral]Refunds within 2 minutes go back to your original payment method.[/neutral]\n"
             "Tags are stripped before being spoken; they only control the voice's tone. Most replies are mostly [neutral] with one warm or empathic opener.\n\n"
             "# VOICE & PERSONALITY\n"
+            f"{custom_guidance_section}"
             "- Use contractions: 'I'll', 'you're', 'let's' — same in every language (equivalent informal forms).\n"
             "- Open with quick acknowledgments — 'Sure', 'Got it', 'Of course', 'Okay', 'Right' — not 'I understand your concern' or 'Thank you for reaching out'.\n"
             "- When the caller is frustrated, hurt, or angry: ACKNOWLEDGE the feeling first in one short phrase ('Oh that's frustrating', 'Sorry to hear that'), THEN help. Don't skip to 'please provide your order number'.\n"
@@ -818,10 +839,10 @@ class NokvoOneVoicePipeline:
             "- If you asked a question last turn, treat their short reply as the answer to that.\n"
             "- If you didn't ask anything specific, respond openly: 'What can I help you with?'\n\n"
             "# GROUNDING RULES — non-negotiable for company-specific facts\n"
-            "1. Answer only with facts stated explicitly in the retrieved tenant context. "
+            "1. Answer only with facts stated explicitly in the retrieved tenant context or the active admin single-prompt guidance. "
             "If the user's question is partially covered, state EVERY relevant fact the context contains (city, name, hours, number, etc.) and ONLY then say the remaining detail must be confirmed by support. "
             "Refuse only when nothing in the context is relevant.\n"
-            "1a. CRITICAL FOR NON-ENGLISH REPLIES: When responding in Telugu, Hindi, Tamil, Bengali, Marathi, Gujarati, Kannada, Malayalam, Punjabi, or Urdu — NEVER use 'I don't have that information' if the retrieved context contains ANY relevant fact. "
+            "1a. CRITICAL FOR NON-ENGLISH REPLIES: When responding in Telugu, Hindi, Tamil, Bengali, Marathi, Gujarati, Kannada, Malayalam, Punjabi, or Urdu — NEVER use 'I don't have that information' if the retrieved context or admin guidance contains ANY relevant fact. "
             "Translate the facts you DO have into the target language and share them. Only after sharing should you note what's missing. "
             "Example: caller asks 'where is the clinic?' in Telugu, context says 'clinic is in KPHB, Hyderabad'. CORRECT response: share KPHB+Hyderabad in Telugu and offer to follow up for the exact street. INCORRECT: 'I don't have the exact address'.\n"
             "1b. AMBIGUOUS PRONOUNS — when the user says 'where is it', 'how much is this', 'when do they open', or similar pronoun-style questions without explicit subject, "
@@ -855,7 +876,7 @@ class NokvoOneVoicePipeline:
             {
                 "role": "user",
                 "content": (
-                    f"Retrieved tenant context:\n{chr(10).join(context_parts)}\n\n"
+                    f"Retrieved tenant context, if any:\n{chr(10).join(context_parts)}\n\n"
                     f"Current user question:\n{query}\n\n"
                     f"Reply in {language_label}."
                 ),
@@ -871,6 +892,7 @@ class NokvoOneVoicePipeline:
         history: list[dict[str, str]],
         company_name: str | None = None,
         sentiment: str = "neutral",
+        single_prompt_guidance: str | None = None,
     ) -> list[dict[str, str]]:
         """Prompt for the LLM in *casual conversation* mode.
 
@@ -880,7 +902,15 @@ class NokvoOneVoicePipeline:
         world or about the company — those still require KB-grounded context.
         """
         language_label = SarvamVoiceService.language_label(language)
-        brand = company_name or "the company"
+        custom_guidance = (single_prompt_guidance or "").strip()
+        brand = "the configured business" if custom_guidance else (company_name or "the company")
+        custom_guidance_section = (
+            "# ADMIN SINGLE-PROMPT VOICE AGENT GUIDANCE\n"
+            f"{custom_guidance}\n\n"
+            "Use this for role, tone, and conversation flow. You may use explicit business facts from it, but do not invent details beyond it.\n\n"
+            if custom_guidance
+            else ""
+        )
 
         sentiment_guidance = {
             "frustrated": "The caller sounds frustrated. ACKNOWLEDGE the feeling first in one short phrase before asking how to help.",
@@ -895,6 +925,7 @@ class NokvoOneVoicePipeline:
             f"Reply in {language_label}, using its native script. Do not switch languages.\n\n"
             f"You are Nokvo One's live voice agent for {brand}. The caller just said something CONVERSATIONAL — a greeting, thank-you, acknowledgment, casual remark, or expression of feeling. Not a factual question about the company.\n\n"
             "# RESPONSE STYLE\n"
+            f"{custom_guidance_section}"
             "- One or two short sentences. Voice-first — keep it crisp.\n"
             "- Use contractions: 'I'll', 'you're', 'let's'.\n"
             "- Sound like a real person on a phone call, not a help-center bot.\n"
@@ -1058,6 +1089,20 @@ class NokvoOneVoicePipeline:
         # 1) Greeting / thanks / goodbye / smalltalk — no LLM, no cache, no embeddings.
         templated = NokvoOneVoicePipeline._template_reply(intent_result.intent, language, company_name)
         if templated:
+            if intent_result.intent == INTENT_GREETING and NokvoOneVoicePipeline._single_prompt_guidance(tenant_res):
+                return {
+                    "route": "smalltalk_llm",
+                    "answer": None,
+                    "intent_result": intent_result,
+                    "safe_to_cache": False,
+                    "sensitive": False,
+                    "classified": {
+                        "intent": "smalltalk",
+                        "needs_kb": False,
+                        "sentiment": "neutral",
+                        "reason": "single prompt greeting override",
+                    },
+                }
             return {
                 "route": "template",
                 "answer": templated,
@@ -1337,6 +1382,16 @@ class NokvoOneVoicePipeline:
                     "classified": classified.to_dict(),
                     "prefetched_retrieval": probe,
                 }
+            if NokvoOneVoicePipeline._single_prompt_guidance(tenant_res):
+                return {
+                    "route": "rag",
+                    "answer": None,
+                    "intent_result": intent_result,
+                    "safe_to_cache": False,
+                    "sensitive": False,
+                    "classified": classified.to_dict(),
+                    "prefetched_retrieval": probe,
+                }
             # KB really has nothing → friendly redirect template.
             brand = company_name or "us"
             msg = {
@@ -1455,6 +1510,7 @@ class NokvoOneVoicePipeline:
             campaign_id=campaign_id,
         )
         intent_result: IntentResult = route["intent_result"]
+        single_prompt_guidance = NokvoOneVoicePipeline._single_prompt_guidance(tenant_res)
         if route["route"] in {"template", "answer_card", "policy_card"}:
             answer = route["answer"]
             await AgentSessionStore.append_turn(tenant_res, call_id, user_text, answer)
@@ -1558,7 +1614,7 @@ class NokvoOneVoicePipeline:
             }
             for chunk in chunks
         ]
-        if not chunks:
+        if not chunks and not single_prompt_guidance:
             if _SMALLTALK_RE.match(user_text):
                 answer = NokvoOneVoicePipeline._smalltalk_reply(user_text, language, company_name)
                 refused = False
@@ -1605,6 +1661,7 @@ class NokvoOneVoicePipeline:
             history=history,
             company_name=company_name,
             campaign_goal=campaign_goal,
+            single_prompt_guidance=single_prompt_guidance,
         )
         timeout = max(0.8, (latency_budget_ms or settings.AGENT_LLM_TIMEOUT_MS) / 1000)
         llm_error = None
@@ -1636,7 +1693,7 @@ class NokvoOneVoicePipeline:
                 "call_id": call_id,
                 "intent": intent_result.intent,
                 "topic": intent_result.topic,
-                "route": "qdrant_rag" if not refused else "refusal",
+                "route": ("single_prompt_rag" if not chunks else "qdrant_rag") if not refused else "refusal",
                 "sensitive": intent_result.sensitive,
                 "cache_hit": False,
                 "qdrant_called": True,
@@ -1654,7 +1711,7 @@ class NokvoOneVoicePipeline:
             "chunks": chunks,
             "runtime": {
                 "graph": "nokvo_rag_pipeline",
-                "mode": "grounded_rag",
+                "mode": "single_prompt_grounded" if not chunks else "grounded_rag",
                 "model": settings.AZURE_OPENAI_AGENT_MODEL,
                 "response_language": language,
                 "latency_ms": total_ms,
@@ -1705,6 +1762,7 @@ class NokvoOneVoicePipeline:
             campaign_id=campaign_id,
         )
         intent_result: IntentResult = route["intent_result"]
+        single_prompt_guidance = NokvoOneVoicePipeline._single_prompt_guidance(tenant_res)
         if route["route"] in {"template", "answer_card", "policy_card"}:
             answer = route["answer"]
             yield {"type": "sentence", "text": answer, "language": language, "cache_hit": False}
@@ -1756,6 +1814,7 @@ class NokvoOneVoicePipeline:
                 history=history,
                 company_name=company_name,
                 sentiment=sentiment,
+                single_prompt_guidance=single_prompt_guidance,
             )
             answer_parts: list[str] = []
             try:
@@ -1853,7 +1912,7 @@ class NokvoOneVoicePipeline:
             }
             for chunk in chunks
         ]
-        if not chunks:
+        if not chunks and not single_prompt_guidance:
             if _SMALLTALK_RE.match(user_text):
                 answer = NokvoOneVoicePipeline._smalltalk_reply(user_text, language, company_name)
                 refused = False
@@ -1885,6 +1944,7 @@ class NokvoOneVoicePipeline:
             history=history,
             company_name=company_name,
             campaign_goal=campaign_goal,
+            single_prompt_guidance=single_prompt_guidance,
         )
         # Prosody-aware streaming: the LLM is asked to wrap each sentence in a
         # [tone]…[/tone] tag. The parser strips the tags and emits one chunk
@@ -1932,7 +1992,7 @@ class NokvoOneVoicePipeline:
                 "call_id": call_id,
                 "intent": intent_result.intent,
                 "topic": intent_result.topic,
-                "route": "qdrant_rag" if not refused else "refusal",
+                "route": ("single_prompt_rag" if not chunks else "qdrant_rag") if not refused else "refusal",
                 "sensitive": intent_result.sensitive,
                 "cache_hit": False,
                 "qdrant_called": True,
@@ -1950,7 +2010,7 @@ class NokvoOneVoicePipeline:
             "citations": citations,
             "runtime": {
                 "graph": "nokvo_rag_pipeline",
-                "mode": "grounded_rag_streamed",
+                "mode": "single_prompt_grounded_streamed" if not chunks else "grounded_rag_streamed",
                 "model": settings.AZURE_OPENAI_AGENT_MODEL,
                 "response_language": language,
                 "latency_ms": total_ms,
@@ -2012,10 +2072,23 @@ class NokvoOneVoicePipeline:
     @staticmethod
     def runtime_status(tenant_res: TenantResources) -> dict[str, Any]:
         provider_status = dict(tenant_res.provider_status or {})
+        single_prompt_config = provider_status.get(AGENT_SINGLE_PROMPT_CONFIG_KEY) or {}
+        single_prompt_enabled = bool(
+            isinstance(single_prompt_config, dict)
+            and single_prompt_config.get("enabled")
+            and single_prompt_config.get("prompt")
+        )
         return {
             "runtime": "nokvo_one_voice_agent",
             "graph": "nokvo_rag_pipeline",
             "knowledge_scope": "pre_indexed_tenant_qdrant_collection",
+            "setup_mode": "document_based_with_single_prompt" if single_prompt_enabled else "document_based",
+            "single_prompt_voice_agent": {
+                "enabled": single_prompt_enabled,
+                "updated_at": single_prompt_config.get("updated_at")
+                if isinstance(single_prompt_config, dict)
+                else None,
+            },
             "intent_gating": False,
             "brains": ["retrieval_grounded_pipeline", "semantic_cache", "session_memory"],
             "optimization": {

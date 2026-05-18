@@ -14,6 +14,8 @@ from app.schemas.organization_auth import (
     OrganizationAgentDocumentReviewRequest,
     OrganizationAgentDocumentUploadRequest,
     OrganizationAgentDocumentsResponse,
+    OrganizationAgentSinglePromptSetupRequest,
+    OrganizationAgentSinglePromptSetupResponse,
     OrganizationAgentTestAnswerResponse,
     OrganizationAgentTestQueryRequest,
     OrganizationAgentTestRetrievalResponse,
@@ -102,6 +104,54 @@ async def upload_document(
             ) from exc
         raise HTTPException(status_code=400, detail=message[:500]) from exc
     return OrganizationAgentDocumentResponse(**document)
+
+
+@router.get("/single-prompt-agent", response_model=OrganizationAgentSinglePromptSetupResponse)
+async def get_single_prompt_agent(
+    user: OrganizationUser = Depends(_viewer_dep()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tenant_res = await _tenant_resources(db, user)
+    return OrganizationAgentSinglePromptSetupResponse(
+        **AgentKnowledgeService.get_single_prompt_setup(tenant_res)
+    )
+
+
+@router.post("/single-prompt-agent", response_model=OrganizationAgentSinglePromptSetupResponse)
+async def configure_single_prompt_agent(
+    payload: OrganizationAgentSinglePromptSetupRequest,
+    user: OrganizationUser = Depends(_admin_dep()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tenant_res = await _tenant_resources(db, user)
+    try:
+        result = await AgentKnowledgeService.configure_single_prompt_voice_agent(
+            tenant_res,
+            db,
+            user,
+            prompt=payload.prompt,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        import traceback
+        tb = traceback.format_exc()
+        print(f"[NOKVO-KB-API] single-prompt setup failed: {exc!r}\n{tb[:1500]}")
+        raise HTTPException(status_code=400, detail=str(exc)[:500]) from exc
+    return OrganizationAgentSinglePromptSetupResponse(**result)
+
+
+@router.post("/single-prompt-agent/disable", response_model=OrganizationAgentSinglePromptSetupResponse)
+async def disable_single_prompt_agent(
+    user: OrganizationUser = Depends(_admin_dep()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tenant_res = await _tenant_resources(db, user)
+    try:
+        result = await AgentKnowledgeService.disable_single_prompt_voice_agent(tenant_res, db, user)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)[:500]) from exc
+    return OrganizationAgentSinglePromptSetupResponse(**result)
 
 
 @router.post("/documents/{document_id}/approve", response_model=OrganizationAgentDocumentResponse)

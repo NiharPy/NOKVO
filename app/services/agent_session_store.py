@@ -36,7 +36,19 @@ class AgentSessionStore:
     @staticmethod
     def _policy_version(tenant_res: TenantResources) -> str:
         provider_status = dict(tenant_res.provider_status or {})
-        return str(provider_status.get("agent_policy_version") or "pv_default")
+        base_version = str(provider_status.get("agent_policy_version") or "pv_default")
+        prompt_config = provider_status.get("single_prompt_voice_agent") or {}
+        if not isinstance(prompt_config, dict):
+            return base_version
+        prompt_enabled = bool(prompt_config.get("enabled") and prompt_config.get("prompt"))
+        if not prompt_enabled:
+            return base_version
+        marker = str(prompt_config.get("updated_at") or "")
+        if not marker:
+            marker = hashlib.sha256(str(prompt_config.get("prompt") or "").encode("utf-8")).hexdigest()[:12]
+        if not marker:
+            return base_version
+        return f"{base_version}:single_prompt:1:{marker}"
 
     @classmethod
     def semantic_cache_key(

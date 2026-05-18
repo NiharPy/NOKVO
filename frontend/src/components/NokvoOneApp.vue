@@ -90,9 +90,15 @@ const kbForm = ref({
   tags: '',
   file: null,
 });
+const kbSinglePromptConfig = ref(null);
+const kbSinglePromptForm = ref({
+  prompt: '',
+});
 const kbUploadInputRef = ref(null);
 const isLoadingKb = ref(false);
 const isUploadingKb = ref(false);
+const isSavingSinglePromptAgent = ref(false);
+const isDisablingSinglePromptAgent = ref(false);
 const isReconcilingKb = ref(false);
 const kbError = ref('');
 const kbInfo = ref('');
@@ -260,6 +266,7 @@ const switchPage = (page) => {
   infoMsg.value = '';
   if (page === 'knowledge_base') {
     loadKnowledgeDocuments();
+    loadSinglePromptAgent();
   }
   if (page === 'agent') {
     loadRuntimeStatus();
@@ -1144,12 +1151,73 @@ const loadKnowledgeDocuments = async () => {
   }
 };
 
+const loadSinglePromptAgent = async () => {
+  try {
+    const { data } = await kbApi.get('/single-prompt-agent', { headers: authHeader() });
+    kbSinglePromptConfig.value = data;
+    if (data?.prompt && !kbSinglePromptForm.value.prompt.trim()) {
+      kbSinglePromptForm.value.prompt = data.prompt;
+    }
+  } catch (err) {
+    kbSinglePromptConfig.value = null;
+  }
+};
+
 // Bulk upload queue. Becomes non-empty when 2+ files are selected at once.
 // Each entry tracks its own status so the user sees per-file progress.
 const kbBulkQueue = ref([]);  // { file, name, status: 'queued'|'uploading'|'done'|'error', error?: string }
 const isUploadingKbBulk = ref(false);
 
 const _kbStripExt = (filename) => filename.replace(/\.[^/.]+$/, '');
+
+const kbSinglePromptCanSubmit = computed(() => (
+  kbSinglePromptForm.value.prompt.trim().length >= 20
+));
+
+const saveSinglePromptVoiceAgent = async () => {
+  if (!kbSinglePromptForm.value.prompt.trim()) {
+    kbError.value = 'Add the single prompt for the voice agent.';
+    return;
+  }
+  if (kbSinglePromptForm.value.prompt.trim().length < 20) {
+    kbError.value = 'Single prompt must be at least 20 characters.';
+    return;
+  }
+  isSavingSinglePromptAgent.value = true;
+  kbError.value = '';
+  kbInfo.value = '';
+  try {
+    const { data } = await kbApi.post(
+      '/single-prompt-agent',
+      {
+        prompt: kbSinglePromptForm.value.prompt.trim(),
+      },
+      { headers: authHeader() },
+    );
+    kbSinglePromptConfig.value = data;
+    kbInfo.value = 'Single prompt voice agent configured.';
+  } catch (err) {
+    kbError.value = extractErrorMessage(err, 'Failed to configure single prompt voice agent.');
+  } finally {
+    isSavingSinglePromptAgent.value = false;
+  }
+};
+
+const disableSinglePromptVoiceAgent = async () => {
+  isDisablingSinglePromptAgent.value = true;
+  kbError.value = '';
+  kbInfo.value = '';
+  try {
+    const { data } = await kbApi.post('/single-prompt-agent/disable', {}, { headers: authHeader() });
+    kbSinglePromptConfig.value = data;
+    kbSinglePromptForm.value.prompt = '';
+    kbInfo.value = 'Single prompt removed. The voice runtime will use the default system prompt with approved documents.';
+  } catch (err) {
+    kbError.value = extractErrorMessage(err, 'Failed to remove single prompt.');
+  } finally {
+    isDisablingSinglePromptAgent.value = false;
+  }
+};
 
 const _acceptKbFiles = (files) => {
   const list = Array.from(files || []);
@@ -3631,6 +3699,60 @@ onBeforeUnmount(() => {
                 <template v-else-if="kbBulkQueue.length">2 files embed in parallel to stay under Azure OpenAI rate limits.</template>
                 <template v-else>Approved by default if text is extractable.</template>
               </span>
+            </div>
+          </article>
+
+          <article v-if="isAdmin" class="dashboard-card kb-card kb-single-prompt-card">
+            <div class="kb-card-head">
+              <div class="kb-card-icon kb-card-icon-primary">
+                <Mic :size="18" />
+              </div>
+              <div>
+                <h4>Single Prompt Voice Agent</h4>
+                <p>Give the live voice agent one operating prompt. It works alongside approved Knowledge Base documents.</p>
+              </div>
+            </div>
+
+            <div v-if="kbSinglePromptConfig?.enabled" class="kb-single-status">
+              <CheckCircle2 :size="16" />
+              <div>
+                <strong>Single prompt route active</strong>
+                <span>
+                  <template v-if="kbSinglePromptConfig.updated_at">Updated {{ formatRelativeDate(kbSinglePromptConfig.updated_at) }}</template>
+                  <template v-else>Runtime prompt enabled</template>
+                </span>
+              </div>
+              <button
+                type="button"
+                class="kb-link-button kb-single-disable"
+                :disabled="isDisablingSinglePromptAgent"
+                @click="disableSinglePromptVoiceAgent"
+              >
+                {{ isDisablingSinglePromptAgent ? 'Removing…' : 'Remove prompt' }}
+              </button>
+            </div>
+
+            <label class="kb-field kb-field-wide">
+              <span>Single Prompt</span>
+              <textarea
+                v-model="kbSinglePromptForm.prompt"
+                class="kb-prompt-textarea"
+                placeholder="You are a warm phone agent for the clinic. Greet callers briefly, answer only from approved Knowledge Base documents, ask for the missing detail when needed, and keep every reply under three sentences."
+                :disabled="isSavingSinglePromptAgent"
+              ></textarea>
+            </label>
+
+            <div class="kb-card-actions">
+              <button
+                type="button"
+                class="primary-button compact"
+                :disabled="isSavingSinglePromptAgent || !kbSinglePromptCanSubmit"
+                @click="saveSinglePromptVoiceAgent"
+              >
+                <CheckCircle2 :size="15" />
+                {{ isSavingSinglePromptAgent ? 'Configuring…' : 'Configure Voice Agent' }}
+              </button>
+              <span class="kb-card-hint">Applies this prompt to the live voice runtime. Knowledge still comes from approved documents.</span>
             </div>
           </article>
 
@@ -7394,6 +7516,7 @@ onBeforeUnmount(() => {
 
 .kb-field input,
 .kb-field select,
+.kb-field textarea,
 .kb-search-bar input {
   width: 100%;
   padding: 0.7rem 0.85rem;
@@ -7407,10 +7530,57 @@ onBeforeUnmount(() => {
 
 .kb-field input:focus,
 .kb-field select:focus,
+.kb-field textarea:focus,
 .kb-search-bar input:focus {
   outline: none;
   border-color: rgba(27, 28, 21, 0.6);
   box-shadow: 0 0 0 3px rgba(27, 28, 21, 0.08);
+}
+
+.kb-prompt-textarea {
+  min-height: 9.5rem;
+  resize: vertical;
+  line-height: 1.5;
+}
+
+.kb-single-status {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.65rem;
+  flex-wrap: wrap;
+  padding: 0.75rem 0.85rem;
+  border-radius: 0.75rem;
+  border: 1px solid rgba(5, 150, 105, 0.25);
+  background: rgba(5, 150, 105, 0.08);
+  color: #1b1c15;
+}
+
+.kb-single-status svg {
+  flex: 0 0 auto;
+  color: #047857;
+  margin-top: 0.1rem;
+}
+
+.kb-single-status div {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  min-width: 0;
+}
+
+.kb-single-status strong {
+  font-family: Manrope, sans-serif;
+  font-size: 0.9rem;
+}
+
+.kb-single-status span {
+  color: #4d5b51;
+  font-size: 0.78rem;
+}
+
+.kb-single-disable {
+  flex: 0 0 auto;
+  margin-left: auto;
 }
 
 .kb-card-actions {

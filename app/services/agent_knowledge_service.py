@@ -29,6 +29,7 @@ AGENT_CHUNK_SOURCE_KIND = "agent_document_chunk"
 AGENT_ANSWER_CARDS_KEY = "agent_answer_cards"
 AGENT_POLICY_CARDS_KEY = "agent_policy_cards"
 AGENT_POLICY_VERSION_KEY = "agent_policy_version"
+AGENT_SINGLE_PROMPT_CONFIG_KEY = "single_prompt_voice_agent"
 
 _HEADING_RE = re.compile(
     r"^(?:#+\s*)?([A-Z][A-Za-z0-9 /&\-:]{2,80})\s*[:\-]?\s*$"
@@ -95,6 +96,27 @@ class AgentKnowledgeService:
     @staticmethod
     def _set_policy_cards(provider_status: dict, cards: list[dict]) -> None:
         provider_status[AGENT_POLICY_CARDS_KEY] = cards[-500:]
+
+    @staticmethod
+    def _single_prompt_config(provider_status: dict) -> dict:
+        value = provider_status.get(AGENT_SINGLE_PROMPT_CONFIG_KEY) or {}
+        return dict(value) if isinstance(value, dict) else {}
+
+    @staticmethod
+    def single_prompt_config(tenant_res: TenantResources) -> dict:
+        provider_status = AgentKnowledgeService._provider_status(tenant_res)
+        return AgentKnowledgeService._single_prompt_config(provider_status)
+
+    @staticmethod
+    def get_single_prompt_setup(tenant_res: TenantResources) -> dict:
+        provider_status = AgentKnowledgeService._provider_status(tenant_res)
+        config = AgentKnowledgeService._single_prompt_config(provider_status)
+        return {
+            "enabled": bool(config.get("enabled")),
+            "prompt": str(config.get("prompt") or ""),
+            "updated_at": config.get("updated_at"),
+            "updated_by": config.get("updated_by"),
+        }
 
     @staticmethod
     def _build_policy_cards(document: dict, policy_version: str) -> list[dict]:
@@ -672,6 +694,52 @@ class AgentKnowledgeService:
             document["approval_status"] = "rejected"
             document["last_error"] = f"persistence failed: {str(exc)[:400]}"
         return AgentKnowledgeService._document_response(document)
+
+    @staticmethod
+    async def configure_single_prompt_voice_agent(
+        tenant_res: TenantResources,
+        db: AsyncSession,
+        current_user: OrganizationUser,
+        *,
+        prompt: str,
+    ) -> dict:
+        cleaned_prompt = re.sub(r"\n{3,}", "\n\n", (prompt or "").strip())
+        if len(cleaned_prompt) < 20:
+            raise ValueError("Single prompt must be at least 20 characters.")
+
+        provider_status = AgentKnowledgeService._provider_status(tenant_res)
+        provider_status[AGENT_SINGLE_PROMPT_CONFIG_KEY] = {
+            "enabled": True,
+            "prompt": cleaned_prompt[:8000],
+            "updated_at": AgentKnowledgeService._now(),
+            "updated_by": str(current_user.id),
+        }
+        tenant_res.provider_status = provider_status
+        flag_modified(tenant_res, "provider_status")
+        db.add(tenant_res)
+        await db.commit()
+        await db.refresh(tenant_res)
+        return AgentKnowledgeService.get_single_prompt_setup(tenant_res)
+
+    @staticmethod
+    async def disable_single_prompt_voice_agent(
+        tenant_res: TenantResources,
+        db: AsyncSession,
+        current_user: OrganizationUser,
+    ) -> dict:
+        provider_status = AgentKnowledgeService._provider_status(tenant_res)
+        config = AgentKnowledgeService._single_prompt_config(provider_status)
+        config["enabled"] = False
+        config["prompt"] = ""
+        config["updated_at"] = AgentKnowledgeService._now()
+        config["updated_by"] = str(current_user.id)
+        provider_status[AGENT_SINGLE_PROMPT_CONFIG_KEY] = config
+        tenant_res.provider_status = provider_status
+        flag_modified(tenant_res, "provider_status")
+        db.add(tenant_res)
+        await db.commit()
+        await db.refresh(tenant_res)
+        return AgentKnowledgeService.get_single_prompt_setup(tenant_res)
 
     @staticmethod
     async def review_document(
