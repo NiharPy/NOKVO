@@ -40,6 +40,7 @@ from app.api import (
     nokvo_one_agents,
     nokvo_one_knowledge_base,
     nokvo_one_requests,
+    nokvo_one_voice,
 )
 
 app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
@@ -49,6 +50,11 @@ app.include_router(nokvo_one_auth.router, prefix="/api/nokvo-one", tags=["nokvo-
 app.include_router(nokvo_one_requests.router, prefix="/api/nokvo-one", tags=["nokvo-one-requests"])
 app.include_router(nokvo_one_members.router, prefix="/api/nokvo-one/members", tags=["nokvo-one-members"])
 app.include_router(nokvo_one_agents.router, prefix="/api/nokvo-one/agents", tags=["nokvo-one-agents"])
+app.include_router(
+    nokvo_one_voice.router,
+    prefix="/api/nokvo-one/agents",
+    tags=["nokvo-one-voice"],
+)
 app.include_router(
     nokvo_one_knowledge_base.router,
     prefix="/api/nokvo-one/knowledge-base",

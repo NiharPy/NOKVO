@@ -300,11 +300,22 @@ class OutboundCampaignService:
         db: AsyncSession,
         *,
         public_base_url: str,
+        path_prefix: str = "/api/org-auth/agent",
+        tenant_res: TenantResources | None = None,
     ) -> OutboundCampaign:
         if campaign.status != CampaignStatus.draft:
             raise ValueError(f"Campaign is already '{campaign.status}' — only draft campaigns can be launched.")
 
+        if tenant_res is None:
+            res = await db.execute(
+                select(TenantResources).where(TenantResources.tenant_id == campaign.tenant_id)
+            )
+            tenant_res = res.scalars().first()
+            if tenant_res is None:
+                raise ValueError("Tenant resources for this campaign could not be loaded.")
+
         base = public_base_url.rstrip("/")
+        prefix = path_prefix.rstrip("/")
         contacts = list(campaign.contacts or [])
 
         campaign.status = CampaignStatus.running
@@ -317,8 +328,8 @@ class OutboundCampaignService:
         async def _call_one(contact: dict) -> None:
             link_id = contact["call_link_id"]
             ws_base = base.replace("https://", "wss://").replace("http://", "ws://")
-            stream_url = f"{ws_base}/api/org-auth/agent/exotel/outbound-media/{link_id}"
-            status_callback = f"{base}/api/org-auth/agent/exotel/outbound-status/{link_id}"
+            stream_url = f"{ws_base}{prefix}/exotel/outbound-media/{link_id}"
+            status_callback = f"{base}{prefix}/exotel/outbound-status/{link_id}"
             try:
                 result = await ExotelService.initiate_outbound_call(
                     tenant_res,

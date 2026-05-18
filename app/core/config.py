@@ -140,7 +140,7 @@ class Settings(BaseSettings):
     SARVAM_STT_MODEL: str = "saaras:v3"
     SARVAM_STT_MODE: str = "transcribe"
     SARVAM_STT_SAMPLE_RATE: int = 16000
-    SARVAM_STT_AUDIO_ENCODING: str = "pcm_s16le"
+    SARVAM_STT_AUDIO_ENCODING: str = "audio/wav"
     SARVAM_TTS_REST_URL: str = "https://api.sarvam.ai/text-to-speech"
     SARVAM_TTS_STREAM_URL: str = "https://api.sarvam.ai/text-to-speech/stream"
     SARVAM_TTS_WEBSOCKET_URL: str = "wss://api.sarvam.ai/text-to-speech/ws"
@@ -163,10 +163,21 @@ class Settings(BaseSettings):
     AGENT_LLM_TIMEOUT_MS: int = 350
     AGENT_RETRIEVAL_TOP_K: int = 3
     AGENT_MAX_CONTEXT_CHARS: int = 3000
-    AGENT_MIN_RELEVANCE_SCORE: float = 0.25
+    AGENT_MIN_RELEVANCE_SCORE: float = 0.35
+    AGENT_MIN_RELEVANCE_SCORE_SENSITIVE: float = 0.45
+    AGENT_RETRIEVAL_TOP_K_SENSITIVE: int = 8
+    AGENT_RAG_DEBUG: bool = False
+    AGENT_RAG_MIN_QUERY_WORDS: int = 3
+    AGENT_TRANSLATE_FOR_RETRIEVAL_ENABLED: bool = True
+    # Per-call conversation memory. Set to 10 min so a 7-min call always has
+    # full history available even with no agent activity for a stretch
+    # (caller on hold, on-screen confirmation, etc.). Refreshed on every
+    # append, so an active call effectively never times out.
+    AGENT_SESSION_HISTORY_TTL_SECONDS: int = 600
+    AGENT_SESSION_HISTORY_MAX_TURNS: int = 30
     AGENT_INTENT_CLASSIFIER_TIMEOUT_MS: int = 500
     # Voice agent latency tuning
-    FILLER_TRIGGER_MS: int = 650          # Play filler only if the real answer is not ready quickly
+    FILLER_TRIGGER_MS: int = 400          # Play filler only if the real answer is not ready quickly
     TTS_SEGMENT_IDLE_DONE_MS: int = 750   # Treat a TTS segment as done after audio goes idle
     TTS_SEGMENT_FIRST_AUDIO_TIMEOUT_MS: int = 2500
     AGENT_LLM_STREAM_TOTAL_MS: int = 6000 # Max total LLM stream wait
@@ -199,7 +210,11 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: str = ""
     OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-small"
     OPENAI_EMBEDDING_BATCH_SIZE: int = 96
-    OPENAI_EMBEDDING_TIMEOUT_SECONDS: float = 20.0
+    OPENAI_EMBEDDING_TIMEOUT_SECONDS: float = 4.0
+    # The OpenAI SDK defaults to 2 retries with exponential backoff on 429,
+    # which can push a single embed call past 20s during rate-limit bursts.
+    # Cap retries so voice latency stays bounded.
+    OPENAI_EMBEDDING_MAX_RETRIES: int = 1
     OPENAI_EMBEDDING_ALLOW_ZERO_FALLBACK: bool = False
 
     # Voice agent answer cache (Redis)

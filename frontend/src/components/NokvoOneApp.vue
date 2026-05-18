@@ -3,26 +3,38 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import axios from 'axios';
 import QrcodeVue from 'qrcode.vue';
 import {
+  Activity,
   Bell,
   BookOpen,
   Bot,
+  Brain,
   CalendarDays,
   CheckCircle2,
+  Cpu,
   Database,
   FileText,
+  Globe,
+  Layers,
   LogOut,
   MessageSquare,
+  Mic,
+  MicOff,
   Moon,
+  PhoneCall,
+  Play,
   Plus,
+  Radio,
   Search,
   Settings2,
   Shield,
+  Square,
   SunMedium,
   SunMedium as Sun,
   Trash2,
   Upload,
   UserPlus,
   Users,
+  Volume2,
   Wrench,
   XCircle,
 } from 'lucide-vue-next';
@@ -81,11 +93,53 @@ const kbForm = ref({
 const kbUploadInputRef = ref(null);
 const isLoadingKb = ref(false);
 const isUploadingKb = ref(false);
+const isReconcilingKb = ref(false);
 const kbError = ref('');
 const kbInfo = ref('');
 const kbQuery = ref('');
 const kbResults = ref([]);
 const isSearchingKb = ref(false);
+const runtimeStatus = ref(null);
+const phoneLink = ref(null);
+const phoneLinkInput = ref('');
+const isSavingPhoneLink = ref(false);
+const campaigns = ref([]);
+const campaignForm = ref({ name: '', from_number: '', excel_file: null, doc_file: null });
+const isCreatingCampaign = ref(false);
+const isLaunchingCampaign = ref(null);
+const voice = ref({
+  ws: null,
+  audioCtx: null,
+  micStream: null,
+  micNode: null,
+  status: 'idle', // idle | connecting | listening | thinking | speaking | error
+  callId: null,
+  language: 'en',
+  liveTranscript: '',
+  transcriptLang: '',
+  turns: [], // { id, query, sentences[], answer, latencyMs, cacheHit, citations[] }
+  // Gapless playback state (see decodeAndSchedule / stopAllPlayback)
+  playbackGeneration: 0,
+  scheduledSources: [],
+  pendingPlaybackChunks: 0,
+  nextPlaybackTime: 0,
+  playbackChain: Promise.resolve(),
+  errorMsg: '',
+  firstSentenceMs: null,
+  ttsFirstAudioMs: null,
+});
+const voiceLanguageOptions = [
+  { value: 'en', label: 'English' },
+  { value: 'hi', label: 'Hindi' },
+  { value: 'ta', label: 'Tamil' },
+  { value: 'te', label: 'Telugu' },
+  { value: 'bn', label: 'Bengali' },
+  { value: 'mr', label: 'Marathi' },
+  { value: 'kn', label: 'Kannada' },
+  { value: 'ml', label: 'Malayalam' },
+  { value: 'gu', label: 'Gujarati' },
+  { value: 'pa', label: 'Punjabi' },
+];
 const kbDocumentTypes = [
   { value: 'policy', label: 'Policy' },
   { value: 'faq', label: 'FAQ' },
@@ -206,6 +260,11 @@ const switchPage = (page) => {
   infoMsg.value = '';
   if (page === 'knowledge_base') {
     loadKnowledgeDocuments();
+  }
+  if (page === 'agent') {
+    loadRuntimeStatus();
+    loadPhoneLink();
+    loadCampaigns();
   }
 };
 
@@ -1085,26 +1144,130 @@ const loadKnowledgeDocuments = async () => {
   }
 };
 
-const handleKbFileChange = (event) => {
-  const file = event.target.files?.[0] || null;
-  kbForm.value.file = file;
-  if (file && !kbForm.value.name) {
-    kbForm.value.name = file.name.replace(/\.[^/.]+$/, '');
+// Bulk upload queue. Becomes non-empty when 2+ files are selected at once.
+// Each entry tracks its own status so the user sees per-file progress.
+const kbBulkQueue = ref([]);  // { file, name, status: 'queued'|'uploading'|'done'|'error', error?: string }
+const isUploadingKbBulk = ref(false);
+
+const _kbStripExt = (filename) => filename.replace(/\.[^/.]+$/, '');
+
+const _acceptKbFiles = (files) => {
+  const list = Array.from(files || []);
+  if (!list.length) return;
+  if (list.length === 1) {
+    // Single-file path — keep existing form-driven flow.
+    kbBulkQueue.value = [];
+    kbForm.value.file = list[0];
+    if (!kbForm.value.name) {
+      kbForm.value.name = _kbStripExt(list[0].name);
+    }
+    return;
   }
+  // Bulk path: ignore the form name/description (would be wrong for N files)
+  // and queue every file with its filename as the doc name. document_type and
+  // tags carry over from kbForm so the admin can set defaults before bulk upload.
+  kbForm.value.file = null;
+  kbBulkQueue.value = list.map((file) => ({
+    file,
+    name: _kbStripExt(file.name),
+    status: 'queued',
+    error: '',
+  }));
+};
+
+const handleKbFileChange = (event) => {
+  _acceptKbFiles(event.target.files);
 };
 
 const handleKbDrop = (event) => {
-  const file = event.dataTransfer?.files?.[0] || null;
-  if (!file) return;
-  kbForm.value.file = file;
-  if (!kbForm.value.name) {
-    kbForm.value.name = file.name.replace(/\.[^/.]+$/, '');
-  }
+  _acceptKbFiles(event.dataTransfer?.files);
 };
 
 const clearKbFile = () => {
   kbForm.value.file = null;
+  kbBulkQueue.value = [];
   if (kbUploadInputRef.value) kbUploadInputRef.value.value = '';
+};
+
+const removeBulkQueueItem = (index) => {
+  if (isUploadingKbBulk.value) return;
+  kbBulkQueue.value.splice(index, 1);
+  if (kbBulkQueue.value.length === 1) {
+    // Reverting back to single-file behavior so the admin can edit the name.
+    const remaining = kbBulkQueue.value[0].file;
+    kbBulkQueue.value = [];
+    kbForm.value.file = remaining;
+    if (!kbForm.value.name) {
+      kbForm.value.name = _kbStripExt(remaining.name);
+    }
+  }
+};
+
+// Bulk uploader concurrency. Serialised (1 at a time) because Azure OpenAI
+// embedding deployments on the S0 tier rate-limit aggressively — even 2 in
+// parallel triggers 429s during a multi-doc upload. The backend retries with
+// a brief sleep on 429, but spacing uploads here halves the chance of ever
+// hitting it.
+const BULK_UPLOAD_CONCURRENCY = 1;
+
+const uploadKnowledgeDocumentsBulk = async () => {
+  if (!kbBulkQueue.value.length) return;
+  isUploadingKbBulk.value = true;
+  kbError.value = '';
+  kbInfo.value = '';
+
+  const tagsValue = kbForm.value.tags.trim() || null;
+  const docType = kbForm.value.document_type;
+  const queue = kbBulkQueue.value;
+  // Track next index to pick up; worker loop pulls until exhausted.
+  let cursor = 0;
+
+  const _workOne = async () => {
+    while (cursor < queue.length) {
+      const idx = cursor;
+      cursor += 1;
+      const entry = queue[idx];
+      entry.status = 'uploading';
+      try {
+        const content_base64 = await fileToBase64(entry.file);
+        await kbApi.post(
+          '/documents/upload',
+          {
+            name: entry.name,
+            document_type: docType,
+            description: null,
+            tags: tagsValue,
+            filename: entry.file.name,
+            content_type: entry.file.type || null,
+            content_base64,
+          },
+          { headers: authHeader() },
+        );
+        entry.status = 'done';
+      } catch (err) {
+        entry.status = 'error';
+        entry.error = extractErrorMessage(err, 'Upload failed.');
+      }
+    }
+  };
+
+  const workers = [];
+  for (let i = 0; i < Math.min(BULK_UPLOAD_CONCURRENCY, queue.length); i += 1) {
+    workers.push(_workOne());
+  }
+  await Promise.all(workers);
+
+  const succeeded = queue.filter((q) => q.status === 'done').length;
+  const failed = queue.filter((q) => q.status === 'error').length;
+  if (failed === 0) {
+    kbInfo.value = `Embedded ${succeeded} document${succeeded === 1 ? '' : 's'}.`;
+    kbBulkQueue.value = [];
+    if (kbUploadInputRef.value) kbUploadInputRef.value.value = '';
+  } else {
+    kbError.value = `${succeeded} of ${queue.length} uploaded. ${failed} failed — see the list below.`;
+  }
+  isUploadingKbBulk.value = false;
+  await loadKnowledgeDocuments();
 };
 
 const formatRelativeDate = (iso) => {
@@ -1205,6 +1368,85 @@ const rejectKnowledgeDocument = async (documentId) => {
   }
 };
 
+// Chunk viewer: per-doc expanded panel showing the embedded chunks.
+// Lazy-loaded — we don't blow up the list response with chunk text for
+// every doc; we fetch on-demand when the admin clicks "View chunks".
+const kbChunksByDoc = ref({});      // documentId -> {chunks, loading, error}
+const kbExpandedDocs = ref({});     // documentId -> true when panel is open
+
+const toggleKnowledgeChunks = async (documentId) => {
+  const isOpen = !!kbExpandedDocs.value[documentId];
+  if (isOpen) {
+    kbExpandedDocs.value = { ...kbExpandedDocs.value, [documentId]: false };
+    return;
+  }
+  kbExpandedDocs.value = { ...kbExpandedDocs.value, [documentId]: true };
+  // Already loaded — don't refetch unless the user explicitly refreshes.
+  if (kbChunksByDoc.value[documentId]?.chunks) return;
+  kbChunksByDoc.value = {
+    ...kbChunksByDoc.value,
+    [documentId]: { loading: true, error: '', chunks: null },
+  };
+  try {
+    const { data } = await kbApi.get(`/documents/${documentId}/chunks`, { headers: authHeader() });
+    kbChunksByDoc.value = {
+      ...kbChunksByDoc.value,
+      [documentId]: { loading: false, error: '', chunks: data.chunks || [], info: data },
+    };
+  } catch (err) {
+    kbChunksByDoc.value = {
+      ...kbChunksByDoc.value,
+      [documentId]: {
+        loading: false,
+        error: extractErrorMessage(err, 'Failed to load chunks.'),
+        chunks: null,
+      },
+    };
+  }
+};
+
+const reconcileKnowledgeDocuments = async () => {
+  isReconcilingKb.value = true;
+  kbError.value = '';
+  kbInfo.value = '';
+  try {
+    const { data } = await kbApi.post('/documents/reconcile', {}, { headers: authHeader() });
+    const count = data?.reconciled ?? 0;
+    if (count > 0) {
+      kbInfo.value = `Reconciled ${count} orphaned document${count === 1 ? '' : 's'} from Qdrant.`;
+    } else {
+      kbInfo.value = 'No orphaned documents found in Qdrant — registry is already in sync.';
+    }
+    await loadKnowledgeDocuments();
+  } catch (err) {
+    kbError.value = extractErrorMessage(err, 'Reconcile failed.');
+  } finally {
+    isReconcilingKb.value = false;
+  }
+};
+
+const removeKnowledgeDocument = async (documentId, documentName) => {
+  const label = documentName ? `"${documentName}"` : 'this document';
+  if (!window.confirm(`Remove ${label}?\n\nThis deletes the document, its Qdrant embeddings, its source blob in Azure Storage, and any policy/answer cards it produced. The agent will stop using it immediately. This cannot be undone.`)) {
+    return;
+  }
+  kbError.value = '';
+  kbInfo.value = '';
+  try {
+    const { data } = await kbApi.delete(`/documents/${documentId}`, { headers: authHeader() });
+    const parts = ['Document removed.'];
+    if (data?.qdrant_deleted) parts.push('Qdrant vectors deleted.');
+    else parts.push('Qdrant delete skipped (unreachable).');
+    if (typeof data?.blobs_deleted === 'number') {
+      parts.push(`${data.blobs_deleted} blob${data.blobs_deleted === 1 ? '' : 's'} deleted from storage.`);
+    }
+    kbInfo.value = parts.join(' ');
+    await loadKnowledgeDocuments();
+  } catch (err) {
+    kbError.value = extractErrorMessage(err, 'Failed to remove document.');
+  }
+};
+
 const testKnowledgeRetrieval = async () => {
   if (!kbQuery.value.trim()) {
     kbError.value = 'Type a query to search the knowledge base.';
@@ -1240,6 +1482,536 @@ const formatBytes = (bytes) => {
   return `${(n / 1024 / 1024).toFixed(1)} MB`;
 };
 
+// ─────────────────────── Agent Studio: pipeline / phone / campaigns / voice ───────────────────────
+
+const agentsApi = axios.create({ baseURL: 'http://localhost:8000/api/nokvo-one/agents' });
+
+const loadRuntimeStatus = async () => {
+  try {
+    const { data } = await agentsApi.get('/runtime/status', { headers: authHeader() });
+    runtimeStatus.value = data;
+  } catch (err) {
+    runtimeStatus.value = null;
+  }
+};
+
+const loadPhoneLink = async () => {
+  try {
+    const { data } = await agentsApi.get('/phone-link', { headers: authHeader() });
+    phoneLink.value = data;
+    phoneLinkInput.value = data.link_id || '';
+  } catch (err) {
+    phoneLink.value = null;
+  }
+};
+
+const savePhoneLink = async () => {
+  isSavingPhoneLink.value = true;
+  try {
+    const { data } = await agentsApi.post(
+      '/phone-link',
+      { link_id: phoneLinkInput.value.trim() || null },
+      { headers: authHeader() },
+    );
+    phoneLink.value = data;
+  } catch (err) {
+    errorMsg.value = extractErrorMessage(err, 'Failed to save phone link.');
+  } finally {
+    isSavingPhoneLink.value = false;
+  }
+};
+
+const loadCampaigns = async () => {
+  try {
+    const { data } = await agentsApi.get('/campaigns', { headers: authHeader() });
+    campaigns.value = data || [];
+  } catch (err) {
+    campaigns.value = [];
+  }
+};
+
+const onCampaignFile = (event, key) => {
+  campaignForm.value[key] = event.target.files?.[0] || null;
+};
+
+const createCampaign = async () => {
+  if (!campaignForm.value.name.trim() || !campaignForm.value.excel_file || !campaignForm.value.doc_file) {
+    errorMsg.value = 'Campaign name, contacts (.xlsx), and script document are required.';
+    return;
+  }
+  isCreatingCampaign.value = true;
+  try {
+    const fd = new FormData();
+    fd.append('name', campaignForm.value.name.trim());
+    if (campaignForm.value.from_number.trim()) fd.append('from_number', campaignForm.value.from_number.trim());
+    fd.append('excel_file', campaignForm.value.excel_file);
+    fd.append('doc_file', campaignForm.value.doc_file);
+    await agentsApi.post('/campaigns', fd, { headers: { ...authHeader(), 'Content-Type': 'multipart/form-data' } });
+    campaignForm.value = { name: '', from_number: '', excel_file: null, doc_file: null };
+    await loadCampaigns();
+    infoMsg.value = 'Campaign created and script ingested.';
+  } catch (err) {
+    errorMsg.value = extractErrorMessage(err, 'Failed to create campaign.');
+  } finally {
+    isCreatingCampaign.value = false;
+  }
+};
+
+const launchCampaign = async (id) => {
+  isLaunchingCampaign.value = id;
+  try {
+    await agentsApi.post(`/campaigns/${id}/launch`, {}, { headers: authHeader() });
+    await loadCampaigns();
+  } catch (err) {
+    errorMsg.value = extractErrorMessage(err, 'Failed to launch campaign.');
+  } finally {
+    isLaunchingCampaign.value = null;
+  }
+};
+
+const cancelCampaign = async (id) => {
+  try {
+    await agentsApi.post(`/campaigns/${id}/cancel`, {}, { headers: authHeader() });
+    await loadCampaigns();
+  } catch (err) {
+    errorMsg.value = extractErrorMessage(err, 'Failed to cancel campaign.');
+  }
+};
+
+// ───── Voice tester (browser mic ↔ WebSocket ↔ Sarvam STT ↔ pipeline ↔ Sarvam TTS) ─────
+
+const downsampleTo16k = (input, inputRate) => {
+  if (inputRate === 16000) return input;
+  const ratio = inputRate / 16000;
+  const newLen = Math.round(input.length / ratio);
+  const out = new Float32Array(newLen);
+  let pos = 0;
+  let idx = 0;
+  while (pos < newLen) {
+    const nextIdx = Math.round((pos + 1) * ratio);
+    let sum = 0;
+    let count = 0;
+    for (let i = idx; i < nextIdx && i < input.length; i++) {
+      sum += input[i];
+      count += 1;
+    }
+    out[pos] = count > 0 ? sum / count : 0;
+    pos += 1;
+    idx = nextIdx;
+  }
+  return out;
+};
+
+const floatToInt16 = (input) => {
+  const buffer = new Int16Array(input.length);
+  for (let i = 0; i < input.length; i++) {
+    const s = Math.max(-1, Math.min(1, input[i]));
+    buffer[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+  return buffer;
+};
+
+// Gapless playback with generation-counter for barge-in safety.
+// Approach (ported from agent_lab/useVoiceCall.ts):
+//   - Each decoded buffer is scheduled at max(now, nextPlaybackTime) so
+//     adjacent sentences play seamlessly with no inter-sentence click.
+//   - playbackGeneration is bumped on barge-in / interrupt so any decode
+//     still in flight is dropped instead of getting scheduled after the
+//     user has already started a new turn.
+//   - playbackChain serializes decodeAudioData() across chunks so they
+//     land in arrival order even though decode is async.
+const enqueueTtsAudio = (base64) => {
+  if (!voice.value.audioCtx) {
+    voice.value.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    voice.value.nextPlaybackTime = voice.value.audioCtx.currentTime;
+  }
+  const gen = voice.value.playbackGeneration;
+  voice.value.pendingPlaybackChunks = (voice.value.pendingPlaybackChunks || 0) + 1;
+  voice.value.playbackChain = (voice.value.playbackChain || Promise.resolve())
+    .then(() => decodeAndSchedule(base64, gen))
+    .catch((err) => console.warn('TTS decode/play failed', err))
+    .finally(() => {
+      voice.value.pendingPlaybackChunks = Math.max(0, (voice.value.pendingPlaybackChunks || 0) - 1);
+      if (!hasPendingOrActiveAgentAudio()) {
+        voice.value.playbackCaptureBlockedUntil = performance.now() + PLAYBACK_CAPTURE_GRACE_MS;
+        if (voice.value.status === 'speaking') voice.value.status = 'listening';
+      }
+    });
+};
+
+const decodeAndSchedule = async (base64, gen) => {
+  if (!voice.value.audioCtx || gen !== voice.value.playbackGeneration) return;
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  const buffer = await voice.value.audioCtx.decodeAudioData(bytes.buffer.slice(0));
+  // Re-check after the await — barge-in may have invalidated this chunk.
+  if (gen !== voice.value.playbackGeneration) return;
+  const src = voice.value.audioCtx.createBufferSource();
+  src.buffer = buffer;
+  src.connect(voice.value.audioCtx.destination);
+  const startAt = Math.max(voice.value.audioCtx.currentTime + 0.02, voice.value.nextPlaybackTime);
+  src.start(startAt);
+  voice.value.nextPlaybackTime = startAt + buffer.duration;
+  voice.value.scheduledSources = voice.value.scheduledSources || [];
+  voice.value.scheduledSources.push(src);
+  voice.value.status = 'speaking';
+  src.onended = () => {
+    voice.value.scheduledSources = (voice.value.scheduledSources || []).filter((s) => s !== src);
+    if (!hasPendingOrActiveAgentAudio()) {
+      // Brief grace period so the VAD doesn't re-capture residual playback
+      // echo. Matches agent_lab's PLAYBACK_CAPTURE_GRACE_MS.
+      voice.value.playbackCaptureBlockedUntil = performance.now() + PLAYBACK_CAPTURE_GRACE_MS;
+      if (voice.value.status === 'speaking') voice.value.status = 'listening';
+    }
+  };
+};
+
+const hasPendingOrActiveAgentAudio = () => {
+  if (!voice.value.audioCtx) return (voice.value.pendingPlaybackChunks || 0) > 0;
+  return (
+    (voice.value.pendingPlaybackChunks || 0) > 0 ||
+    (voice.value.scheduledSources || []).length > 0 ||
+    voice.value.nextPlaybackTime > voice.value.audioCtx.currentTime + 0.05
+  );
+};
+
+// Called on barge-in / interrupt: stop everything currently playing or
+// pending and bump the generation so in-flight decode tasks bail out
+// before scheduling.
+const stopAllPlayback = () => {
+  voice.value.playbackGeneration = (voice.value.playbackGeneration || 0) + 1;
+  for (const src of voice.value.scheduledSources || []) {
+    try { src.stop(); } catch (_e) {}
+  }
+  voice.value.scheduledSources = [];
+  voice.value.pendingPlaybackChunks = 0;
+  if (voice.value.audioCtx) {
+    voice.value.nextPlaybackTime = voice.value.audioCtx.currentTime;
+  }
+};
+
+// ── VAD-based recorder (browser-side end-of-utterance detection) ──
+// Replaces continuous raw-PCM streaming with: record while user is speaking,
+// stop on sustained silence, send one WebM blob per utterance to the server.
+// Ported from agent_lab/useVoiceCall.ts. Tunables below match the lab.
+const VAD_SPEECH_THRESHOLD = 0.04;        // RMS over this counts as speech
+const VAD_BARGE_THRESHOLD = 0.08;         // higher threshold during agent playback to avoid echo bleeding
+const VAD_END_SILENCE_MS = 700;           // silence duration that marks end of utterance
+const VAD_MIN_UTTERANCE_MS = 250;         // ignore taps / coughs shorter than this
+const VAD_POLL_INTERVAL_MS = 50;
+const PLAYBACK_CAPTURE_GRACE_MS = 350;    // ignore mic for this long after agent stops playing
+
+const pickRecorderMime = () => {
+  const candidates = [
+    'audio/webm;codecs=opus',
+    'audio/webm',
+    'audio/ogg;codecs=opus',
+    'audio/mp4',
+  ];
+  for (const m of candidates) {
+    if (window.MediaRecorder && MediaRecorder.isTypeSupported(m)) return m;
+  }
+  return 'audio/webm';
+};
+
+const tickVad = () => {
+  if (!voice.value.analyser || !voice.value.analysisBuffer) return;
+  voice.value.analyser.getByteTimeDomainData(voice.value.analysisBuffer);
+  let sum = 0;
+  for (let i = 0; i < voice.value.analysisBuffer.length; i++) {
+    const v = (voice.value.analysisBuffer[i] - 128) / 128;
+    sum += v * v;
+  }
+  const rms = Math.sqrt(sum / voice.value.analysisBuffer.length);
+  voice.value.micLevel = rms;
+
+  const now = performance.now();
+  const s = voice.value.status;
+  const playbackActive = hasPendingOrActiveAgentAudio() || now < (voice.value.playbackCaptureBlockedUntil || 0);
+
+  // Barge-in: caller is speaking while the agent is producing audio.
+  if ((s === 'speaking' || s === 'thinking') && rms > VAD_BARGE_THRESHOLD) {
+    stopAllPlayback();
+    if (voice.value.ws && voice.value.ws.readyState === WebSocket.OPEN) {
+      try { voice.value.ws.send(JSON.stringify({ type: 'interrupt' })); } catch {}
+    }
+    voice.value.status = 'listening';
+    return;
+  }
+  if (playbackActive) return;
+  if (s !== 'listening' && s !== 'recording') return;
+
+  if (rms > VAD_SPEECH_THRESHOLD) {
+    voice.value.silenceStartTime = 0;
+    if (!voice.value.isInSpeech) {
+      voice.value.isInSpeech = true;
+      voice.value.speechStartTime = now;
+      startRecorder();
+      voice.value.status = 'recording';
+    }
+  } else if (voice.value.isInSpeech) {
+    if (!voice.value.silenceStartTime) voice.value.silenceStartTime = now;
+    if (now - voice.value.silenceStartTime > VAD_END_SILENCE_MS) {
+      const duration = now - voice.value.speechStartTime;
+      voice.value.isInSpeech = false;
+      voice.value.silenceStartTime = 0;
+      if (duration > VAD_MIN_UTTERANCE_MS) {
+        stopRecorderAndSend();
+        voice.value.status = 'thinking';
+      } else {
+        discardRecorder();
+        voice.value.status = 'listening';
+      }
+    }
+  }
+};
+
+const startRecorder = () => {
+  if (!voice.value.micStream) return;
+  if (voice.value.recorder && voice.value.recorder.state === 'recording') return;
+  voice.value.recordedChunks = [];
+  try {
+    voice.value.recorder = new MediaRecorder(voice.value.micStream, { mimeType: voice.value.recorderMime });
+  } catch {
+    voice.value.recorder = new MediaRecorder(voice.value.micStream);
+  }
+  voice.value.recorder.ondataavailable = (e) => {
+    if (e.data && e.data.size > 0) voice.value.recordedChunks.push(e.data);
+  };
+  voice.value.recorder.start();
+};
+
+const stopRecorderAndSend = () => {
+  const r = voice.value.recorder;
+  if (!r || r.state !== 'recording') return;
+  r.onstop = async () => {
+    if (!voice.value.recordedChunks.length) return;
+    if (!voice.value.ws || voice.value.ws.readyState !== WebSocket.OPEN) return;
+    const blob = new Blob(voice.value.recordedChunks, { type: voice.value.recorderMime });
+    voice.value.recordedChunks = [];
+    const buf = await blob.arrayBuffer();
+    voice.value.ws.send(buf);
+  };
+  r.stop();
+  voice.value.recorder = null;
+};
+
+const discardRecorder = () => {
+  const r = voice.value.recorder;
+  if (!r) return;
+  r.onstop = () => { voice.value.recordedChunks = []; };
+  try { r.stop(); } catch {}
+  voice.value.recorder = null;
+};
+
+const startVoiceCall = async () => {
+  if (voice.value.status !== 'idle' && voice.value.status !== 'error') return;
+  voice.value.status = 'connecting';
+  voice.value.errorMsg = '';
+  voice.value.turns = [];
+  voice.value.liveTranscript = '';
+  voice.value.playbackGeneration = 0;
+  voice.value.scheduledSources = [];
+  voice.value.pendingPlaybackChunks = 0;
+  voice.value.playbackChain = Promise.resolve();
+  voice.value.firstSentenceMs = null;
+  voice.value.ttsFirstAudioMs = null;
+  // VAD state
+  voice.value.isInSpeech = false;
+  voice.value.speechStartTime = 0;
+  voice.value.silenceStartTime = 0;
+  voice.value.playbackCaptureBlockedUntil = 0;
+  voice.value.recordedChunks = [];
+  voice.value.recorder = null;
+
+  const token = localStorage.getItem(ACCESS_TOKEN_KEY);
+  if (!token) {
+    voice.value.status = 'error';
+    voice.value.errorMsg = 'Not authenticated.';
+    return;
+  }
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+    });
+    voice.value.micStream = stream;
+    voice.value.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (voice.value.audioCtx.state === 'suspended') {
+      try { await voice.value.audioCtx.resume(); } catch {}
+    }
+    voice.value.nextPlaybackTime = voice.value.audioCtx.currentTime;
+
+    // Analyser feeds the VAD loop. NOT connected to destination so the mic
+    // isn't echoed into the speakers.
+    const source = voice.value.audioCtx.createMediaStreamSource(stream);
+    const analyser = voice.value.audioCtx.createAnalyser();
+    analyser.fftSize = 1024;
+    source.connect(analyser);
+    voice.value.analyser = analyser;
+    voice.value.analysisBuffer = new Uint8Array(analyser.fftSize);
+
+    voice.value.recorderMime = pickRecorderMime();
+
+    const wsUrl = `ws://localhost:8000/api/nokvo-one/agents/voice/ws?token=${encodeURIComponent(token)}`;
+    const ws = new WebSocket(wsUrl);
+    ws.binaryType = 'arraybuffer';
+    voice.value.ws = ws;
+
+    ws.onopen = () => {
+      // Tell the backend we're using browser VAD — it will treat each binary
+      // frame as a complete utterance instead of streaming PCM.
+      ws.send(JSON.stringify({ type: 'config', language: voice.value.language, mode: 'vad_blob' }));
+    };
+
+    ws.onmessage = (event) => {
+      let msg;
+      try { msg = JSON.parse(event.data); } catch { return; }
+      handleVoiceEvent(msg);
+    };
+
+    ws.onerror = () => {
+      voice.value.status = 'error';
+      voice.value.errorMsg = 'WebSocket error.';
+    };
+
+    ws.onclose = () => {
+      cleanupVoiceCall();
+    };
+
+    // Start VAD loop
+    if (voice.value.vadTimer) clearInterval(voice.value.vadTimer);
+    voice.value.vadTimer = setInterval(tickVad, VAD_POLL_INTERVAL_MS);
+  } catch (err) {
+    voice.value.status = 'error';
+    voice.value.errorMsg = err?.message || 'Failed to start microphone.';
+  }
+};
+
+const handleVoiceEvent = (msg) => {
+  switch (msg.type) {
+    case 'voice_session_ready':
+      voice.value.callId = msg.call_id;
+      voice.value.status = 'listening';
+      break;
+    case 'runtime_status':
+      runtimeStatus.value = msg;
+      break;
+    case 'stt_transcript':
+      voice.value.liveTranscript = msg.text;
+      voice.value.transcriptLang = msg.language || voice.value.language;
+      break;
+    case 'stt_finished': {
+      voice.value.status = 'thinking';
+      const turn = { id: msg.turn_id, query: msg.text, sentences: [], answer: '', latencyMs: null, cacheHit: false, citations: [] };
+      voice.value.turns.push(turn);
+      voice.value.liveTranscript = '';
+      break;
+    }
+    case 'agent_sentence': {
+      const turn = voice.value.turns.find(t => t.id === msg.turn_id);
+      if (turn) {
+        turn.sentences.push(msg.sentence);
+        turn.cacheHit = msg.cache_hit;
+        if (msg.first_sentence_ms != null) {
+          turn.latencyMs = msg.first_sentence_ms;
+          voice.value.firstSentenceMs = msg.first_sentence_ms;
+        }
+      }
+      voice.value.status = 'speaking';
+      break;
+    }
+    case 'tts_first_audio':
+      voice.value.ttsFirstAudioMs = msg.first_audio_latency_ms;
+      break;
+    case 'tts_audio':
+      enqueueTtsAudio(msg.audio_base64);
+      break;
+    case 'barge_in_detected':
+      stopAllPlayback();
+      voice.value.status = 'listening';
+      break;
+    case 'language_locked':
+      voice.value.transcriptLang = msg.language;
+      break;
+    case 'agent_answer': {
+      const turn = voice.value.turns.find(t => t.id === msg.turn_id);
+      if (turn) {
+        turn.answer = msg.answer;
+        turn.citations = msg.citations || [];
+      }
+      break;
+    }
+    case 'turn_complete':
+      if (voice.value.status === 'thinking') voice.value.status = 'listening';
+      break;
+    case 'agent_error':
+      voice.value.errorMsg = msg.error;
+      voice.value.status = 'error';
+      break;
+    case 'stt_error':
+      // Prefer the human-friendly user_message when present (e.g. Sarvam
+      // rate-limit). Falls back to the raw error_message for everything else.
+      voice.value.errorMsg = msg.user_message || msg.error_message || 'STT failed';
+      if (voice.value.status === 'thinking') voice.value.status = 'listening';
+      break;
+    default:
+      break;
+  }
+};
+
+const cleanupVoiceCall = () => {
+  // Stop VAD polling FIRST so it can't try to start a new recorder mid-cleanup.
+  if (voice.value.vadTimer) {
+    try { clearInterval(voice.value.vadTimer); } catch {}
+    voice.value.vadTimer = null;
+  }
+  if (voice.value.recorder && voice.value.recorder.state === 'recording') {
+    try { voice.value.recorder.stop(); } catch {}
+  }
+  voice.value.recorder = null;
+  voice.value.recordedChunks = [];
+  if (voice.value.micNode) try { voice.value.micNode.disconnect(); } catch {}
+  if (voice.value.micStream) voice.value.micStream.getTracks().forEach(t => t.stop());
+  if (voice.value.audioCtx) try { voice.value.audioCtx.close(); } catch {}
+  voice.value.ws = null;
+  voice.value.micStream = null;
+  voice.value.micNode = null;
+  voice.value.audioCtx = null;
+  voice.value.analyser = null;
+  voice.value.analysisBuffer = null;
+  voice.value.isInSpeech = false;
+  voice.value.silenceStartTime = 0;
+  voice.value.scheduledSources = [];
+  voice.value.pendingPlaybackChunks = 0;
+  voice.value.playbackChain = Promise.resolve();
+  voice.value.playbackGeneration = (voice.value.playbackGeneration || 0) + 1;
+  if (voice.value.status !== 'error') voice.value.status = 'idle';
+};
+
+const endVoiceCall = () => {
+  if (voice.value.ws && voice.value.ws.readyState === WebSocket.OPEN) {
+    try { voice.value.ws.send(JSON.stringify({ type: 'stop' })); } catch {}
+    try { voice.value.ws.close(); } catch {}
+  } else {
+    cleanupVoiceCall();
+  }
+};
+
+const sendTextToVoiceAgent = () => {
+  if (!voice.value.ws || voice.value.ws.readyState !== WebSocket.OPEN) return;
+  const text = (chatInput.value || '').trim();
+  if (!text) return;
+  voice.value.ws.send(JSON.stringify({ type: 'text_query', text, language: voice.value.language }));
+  chatInput.value = '';
+};
+
 const handleLogout = async () => {
   try {
     await api.post('/logout', {}, { headers: authHeader() });
@@ -1260,6 +2032,10 @@ const handleLogout = async () => {
   kbQuery.value = '';
   kbInfo.value = '';
   kbError.value = '';
+  runtimeStatus.value = null;
+  phoneLink.value = null;
+  campaigns.value = [];
+  endVoiceCall();
   closeFieldEdit();
   closeAssignmentEdit();
   authState.value = 'login';
@@ -2154,19 +2930,218 @@ onBeforeUnmount(() => {
       </section>
 
       <!-- AGENT STUDIO -->
-      <section v-if="currentPage === 'agent'" class="dashboard-section">
-        <div class="dashboard-section-head">
-          <div>
+      <section v-if="currentPage === 'agent'" class="dashboard-section agent-studio-section">
+        <div class="agent-hero">
+          <div class="agent-hero-copy">
             <span class="section-kicker">Agent Studio</span>
-            <h3>Build & Test Agents</h3>
+            <h3>Build, test, and run your voice agent.</h3>
+            <p>
+              Sarvam STT → Qdrant retrieval → Azure OpenAI <strong>gpt-4.1-mini</strong> → Sarvam TTS,
+              all running on your tenant-isolated infra. Calls hit your own embedding deployment and
+              Knowledge Base collection — nothing leaks across organizations.
+            </p>
           </div>
-          <p>Compose agents from predefined tools. Chat is sandboxed and never sends external email.</p>
+          <div class="agent-pipeline-grid">
+            <div class="pipeline-chip">
+              <Mic :size="16" />
+              <div>
+                <span>STT</span>
+                <strong>{{ runtimeStatus?.stt?.model || 'Sarvam saaras:v3' }}</strong>
+                <small :class="`chip-status-${runtimeStatus?.stt?.status || 'unknown'}`">
+                  {{ runtimeStatus?.stt?.status || 'unknown' }}
+                </small>
+              </div>
+            </div>
+            <div class="pipeline-chip">
+              <Brain :size="16" />
+              <div>
+                <span>LLM</span>
+                <strong>{{ runtimeStatus?.llm?.model || 'gpt-4.1-mini' }}</strong>
+                <small>South India</small>
+              </div>
+            </div>
+            <div class="pipeline-chip">
+              <Volume2 :size="16" />
+              <div>
+                <span>TTS</span>
+                <strong>{{ runtimeStatus?.tts?.model || 'Sarvam bulbul:v3' }}</strong>
+                <small :class="`chip-status-${runtimeStatus?.tts?.status || 'unknown'}`">
+                  {{ runtimeStatus?.tts?.status || 'unknown' }}
+                </small>
+              </div>
+            </div>
+            <div class="pipeline-chip">
+              <Layers :size="16" />
+              <div>
+                <span>Embeddings</span>
+                <strong>text-embedding-3-small</strong>
+                <small>1536-dim · cosine</small>
+              </div>
+            </div>
+            <div class="pipeline-chip">
+              <Database :size="16" />
+              <div>
+                <span>Vector store</span>
+                <strong>Qdrant</strong>
+                <small>{{ runtimeStatus?.knowledge_scope?.replace(/_/g, ' ') || 'tenant collection' }}</small>
+              </div>
+            </div>
+            <div class="pipeline-chip">
+              <Activity :size="16" />
+              <div>
+                <span>Cache</span>
+                <strong>{{ runtimeStatus?.optimization?.semantic_cache_enabled ? 'Redis on' : 'off' }}</strong>
+                <small>top-k {{ runtimeStatus?.optimization?.qdrant_top_k || 3 }}</small>
+              </div>
+            </div>
+          </div>
         </div>
 
         <div v-if="currentOrganization?.status === 'pending_approval'" class="message info dashboard-message">
-          Your organization is awaiting Nokvo activation. Chat with agents in limited mode is available; calling
-          unlocks after approval.
+          Your organization is awaiting Nokvo activation. Voice testing and agent CRUD work today; outbound
+          calling unlocks after approval.
         </div>
+
+        <!-- VOICE TESTER -->
+        <article class="dashboard-card voice-tester-card">
+          <div class="kb-card-head">
+            <div class="kb-card-icon kb-card-icon-primary">
+              <Mic :size="18" />
+            </div>
+            <div>
+              <h4>Voice Tester</h4>
+              <p>Talk to your agent live in the browser. Audio → Sarvam STT → RAG → LLM → Sarvam TTS, full pipeline.</p>
+            </div>
+            <div class="voice-status-badge" :class="`voice-status-${voice.status}`">
+              <span class="voice-status-dot"></span>
+              {{ voice.status }}
+            </div>
+          </div>
+
+          <div class="voice-controls">
+            <select v-model="voice.language" :disabled="voice.status !== 'idle' && voice.status !== 'error'">
+              <option v-for="opt in voiceLanguageOptions" :key="opt.value" :value="opt.value">
+                {{ opt.label }}
+              </option>
+            </select>
+            <button
+              v-if="voice.status === 'idle' || voice.status === 'error'"
+              type="button"
+              class="primary-button compact"
+              @click="startVoiceCall"
+            >
+              <PhoneCall :size="15" />
+              Start Call
+            </button>
+            <button
+              v-else
+              type="button"
+              class="ghost-button compact"
+              @click="endVoiceCall"
+            >
+              <Square :size="15" />
+              End Call
+            </button>
+            <button
+              type="button"
+              class="ghost-button compact"
+              :disabled="!voice.ws"
+              @click="sendTextToVoiceAgent"
+              title="Send a text-only query through the same pipeline"
+            >
+              <MessageSquare :size="15" />
+              Send Text Turn
+            </button>
+            <input
+              v-if="voice.ws"
+              v-model="chatInput"
+              type="text"
+              class="voice-text-input"
+              placeholder="Type a query to send through the pipeline"
+              @keyup.enter="sendTextToVoiceAgent"
+            />
+          </div>
+
+          <div v-if="voice.errorMsg" class="message error dashboard-message">{{ voice.errorMsg }}</div>
+
+          <div class="voice-live-row" v-if="voice.liveTranscript">
+            <Radio :size="14" />
+            <em>{{ voice.liveTranscript }}</em>
+            <span v-if="voice.transcriptLang" class="kb-pill kb-pill-soft">{{ voice.transcriptLang }}</span>
+          </div>
+
+          <div class="voice-latency-row" v-if="voice.firstSentenceMs || voice.ttsFirstAudioMs">
+            <span v-if="voice.firstSentenceMs">LLM first sentence: <strong>{{ voice.firstSentenceMs }}ms</strong></span>
+            <span v-if="voice.ttsFirstAudioMs">TTS first audio: <strong>{{ voice.ttsFirstAudioMs }}ms</strong></span>
+            <span v-if="voice.callId">call: <code>{{ voice.callId.slice(0, 8) }}</code></span>
+          </div>
+
+          <div v-if="!voice.turns.length && voice.status === 'idle'" class="kb-empty voice-empty">
+            <div class="kb-empty-icon">
+              <Mic :size="24" />
+            </div>
+            <strong>Start a call to test the pipeline.</strong>
+            <span>Choose a language, hit Start Call, allow mic access, and speak. Audio plays back in real time.</span>
+          </div>
+
+          <div v-if="voice.turns.length" class="voice-transcript">
+            <div v-for="turn in voice.turns" :key="turn.id" class="voice-turn">
+              <div class="voice-turn-user">
+                <span class="kb-pill kb-pill-type">caller</span>
+                <p>{{ turn.query }}</p>
+              </div>
+              <div class="voice-turn-agent">
+                <span class="kb-pill kb-pill-status-approved">agent</span>
+                <p>{{ turn.sentences.join(' ') || turn.answer || '…' }}</p>
+                <div class="voice-turn-meta">
+                  <span v-if="turn.latencyMs">first sentence {{ turn.latencyMs }}ms</span>
+                  <span v-if="turn.cacheHit" class="kb-pill kb-pill-soft">cache hit</span>
+                  <span v-if="turn.citations.length" class="kb-pill kb-pill-soft">{{ turn.citations.length }} citation{{ turn.citations.length === 1 ? '' : 's' }}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </article>
+
+        <!-- PHONE LINK -->
+        <article class="dashboard-card phone-link-card">
+          <div class="kb-card-head">
+            <div class="kb-card-icon">
+              <PhoneCall :size="18" />
+            </div>
+            <div>
+              <h4>Exotel Phone Link</h4>
+              <p>Set a stable link ID, then configure the URLs below in your Exotel portal under the inbound number.</p>
+            </div>
+          </div>
+
+          <div class="kb-form-grid">
+            <label class="kb-field kb-field-wide">
+              <span>Link ID (any unique string)</span>
+              <input v-model="phoneLinkInput" type="text" placeholder="acme-india-line-1" :disabled="!isAdmin" />
+            </label>
+          </div>
+
+          <div class="kb-card-actions" v-if="isAdmin">
+            <button type="button" class="primary-button compact" :disabled="isSavingPhoneLink" @click="savePhoneLink">
+              <CheckCircle2 :size="15" />
+              {{ isSavingPhoneLink ? 'Saving…' : 'Save Link' }}
+            </button>
+            <span class="kb-card-hint" v-if="phoneLink?.status === 'linked'">linked · {{ phoneLink.link_id }}</span>
+            <span class="kb-card-hint" v-else>not linked yet</span>
+          </div>
+
+          <div v-if="phoneLink?.exotel_webhook_url" class="phone-link-urls">
+            <div class="phone-link-url-row">
+              <span>Inbound webhook (HTTP POST)</span>
+              <code>{{ phoneLink.exotel_webhook_url }}</code>
+            </div>
+            <div class="phone-link-url-row">
+              <span>Inbound media stream (WSS)</span>
+              <code>{{ phoneLink.exotel_media_url }}</code>
+            </div>
+          </div>
+        </article>
 
         <div class="dashboard-grid agent-page-grid">
           <article class="dashboard-card agent-upload-card">
@@ -2349,6 +3324,107 @@ onBeforeUnmount(() => {
             </div>
           </article>
         </div>
+
+        <!-- OUTBOUND CAMPAIGNS -->
+        <article class="dashboard-card campaign-card">
+          <div class="kb-card-head">
+            <div class="kb-card-icon">
+              <PhoneCall :size="18" />
+            </div>
+            <div>
+              <h4>Outbound Campaigns</h4>
+              <p>Upload a script + an Excel of phone numbers. The script is ingested into RAG; calls fire on launch.</p>
+            </div>
+            <button type="button" class="ghost-button compact" @click="loadCampaigns">Refresh</button>
+          </div>
+
+          <div v-if="isAdmin" class="campaign-create">
+            <div class="kb-form-grid">
+              <label class="kb-field">
+                <span>Campaign name</span>
+                <input v-model="campaignForm.name" type="text" placeholder="Diwali outreach" />
+              </label>
+              <label class="kb-field">
+                <span>From number (optional)</span>
+                <input v-model="campaignForm.from_number" type="text" placeholder="+91XXXXXXXXXX" />
+              </label>
+              <label class="kb-field">
+                <span>Contacts (.xlsx — col A phone, col B name)</span>
+                <input type="file" accept=".xlsx,.xls" @change="onCampaignFile($event, 'excel_file')" />
+                <small v-if="campaignForm.excel_file">{{ campaignForm.excel_file.name }} · {{ formatBytes(campaignForm.excel_file.size) }}</small>
+              </label>
+              <label class="kb-field">
+                <span>Script document (PDF/DOCX/TXT)</span>
+                <input type="file" accept=".pdf,.docx,.txt,.md" @change="onCampaignFile($event, 'doc_file')" />
+                <small v-if="campaignForm.doc_file">{{ campaignForm.doc_file.name }} · {{ formatBytes(campaignForm.doc_file.size) }}</small>
+              </label>
+            </div>
+            <div class="kb-card-actions">
+              <button
+                type="button"
+                class="primary-button compact"
+                :disabled="isCreatingCampaign"
+                @click="createCampaign"
+              >
+                <Plus :size="15" />
+                {{ isCreatingCampaign ? 'Creating & ingesting…' : 'Create Campaign' }}
+              </button>
+              <span class="kb-card-hint">Script auto-indexes to Qdrant scoped to this campaign.</span>
+            </div>
+          </div>
+
+          <div v-if="!campaigns.length" class="kb-empty">
+            <div class="kb-empty-icon">
+              <PhoneCall :size="24" />
+            </div>
+            <strong>No outbound campaigns yet.</strong>
+            <span>Upload contacts and a script to start.</span>
+          </div>
+
+          <div v-else class="kb-doc-list">
+            <article v-for="c in campaigns" :key="c.id" class="kb-doc-card">
+              <div class="kb-doc-icon">
+                <PhoneCall :size="18" />
+              </div>
+              <div class="kb-doc-body">
+                <div class="kb-doc-title-row">
+                  <strong>{{ c.name }}</strong>
+                  <span class="kb-pill" :class="`kb-pill-status-${c.status === 'running' ? 'approved' : c.status === 'draft' ? 'pending' : 'rejected'}`">
+                    {{ c.status }}
+                  </span>
+                </div>
+                <div class="kb-doc-meta">
+                  <span><strong>{{ c.total_count }}</strong> contacts</span>
+                  <span><strong>{{ c.answered_count }}</strong> answered</span>
+                  <span v-if="c.failed_count"><strong>{{ c.failed_count }}</strong> failed</span>
+                  <span v-if="c.from_number">from {{ c.from_number }}</span>
+                  <span v-if="c.created_at">created {{ formatRelativeDate(c.created_at) }}</span>
+                </div>
+              </div>
+              <div class="kb-doc-actions" v-if="isAdmin">
+                <button
+                  v-if="c.status === 'draft'"
+                  type="button"
+                  class="primary-button compact"
+                  :disabled="isLaunchingCampaign === c.id"
+                  @click="launchCampaign(c.id)"
+                >
+                  <Play :size="15" />
+                  {{ isLaunchingCampaign === c.id ? 'Launching…' : 'Launch' }}
+                </button>
+                <button
+                  v-if="c.status === 'draft' || c.status === 'running'"
+                  type="button"
+                  class="ghost-button compact"
+                  @click="cancelCampaign(c.id)"
+                >
+                  <XCircle :size="15" />
+                  Cancel
+                </button>
+              </div>
+            </article>
+          </div>
+        </article>
       </section>
 
       <!-- KNOWLEDGE BASE -->
@@ -2408,7 +3484,7 @@ onBeforeUnmount(() => {
 
             <label
               class="kb-dropzone"
-              :class="{ 'has-file': kbForm.file, 'is-busy': isUploadingKb }"
+              :class="{ 'has-file': kbForm.file || kbBulkQueue.length, 'is-busy': isUploadingKb || isUploadingKbBulk }"
               @dragover.prevent
               @drop.prevent="handleKbDrop"
             >
@@ -2416,17 +3492,18 @@ onBeforeUnmount(() => {
                 ref="kbUploadInputRef"
                 class="kb-dropzone-input"
                 type="file"
+                multiple
                 accept=".pdf,.docx,.txt,.md,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain,text/markdown"
                 @change="handleKbFileChange"
               />
-              <div v-if="!kbForm.file" class="kb-dropzone-empty">
+              <div v-if="!kbForm.file && !kbBulkQueue.length" class="kb-dropzone-empty">
                 <div class="kb-dropzone-icon">
                   <Upload :size="22" />
                 </div>
-                <strong>Drop file or click to browse</strong>
-                <span>PDF, DOCX, TXT, MD — up to ~10MB</span>
+                <strong>Drop files or click to browse</strong>
+                <span>PDF, DOCX, TXT, MD · pick one for a named upload or many for bulk embed</span>
               </div>
-              <div v-else class="kb-dropzone-filled">
+              <div v-else-if="kbForm.file && !kbBulkQueue.length" class="kb-dropzone-filled">
                 <div class="kb-dropzone-icon">
                   <FileText :size="20" />
                 </div>
@@ -2442,9 +3519,55 @@ onBeforeUnmount(() => {
                   Replace
                 </button>
               </div>
+              <div v-else class="kb-dropzone-filled kb-dropzone-bulk">
+                <div class="kb-dropzone-icon">
+                  <FileText :size="20" />
+                </div>
+                <div class="kb-dropzone-file">
+                  <strong>{{ kbBulkQueue.length }} files queued for bulk embed</strong>
+                  <span>Tags &amp; type below apply to all. Filenames become document names.</span>
+                </div>
+                <button
+                  type="button"
+                  class="kb-link-button"
+                  :disabled="isUploadingKbBulk"
+                  @click.prevent.stop="clearKbFile"
+                >
+                  Clear
+                </button>
+              </div>
             </label>
 
-            <div class="kb-form-grid">
+            <ul v-if="kbBulkQueue.length" class="kb-bulk-queue">
+              <li v-for="(entry, idx) in kbBulkQueue" :key="entry.file.name + idx" :class="`kb-bulk-row kb-bulk-${entry.status}`">
+                <div class="kb-bulk-row-top">
+                  <div class="kb-bulk-row-main">
+                    <FileText :size="14" />
+                    <span class="kb-bulk-name">{{ entry.name }}</span>
+                    <span class="kb-bulk-size">{{ formatBytes(entry.file.size) }}</span>
+                  </div>
+                  <div class="kb-bulk-status">
+                    <span v-if="entry.status === 'queued'">Queued</span>
+                    <span v-else-if="entry.status === 'uploading'">Embedding…</span>
+                    <span v-else-if="entry.status === 'done'" class="kb-bulk-done">Embedded</span>
+                    <span v-else class="kb-bulk-error">Failed</span>
+                    <button
+                      v-if="entry.status === 'queued' && !isUploadingKbBulk"
+                      type="button"
+                      class="kb-link-button"
+                      @click="removeBulkQueueItem(idx)"
+                    >
+                      Remove
+                    </button>
+                  </div>
+                </div>
+                <div v-if="entry.status === 'error' && entry.error" class="kb-bulk-error-detail">
+                  {{ entry.error }}
+                </div>
+              </li>
+            </ul>
+
+            <div v-if="!kbBulkQueue.length" class="kb-form-grid">
               <label class="kb-field">
                 <span>Name</span>
                 <input v-model="kbForm.name" type="text" placeholder="Refund policy v2" />
@@ -2467,8 +3590,24 @@ onBeforeUnmount(() => {
               </label>
             </div>
 
+            <div v-else class="kb-form-grid">
+              <label class="kb-field">
+                <span>Type (applies to all)</span>
+                <select v-model="kbForm.document_type" :disabled="isUploadingKbBulk">
+                  <option v-for="opt in kbDocumentTypes" :key="opt.value" :value="opt.value">
+                    {{ opt.label }}
+                  </option>
+                </select>
+              </label>
+              <label class="kb-field kb-field-wide">
+                <span>Tags (applies to all)</span>
+                <input v-model="kbForm.tags" type="text" placeholder="refunds, returns, escalation" :disabled="isUploadingKbBulk" />
+              </label>
+            </div>
+
             <div class="kb-card-actions">
               <button
+                v-if="!kbBulkQueue.length"
                 type="button"
                 class="primary-button compact"
                 :disabled="isUploadingKb || !kbForm.file"
@@ -2477,7 +3616,21 @@ onBeforeUnmount(() => {
                 <Upload :size="15" />
                 {{ isUploadingKb ? 'Embedding…' : 'Upload & Embed' }}
               </button>
-              <span class="kb-card-hint">{{ isUploadingKb ? 'Chunking and calling Azure OpenAI…' : 'Approved by default if text is extractable.' }}</span>
+              <button
+                v-else
+                type="button"
+                class="primary-button compact"
+                :disabled="isUploadingKbBulk || !kbBulkQueue.length"
+                @click="uploadKnowledgeDocumentsBulk"
+              >
+                <Upload :size="15" />
+                {{ isUploadingKbBulk ? 'Embedding…' : `Upload &amp; Embed ${kbBulkQueue.length} Files` }}
+              </button>
+              <span class="kb-card-hint">
+                <template v-if="isUploadingKb || isUploadingKbBulk">Chunking and calling Azure OpenAI…</template>
+                <template v-else-if="kbBulkQueue.length">2 files embed in parallel to stay under Azure OpenAI rate limits.</template>
+                <template v-else>Approved by default if text is extractable.</template>
+              </span>
             </div>
           </article>
 
@@ -2544,15 +3697,28 @@ onBeforeUnmount(() => {
             <h4>{{ kbDocuments.length }} document{{ kbDocuments.length === 1 ? '' : 's' }}</h4>
             <p>Pending uploads still embed; only approved documents serve answers in production.</p>
           </div>
-          <button
-            type="button"
-            class="ghost-button compact"
-            :disabled="isLoadingKb"
-            @click="loadKnowledgeDocuments"
-          >
-            <Database :size="15" />
-            {{ isLoadingKb ? 'Loading…' : 'Refresh' }}
-          </button>
+          <div class="kb-list-actions">
+            <button
+              v-if="isAdmin"
+              type="button"
+              class="ghost-button compact"
+              :disabled="isReconcilingKb"
+              @click="reconcileKnowledgeDocuments"
+              title="Rebuild this list from chunks that already exist in Qdrant (used when an earlier upload landed vectors but lost the metadata)"
+            >
+              <Database :size="15" />
+              {{ isReconcilingKb ? 'Reconciling…' : 'Reconcile from Qdrant' }}
+            </button>
+            <button
+              type="button"
+              class="ghost-button compact"
+              :disabled="isLoadingKb"
+              @click="loadKnowledgeDocuments"
+            >
+              <Database :size="15" />
+              {{ isLoadingKb ? 'Loading…' : 'Refresh' }}
+            </button>
+          </div>
         </div>
 
         <div v-if="!kbDocuments.length && !isLoadingKb" class="kb-empty">
@@ -2560,7 +3726,7 @@ onBeforeUnmount(() => {
             <BookOpen :size="28" />
           </div>
           <strong>No documents yet.</strong>
-          <span>Upload your first policy or FAQ to start grounding the agent.</span>
+          <span>Upload your first policy or FAQ to start grounding the agent. <template v-if="isAdmin">If you've already uploaded but the list is empty, click <em>Reconcile from Qdrant</em> to rebuild the registry from any orphaned embeddings.</template></span>
         </div>
 
         <div v-else class="kb-doc-list">
@@ -2594,26 +3760,74 @@ onBeforeUnmount(() => {
                 </span>
               </div>
               <p v-if="doc.last_error" class="kb-doc-error">{{ doc.last_error }}</p>
+
+              <!-- Lazy-loaded chunk viewer. Lets the admin see exactly
+                   what the agent is grounding on for this document. -->
+              <div v-if="kbExpandedDocs[doc.id]" class="kb-doc-chunks">
+                <div v-if="kbChunksByDoc[doc.id]?.loading" class="kb-doc-chunks-status">
+                  Loading chunks…
+                </div>
+                <div v-else-if="kbChunksByDoc[doc.id]?.error" class="kb-doc-chunks-status kb-doc-chunks-error">
+                  {{ kbChunksByDoc[doc.id].error }}
+                </div>
+                <div v-else-if="!kbChunksByDoc[doc.id]?.chunks?.length" class="kb-doc-chunks-status">
+                  No chunks indexed for this document.
+                </div>
+                <ol v-else class="kb-doc-chunks-list">
+                  <li
+                    v-for="chunk in kbChunksByDoc[doc.id].chunks"
+                    :key="chunk.index"
+                    class="kb-chunk"
+                  >
+                    <div class="kb-chunk-head">
+                      <span class="kb-chunk-index">#{{ chunk.index + 1 }}</span>
+                      <span v-if="chunk.section_title" class="kb-chunk-section">{{ chunk.section_title }}</span>
+                      <span class="kb-chunk-meta">{{ chunk.token_count }} tok · {{ chunk.char_end - chunk.char_start }} chars</span>
+                    </div>
+                    <p class="kb-chunk-text">{{ chunk.text }}</p>
+                  </li>
+                </ol>
+              </div>
             </div>
-            <div v-if="isAdmin" class="kb-doc-actions">
+            <div class="kb-doc-actions">
               <button
-                v-if="doc.approval_status !== 'approved' && doc.chunk_count > 0"
-                type="button"
-                class="primary-button compact"
-                @click="approveKnowledgeDocument(doc.id)"
-              >
-                <CheckCircle2 :size="15" />
-                Approve
-              </button>
-              <button
-                v-if="doc.approval_status === 'approved'"
                 type="button"
                 class="ghost-button compact"
-                @click="rejectKnowledgeDocument(doc.id)"
+                @click="toggleKnowledgeChunks(doc.id)"
+                :title="kbExpandedDocs[doc.id] ? 'Hide chunks' : 'View chunks the agent uses for retrieval'"
               >
-                <XCircle :size="15" />
-                Revoke
+                <FileText :size="15" />
+                {{ kbExpandedDocs[doc.id] ? 'Hide chunks' : 'View chunks' }}
               </button>
+              <template v-if="isAdmin">
+                <button
+                  v-if="doc.approval_status !== 'approved' && doc.chunk_count > 0"
+                  type="button"
+                  class="primary-button compact"
+                  @click="approveKnowledgeDocument(doc.id)"
+                >
+                  <CheckCircle2 :size="15" />
+                  Approve
+                </button>
+                <button
+                  v-if="doc.approval_status === 'approved'"
+                  type="button"
+                  class="ghost-button compact"
+                  @click="rejectKnowledgeDocument(doc.id)"
+                >
+                  <XCircle :size="15" />
+                  Revoke
+                </button>
+                <button
+                  type="button"
+                  class="ghost-button compact danger"
+                  @click="removeKnowledgeDocument(doc.id, doc.name)"
+                  title="Delete document, embeddings, and generated cards"
+                >
+                  <Trash2 :size="15" />
+                  Remove
+                </button>
+              </template>
             </div>
           </article>
         </div>
@@ -3180,6 +4394,16 @@ onBeforeUnmount(() => {
 .primary-button.compact {
   flex: unset;
   padding: 0.7rem 0.95rem;
+}
+
+.ghost-button.danger {
+  border-color: #d6a7a0;
+  background: #fff5f3;
+  color: #8a2a1a;
+}
+.ghost-button.danger:hover {
+  background: #fde9e4;
+  border-color: #c98577;
 }
 
 .db-form-block {
@@ -5403,6 +6627,282 @@ onBeforeUnmount(() => {
   }
 }
 
+/* ───────────────── Agent Studio (voice pipeline) ───────────────── */
+.agent-studio-section {
+  display: flex;
+  flex-direction: column;
+  gap: 1.4rem;
+}
+
+.agent-hero {
+  display: grid;
+  grid-template-columns: minmax(0, 1.1fr) minmax(0, 1.3fr);
+  gap: 1.5rem;
+  padding: 1.6rem 1.8rem;
+  border-radius: 1.3rem;
+  border: 1px solid rgba(196, 199, 199, 0.5);
+  background:
+    radial-gradient(120% 120% at 0% 0%, rgba(255, 255, 255, 0.9), rgba(245, 244, 232, 0.6) 55%, rgba(229, 226, 225, 0.4) 100%);
+}
+
+.agent-hero-copy h3 {
+  font-family: Manrope, sans-serif;
+  font-size: 1.55rem;
+  line-height: 1.15;
+  margin-top: 0.3rem;
+}
+
+.agent-hero-copy p {
+  margin-top: 0.65rem;
+  color: #4a4a3e;
+  font-size: 0.92rem;
+  line-height: 1.65;
+}
+
+.agent-pipeline-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.6rem;
+}
+
+.pipeline-chip {
+  display: flex;
+  gap: 0.6rem;
+  align-items: flex-start;
+  padding: 0.7rem 0.8rem;
+  border-radius: 0.85rem;
+  background: rgba(255, 255, 255, 0.85);
+  border: 1px solid rgba(196, 199, 199, 0.5);
+}
+
+.pipeline-chip > svg {
+  margin-top: 0.18rem;
+  color: #5f5f53;
+  flex-shrink: 0;
+}
+
+.pipeline-chip > div {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.pipeline-chip span {
+  font-size: 0.65rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #5f5f53;
+}
+
+.pipeline-chip strong {
+  font-family: Manrope, sans-serif;
+  font-size: 0.85rem;
+  line-height: 1.2;
+  margin-top: 0.1rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pipeline-chip small {
+  font-size: 0.7rem;
+  color: #5f5f53;
+  margin-top: 0.18rem;
+}
+
+.chip-status-configured { color: #047857; }
+.chip-status-missing_api_key,
+.chip-status-unknown { color: #b45309; }
+
+.voice-tester-card,
+.phone-link-card,
+.campaign-card {
+  margin-bottom: 1.3rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.voice-status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.35rem 0.7rem;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  border: 1px solid rgba(196, 199, 199, 0.6);
+  background: rgba(255, 255, 255, 0.7);
+  color: #5f5f53;
+}
+
+.voice-status-dot {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 999px;
+  background: currentColor;
+  opacity: 0.6;
+}
+
+.voice-status-idle { color: #5f5f53; }
+.voice-status-connecting { color: #b45309; }
+.voice-status-listening { color: #047857; background: rgba(5, 150, 105, 0.08); border-color: rgba(5, 150, 105, 0.3); }
+.voice-status-thinking { color: #1d4ed8; background: rgba(59, 130, 246, 0.08); border-color: rgba(59, 130, 246, 0.3); }
+.voice-status-speaking { color: #6d28d9; background: rgba(124, 58, 237, 0.08); border-color: rgba(124, 58, 237, 0.3); }
+.voice-status-error { color: #b91c1c; background: rgba(220, 38, 38, 0.08); border-color: rgba(220, 38, 38, 0.35); }
+
+.voice-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.voice-controls select {
+  padding: 0.55rem 0.7rem;
+  border-radius: 0.7rem;
+  border: 1px solid rgba(196, 199, 199, 0.6);
+  background: rgba(255, 255, 255, 0.85);
+  font-size: 0.88rem;
+}
+
+.voice-text-input {
+  flex: 1;
+  min-width: 12rem;
+  padding: 0.55rem 0.8rem;
+  border-radius: 0.7rem;
+  border: 1px solid rgba(196, 199, 199, 0.6);
+  background: rgba(255, 255, 255, 0.85);
+  font-size: 0.9rem;
+}
+
+.voice-live-row {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0.65rem 0.85rem;
+  border-radius: 0.8rem;
+  background: rgba(59, 130, 246, 0.08);
+  color: #1d4ed8;
+}
+
+.voice-live-row em {
+  flex: 1;
+  font-style: italic;
+}
+
+.voice-latency-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.9rem;
+  font-size: 0.78rem;
+  color: #5f5f53;
+}
+
+.voice-latency-row strong { color: #1b1c15; font-variant-numeric: tabular-nums; }
+.voice-latency-row code {
+  background: rgba(15, 23, 42, 0.06);
+  padding: 0.1rem 0.35rem;
+  border-radius: 0.35rem;
+  font-size: 0.75rem;
+}
+
+.voice-empty { padding: 1.8rem 1.2rem; }
+
+.voice-transcript {
+  display: grid;
+  gap: 0.7rem;
+  max-height: 26rem;
+  overflow-y: auto;
+  padding-right: 0.4rem;
+}
+
+.voice-turn {
+  display: grid;
+  gap: 0.35rem;
+  padding: 0.85rem 1rem;
+  border-radius: 1rem;
+  border: 1px solid rgba(196, 199, 199, 0.5);
+  background: rgba(255, 255, 255, 0.7);
+}
+
+.voice-turn-user,
+.voice-turn-agent {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 0.55rem;
+  align-items: start;
+}
+
+.voice-turn-user p,
+.voice-turn-agent p {
+  margin: 0;
+  color: #1b1c15;
+  font-size: 0.9rem;
+  line-height: 1.55;
+}
+
+.voice-turn-meta {
+  grid-column: 2 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  font-size: 0.72rem;
+  color: #5f5f53;
+}
+
+.phone-link-urls {
+  display: grid;
+  gap: 0.5rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid rgba(196, 199, 199, 0.5);
+}
+
+.phone-link-url-row {
+  display: grid;
+  gap: 0.2rem;
+}
+
+.phone-link-url-row span {
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: #5f5f53;
+}
+
+.phone-link-url-row code {
+  background: rgba(15, 23, 42, 0.06);
+  padding: 0.5rem 0.7rem;
+  border-radius: 0.55rem;
+  font-size: 0.78rem;
+  word-break: break-all;
+}
+
+.campaign-create {
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid rgba(196, 199, 199, 0.5);
+  margin-bottom: 0.5rem;
+}
+
+@media (max-width: 980px) {
+  .agent-hero {
+    grid-template-columns: 1fr;
+  }
+  .agent-pipeline-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 640px) {
+  .agent-pipeline-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 /* ───────────────── Knowledge Base ───────────────── */
 .kb-section {
   display: flex;
@@ -5650,6 +7150,155 @@ onBeforeUnmount(() => {
   text-align: left;
 }
 
+.kb-bulk-queue {
+  list-style: none;
+  margin: 0.85rem 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  max-height: 240px;
+  overflow-y: auto;
+}
+.kb-bulk-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  padding: 0.55rem 0.75rem;
+  border-radius: 0.5rem;
+  background: #fffef6;
+  border: 1px solid #ece9d7;
+  font-size: 0.85rem;
+}
+.kb-bulk-row-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.85rem;
+  width: 100%;
+}
+.kb-bulk-error-detail {
+  font-size: 0.78rem;
+  color: #8a2a1a;
+  background: #fff5f3;
+  padding: 0.35rem 0.55rem;
+  border-radius: 0.4rem;
+  line-height: 1.35;
+  word-break: break-word;
+}
+
+/* ── Per-document chunk viewer ─────────────────────────────────────── */
+.kb-doc-chunks {
+  margin-top: 0.85rem;
+  padding: 0.8rem;
+  border: 1px solid #ece9d7;
+  border-radius: 0.6rem;
+  background: #fefdf3;
+}
+.kb-doc-chunks-status {
+  font-size: 0.85rem;
+  color: #57544a;
+  padding: 0.3rem 0;
+}
+.kb-doc-chunks-status.kb-doc-chunks-error {
+  color: #8a2a1a;
+}
+.kb-doc-chunks-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+  max-height: 480px;
+  overflow-y: auto;
+}
+.kb-chunk {
+  padding: 0.6rem 0.7rem;
+  border-radius: 0.45rem;
+  background: #ffffff;
+  border: 1px solid #ece9d7;
+}
+.kb-chunk-head {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  margin-bottom: 0.35rem;
+  font-size: 0.74rem;
+  color: #57544a;
+  flex-wrap: wrap;
+}
+.kb-chunk-index {
+  font-weight: 700;
+  color: #1b1c15;
+}
+.kb-chunk-section {
+  padding: 0.05rem 0.45rem;
+  background: #f4f1de;
+  border-radius: 0.35rem;
+  font-weight: 600;
+  color: #57544a;
+}
+.kb-chunk-meta {
+  margin-left: auto;
+  font-size: 0.7rem;
+  color: #6e6c5b;
+}
+.kb-chunk-text {
+  margin: 0;
+  font-size: 0.83rem;
+  line-height: 1.45;
+  color: #1b1c15;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.kb-bulk-row-main {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  min-width: 0;
+  flex: 1;
+}
+.kb-bulk-name {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.kb-bulk-size {
+  color: #6e6c5b;
+  font-size: 0.78rem;
+  flex-shrink: 0;
+}
+.kb-bulk-status {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.8rem;
+  color: #57544a;
+}
+.kb-bulk-uploading {
+  background: #f4f1de;
+  border-color: #d8d3aa;
+}
+.kb-bulk-done {
+  color: #1f6f3a;
+  font-weight: 600;
+}
+.kb-bulk-error {
+  color: #8a2a1a;
+  font-weight: 600;
+  cursor: help;
+}
+.kb-bulk-row.kb-bulk-done {
+  background: #f1f7ef;
+  border-color: #c1d8bc;
+}
+.kb-bulk-row.kb-bulk-error {
+  background: #fdf2ee;
+  border-color: #d6a7a0;
+}
+
 .kb-dropzone-empty {
   flex-direction: column;
   align-items: center;
@@ -5880,6 +7529,12 @@ onBeforeUnmount(() => {
   margin: 0;
   color: #5f5f53;
   font-size: 0.85rem;
+}
+
+.kb-list-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
 }
 
 .kb-empty {

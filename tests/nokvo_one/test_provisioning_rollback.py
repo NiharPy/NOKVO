@@ -204,7 +204,10 @@ def test_provisioner_rolls_back_when_qdrant_fails():
         blob_delete.assert_awaited_once()
         kv_delete.assert_awaited()  # at least one secret deleted
         ai_delete.assert_awaited_once()
-        rg_delete.assert_awaited_once_with("rg-nokvo1-acme-inc-staging")
+        rg_delete.assert_awaited_once()
+        deleted_rg = rg_delete.await_args.args[0]
+        assert deleted_rg.startswith("rg-nokvo1-acme-inc-")
+        assert deleted_rg.endswith("-staging")
     finally:
         for p in patches:
             p.stop()

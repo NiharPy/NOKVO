@@ -449,9 +449,20 @@ class WarmSonioxTTSStream:
         language = AgentRuntimeService.normalize_language(language)
         if self._connect_task and not self._connect_task.done():
             if self.language == language:
+                await asyncio.shield(self._connect_task)
                 return
             await self.close()
         self._connect_task = asyncio.create_task(self._warm_safe(language))
+        await asyncio.shield(self._connect_task)
+
+    def is_healthy(self) -> bool:
+        if self.tts_ws is None:
+            return False
+        closed = getattr(self.tts_ws, "closed", None)
+        if closed is not None:
+            return not bool(closed)
+        state = getattr(self.tts_ws, "state", None)
+        return str(state).upper() not in {"CLOSED", "CLOSING"}
 
     async def _warm_safe(self, language: str) -> None:
         try:
@@ -474,7 +485,7 @@ class WarmSonioxTTSStream:
                 await asyncio.shield(self._connect_task)
             except Exception:
                 pass
-        if self.tts_ws is not None and self.language == language:
+        if self.tts_ws is not None and self.language == language and self.is_healthy():
             return self.tts_ws
         await self.close()
         started = perf_counter()
@@ -640,9 +651,12 @@ class WarmSonioxTTSStream:
                 return True
 
     async def close(self) -> None:
-        if self._connect_task and not self._connect_task.done():
+        current_task = asyncio.current_task()
+        if self._connect_task and not self._connect_task.done() and self._connect_task is not current_task:
             self._connect_task.cancel()
-        self._connect_task = None
+            self._connect_task = None
+        elif self._connect_task is not current_task:
+            self._connect_task = None
         if self.tts_ws is not None:
             try:
                 await self.tts_ws.close()
@@ -826,6 +840,7 @@ class AgentVoiceStreamService:
             "should_retrieve": False,
             "pre_answer": None,
             "source": "unknown",
+            "redis_latency_ms": None,
         }
 
         if session_ctx.last_answer and _REPEAT_LAST_RE.search(query):
@@ -878,10 +893,13 @@ class AgentVoiceStreamService:
         intent = await intent_task
         redis_hit = None
         if redis_task:
+            redis_started = perf_counter()
             try:
-                redis_hit = await asyncio.wait_for(asyncio.shield(redis_task), timeout=0.05)
+                redis_hit = await asyncio.wait_for(asyncio.shield(redis_task), timeout=0.15)
             except (asyncio.TimeoutError, Exception):
                 pass
+            finally:
+                ctx["redis_latency_ms"] = int((perf_counter() - redis_started) * 1000)
 
         ctx["intent_type"] = intent.get("type", INTENT_AMBIGUOUS)
         ctx["should_retrieve"] = bool(intent.get("shouldRetrieve"))
@@ -1096,6 +1114,7 @@ class AgentVoiceStreamService:
                         "detected_language": resp_language,
                         "latency_ms": int((perf_counter() - t_start) * 1000),
                         "context_source": resolved["source"],
+                        "redis_latency_ms": resolved.get("redis_latency_ms"),
                     },
                     "intent": {
                         "type": intent_type,
@@ -1198,6 +1217,7 @@ class AgentVoiceStreamService:
                         "context_source": resolved["source"],
                         "pre_answer_used": bool(pre_answer),
                         "context_ms": context_ms,
+                        "redis_latency_ms": resolved.get("redis_latency_ms"),
                     },
                     "intent": {
                         "type": intent_type,
@@ -1367,6 +1387,18 @@ class AgentVoiceStreamService:
         }
         final_transcript_parts: list[str] = []
 
+        async def _prewarm_tts_pair(language: str, *, timeout_s: float = 2.0) -> None:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(
+                        warm_tts.warm(language),
+                        warm_tts_filler.warm(language),
+                    ),
+                    timeout=timeout_s,
+                )
+            except asyncio.TimeoutError:
+                print(f"[NOKVO-TTS] warm timeout after {timeout_s:.1f}s; continuing with lazy reconnect")
+
         def _on_speaking() -> None:
             _s["state"] = TurnState.SPEAKING
 
@@ -1389,8 +1421,7 @@ class AgentVoiceStreamService:
                 await task
             except asyncio.CancelledError:
                 # Barge-in cancelled this turn — re-warm TTS for the next turn
-                asyncio.create_task(warm_tts.warm(session_ctx.language))
-                asyncio.create_task(warm_tts_filler.warm(session_ctx.language))
+                asyncio.create_task(_prewarm_tts_pair(session_ctx.language))
             except Exception as exc:
                 try:
                     await websocket.send_json({"type": "agent_error", "error": str(exc)[:200]})
@@ -1505,9 +1536,9 @@ class AgentVoiceStreamService:
             except Exception:
                 pass
 
-            # Warm both TTS connections in background at session start
-            asyncio.create_task(warm_tts.warm(session_ctx.language))
-            asyncio.create_task(warm_tts_filler.warm(session_ctx.language))
+            # Warm both TTS connections at session start so the first answer
+            # does not pay the WebSocket/TLS handshake cost.
+            await _prewarm_tts_pair(session_ctx.language)
 
             while True:
                 try:
@@ -1531,8 +1562,7 @@ class AgentVoiceStreamService:
                 if event_type == "config":
                     lang = AgentRuntimeService.normalize_language(str(payload.get("language") or "en"))
                     session_ctx.language = lang
-                    asyncio.create_task(warm_tts.warm(lang))
-                    asyncio.create_task(warm_tts_filler.warm(lang))
+                    asyncio.create_task(_prewarm_tts_pair(lang))
                     await _ensure_stt()
 
                 elif event_type == "audio":

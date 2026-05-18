@@ -9,8 +9,11 @@ from io import BytesIO
 from typing import Any
 from xml.etree import ElementTree
 
+import tiktoken
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.ext.asyncio import AsyncSession
+
+_TOKEN_ENCODER = tiktoken.get_encoding("cl100k_base")
 
 from app.models.organization_user import OrganizationUser
 from app.models.tenant_resources import TenantResources
@@ -24,7 +27,16 @@ AGENT_DOCUMENT_TYPES = {"policy", "faq", "script", "compliance", "product_docs",
 AGENT_KNOWLEDGE_SOURCE_TYPE = "agent_knowledge"
 AGENT_CHUNK_SOURCE_KIND = "agent_document_chunk"
 AGENT_ANSWER_CARDS_KEY = "agent_answer_cards"
+AGENT_POLICY_CARDS_KEY = "agent_policy_cards"
 AGENT_POLICY_VERSION_KEY = "agent_policy_version"
+
+_HEADING_RE = re.compile(
+    r"^(?:#+\s*)?([A-Z][A-Za-z0-9 /&\-:]{2,80})\s*[:\-]?\s*$"
+)
+_POLICY_HEADING_RE = re.compile(
+    r"^(?:#+\s*|\s*)?(cancellation(?:\s+policy)?|refund(?:\s+policy)?|cancellation\s*&\s*refund|cancel\s*/\s*refund)(?:\s*[:\-–])?\s*$",
+    re.IGNORECASE,
+)
 
 _SENSITIVE_POLICY_RE = re.compile(
     r"\b(refund|payment|card|upi|bank|cancel|delete|account|medical|legal|password|otp|kyc)\b",
@@ -75,6 +87,40 @@ class AgentKnowledgeService:
     @staticmethod
     def _set_answer_cards(provider_status: dict, cards: list[dict]) -> None:
         provider_status[AGENT_ANSWER_CARDS_KEY] = cards[-1000:]
+
+    @staticmethod
+    def _policy_cards(provider_status: dict) -> list[dict]:
+        return list(provider_status.get(AGENT_POLICY_CARDS_KEY) or [])
+
+    @staticmethod
+    def _set_policy_cards(provider_status: dict, cards: list[dict]) -> None:
+        provider_status[AGENT_POLICY_CARDS_KEY] = cards[-500:]
+
+    @staticmethod
+    def _build_policy_cards(document: dict, policy_version: str) -> list[dict]:
+        """Run the structured PolicyCardExtractor over the joined chunk text
+        and stamp each card with the document/version/approval metadata so
+        PolicyDecisionEngine can apply the same active/approved/version
+        filters used for chunks."""
+        # Lazy import to avoid a cycle (the extractor pulls only stdlib).
+        from app.services.policy_card_extractor import PolicyCardExtractor
+
+        source_text = "\n\n".join(str(chunk.get("text") or "") for chunk in (document.get("chunks") or []))
+        extracted = PolicyCardExtractor.extract(source_text)
+        cards: list[dict] = []
+        for index, card in enumerate(extracted):
+            cards.append(
+                {
+                    **card,
+                    "id": f"{document['id']}:policy:{index}",
+                    "document_id": document["id"],
+                    "document_version_id": document.get("document_version_id"),
+                    "policy_version": policy_version,
+                    "approval_status": document.get("approval_status"),
+                    "status": document.get("status"),
+                }
+            )
+        return cards
 
     @staticmethod
     def _normalize_tags(tags: str | list[str] | None) -> list[str]:
@@ -146,43 +192,153 @@ class AgentKnowledgeService:
         return content.decode("utf-8", errors="ignore")
 
     @staticmethod
-    def _chunk_text(text: str, max_tokens: int = 450, overlap_tokens: int = 50) -> list[dict]:
+    def _split_sections(text: str) -> list[dict]:
+        """Split the doc into best-effort sections by heading lines so each
+        chunk can carry ``section_id``/``section_title``/``parent_section_text``
+        metadata. Enables parent-section retrieval expansion for tables/lists
+        that would otherwise be sliced into useless single rows."""
         cleaned = re.sub(r"\r\n?", "\n", text or "").strip()
         if not cleaned:
             return []
-        paragraphs = [re.sub(r"\s+", " ", item).strip() for item in re.split(r"\n{2,}", cleaned) if item.strip()]
-        if len(paragraphs) == 1 and len(paragraphs[0].split()) > max_tokens:
-            paragraphs = [item.strip() for item in re.split(r"(?<=[.!?।])\s+", paragraphs[0]) if item.strip()]
-        chunks: list[dict] = []
-        current_words: list[str] = []
-        cursor = 0
-        start = 0
+        lines = cleaned.split("\n")
+        sections: list[dict] = []
+        current_title = "Document"
+        current_lines: list[str] = []
 
         def flush() -> None:
-            nonlocal current_words, start
-            if not current_words:
+            body = "\n".join(current_lines).strip()
+            if body:
+                sections.append(
+                    {
+                        "section_id": str(uuid.uuid4())[:12],
+                        "section_title": current_title.strip()[:160],
+                        "body": body,
+                    }
+                )
+
+        for raw_line in lines:
+            line = raw_line.rstrip()
+            stripped = line.strip()
+            is_heading = False
+            if _POLICY_HEADING_RE.match(stripped):
+                is_heading = True
+            elif _HEADING_RE.match(stripped) and len(stripped.split()) <= 8 and not stripped.endswith("."):
+                # All-caps or Title-Case short line — likely a heading.
+                is_heading = True
+            if is_heading:
+                flush()
+                current_title = re.sub(r"^#+\s*", "", stripped).strip(": -–")
+                current_lines = []
+                continue
+            current_lines.append(raw_line)
+        flush()
+        if not sections:
+            sections.append({"section_id": str(uuid.uuid4())[:12], "section_title": "Document", "body": cleaned})
+        return sections
+
+    @staticmethod
+    def _chunk_section_body(body: str, max_tokens: int = 450, overlap_tokens: int = 50) -> list[dict]:
+        """Paragraph-aware semantic chunking with tiktoken-accurate sizes.
+
+        Strategy: split on paragraph boundaries, greedily pack paragraphs up
+        to ``max_tokens``, then carry the trailing ``overlap_tokens`` into the
+        next chunk for boundary recall. A paragraph that on its own exceeds
+        ``max_tokens`` is sliced mid-paragraph as a last resort. Token counts
+        come from ``cl100k_base`` so they line up with embedding model
+        behavior (text-embedding-3-small uses the same tokenizer family).
+        """
+        cleaned = re.sub(r"\r\n?", "\n", body or "").strip()
+        if not cleaned:
+            return []
+        paragraphs = [
+            re.sub(r"\s+", " ", item).strip()
+            for item in re.split(r"\n{2,}", cleaned)
+            if item.strip()
+        ]
+        chunks: list[dict] = []
+        current: list[str] = []
+        current_tokens = 0
+        cursor = 0  # char position into the original body
+        chunk_start = 0
+
+        def _flush() -> None:
+            nonlocal current, current_tokens, chunk_start
+            if not current:
                 return
-            chunk_text = " ".join(current_words).strip()
-            chunks.append({"text": chunk_text, "char_start": start, "char_end": start + len(chunk_text)})
-            current_words = current_words[-overlap_tokens:] if overlap_tokens else []
-            start = max(start + len(chunk_text) - len(" ".join(current_words)), 0)
+            chunk_text = "\n\n".join(current)
+            chunks.append(
+                {
+                    "text": chunk_text,
+                    "char_start": chunk_start,
+                    "char_end": chunk_start + len(chunk_text),
+                }
+            )
+            # Carry the last ``overlap_tokens`` of this chunk into the next as
+            # a single seeded paragraph. Falls back to no overlap when the
+            # chunk is already shorter than the overlap window.
+            if overlap_tokens > 0 and current_tokens > overlap_tokens:
+                tail_ids = _TOKEN_ENCODER.encode(chunk_text)[-overlap_tokens:]
+                tail_text = _TOKEN_ENCODER.decode(tail_ids)
+                current = [tail_text]
+                current_tokens = len(tail_ids)
+                chunk_start = max(0, chunk_start + len(chunk_text) - len(tail_text))
+            else:
+                current = []
+                current_tokens = 0
+                chunk_start = cursor
 
         for paragraph in paragraphs:
-            words = paragraph.split()
-            if not words:
+            para_tokens = len(_TOKEN_ENCODER.encode(paragraph))
+            if not current:
+                chunk_start = cursor
+
+            if para_tokens > max_tokens:
+                # Paragraph alone is too big — flush, then slice it.
+                _flush()
+                token_ids = _TOKEN_ENCODER.encode(paragraph)
+                step = max(1, max_tokens - overlap_tokens)
+                for i in range(0, len(token_ids), step):
+                    window = token_ids[i : i + max_tokens]
+                    slice_text = _TOKEN_ENCODER.decode(window)
+                    chunks.append(
+                        {
+                            "text": slice_text,
+                            "char_start": cursor,
+                            "char_end": cursor + len(slice_text),
+                        }
+                    )
+                cursor += len(paragraph) + 2  # account for the \n\n separator
                 continue
-            for word in words:
-                if not current_words:
-                    start = cursor
-                if len(current_words) >= max_tokens:
-                    flush()
-                current_words.append(word)
-                cursor += len(word) + 1
-            if len(current_words) >= max_tokens:
-                flush()
-        if current_words:
-            flush()
-        return chunks[:200]
+
+            if current_tokens + para_tokens > max_tokens:
+                _flush()
+                if not current:
+                    chunk_start = cursor
+            current.append(paragraph)
+            current_tokens += para_tokens
+            cursor += len(paragraph) + 2
+
+        _flush()
+        return chunks
+
+    @staticmethod
+    def _chunk_text(text: str, max_tokens: int = 450, overlap_tokens: int = 50) -> list[dict]:
+        sections = AgentKnowledgeService._split_sections(text)
+        chunks: list[dict] = []
+        for section in sections:
+            body = section["body"]
+            section_chunks = AgentKnowledgeService._chunk_section_body(body, max_tokens, overlap_tokens)
+            # Cap parent_section_text size to keep payloads manageable but
+            # large enough to expand a sliced cancellation/refund table.
+            parent_text = body[:4000]
+            for chunk in section_chunks:
+                chunk["section_id"] = section["section_id"]
+                chunk["section_title"] = section["section_title"]
+                chunk["parent_section_text"] = parent_text
+                chunks.append(chunk)
+                if len(chunks) >= 200:
+                    return chunks
+        return chunks
 
     @staticmethod
     def _chunk_payload(
@@ -224,6 +380,9 @@ class AgentKnowledgeService:
             "topic": AgentKnowledgeService._topic_for_text(text),
             "sensitivity": sensitivity,
             "source_title": document.get("name"),
+            "section_id": chunk.get("section_id"),
+            "section_title": chunk.get("section_title"),
+            "parent_section_text": chunk.get("parent_section_text"),
             "char_start": chunk.get("char_start", 0),
             "char_end": chunk.get("char_end", 0),
             "token_count": max(1, len(text.split())),
@@ -387,17 +546,53 @@ class AgentKnowledgeService:
             document_type = "other"
         document_id = str(uuid.uuid4())
         created_at = AgentKnowledgeService._now()
-        blob = await AzureBlobService.upload_agent_knowledge_document(
-            tenant_res.tenant_id,
-            tenant_res.blob_prefix,
-            document_id,
-            filename,
-            content,
-            content_type,
-        )
-        extracted_text = AgentKnowledgeService._extract_text(filename, content)
-        chunks = AgentKnowledgeService._chunk_text(extracted_text)
-        status = "pending" if chunks else "empty"
+
+        # Stage 1: blob upload. If this fails (Azure storage misconfigured,
+        # credentials expired, etc.) we STILL want the document to land in
+        # the registry with an error — never silently vanish.
+        blob_error: str | None = None
+        try:
+            blob = await AzureBlobService.upload_agent_knowledge_document(
+                tenant_res.tenant_id,
+                tenant_res.blob_prefix,
+                document_id,
+                filename,
+                content,
+                content_type,
+            )
+        except Exception as exc:
+            import traceback
+            tb = traceback.format_exc()
+            print(f"[NOKVO-KB] blob upload failed for {filename!r}: {exc!r}\n{tb[:1200]}")
+            blob = {"blob_path": None, "blob_name": None}
+            blob_error = f"Blob upload failed: {str(exc)[:200]}"
+
+        # Stage 2: text extraction + chunking. _extract_text has its own
+        # try/except so it shouldn't raise. _chunk_text uses tiktoken and is
+        # safe. Guarding anyway.
+        try:
+            extracted_text = AgentKnowledgeService._extract_text(filename, content)
+            chunks = AgentKnowledgeService._chunk_text(extracted_text)
+        except Exception as exc:
+            import traceback
+            tb = traceback.format_exc()
+            print(f"[NOKVO-KB] extract/chunk failed for {filename!r}: {exc!r}\n{tb[:1200]}")
+            chunks = []
+            extracted_text = ""
+            blob_error = (blob_error + "; " if blob_error else "") + f"Extract/chunk failed: {str(exc)[:200]}"
+
+        if chunks:
+            status = "pending"
+            initial_approval = "approved"
+            initial_last_error = blob_error
+        elif blob_error:
+            status = "error"
+            initial_approval = "rejected"
+            initial_last_error = blob_error
+        else:
+            status = "empty"
+            initial_approval = "rejected"
+            initial_last_error = "No usable text was found in this document."
         document = {
             "id": document_id,
             "document_version_id": str(uuid.uuid4()),
@@ -406,9 +601,9 @@ class AgentKnowledgeService:
             "description": (description or "").strip()[:1000] or None,
             "tags": AgentKnowledgeService._normalize_tags(tags),
             "status": status,
-            "approval_status": "approved" if chunks else "rejected",
-            "blob_path": blob["blob_path"],
-            "blob_name": blob["blob_name"],
+            "approval_status": initial_approval,
+            "blob_path": blob.get("blob_path"),
+            "blob_name": blob.get("blob_name"),
             "content_type": content_type,
             "size_bytes": len(content),
             "chunk_count": len(chunks),
@@ -416,9 +611,9 @@ class AgentKnowledgeService:
             "chunks": chunks,
             "uploaded_by": str(current_user.id),
             "created_at": created_at,
-            "approved_at": created_at if chunks else None,
-            "approved_by": str(current_user.id) if chunks else None,
-            "last_error": None if chunks else "No usable text was found in this document.",
+            "approved_at": created_at if chunks and not blob_error else None,
+            "approved_by": str(current_user.id) if chunks and not blob_error else None,
+            "last_error": initial_last_error,
         }
         provider_status = AgentKnowledgeService._provider_status(tenant_res)
         if chunks:
@@ -432,7 +627,21 @@ class AgentKnowledgeService:
                     "ok",
                     db=db,
                 )
+                # Generate policy cards for the freshly-approved document. We
+                # only attach them when the upsert above succeeded so a half-
+                # ingested doc never becomes the source of deterministic
+                # answers.
+                policy_cards = AgentKnowledgeService._build_policy_cards(document, document["policy_version"])
+                if policy_cards:
+                    existing = AgentKnowledgeService._policy_cards(provider_status)
+                    AgentKnowledgeService._set_policy_cards(provider_status, existing + policy_cards)
             except Exception as exc:
+                # Log the actual failure cause so we don't have to guess
+                # later from a 400. Embedding 429s, Qdrant unreachable,
+                # tiktoken edge cases — all should surface here.
+                import traceback
+                tb = traceback.format_exc()
+                print(f"[NOKVO-KB] upload_document chunk-upsert failed: {exc!r}\n{tb[:1500]}")
                 document["status"] = "error"
                 document["approval_status"] = "rejected"
                 document["approved_at"] = None
@@ -442,13 +651,26 @@ class AgentKnowledgeService:
         documents = AgentKnowledgeService._documents(provider_status)
         documents.append(document)
         AgentKnowledgeService._set_documents(provider_status, documents)
+        print(f"[NOKVO-KB] registered document {document['id']} ({document['name']!r}) status={document['status']} approval={document['approval_status']} chunks={document['chunk_count']}")
         if not (chunks and document["status"] == "ok"):
             provider_status.setdefault(AGENT_POLICY_VERSION_KEY, "pv_default")
         tenant_res.provider_status = provider_status
         flag_modified(tenant_res, "provider_status")
-        db.add(tenant_res)
-        await db.commit()
-        await db.refresh(tenant_res)
+        try:
+            db.add(tenant_res)
+            await db.commit()
+            await db.refresh(tenant_res)
+        except Exception as exc:
+            import traceback
+            tb = traceback.format_exc()
+            print(f"[NOKVO-KB] upload_document commit failed: {exc!r}\n{tb[:1500]}")
+            await db.rollback()
+            # If we got this far, surface the doc-with-error rather than
+            # raising — the caller asked for an upload and we managed to
+            # at least record the failure.
+            document["status"] = "error"
+            document["approval_status"] = "rejected"
+            document["last_error"] = f"persistence failed: {str(exc)[:400]}"
         return AgentKnowledgeService._document_response(document)
 
     @staticmethod
@@ -481,6 +703,10 @@ class AgentKnowledgeService:
             card for card in AgentKnowledgeService._answer_cards(provider_status)
             if card.get("document_id") != selected["id"]
         ]
+        existing_policy_cards = [
+            card for card in AgentKnowledgeService._policy_cards(provider_status)
+            if card.get("document_id") != selected["id"]
+        ]
         if approve:
             policy_version = AgentKnowledgeService._bump_policy_version(provider_status)
             selected["policy_version"] = policy_version
@@ -492,6 +718,9 @@ class AgentKnowledgeService:
                 db=db,
             )
             existing_cards.extend(AgentKnowledgeService._build_answer_cards(selected, policy_version))
+            existing_policy_cards.extend(
+                AgentKnowledgeService._build_policy_cards(selected, policy_version)
+            )
         else:
             selected["qdrant_point_count"] = 0
             await QdrantService.delete_points_by_filter(
@@ -501,6 +730,7 @@ class AgentKnowledgeService:
             )
             AgentKnowledgeService._bump_policy_version(provider_status)
         AgentKnowledgeService._set_answer_cards(provider_status, existing_cards)
+        AgentKnowledgeService._set_policy_cards(provider_status, existing_policy_cards)
 
         AgentKnowledgeService._set_documents(provider_status, documents)
         tenant_res.provider_status = provider_status
@@ -509,6 +739,279 @@ class AgentKnowledgeService:
         await db.commit()
         await db.refresh(tenant_res)
         return AgentKnowledgeService._document_response(selected)
+
+    @staticmethod
+    async def reconcile_from_qdrant(
+        tenant_res: TenantResources,
+        db: AsyncSession,
+    ) -> dict:
+        """Rebuild the document registry from chunks that exist in Qdrant.
+
+        Useful when an earlier upload succeeded in writing vectors to Qdrant
+        but failed to persist the metadata into ``provider_status`` (Azure
+        Blob outage, transient DB error, etc.). Walks every point in the
+        tenant collection with ``source_type=agent_knowledge``, groups by
+        ``document_id``, and for each orphaned doc creates a stub entry with
+        the chunk texts reconstructed from the payload — marked approved+
+        active so the agent immediately starts using them.
+
+        Returns a summary: how many docs were reconciled, how many chunks
+        each, and the new total.
+        """
+        provider_status = AgentKnowledgeService._provider_status(tenant_res)
+        existing_doc_ids = {
+            str(doc.get("id"))
+            for doc in AgentKnowledgeService._documents(provider_status)
+        }
+
+        try:
+            points = await QdrantService.scroll_points(
+                tenant_res,
+                payload_filters={"source_type": AGENT_KNOWLEDGE_SOURCE_TYPE},
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Qdrant scan failed: {exc}") from exc
+
+        # Group points by document_id
+        by_doc: dict[str, list[Any]] = {}
+        for p in points:
+            payload = dict(getattr(p, "payload", {}) or {})
+            doc_id = str(payload.get("document_id") or "")
+            if not doc_id or doc_id in existing_doc_ids:
+                continue
+            by_doc.setdefault(doc_id, []).append(p)
+
+        if not by_doc:
+            return {"reconciled": 0, "documents": [], "total_after": len(existing_doc_ids)}
+
+        reconciled_docs: list[dict] = []
+        documents = AgentKnowledgeService._documents(provider_status)
+        for doc_id, doc_points in by_doc.items():
+            # Sort by chunk_index so order is preserved.
+            doc_points.sort(key=lambda p: int((getattr(p, "payload", {}) or {}).get("chunk_index") or 0))
+            first = dict(getattr(doc_points[0], "payload", {}) or {})
+            chunks: list[dict] = []
+            for p in doc_points:
+                pay = dict(getattr(p, "payload", {}) or {})
+                chunks.append(
+                    {
+                        "text": str(pay.get("text") or ""),
+                        "char_start": int(pay.get("char_start") or 0),
+                        "char_end": int(pay.get("char_end") or 0),
+                        "section_id": pay.get("section_id"),
+                        "section_title": pay.get("section_title"),
+                        "parent_section_text": pay.get("parent_section_text"),
+                    }
+                )
+            reconciled_at = AgentKnowledgeService._now()
+            document = {
+                "id": doc_id,
+                "document_version_id": str(first.get("document_version_id") or str(uuid.uuid4())),
+                "name": str(first.get("document_name") or first.get("source_title") or f"reconciled:{doc_id[:8]}"),
+                "document_type": str(first.get("document_type") or first.get("doc_type") or "other"),
+                "description": None,
+                "tags": list(first.get("tags") or []),
+                "status": "active",
+                "approval_status": "approved",
+                "blob_path": str(first.get("blob_path") or "") or None,
+                "blob_name": None,
+                "content_type": None,
+                "size_bytes": 0,
+                "chunk_count": len(chunks),
+                "qdrant_point_count": len(chunks),
+                "chunks": chunks,
+                "uploaded_by": None,
+                "created_at": str(first.get("created_at") or reconciled_at),
+                "approved_at": reconciled_at,
+                "approved_by": None,
+                "last_error": None,
+                "policy_version": str(first.get("policy_version") or "pv_default"),
+                "reconciled_at": reconciled_at,
+            }
+            documents.append(document)
+            reconciled_docs.append(
+                {"document_id": doc_id, "name": document["name"], "chunks": len(chunks)}
+            )
+            print(f"[NOKVO-KB] reconciled document {doc_id} ({document['name']!r}) with {len(chunks)} chunks")
+
+            # Generate policy cards on the fly so cancellation/refund routing
+            # works immediately for the reconciled doc.
+            try:
+                policy_cards = AgentKnowledgeService._build_policy_cards(document, document["policy_version"])
+                if policy_cards:
+                    existing_cards = AgentKnowledgeService._policy_cards(provider_status)
+                    AgentKnowledgeService._set_policy_cards(provider_status, existing_cards + policy_cards)
+            except Exception as exc:
+                print(f"[NOKVO-KB] reconcile: policy card generation failed for {doc_id}: {exc!r}")
+
+        AgentKnowledgeService._set_documents(provider_status, documents)
+        # Align the global agent_policy_version with what the reconciled
+        # documents actually have (taken from the chunk payloads in Qdrant).
+        # If we BUMP instead, retrieval's policy_version filter would no
+        # longer match any of the chunks we just resurfaced.
+        chunk_versions = [
+            doc.get("policy_version")
+            for doc in documents
+            if doc.get("policy_version")
+        ]
+        if chunk_versions:
+            # Pick the most common version from the reconciled docs.
+            from collections import Counter
+            most_common, _count = Counter(chunk_versions).most_common(1)[0]
+            provider_status[AGENT_POLICY_VERSION_KEY] = str(most_common)
+        tenant_res.provider_status = provider_status
+        flag_modified(tenant_res, "provider_status")
+        try:
+            db.add(tenant_res)
+            await db.commit()
+            await db.refresh(tenant_res)
+        except Exception as exc:
+            await db.rollback()
+            raise RuntimeError(f"Reconcile persistence failed: {exc}") from exc
+        return {
+            "reconciled": len(reconciled_docs),
+            "documents": reconciled_docs,
+            "total_after": len(documents),
+        }
+
+    @staticmethod
+    def get_document_chunks(tenant_res: TenantResources, document_id: str) -> dict:
+        """Return all chunks for one document in display-ready shape.
+
+        Reads from ``provider_status.agent_knowledge_documents[*].chunks`` —
+        the same data we already embedded into Qdrant — so the admin can see
+        exactly what the agent is grounding on for this document. Raises
+        ``ValueError`` if the document doesn't exist on this tenant.
+        """
+        provider_status = AgentKnowledgeService._provider_status(tenant_res)
+        for document in AgentKnowledgeService._documents(provider_status):
+            if document.get("id") != document_id:
+                continue
+            chunks = []
+            for index, chunk in enumerate(document.get("chunks") or []):
+                chunks.append(
+                    {
+                        "index": index,
+                        "text": str(chunk.get("text") or ""),
+                        "section_id": chunk.get("section_id"),
+                        "section_title": chunk.get("section_title"),
+                        "char_start": int(chunk.get("char_start") or 0),
+                        "char_end": int(chunk.get("char_end") or 0),
+                        "token_count": int(chunk.get("token_count") or 0) or max(1, len((chunk.get("text") or "").split())),
+                    }
+                )
+            return {
+                "document_id": document_id,
+                "document_name": document.get("name"),
+                "document_type": document.get("document_type"),
+                "approval_status": document.get("approval_status"),
+                "status": document.get("status"),
+                "chunk_count": len(chunks),
+                "qdrant_point_count": int(document.get("qdrant_point_count") or 0),
+                "policy_version": document.get("policy_version"),
+                "chunks": chunks,
+            }
+        raise ValueError("Agent Knowledge document not found")
+
+    @staticmethod
+    async def delete_document(
+        tenant_res: TenantResources,
+        db: AsyncSession,
+        document_id: str,
+    ) -> dict:
+        """Hard-delete a knowledge-base document and everything it produced.
+
+        Steps (in order):
+          1. Qdrant points for the document → embeddings gone so retrieval
+             can't surface them.
+          2. Answer cards and policy cards generated from this document.
+          3. Source blob(s) in Azure Blob Storage — sweeps the entire
+             ``agent-knowledge/{document_id}/`` prefix so retry-orphans get
+             cleaned up too, not just the single ``blob_path`` we stored.
+          4. Registry entry in ``provider_status``.
+          5. Bump ``agent_policy_version`` so cached answers age out.
+
+        Returns ``{document_id, deleted, qdrant_deleted, blobs_deleted}`` so
+        the caller / UI can show exactly what was reclaimed.
+        Raises ``ValueError`` if the document_id isn't in the registry.
+        """
+        provider_status = AgentKnowledgeService._provider_status(tenant_res)
+        documents = AgentKnowledgeService._documents(provider_status)
+        target = None
+        for document in documents:
+            if document.get("id") == document_id:
+                target = document
+                break
+        if not target:
+            raise ValueError("Agent Knowledge document not found")
+
+        # 1) Drop the vectors first — best to make them unreachable before
+        #    we forget the document existed, in case anything fails midway.
+        qdrant_deleted = True
+        try:
+            await QdrantService.delete_points_by_filter(
+                tenant_res,
+                {"source_type": AGENT_KNOWLEDGE_SOURCE_TYPE, "document_id": document_id},
+                db=db,
+            )
+            print(f"[NOKVO-KB] delete: removed Qdrant points for document_id={document_id}")
+        except Exception as exc:
+            qdrant_deleted = False
+            import traceback
+            tb = traceback.format_exc()
+            print(f"[NOKVO-KB] delete: Qdrant delete failed for {document_id}: {exc!r}\n{tb[:1000]}")
+
+        # 2) Prune answer + policy cards belonging to this document.
+        remaining_answer_cards = [
+            card for card in AgentKnowledgeService._answer_cards(provider_status)
+            if card.get("document_id") != document_id
+        ]
+        AgentKnowledgeService._set_answer_cards(provider_status, remaining_answer_cards)
+
+        remaining_policy_cards = [
+            card for card in AgentKnowledgeService._policy_cards(provider_status)
+            if card.get("document_id") != document_id
+        ]
+        AgentKnowledgeService._set_policy_cards(provider_status, remaining_policy_cards)
+
+        # 3) Sweep ALL blobs for this document_id (not just the recorded
+        #    blob_path — earlier retries may have orphaned others under the
+        #    same agent-knowledge/{document_id}/ prefix).
+        blobs_deleted = 0
+        blob_path = target.get("blob_path")
+        try:
+            blobs_deleted = await AzureBlobService.delete_agent_knowledge_document(
+                tenant_res.tenant_id,
+                blob_path or "",
+                blob_prefix=tenant_res.blob_prefix,
+                document_id=document_id,
+            )
+        except Exception as exc:
+            import traceback
+            tb = traceback.format_exc()
+            print(f"[NOKVO-KB] delete: blob sweep failed for {document_id}: {exc!r}\n{tb[:1000]}")
+
+        # 4) Remove from the registry and bump policy_version so any cached
+        #    answers tied to the prior version age out.
+        documents = [doc for doc in documents if doc.get("id") != document_id]
+        AgentKnowledgeService._set_documents(provider_status, documents)
+        AgentKnowledgeService._bump_policy_version(provider_status)
+
+        tenant_res.provider_status = provider_status
+        flag_modified(tenant_res, "provider_status")
+        db.add(tenant_res)
+        await db.commit()
+        await db.refresh(tenant_res)
+        print(
+            f"[NOKVO-KB] delete: document_id={document_id} qdrant_ok={qdrant_deleted} "
+            f"blobs_deleted={blobs_deleted}"
+        )
+        return {
+            "document_id": document_id,
+            "deleted": True,
+            "qdrant_deleted": qdrant_deleted,
+            "blobs_deleted": blobs_deleted,
+        }
 
     @staticmethod
     async def rechunk_documents(
@@ -550,11 +1053,14 @@ class AgentKnowledgeService:
 
         if updated_documents:
             active_cards: list[dict] = []
+            active_policy_cards: list[dict] = []
             policy_version = str(provider_status.get(AGENT_POLICY_VERSION_KEY) or "pv_default")
             for document in documents:
                 if document.get("approval_status") == "approved" and document.get("status") in {"active", "ok"}:
                     active_cards.extend(AgentKnowledgeService._build_answer_cards(document, policy_version))
+                    active_policy_cards.extend(AgentKnowledgeService._build_policy_cards(document, policy_version))
             AgentKnowledgeService._set_answer_cards(provider_status, active_cards)
+            AgentKnowledgeService._set_policy_cards(provider_status, active_policy_cards)
 
         AgentKnowledgeService._set_documents(provider_status, documents)
         tenant_res.provider_status = provider_status
@@ -600,18 +1106,26 @@ class AgentKnowledgeService:
         top_k: int = 5,
         db: AsyncSession | None = None,
     ) -> dict:
+        """Source of truth for whether a chunk is usable: the Qdrant payload's
+        ``approval_status``/``status`` fields (set at upsert time). The
+        ``provider_status.agent_knowledge_documents`` registry is treated as
+        a HINT for the document_id whitelist, but if the registry is empty
+        we trust Qdrant directly — otherwise tenants whose registry got
+        desynced from Qdrant (failed DB commit after a successful upsert)
+        see "No approved documents" even though their vectors are there.
+        """
         provider_status = AgentKnowledgeService._provider_status(tenant_res)
         approved_document_ids = {
             str(document.get("id"))
             for document in AgentKnowledgeService._documents(provider_status)
             if document.get("approval_status") == "approved" and document.get("status") in {"active", "ok"}
         }
-        if not approved_document_ids:
-            return {
-                "query": query,
-                "chunks": [],
-                "refusal": "No approved Agent Knowledge documents are active for this organization.",
-            }
+        registry_empty = not approved_document_ids
+        if registry_empty:
+            print(
+                f"[NOKVO-KB] test_retrieval: registry empty for tenant {tenant_res.tenant_id}; "
+                f"trusting Qdrant payload filters as the source of truth"
+            )
 
         policy_version = str(provider_status.get(AGENT_POLICY_VERSION_KEY) or "")
         language = detect_language(query)
@@ -622,10 +1136,13 @@ class AgentKnowledgeService:
             "approval_status": "approved",
             "status": "active",
         }
-        if policy_version:
+        # Don't filter by policy_version when the registry is empty — chunks
+        # in Qdrant might have a different version stamped at their original
+        # upsert time, and we shouldn't hide them from the user just because
+        # we lost the metadata. Once they reconcile, the version filter
+        # re-engages.
+        if policy_version and not registry_empty:
             filters["policy_version"] = policy_version
-        # Prefer same-language chunks when available; English docs remain usable
-        # for Indian-English/Hinglish tenants because many policies are English.
         if language != "en":
             filters["language"] = [language, "en"]
 
@@ -637,10 +1154,19 @@ class AgentKnowledgeService:
             payload_filters=filters,
             db=db,
         )
+
+        def _is_approved_chunk(point) -> bool:
+            doc_id = str((getattr(point, "payload", {}) or {}).get("document_id") or "")
+            if registry_empty:
+                # Trust the Qdrant approval_status/status filters that have
+                # already been applied above. Any returned chunk is approved.
+                return True
+            return doc_id in approved_document_ids
+
         chunks = [
             AgentKnowledgeService._map_search_result(point)
             for point in results
-            if str((getattr(point, "payload", {}) or {}).get("document_id") or "") in approved_document_ids
+            if _is_approved_chunk(point)
         ]
         refusal = None
         if not chunks:

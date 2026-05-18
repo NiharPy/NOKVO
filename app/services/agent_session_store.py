@@ -106,11 +106,12 @@ class AgentSessionStore:
             raw = await cls.client().get(cls.session_key(tenant_res, call_id))
             value = json.loads(raw) if raw else []
             if isinstance(value, list):
+                max_turns = int(settings.AGENT_SESSION_HISTORY_MAX_TURNS)
                 return [
                     {"role": str(item.get("role") or ""), "content": str(item.get("content") or "")}
                     for item in value
                     if isinstance(item, dict)
-                ][-12:]
+                ][-max_turns:]
         except Exception:
             return []
         return []
@@ -126,11 +127,12 @@ class AgentSessionStore:
                 {"role": "assistant", "content": answer[:2000]},
             ]
         )
-        history = history[-12:]
+        max_turns = int(settings.AGENT_SESSION_HISTORY_MAX_TURNS)
+        history = history[-max_turns:]
         try:
             await cls.client().setex(
                 cls.session_key(tenant_res, call_id),
-                max(300, int(settings.AGENT_ANSWER_CACHE_TTL_SECONDS) * 4),
+                int(settings.AGENT_SESSION_HISTORY_TTL_SECONDS),
                 json.dumps(history, ensure_ascii=False),
             )
         except Exception:

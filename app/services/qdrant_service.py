@@ -1,5 +1,7 @@
+import asyncio
 import re
 import uuid
+from typing import Any
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, Filter, FieldCondition, FilterSelector, MatchAny, MatchValue, PayloadSchemaType, PointStruct, VectorParams
 from app.core.config import settings
@@ -9,6 +11,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 class QdrantService:
     _INDEXED_COLLECTIONS: set[str] = set()
+    _CLIENT: QdrantClient | None = None
+    _CLIENT_KEY: tuple[str, str] | None = None
     TOOLKIT_PAYLOAD_INDEX_FIELDS = [
         "organization_id",
         "tenant_id",
@@ -47,9 +51,16 @@ class QdrantService:
 
     @staticmethod
     def _client() -> QdrantClient:
+        key = (settings.QDRANT_URL, settings.QDRANT_API_KEY)
+        if QdrantService._CLIENT is not None and QdrantService._CLIENT_KEY == key:
+            return QdrantService._CLIENT
         if settings.QDRANT_URL == ":memory:":
-            return QdrantClient(location=":memory:")
-        return QdrantClient(url=settings.QDRANT_URL, api_key=settings.QDRANT_API_KEY, timeout=60.0)
+            client = QdrantClient(location=":memory:")
+        else:
+            client = QdrantClient(url=settings.QDRANT_URL, api_key=settings.QDRANT_API_KEY, timeout=60.0)
+        QdrantService._CLIENT = client
+        QdrantService._CLIENT_KEY = key
+        return client
 
     @staticmethod
     def collection_name_for_tenant(tenant_id: str) -> str:
@@ -156,14 +167,18 @@ class QdrantService:
         superadmin_id: uuid.UUID | None = None,
     ):
         collection_name = QdrantService._required_collection(tenant_res)
-        client = QdrantService._client()
-        QdrantService.ensure_payload_indexes(collection_name, client)
-        response = client.query_points(
-            collection_name=collection_name,
-            query=query_vector,
-            limit=limit,
-            query_filter=QdrantService._payload_filter(tenant_res, payload_filters),
-        )
+
+        def _query():
+            client = QdrantService._client()
+            QdrantService.ensure_payload_indexes(collection_name, client)
+            return client.query_points(
+                collection_name=collection_name,
+                query=query_vector,
+                limit=limit,
+                query_filter=QdrantService._payload_filter(tenant_res, payload_filters),
+            )
+
+        response = await asyncio.to_thread(_query)
         results = getattr(response, "points", [])
         await QdrantService._audit(
             db,
@@ -173,6 +188,41 @@ class QdrantService:
             {"tenant_id": tenant_res.tenant_id, "limit": limit, "results_count": len(results)},
         )
         return results
+
+    @staticmethod
+    async def scroll_points(
+        tenant_res: TenantResources,
+        payload_filters: dict | None = None,
+        limit: int = 256,
+        with_vectors: bool = False,
+    ) -> list[Any]:
+        """Page through every point that matches the filter (tenant_id is
+        always required). Used by reconciliation paths that need to walk the
+        collection without ranking."""
+        collection_name = QdrantService._required_collection(tenant_res)
+        client = QdrantService._client()
+        QdrantService.ensure_payload_indexes(collection_name, client)
+        flt = QdrantService._payload_filter(tenant_res, payload_filters)
+        out: list[Any] = []
+        offset = None
+        while True:
+            points, next_offset = client.scroll(
+                collection_name=collection_name,
+                scroll_filter=flt,
+                limit=limit,
+                offset=offset,
+                with_payload=True,
+                with_vectors=with_vectors,
+            )
+            out.extend(points or [])
+            if not next_offset:
+                break
+            offset = next_offset
+            if len(out) >= 5000:
+                # Defensive cap; a single reconciliation shouldn't be processing
+                # more than a few thousand chunks.
+                break
+        return out
 
     @staticmethod
     def _payload_filter(tenant_res: TenantResources, payload_filters: dict | None = None) -> Filter:

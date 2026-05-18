@@ -87,6 +87,56 @@ class SarvamVoiceService:
         raise RuntimeError("Sarvam API key is not configured.")
 
     @staticmethod
+    async def _stt_post_with_retry(
+        client: "httpx.AsyncClient",
+        url: str,
+        api_key: str,
+        data: dict[str, Any],
+        files: dict[str, Any],
+        max_attempts: int = 3,
+    ) -> "httpx.Response":
+        """POST to a Sarvam STT endpoint, retrying on 429 with respect for
+        the Retry-After header. Capped at ~5s total wait so voice latency
+        stays bounded. Returns the final response (success or last failure)."""
+        import asyncio
+
+        attempt = 0
+        last_response: "httpx.Response" | None = None
+        while attempt < max_attempts:
+            attempt += 1
+            response = await client.post(
+                url,
+                headers={"api-subscription-key": api_key},
+                data=data,
+                files=files,
+            )
+            last_response = response
+            if response.status_code != 429:
+                return response
+            # 429 — figure out how long to wait
+            retry_after_hdr = response.headers.get("retry-after", "")
+            try:
+                retry_after = float(retry_after_hdr) if retry_after_hdr else 0.0
+            except ValueError:
+                retry_after = 0.0
+            # Default backoff if Retry-After missing: 0.8s, 1.6s, ...
+            backoff = retry_after if retry_after > 0 else (0.8 * (2 ** (attempt - 1)))
+            # Cap each wait so we don't blow the voice latency budget.
+            wait = min(backoff, 2.0)
+            if attempt >= max_attempts:
+                print(
+                    f"[NOKVO-SARVAM] STT 429 after {attempt} attempts — giving up "
+                    f"(retry_after={retry_after_hdr!r}, body={response.text[:120]!r})"
+                )
+                return response
+            print(
+                f"[NOKVO-SARVAM] STT 429 attempt {attempt}/{max_attempts}; "
+                f"sleeping {wait:.2f}s before retry"
+            )
+            await asyncio.sleep(wait)
+        return last_response  # unreachable in practice
+
+    @staticmethod
     async def transcribe_rest(
         tenant_res: TenantResources,
         audio_bytes: bytes,
@@ -110,11 +160,8 @@ class SarvamVoiceService:
         files = {"file": (filename, audio_bytes, content_type or "application/octet-stream")}
         endpoint = provider_status.get("sarvam_stt_rest_url") or settings.SARVAM_STT_REST_URL
         async with httpx.AsyncClient(timeout=httpx.Timeout(35.0)) as client:
-            response = await client.post(
-                endpoint,
-                headers={"api-subscription-key": api_key},
-                data=data,
-                files=files,
+            response = await SarvamVoiceService._stt_post_with_retry(
+                client, endpoint, api_key, data, files
             )
             if response.status_code >= 400:
                 raise RuntimeError(f"Sarvam STT failed ({response.status_code}): {response.text[:300]}")
@@ -126,6 +173,49 @@ class SarvamVoiceService:
             "language_code": language_code,
             "language": SarvamVoiceService.normalize_language(language_code),
             "language_probability": payload.get("language_probability"),
+            "raw": payload,
+        }
+
+    @staticmethod
+    async def transcribe_translate(
+        tenant_res: TenantResources,
+        audio_bytes: bytes,
+        *,
+        filename: str = "audio.wav",
+        content_type: str = "audio/wav",
+    ) -> dict[str, Any]:
+        """Call Sarvam's speech-to-text-translate endpoint.
+
+        Returns an English-translated transcript regardless of the source
+        language. Used by the cross-lingual retrieval path: the LLM gets the
+        native transcript (preserving the caller's exact words) while the
+        embedding query uses this English version so it matches an English
+        document corpus.
+        """
+        if not audio_bytes:
+            return {"transcript": "", "language_code": None}
+        provider_status = dict(tenant_res.provider_status or {})
+        api_key = await SarvamVoiceService.api_key(tenant_res, "stt")
+        # The translate endpoint requires a saaras:* model.
+        translate_model = provider_status.get("sarvam_stt_translate_model") or "saaras:v3"
+        base = provider_status.get("sarvam_stt_rest_url") or settings.SARVAM_STT_REST_URL
+        translate_endpoint = base.rstrip("/").replace("/speech-to-text", "/speech-to-text-translate")
+        if "/speech-to-text-translate" not in translate_endpoint:
+            translate_endpoint = "https://api.sarvam.ai/speech-to-text-translate"
+        files = {"file": (filename, audio_bytes, content_type or "application/octet-stream")}
+        async with httpx.AsyncClient(timeout=httpx.Timeout(20.0)) as client:
+            response = await SarvamVoiceService._stt_post_with_retry(
+                client, translate_endpoint, api_key, {"model": translate_model}, files,
+            )
+            if response.status_code >= 400:
+                raise RuntimeError(
+                    f"Sarvam translate STT failed ({response.status_code}): {response.text[:300]}"
+                )
+            payload = response.json()
+        return {
+            "request_id": payload.get("request_id"),
+            "transcript": str(payload.get("transcript") or "").strip(),
+            "language_code": payload.get("language_code"),
             "raw": payload,
         }
 
@@ -225,6 +315,9 @@ class SarvamVoiceService:
         text: str,
         *,
         language: str | None = None,
+        pace: float | None = None,
+        pitch: float | None = None,
+        loudness: float | None = None,
     ) -> dict[str, Any]:
         if not text.strip():
             return {"audios": [], "audio_format": settings.SARVAM_TTS_AUDIO_CODEC}
@@ -242,14 +335,40 @@ class SarvamVoiceService:
         }
         if model == "bulbul:v3":
             body["temperature"] = float(provider_status.get("sarvam_tts_temperature") or 0.6)
+        # Per-tone prosody modulation. Sarvam Bulbul accepts pace (0.3-3.0),
+        # pitch (-0.75-0.75), loudness (0.1-3.0); we clamp defensively. Older
+        # bulbul versions / non-bulbul models may not accept these params,
+        # so we add them and gracefully retry without them on 400.
+        prosody_body: dict[str, Any] = {}
+        if pace is not None:
+            prosody_body["pace"] = max(0.3, min(3.0, float(pace)))
+        if pitch is not None:
+            prosody_body["pitch"] = max(-0.75, min(0.75, float(pitch)))
+        if loudness is not None:
+            prosody_body["loudness"] = max(0.1, min(3.0, float(loudness)))
+        body.update(prosody_body)
         async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
             response = await client.post(
                 endpoint,
                 headers={"api-subscription-key": api_key, "Content-Type": "application/json"},
                 json=body,
             )
+            # Retry once without prosody params if the server rejects the
+            # request — saves the entire turn from going silent when a
+            # tenant is on a model that doesn't support pace/pitch/loudness.
+            if response.status_code >= 400 and prosody_body:
+                first_err = response.text[:300]
+                print(f"[NOKVO-TTS] Sarvam rejected prosody params ({response.status_code}): {first_err!r}; retrying without prosody")
+                retry_body = {k: v for k, v in body.items() if k not in prosody_body}
+                response = await client.post(
+                    endpoint,
+                    headers={"api-subscription-key": api_key, "Content-Type": "application/json"},
+                    json=retry_body,
+                )
             if response.status_code >= 400:
-                raise RuntimeError(f"Sarvam TTS failed ({response.status_code}): {response.text[:300]}")
+                error_body = response.text[:300]
+                print(f"[NOKVO-TTS] Sarvam TTS failed ({response.status_code}): {error_body!r}")
+                raise RuntimeError(f"Sarvam TTS failed ({response.status_code}): {error_body}")
             payload = response.json()
         return {
             "request_id": payload.get("request_id"),
@@ -267,6 +386,9 @@ class SarvamVoiceService:
         *,
         language: str | None = None,
         purpose: str = "answer",
+        pace: float | None = None,
+        pitch: float | None = None,
+        loudness: float | None = None,
     ) -> dict[str, Any]:
         stream_id = f"sarvam-tts-{int(perf_counter() * 1000)}"
         started = perf_counter()
@@ -274,7 +396,14 @@ class SarvamVoiceService:
             await websocket.send_json({"type": "tts_started", "stream_id": stream_id, "purpose": purpose, "provider": "sarvam"})
         except Exception:
             pass
-        result = await SarvamVoiceService.synthesize(tenant_res, text, language=language)
+        result = await SarvamVoiceService.synthesize(
+            tenant_res,
+            text,
+            language=language,
+            pace=pace,
+            pitch=pitch,
+            loudness=loudness,
+        )
         first_audio_ms: int | None = None
         for audio in result.get("audios") or []:
             if not audio:
