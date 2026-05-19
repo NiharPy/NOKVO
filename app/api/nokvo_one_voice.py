@@ -210,6 +210,7 @@ async def set_phone_link(
     payload: PhoneLinkConfigRequest,
     request: Request,
     user: OrganizationUser = Depends(_admin_dep()),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
     db: AsyncSession = Depends(deps.get_db),
 ):
     tr = await _tenant_for_user(db, user)
@@ -360,6 +361,7 @@ async def create_campaign(
     doc_file: UploadFile = File(...),
     from_number: str | None = Form(None),
     user: OrganizationUser = Depends(_admin_dep()),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
     db: AsyncSession = Depends(deps.get_db),
 ):
     tr = await _tenant_for_user(db, user)
@@ -397,6 +399,7 @@ async def launch_campaign(
     campaign_id: uuid.UUID,
     request: Request,
     user: OrganizationUser = Depends(_admin_dep()),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
     db: AsyncSession = Depends(deps.get_db),
 ):
     tr = await _tenant_for_user(db, user)
@@ -421,6 +424,7 @@ async def launch_campaign(
 async def cancel_campaign(
     campaign_id: uuid.UUID,
     user: OrganizationUser = Depends(_admin_dep()),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
     db: AsyncSession = Depends(deps.get_db),
 ):
     tr = await _tenant_for_user(db, user)

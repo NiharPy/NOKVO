@@ -241,6 +241,7 @@ class NokvoOneUserResponse(BaseModel):
     status: str
     auth_provider: str
     email_verified: bool
+    mfa_pending: bool = False
     last_login_at: Optional[datetime]
     created_at: datetime
 
@@ -302,6 +303,28 @@ class NokvoOneBusinessFieldDefinition(BaseModel):
 
 class NokvoOneBusinessSchemaUpdateRequest(BaseModel):
     fields: list[NokvoOneBusinessFieldDefinition] = Field(min_length=1, max_length=25)
+
+
+class NokvoOneCustomTabStatusVocabulary(BaseModel):
+    initial: str = Field(min_length=1, max_length=40)
+    all: list[str] = Field(min_length=1, max_length=20)
+    forward: list[str] = Field(default_factory=list, max_length=20)
+
+
+class NokvoOneCustomTabCreateRequest(BaseModel):
+    slug: str = Field(min_length=1, max_length=32)
+    label: str = Field(min_length=1, max_length=80)
+    fields: list[NokvoOneBusinessFieldDefinition] = Field(default_factory=list, max_length=25)
+    status_vocabulary: Optional[NokvoOneCustomTabStatusVocabulary] = None
+    search_keys: list[str] = Field(default_factory=list, max_length=12)
+
+
+class NokvoOneCustomTabResponse(BaseModel):
+    slug: str
+    label: str
+    fields: list[dict[str, Any]] = Field(default_factory=list)
+    status_vocabulary: dict[str, Any] = Field(default_factory=dict)
+    search_keys: list[str] = Field(default_factory=list)
 
 
 class NokvoOneAssignmentSettingsResponse(BaseModel):
@@ -457,6 +480,39 @@ class NokvoOnePredefinedToolResponse(BaseModel):
     description: str
     input_schema: dict[str, Any]
     requires_confirmation: bool
+
+
+class NokvoOneToolGroupResponse(BaseModel):
+    label: str
+    tools: list[NokvoOnePredefinedToolResponse]
+
+
+class NokvoOneToolCatalogResponse(BaseModel):
+    business_type: Optional[str] = None
+    groups: list[NokvoOneToolGroupResponse] = Field(default_factory=list)
+    default_tool_keys: list[str] = Field(default_factory=list)
+
+
+class NokvoOneOutcomeOption(BaseModel):
+    slug: str
+    label: str
+    description: str
+    default_on: bool = False
+
+
+class NokvoOneOutcomesResponse(BaseModel):
+    business_type: Optional[str] = None
+    outcomes: list[NokvoOneOutcomeOption] = Field(default_factory=list)
+    default_agent_name: str
+
+
+class NokvoOneAgentFromOutcomesRequest(BaseModel):
+    outcomes: list[str] = Field(default_factory=list, max_length=20)
+    agent_name: Optional[str] = Field(default=None, max_length=120)
+
+
+class NokvoOneSignupSkipTOTPRequest(BaseModel):
+    setup_token: str
 
 
 class NokvoOneAgentChatRequest(BaseModel):

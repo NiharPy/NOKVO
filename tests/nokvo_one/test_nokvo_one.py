@@ -40,11 +40,11 @@ from app.services.nokvo_one_agent_runtime import NokvoOneAgentRuntime
 from app.services.nokvo_one_assignment_service import NokvoOneAssignmentService
 from app.services.nokvo_one_business_templates import member_label_for_business_type
 from app.services.predefined_tools_service import (
-    CATALOG,
+    CROSS_CUTTING_CATALOG as CATALOG,
     PredefinedToolsService,
     get_tool,
     list_tools,
-    validate_tool_keys,
+    validate_cross_cutting_keys as validate_tool_keys,
 )
 
 
@@ -81,19 +81,17 @@ def test_totp_ciphertexts_are_unique_per_invocation():
 # ─────────── Predefined tools catalog ───────────
 
 
-def test_catalog_has_exactly_v1_tools():
+def test_cross_cutting_catalog_has_expected_tools():
     expected = {
-        "lead_tracker_create_lead",
-        "lead_tracker_update_status",
-        "lead_tracker_add_note",
-        "call_logger_create_entry",
-        "call_logger_get_history",
-        "create_ticket",
+        "call_log_create",
+        "call_log_search",
         "schedule_callback",
         "send_email_draft",
+        "escalate_to_human",
+        "find_contact",
     }
     actual = {tool.key for tool in CATALOG}
-    assert actual == expected, f"V1 catalog drift: missing={expected - actual} extra={actual - expected}"
+    assert actual == expected, f"Cross-cutting catalog drift: missing={expected - actual} extra={actual - expected}"
 
 
 def test_catalog_excludes_dangerous_tools():
@@ -119,19 +117,23 @@ def test_send_email_draft_description_explains_no_direct_send():
 
 def test_list_tools_returns_serialisable_dicts():
     items = list_tools()
-    assert len(items) == 8
+    # Cross-cutting catalog: call_log_create/search, schedule_callback,
+    # send_email_draft, escalate_to_human, find_contact = 6.
+    assert len(items) == 6
     for item in items:
         assert {"key", "display_name", "description", "input_schema", "requires_confirmation"} <= set(item.keys())
 
 
 def test_validate_tool_keys_rejects_unknown():
     with pytest.raises(ValueError):
-        validate_tool_keys(["lead_tracker_create_lead", "web_search"])
+        validate_tool_keys(["send_email_draft", "web_search"])
 
 
-def test_validate_tool_keys_accepts_known():
-    keys = ["lead_tracker_create_lead", "create_ticket"]
-    assert validate_tool_keys(keys) == keys
+def test_validate_tool_keys_resolves_legacy_keys():
+    # legacy keys are now aliased to the new names; validator returns the resolved set.
+    out = validate_tool_keys(["call_logger_get_history", "schedule_callback"])
+    assert "call_log_search" in out
+    assert "schedule_callback" in out
 
 
 # ─────────── Schema validators ───────────
@@ -298,9 +300,10 @@ def test_send_email_draft_dispatch_creates_pending_confirmation():
     assert result["ok"] is True
     assert result["status"] == "pending_confirmation"
     assert "human" in result["message"].lower() or "confirm" in result["message"].lower()
-    assert len(db.added) == 1
-    record = db.added[0]
-    assert record.record_type == "email_draft"
+    # One side-effect row (the draft) plus one audit row (AgentToolInvocation).
+    drafts = [o for o in db.added if getattr(o, "record_type", None) == "email_draft"]
+    assert len(drafts) == 1
+    record = drafts[0]
     assert record.status == "pending_confirmation"
 
 
@@ -312,6 +315,22 @@ def test_unknown_tool_rejected_by_dispatcher():
                 db, uuid.uuid4(), uuid.uuid4(), "web_search", {"query": "x"}
             )
         )
+
+
+def test_tool_dispatcher_rejects_missing_required_fields_before_side_effects():
+    db = _FakeDB()
+    with pytest.raises(ValueError) as exc:
+        _run(
+            PredefinedToolsService.execute(
+                db,
+                uuid.uuid4(),
+                uuid.uuid4(),
+                "schedule_callback",
+                {"contact_phone": "7569672503"},
+            )
+        )
+    assert "callback_at" in str(exc.value)
+    assert db.added == []
 
 
 def _org_and_user(industry=None):
@@ -381,6 +400,10 @@ class _FakeAssignmentDB:
             rows = self.blocked_slots
         elif "nokvo_one_tool_records" in text:
             rows = self.records
+            params = getattr(stmt.compile(), "params", {})
+            requested_id = params.get("id_1")
+            if requested_id is not None:
+                rows = [row for row in rows if row.id == requested_id]
         elif "organization_users" in text:
             rows = self.members
         elif "organizations" in text:
@@ -614,6 +637,30 @@ def test_assignment_hourly_capacity_counts_completed_requests_in_same_hour():
     assert "hourly_request_capacity_reached" in result["skipped_member_reasons"][str(member.id)]
 
 
+def test_assignment_respects_blocked_slots_for_non_clinic_members():
+    organization, _ = _org_and_user(industry="real_estate")
+    member = _member(organization.id, "AgentA")
+    settings = _settings(organization.id, member.id)
+    slot = MemberBlockedSlot(
+        id=uuid.uuid4(),
+        organization_id=organization.id,
+        member_id=member.id,
+        start_time=datetime(2026, 5, 16, 10, 30, tzinfo=timezone.utc),
+        end_time=datetime(2026, 5, 16, 11, 30, tzinfo=timezone.utc),
+    )
+    db = _FakeAssignmentDB(organization, [member], [settings], blocked_slots=[slot])
+    result = _run(
+        NokvoOneAssignmentService.assign_request(
+            db,
+            organization,
+            request_type="property_inquiry",
+            requested_time=datetime(2026, 5, 16, 11, 0, tzinfo=timezone.utc),
+        )
+    )
+    assert result["assignment_status"] == "no_available_member"
+    assert "blocked_slot_conflict" in result["skipped_member_reasons"][str(member.id)]
+
+
 def test_clinic_assignment_skips_blocked_slot():
     organization, _ = _org_and_user(industry="clinics")
     doctor = _member(organization.id, "Dr Rao")
@@ -646,6 +693,23 @@ def test_clinic_assignment_skips_blocked_slot():
     )
     assert result["assignment_status"] == "no_available_member"
     assert "blocked_slot_conflict" in result["skipped_member_reasons"][str(doctor.id)]
+
+
+def test_clinic_assignment_uses_base_schedule_when_clinic_schedule_missing():
+    organization, _ = _org_and_user(industry="clinics")
+    doctor = _member(organization.id, "Dr Rao")
+    settings = _settings(organization.id, doctor.id, request_types=["appointment"])
+    db = _FakeAssignmentDB(organization, [doctor], [settings])
+    result = _run(
+        NokvoOneAssignmentService.assign_request(
+            db,
+            organization,
+            request_type="appointment",
+            requested_time=datetime(2026, 5, 16, 11, 0, tzinfo=timezone.utc),
+        )
+    )
+    assert result["assignment_status"] == "assigned"
+    assert result["selected_member_name"] == "Dr Rao"
 
 
 def test_clinic_assignment_respects_hourly_patient_capacity():
@@ -686,6 +750,119 @@ def test_clinic_assignment_respects_hourly_patient_capacity():
     )
     assert result["assignment_status"] == "no_available_member"
     assert "hourly_patient_capacity_reached" in result["skipped_member_reasons"][str(doctor.id)]
+
+
+def test_appointments_create_assigns_available_clinic_doctor():
+    from app.services.dynamic_tool_resolver import resolve_index
+
+    organization, _ = _org_and_user(industry="clinics")
+    doctor = _member(organization.id, "Dr Rao")
+    settings = _settings(organization.id, doctor.id, request_types=["appointment"])
+    clinic_settings = ClinicMemberScheduleSettings(
+        id=uuid.uuid4(),
+        organization_id=organization.id,
+        member_id=doctor.id,
+        appointment_duration_minutes=30,
+        buffer_minutes=0,
+        max_patients_per_hour=4,
+        max_patients_per_day=20,
+        consultation_types=["appointment"],
+    )
+    db = _FakeAssignmentDB(organization, [doctor], [settings], clinic_settings=[clinic_settings])
+    tool = resolve_index("clinics")["appointments_create"]
+    result = _run(
+        PredefinedToolsService.execute(
+            db,
+            organization.id,
+            uuid.uuid4(),
+            tool,
+            {
+                "patient_name": "Ravi Kumar",
+                "phone": "7569672503",
+                "appointment_time": "2026-05-16T11:00:00+00:00",
+                "reason": "Red eye consultation",
+            },
+        )
+    )
+    assert result["ok"] is True
+    assert result["record_type"] == "appointment"
+    assert result["assignment_status"] == "assigned"
+    assert result["assigned_member_name"] == "Dr Rao"
+    appointment = next(r for r in db.records if r.record_type == "appointment")
+    assert appointment.status == "assigned"
+    assert appointment.data["doctor"] == "Dr Rao"
+    assert appointment.data["assigned_doctor_id"] == str(doctor.id)
+    assert db.audits[-1].selected_member_id == doctor.id
+
+
+def test_appointments_create_records_no_availability_without_fake_confirmation():
+    from app.services.dynamic_tool_resolver import resolve_index
+
+    organization, _ = _org_and_user(industry="clinics")
+    doctor = _member(organization.id, "Dr Rao")
+    settings = _settings(organization.id, doctor.id, request_types=["appointment"], start=time(9, 0), end=time(10, 0))
+    clinic_settings = ClinicMemberScheduleSettings(
+        id=uuid.uuid4(),
+        organization_id=organization.id,
+        member_id=doctor.id,
+        appointment_duration_minutes=30,
+        buffer_minutes=0,
+        max_patients_per_hour=4,
+        max_patients_per_day=20,
+        consultation_types=["appointment"],
+    )
+    db = _FakeAssignmentDB(organization, [doctor], [settings], clinic_settings=[clinic_settings])
+    tool = resolve_index("clinics")["appointments_create"]
+    result = _run(
+        PredefinedToolsService.execute(
+            db,
+            organization.id,
+            uuid.uuid4(),
+            tool,
+            {
+                "patient_name": "Ravi Kumar",
+                "phone": "7569672503",
+                "appointment_time": "2026-05-16T12:00:00+00:00",
+                "reason": "Red eye consultation",
+            },
+        )
+    )
+    assert result["assignment_status"] == "no_available_member"
+    appointment = next(r for r in db.records if r.record_type == "appointment")
+    assert appointment.status == "requested"
+    assert appointment.data["assignment_status"] == "no_available_member"
+    assert "outside_working_hours" in appointment.data["skipped_member_reasons"][str(doctor.id)]
+
+
+def test_real_estate_site_visit_macro_assigns_available_agent():
+    from app.services.dynamic_tool_resolver import resolve_index
+
+    organization, _ = _org_and_user(industry="real_estate")
+    agent = _member(organization.id, "Agent Priya")
+    settings = _settings(organization.id, agent.id, request_types=["site_visit"])
+    db = _FakeAssignmentDB(organization, [agent], [settings])
+    tool = resolve_index("real_estate")["qualify_lead_and_schedule_visit"]
+    result = _run(
+        PredefinedToolsService.execute(
+            db,
+            organization.id,
+            uuid.uuid4(),
+            tool,
+            {
+                "name": "Buyer One",
+                "phone": "7569672503",
+                "property_type": "Apartment",
+                "location": "KPHB",
+                "visit_at": "2026-05-16T11:00:00+00:00",
+            },
+        )
+    )
+    assert result["assignment_status"] == "assigned"
+    assert result["assigned_member_name"] == "Agent Priya"
+    callback = next(r for r in db.records if r.record_type == "callback")
+    assert callback.status == "assigned"
+    assert callback.data["agent"] == "Agent Priya"
+    assert callback.data["assigned_agent_id"] == str(agent.id)
 
 
 def test_clinic_emergency_creates_escalation_without_normal_assignment():
@@ -777,26 +954,76 @@ def test_runtime_injects_business_template_prompt(monkeypatch):
     assert system_prompt.index("Global Nokvo rules:") < system_prompt.index("Business template rules:")
     assert system_prompt.index("Business template rules:") < system_prompt.index("Agent custom prompt:")
     assert system_prompt.index("Agent custom prompt:") < system_prompt.index("RAG rules:")
-    assert system_prompt.index("RAG rules:") < system_prompt.index("Tool rules:")
+    assert system_prompt.index("RAG rules:") < system_prompt.index("Member and availability rules:")
+    assert system_prompt.index("Member and availability rules:") < system_prompt.index("Tool rules:")
     assert system_prompt.index("Tool rules:") < system_prompt.index("Escalation rules:")
 
 
-def test_create_ticket_dispatch():
+def test_runtime_turns_missing_tool_fields_into_clarifying_reply(monkeypatch):
+    responses = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "schedule_callback",
+                        "arguments": '{"contact_phone": "7569672503"}',
+                    },
+                }
+            ],
+        },
+        {"role": "assistant", "content": "I need one more detail before I can do that: callback at."},
+    ]
+
+    async def fake_chat_with_tools(messages, tools):
+        return responses.pop(0)
+
+    monkeypatch.setattr(
+        "app.services.nokvo_one_agent_runtime._AzureOpenAIClient.chat_with_tools",
+        fake_chat_with_tools,
+    )
     db = _FakeDB()
+    result = _run(
+        NokvoOneAgentRuntime.chat_turn(
+            db,
+            organization_id=uuid.uuid4(),
+            user_id=uuid.uuid4(),
+            agent_system_prompt=None,
+            business_type="clinics",
+            tool_keys=["schedule_callback"],
+            user_message="Please call me back on 7569672503",
+        )
+    )
+    assert "callback at" in result["reply"].lower()
+    assert result["tool_calls"][0]["ok"] is False
+    assert db.rolled_back is True
+
+
+def test_tickets_create_dispatch():
+    from app.services.dynamic_tool_resolver import resolve_index
+
+    db = _FakeDB()
+    tool = resolve_index("ecommerce")["tickets_create"]
     result = _run(
         PredefinedToolsService.execute(
             db,
             uuid.uuid4(),
             uuid.uuid4(),
-            "create_ticket",
+            tool,
             {
                 "subject": "Login broken",
-                "description": "Cannot log in since this morning.",
+                "customer_name": "Sample User",
+                "issue_type": "complaint",
                 "priority": "high",
             },
         )
     )
     assert result["ok"] is True
-    assert "ticket_id" in result
-    assert db.added[0].record_type == "ticket"
-    assert db.added[0].status == "open"
+    assert result["record_type"] == "ticket"
+    # ecommerce tickets vocab initial = "open"
+    assert result["status"] == "open"
+    record = next(o for o in db.added if hasattr(o, "record_type") and o.record_type == "ticket")
+    assert record.status == "open"

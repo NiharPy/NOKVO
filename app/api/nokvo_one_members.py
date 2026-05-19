@@ -98,6 +98,24 @@ def _assignment_timezone() -> str:
     return "Asia/Kolkata"
 
 
+def _default_working_days_for_business(industry: str | None) -> list[str]:
+    if industry in {"real_estate", "hospitality"}:
+        return ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+    if industry == "clinics":
+        return ["mon", "tue", "wed", "thu", "fri", "sat"]
+    return ["mon", "tue", "wed", "thu", "fri"]
+
+
+def _default_working_window_for_business(industry: str | None) -> tuple[str, str]:
+    if industry == "clinics":
+        return "10:00", "21:00"
+    if industry == "real_estate":
+        return "09:00", "20:00"
+    if industry == "hospitality":
+        return "08:00", "22:00"
+    return "09:00", "18:00"
+
+
 def _validate_request_types_for_org(organization: Organization, request_types: list[str]) -> list[str]:
     allowed = allowed_request_types(organization.industry)
     invalid = [item for item in request_types if item not in allowed]
@@ -230,16 +248,43 @@ async def update_assignment_settings(
             organization_id=organization.id,
             member_id=member_id,
         )
+    start_default, end_default = _default_working_window_for_business(organization.industry)
+    working_days = payload.working_days
+    start_time = payload.start_time
+    end_time = payload.end_time
+    if payload.is_assignable:
+        working_days = working_days or _default_working_days_for_business(organization.industry)
+        start_time = start_time or start_default
+        end_time = end_time or end_default
+        if not request_types:
+            request_types = sorted(allowed_request_types(organization.industry))
     settings.is_assignable = payload.is_assignable
-    settings.working_days = payload.working_days
-    settings.start_time = _parse_time(payload.start_time)
-    settings.end_time = _parse_time(payload.end_time)
+    settings.working_days = working_days
+    settings.start_time = _parse_time(start_time)
+    settings.end_time = _parse_time(end_time)
     settings.timezone = _assignment_timezone()
     settings.request_types = request_types
     settings.max_active_requests = payload.max_active_requests
     settings.max_requests_per_day = payload.max_requests_per_day
     settings.max_requests_per_hour = payload.max_requests_per_hour
     db.add(settings)
+    if organization.industry == "clinics" and settings.is_assignable:
+        clinic_res = await db.execute(
+            select(ClinicMemberScheduleSettings).where(
+                ClinicMemberScheduleSettings.organization_id == organization.id,
+                ClinicMemberScheduleSettings.member_id == member_id,
+            )
+        )
+        clinic_settings = clinic_res.scalars().first()
+        if clinic_settings is None:
+            clinic_settings = ClinicMemberScheduleSettings(
+                id=uuid.uuid4(),
+                organization_id=organization.id,
+                member_id=member_id,
+            )
+        if not clinic_settings.consultation_types:
+            clinic_settings.consultation_types = sorted(allowed_consultation_types(organization.industry))
+        db.add(clinic_settings)
     await db.commit()
     await db.refresh(settings)
     records = await NokvoOneAssignmentService._load_request_records(db, organization.id)
@@ -344,8 +389,6 @@ async def list_blocked_slots(
     db: AsyncSession = Depends(deps.get_db),
 ):
     organization = await _get_organization(db, user.organization_id)
-    if organization.industry != "clinics":
-        raise HTTPException(status_code=404, detail="Blocked slots are only available for Clinics")
     await _get_member(db, organization.id, member_id)
     res = await db.execute(
         select(MemberBlockedSlot)
@@ -368,8 +411,6 @@ async def create_blocked_slot(
     db: AsyncSession = Depends(deps.get_db),
 ):
     organization = await _get_organization(db, user.organization_id)
-    if organization.industry != "clinics":
-        raise HTTPException(status_code=404, detail="Blocked slots are only available for Clinics")
     await _get_member(db, organization.id, member_id)
     if payload.end_time <= payload.start_time:
         raise HTTPException(status_code=400, detail="Blocked slot end_time must be after start_time")
@@ -404,6 +445,7 @@ async def invite_member(
             allowed_roles=["admin"],
         )
     ),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
     db: AsyncSession = Depends(deps.get_db),
 ):
     org_res = await db.execute(select(Organization).where(Organization.id == inviter.organization_id))

@@ -111,8 +111,6 @@ async def update_blocked_slot(
     db: AsyncSession = Depends(deps.get_db),
 ):
     organization = await _get_organization(db, user.organization_id)
-    if organization.industry != "clinics":
-        raise HTTPException(status_code=404, detail="Blocked slots are only available for Clinics")
     res = await db.execute(
         select(MemberBlockedSlot).where(
             MemberBlockedSlot.id == blocked_slot_id,
@@ -150,8 +148,6 @@ async def delete_blocked_slot(
     db: AsyncSession = Depends(deps.get_db),
 ):
     organization = await _get_organization(db, user.organization_id)
-    if organization.industry != "clinics":
-        raise HTTPException(status_code=404, detail="Blocked slots are only available for Clinics")
     res = await db.execute(
         select(MemberBlockedSlot).where(
             MemberBlockedSlot.id == blocked_slot_id,

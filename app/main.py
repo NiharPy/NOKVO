@@ -1,5 +1,8 @@
+from pathlib import Path
+
 from fastapi import FastAPI, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
@@ -60,6 +63,14 @@ app.include_router(
     prefix="/api/nokvo-one/knowledge-base",
     tags=["nokvo-one-knowledge-base"],
 )
+
+# Serve CC0 call-center ambience clips bundled in app/assets/audio/ so the
+# frontend can mix them under the live agent voice. Path is public — the
+# files are public-domain assets, not tenant data.
+_AMBIENCE_DIR = Path(__file__).resolve().parent / "assets" / "audio"
+if _AMBIENCE_DIR.exists():
+    app.mount("/assets/audio", StaticFiles(directory=str(_AMBIENCE_DIR)), name="audio_assets")
+
 
 @app.get("/health")
 async def health_check():

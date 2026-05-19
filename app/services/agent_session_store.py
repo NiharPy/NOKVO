@@ -167,3 +167,36 @@ class AgentSessionStore:
             )
         except Exception:
             return
+
+    @classmethod
+    async def get_state(cls, tenant_res: TenantResources, call_id: str | None) -> dict[str, Any]:
+        if not call_id:
+            return {}
+        try:
+            raw = await cls.client().get(f"{cls.namespace(tenant_res)}:agent:call:{call_id}:state")
+            value = json.loads(raw) if raw else {}
+            return value if isinstance(value, dict) else {}
+        except Exception:
+            return {}
+
+    @classmethod
+    async def merge_state(
+        cls,
+        tenant_res: TenantResources,
+        call_id: str | None,
+        patch: dict[str, Any],
+        *,
+        ttl_seconds: int = 900,
+    ) -> dict[str, Any]:
+        if not call_id or not isinstance(patch, dict) or not patch:
+            return {}
+        state = await cls.get_state(tenant_res, call_id)
+        for key, value in patch.items():
+            if isinstance(value, dict) and isinstance(state.get(key), dict):
+                merged = dict(state[key])
+                merged.update(value)
+                state[key] = merged
+            else:
+                state[key] = value
+        await cls.set_state(tenant_res, call_id, state, ttl_seconds=ttl_seconds)
+        return state

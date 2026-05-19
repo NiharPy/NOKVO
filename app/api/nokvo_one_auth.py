@@ -37,6 +37,8 @@ from app.schemas.nokvo_one import (
     NokvoOneBusinessTemplateRequest,
     NokvoOneBusinessTemplateSaveResponse,
     NokvoOneBusinessSchemaUpdateRequest,
+    NokvoOneCustomTabCreateRequest,
+    NokvoOneCustomTabResponse,
     NokvoOneEmailVerifiedResponse,
     NokvoOneGoogleLoginRequest,
     NokvoOneLoginRequest,
@@ -48,6 +50,7 @@ from app.schemas.nokvo_one import (
     NokvoOneSessionResponse,
     NokvoOneSignupRequest,
     NokvoOneSignupResponse,
+    NokvoOneSignupSkipTOTPRequest,
     NokvoOneTOTPSetupRequest,
     NokvoOneTOTPSetupResponse,
     NokvoOneTOTPVerifyRequest,
@@ -64,8 +67,12 @@ from app.services.nokvo_one_business_templates import (
     apply_schema_overrides,
     business_type_config,
     business_type_options,
+    custom_tabs_from_overrides,
+    default_custom_tab_status_vocabulary,
     normalize_business_type,
+    normalize_custom_tab_slug,
 )
+from app.services.tool_flow_questions import ensure_tool_flow_questions
 
 
 router = APIRouter()
@@ -152,7 +159,12 @@ def _resolved_business_template(
 
 
 async def _issue_full_session(
-    db: AsyncSession, request: Request, user: OrganizationUser, organization: Organization
+    db: AsyncSession,
+    request: Request,
+    user: OrganizationUser,
+    organization: Organization,
+    *,
+    mfa_completed: bool = True,
 ) -> NokvoOneSessionResponse:
     raw_refresh, token_hash = security.create_refresh_token()
     session = OrganizationSession(
@@ -173,7 +185,7 @@ async def _issue_full_session(
 
     access_token = security.create_access_token(
         subject=user.id,
-        mfa_completed=True,
+        mfa_completed=mfa_completed,
         session_id=str(session.id),
         extra_claims={
             "principal_type": "organization_user",
@@ -636,6 +648,62 @@ async def nokvo_one_signup_totp_verify(
     return NokvoOnePostTotpResponse(organization_id=organization.id, org_status=organization.status)
 
 
+@router.post("/signup/skip-totp", response_model=NokvoOneSessionResponse)
+@limiter.limit("10/hour")
+async def nokvo_one_signup_skip_totp(
+    request: Request,
+    payload: NokvoOneSignupSkipTOTPRequest,
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Onboarding v2: defer MFA for the founding admin.
+
+    Promotes the user to active locally without forcing TOTP setup, mints a
+    session with mfa_completed=False, and flips user.mfa_required=False so
+    subsequent logins also succeed without MFA. Sensitive actions stay
+    blocked by RequireMFACompleted until the user completes MFA from the
+    dashboard banner.
+
+    Only available when NOKVO_ONBOARDING_V2 is enabled. Member invites and
+    privileged actions still require MFA.
+    """
+    if not settings.NOKVO_ONBOARDING_V2:
+        raise HTTPException(status_code=404, detail="Endpoint not available")
+
+    claims = _decode_setup_token(payload.setup_token, expected_stage="totp_setup")
+    user_id = uuid.UUID(claims["sub"])
+    org_id = uuid.UUID(claims["organization_id"])
+
+    user_res = await db.execute(select(OrganizationUser).where(OrganizationUser.id == user_id))
+    user = user_res.scalars().first()
+    if user is None or user.organization_id != org_id:
+        raise HTTPException(status_code=404, detail="Organization user not found")
+    if not user.email_verified:
+        raise HTTPException(status_code=403, detail="Email must be verified first")
+    # Founding admin only — invited members must complete MFA on first login.
+    if user.role != "admin" or user.invited_by is not None:
+        raise HTTPException(status_code=403, detail="MFA cannot be deferred for invited members")
+    # If TOTP is already configured, the user must complete the normal flow.
+    if user.totp_secret_encrypted_v2:
+        raise HTTPException(status_code=409, detail="TOTP is already configured for this account")
+
+    org_res = await db.execute(select(Organization).where(Organization.id == org_id))
+    organization = org_res.scalars().first()
+    if organization is None or organization.product_tier != "nokvo_one":
+        raise HTTPException(status_code=404, detail="Organization not found")
+
+    user.mfa_required = False
+    user.status = "active"
+    if organization.status == "pending_totp":
+        organization.status = "pending_approval"
+    db.add(user)
+    db.add(organization)
+    await db.flush()
+
+    return await _issue_full_session(
+        db, request, user, organization, mfa_completed=False
+    )
+
+
 # ─────────── Password login ───────────
 
 
@@ -737,9 +805,35 @@ async def nokvo_one_login_totp_verify(
 
 @router.get("/config")
 async def nokvo_one_config():
+    ambience_urls: list[str] = []
+    if settings.NOKVO_CALL_CENTER_AMBIENCE_ENABLED:
+        try:
+            from pathlib import Path
+
+            ambience_dir = (
+                Path(__file__).resolve().parents[1]
+                / "assets"
+                / "audio"
+                / "call_center_ambience"
+            )
+            if ambience_dir.exists():
+                ambience_urls = sorted(
+                    f"/assets/audio/call_center_ambience/{p.name}"
+                    for p in ambience_dir.iterdir()
+                    if p.is_file() and p.suffix.lower() in {".mp3", ".ogg", ".wav"}
+                )
+        except Exception:
+            ambience_urls = []
+
     return {
         "google_client_id": settings.GOOGLE_OAUTH_CLIENT_ID,
         "google_login_enabled": bool(settings.GOOGLE_OAUTH_CLIENT_ID),
+        "onboarding_v2_enabled": bool(settings.NOKVO_ONBOARDING_V2),
+        "call_center_ambience": {
+            "enabled": bool(settings.NOKVO_CALL_CENTER_AMBIENCE_ENABLED) and bool(ambience_urls),
+            "volume": float(settings.NOKVO_CALL_CENTER_AMBIENCE_VOLUME),
+            "urls": ambience_urls,
+        },
     }
 
 
@@ -1055,6 +1149,13 @@ async def nokvo_one_save_business_template(
     await db.refresh(organization)
 
     tenant_res = await _tenant_resources_for_org(db, organization.id)
+    provider_status, questions_changed = ensure_tool_flow_questions(tenant_res.provider_status, organization.industry)
+    if questions_changed:
+        tenant_res.provider_status = provider_status
+        flag_modified(tenant_res, "provider_status")
+        db.add(tenant_res)
+        await db.commit()
+        await db.refresh(tenant_res)
     return NokvoOneBusinessTemplateSaveResponse(
         organization=_organization_response(organization),
         business_template=_resolved_business_template(organization, tenant_res),
@@ -1089,6 +1190,7 @@ async def nokvo_one_update_business_template_schema(
     overrides = dict(provider_status.get("business_template_schema_overrides") or {})
     overrides[schema_key] = [field.model_dump() for field in payload.fields]
     provider_status["business_template_schema_overrides"] = overrides
+    provider_status, _ = ensure_tool_flow_questions(provider_status, organization.industry)
     tenant_res.provider_status = provider_status
     flag_modified(tenant_res, "provider_status")
     db.add(tenant_res)
@@ -1096,6 +1198,122 @@ async def nokvo_one_update_business_template_schema(
     await db.refresh(tenant_res)
 
     return _resolved_business_template(organization, tenant_res)
+
+
+# ─────────── Custom tabs ───────────
+
+
+def _custom_tab_admin_dep():
+    return deps.RequireNokvoOneOrganization(
+        allowed_statuses=["pending_approval", "active", "suspended"],
+        allowed_roles=["admin", "manager"],
+    )
+
+
+def _custom_tab_read_dep():
+    return deps.RequireNokvoOneOrganization(
+        allowed_statuses=["pending_approval", "active", "suspended"],
+    )
+
+
+@router.get(
+    "/business-template/custom-tabs",
+    response_model=list[NokvoOneCustomTabResponse],
+)
+async def nokvo_one_list_custom_tabs(
+    user: OrganizationUser = Depends(_custom_tab_read_dep()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tenant_res = await _tenant_resources_for_org(db, user.organization_id)
+    provider_status = dict(tenant_res.provider_status or {})
+    return [NokvoOneCustomTabResponse(**spec) for spec in custom_tabs_from_overrides(provider_status)]
+
+
+@router.post(
+    "/business-template/custom-tabs",
+    response_model=list[NokvoOneCustomTabResponse],
+    status_code=status.HTTP_201_CREATED,
+)
+async def nokvo_one_create_custom_tab(
+    payload: NokvoOneCustomTabCreateRequest,
+    user: OrganizationUser = Depends(_custom_tab_admin_dep()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    try:
+        slug = normalize_custom_tab_slug(payload.slug)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    tenant_res = await _tenant_resources_for_org(db, user.organization_id)
+    provider_status = dict(tenant_res.provider_status or {})
+    existing = custom_tabs_from_overrides(provider_status)
+    if any(entry["slug"] == slug for entry in existing):
+        raise HTTPException(status_code=409, detail="A custom tab with this slug already exists")
+    if len(existing) >= 8:
+        raise HTTPException(status_code=400, detail="Custom-tab limit reached (max 8 per org)")
+
+    vocab = (
+        payload.status_vocabulary.model_dump() if payload.status_vocabulary
+        else default_custom_tab_status_vocabulary()
+    )
+    new_entry = {
+        "slug": slug,
+        "label": payload.label.strip(),
+        "fields": [field.model_dump() for field in payload.fields],
+        "status_vocabulary": vocab,
+        "search_keys": list(payload.search_keys or []),
+    }
+    next_tabs = list(existing) + [new_entry]
+    provider_status["business_template_custom_tabs"] = next_tabs
+    org_res = await db.execute(select(Organization).where(Organization.id == user.organization_id))
+    organization = org_res.scalars().first()
+    provider_status, _ = ensure_tool_flow_questions(
+        provider_status,
+        organization.industry if organization else None,
+    )
+    tenant_res.provider_status = provider_status
+    flag_modified(tenant_res, "provider_status")
+    db.add(tenant_res)
+    await db.commit()
+    await db.refresh(tenant_res)
+
+    return [NokvoOneCustomTabResponse(**spec) for spec in custom_tabs_from_overrides(tenant_res.provider_status)]
+
+
+@router.delete(
+    "/business-template/custom-tabs/{slug}",
+    response_model=list[NokvoOneCustomTabResponse],
+)
+async def nokvo_one_delete_custom_tab(
+    slug: str,
+    user: OrganizationUser = Depends(_custom_tab_admin_dep()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    try:
+        slug = normalize_custom_tab_slug(slug)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    tenant_res = await _tenant_resources_for_org(db, user.organization_id)
+    provider_status = dict(tenant_res.provider_status or {})
+    existing = custom_tabs_from_overrides(provider_status)
+    next_tabs = [entry for entry in existing if entry["slug"] != slug]
+    if len(next_tabs) == len(existing):
+        raise HTTPException(status_code=404, detail="Custom tab not found")
+    provider_status["business_template_custom_tabs"] = next_tabs
+    org_res = await db.execute(select(Organization).where(Organization.id == user.organization_id))
+    organization = org_res.scalars().first()
+    provider_status, _ = ensure_tool_flow_questions(
+        provider_status,
+        organization.industry if organization else None,
+    )
+    tenant_res.provider_status = provider_status
+    flag_modified(tenant_res, "provider_status")
+    db.add(tenant_res)
+    await db.commit()
+    await db.refresh(tenant_res)
+
+    return [NokvoOneCustomTabResponse(**spec) for spec in custom_tabs_from_overrides(tenant_res.provider_status)]
 
 
 @router.get("/me/provisioning", response_model=NokvoOneProvisioningSummary)

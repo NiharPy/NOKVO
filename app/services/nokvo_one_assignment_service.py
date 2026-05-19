@@ -190,10 +190,24 @@ class NokvoOneAssignmentService:
             hourly_count = NokvoOneAssignmentService._hourly_count(records, member.id, requested_at, settings)
             if (
                 settings is not None
+                and getattr(settings, "max_active_requests", None) is not None
+                and active_load >= int(settings.max_active_requests)
+            ):
+                reasons.append("active_request_capacity_reached")
+            if (
+                settings is not None
                 and getattr(settings, "max_requests_per_hour", None) is not None
                 and hourly_count >= int(settings.max_requests_per_hour)
             ):
                 reasons.append("hourly_request_capacity_reached")
+            if (
+                organization.industry != "clinics"
+                and NokvoOneAssignmentService._blocked_slot_conflict(
+                    requested_at,
+                    blocked_slots_by_member.get(member.id, []),
+                )
+            ):
+                reasons.append("blocked_slot_conflict")
 
             if organization.industry == "clinics" and settings is not None:
                 clinic_reasons = NokvoOneAssignmentService._clinic_skip_reasons(
@@ -215,6 +229,19 @@ class NokvoOneAssignmentService:
 
         if not candidates:
             reason = "no_members_matched_assignment_rules"
+            data = dict(record.data or {})
+            data.update(
+                {
+                    "request_type": request_type,
+                    "requested_time": requested_at.isoformat(),
+                    "assignment_status": "no_available_member",
+                    "assignment_reason": reason,
+                    "skipped_member_reasons": skipped,
+                }
+            )
+            record.data = data
+            db.add(record)
+            await db.flush()
             logger.debug(
                 "Nokvo One assignment skipped organization=%s request=%s request_type=%s reasons=%s",
                 organization.id,
@@ -242,11 +269,20 @@ class NokvoOneAssignmentService:
             {
                 "request_type": request_type,
                 "assigned_member_id": str(selected.member.id),
+                "assigned_member_name": selected.member.full_name,
                 "assigned_at": now.isoformat(),
                 "requested_time": requested_at.isoformat(),
                 "assignment_method": "lowest_load",
+                "assignment_status": "assigned",
             }
         )
+        if organization.industry == "clinics" and record.record_type == "appointment":
+            data["doctor"] = selected.member.full_name
+            data["assigned_doctor_id"] = str(selected.member.id)
+        elif organization.industry == "real_estate":
+            data["agent"] = selected.member.full_name
+            data["assigned_agent_id"] = str(selected.member.id)
+            data["assigned_to"] = selected.member.full_name
         record.status = "assigned"
         record.data = data
         db.add(record)
@@ -256,6 +292,7 @@ class NokvoOneAssignmentService:
             "request_id": record.id,
             "organization_id": organization.id,
             "selected_member_id": selected.member.id,
+            "selected_member_name": selected.member.full_name,
             "request_type": request_type,
             "assignment_status": "assigned",
             "reason": None,
@@ -354,6 +391,21 @@ class NokvoOneAssignmentService:
         return slots
 
     @staticmethod
+    def _blocked_slot_conflict(
+        requested_at: datetime,
+        blocked_slots: list[MemberBlockedSlot],
+        *,
+        duration_minutes: int = 30,
+    ) -> bool:
+        end_at = requested_at + timedelta(minutes=duration_minutes)
+        for slot in blocked_slots:
+            slot_start = _aware_utc(slot.start_time)
+            slot_end = _aware_utc(slot.end_time)
+            if requested_at < slot_end and end_at > slot_start:
+                return True
+        return False
+
+    @staticmethod
     async def _load_request_records(db: AsyncSession, organization_id: uuid.UUID) -> list[NokvoOneToolRecord]:
         res = await db.execute(
             select(NokvoOneToolRecord).where(NokvoOneToolRecord.organization_id == organization_id)
@@ -432,17 +484,17 @@ class NokvoOneAssignmentService:
         records: list[NokvoOneToolRecord],
         assignment_settings: OrganizationMemberAssignmentSettings,
     ) -> list[str]:
-        if clinic_settings is None:
-            return ["clinic_schedule_missing"]
-        consultation_types = set(clinic_settings.consultation_types or [])
-        consultation_supported = request_type in consultation_types or (
-            request_type == "appointment" and bool(consultation_types)
+        consultation_types = set(clinic_settings.consultation_types or []) if clinic_settings is not None else set()
+        consultation_supported = (
+            not consultation_types
+            or request_type in consultation_types
+            or request_type == "appointment"
         )
         if not consultation_supported:
             return ["consultation_type_not_supported"]
 
-        duration = int(clinic_settings.appointment_duration_minutes or 30)
-        buffer_minutes = int(clinic_settings.buffer_minutes or 0)
+        duration = int((clinic_settings.appointment_duration_minutes if clinic_settings else None) or 30)
+        buffer_minutes = int((clinic_settings.buffer_minutes if clinic_settings else None) or 0)
         end_at = requested_at + timedelta(minutes=duration + buffer_minutes)
         for slot in blocked_slots:
             slot_start = _aware_utc(slot.start_time)
@@ -474,9 +526,9 @@ class NokvoOneAssignmentService:
                 if appointment_local.hour == requested_local.hour:
                     hour_count += 1
 
-        if clinic_settings.max_patients_per_hour is not None and hour_count >= int(clinic_settings.max_patients_per_hour):
+        if clinic_settings is not None and clinic_settings.max_patients_per_hour is not None and hour_count >= int(clinic_settings.max_patients_per_hour):
             return ["hourly_patient_capacity_reached"]
-        if clinic_settings.max_patients_per_day is not None and day_count >= int(clinic_settings.max_patients_per_day):
+        if clinic_settings is not None and clinic_settings.max_patients_per_day is not None and day_count >= int(clinic_settings.max_patients_per_day):
             return ["daily_patient_capacity_reached"]
         return []
 

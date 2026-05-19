@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, time, timedelta, timezone
 import json
 import re
 import uuid
 from time import perf_counter
 from typing import Any, AsyncIterator
 from urllib import parse as urllib_parse
+from zoneinfo import ZoneInfo
 
 import httpx
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.models.organization import Organization
 from app.models.tenant_resources import TenantResources
 from app.services.agent_knowledge_service import (
     AGENT_CHUNK_SOURCE_KIND,
@@ -20,6 +24,7 @@ from app.services.agent_knowledge_service import (
     AGENT_SINGLE_PROMPT_CONFIG_KEY,
     AgentKnowledgeService,
 )
+from app.services.dynamic_tool_resolver import resolve_index
 from app.services.agent_session_store import AgentSessionStore
 from app.services.azure_keyvault_service import AzureKeyVaultService
 from app.services.fast_intent_router import (
@@ -55,6 +60,8 @@ from app.services.policy_decision_engine import (
     extract_live_context_from_history,
     fetch_live_order_context,
 )
+from app.services.nokvo_one_business_templates import custom_tabs_from_overrides
+from app.services.predefined_tools_service import PredefinedToolsService
 from app.services.prosody import (
     DEFAULT_TONE,
     ProsodyChunk,
@@ -65,6 +72,8 @@ from app.services.prosody import (
 from app.services.qdrant_service import QdrantService
 from app.services.sarvam_voice_service import SARVAM_LANGUAGE_OPTIONS, SarvamVoiceService
 from app.services.text_embedding_service import TextEmbeddingService
+from app.services.tool_flow_policy import evaluate_tool_flow_policy
+from app.services.voice_turn_policy import evaluate_voice_turn_policy
 
 
 _SENTENCE_RE = re.compile(r"(?<=[.!?।])\s+")
@@ -116,6 +125,51 @@ _FACILITY_LOCATION_RE = re.compile(
     ]),
     re.IGNORECASE,
 )
+_APPOINTMENT_LOCAL_TZ = ZoneInfo("Asia/Kolkata")
+_MONTH_INDEX = {
+    "jan": 1,
+    "january": 1,
+    "feb": 2,
+    "february": 2,
+    "mar": 3,
+    "march": 3,
+    "apr": 4,
+    "april": 4,
+    "may": 5,
+    "jun": 6,
+    "june": 6,
+    "jul": 7,
+    "july": 7,
+    "aug": 8,
+    "august": 8,
+    "sep": 9,
+    "sept": 9,
+    "september": 9,
+    "oct": 10,
+    "october": 10,
+    "nov": 11,
+    "november": 11,
+    "dec": 12,
+    "december": 12,
+}
+_WEEKDAY_INDEX = {
+    "monday": 0,
+    "tuesday": 1,
+    "wednesday": 2,
+    "thursday": 3,
+    "friday": 4,
+    "saturday": 5,
+    "sunday": 6,
+}
+
+
+class _AppointmentToolInputError(ValueError):
+    def __init__(self, slot: str, answer: str, *, clear_time: bool = False, clear_date: bool = False):
+        super().__init__(answer)
+        self.slot = slot
+        self.answer = answer
+        self.clear_time = clear_time
+        self.clear_date = clear_date
 
 
 def _normalize(text: str) -> str:
@@ -250,21 +304,37 @@ class AzureGroundedLLM:
     async def complete(tenant_res: TenantResources, messages: list[dict[str, str]], *, max_tokens: int = 180) -> str:
         api_key = await AzureGroundedLLM.api_key(tenant_res)
         url, body = AzureGroundedLLM.endpoint_and_body(tenant_res, messages, max_tokens=max_tokens)
-        response = await AzureGroundedLLM.http().post(
-            url,
-            headers={"api-key": api_key, "Content-Type": "application/json"},
-            json=body,
-        )
-        if response.status_code == 429:
+        attempts = 4
+        last_response = None
+        for attempt in range(attempts):
+            response = await AzureGroundedLLM.http().post(
+                url,
+                headers={"api-key": api_key, "Content-Type": "application/json"},
+                json=body,
+            )
+            last_response = response
+            if response.status_code != 429:
+                break
             retry_after_hdr = response.headers.get("retry-after", "")
             try:
                 retry_after = float(retry_after_hdr) if retry_after_hdr else 0.0
             except ValueError:
                 retry_after = 0.0
+            if attempt < attempts - 1:
+                wait_for = retry_after if retry_after > 0 else 0.6 * (2 ** attempt)
+                wait_for = min(wait_for, 3.5)
+                print(
+                    f"[NOKVO-LLM] 429 (complete) attempt {attempt + 1}/{attempts} — sleeping {wait_for:.2f}s "
+                    f"(retry_after={retry_after_hdr!r})"
+                )
+                await asyncio.sleep(wait_for)
+                continue
+            print(f"[NOKVO-LLM] 429 (complete) — giving up after {attempt + 1} attempt(s); retry_after={retry_after_hdr!r}")
             raise NokvoOneAgentRateLimited(
                 f"Azure OpenAI rate-limited (429): {response.text[:300]}",
                 retry_after_seconds=retry_after or None,
             )
+        response = last_response
         if response.status_code >= 400:
             raise NokvoOneAgentRuntimeError(f"Azure OpenAI request failed ({response.status_code}): {response.text[:300]}")
         return AzureGroundedLLM.extract_text(response.json())
@@ -297,7 +367,14 @@ class AzureGroundedLLM:
             stream=True,
             max_tokens=max_tokens,
         )
-        attempts = 2  # initial + 1 retry on 429
+        # Azure OpenAI per-tenant deployments often have low TPM/RPM. In
+        # interactive testing the user fires several turns in quick succession
+        # and trips the quota — the agent then says "Give me a second, I'm a
+        # bit busy" which sounds like Sarvam crashed but is actually Azure LLM.
+        # Be more patient: up to 4 attempts, honor Retry-After up to 3.5s,
+        # and fall back to an exponential 0.6 / 1.2 / 2.4s wait when Azure
+        # doesn't tell us how long.
+        attempts = 4
         for attempt in range(attempts):
             async with AzureGroundedLLM.http().stream(
                 "POST",
@@ -306,19 +383,21 @@ class AzureGroundedLLM:
                 json=body,
             ) as response:
                 if response.status_code == 429:
-                    # Rate-limited. Honor Retry-After but cap so voice
-                    # latency stays bounded — better to fall back to a
-                    # graceful "busy" reply than to keep the caller waiting.
                     retry_after_hdr = response.headers.get("retry-after", "")
                     try:
                         retry_after = float(retry_after_hdr) if retry_after_hdr else 0.0
                     except ValueError:
                         retry_after = 0.0
                     body_text = (await response.aread()).decode("utf-8", errors="replace")[:300]
-                    if attempt < attempts - 1 and retry_after and retry_after <= 1.5:
-                        print(f"[NOKVO-LLM] 429 — retrying after {retry_after:.2f}s")
-                        await asyncio.sleep(retry_after)
-                        continue  # retry the outer for-loop
+                    if attempt < attempts - 1:
+                        wait_for = retry_after if retry_after > 0 else 0.6 * (2 ** attempt)
+                        wait_for = min(wait_for, 3.5)
+                        print(
+                            f"[NOKVO-LLM] 429 attempt {attempt + 1}/{attempts} — sleeping {wait_for:.2f}s "
+                            f"(retry_after={retry_after_hdr!r})"
+                        )
+                        await asyncio.sleep(wait_for)
+                        continue
                     print(f"[NOKVO-LLM] 429 — giving up after {attempt + 1} attempt(s); retry_after={retry_after_hdr!r}")
                     raise NokvoOneAgentRateLimited(
                         f"Azure OpenAI rate-limited (429): {body_text}",
@@ -751,6 +830,440 @@ class NokvoOneVoicePipeline:
         return prompt[:8000]
 
     @staticmethod
+    def _single_prompt_enabled(tenant_res: TenantResources) -> bool:
+        return bool(NokvoOneVoicePipeline._single_prompt_guidance(tenant_res))
+
+    @staticmethod
+    async def _voice_business_context(
+        db: AsyncSession | None,
+        tenant_res: TenantResources,
+    ) -> tuple[Organization, dict[str, Any], list[dict[str, Any]]] | None:
+        if db is None:
+            return None
+        try:
+            org_res = await db.execute(select(Organization).where(Organization.id == tenant_res.organization_id))
+            organization = org_res.scalars().first()
+        except Exception:
+            return None
+        if organization is None:
+            return None
+        provider_status = dict(tenant_res.provider_status or {})
+        overrides = dict(provider_status.get("business_template_schema_overrides") or {})
+        return organization, overrides, custom_tabs_from_overrides(provider_status)
+
+    @staticmethod
+    def _parse_appointment_date(value: Any, *, now: datetime | None = None) -> datetime.date:
+        raw = re.sub(r"\s+", " ", str(value or "").strip().lower())
+        local_now = (now or datetime.now(timezone.utc)).astimezone(_APPOINTMENT_LOCAL_TZ)
+        today = local_now.date()
+        if not raw:
+            raise _AppointmentToolInputError("preferred_date", "Which date should I note for the appointment?")
+        if "day after tomorrow" in raw:
+            return today + timedelta(days=2)
+        if "tomorrow" in raw:
+            return today + timedelta(days=1)
+        if "today" in raw:
+            return today
+        for name, weekday in _WEEKDAY_INDEX.items():
+            if name in raw:
+                delta = (weekday - today.weekday()) % 7
+                return today + timedelta(days=delta)
+
+        numeric = re.search(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b", raw)
+        if numeric:
+            day = int(numeric.group(1))
+            month = int(numeric.group(2))
+            year = int(numeric.group(3) or today.year)
+            if year < 100:
+                year += 2000
+            try:
+                parsed = datetime(year, month, day, tzinfo=_APPOINTMENT_LOCAL_TZ).date()
+            except ValueError as exc:
+                raise _AppointmentToolInputError(
+                    "preferred_date",
+                    "That date does not look valid. Which date should I note?",
+                    clear_date=True,
+                ) from exc
+            return parsed if parsed >= today or numeric.group(3) else parsed.replace(year=parsed.year + 1)
+
+        named = re.search(r"\b(\d{1,2})(?:st|nd|rd|th)?\s+([a-z]+)(?:\s+(\d{2,4}))?\b", raw)
+        if not named:
+            named = re.search(r"\b([a-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s+(\d{2,4}))?\b", raw)
+            if named:
+                month_token, day_token, year_token = named.group(1), named.group(2), named.group(3)
+            else:
+                month_token = day_token = year_token = None
+        else:
+            day_token, month_token, year_token = named.group(1), named.group(2), named.group(3)
+        if day_token and month_token:
+            month = _MONTH_INDEX.get(month_token[:3], _MONTH_INDEX.get(month_token))
+            if month:
+                year = int(year_token or today.year)
+                if year < 100:
+                    year += 2000
+                try:
+                    parsed = datetime(year, month, int(day_token), tzinfo=_APPOINTMENT_LOCAL_TZ).date()
+                except ValueError as exc:
+                    raise _AppointmentToolInputError(
+                        "preferred_date",
+                        "That date does not look valid. Which date should I note?",
+                        clear_date=True,
+                    ) from exc
+                return parsed if parsed >= today or year_token else parsed.replace(year=parsed.year + 1)
+
+        raise _AppointmentToolInputError(
+            "preferred_date",
+            "I need the appointment date clearly. Which date should I note?",
+            clear_date=True,
+        )
+
+    @staticmethod
+    def _parse_appointment_time(value: Any) -> time:
+        raw = re.sub(r"\s+", " ", str(value or "").strip().lower())
+        if not raw:
+            raise _AppointmentToolInputError("preferred_time", "What time should I note for the appointment?")
+        named_times = {
+            "morning": time(9, 0),
+            "afternoon": time(14, 0),
+            "evening": time(17, 0),
+            "night": time(19, 0),
+            "noon": time(12, 0),
+        }
+        for label, parsed in named_times.items():
+            if label in raw:
+                return parsed
+        ampm = re.search(r"\b(\d{1,2})(?::([0-5]\d))?\s*(am|pm)\b", raw)
+        if ampm:
+            hour = int(ampm.group(1))
+            minute = int(ampm.group(2) or 0)
+            suffix = ampm.group(3)
+            if hour < 1 or hour > 12:
+                raise _AppointmentToolInputError(
+                    "preferred_time",
+                    "That time does not look valid. What time should I note?",
+                    clear_time=True,
+                )
+            if suffix == "pm" and hour != 12:
+                hour += 12
+            if suffix == "am" and hour == 12:
+                hour = 0
+            return time(hour, minute)
+        twenty_four = re.search(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", raw)
+        if twenty_four:
+            return time(int(twenty_four.group(1)), int(twenty_four.group(2)))
+        bare = re.fullmatch(r"(?:at\s+)?(\d{1,2})", raw)
+        if bare:
+            hour = int(bare.group(1))
+            if 0 <= hour <= 23 and hour > 12:
+                return time(hour, 0)
+            raise _AppointmentToolInputError(
+                "preferred_time",
+                f"Just to confirm, is that {hour} AM or {hour} PM?",
+                clear_time=True,
+            )
+        raise _AppointmentToolInputError(
+            "preferred_time",
+            "I need the appointment time clearly. What time should I note?",
+            clear_time=True,
+        )
+
+    @staticmethod
+    def _appointment_datetime_iso(appointment: dict[str, Any]) -> str:
+        local_date = NokvoOneVoicePipeline._parse_appointment_date(appointment.get("preferred_date"))
+        local_time = NokvoOneVoicePipeline._parse_appointment_time(appointment.get("preferred_time"))
+        local_dt = datetime.combine(local_date, local_time, tzinfo=_APPOINTMENT_LOCAL_TZ)
+        if local_dt <= datetime.now(_APPOINTMENT_LOCAL_TZ):
+            raise _AppointmentToolInputError(
+                "preferred_date",
+                "That appointment time is already past. Which future date and time should I note?",
+                clear_date=True,
+                clear_time=True,
+            )
+        return local_dt.astimezone(timezone.utc).isoformat()
+
+    @staticmethod
+    def _appointment_tool_answer(
+        result: dict[str, Any],
+        args: dict[str, Any],
+        *,
+        language: str | None = None,
+    ) -> str:
+        patient = str(args.get("patient_name") or "the patient")
+        when = str(args.get("appointment_time") or "the requested time")
+        try:
+            parsed = datetime.fromisoformat(when.replace("Z", "+00:00"))
+            local_when = parsed.astimezone(_APPOINTMENT_LOCAL_TZ).strftime("%d %b %Y at %I:%M %p")
+        except Exception:
+            local_when = when
+        assignment_status = result.get("assignment_status")
+        assigned_name = result.get("assigned_member_name")
+        lang = SarvamVoiceService.normalize_language(language)
+        if lang == "te":
+            if assignment_status == "assigned" and assigned_name:
+                return (
+                    f"Appointment request create అయ్యింది for {patient} on {local_when}. "
+                    f"It has been assigned to {assigned_name}."
+                )
+            if assignment_status == "no_available_member":
+                return (
+                    f"Appointment request create అయ్యింది for {patient} on {local_when}. "
+                    "That slot note చేశాను, కానీ available doctor system లో కనిపించలేదు. "
+                    "Clinic team availability confirm చేస్తారు."
+                )
+            return (
+                f"Appointment request create అయ్యింది for {patient} on {local_when}. "
+                "Clinic team exact availability confirm చేస్తారు."
+            )
+        if assignment_status == "assigned" and assigned_name:
+            return (
+                f"I have created the appointment request for {patient} on {local_when}. "
+                f"It has been assigned to {assigned_name}."
+            )
+        if assignment_status == "no_available_member":
+            return (
+                f"I have created the appointment request for {patient} on {local_when}. "
+                "That time is noted, but I could not find an available doctor in the system for that slot, "
+                "so the clinic team will confirm availability."
+            )
+        return (
+            f"I have created the appointment request for {patient} on {local_when}. "
+            "The clinic team can confirm exact availability."
+        )
+
+    @staticmethod
+    async def _maybe_execute_turn_policy_action(
+        tenant_res: TenantResources,
+        call_id: str | None,
+        db: AsyncSession | None,
+        turn_policy: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if turn_policy.get("intent") != "appointment_flow" or turn_policy.get("state_slot") != "complete":
+            return None
+        appointment = dict(((turn_policy.get("state_patch") or {}).get("appointment") or {}))
+        if appointment.get("created_record_id"):
+            return None
+
+        context = await NokvoOneVoicePipeline._voice_business_context(db, tenant_res)
+        if context is None:
+            return None
+        organization, overrides, custom_tabs = context
+        if organization.industry != "clinics":
+            return None
+        catalog = resolve_index(organization.industry, overrides, custom_tabs)
+        tool = catalog.get("appointments_create")
+        if tool is None:
+            return None
+
+        try:
+            appointment_time = NokvoOneVoicePipeline._appointment_datetime_iso(appointment)
+        except _AppointmentToolInputError as exc:
+            appointment["completed"] = False
+            appointment["pending_slot"] = exc.slot
+            if exc.clear_date:
+                appointment["preferred_date"] = None
+            if exc.clear_time:
+                appointment["preferred_time"] = None
+            return {
+                "answer": exc.answer,
+                "state_patch": {"appointment": appointment},
+                "state_slot": exc.slot,
+                "route_reason": "appointment needs exact scheduling detail",
+                "tool_calls": [],
+            }
+
+        args = {
+            "patient_name": appointment["patient_name"],
+            "phone": appointment["phone"],
+            "appointment_time": appointment_time,
+            "reason": appointment["reason"],
+        }
+        try:
+            result = await PredefinedToolsService.execute(
+                db,
+                tenant_res.organization_id,
+                None,
+                tool,
+                args,
+                session_id=call_id,
+            )
+            await db.commit()
+        except Exception as exc:
+            if db is not None:
+                await db.rollback()
+            appointment["completed"] = False
+            appointment["pending_slot"] = None
+            return {
+                "answer": f"I collected the appointment details, but I could not create the appointment record: {str(exc)[:180]}",
+                "state_patch": {"appointment": appointment},
+                "state_slot": "tool_error",
+                "route_reason": "appointment tool failed",
+                "tool_calls": [{"tool": tool.key, "arguments": args, "ok": False, "error": str(exc)[:240]}],
+            }
+
+        appointment.update(
+            {
+                "active": False,
+                "completed": True,
+                "pending_slot": None,
+                "appointment_time": appointment_time,
+                "created_record_id": result.get("id"),
+                "assignment_status": result.get("assignment_status"),
+                "assigned_member_name": result.get("assigned_member_name"),
+            }
+        )
+        return {
+            "answer": NokvoOneVoicePipeline._appointment_tool_answer(
+                result,
+                args,
+                language=turn_policy.get("language"),
+            ),
+            "state_patch": {"appointment": appointment},
+            "state_slot": "complete",
+            "route_reason": "appointment tool executed",
+            "tool_calls": [{"tool": tool.key, "arguments": args, "result": result}],
+        }
+
+    @staticmethod
+    def _tool_flow_success_answer(result: dict[str, Any], args: dict[str, Any], *, flow_key: str, language: str | None) -> str:
+        lang = SarvamVoiceService.normalize_language(language)
+        assigned_name = result.get("assigned_member_name")
+        assignment_status = result.get("assignment_status")
+        name = str(args.get("name") or args.get("customer_name") or args.get("phone") or "the customer")
+        if flow_key == "real_estate_site_visit":
+            when = str(args.get("visit_at") or "the requested time")
+            try:
+                parsed = datetime.fromisoformat(when.replace("Z", "+00:00"))
+                local_when = parsed.astimezone(_APPOINTMENT_LOCAL_TZ).strftime("%d %b %Y at %I:%M %p")
+            except Exception:
+                local_when = when
+            if lang == "te":
+                if assignment_status == "assigned" and assigned_name:
+                    return f"Site visit request create అయ్యింది for {name} on {local_when}. It has been assigned to {assigned_name}."
+                return f"Site visit request create అయ్యింది for {name} on {local_when}. Team availability confirm చేస్తారు."
+            if lang == "hi":
+                if assignment_status == "assigned" and assigned_name:
+                    return f"Site visit request create हो गया for {name} on {local_when}. It has been assigned to {assigned_name}."
+                return f"Site visit request create हो गया for {name} on {local_when}. Team availability confirm करेगी."
+            if assignment_status == "assigned" and assigned_name:
+                return f"I have created the site visit request for {name} on {local_when}. It has been assigned to {assigned_name}."
+            return f"I have created the site visit request for {name} on {local_when}. The team will confirm availability."
+
+        if lang == "te":
+            return f"Lead create అయ్యింది for {name}. Team follow up చేస్తారు."
+        if lang == "hi":
+            return f"Lead create हो गया for {name}. Team follow up करेगी."
+        return f"I have created the lead for {name}. The team will follow up."
+
+    @staticmethod
+    async def _maybe_execute_tool_flow_action(
+        tenant_res: TenantResources,
+        call_id: str | None,
+        db: AsyncSession | None,
+        tool_flow: dict[str, Any],
+        *,
+        business_context: tuple[Organization, dict[str, Any], list[dict[str, Any]]] | None = None,
+        language: str | None = None,
+    ) -> dict[str, Any] | None:
+        if tool_flow.get("intent") != "tool_flow" or tool_flow.get("state_slot") != "complete":
+            return None
+        action = tool_flow.get("action") if isinstance(tool_flow.get("action"), dict) else None
+        if not action:
+            return None
+        context = business_context or await NokvoOneVoicePipeline._voice_business_context(db, tenant_res)
+        if context is None:
+            return None
+        organization, overrides, custom_tabs = context
+        catalog = resolve_index(organization.industry, overrides, custom_tabs)
+        tool_key = str(action.get("tool_key") or "")
+        tool = catalog.get(tool_key)
+        if tool is None:
+            return None
+        raw_args = dict(action.get("arguments") or {})
+        flow_key = str(action.get("flow_key") or tool_flow.get("flow_key") or "")
+        args: dict[str, Any] = {}
+        if flow_key == "real_estate_site_visit":
+            try:
+                visit_date = NokvoOneVoicePipeline._parse_appointment_date(raw_args.get("visit_date"))
+                visit_time = NokvoOneVoicePipeline._parse_appointment_time(raw_args.get("visit_time"))
+            except _AppointmentToolInputError as exc:
+                flow_state = dict(((tool_flow.get("state_patch") or {}).get("tool_flow") or {}))
+                flow_state["active"] = True
+                flow_state["completed"] = False
+                flow_state["pending_slot"] = "visit_date" if exc.slot == "preferred_date" else "visit_time"
+                return {
+                    "answer": exc.answer,
+                    "state_patch": {"tool_flow": flow_state},
+                    "state_slot": flow_state["pending_slot"],
+                    "route_reason": "tool flow needs exact scheduling detail",
+                    "tool_calls": [],
+                }
+            visit_at = datetime.combine(visit_date, visit_time, tzinfo=_APPOINTMENT_LOCAL_TZ).astimezone(timezone.utc).isoformat()
+            args = {
+                "name": raw_args.get("name"),
+                "phone": raw_args.get("phone"),
+                "visit_at": visit_at,
+            }
+            for key in ("email", "property_type", "budget", "location", "notes"):
+                if raw_args.get(key) not in (None, ""):
+                    args[key] = raw_args[key]
+            extra = {k: v for k, v in raw_args.items() if k not in {*args.keys(), "visit_date", "visit_time"} and v not in (None, "")}
+            if extra:
+                args["notes"] = "Additional details: " + json.dumps(extra, ensure_ascii=False, default=str)
+        else:
+            args = {k: v for k, v in raw_args.items() if v not in (None, "")}
+        try:
+            result = await PredefinedToolsService.execute(
+                db,
+                tenant_res.organization_id,
+                None,
+                tool,
+                args,
+                session_id=call_id,
+            )
+            await db.commit()
+        except Exception as exc:
+            if db is not None:
+                await db.rollback()
+            flow_state = dict(((tool_flow.get("state_patch") or {}).get("tool_flow") or {}))
+            flow_state["active"] = False
+            flow_state["tool_error"] = str(exc)[:180]
+            return {
+                "answer": f"I collected the details, but I could not create the record: {str(exc)[:180]}",
+                "state_patch": {"tool_flow": flow_state},
+                "state_slot": "tool_error",
+                "route_reason": "tool flow tool failed",
+                "tool_calls": [{"tool": tool.key, "arguments": args, "ok": False, "error": str(exc)[:240]}],
+            }
+
+        flow_state = dict(((tool_flow.get("state_patch") or {}).get("tool_flow") or {}))
+        flow_state.update(
+            {
+                "active": False,
+                "completed": True,
+                "created_record_id": result.get("id") or result.get("lead_id") or result.get("callback_id"),
+                "assignment_status": result.get("assignment_status"),
+                "assigned_member_name": result.get("assigned_member_name"),
+            }
+        )
+        return {
+            "answer": NokvoOneVoicePipeline._tool_flow_success_answer(result, args, flow_key=flow_key, language=language),
+            "state_patch": {"tool_flow": flow_state},
+            "state_slot": "complete",
+            "route_reason": "tool flow tool executed",
+            "tool_calls": [{"tool": tool.key, "arguments": args, "result": result}],
+        }
+
+    @staticmethod
+    async def _apply_route_state(
+        tenant_res: TenantResources,
+        call_id: str | None,
+        route: dict[str, Any],
+    ) -> None:
+        patch = route.get("state_patch") if isinstance(route, dict) else None
+        if isinstance(patch, dict) and patch:
+            await AgentSessionStore.merge_state(tenant_res, call_id, patch)
+
+    @staticmethod
     def _messages(
         query: str,
         chunks: list[dict[str, Any]],
@@ -1017,7 +1530,8 @@ class NokvoOneVoicePipeline:
                 for k, v in route_payload.items()
                 if k in {"tenant_id", "call_id", "intent", "topic", "route", "sensitive",
                          "cache_hit", "qdrant_called", "llm_called", "policy_card_id",
-                         "decision_code", "ttfb_ms", "total_ms"}
+                         "decision_code", "ttfb_ms", "total_ms", "single_prompt_enabled",
+                         "detected_entities", "state_slot", "route_reason"}
             }
             # Surface the LLM classifier's intent so we can debug "why didn't
             # RAG fire" without enabling full debug mode.
@@ -1041,6 +1555,86 @@ class NokvoOneVoicePipeline:
                 pass
             return
         task.cancel()
+
+    @staticmethod
+    async def _mark_appointment_deferred(
+        tenant_res: TenantResources,
+        call_id: str | None,
+        prior_appointment: dict[str, Any],
+    ) -> None:
+        """Mark an in-progress booking as deferred for a knowledge-base digression.
+
+        The slot-fill FSM consumes this flag on its next turn to prefix the
+        resumed slot question with a "Coming back to your booking — " phrase.
+        Re-yielding before the FSM resumes is idempotent: the flag stays True.
+        """
+        if not call_id or not prior_appointment.get("active"):
+            return
+        patch = {"appointment": {**prior_appointment, "deferred_for_kb": True}}
+        try:
+            await AgentSessionStore.merge_state(tenant_res, call_id, patch)
+        except Exception as exc:
+            # Don't let a state-store hiccup poison the route; the user just
+            # won't get the "Coming back" prefix on the next turn.
+            print(f"[NOKVO-ROUTE] failed to mark appointment deferred: {exc!r}")
+
+    @staticmethod
+    async def _mark_tool_flow_deferred(
+        tenant_res: TenantResources,
+        call_id: str | None,
+        prior_tool_flow: dict[str, Any],
+    ) -> None:
+        """Same deferred-for-kb mechanism as appointments, for tool_flow.
+
+        When the caller pivots to a KB question mid tool_flow (leads_create,
+        real_estate_site_visit, etc.), the policy returns None and the next
+        slot question is prefixed with "Coming back to your booking — ".
+        """
+        if not call_id or not prior_tool_flow.get("active"):
+            return
+        patch = {"tool_flow": {**prior_tool_flow, "deferred_for_kb": True}}
+        try:
+            await AgentSessionStore.merge_state(tenant_res, call_id, patch)
+        except Exception as exc:
+            print(f"[NOKVO-ROUTE] failed to mark tool_flow deferred: {exc!r}")
+
+    @staticmethod
+    async def _llm_check_booking_digression(
+        tenant_res: TenantResources,
+        user_text: str,
+        history: list[dict[str, str]],
+    ) -> Any | None:
+        """Final-guard digression check via the small LLM classifier.
+
+        Called only when the FSM is about to re-ask the same slot — which is
+        a strong signal that the caller's input wasn't a slot answer. Returns
+        the ClassifiedIntent when the caller clearly pivoted (kb_question,
+        complaint, escalation, cancel/refund, out_of_scope); returns ``None``
+        when the classifier timed out, errored, or said "this still looks
+        like booking input" (smalltalk / order_status / unclear).
+        """
+        try:
+            result = await LLMIntentClassifier.classify(
+                user_text,
+                tenant_res=tenant_res,
+                history=history,
+                timeout_ms=500,
+            )
+        except Exception as exc:
+            print(f"[NOKVO-DIGRESSION] classifier failed: {exc!r}")
+            return None
+        if result.fallback:
+            return None
+        if result.intent in {
+            LLM_INTENT_KB,
+            LLM_INTENT_COMPLAINT,
+            LLM_INTENT_ESCALATION,
+            LLM_INTENT_CANCEL,
+            LLM_INTENT_REFUND,
+            LLM_INTENT_OUT_OF_SCOPE,
+        }:
+            return result
+        return None
 
     @staticmethod
     async def _await_prefetched_retrieval(route: dict[str, Any]) -> dict[str, Any] | None:
@@ -1122,6 +1716,202 @@ class NokvoOneVoicePipeline:
                 "sensitive": intent_result.sensitive,
                 "card_id": card.get("id"),
             }
+
+        history_for_turn = await AgentSessionStore.get_history(tenant_res, call_id)
+        state_for_turn = await AgentSessionStore.get_state(tenant_res, call_id)
+        prior_appointment = dict((state_for_turn or {}).get("appointment") or {})
+        prior_in_booking_flow = bool(prior_appointment.get("active")) and not (
+            prior_appointment.get("completed") and not prior_appointment.get("pending_slot")
+        )
+        prior_pending_slot = prior_appointment.get("pending_slot")
+
+        turn_policy = evaluate_voice_turn_policy(
+            user_text,
+            history=history_for_turn,
+            state=state_for_turn,
+            language=language,
+        )
+
+        # If the regex side-question detector inside evaluate_voice_turn_policy
+        # yielded mid-booking, persist a `deferred_for_kb` marker so the next
+        # FSM turn can acknowledge the digression with a "Coming back..."
+        # prefix. The function itself is sync and can't touch Redis, so we do
+        # the merge here.
+        if turn_policy is None and prior_in_booking_flow:
+            await NokvoOneVoicePipeline._mark_appointment_deferred(
+                tenant_res, call_id, prior_appointment
+            )
+
+        # LLM digression fallback: if the FSM is about to re-ask the SAME slot
+        # (i.e., the caller's input didn't advance the flow), the regex detector
+        # missed something. Ask the small LLM classifier with a tight timeout —
+        # if it says the caller pivoted (kb_question, complaint, escalation,
+        # cancel/refund), bypass the FSM and let the route fall through to RAG
+        # or the sensitive-policy handler.
+        if (
+            turn_policy
+            and turn_policy.get("answer")
+            and turn_policy.get("intent") == "appointment_flow"
+            and prior_in_booking_flow
+            and prior_pending_slot
+            and turn_policy.get("state_slot") == prior_pending_slot
+        ):
+            digression = await NokvoOneVoicePipeline._llm_check_booking_digression(
+                tenant_res, user_text, history_for_turn
+            )
+            if digression is not None:
+                await NokvoOneVoicePipeline._mark_appointment_deferred(
+                    tenant_res, call_id, prior_appointment
+                )
+                if digression.intent == LLM_INTENT_CANCEL:
+                    intent_result = FastIntentRouter._build(
+                        INTENT_CANCELLATION_REQUEST, confidence=0.9, reason="llm digression"
+                    )
+                elif digression.intent == LLM_INTENT_REFUND:
+                    intent_result = FastIntentRouter._build(
+                        INTENT_REFUND_ELIGIBILITY, confidence=0.9, reason="llm digression"
+                    )
+                turn_policy = None
+
+        if turn_policy and turn_policy.get("answer"):
+            action = await NokvoOneVoicePipeline._maybe_execute_turn_policy_action(
+                tenant_res,
+                call_id,
+                db,
+                turn_policy,
+            )
+            if action:
+                turn_policy["answer"] = action.get("answer") or turn_policy["answer"]
+                turn_policy["state_patch"] = action.get("state_patch") or turn_policy.get("state_patch") or {}
+                turn_policy["state_slot"] = action.get("state_slot") or turn_policy.get("state_slot")
+                turn_policy["reason"] = action.get("route_reason") or turn_policy.get("reason")
+            metadata = {
+                **(intent_result.metadata or {}),
+                "turn_policy_intent": turn_policy.get("intent"),
+                "turn_policy_reason": turn_policy.get("reason"),
+                "entities": turn_policy.get("entities") or {},
+                "state_slot": turn_policy.get("state_slot"),
+                "tool_calls": (action or {}).get("tool_calls") or [],
+            }
+            return {
+                "route": "template",
+                "answer": str(turn_policy["answer"]),
+                "intent_result": IntentResult(
+                    intent=intent_result.intent,
+                    topic=intent_result.topic,
+                    confidence=max(intent_result.confidence, 0.88),
+                    sensitive=intent_result.sensitive,
+                    requires_live_status=intent_result.requires_live_status,
+                    reason=turn_policy.get("reason") or intent_result.reason,
+                    metadata=metadata,
+                ),
+                "safe_to_cache": False,
+                "sensitive": intent_result.sensitive,
+                "state_patch": turn_policy.get("state_patch") or {},
+                "detected_entities": turn_policy.get("entities") or {},
+                "state_slot": turn_policy.get("state_slot"),
+                "route_reason": turn_policy.get("reason"),
+                "tool_calls": (action or {}).get("tool_calls") or [],
+            }
+
+        business_context = await NokvoOneVoicePipeline._voice_business_context(db, tenant_res)
+        if business_context is not None:
+            organization, overrides, custom_tabs = business_context
+            prior_tool_flow = dict((state_for_turn or {}).get("tool_flow") or {})
+            prior_in_tool_flow = bool(prior_tool_flow.get("active")) and not bool(prior_tool_flow.get("completed"))
+            prior_tool_flow_slot = prior_tool_flow.get("pending_slot")
+            tool_flow = evaluate_tool_flow_policy(
+                user_text,
+                business_type=organization.industry,
+                schema_overrides=overrides,
+                custom_tabs=custom_tabs,
+                provider_status=dict(tenant_res.provider_status or {}),
+                history=history_for_turn,
+                state=state_for_turn,
+                language=language,
+            )
+
+            # Regex side-question detector inside evaluate_tool_flow_policy
+            # returns None when the caller pivots mid-flow. Persist the
+            # deferred-for-kb marker so the next turn resumes with a
+            # "Coming back to your booking — " prefix on the slot question.
+            if tool_flow is None and prior_in_tool_flow:
+                await NokvoOneVoicePipeline._mark_tool_flow_deferred(
+                    tenant_res, call_id, prior_tool_flow
+                )
+
+            # LLM digression fallback: if the FSM is about to re-ask the SAME
+            # tool_flow slot (regex extractor failed to advance), check with
+            # the small LLM classifier. When it says "kb_question / complaint
+            # / escalation / cancel / refund", bypass the FSM so the route
+            # falls through to RAG or the sensitive-policy handler.
+            if (
+                tool_flow
+                and tool_flow.get("answer")
+                and tool_flow.get("intent") == "tool_flow"
+                and prior_in_tool_flow
+                and prior_tool_flow_slot
+                and tool_flow.get("state_slot") == prior_tool_flow_slot
+            ):
+                digression = await NokvoOneVoicePipeline._llm_check_booking_digression(
+                    tenant_res, user_text, history_for_turn
+                )
+                if digression is not None:
+                    await NokvoOneVoicePipeline._mark_tool_flow_deferred(
+                        tenant_res, call_id, prior_tool_flow
+                    )
+                    if digression.intent == LLM_INTENT_CANCEL:
+                        intent_result = FastIntentRouter._build(
+                            INTENT_CANCELLATION_REQUEST, confidence=0.9, reason="llm digression"
+                        )
+                    elif digression.intent == LLM_INTENT_REFUND:
+                        intent_result = FastIntentRouter._build(
+                            INTENT_REFUND_ELIGIBILITY, confidence=0.9, reason="llm digression"
+                        )
+                    tool_flow = None
+
+            if tool_flow and tool_flow.get("answer"):
+                action = await NokvoOneVoicePipeline._maybe_execute_tool_flow_action(
+                    tenant_res,
+                    call_id,
+                    db,
+                    tool_flow,
+                    business_context=business_context,
+                    language=language,
+                )
+                if action:
+                    tool_flow["answer"] = action.get("answer") or tool_flow["answer"]
+                    tool_flow["state_patch"] = action.get("state_patch") or tool_flow.get("state_patch") or {}
+                    tool_flow["state_slot"] = action.get("state_slot") or tool_flow.get("state_slot")
+                    tool_flow["reason"] = action.get("route_reason") or tool_flow.get("reason")
+                metadata = {
+                    **(intent_result.metadata or {}),
+                    "turn_policy_intent": tool_flow.get("intent"),
+                    "turn_policy_reason": tool_flow.get("reason"),
+                    "flow_key": tool_flow.get("flow_key"),
+                    "state_slot": tool_flow.get("state_slot"),
+                    "tool_calls": (action or {}).get("tool_calls") or [],
+                }
+                return {
+                    "route": "template",
+                    "answer": str(tool_flow["answer"]),
+                    "intent_result": IntentResult(
+                        intent=intent_result.intent,
+                        topic=intent_result.topic,
+                        confidence=max(intent_result.confidence, 0.9),
+                        sensitive=intent_result.sensitive,
+                        requires_live_status=intent_result.requires_live_status,
+                        reason=tool_flow.get("reason") or intent_result.reason,
+                        metadata=metadata,
+                    ),
+                    "safe_to_cache": False,
+                    "sensitive": intent_result.sensitive,
+                    "state_patch": tool_flow.get("state_patch") or {},
+                    "detected_entities": {},
+                    "state_slot": tool_flow.get("state_slot"),
+                    "route_reason": tool_flow.get("reason"),
+                    "tool_calls": (action or {}).get("tool_calls") or [],
+                }
 
         # 3) Sensitive policy intents (cancellation/refund) → deterministic engine.
         if intent_result.intent in (INTENT_CANCELLATION_REQUEST, INTENT_REFUND_ELIGIBILITY):
@@ -1513,6 +2303,7 @@ class NokvoOneVoicePipeline:
         single_prompt_guidance = NokvoOneVoicePipeline._single_prompt_guidance(tenant_res)
         if route["route"] in {"template", "answer_card", "policy_card"}:
             answer = route["answer"]
+            await NokvoOneVoicePipeline._apply_route_state(tenant_res, call_id, route)
             await AgentSessionStore.append_turn(tenant_res, call_id, user_text, answer)
             total_ms = int((perf_counter() - started) * 1000)
             NokvoOneVoicePipeline._log_route(
@@ -1529,6 +2320,10 @@ class NokvoOneVoicePipeline:
                     "llm_called": False,
                     "policy_card_id": route.get("policy_card_id"),
                     "decision_code": route.get("decision_code"),
+                    "single_prompt_enabled": bool(single_prompt_guidance),
+                    "detected_entities": route.get("detected_entities"),
+                    "state_slot": route.get("state_slot"),
+                    "route_reason": route.get("route_reason"),
                     "total_ms": total_ms,
                 }
             )
@@ -1547,6 +2342,7 @@ class NokvoOneVoicePipeline:
                 },
                 "retrieval": {"used": False, "cache_hit": False, "relevant_count": 0},
                 "intent": {"type": intent_result.intent, "topic": intent_result.topic, "should_retrieve": False},
+                "tool_calls": route.get("tool_calls") or [],
             }
 
         # RAG fallback path — only cache non-sensitive queries.
@@ -1570,6 +2366,7 @@ class NokvoOneVoicePipeline:
                     "cache_hit": True,
                     "qdrant_called": False,
                     "llm_called": False,
+                    "single_prompt_enabled": bool(single_prompt_guidance),
                     "total_ms": total_ms,
                 }
             )
@@ -1698,6 +2495,7 @@ class NokvoOneVoicePipeline:
                 "cache_hit": False,
                 "qdrant_called": True,
                 "llm_called": True,
+                "single_prompt_enabled": bool(single_prompt_guidance),
                 "total_ms": total_ms,
                 "top_score": max((float(c.get("score") or 0.0) for c in chunks), default=0.0),
                 "chunk_count": len(chunks),
@@ -1766,6 +2564,7 @@ class NokvoOneVoicePipeline:
         if route["route"] in {"template", "answer_card", "policy_card"}:
             answer = route["answer"]
             yield {"type": "sentence", "text": answer, "language": language, "cache_hit": False}
+            await NokvoOneVoicePipeline._apply_route_state(tenant_res, call_id, route)
             await AgentSessionStore.append_turn(tenant_res, call_id, user_text, answer)
             total_ms = int((perf_counter() - started) * 1000)
             NokvoOneVoicePipeline._log_route(
@@ -1782,6 +2581,10 @@ class NokvoOneVoicePipeline:
                     "llm_called": False,
                     "policy_card_id": route.get("policy_card_id"),
                     "decision_code": route.get("decision_code"),
+                    "single_prompt_enabled": bool(single_prompt_guidance),
+                    "detected_entities": route.get("detected_entities"),
+                    "state_slot": route.get("state_slot"),
+                    "route_reason": route.get("route_reason"),
                     "total_ms": total_ms,
                 }
             )
@@ -1797,6 +2600,7 @@ class NokvoOneVoicePipeline:
                     "latency_ms": total_ms,
                 },
                 "intent": {"type": intent_result.intent, "topic": intent_result.topic, "should_retrieve": False},
+                "tool_calls": route.get("tool_calls") or [],
             }
             return
 
@@ -1854,6 +2658,7 @@ class NokvoOneVoicePipeline:
                     "cache_hit": False,
                     "qdrant_called": False,
                     "llm_called": True,
+                    "single_prompt_enabled": bool(single_prompt_guidance),
                     "total_ms": total_ms,
                     "classified": classified,
                 }
@@ -1997,6 +2802,7 @@ class NokvoOneVoicePipeline:
                 "cache_hit": False,
                 "qdrant_called": True,
                 "llm_called": True,
+                "single_prompt_enabled": bool(single_prompt_guidance),
                 "total_ms": total_ms,
                 "top_score": max((float(c.get("score") or 0.0) for c in chunks), default=0.0),
                 "chunk_count": len(chunks),

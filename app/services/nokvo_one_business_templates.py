@@ -7,6 +7,192 @@ from typing import Any
 ALLOWED_BUSINESS_TYPES = {"real_estate", "clinics", "ecommerce", "hospitality", "other"}
 
 
+# ─────────── Per-tab status vocabularies ───────────
+#
+# Used to (a) generate enum values for the `status` field in resource tool input
+# schemas, (b) validate set_status transitions, and (c) flag regressive moves
+# (e.g. closed→open) as requires_confirmation.
+#
+# Each entry: tab -> {"initial": str, "all": [str, ...], "forward": [str, ...]}
+# `forward` is the canonical happy-path order; transitions that go backwards
+# in this list are policy-gated to require human confirmation.
+STATUS_VOCABULARIES: dict[str, dict[str, dict[str, Any]]] = {
+    "real_estate": {
+        "leads": {
+            "initial": "new",
+            "all": ["new", "contacted", "qualified", "visit_scheduled", "converted", "lost"],
+            "forward": ["new", "contacted", "qualified", "visit_scheduled", "converted"],
+        },
+        "tickets": {
+            "initial": "open",
+            "all": ["open", "in_progress", "waiting_on_customer", "resolved", "closed"],
+            "forward": ["open", "in_progress", "resolved", "closed"],
+        },
+    },
+    "clinics": {
+        "leads": {
+            "initial": "new",
+            "all": ["new", "contacted", "qualified", "scheduled", "no_show", "lost"],
+            "forward": ["new", "contacted", "qualified", "scheduled"],
+        },
+        "tickets": {
+            "initial": "open",
+            "all": ["open", "in_progress", "waiting_on_patient", "resolved", "closed", "escalated"],
+            "forward": ["open", "in_progress", "resolved", "closed"],
+        },
+        "appointments": {
+            "initial": "requested",
+            "all": ["requested", "assigned", "confirmed", "checked_in", "completed", "cancelled", "no_show", "rescheduled"],
+            "forward": ["requested", "assigned", "confirmed", "checked_in", "completed"],
+        },
+    },
+    "ecommerce": {
+        "leads": {
+            "initial": "new",
+            "all": ["new", "contacted", "qualified", "converted", "lost"],
+            "forward": ["new", "contacted", "qualified", "converted"],
+        },
+        "tickets": {
+            "initial": "open",
+            "all": ["open", "in_progress", "waiting_on_customer", "resolved", "closed", "escalated"],
+            "forward": ["open", "in_progress", "resolved", "closed"],
+        },
+    },
+    "hospitality": {
+        "leads": {
+            "initial": "new",
+            "all": ["new", "contacted", "qualified", "booked", "lost"],
+            "forward": ["new", "contacted", "qualified", "booked"],
+        },
+        "tickets": {
+            "initial": "open",
+            "all": ["open", "in_progress", "waiting_on_guest", "resolved", "closed", "escalated"],
+            "forward": ["open", "in_progress", "resolved", "closed"],
+        },
+    },
+    "other": {
+        "leads": {
+            "initial": "new",
+            "all": ["new", "contacted", "qualified", "converted", "lost"],
+            "forward": ["new", "contacted", "qualified", "converted"],
+        },
+        "tickets": {
+            "initial": "open",
+            "all": ["open", "in_progress", "resolved", "closed"],
+            "forward": ["open", "in_progress", "resolved", "closed"],
+        },
+    },
+}
+
+
+# Maps each tab name to the `record_type` it lives under inside NokvoOneToolRecord.
+# Keeping tabs and record_types decoupled lets us reuse the same storage row for
+# tabs that share semantics (e.g. real_estate.leads and clinics.leads both write
+# `record_type='lead'`).
+TAB_TO_RECORD_TYPE: dict[str, str] = {
+    "leads": "lead",
+    "tickets": "ticket",
+    "appointments": "appointment",
+}
+
+
+# Searchable JSONB keys per tab — used by {tab}_search and find_contact for
+# indexed lookup over the data column.
+TAB_SEARCH_KEYS: dict[str, tuple[str, ...]] = {
+    "leads": ("full_name", "name", "customer_name", "patient_name", "guest_name", "phone", "email"),
+    "tickets": ("subject", "customer", "customer_name", "patient_name", "guest_name", "order_id", "reservation_id", "property_id"),
+    "appointments": ("patient_name", "doctor", "department", "reason"),
+}
+
+
+# Reserved slugs that custom tabs cannot use. The built-in tab slugs and a few
+# system record_type prefixes are off-limits.
+_RESERVED_CUSTOM_TAB_SLUGS: frozenset[str] = frozenset(
+    {"leads", "tickets", "appointments", "callback", "call_log", "email_draft", "escalation", "lead", "ticket", "appointment"}
+)
+
+
+def _slugify(value: str) -> str:
+    cleaned = (value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    cleaned = "".join(ch for ch in cleaned if ch.isalnum() or ch == "_")
+    return cleaned
+
+
+def normalize_custom_tab_slug(value: str) -> str:
+    slug = _slugify(value)
+    if not slug:
+        raise ValueError("Custom tab slug is required")
+    if slug in _RESERVED_CUSTOM_TAB_SLUGS:
+        raise ValueError(f"Custom tab slug '{slug}' is reserved")
+    if not slug[0].isalpha():
+        raise ValueError("Custom tab slug must start with a letter")
+    if len(slug) > 32:
+        raise ValueError("Custom tab slug must be 32 characters or fewer")
+    return slug
+
+
+def custom_tab_record_type(slug: str) -> str:
+    return f"custom_{normalize_custom_tab_slug(slug)}"
+
+
+def custom_tab_tool_prefix(slug: str) -> str:
+    """Tool key prefix for a custom tab — never collides with built-in tabs."""
+    return normalize_custom_tab_slug(slug)
+
+
+_DEFAULT_CUSTOM_TAB_STATUS_VOCAB: dict[str, Any] = {
+    "initial": "open",
+    "all": ["open", "in_progress", "done", "archived"],
+    "forward": ["open", "in_progress", "done"],
+}
+
+
+def custom_tabs_from_overrides(provider_status: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Return validated, normalized list of custom-tab definitions for a tenant."""
+    raw = (provider_status or {}).get("business_template_custom_tabs") or []
+    if not isinstance(raw, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    seen_slugs: set[str] = set()
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        slug_raw = entry.get("slug") or entry.get("key")
+        if not slug_raw:
+            continue
+        try:
+            slug = normalize_custom_tab_slug(str(slug_raw))
+        except ValueError:
+            continue
+        if slug in seen_slugs:
+            continue
+        seen_slugs.add(slug)
+        label = str(entry.get("label") or slug.replace("_", " ").title())
+        fields = entry.get("fields")
+        if not isinstance(fields, list):
+            fields = []
+        vocab = entry.get("status_vocabulary")
+        if not isinstance(vocab, dict) or not vocab.get("all"):
+            vocab = deepcopy(_DEFAULT_CUSTOM_TAB_STATUS_VOCAB)
+        search_keys = entry.get("search_keys")
+        if not isinstance(search_keys, list):
+            search_keys = []
+        normalized.append(
+            {
+                "slug": slug,
+                "label": label,
+                "fields": deepcopy(fields),
+                "status_vocabulary": deepcopy(vocab),
+                "search_keys": [str(k) for k in search_keys if isinstance(k, str)],
+            }
+        )
+    return normalized
+
+
+def default_custom_tab_status_vocabulary() -> dict[str, Any]:
+    return deepcopy(_DEFAULT_CUSTOM_TAB_STATUS_VOCAB)
+
+
 BUSINESS_TYPE_LABELS = {
     "real_estate": "Real Estate",
     "clinics": "Clinics",
@@ -131,6 +317,7 @@ BUSINESS_TYPE_CONFIGS: dict[str, dict[str, Any]] = {
                 {"key": "status", "label": "Status", "type": "select", "required": True},
             ],
             "tickets": [
+                {"key": "subject", "label": "Subject", "type": "text", "required": False},
                 {"key": "customer_name", "label": "Customer Name", "type": "text", "required": True},
                 {"key": "order_id", "label": "Order ID", "type": "text", "required": False},
                 {"key": "issue_type", "label": "Request Type", "type": "select", "required": True},
@@ -275,6 +462,30 @@ def apply_schema_overrides(config: dict[str, Any], overrides: dict[str, Any] | N
             schemas[key] = deepcopy(fields)
     merged["schemas"] = schemas
     return merged
+
+
+def tab_status_vocabulary(business_type: str | None, tab: str) -> dict[str, Any] | None:
+    """Return the status vocab {initial, all, forward} for (business_type, tab), or None."""
+    normalized = normalize_business_type(business_type)
+    if normalized is None:
+        return None
+    vocab = STATUS_VOCABULARIES.get(normalized, {}).get(tab)
+    return deepcopy(vocab) if vocab else None
+
+
+def tab_record_type(tab: str) -> str | None:
+    return TAB_TO_RECORD_TYPE.get(tab)
+
+
+def tab_search_keys(tab: str) -> tuple[str, ...]:
+    return TAB_SEARCH_KEYS.get(tab, ())
+
+
+def enabled_tabs_for(business_type: str | None) -> list[str]:
+    config = business_type_config(business_type)
+    if config is None:
+        return []
+    return [t for t in (config.get("tabs") or []) if t in TAB_TO_RECORD_TYPE]
 
 
 def business_template_prompt(value: str | None) -> str:

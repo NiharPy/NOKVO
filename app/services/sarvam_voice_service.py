@@ -93,11 +93,15 @@ class SarvamVoiceService:
         api_key: str,
         data: dict[str, Any],
         files: dict[str, Any],
-        max_attempts: int = 3,
+        max_attempts: int = 6,
     ) -> "httpx.Response":
         """POST to a Sarvam STT endpoint, retrying on 429 with respect for
-        the Retry-After header. Capped at ~5s total wait so voice latency
-        stays bounded. Returns the final response (success or last failure)."""
+        the Retry-After header. Returns the final response (success or last failure).
+
+        Sarvam's quota is the actual constraint here; this just makes the client
+        wait it out instead of bubbling the 429 to the user. Per-wait cap is 4s
+        so voice latency degrades but doesn't go infinite when Sarvam throttles.
+        """
         import asyncio
 
         attempt = 0
@@ -119,10 +123,11 @@ class SarvamVoiceService:
                 retry_after = float(retry_after_hdr) if retry_after_hdr else 0.0
             except ValueError:
                 retry_after = 0.0
-            # Default backoff if Retry-After missing: 0.8s, 1.6s, ...
+            # Default backoff if Retry-After missing: 0.8s, 1.6s, 3.2s, ...
             backoff = retry_after if retry_after > 0 else (0.8 * (2 ** (attempt - 1)))
-            # Cap each wait so we don't blow the voice latency budget.
-            wait = min(backoff, 2.0)
+            # Per-wait cap (longer than before — the user opted to absorb 429s
+            # at the cost of latency rather than surface them).
+            wait = min(backoff, 4.0)
             if attempt >= max_attempts:
                 print(
                     f"[NOKVO-SARVAM] STT 429 after {attempt} attempts — giving up "

@@ -13,6 +13,7 @@ from app.models.email_verification import EmailVerification
 from app.models.member_invitation import MemberInvitation
 from app.models.nokvo_one_tool_record import NokvoOneToolRecord
 from app.models.nokvo_one_agent import NokvoOneAgent
+from app.models.agent_tool_invocation import AgentToolInvocation
 from app.models.member_assignment import (
     ClinicMemberScheduleSettings,
     MemberBlockedSlot,
@@ -37,6 +38,7 @@ __all__ = [
     "MemberInvitation",
     "NokvoOneToolRecord",
     "NokvoOneAgent",
+    "AgentToolInvocation",
     "OrganizationMemberAssignmentSettings",
     "ClinicMemberScheduleSettings",
     "MemberBlockedSlot",

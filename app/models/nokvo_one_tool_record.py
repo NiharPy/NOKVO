@@ -34,5 +34,7 @@ class NokvoOneToolRecord(Base):
     record_type = Column(String, nullable=False, index=True)
     status = Column(String, nullable=False, server_default="open")
     data = Column(JSONB, nullable=False, server_default="{}")
+    contact_phone = Column(String, nullable=True)
+    contact_email = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

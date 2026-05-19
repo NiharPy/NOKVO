@@ -38,6 +38,7 @@ from app.models.tenant_resources import TenantResources
 from app.services.agent_session_store import AgentSessionStore
 from app.services.language_intent import detect_language_switch
 from app.services.nokvo_one_voice_pipeline import NokvoOneVoicePipeline
+from app.services.predefined_tools_service import PredefinedToolsService, get_tool
 from app.services.prosody import DEFAULT_TONE, ProsodyChunk, prosody_for, stream_prosody_chunks
 from app.services.sarvam_voice_service import SarvamVoiceService
 
@@ -57,6 +58,67 @@ class NokvoOneVoiceStreamService:
     @staticmethod
     async def _emit_runtime_status(websocket: WebSocket, tenant_res: TenantResources) -> None:
         await websocket.send_json({"type": "runtime_status", **NokvoOneVoicePipeline.runtime_status(tenant_res)})
+
+    @staticmethod
+    def _inbound_opening_text(language: str | None) -> str:
+        lang = SarvamVoiceService.normalize_language(language)
+        if lang == "te":
+            return "హలో, మీరు మీకు సౌకర్యమైన భాషలో మాట్లాడండి. నేను అదే భాషలో కొనసాగిస్తాను. నేను ఎలా సహాయం చేయగలను?"
+        if lang == "hi":
+            return "नमस्ते, आप जिस भाषा में सहज हैं उसमें बात कीजिए। मैं उसी भाषा में आगे बात करूंगा। मैं कैसे मदद कर सकता हूं?"
+        return "Hello, please speak in the language you're comfortable with. I'll continue in that language. How can I help?"
+
+    @staticmethod
+    async def _log_voice_call(
+        db: AsyncSession | None,
+        tenant_res: TenantResources,
+        call_id: str | None,
+        *,
+        duration_seconds: int,
+        campaign_context: dict[str, Any] | None = None,
+    ) -> None:
+        if db is None or not call_id:
+            return
+        history = await AgentSessionStore.get_history(tenant_res, call_id)
+        if not history:
+            return
+        lines: list[str] = []
+        for item in history[-16:]:
+            role = str(item.get("role") or "turn").strip() or "turn"
+            content = " ".join(str(item.get("content") or "").split())
+            if content:
+                lines.append(f"{role}: {content}")
+        if not lines:
+            return
+        contact = (campaign_context or {}).get("contact") or {}
+        args: dict[str, Any] = {
+            "channel": "voice",
+            "summary": "\n".join(lines)[-4000:],
+            "outcome": "completed",
+            "duration_seconds": max(0, duration_seconds),
+        }
+        if isinstance(contact, dict):
+            if contact.get("name"):
+                args["contact_name"] = str(contact["name"])
+            if contact.get("phone"):
+                args["contact_phone"] = str(contact["phone"])
+            if contact.get("email"):
+                args["contact_email"] = str(contact["email"])
+        tool = get_tool("call_log_create")
+        if tool is None:
+            return
+        try:
+            await PredefinedToolsService.execute(
+                db,
+                tenant_res.organization_id,
+                None,
+                tool,
+                args,
+                session_id=f"{call_id}:call_log",
+            )
+            await db.commit()
+        except Exception:
+            await db.rollback()
 
     @staticmethod
     async def _run_text_turn(
@@ -239,6 +301,7 @@ class NokvoOneVoiceStreamService:
                 "runtime": (final_payload or {}).get("runtime") or {},
                 "retrieval": (final_payload or {}).get("retrieval") or {},
                 "intent": (final_payload or {}).get("intent") or {"type": "RAG_ALWAYS_ON", "should_retrieve": True},
+                "tool_calls": (final_payload or {}).get("tool_calls") or [],
             }
         )
         await websocket.send_json(
@@ -339,9 +402,8 @@ class NokvoOneVoiceStreamService:
             await websocket.send_json(payload)
             return
 
-        detected_lang = SarvamVoiceService.normalize_language(
-            native_result.get("language") or fallback_language
-        )
+        raw_detected_language = native_result.get("language")
+        detected_lang = SarvamVoiceService.normalize_language(raw_detected_language or fallback_language)
         if not transcript:
             await websocket.send_json({"type": "stt_empty"})
             return
@@ -367,6 +429,10 @@ class NokvoOneVoiceStreamService:
             turn_language = normalized
         elif session_locked_language[0]:
             turn_language = session_locked_language[0]
+        elif raw_detected_language:
+            session_locked_language[0] = detected_lang
+            await websocket.send_json({"type": "language_locked", "language": detected_lang})
+            turn_language = detected_lang
         else:
             turn_language = detected_lang
 
@@ -492,6 +558,7 @@ class NokvoOneVoiceStreamService:
         campaign_context: dict[str, Any] | None = None,
     ) -> None:
         await websocket.accept()
+        session_started = perf_counter()
         language = SarvamVoiceService.normalize_language(language)
         call_id = call_id or str(uuid.uuid4())
         company_name = await NokvoOneVoiceStreamService._company_name(db, tenant_res)
@@ -541,6 +608,22 @@ class NokvoOneVoiceStreamService:
         # detection flaps the reply language mid-conversation, especially on
         # code-switched utterances.
         session_locked_language: list[str | None] = [None]
+        utterance_language_detected: list[bool] = [False]
+        inbound_opener_played: list[bool] = [False]
+        inbound_opener_task: asyncio.Task | None = None
+
+        async def _play_default_inbound_opener() -> None:
+            if inbound_opener_played[0] or (campaign_context or {}).get("opening_message"):
+                return
+            inbound_opener_played[0] = True
+            await NokvoOneVoiceStreamService._play_opener(
+                websocket,
+                tenant_res,
+                NokvoOneVoiceStreamService._inbound_opening_text(language),
+                language=language,
+                call_id=call_id,
+                campaign_context=campaign_context,
+            )
 
         # Per-utterance audio buffer (separate from the call-long ``audio_buffer``).
         # Reset on speech_start so each turn's translate-STT call sees only the
@@ -567,8 +650,13 @@ class NokvoOneVoiceStreamService:
                 turn_language = normalized
             elif session_locked_language[0]:
                 turn_language = session_locked_language[0]
+            elif utterance_language_detected[0]:
+                session_locked_language[0] = utterance_language[0]
+                turn_language = utterance_language[0]
+                await websocket.send_json({"type": "language_locked", "language": turn_language})
             else:
                 turn_language = utterance_language[0]
+            utterance_language_detected[0] = False
 
             # Cross-lingual retrieval: when enabled AND the utterance isn't already
             # English, dispatch a parallel translate-STT call on the per-utterance
@@ -731,8 +819,11 @@ class NokvoOneVoiceStreamService:
                         if not text:
                             continue
                         is_final = bool(parsed.get("is_final"))
+                        raw_segment_language = parsed.get("language")
+                        if raw_segment_language:
+                            utterance_language_detected[0] = True
                         utterance_language[0] = SarvamVoiceService.normalize_language(
-                            parsed.get("language") or utterance_language[0]
+                            raw_segment_language or utterance_language[0]
                         )
                         await websocket.send_json(
                             {
@@ -773,6 +864,15 @@ class NokvoOneVoiceStreamService:
                 call_id=call_id,
                 campaign_context=campaign_context,
             )
+        else:
+            async def _delayed_inbound_opener() -> None:
+                try:
+                    await asyncio.sleep(0.35)
+                    await _play_default_inbound_opener()
+                except asyncio.CancelledError:
+                    pass
+
+            inbound_opener_task = asyncio.create_task(_delayed_inbound_opener())
 
         try:
             while True:
@@ -836,6 +936,9 @@ class NokvoOneVoiceStreamService:
                         capture_mode[0] = requested_mode
                         print(f"[NOKVO-VOICE] capture_mode set to {capture_mode[0]} for call {call_id}")
                     await NokvoOneVoiceStreamService._emit_runtime_status(websocket, tenant_res)
+                    if inbound_opener_task and not inbound_opener_task.done():
+                        inbound_opener_task.cancel()
+                    await _play_default_inbound_opener()
                     continue
                 if event_type == "interrupt":
                     # Client-side barge-in: user started speaking while agent
@@ -894,6 +997,8 @@ class NokvoOneVoiceStreamService:
                     if event_type == "stop":
                         break
         finally:
+            if inbound_opener_task and not inbound_opener_task.done():
+                inbound_opener_task.cancel()
             _cancel_eou_timer()
             if current_turn and not current_turn.done():
                 current_turn.cancel()
@@ -908,3 +1013,10 @@ class NokvoOneVoiceStreamService:
                     await stt_ws.close()
                 except Exception:
                     pass
+            await NokvoOneVoiceStreamService._log_voice_call(
+                db,
+                tenant_res,
+                call_id,
+                duration_seconds=int(perf_counter() - session_started),
+                campaign_context=campaign_context,
+            )

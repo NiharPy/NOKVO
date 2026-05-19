@@ -27,6 +27,22 @@ class Settings(BaseSettings):
     NOKVO_ONE_EMAIL_TOKEN_TTL_HOURS: int = 24
     NOKVO_ONE_INVITE_TOKEN_TTL_HOURS: int = 72
 
+    # Nokvo One onboarding v2 (outcome wizard, deferred MFA, simplified nav).
+    # When false, the legacy onboarding flow is preserved exactly. The v2 surface
+    # piggybacks on the same auth states + endpoints; it only changes how the
+    # frontend routes and which actions require MFA up-front.
+    NOKVO_ONBOARDING_V2: bool = False
+    NOKVO_ONE_NATIVE_TOOL_CALLING: bool = True
+    NOKVO_ONE_TOOL_LOOP_MAX_ITERATIONS: int = 4
+
+    # Call-center ambience mixing for the agent's voice output. When enabled,
+    # the frontend mic tester (and, when wired, the Exotel media path) layers
+    # a low-volume office hum under the agent so calls feel realistic.
+    # Files live in app/assets/audio/call_center_ambience/ (download via
+    # `python -m app.scripts.download_ambience_audio`).
+    NOKVO_CALL_CENTER_AMBIENCE_ENABLED: bool = True
+    NOKVO_CALL_CENTER_AMBIENCE_VOLUME: float = 0.28  # 0.0 (silent) to 1.0 (full)
+
     # SMTP (optional — when unset, emails are logged only)
     SMTP_HOST: str = ""
     SMTP_PORT: int = 587
@@ -88,7 +104,12 @@ class Settings(BaseSettings):
     AZURE_OPENAI_CHAT_MODEL_VERSION: str = "2025-04-14"
     AZURE_OPENAI_CHAT_DEPLOYMENT: str = "gpt-4-1-mini"
     AZURE_OPENAI_CHAT_SKU: str = "GlobalStandard"
-    AZURE_OPENAI_CHAT_CAPACITY: int = 1
+    # Capacity is in K-TPM (1 unit = 1,000 tokens/min, 6 requests/min). The Azure
+    # floor of 1 (1K TPM / 6 RPM) is far too small for conversational voice — a
+    # single turn burns ~2-5K tokens and interactive testing trips the quota
+    # every couple of utterances. Bumping to 500K TPM / 3,000 RPM gives any new
+    # tenant headroom for sustained calls without falling back to the global pool.
+    AZURE_OPENAI_CHAT_CAPACITY: int = 500
     AZURE_OPENAI_CHAT_REGION: str = "southindia"
 
     # Nokvo One per-tenant text embedding deployment (text-embedding-3-small in

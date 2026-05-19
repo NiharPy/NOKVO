@@ -1,38 +1,50 @@
 """
 Nokvo One predefined-tool catalog and dispatcher.
 
-V1 ships a tightly scoped set of safe, controlled tools:
-  - lead_tracker_create_lead
-  - lead_tracker_update_status
-  - lead_tracker_add_note
-  - call_logger_create_entry
-  - call_logger_get_history
-  - create_ticket
-  - schedule_callback
-  - send_email_draft
+Two layers of tools live here:
 
-Hard rules for V1:
-  - No direct database-write tools beyond the schema we own (NokvoOneToolRecord).
-  - No web_search.
-  - No refund / payment / order-modification tools.
-  - send_email_draft NEVER sends external email — it creates a queued draft requiring
-    explicit human confirmation via the portal.
+1. **Cross-cutting tools** (CROSS_CUTTING_CATALOG) — business-type-agnostic
+   primitives: log a call, schedule a callback, draft an email, escalate to a
+   human, find a contact across a tab. Same for every org.
+
+2. **Resource handlers** — generic CRUD handlers (`_handle_resource_*`)
+   parameterized by `record_type`. The per-tab tools (`leads_create`,
+   `tickets_update`, `appointments_set_status`, ...) are produced by
+   `dynamic_tool_resolver.resolve_catalog()` from the org's business template
+   and schema overrides; they route to these handlers via `handler_name`.
+
+Hard rules:
+  - No tool ever performs an external send. send_email_draft only writes a
+    pending_confirmation draft row.
+  - No tool hard-deletes data. {tab}_close transitions to a terminal status.
+  - All side-effects go through NokvoOneToolRecord (org-scoped).
+  - Every successful invocation is audited in AgentToolInvocation; identical
+    repeated calls within IDEMPOTENCY_WINDOW_SECONDS are short-circuited.
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import re
 import uuid
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Iterable
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.agent_tool_invocation import AgentToolInvocation
 from app.models.nokvo_one_tool_record import NokvoOneToolRecord
+from app.models.organization import Organization
+from app.services.nokvo_one_assignment_service import NokvoOneAssignmentService
 
 
 JSONSchema = dict[str, Any]
 ToolHandler = Callable[..., Awaitable[dict[str, Any]]]
+
+
+IDEMPOTENCY_WINDOW_SECONDS = 60
 
 
 @dataclass(frozen=True)
@@ -44,70 +56,18 @@ class PredefinedTool:
     record_type: str | None
     handler_name: str
     requires_confirmation: bool = False
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
-CATALOG: tuple[PredefinedTool, ...] = (
+# ─────────── Cross-cutting catalog ───────────
+
+CROSS_CUTTING_CATALOG: tuple[PredefinedTool, ...] = (
     PredefinedTool(
-        key="lead_tracker_create_lead",
-        display_name="Create lead",
-        description="Create a new lead in the Nokvo One lead tracker.",
-        record_type="lead",
-        handler_name="lead_tracker_create_lead",
-        input_schema={
-            "type": "object",
-            "required": ["full_name"],
-            "properties": {
-                "full_name": {"type": "string", "minLength": 1, "maxLength": 200},
-                "email": {"type": "string", "format": "email"},
-                "phone": {"type": "string", "maxLength": 32},
-                "company": {"type": "string", "maxLength": 200},
-                "source": {"type": "string", "maxLength": 80},
-                "notes": {"type": "string", "maxLength": 2000},
-            },
-            "additionalProperties": False,
-        },
-    ),
-    PredefinedTool(
-        key="lead_tracker_update_status",
-        display_name="Update lead status",
-        description="Change the status of an existing lead.",
-        record_type="lead",
-        handler_name="lead_tracker_update_status",
-        input_schema={
-            "type": "object",
-            "required": ["lead_id", "status"],
-            "properties": {
-                "lead_id": {"type": "string", "format": "uuid"},
-                "status": {
-                    "type": "string",
-                    "enum": ["new", "contacted", "qualified", "converted", "lost"],
-                },
-            },
-            "additionalProperties": False,
-        },
-    ),
-    PredefinedTool(
-        key="lead_tracker_add_note",
-        display_name="Add lead note",
-        description="Append a note to a lead's history.",
-        record_type="lead",
-        handler_name="lead_tracker_add_note",
-        input_schema={
-            "type": "object",
-            "required": ["lead_id", "note"],
-            "properties": {
-                "lead_id": {"type": "string", "format": "uuid"},
-                "note": {"type": "string", "minLength": 1, "maxLength": 2000},
-            },
-            "additionalProperties": False,
-        },
-    ),
-    PredefinedTool(
-        key="call_logger_create_entry",
+        key="call_log_create",
         display_name="Log call",
         description="Record an interaction with a customer (call, chat, email).",
         record_type="call_log",
-        handler_name="call_logger_create_entry",
+        handler_name="call_log_create",
         input_schema={
             "type": "object",
             "required": ["channel", "summary"],
@@ -124,36 +84,17 @@ CATALOG: tuple[PredefinedTool, ...] = (
         },
     ),
     PredefinedTool(
-        key="call_logger_get_history",
-        display_name="Get call history",
-        description="Retrieve recent call/interaction history for the organization.",
+        key="call_log_search",
+        display_name="Search call history",
+        description="Retrieve recent call/interaction history, optionally filtered by contact.",
         record_type="call_log",
-        handler_name="call_logger_get_history",
+        handler_name="call_log_search",
         input_schema={
             "type": "object",
             "properties": {
                 "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
                 "contact_email": {"type": "string", "format": "email"},
                 "contact_phone": {"type": "string", "maxLength": 32},
-            },
-            "additionalProperties": False,
-        },
-    ),
-    PredefinedTool(
-        key="create_ticket",
-        display_name="Create support ticket",
-        description="Open a support ticket in the Nokvo One ticket inbox.",
-        record_type="ticket",
-        handler_name="create_ticket",
-        input_schema={
-            "type": "object",
-            "required": ["subject", "description"],
-            "properties": {
-                "subject": {"type": "string", "minLength": 1, "maxLength": 200},
-                "description": {"type": "string", "minLength": 1, "maxLength": 4000},
-                "priority": {"type": "string", "enum": ["low", "normal", "high", "urgent"], "default": "normal"},
-                "contact_email": {"type": "string", "format": "email"},
-                "contact_name": {"type": "string", "maxLength": 200},
             },
             "additionalProperties": False,
         },
@@ -198,13 +139,200 @@ CATALOG: tuple[PredefinedTool, ...] = (
             "additionalProperties": False,
         },
     ),
+    PredefinedTool(
+        key="escalate_to_human",
+        display_name="Escalate to human",
+        description="Flag a conversation for human follow-up with a reason and priority.",
+        record_type="escalation",
+        handler_name="escalate_to_human",
+        input_schema={
+            "type": "object",
+            "required": ["reason"],
+            "properties": {
+                "reason": {"type": "string", "minLength": 1, "maxLength": 1000},
+                "priority": {"type": "string", "enum": ["low", "normal", "high", "urgent"], "default": "normal"},
+                "contact_name": {"type": "string", "maxLength": 200},
+                "contact_phone": {"type": "string", "maxLength": 32},
+                "contact_email": {"type": "string", "format": "email"},
+                "related_record_id": {"type": "string", "format": "uuid"},
+            },
+            "additionalProperties": False,
+        },
+    ),
+    PredefinedTool(
+        key="find_contact",
+        display_name="Find contact",
+        description=(
+            "Look up the most recent record matching a phone or email inside one tab "
+            "(leads | tickets | appointments). Returns id + summary or null."
+        ),
+        record_type=None,
+        handler_name="find_contact",
+        input_schema={
+            "type": "object",
+            "required": ["tab"],
+            "properties": {
+                "tab": {"type": "string", "enum": ["leads", "tickets", "appointments"]},
+                "phone": {"type": "string", "maxLength": 32},
+                "email": {"type": "string", "format": "email"},
+            },
+            "additionalProperties": False,
+        },
+    ),
 )
 
 
-_CATALOG_INDEX: dict[str, PredefinedTool] = {tool.key: tool for tool in CATALOG}
+_CROSS_CUTTING_INDEX: dict[str, PredefinedTool] = {tool.key: tool for tool in CROSS_CUTTING_CATALOG}
 
 
-def list_tools() -> list[dict[str, Any]]:
+# ─────────── Macro catalog (per business_type) ───────────
+#
+# Macros are compound tools that perform a multi-step workflow in a single
+# invocation. They write multiple NokvoOneToolRecord rows (e.g. a lead AND
+# an appointment) and return a structured result with all created ids.
+#
+# Macros are STRICTLY gated to a business_type. The resolver only emits the
+# macros whose key appears in MACRO_CATALOG[business_type].
+
+MACRO_CATALOG: dict[str, tuple[PredefinedTool, ...]] = {
+    "clinics": (
+        PredefinedTool(
+            key="book_appointment_with_lead_capture",
+            display_name="Book appointment + capture lead",
+            description=(
+                "Atomic workflow for clinics: creates a lead if the patient is new, "
+                "then books an appointment for them. Returns both record ids."
+            ),
+            record_type=None,
+            handler_name="macro_book_appointment_with_lead_capture",
+            input_schema={
+                "type": "object",
+                "required": ["patient_name", "phone", "reason", "appointment_time"],
+                "properties": {
+                    "patient_name": {"type": "string", "minLength": 1, "maxLength": 200},
+                    "phone": {"type": "string", "minLength": 4, "maxLength": 32},
+                    "email": {"type": "string", "format": "email"},
+                    "reason": {"type": "string", "minLength": 1, "maxLength": 500},
+                    "preferred_doctor": {"type": "string", "maxLength": 200},
+                    "department": {"type": "string", "maxLength": 200},
+                    "appointment_time": {"type": "string", "format": "date-time"},
+                    "source": {"type": "string", "maxLength": 80},
+                },
+                "additionalProperties": False,
+            },
+        ),
+    ),
+    "real_estate": (
+        PredefinedTool(
+            key="qualify_lead_and_schedule_visit",
+            display_name="Qualify lead + schedule site visit",
+            description=(
+                "Real-estate workflow: creates a qualified lead with budget/location, "
+                "then schedules a site-visit callback. Returns lead_id + callback_id."
+            ),
+            record_type=None,
+            handler_name="macro_qualify_lead_and_schedule_visit",
+            input_schema={
+                "type": "object",
+                "required": ["name", "phone", "visit_at"],
+                "properties": {
+                    "name": {"type": "string", "minLength": 1, "maxLength": 200},
+                    "phone": {"type": "string", "minLength": 4, "maxLength": 32},
+                    "email": {"type": "string", "format": "email"},
+                    "property_type": {"type": "string", "maxLength": 80},
+                    "budget": {"type": "number"},
+                    "location": {"type": "string", "maxLength": 200},
+                    "visit_at": {"type": "string", "format": "date-time"},
+                    "notes": {"type": "string", "maxLength": 2000},
+                },
+                "additionalProperties": False,
+            },
+        ),
+    ),
+    "ecommerce": (
+        PredefinedTool(
+            key="open_return_ticket_with_order_lookup",
+            display_name="Open return ticket + log call",
+            description=(
+                "E-commerce workflow: opens a return_request ticket scoped to an order, "
+                "and logs the customer interaction. Returns ticket_id + call_log_id."
+            ),
+            record_type=None,
+            handler_name="macro_open_return_ticket_with_order_lookup",
+            input_schema={
+                "type": "object",
+                "required": ["customer_name", "issue_summary"],
+                "properties": {
+                    "customer_name": {"type": "string", "minLength": 1, "maxLength": 200},
+                    "email": {"type": "string", "format": "email"},
+                    "phone": {"type": "string", "maxLength": 32},
+                    "order_id": {"type": "string", "maxLength": 80},
+                    "issue_summary": {"type": "string", "minLength": 1, "maxLength": 2000},
+                    "priority": {"type": "string", "enum": ["low", "normal", "high", "urgent"], "default": "normal"},
+                    "channel": {"type": "string", "enum": ["voice", "chat", "email", "other"], "default": "voice"},
+                },
+                "additionalProperties": False,
+            },
+        ),
+    ),
+    "hospitality": (
+        PredefinedTool(
+            key="create_reservation_lead_and_hold",
+            display_name="Create reservation lead + schedule hold-confirm",
+            description=(
+                "Hospitality workflow: captures a qualified booking lead and schedules a "
+                "callback to confirm the hold. Returns lead_id + callback_id."
+            ),
+            record_type=None,
+            handler_name="macro_create_reservation_lead_and_hold",
+            input_schema={
+                "type": "object",
+                "required": ["guest_name", "phone", "stay_dates", "confirm_at"],
+                "properties": {
+                    "guest_name": {"type": "string", "minLength": 1, "maxLength": 200},
+                    "phone": {"type": "string", "minLength": 4, "maxLength": 32},
+                    "email": {"type": "string", "format": "email"},
+                    "stay_dates": {"type": "string", "maxLength": 200},
+                    "room_type": {"type": "string", "maxLength": 80},
+                    "party_size": {"type": "integer", "minimum": 1, "maximum": 64},
+                    "confirm_at": {"type": "string", "format": "date-time"},
+                    "notes": {"type": "string", "maxLength": 2000},
+                },
+                "additionalProperties": False,
+            },
+        ),
+    ),
+}
+
+
+def macros_for_business_type(business_type: str | None) -> tuple[PredefinedTool, ...]:
+    if business_type is None:
+        return ()
+    return MACRO_CATALOG.get(business_type, ())
+
+
+# ─────────── Backwards-compat aliases ───────────
+# Older NokvoOneAgent rows reference these v0 tool keys. We map them to the new
+# resolver-produced or cross-cutting keys so existing agents continue to work
+# without a migration.
+LEGACY_KEY_ALIASES: dict[str, str] = {
+    "lead_tracker_create_lead": "leads_create",
+    "lead_tracker_update_status": "leads_set_status",
+    "lead_tracker_add_note": "leads_add_note",
+    "call_logger_create_entry": "call_log_create",
+    "call_logger_get_history": "call_log_search",
+    "create_ticket": "tickets_create",
+}
+
+
+def resolve_legacy_key(key: str) -> str:
+    return LEGACY_KEY_ALIASES.get(key, key)
+
+
+# ─────────── Public catalog accessors (cross-cutting only) ───────────
+
+
+def list_cross_cutting_tools() -> list[dict[str, Any]]:
     return [
         {
             "key": tool.key,
@@ -213,27 +341,102 @@ def list_tools() -> list[dict[str, Any]]:
             "input_schema": tool.input_schema,
             "requires_confirmation": tool.requires_confirmation,
         }
-        for tool in CATALOG
+        for tool in CROSS_CUTTING_CATALOG
     ]
 
 
-def get_tool(key: str) -> PredefinedTool | None:
-    return _CATALOG_INDEX.get(key)
+def get_cross_cutting_tool(key: str) -> PredefinedTool | None:
+    return _CROSS_CUTTING_INDEX.get(key)
 
 
-def validate_tool_keys(keys: Iterable[str]) -> list[str]:
-    invalid = [k for k in keys if k not in _CATALOG_INDEX]
+def validate_cross_cutting_keys(keys: Iterable[str]) -> list[str]:
+    resolved = [resolve_legacy_key(k) for k in keys]
+    invalid = [k for k in resolved if k not in _CROSS_CUTTING_INDEX]
     if invalid:
-        raise ValueError(f"Unknown predefined tool keys: {invalid}")
-    return list(keys)
+        raise ValueError(f"Unknown cross-cutting tool keys: {invalid}")
+    return resolved
+
+
+# Legacy export names — kept so callers that haven't migrated still import cleanly.
+def list_tools() -> list[dict[str, Any]]:
+    return list_cross_cutting_tools()
+
+
+def get_tool(key: str) -> PredefinedTool | None:
+    return get_cross_cutting_tool(resolve_legacy_key(key))
+
+
+# ─────────── Idempotency ───────────
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def compute_idempotency_key(session_id: str | None, tool_key: str, arguments: dict[str, Any]) -> str:
+    payload = f"{session_id or ''}|{tool_key}|{_canonical_json(arguments)}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _validate_tool_arguments(tool: PredefinedTool, arguments: dict[str, Any]) -> None:
+    schema = tool.input_schema or {}
+    properties = schema.get("properties") or {}
+    required = [str(item) for item in schema.get("required") or []]
+    if not isinstance(arguments, dict):
+        raise ValueError("Tool arguments must be a JSON object.")
+
+    missing = [
+        key
+        for key in required
+        if key not in arguments or arguments.get(key) is None or str(arguments.get(key)).strip() == ""
+    ]
+    if missing:
+        raise ValueError(f"Missing required fields: {', '.join(missing)}")
+
+    if schema.get("additionalProperties") is False:
+        extra = [key for key in arguments if key not in properties]
+        if extra:
+            raise ValueError(f"Unsupported fields for {tool.key}: {', '.join(extra)}")
+
+    for key, value in arguments.items():
+        field = properties.get(key)
+        if not isinstance(field, dict) or value is None:
+            continue
+        expected_type = field.get("type")
+        if expected_type == "string":
+            if not isinstance(value, str):
+                raise ValueError(f"Field '{key}' must be a string.")
+            if field.get("minLength") is not None and len(value.strip()) < int(field["minLength"]):
+                raise ValueError(f"Field '{key}' is too short.")
+            if field.get("maxLength") is not None and len(value) > int(field["maxLength"]):
+                raise ValueError(f"Field '{key}' is too long.")
+            if field.get("format") == "email" and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", value.strip()):
+                raise ValueError(f"Field '{key}' must be a valid email address.")
+        elif expected_type == "integer":
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise ValueError(f"Field '{key}' must be an integer.")
+            if field.get("minimum") is not None and value < int(field["minimum"]):
+                raise ValueError(f"Field '{key}' is below the minimum.")
+            if field.get("maximum") is not None and value > int(field["maximum"]):
+                raise ValueError(f"Field '{key}' is above the maximum.")
+        elif expected_type == "number":
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise ValueError(f"Field '{key}' must be a number.")
+        enum_values = field.get("enum")
+        if enum_values and value not in enum_values:
+            raise ValueError(f"Field '{key}' must be one of: {', '.join(map(str, enum_values))}.")
+
+
+# ─────────── Dispatcher ───────────
 
 
 class PredefinedToolsService:
     """Async dispatcher for Nokvo One predefined tool calls.
 
-    All tool side-effects route through this service so the agent runtime
-    never bypasses the safety envelope (no external sends, schema validation
-    handled here in the future, etc.).
+    Callers must pass the resolved `tool` (from the cross-cutting index or
+    dynamic_tool_resolver) so the dispatcher knows which handler to run and
+    which record_type to scope to. This avoids re-resolving the catalog inside
+    every execute() call.
     """
 
     @staticmethod
@@ -241,56 +444,257 @@ class PredefinedToolsService:
         db: AsyncSession,
         organization_id: uuid.UUID,
         user_id: uuid.UUID | None,
-        tool_key: str,
+        tool: PredefinedTool | str,
         arguments: dict[str, Any],
+        *,
+        agent_id: uuid.UUID | None = None,
+        session_id: str | None = None,
     ) -> dict[str, Any]:
-        tool = get_tool(tool_key)
-        if tool is None:
-            raise ValueError(f"Unknown tool '{tool_key}'")
-        handler = getattr(PredefinedToolsService, f"_handle_{tool.handler_name}")
-        return await handler(db, organization_id, user_id, arguments)
+        if isinstance(tool, str):
+            resolved_key = resolve_legacy_key(tool)
+            cross = get_cross_cutting_tool(resolved_key)
+            if cross is None:
+                raise ValueError(f"Unknown tool '{tool}'")
+            tool = cross
+        _validate_tool_arguments(tool, arguments)
+        idem_key = compute_idempotency_key(session_id, tool.key, arguments)
+        cached = await _recent_invocation(db, organization_id, idem_key)
+        if cached is not None:
+            return {"idempotent": True, **(cached.result or {})}
+
+        handler_name = f"_handle_{tool.handler_name}"
+        handler = getattr(PredefinedToolsService, handler_name, None)
+        if handler is None:
+            raise ValueError(f"No handler '{handler_name}' for tool '{tool.key}'")
+
+        try:
+            result = await handler(db, organization_id, user_id, tool, arguments)
+        except ValueError:
+            # Validation errors propagate; do NOT write an audit row (no side-effect ran).
+            raise
+
+        await _record_invocation(
+            db,
+            organization_id=organization_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            tool_key=tool.key,
+            idempotency_key=idem_key,
+            arguments=arguments,
+            result=result,
+        )
+        return result
+
+    # ─────────── Generic resource handlers ───────────
 
     @staticmethod
-    async def _handle_lead_tracker_create_lead(db, org_id, user_id, args):
+    async def _handle_resource_create(db, org_id, user_id, tool, args):
+        record_type = tool.record_type
+        if record_type is None:
+            raise ValueError(f"Tool '{tool.key}' has no record_type")
+
+        vocab = _tool_status_vocabulary(tool)
+        initial_status = (vocab or {}).get("initial") or "open"
+
+        data = dict(args)
+        contact_phone, contact_email = _extract_contact(data)
         rec = NokvoOneToolRecord(
             id=uuid.uuid4(),
             organization_id=org_id,
             created_by_user_id=user_id,
-            record_type="lead",
-            status="new",
-            data={
-                "full_name": args["full_name"],
-                "email": args.get("email"),
-                "phone": args.get("phone"),
-                "company": args.get("company"),
-                "source": args.get("source"),
-                "notes_history": [args["notes"]] if args.get("notes") else [],
-            },
+            record_type=record_type,
+            status=initial_status,
+            data=data,
+            contact_phone=contact_phone,
+            contact_email=contact_email,
         )
         db.add(rec)
         await db.flush()
-        return {"ok": True, "lead_id": str(rec.id), "status": rec.status}
+        assignment = await _maybe_assign_created_resource(db, org_id, user_id, tool, rec, data)
+        response = {
+            "ok": True,
+            "id": str(rec.id),
+            "record_type": record_type,
+            "status": rec.status,
+        }
+        if assignment:
+            response["assignment"] = assignment
+            if assignment.get("selected_member_name"):
+                response["assigned_member_name"] = assignment["selected_member_name"]
+            response["assignment_status"] = assignment.get("assignment_status")
+        return response
 
     @staticmethod
-    async def _handle_lead_tracker_update_status(db, org_id, user_id, args):
-        rec = await PredefinedToolsService._fetch_record(db, org_id, args["lead_id"], "lead")
-        rec.status = args["status"]
+    async def _handle_resource_update(db, org_id, user_id, tool, args):
+        record_type = tool.record_type
+        if record_type is None:
+            raise ValueError(f"Tool '{tool.key}' has no record_type")
+
+        rec = await _resolve_record(db, org_id, record_type, args)
+        new_data = dict(rec.data or {})
+        for key, value in args.items():
+            if key in {"id", "phone", "email"} and key not in new_data:
+                continue
+            if value is None:
+                continue
+            new_data[key] = value
+        rec.data = new_data
+        contact_phone, contact_email = _extract_contact(new_data)
+        if contact_phone:
+            rec.contact_phone = contact_phone
+        if contact_email:
+            rec.contact_email = contact_email
         await db.flush()
-        return {"ok": True, "lead_id": str(rec.id), "status": rec.status}
+        return {"ok": True, "id": str(rec.id), "status": rec.status}
 
     @staticmethod
-    async def _handle_lead_tracker_add_note(db, org_id, user_id, args):
-        rec = await PredefinedToolsService._fetch_record(db, org_id, args["lead_id"], "lead")
+    async def _handle_resource_get(db, org_id, user_id, tool, args):
+        record_type = tool.record_type
+        rec = await _fetch_by_id(db, org_id, args["id"], record_type)
+        return {
+            "ok": True,
+            "id": str(rec.id),
+            "record_type": rec.record_type,
+            "status": rec.status,
+            "data": rec.data or {},
+            "created_at": rec.created_at.isoformat() if rec.created_at else None,
+        }
+
+    @staticmethod
+    async def _handle_resource_list(db, org_id, user_id, tool, args):
+        record_type = tool.record_type
+        limit = int(args.get("limit") or 10)
+        stmt = (
+            select(NokvoOneToolRecord)
+            .where(
+                NokvoOneToolRecord.organization_id == org_id,
+                NokvoOneToolRecord.record_type == record_type,
+            )
+            .order_by(NokvoOneToolRecord.created_at.desc())
+            .limit(limit)
+        )
+        if args.get("status"):
+            stmt = stmt.where(NokvoOneToolRecord.status == args["status"])
+        result = await db.execute(stmt)
+        rows = result.scalars().all()
+        return {
+            "ok": True,
+            "entries": [_row_summary(r) for r in rows],
+        }
+
+    @staticmethod
+    async def _handle_resource_search(db, org_id, user_id, tool, args):
+        from app.services.nokvo_one_business_templates import tab_search_keys
+
+        record_type = tool.record_type
+        tab = _tab_from_tool_key(tool.key) or ""
+        keys = tuple(tab_search_keys(tab)) or tuple(tool.metadata.get("custom_tab_search_keys") or ())
+        query = str(args.get("query") or "").strip()
+        limit = int(args.get("limit") or 10)
+        if not query:
+            return {"ok": True, "entries": []}
+
+        stmt = (
+            select(NokvoOneToolRecord)
+            .where(
+                NokvoOneToolRecord.organization_id == org_id,
+                NokvoOneToolRecord.record_type == record_type,
+            )
+            .order_by(NokvoOneToolRecord.created_at.desc())
+            .limit(200)
+        )
+        result = await db.execute(stmt)
+        rows = result.scalars().all()
+        lowered = query.lower()
+        matches: list[NokvoOneToolRecord] = []
+        for row in rows:
+            data = row.data or {}
+            haystack_parts = [str(data.get(k) or "") for k in keys] + [
+                str(row.contact_phone or ""),
+                str(row.contact_email or ""),
+            ]
+            haystack = " ".join(haystack_parts).lower()
+            if lowered in haystack:
+                matches.append(row)
+                if len(matches) >= limit:
+                    break
+        return {"ok": True, "entries": [_row_summary(r) for r in matches]}
+
+    @staticmethod
+    async def _handle_resource_add_note(db, org_id, user_id, tool, args):
+        record_type = tool.record_type
+        rec = await _fetch_by_id(db, org_id, args["id"], record_type)
         data = dict(rec.data or {})
         history = list(data.get("notes_history") or [])
-        history.append(args["note"])
+        history.append(
+            {
+                "note": args["note"],
+                "at": datetime.now(timezone.utc).isoformat(),
+                "by_user_id": str(user_id) if user_id else None,
+            }
+        )
         data["notes_history"] = history
         rec.data = data
         await db.flush()
-        return {"ok": True, "lead_id": str(rec.id), "note_count": len(history)}
+        return {"ok": True, "id": str(rec.id), "note_count": len(history)}
 
     @staticmethod
-    async def _handle_call_logger_create_entry(db, org_id, user_id, args):
+    async def _handle_resource_set_status(db, org_id, user_id, tool, args):
+        record_type = tool.record_type
+        rec = await _fetch_by_id(db, org_id, args["id"], record_type)
+
+        new_status = args["status"]
+        vocab = _tool_status_vocabulary(tool)
+        if vocab and new_status not in (vocab.get("all") or []):
+            raise ValueError(f"Status '{new_status}' is not allowed for this resource")
+
+        regressive = False
+        if vocab:
+            forward = list(vocab.get("forward") or [])
+            try:
+                cur_ix = forward.index(rec.status)
+                new_ix = forward.index(new_status)
+                regressive = new_ix < cur_ix
+            except ValueError:
+                regressive = False
+
+        prior = rec.status
+        rec.status = new_status
+        await db.flush()
+        return {
+            "ok": True,
+            "id": str(rec.id),
+            "prior_status": prior,
+            "status": rec.status,
+            "regressive": regressive,
+        }
+
+    @staticmethod
+    async def _handle_resource_close(db, org_id, user_id, tool, args):
+        record_type = tool.record_type
+        rec = await _fetch_by_id(db, org_id, args["id"], record_type)
+        tab = _tab_from_tool_key(tool.key) or ""
+        vocab = _tool_status_vocabulary(tool)
+        if tab == "appointments":
+            terminal = "cancelled"
+        elif tool.metadata.get("custom_tab_terminal_status"):
+            terminal = str(tool.metadata["custom_tab_terminal_status"])
+        elif vocab and vocab.get("forward"):
+            terminal = vocab["forward"][-1]
+        else:
+            terminal = "closed"
+        rec.status = terminal
+        data = dict(rec.data or {})
+        if args.get("reason"):
+            data["close_reason"] = args["reason"]
+        rec.data = data
+        await db.flush()
+        return {"ok": True, "id": str(rec.id), "status": rec.status}
+
+    # ─────────── Cross-cutting handlers ───────────
+
+    @staticmethod
+    async def _handle_call_log_create(db, org_id, user_id, tool, args):
         rec = NokvoOneToolRecord(
             id=uuid.uuid4(),
             organization_id=org_id,
@@ -306,29 +710,32 @@ class PredefinedToolsService:
                 "outcome": args.get("outcome"),
                 "duration_seconds": args.get("duration_seconds"),
             },
+            contact_phone=args.get("contact_phone"),
+            contact_email=args.get("contact_email"),
         )
         db.add(rec)
         await db.flush()
         return {"ok": True, "call_log_id": str(rec.id)}
 
     @staticmethod
-    async def _handle_call_logger_get_history(db, org_id, user_id, args):
+    async def _handle_call_log_search(db, org_id, user_id, tool, args):
         limit = int(args.get("limit") or 10)
+        clauses = [
+            NokvoOneToolRecord.organization_id == org_id,
+            NokvoOneToolRecord.record_type == "call_log",
+        ]
+        if args.get("contact_email"):
+            clauses.append(NokvoOneToolRecord.contact_email == args["contact_email"])
+        if args.get("contact_phone"):
+            clauses.append(NokvoOneToolRecord.contact_phone == args["contact_phone"])
         stmt = (
             select(NokvoOneToolRecord)
-            .where(
-                NokvoOneToolRecord.organization_id == org_id,
-                NokvoOneToolRecord.record_type == "call_log",
-            )
+            .where(and_(*clauses))
             .order_by(NokvoOneToolRecord.created_at.desc())
             .limit(limit)
         )
         result = await db.execute(stmt)
         rows = result.scalars().all()
-        if args.get("contact_email"):
-            rows = [r for r in rows if (r.data or {}).get("contact_email") == args["contact_email"]]
-        if args.get("contact_phone"):
-            rows = [r for r in rows if (r.data or {}).get("contact_phone") == args["contact_phone"]]
         return {
             "ok": True,
             "entries": [
@@ -342,27 +749,7 @@ class PredefinedToolsService:
         }
 
     @staticmethod
-    async def _handle_create_ticket(db, org_id, user_id, args):
-        rec = NokvoOneToolRecord(
-            id=uuid.uuid4(),
-            organization_id=org_id,
-            created_by_user_id=user_id,
-            record_type="ticket",
-            status="open",
-            data={
-                "subject": args["subject"],
-                "description": args["description"],
-                "priority": args.get("priority", "normal"),
-                "contact_email": args.get("contact_email"),
-                "contact_name": args.get("contact_name"),
-            },
-        )
-        db.add(rec)
-        await db.flush()
-        return {"ok": True, "ticket_id": str(rec.id), "status": rec.status}
-
-    @staticmethod
-    async def _handle_schedule_callback(db, org_id, user_id, args):
+    async def _handle_schedule_callback(db, org_id, user_id, tool, args):
         rec = NokvoOneToolRecord(
             id=uuid.uuid4(),
             organization_id=org_id,
@@ -375,13 +762,14 @@ class PredefinedToolsService:
                 "callback_at": args["callback_at"],
                 "notes": args.get("notes"),
             },
+            contact_phone=args.get("contact_phone"),
         )
         db.add(rec)
         await db.flush()
         return {"ok": True, "callback_id": str(rec.id), "scheduled_for": args["callback_at"]}
 
     @staticmethod
-    async def _handle_send_email_draft(db, org_id, user_id, args):
+    async def _handle_send_email_draft(db, org_id, user_id, tool, args):
         # CRITICAL: this never sends. It only stores a draft requiring confirmation.
         rec = NokvoOneToolRecord(
             id=uuid.uuid4(),
@@ -396,6 +784,7 @@ class PredefinedToolsService:
                 "body": args["body"],
                 "drafted_at": datetime.now(timezone.utc).isoformat(),
             },
+            contact_email=args["to_email"],
         )
         db.add(rec)
         await db.flush()
@@ -410,18 +799,598 @@ class PredefinedToolsService:
         }
 
     @staticmethod
-    async def _fetch_record(db, org_id, record_id, expected_type) -> NokvoOneToolRecord:
-        try:
-            uid = uuid.UUID(str(record_id))
-        except ValueError as exc:
-            raise ValueError(f"Invalid record id: {record_id}") from exc
-        stmt = select(NokvoOneToolRecord).where(
-            NokvoOneToolRecord.id == uid,
+    async def _handle_escalate_to_human(db, org_id, user_id, tool, args):
+        rec = NokvoOneToolRecord(
+            id=uuid.uuid4(),
+            organization_id=org_id,
+            created_by_user_id=user_id,
+            record_type="escalation",
+            status="open",
+            data={
+                "reason": args["reason"],
+                "priority": args.get("priority") or "normal",
+                "contact_name": args.get("contact_name"),
+                "contact_phone": args.get("contact_phone"),
+                "contact_email": args.get("contact_email"),
+                "related_record_id": args.get("related_record_id"),
+                "flagged_at": datetime.now(timezone.utc).isoformat(),
+            },
+            contact_phone=args.get("contact_phone"),
+            contact_email=args.get("contact_email"),
+        )
+        db.add(rec)
+        await db.flush()
+        return {"ok": True, "escalation_id": str(rec.id), "priority": rec.data["priority"]}
+
+    @staticmethod
+    async def _handle_find_contact(db, org_id, user_id, tool, args):
+        from app.services.nokvo_one_business_templates import tab_record_type
+
+        record_type = tab_record_type(args["tab"])
+        if record_type is None:
+            raise ValueError(f"Unknown tab '{args['tab']}'")
+        phone = args.get("phone")
+        email = args.get("email")
+        if not phone and not email:
+            raise ValueError("Provide phone or email")
+        clauses: list[Any] = [
             NokvoOneToolRecord.organization_id == org_id,
-            NokvoOneToolRecord.record_type == expected_type,
+            NokvoOneToolRecord.record_type == record_type,
+        ]
+        match_clauses: list[Any] = []
+        if phone:
+            match_clauses.append(NokvoOneToolRecord.contact_phone == phone)
+        if email:
+            match_clauses.append(NokvoOneToolRecord.contact_email == email)
+        clauses.append(or_(*match_clauses))
+        stmt = (
+            select(NokvoOneToolRecord)
+            .where(and_(*clauses))
+            .order_by(NokvoOneToolRecord.created_at.desc())
+            .limit(1)
         )
         result = await db.execute(stmt)
         rec = result.scalars().first()
         if rec is None:
-            raise ValueError(f"{expected_type} {record_id} not found in this organization")
-        return rec
+            return {"ok": True, "match": None}
+        return {"ok": True, "match": _row_summary(rec)}
+
+    # ─────────── Macro handlers ───────────
+    # Each macro creates multiple NokvoOneToolRecord rows in one invocation and
+    # returns all created ids. The handlers reuse the same storage so the records
+    # appear in the standard tab queries with no special-casing.
+
+    @staticmethod
+    async def _handle_macro_book_appointment_with_lead_capture(db, org_id, user_id, tool, args):
+        lead = NokvoOneToolRecord(
+            id=uuid.uuid4(),
+            organization_id=org_id,
+            created_by_user_id=user_id,
+            record_type="lead",
+            status="scheduled",
+            data={
+                "patient_name": args["patient_name"],
+                "phone": args["phone"],
+                "email": args.get("email"),
+                "care_need": args["reason"],
+                "preferred_doctor": args.get("preferred_doctor"),
+                "source": args.get("source"),
+            },
+            contact_phone=args["phone"],
+            contact_email=args.get("email"),
+        )
+        appt = NokvoOneToolRecord(
+            id=uuid.uuid4(),
+            organization_id=org_id,
+            created_by_user_id=user_id,
+            record_type="appointment",
+            status="requested",
+            data={
+                "patient_name": args["patient_name"],
+                "phone": args["phone"],
+                "doctor": args.get("preferred_doctor"),
+                "department": args.get("department"),
+                "appointment_time": args["appointment_time"],
+                "reason": args["reason"],
+                "related_lead_id": str(lead.id),
+            },
+            contact_phone=args["phone"],
+            contact_email=args.get("email"),
+        )
+        db.add(lead)
+        db.add(appt)
+        await db.flush()
+        appointment_at = _parse_tool_datetime(args["appointment_time"], field_name="appointment_time")
+        assignment = await _assign_existing_record(
+            db,
+            org_id,
+            appt,
+            request_type="appointment",
+            requested_time=appointment_at,
+            summary=args["reason"],
+            metadata={
+                "patient_name": args["patient_name"],
+                "phone": args["phone"],
+                "department": args.get("department"),
+                "preferred_doctor": args.get("preferred_doctor"),
+                "appointment_time": args["appointment_time"],
+                "appointment_start": appointment_at.isoformat(),
+                "reason": args["reason"],
+                "related_lead_id": str(lead.id),
+                "assignment_source": tool.key,
+            },
+        )
+        return {
+            "ok": True,
+            "lead_id": str(lead.id),
+            "appointment_id": str(appt.id),
+            "appointment_status": appt.status,
+            "assignment": assignment,
+            "assigned_member_name": assignment.get("selected_member_name") if assignment else None,
+            "assignment_status": assignment.get("assignment_status") if assignment else None,
+        }
+
+    @staticmethod
+    async def _handle_macro_qualify_lead_and_schedule_visit(db, org_id, user_id, tool, args):
+        lead = NokvoOneToolRecord(
+            id=uuid.uuid4(),
+            organization_id=org_id,
+            created_by_user_id=user_id,
+            record_type="lead",
+            status="qualified",
+            data={
+                "name": args["name"],
+                "phone": args["phone"],
+                "email": args.get("email"),
+                "property_type": args.get("property_type"),
+                "budget": args.get("budget"),
+                "location": args.get("location"),
+                "visit_date": args["visit_at"],
+            },
+            contact_phone=args["phone"],
+            contact_email=args.get("email"),
+        )
+        callback = NokvoOneToolRecord(
+            id=uuid.uuid4(),
+            organization_id=org_id,
+            created_by_user_id=user_id,
+            record_type="callback",
+            status="scheduled",
+            data={
+                "contact_name": args["name"],
+                "contact_phone": args["phone"],
+                "callback_at": args["visit_at"],
+                "notes": args.get("notes") or "Site visit scheduled.",
+                "related_lead_id": str(lead.id),
+            },
+            contact_phone=args["phone"],
+        )
+        db.add(lead)
+        db.add(callback)
+        await db.flush()
+        visit_at = _parse_tool_datetime(args["visit_at"], field_name="visit_at")
+        assignment = await _assign_existing_record(
+            db,
+            org_id,
+            callback,
+            request_type="site_visit",
+            requested_time=visit_at,
+            summary=_assignment_summary_for(args, fallback="Real-estate site visit"),
+            metadata={
+                "contact_name": args["name"],
+                "contact_phone": args["phone"],
+                "visit_at": args["visit_at"],
+                "callback_at": args["visit_at"],
+                "property_type": args.get("property_type"),
+                "budget": args.get("budget"),
+                "location": args.get("location"),
+                "related_lead_id": str(lead.id),
+                "assignment_source": tool.key,
+            },
+        )
+        return {
+            "ok": True,
+            "lead_id": str(lead.id),
+            "lead_status": lead.status,
+            "callback_id": str(callback.id),
+            "callback_status": callback.status,
+            "scheduled_for": args["visit_at"],
+            "assignment": assignment,
+            "assigned_member_name": assignment.get("selected_member_name") if assignment else None,
+            "assignment_status": assignment.get("assignment_status") if assignment else None,
+        }
+
+    @staticmethod
+    async def _handle_macro_open_return_ticket_with_order_lookup(db, org_id, user_id, tool, args):
+        ticket = NokvoOneToolRecord(
+            id=uuid.uuid4(),
+            organization_id=org_id,
+            created_by_user_id=user_id,
+            record_type="ticket",
+            status="open",
+            data={
+                "customer_name": args["customer_name"],
+                "email": args.get("email"),
+                "phone": args.get("phone"),
+                "order_id": args.get("order_id"),
+                "issue_type": "return_request",
+                "priority": args.get("priority") or "normal",
+                "subject": f"Return request for order {args.get('order_id') or '(no order id)'}",
+                "description": args["issue_summary"],
+            },
+            contact_phone=args.get("phone"),
+            contact_email=args.get("email"),
+        )
+        call_log = NokvoOneToolRecord(
+            id=uuid.uuid4(),
+            organization_id=org_id,
+            created_by_user_id=user_id,
+            record_type="call_log",
+            status="logged",
+            data={
+                "channel": args.get("channel") or "voice",
+                "contact_name": args["customer_name"],
+                "contact_email": args.get("email"),
+                "contact_phone": args.get("phone"),
+                "summary": args["issue_summary"],
+                "outcome": "Opened return-request ticket",
+                "related_ticket_id": str(ticket.id),
+            },
+            contact_phone=args.get("phone"),
+            contact_email=args.get("email"),
+        )
+        db.add(ticket)
+        db.add(call_log)
+        await db.flush()
+        return {
+            "ok": True,
+            "ticket_id": str(ticket.id),
+            "ticket_status": ticket.status,
+            "call_log_id": str(call_log.id),
+        }
+
+    @staticmethod
+    async def _handle_macro_create_reservation_lead_and_hold(db, org_id, user_id, tool, args):
+        lead = NokvoOneToolRecord(
+            id=uuid.uuid4(),
+            organization_id=org_id,
+            created_by_user_id=user_id,
+            record_type="lead",
+            status="qualified",
+            data={
+                "guest_name": args["guest_name"],
+                "phone": args["phone"],
+                "email": args.get("email"),
+                "stay_dates": args["stay_dates"],
+                "room_type": args.get("room_type"),
+                "party_size": args.get("party_size"),
+            },
+            contact_phone=args["phone"],
+            contact_email=args.get("email"),
+        )
+        callback = NokvoOneToolRecord(
+            id=uuid.uuid4(),
+            organization_id=org_id,
+            created_by_user_id=user_id,
+            record_type="callback",
+            status="scheduled",
+            data={
+                "contact_name": args["guest_name"],
+                "contact_phone": args["phone"],
+                "callback_at": args["confirm_at"],
+                "notes": args.get("notes") or "Confirm hospitality booking hold.",
+                "related_lead_id": str(lead.id),
+            },
+            contact_phone=args["phone"],
+        )
+        db.add(lead)
+        db.add(callback)
+        await db.flush()
+        return {
+            "ok": True,
+            "lead_id": str(lead.id),
+            "callback_id": str(callback.id),
+            "scheduled_for": args["confirm_at"],
+        }
+
+
+# ─────────── Internal helpers ───────────
+
+
+def _row_summary(rec: NokvoOneToolRecord) -> dict[str, Any]:
+    return {
+        "id": str(rec.id),
+        "record_type": rec.record_type,
+        "status": rec.status,
+        "data": rec.data or {},
+        "created_at": rec.created_at.isoformat() if rec.created_at else None,
+    }
+
+
+def _extract_contact(data: dict[str, Any]) -> tuple[str | None, str | None]:
+    phone = None
+    email = None
+    for key in ("phone", "contact_phone"):
+        if data.get(key):
+            phone = str(data[key])
+            break
+    for key in ("email", "contact_email"):
+        if data.get(key):
+            email = str(data[key])
+            break
+    return phone, email
+
+
+def _tab_from_tool_key(key: str) -> str | None:
+    if "_" not in key:
+        return None
+    head = key.split("_", 1)[0]
+    if head in {"leads", "tickets", "appointments"}:
+        return head
+    return None
+
+
+def _tool_status_vocabulary(tool: PredefinedTool) -> dict[str, Any] | None:
+    """Resolve the status vocabulary for a resource tool.
+
+    Built-in tabs route through the per-business_type STATUS_VOCABULARIES table.
+    Custom tabs stamp their vocabulary directly into tool metadata.
+    """
+    from app.services.nokvo_one_business_templates import tab_status_vocabulary
+
+    custom_vocab = tool.metadata.get("custom_tab_status_vocabulary")
+    if custom_vocab:
+        return dict(custom_vocab)
+    tab = _tab_from_tool_key(tool.key)
+    if tab is None:
+        return None
+    return tab_status_vocabulary(tool.metadata.get("business_type"), tab)
+
+
+def _parse_tool_datetime(value: Any, *, field_name: str) -> datetime:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            raise ValueError(f"Field '{field_name}' is required.")
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError(f"Field '{field_name}' must be an ISO date-time.") from exc
+    else:
+        raise ValueError(f"Field '{field_name}' must be an ISO date-time.")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+async def _load_organization(db: AsyncSession, org_id: uuid.UUID) -> Organization | None:
+    res = await db.execute(select(Organization).where(Organization.id == org_id))
+    return res.scalars().first()
+
+
+def _assignment_summary_for(data: dict[str, Any], *, fallback: str = "") -> str:
+    for key in ("reason", "care_need", "summary", "notes", "issue_summary", "property_type", "location"):
+        value = data.get(key)
+        if value:
+            return str(value)
+    return fallback
+
+
+async def _assign_existing_record(
+    db: AsyncSession,
+    org_id: uuid.UUID,
+    rec: NokvoOneToolRecord,
+    *,
+    request_type: str,
+    requested_time: datetime,
+    summary: str,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    organization = await _load_organization(db, org_id)
+    if organization is None:
+        return None
+    assignment = await NokvoOneAssignmentService.assign_request(
+        db,
+        organization,
+        request_type=request_type,
+        request_id=rec.id,
+        requested_time=requested_time,
+        summary=summary,
+        metadata=metadata or {},
+        record_type=rec.record_type,
+    )
+    return {
+        "assignment_status": assignment.get("assignment_status"),
+        "selected_member_id": str(assignment["selected_member_id"]) if assignment.get("selected_member_id") else None,
+        "selected_member_name": assignment.get("selected_member_name"),
+        "reason": assignment.get("reason"),
+        "skipped_member_reasons": assignment.get("skipped_member_reasons") or {},
+    }
+
+
+async def _maybe_assign_created_resource(
+    db: AsyncSession,
+    org_id: uuid.UUID,
+    user_id: uuid.UUID | None,
+    tool: PredefinedTool,
+    rec: NokvoOneToolRecord,
+    data: dict[str, Any],
+) -> dict[str, Any] | None:
+    del user_id
+    business_type = str((tool.metadata or {}).get("business_type") or "")
+    tab = str((tool.metadata or {}).get("tab") or "")
+    if business_type == "clinics" and tab == "appointments":
+        appointment_at = _parse_tool_datetime(data.get("appointment_time"), field_name="appointment_time")
+        metadata = {
+            **data,
+            "appointment_start": appointment_at.isoformat(),
+            "assignment_source": tool.key,
+        }
+        return await _assign_existing_record(
+            db,
+            org_id,
+            rec,
+            request_type="appointment",
+            requested_time=appointment_at,
+            summary=_assignment_summary_for(data, fallback="Clinic appointment"),
+            metadata=metadata,
+        )
+    return None
+
+
+async def _fetch_by_id(
+    db: AsyncSession, org_id: uuid.UUID, record_id: str, record_type: str | None
+) -> NokvoOneToolRecord:
+    try:
+        uid = uuid.UUID(str(record_id))
+    except ValueError as exc:
+        raise ValueError(f"Invalid record id: {record_id}") from exc
+    clauses: list[Any] = [
+        NokvoOneToolRecord.id == uid,
+        NokvoOneToolRecord.organization_id == org_id,
+    ]
+    if record_type is not None:
+        clauses.append(NokvoOneToolRecord.record_type == record_type)
+    stmt = select(NokvoOneToolRecord).where(and_(*clauses))
+    result = await db.execute(stmt)
+    rec = result.scalars().first()
+    if rec is None:
+        rtype = record_type or "record"
+        raise ValueError(f"{rtype} {record_id} not found in this organization")
+    return rec
+
+
+async def _resolve_record(
+    db: AsyncSession,
+    org_id: uuid.UUID,
+    record_type: str,
+    args: dict[str, Any],
+) -> NokvoOneToolRecord:
+    """Find a record by id, phone, or email (in that order of precedence)."""
+    if args.get("id"):
+        return await _fetch_by_id(db, org_id, args["id"], record_type)
+    phone = args.get("phone") or args.get("contact_phone")
+    email = args.get("email") or args.get("contact_email")
+    if not phone and not email:
+        raise ValueError("Provide `id`, `phone`, or `email` to identify the record")
+    clauses: list[Any] = [
+        NokvoOneToolRecord.organization_id == org_id,
+        NokvoOneToolRecord.record_type == record_type,
+    ]
+    match_clauses: list[Any] = []
+    if phone:
+        match_clauses.append(NokvoOneToolRecord.contact_phone == phone)
+    if email:
+        match_clauses.append(NokvoOneToolRecord.contact_email == email)
+    clauses.append(or_(*match_clauses))
+    stmt = (
+        select(NokvoOneToolRecord)
+        .where(and_(*clauses))
+        .order_by(NokvoOneToolRecord.created_at.desc())
+        .limit(1)
+    )
+    result = await db.execute(stmt)
+    rec = result.scalars().first()
+    if rec is None:
+        raise ValueError(f"No {record_type} found matching the provided identifiers")
+    return rec
+
+
+async def _recent_invocation(
+    db: AsyncSession, org_id: uuid.UUID, idem_key: str
+) -> AgentToolInvocation | None:
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=IDEMPOTENCY_WINDOW_SECONDS)
+    stmt = (
+        select(AgentToolInvocation)
+        .where(
+            AgentToolInvocation.organization_id == org_id,
+            AgentToolInvocation.idempotency_key == idem_key,
+            AgentToolInvocation.created_at >= cutoff,
+            AgentToolInvocation.status == "ok",
+        )
+        .order_by(AgentToolInvocation.created_at.desc())
+        .limit(1)
+    )
+    result = await db.execute(stmt)
+    return result.scalars().first()
+
+
+async def _record_invocation(
+    db: AsyncSession,
+    *,
+    organization_id: uuid.UUID,
+    agent_id: uuid.UUID | None,
+    session_id: str | None,
+    tool_key: str,
+    idempotency_key: str,
+    arguments: dict[str, Any],
+    result: dict[str, Any],
+) -> None:
+    result_record_id: uuid.UUID | None = None
+    for key in ("id", "lead_id", "ticket_id", "callback_id", "call_log_id", "draft_id", "escalation_id"):
+        if isinstance(result.get(key), str):
+            try:
+                result_record_id = uuid.UUID(result[key])
+                break
+            except ValueError:
+                continue
+    db.add(
+        AgentToolInvocation(
+            id=uuid.uuid4(),
+            organization_id=organization_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            tool_key=tool_key,
+            idempotency_key=idempotency_key,
+            args=arguments,
+            result=result,
+            result_record_id=result_record_id,
+            status="ok",
+        )
+    )
+    await db.flush()
+
+
+# ─────────── Backwards-compat wrappers ───────────
+# Some callers (api/nokvo_one_agents.py) and the runtime still call
+# `PredefinedToolsService.execute(db, org, user, key_str, args)`. Provide a
+# thin adapter that resolves the key via cross-cutting + legacy aliases.
+
+async def execute_by_key(
+    db: AsyncSession,
+    organization_id: uuid.UUID,
+    user_id: uuid.UUID | None,
+    tool_key: str,
+    arguments: dict[str, Any],
+    *,
+    tool_lookup: Callable[[str], PredefinedTool | None] | None = None,
+    agent_id: uuid.UUID | None = None,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    resolved_key = resolve_legacy_key(tool_key)
+    tool: PredefinedTool | None = None
+    if tool_lookup is not None:
+        tool = tool_lookup(resolved_key)
+    if tool is None:
+        tool = get_cross_cutting_tool(resolved_key)
+    if tool is None:
+        raise ValueError(f"Unknown tool '{tool_key}'")
+    return await PredefinedToolsService.execute(
+        db,
+        organization_id,
+        user_id,
+        tool,
+        arguments,
+        agent_id=agent_id,
+        session_id=session_id,
+    )
+
+
+# Preserve the historical `validate_tool_keys` import surface — but make it
+# tolerant of both cross-cutting AND resolver-produced keys. The agent API
+# layer will swap to the resolver-aware validator separately.
+def validate_tool_keys(keys: Iterable[str]) -> list[str]:
+    resolved = [resolve_legacy_key(k) for k in keys]
+    return resolved

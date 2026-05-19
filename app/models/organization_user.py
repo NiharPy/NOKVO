@@ -30,3 +30,8 @@ class OrganizationUser(Base):
     last_login_ip = Column(INET, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    @property
+    def mfa_pending(self) -> bool:
+        """True when the user has no TOTP secret yet (deferred-MFA onboarding)."""
+        return not bool(self.totp_secret_encrypted_v2 or self.totp_secret_encrypted)

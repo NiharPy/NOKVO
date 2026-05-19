@@ -225,6 +225,51 @@ class RequireProductTier:
         return user
 
 
+class RequireMFACompleted:
+    """Step-up gate for sensitive actions.
+
+    Blocks endpoints that must not be reachable until the calling user has
+    actually completed MFA at least once (and the current session token
+    reflects that). Used to backstop the v2 deferred-MFA onboarding flow.
+
+    Raises 403 with detail='mfa_setup_required' when the user has never set
+    up TOTP, or 403 with detail='mfa_step_up_required' when TOTP exists but
+    the current session is not MFA-elevated.
+    """
+
+    async def __call__(
+        self,
+        user: OrganizationUser = Depends(get_current_active_organization_user),
+        token: str = Depends(oauth2_scheme),
+    ) -> OrganizationUser:
+        if not getattr(user, "totp_secret_encrypted", None) and not getattr(user, "totp_secret_encrypted_v2", None):
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "mfa_setup_required",
+                    "message": (
+                        "This action requires MFA. Set up an authenticator app from your "
+                        "dashboard, then try again."
+                    ),
+                },
+            )
+        try:
+            payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        except jwt.PyJWTError:
+            raise HTTPException(status_code=401, detail="Could not validate credentials")
+        if not bool(payload.get("mfa_completed", False)):
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "mfa_step_up_required",
+                    "message": (
+                        "This action requires you to log in again with your MFA code."
+                    ),
+                },
+            )
+        return user
+
+
 class RequireNokvoOneOrganization:
     """Composite dep: active Nokvo One org user, optionally restricted to a set of org statuses."""
 

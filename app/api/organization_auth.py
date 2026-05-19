@@ -752,6 +752,7 @@ async def get_organization_zoho_desk_status(
 async def connect_organization_database(
     payload: OrganizationDatabaseConnectRequest,
     current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin"])),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
     db: AsyncSession = Depends(deps.get_db),
 ):
     tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
@@ -796,6 +797,7 @@ async def connect_organization_database(
 async def connect_organization_crm(
     payload: OrganizationCRMConnectRequest,
     current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin"])),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
     db: AsyncSession = Depends(deps.get_db),
 ):
     tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
@@ -855,6 +857,7 @@ async def connect_organization_crm(
 async def connect_organization_erp(
     payload: OrganizationERPConnectRequest,
     current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin"])),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
     db: AsyncSession = Depends(deps.get_db),
 ):
     tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
@@ -925,6 +928,7 @@ async def connect_organization_erp(
 async def connect_organization_shipping(
     payload: OrganizationShippingConnectRequest,
     current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin"])),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
     db: AsyncSession = Depends(deps.get_db),
 ):
     tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
@@ -993,6 +997,7 @@ async def connect_organization_shipping(
 @router.post("/crm/zoho-desk/connect", response_model=OrganizationZohoDeskConnectResponse)
 async def connect_organization_zoho_desk(
     current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin"])),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
     db: AsyncSession = Depends(deps.get_db),
 ):
     tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
@@ -1223,6 +1228,7 @@ async def update_organization_zoho_desk_ticket(
 async def execute_organization_tally_xml(
     payload: OrganizationTallyXMLRequest,
     current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin"])),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
     db: AsyncSession = Depends(deps.get_db),
 ):
     tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
@@ -1330,6 +1336,7 @@ async def track_shiprocket_shipment(
 async def generate_toolkit_tool(
     payload: OrganizationToolkitGenerateRequest,
     current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin"])),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
     db: AsyncSession = Depends(deps.get_db),
 ):
     tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
@@ -1424,6 +1431,7 @@ async def approve_toolkit_draft(
     draft_id: str,
     payload: OrganizationToolkitReviewRequest,
     current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin"])),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
     db: AsyncSession = Depends(deps.get_db),
 ):
     tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
@@ -1586,6 +1594,7 @@ async def reject_toolkit_draft(
     draft_id: str,
     payload: OrganizationToolkitReviewRequest,
     current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin"])),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
     db: AsyncSession = Depends(deps.get_db),
 ):
     tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
@@ -1668,6 +1677,7 @@ async def approve_agent_knowledge_document(
     document_id: str,
     payload: OrganizationAgentDocumentReviewRequest,
     current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin"])),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
     db: AsyncSession = Depends(deps.get_db),
 ):
     tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
@@ -1692,6 +1702,7 @@ async def reject_agent_knowledge_document(
     document_id: str,
     payload: OrganizationAgentDocumentReviewRequest,
     current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin"])),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
     db: AsyncSession = Depends(deps.get_db),
 ):
     tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
@@ -1810,6 +1821,7 @@ async def link_agent_phone_number(
 @router.delete("/agent/phone-link", response_model=OrganizationAgentPhoneLinkResponse)
 async def unlink_agent_phone_number(
     current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin"])),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
     db: AsyncSession = Depends(deps.get_db),
 ):
     tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
@@ -1856,6 +1868,7 @@ async def create_agent_campaign(
     script_file: UploadFile = File(...),
     from_number: str | None = Form(None),
     current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin"])),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
     db: AsyncSession = Depends(deps.get_db),
 ):
     tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
@@ -1891,6 +1904,7 @@ async def launch_agent_campaign(
     campaign_id: uuid.UUID,
     request: Request,
     current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin"])),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
     db: AsyncSession = Depends(deps.get_db),
 ):
     tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
@@ -1909,6 +1923,7 @@ async def launch_agent_campaign(
 async def cancel_agent_campaign(
     campaign_id: uuid.UUID,
     current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin"])),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
     db: AsyncSession = Depends(deps.get_db),
 ):
     tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
@@ -2074,6 +2089,7 @@ async def agent_voice_websocket(websocket: WebSocket):
 async def index_organization_database_selection(
     payload: OrganizationDatabaseIndexRequest,
     current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin"])),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
     db: AsyncSession = Depends(deps.get_db),
 ):
     tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
