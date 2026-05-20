@@ -656,31 +656,43 @@ def _shift_to_next_day_prompt(
     return next_date.isoformat(), nice_date, prompt
 
 
-_AFFIRMATIVE_RE = re.compile(
+# ASCII affirmatives carry \b so "yes please" matches but "yesterday" doesn't.
+# Indic affirmatives use (?=\s|$|[.,!?]) lookahead instead — Python's \b only
+# considers ASCII word chars, so the Devanagari/Telugu branches in the old
+# combined regex never fired at all.
+_AFFIRMATIVE_ASCII_RE = re.compile(
     r"^\s*(yes|yeah|yep|yup|sure|ok(?:ay)?|please|please\s+do|"
     r"go\s+ahead|sounds\s+good|that\s+works|that(?:'s|\s+is)\s+(?:fine|correct|right)|"
-    r"do\s+(?:it|that)|book\s+it|"
-    r"అవును|సరే|ఓకే|"
-    r"हाँ|हां|जी|ठीक है|कर दो)\b",
+    r"do\s+(?:it|that)|book\s+it)\b",
+    re.IGNORECASE,
+)
+_AFFIRMATIVE_INDIC_RE = re.compile(
+    r"^\s*(అవును|సరే|ఓకే|"
+    r"हाँ|हां|जी|ठीक है|कर दो)(?=\s|$|[.,!?])",
     re.IGNORECASE,
 )
 
 
-_NEGATIVE_RE = re.compile(
+_NEGATIVE_ASCII_RE = re.compile(
     r"^\s*(no|nope|nah|not\s+(?:really|correct|right)|that(?:'s|\s+is)\s+(?:not|wrong|incorrect)|"
-    r"wrong|incorrect|change|"
-    r"కాదు|లేదు|"
-    r"नहीं|नही|गलत|बदलो)\b",
+    r"wrong|incorrect|change)\b",
+    re.IGNORECASE,
+)
+_NEGATIVE_INDIC_RE = re.compile(
+    r"^\s*(కాదు|లేదు|"
+    r"नहीं|नही|गलत|बदलो)(?=\s|$|[.,!?])",
     re.IGNORECASE,
 )
 
 
 def _looks_affirmative(text: str) -> bool:
-    return bool(_AFFIRMATIVE_RE.match(_clean(text)))
+    cleaned = _clean(text)
+    return bool(_AFFIRMATIVE_ASCII_RE.match(cleaned) or _AFFIRMATIVE_INDIC_RE.match(cleaned))
 
 
 def _looks_negative(text: str) -> bool:
-    return bool(_NEGATIVE_RE.match(_clean(text)))
+    cleaned = _clean(text)
+    return bool(_NEGATIVE_ASCII_RE.match(cleaned) or _NEGATIVE_INDIC_RE.match(cleaned))
 
 
 # Cues volunteered in the reason text that tell us this is a first visit /

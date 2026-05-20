@@ -2005,6 +2005,53 @@ const appointmentAssignedLabel = (record) =>
     'Unassigned',
   );
 
+// Ticket helpers — mirror the appointment helpers but pull from the ticket
+// schema's keys (customer, issue_type, priority, property_id) with sensible
+// fallbacks for records routed from leads (which still carry name/phone).
+const ticketRecordTitle = (record) =>
+  formatRecordValue(
+    firstRecordValue(record, [
+      'customer', 'customer_name', 'patient_name', 'guest_name', 'name', 'contact_name',
+    ]) || firstRecordValue(record, ['subject', 'issue_type', 'reason', 'description']),
+    'Support ticket',
+  );
+
+const ticketRecordSubtitle = (record) => {
+  const phone = firstRecordValue(record, ['contact_phone', 'phone', 'phone_number']);
+  const summary = firstRecordValue(record, ['issue_type', 'subject', 'reason', 'description', 'property_id', 'location']);
+  return [phone, summary].map((item) => formatRecordValue(item, '')).filter(Boolean).join(' · ') || 'No extra details';
+};
+
+const ticketRecordPriority = (record) =>
+  formatRecordValue(firstRecordValue(record, ['priority']), 'normal');
+
+const ticketRecordOwner = (record) =>
+  formatRecordValue(
+    firstRecordValue(record, ['assigned_to', 'owner', 'assigned_member_name', 'agent']),
+    'Unassigned',
+  );
+
+// Lead helpers — pull from lead schema's keys (name, phone, budget, location).
+const leadRecordTitle = (record) =>
+  formatRecordValue(
+    firstRecordValue(record, ['name', 'customer_name', 'patient_name', 'guest_name', 'contact_name']),
+    'New lead',
+  );
+
+const leadRecordSubtitle = (record) => {
+  const phone = firstRecordValue(record, ['contact_phone', 'phone', 'phone_number']);
+  const interest = firstRecordValue(record, [
+    'property_type', 'looking_for', 'service', 'reason', 'care_need', 'subject',
+  ]);
+  return [phone, interest].map((item) => formatRecordValue(item, '')).filter(Boolean).join(' · ') || 'No extra details';
+};
+
+const leadRecordBudget = (record) =>
+  formatRecordValue(firstRecordValue(record, ['budget', 'price_range']), 'Not set');
+
+const leadRecordLocation = (record) =>
+  formatRecordValue(firstRecordValue(record, ['location', 'area', 'city']), 'Not set');
+
 const kbStats = computed(() => {
   const docs = kbDocuments.value || [];
   const total = docs.length;
@@ -4126,6 +4173,57 @@ onBeforeUnmount(() => {
             </dl>
           </article>
         </div>
+
+        <article class="dashboard-card wide-card members-card">
+          <div class="members-card-head">
+            <div>
+              <h3>Ticket Records</h3>
+              <p>Inbound calls handled by the voice or chat agent appear here as tickets.</p>
+            </div>
+            <div class="field-card-actions">
+              <span class="status-chip">{{ (tabRecords.tickets || []).length }} records</span>
+              <button
+                type="button"
+                class="ghost-button compact"
+                :disabled="tabRecordsLoading.tickets"
+                @click="loadTabRecords('tickets')"
+              >
+                {{ tabRecordsLoading.tickets ? 'Refreshing' : 'Refresh' }}
+              </button>
+            </div>
+          </div>
+
+          <div v-if="tabRecordsLoading.tickets" class="empty-state compact">Loading ticket records...</div>
+          <div v-else-if="!(tabRecords.tickets || []).length" class="empty-state compact">
+            No ticket records yet.
+          </div>
+          <div v-else class="tab-record-list">
+            <div v-for="record in tabRecords.tickets" :key="record.id" class="tab-record-row">
+              <div class="tab-record-primary">
+                <strong>{{ ticketRecordTitle(record) }}</strong>
+                <small>{{ ticketRecordSubtitle(record) }}</small>
+              </div>
+              <div class="tab-record-meta">
+                <div>
+                  <span>Priority</span>
+                  <strong>{{ ticketRecordPriority(record) }}</strong>
+                </div>
+                <div>
+                  <span>Owner</span>
+                  <strong>{{ ticketRecordOwner(record) }}</strong>
+                </div>
+                <div>
+                  <span>Status</span>
+                  <strong>{{ record.status || 'open' }}</strong>
+                </div>
+                <div>
+                  <span>Created</span>
+                  <strong>{{ formatRelativeDate(record.created_at) || 'Unknown' }}</strong>
+                </div>
+              </div>
+            </div>
+          </div>
+        </article>
       </section>
 
       <!-- LEADS -->
@@ -4176,6 +4274,57 @@ onBeforeUnmount(() => {
             </dl>
           </article>
         </div>
+
+        <article class="dashboard-card wide-card members-card">
+          <div class="members-card-head">
+            <div>
+              <h3>Lead Records</h3>
+              <p>Outbound campaign calls and any agent-created leads appear here.</p>
+            </div>
+            <div class="field-card-actions">
+              <span class="status-chip">{{ (tabRecords.leads || []).length }} records</span>
+              <button
+                type="button"
+                class="ghost-button compact"
+                :disabled="tabRecordsLoading.leads"
+                @click="loadTabRecords('leads')"
+              >
+                {{ tabRecordsLoading.leads ? 'Refreshing' : 'Refresh' }}
+              </button>
+            </div>
+          </div>
+
+          <div v-if="tabRecordsLoading.leads" class="empty-state compact">Loading lead records...</div>
+          <div v-else-if="!(tabRecords.leads || []).length" class="empty-state compact">
+            No lead records yet.
+          </div>
+          <div v-else class="tab-record-list">
+            <div v-for="record in tabRecords.leads" :key="record.id" class="tab-record-row">
+              <div class="tab-record-primary">
+                <strong>{{ leadRecordTitle(record) }}</strong>
+                <small>{{ leadRecordSubtitle(record) }}</small>
+              </div>
+              <div class="tab-record-meta">
+                <div>
+                  <span>Budget</span>
+                  <strong>{{ leadRecordBudget(record) }}</strong>
+                </div>
+                <div>
+                  <span>Location</span>
+                  <strong>{{ leadRecordLocation(record) }}</strong>
+                </div>
+                <div>
+                  <span>Status</span>
+                  <strong>{{ record.status || 'new' }}</strong>
+                </div>
+                <div>
+                  <span>Created</span>
+                  <strong>{{ formatRelativeDate(record.created_at) || 'Unknown' }}</strong>
+                </div>
+              </div>
+            </div>
+          </div>
+        </article>
       </section>
 
       <!-- APPOINTMENTS -->

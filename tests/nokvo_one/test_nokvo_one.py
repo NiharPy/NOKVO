@@ -1935,3 +1935,181 @@ def test_appointment_date_parser_now_accepts_iso():
 
     parsed = NokvoOneVoicePipeline._parse_appointment_date("2026-05-22")
     assert parsed.year == 2026 and parsed.month == 5 and parsed.day == 22
+
+
+# ─────────── Regression: Telugu/Hindi affirmatives + Indic-aware clinic gate ───────────
+
+
+def test_affirmative_regex_matches_telugu_and_hindi():
+    """Live bug: 'అవును' (Telugu yes) and 'हाँ' (Hindi yes) never matched
+    because Python's \\b only fires at ASCII boundaries — the entire Indic
+    branch of the regex was dead. This test fails if the split is reverted."""
+    from app.services.voice_turn_policy import _looks_affirmative, _looks_negative
+
+    # Affirmatives in Telugu / Hindi
+    for yes in ("అవును", "అవును.", "సరే", "हाँ", "हां", "जी", "ठीक है"):
+        assert _looks_affirmative(yes), f"affirmative regex missed {yes!r}"
+    # Negatives in Telugu / Hindi
+    for no in ("లేదు", "కాదు.", "नहीं", "गलत"):
+        assert _looks_negative(no), f"negative regex missed {no!r}"
+    # ASCII still works
+    assert _looks_affirmative("yes please")
+    assert _looks_affirmative("yeah")
+    assert _looks_negative("no thanks")
+    # Spurious matches should not fire
+    assert not _looks_affirmative("yesterday")
+    assert not _looks_affirmative("nothing")
+
+
+def test_pipeline_skips_clinic_fsm_for_non_clinic_orgs():
+    """Real-estate orgs must not see clinic prompts ('patient', 'eye concern').
+    The pipeline checks organization.industry before calling
+    evaluate_voice_turn_policy and skips it for anything that isn't 'clinics'."""
+    pipeline_source = open("app/services/nokvo_one_voice_pipeline.py").read()
+    assert "is_clinic_org" in pipeline_source
+    assert "organization_industry" in pipeline_source
+    # The clinic FSM call must be conditional on is_clinic_org.
+    assert "if is_clinic_org" in pipeline_source
+
+
+# ─────────── Regression: tool_flow availability_check must dispatch + persist ───────────
+
+
+def test_pipeline_dispatches_tool_flow_availability_check():
+    """Reproduces the live bug: tool_flow returned `intent: availability_check`
+    with `answer=None` for a real-estate site visit. The pipeline's old guard
+    was `if tool_flow.get("answer")` which dropped the response on the floor,
+    never called the scheduler, AND silently discarded the state_patch (so
+    `offered_disambiguation` was lost). Result: the FSM looped forever
+    re-asking "What date would you prefer?".
+
+    Guard: the source must (a) have a `tool_flow_needs_lookup` branch and
+    (b) call `_handle_availability_check` from that branch."""
+    src = open("app/services/nokvo_one_voice_pipeline.py").read()
+    # All four landmarks must be present in source — proves the dispatch
+    # branch exists, calls the scheduler handler, and is gated on the
+    # specific availability_check intent rather than any answerless return.
+    assert "tool_flow_needs_lookup" in src
+    assert "if tool_flow_needs_lookup:" in src, "needs_lookup branch missing"
+    # Find the if-branch and check it dispatches to the scheduler.
+    branch = src.split("if tool_flow_needs_lookup:", 1)[1].split("else:", 1)[0]
+    assert "_handle_availability_check" in branch
+    assert '"availability_check"' in src
+
+
+def test_pipeline_falls_back_to_slot_question_when_no_scheduler_match():
+    """When the scheduler can't satisfy the availability lookup (no
+    assignable site_visit agents yet), the pipeline must fall back to
+    asking the original missing slot directly — NOT swallow the turn and
+    fall through to RAG."""
+    src = open("app/services/nokvo_one_voice_pipeline.py").read()
+    # The fallback branch is `elif tool_flow_needs_lookup and not tool_flow.get("answer"):`
+    assert "elif tool_flow_needs_lookup and not tool_flow.get(\"answer\")" in src
+    # And it must build_tool_flow_questions to look up the slot prompt.
+    assert "build_tool_flow_questions" in src
+
+
+# ─────────── Inbound → tickets, outbound → leads routing ───────────
+
+
+def test_call_surface_set_inbound_when_no_campaign(monkeypatch):
+    """Browser tester / inbound voice line has no campaign_id → surface=voice_inbound."""
+    voice_source = open("app/services/nokvo_one_voice_stream_service.py").read()
+    # The set_state at session start must derive call_surface from campaign_context.
+    assert "call_surface" in voice_source
+    assert 'voice_outbound" if (campaign_context or {}).get("campaign_id") else "voice_inbound"' in voice_source
+
+
+def test_route_record_by_surface_rewrites_lead_to_ticket_for_inbound():
+    """Inbound voice surface must rewrite a `lead` record to `ticket` so it
+    lands in the tickets tab. Outbound leaves it as a lead."""
+    pipeline_source = open("app/services/nokvo_one_voice_pipeline.py").read()
+    assert "_route_record_by_surface" in pipeline_source
+    # The helper must guard on call_surface == voice_inbound for the rewrite
+    helper_block = pipeline_source.split("_route_record_by_surface(", 1)[1]
+    # Definition of the method should clearly check the surface.
+    assert 'call_surface != "voice_inbound"' in pipeline_source
+    # Only lead-type records get rewritten (appointments/callbacks/tickets stay).
+    assert 'rec.record_type != "lead"' in pipeline_source
+
+
+def test_pipeline_calls_route_after_tool_flow_execution():
+    pipeline_source = open("app/services/nokvo_one_voice_pipeline.py").read()
+    # The success path of _maybe_execute_tool_flow_action must invoke the
+    # routing helper with both result['lead_id'] and result['id'].
+    success_region = pipeline_source.split("Surface-based routing:", 1)[1].split("return {", 1)[0]
+    assert "_route_record_by_surface" in success_region
+    assert "lead_id" in success_region
+    assert "call_surface" in success_region
+
+
+# ─────────── Lead → Ticket projection (so the Tickets tab renders) ───────────
+
+
+def test_lead_data_projects_onto_real_estate_ticket_schema():
+    """Real-estate ticket schema needs `customer`, `issue_type`, `priority`,
+    plus `property_id` when the lead carried a `location`. Without this
+    mapping the row shows blank cells and the operator thinks no ticket
+    was created."""
+    from app.services.nokvo_one_voice_pipeline import NokvoOneVoicePipeline
+
+    lead_data = {
+        "name": "Nihar",
+        "phone": "7569672503",
+        "location": "Kokapet",
+        "budget": None,
+        "visit_date": "2026-05-22T03:30:00+00:00",
+    }
+    projected = NokvoOneVoicePipeline._map_lead_data_to_ticket_shape(lead_data, "real_estate")
+    assert projected["customer"] == "Nihar"
+    assert projected["issue_type"] == "site_visit"
+    assert projected["priority"] == "normal"
+    assert projected["property_id"] == "Kokapet"
+    # Original keys preserved
+    assert projected["name"] == "Nihar"
+    assert projected["phone"] == "7569672503"
+
+
+def test_lead_data_projection_industry_aware():
+    """Each industry's ticket schema has different required fields. The
+    mapper picks defaults appropriate to the industry."""
+    from app.services.nokvo_one_voice_pipeline import NokvoOneVoicePipeline
+
+    # Clinics: subject/customer
+    clinic = NokvoOneVoicePipeline._map_lead_data_to_ticket_shape(
+        {"patient_name": "Mamata", "reason": "eye blurriness"}, "clinics"
+    )
+    assert clinic["customer"] == "Mamata"
+    assert clinic["subject"] == "eye blurriness"
+
+    # Ecommerce: issue_type/subject
+    ecom = NokvoOneVoicePipeline._map_lead_data_to_ticket_shape(
+        {"customer_name": "Ravi", "issue_summary": "Order delayed"}, "ecommerce"
+    )
+    assert ecom["customer"] == "Ravi"
+    assert ecom["subject"] == "Order delayed"
+    assert ecom["issue_type"] == "support_request"
+
+    # Hospitality
+    hosp = NokvoOneVoicePipeline._map_lead_data_to_ticket_shape(
+        {"guest_name": "Anita"}, "hospitality"
+    )
+    assert hosp["customer"] == "Anita"
+    assert hosp["subject"] == "Guest inquiry"
+
+
+def test_lead_data_projection_does_not_overwrite_existing_fields():
+    """If the macro happened to set customer/priority/issue_type explicitly,
+    the mapper must NOT clobber those values."""
+    from app.services.nokvo_one_voice_pipeline import NokvoOneVoicePipeline
+
+    data = {
+        "name": "Nihar",
+        "customer": "Existing Customer",
+        "priority": "urgent",
+        "issue_type": "complaint",
+    }
+    projected = NokvoOneVoicePipeline._map_lead_data_to_ticket_shape(data, "real_estate")
+    assert projected["customer"] == "Existing Customer"
+    assert projected["priority"] == "urgent"
+    assert projected["issue_type"] == "complaint"

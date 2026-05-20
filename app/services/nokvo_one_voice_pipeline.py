@@ -73,6 +73,7 @@ from app.services.qdrant_service import QdrantService
 from app.services.sarvam_voice_service import SARVAM_LANGUAGE_OPTIONS, SarvamVoiceService
 from app.services.text_embedding_service import TextEmbeddingService
 from app.services.tool_flow_policy import evaluate_tool_flow_policy
+from app.services.tool_flow_questions import build_tool_flow_questions
 from app.services.voice_turn_policy import evaluate_voice_turn_policy
 
 
@@ -1456,6 +1457,112 @@ class NokvoOneVoicePipeline:
         }
 
     @staticmethod
+    def _map_lead_data_to_ticket_shape(data: dict[str, Any], industry: str | None) -> dict[str, Any]:
+        """Project the lead-shaped fields onto the keys the ticket schema
+        expects so the Tickets tab renders populated cells rather than blank
+        ones. Per business-template:
+
+        * real_estate tickets need ``customer``, ``issue_type``, ``priority``
+          (the lead has ``name``, ``phone``, ``visit_date``).
+        * clinics tickets need ``subject``, ``customer``, ``priority``.
+        * ecommerce / hospitality follow the same name → customer convention.
+
+        We only ADD; existing data is preserved so anything downstream that
+        was looking for the old keys still finds them.
+        """
+        merged = dict(data or {})
+        ind = (industry or "").lower()
+
+        # Common "customer" alias from whatever name-like field the lead had.
+        customer = (
+            merged.get("customer")
+            or merged.get("name")
+            or merged.get("customer_name")
+            or merged.get("patient_name")
+            or merged.get("guest_name")
+            or merged.get("contact_name")
+        )
+        if customer and not merged.get("customer"):
+            merged["customer"] = customer
+
+        # Default priority / issue_type / subject so the required ticket
+        # columns aren't empty. We err on the safe side ("normal") and let
+        # the operator re-classify in the dashboard if needed.
+        merged.setdefault("priority", "normal")
+        if ind == "real_estate":
+            merged.setdefault("issue_type", "site_visit")
+            if merged.get("location") and not merged.get("property_id"):
+                merged["property_id"] = merged["location"]
+        elif ind == "clinics":
+            merged.setdefault("subject", merged.get("care_need") or merged.get("reason") or "Patient request")
+            merged.setdefault("priority", "normal")
+        elif ind == "ecommerce":
+            merged.setdefault("subject", merged.get("subject") or merged.get("issue_summary") or "Customer inquiry")
+            merged.setdefault("issue_type", merged.get("issue_type") or "support_request")
+        elif ind == "hospitality":
+            merged.setdefault("subject", merged.get("subject") or "Guest inquiry")
+            merged.setdefault("reservation_id", merged.get("reservation_id") or merged.get("booking_id"))
+        return merged
+
+    @staticmethod
+    async def _route_record_by_surface(
+        db: AsyncSession,
+        record_ids: list[Any],
+        *,
+        call_surface: str | None,
+        industry: str | None = None,
+    ) -> None:
+        """Inbound calls = caller reached out for help → tickets tab.
+        Outbound calls = we reached out → leads tab.
+
+        We rewrite ``record_type`` post-creation on records the macro created
+        as ``lead`` so they land in the right tab, AND project the data dict
+        onto the ticket schema's expected field keys so the UI renders
+        populated cells (otherwise the row looks blank and the operator
+        thinks no ticket was created)."""
+        if call_surface not in {"voice_inbound", "voice_outbound"} or not record_ids:
+            return
+        from app.models.nokvo_one_tool_record import NokvoOneToolRecord
+        from app.services.nokvo_one_business_templates import STATUS_VOCABULARIES
+        from sqlalchemy import select
+        import uuid as _uuid
+
+        # Only inbound triggers a rewrite (lead → ticket). Outbound already
+        # creates leads and that's correct.
+        if call_surface != "voice_inbound":
+            return
+
+        ticket_status = (
+            (STATUS_VOCABULARIES.get((industry or "").lower(), {}).get("tickets") or {}).get("initial")
+            or "open"
+        )
+        for rid in record_ids:
+            try:
+                rid_uuid = _uuid.UUID(str(rid))
+            except (TypeError, ValueError):
+                continue
+            try:
+                res = await db.execute(
+                    select(NokvoOneToolRecord).where(NokvoOneToolRecord.id == rid_uuid)
+                )
+                rec = res.scalars().first()
+                if rec is None or rec.record_type != "lead":
+                    continue
+                rec.record_type = "ticket"
+                rec.status = ticket_status
+                projected = NokvoOneVoicePipeline._map_lead_data_to_ticket_shape(rec.data or {}, industry)
+                projected["routed_from"] = "lead"
+                projected["call_surface"] = call_surface
+                rec.data = projected
+                db.add(rec)
+                await db.commit()
+            except Exception:
+                try:
+                    await db.rollback()
+                except Exception:
+                    pass
+
+    @staticmethod
     async def _patch_record_metadata(
         db: AsyncSession,
         record_id: Any,
@@ -1688,6 +1795,32 @@ class NokvoOneVoicePipeline:
         created_id = flow_state.get("created_record_id")
         if record_metadata and created_id and db is not None:
             await NokvoOneVoicePipeline._patch_record_metadata(db, created_id, record_metadata)
+
+        # Surface-based routing: inbound calls land in tickets, outbound in
+        # leads. The macro defaults to creating leads, so we rewrite to
+        # tickets when the session is voice_inbound.
+        if db is not None and call_id is not None:
+            try:
+                session_state = await AgentSessionStore.get_state(tenant_res, call_id) or {}
+                surface = session_state.get("call_surface")
+                ids_to_route = [
+                    rid
+                    for rid in (
+                        result.get("lead_id"),
+                        result.get("id"),
+                    )
+                    if rid
+                ]
+                if ids_to_route:
+                    await NokvoOneVoicePipeline._route_record_by_surface(
+                        db,
+                        ids_to_route,
+                        call_surface=surface,
+                        industry=(business_context[0].industry if business_context else None),
+                    )
+            except Exception:
+                pass
+
         return {
             "answer": NokvoOneVoicePipeline._tool_flow_success_answer(result, args, flow_key=flow_key, language=language),
             "state_patch": {"tool_flow": flow_state},
@@ -2270,11 +2403,33 @@ class NokvoOneVoicePipeline:
         )
         prior_pending_slot = prior_appointment.get("pending_slot")
 
-        turn_policy = evaluate_voice_turn_policy(
-            user_text,
-            history=history_for_turn,
-            state=state_for_turn,
-            language=language,
+        # Clinic FSM gate: the appointment slot-fill ("patient name", "eye
+        # concern", "follow-up?") is clinic-specific. Real-estate / hospitality
+        # / ecommerce must NOT see those prompts even if the generic
+        # tool_flow's prior turn happens to contain a word like "పేరు" that
+        # the clinic slot inferrer would otherwise latch onto.
+        organization_industry: str | None = None
+        try:
+            from sqlalchemy import select
+            from app.models.organization import Organization
+
+            org_res = await db.execute(
+                select(Organization.industry).where(Organization.id == tenant_res.organization_id)
+            )
+            organization_industry = org_res.scalar()
+        except Exception:
+            organization_industry = None
+        is_clinic_org = (organization_industry or "").lower() == "clinics"
+
+        turn_policy = (
+            evaluate_voice_turn_policy(
+                user_text,
+                history=history_for_turn,
+                state=state_for_turn,
+                language=language,
+            )
+            if is_clinic_org
+            else None
         )
 
         # If the regex side-question detector inside evaluate_voice_turn_policy
@@ -2425,20 +2580,59 @@ class NokvoOneVoicePipeline:
                         )
                     tool_flow = None
 
-            if tool_flow and tool_flow.get("answer"):
-                action = await NokvoOneVoicePipeline._maybe_execute_tool_flow_action(
-                    tenant_res,
-                    call_id,
-                    db,
-                    tool_flow,
-                    business_context=business_context,
-                    language=language,
-                )
+            # Mirror the clinic-flow handling: the tool_flow's availability
+            # intent comes back with answer=None — the scheduler fills it in.
+            # The previous code's `if tool_flow.get("answer")` guard dropped
+            # the response on the floor, never dispatched the scheduler, AND
+            # silently discarded the state_patch (offered_disambiguation,
+            # pending_slot), so the next turn looped right back into the same
+            # availability question. Use a needs_lookup flag instead.
+            tool_flow_needs_lookup = (
+                tool_flow is not None
+                and tool_flow.get("intent") == "availability_check"
+            )
+            if tool_flow and (tool_flow.get("answer") or tool_flow_needs_lookup):
+                if tool_flow_needs_lookup:
+                    action = await NokvoOneVoicePipeline._handle_availability_check(
+                        tenant_res, db, tool_flow
+                    )
+                else:
+                    action = await NokvoOneVoicePipeline._maybe_execute_tool_flow_action(
+                        tenant_res,
+                        call_id,
+                        db,
+                        tool_flow,
+                        business_context=business_context,
+                        language=language,
+                    )
                 if action:
-                    tool_flow["answer"] = action.get("answer") or tool_flow["answer"]
+                    tool_flow["answer"] = action.get("answer") or tool_flow.get("answer") or ""
                     tool_flow["state_patch"] = action.get("state_patch") or tool_flow.get("state_patch") or {}
                     tool_flow["state_slot"] = action.get("state_slot") or tool_flow.get("state_slot")
                     tool_flow["reason"] = action.get("route_reason") or tool_flow.get("reason")
+                elif tool_flow_needs_lookup and not tool_flow.get("answer"):
+                    # Scheduler couldn't satisfy the lookup (no assignable
+                    # member for this request_type). Fall back to asking the
+                    # original missing slot directly — DO persist the
+                    # state_patch so offered_disambiguation stays True and
+                    # we don't loop.
+                    flow_state = dict((tool_flow.get("state_patch") or {}).get("tool_flow") or {})
+                    pending = flow_state.get("pending_slot") or "visit_time"
+                    business_type_local = (business_context[0].industry if business_context else None)
+                    bundle = build_tool_flow_questions(
+                        business_type_local,
+                        (business_context[1] if business_context else None),
+                        (business_context[2] if business_context else None),
+                    )
+                    slot_question = None
+                    for slot_def in ((bundle.get("flows") or {}).get(tool_flow.get("flow_key") or "") or {}).get("slots") or []:
+                        if slot_def.get("key") == pending:
+                            questions = slot_def.get("questions") or {}
+                            slot_question = questions.get(language) or questions.get("en")
+                            break
+                    tool_flow["answer"] = slot_question or "What time would you prefer?"
+                    tool_flow["state_patch"] = {"tool_flow": flow_state}
+                    tool_flow["state_slot"] = pending
                 metadata = {
                     **(intent_result.metadata or {}),
                     "turn_policy_intent": tool_flow.get("intent"),

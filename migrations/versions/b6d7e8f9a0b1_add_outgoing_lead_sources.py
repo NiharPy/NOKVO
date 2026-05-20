@@ -12,54 +12,68 @@ from sqlalchemy.dialects import postgresql
 
 
 revision: str = "b6d7e8f9a0b1"
-down_revision: Union[str, Sequence[str], None] = "a1c2d3e4f5b6"
+# Re-chained after c3d4e5f6a7b8 (pending_tool_retries) so this migration
+# joins the linear history. It was previously a sibling of b2d3e4f5c6d7
+# off the same parent, producing two alembic heads and stranding these
+# four tables (outgoing_leads, lead_capture_forms, etc.) on a branch the
+# DB never advanced onto.
+down_revision: Union[str, Sequence[str], None] = "c3d4e5f6a7b8"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 
-leadsourceprovider = sa.Enum(
-    "meta_ads",
-    "google_ads",
-    "google_forms",
-    "nokvo_form",
-    name="leadsourceprovider",
+# Column-side enum references with ``create_type=False`` so they never
+# re-issue ``CREATE TYPE`` — the explicit DO-block creation in ``upgrade``
+# is the only place the types are actually defined, and it's idempotent
+# against a prior partial run.
+leadsourceprovider = postgresql.ENUM(
+    "meta_ads", "google_ads", "google_forms", "nokvo_form",
+    name="leadsourceprovider", create_type=False,
 )
-leadconnectionstatus = sa.Enum(
-    "connected",
-    "needs_reauth",
-    "error",
-    "disabled",
-    name="leadconnectionstatus",
+leadconnectionstatus = postgresql.ENUM(
+    "connected", "needs_reauth", "error", "disabled",
+    name="leadconnectionstatus", create_type=False,
 )
-leadcaptureformstatus = sa.Enum(
-    "active",
-    "disabled",
-    "archived",
-    name="leadcaptureformstatus",
+leadcaptureformstatus = postgresql.ENUM(
+    "active", "disabled", "archived",
+    name="leadcaptureformstatus", create_type=False,
 )
-leadconsentstatus = sa.Enum(
-    "granted",
-    "unknown",
-    "revoked",
-    name="leadconsentstatus",
+leadconsentstatus = postgresql.ENUM(
+    "granted", "unknown", "revoked",
+    name="leadconsentstatus", create_type=False,
 )
-leadcallstatus = sa.Enum(
-    "new",
-    "queued",
-    "called",
-    "opted_out",
-    "invalid",
-    name="leadcallstatus",
+leadcallstatus = postgresql.ENUM(
+    "new", "queued", "called", "opted_out", "invalid",
+    name="leadcallstatus", create_type=False,
 )
+
+
+_ENUM_DEFS: list[tuple[str, tuple[str, ...]]] = [
+    ("leadsourceprovider", ("meta_ads", "google_ads", "google_forms", "nokvo_form")),
+    ("leadconnectionstatus", ("connected", "needs_reauth", "error", "disabled")),
+    ("leadcaptureformstatus", ("active", "disabled", "archived")),
+    ("leadconsentstatus", ("granted", "unknown", "revoked")),
+    ("leadcallstatus", ("new", "queued", "called", "opted_out", "invalid")),
+]
+
+
+def _create_enum_if_absent(name: str, values: tuple[str, ...]) -> None:
+    """CREATE TYPE wrapped in DO/EXCEPTION so a prior partial run that
+    leaked the type doesn't blow up this migration on retry."""
+    values_sql = ", ".join(f"'{v}'" for v in values)
+    op.execute(
+        f"""
+        DO $$ BEGIN
+            CREATE TYPE {name} AS ENUM ({values_sql});
+        EXCEPTION WHEN duplicate_object THEN NULL;
+        END $$;
+        """
+    )
 
 
 def upgrade() -> None:
-    bind = op.get_bind()
-    leadsourceprovider.create(bind, checkfirst=True)
-    leadconnectionstatus.create(bind, checkfirst=True)
-    leadcaptureformstatus.create(bind, checkfirst=True)
-    leadconsentstatus.create(bind, checkfirst=True)
-    leadcallstatus.create(bind, checkfirst=True)
+    for enum_name, enum_values in _ENUM_DEFS:
+        _create_enum_if_absent(enum_name, enum_values)
 
     op.create_table(
         "lead_source_connections",

@@ -1153,6 +1153,11 @@ class NokvoOneVoiceStreamService:
             stt_reader_task = asyncio.create_task(_reader())
 
         await NokvoOneVoiceStreamService._emit_runtime_status(websocket, tenant_res)
+        # Surface = inbound vs outbound. We use this to route created records:
+        # inbound voice → ticket (someone reaching out for help), outbound voice
+        # → lead (we reached out to them). The pipeline reads this when the
+        # tool returns its result IDs.
+        call_surface = "voice_outbound" if (campaign_context or {}).get("campaign_id") else "voice_inbound"
         await AgentSessionStore.set_state(
             tenant_res,
             call_id,
@@ -1160,6 +1165,7 @@ class NokvoOneVoiceStreamService:
                 "status": "connected",
                 "language": language,
                 "campaign_id": (campaign_context or {}).get("campaign_id"),
+                "call_surface": call_surface,
             },
         )
         await websocket.send_json({"type": "voice_session_ready", "call_id": call_id})
