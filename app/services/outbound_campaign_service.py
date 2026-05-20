@@ -21,10 +21,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.models.outgoing_lead import LeadCallStatus, OutboundCampaignContact, OutgoingLead
 from app.models.outbound_campaign import CampaignStatus, OutboundCampaign
 from app.models.tenant_resources import TenantResources
 from app.services.agent_knowledge_service import AGENT_KNOWLEDGE_SOURCE_TYPE, AgentKnowledgeService
 from app.services.exotel_service import ExotelService
+from app.services.outgoing_lead_service import OutgoingLeadService, lead_is_callable
 from app.services.qdrant_service import QdrantService
 from app.services.text_embedding_service import TextEmbeddingService
 
@@ -257,6 +259,112 @@ class OutboundCampaignService:
         return campaign
 
     @staticmethod
+    async def create_campaign_from_leads(
+        tenant_res: TenantResources,
+        db: AsyncSession,
+        *,
+        name: str,
+        lead_ids: list[uuid.UUID],
+        doc_file: UploadFile,
+        from_number: str | None = None,
+    ) -> OutboundCampaign:
+        leads = await OutgoingLeadService.validate_callable_leads(tenant_res, db, lead_ids)
+        doc_bytes = await doc_file.read()
+        doc_text = _parse_document(doc_file.filename or "doc.txt", doc_bytes)
+
+        doc_blob_path: str | None = None
+        try:
+            from app.services.azure_blob_service import AzureBlobService
+            blob_name = f"campaigns/{tenant_res.tenant_id}/{uuid.uuid4()}/{doc_file.filename}"
+            await AzureBlobService.upload_bytes(
+                tenant_res, doc_bytes, blob_name,
+                content_type="application/octet-stream",
+            )
+            doc_blob_path = blob_name
+        except Exception:
+            pass
+
+        exotel_cfg = dict((tenant_res.provider_status or {}).get("exotel") or {})
+        caller_id = (
+            from_number
+            or exotel_cfg.get("from_number")
+            or tenant_res.twilio_phone_number
+            or settings.EXOTEL_CALLER_ID
+        )
+        if not caller_id:
+            raise ValueError("No Exotel caller ID is configured. Link an Exotel number first.")
+
+        campaign_id = uuid.uuid4()
+        indexed_points = await OutboundCampaignService._index_campaign_script(
+            tenant_res,
+            campaign_id,
+            name,
+            doc_text,
+            db=db,
+        )
+
+        contacts: list[dict[str, Any]] = []
+        campaign_contact_rows: list[OutboundCampaignContact] = []
+        for lead in leads:
+            link_id = str(uuid.uuid4())
+            snapshot = {
+                "lead_id": str(lead.id),
+                "phone": lead.phone_e164,
+                "name": lead.name or lead.phone_e164,
+                "email": lead.email,
+                "source_provider": lead.source_provider.value if hasattr(lead.source_provider, "value") else lead.source_provider,
+                "capture_form_id": str(lead.capture_form_id) if lead.capture_form_id else None,
+                "provider_lead_id": lead.provider_lead_id,
+                "consent_status": lead.consent_status.value if hasattr(lead.consent_status, "value") else lead.consent_status,
+                "consent_text": lead.consent_text,
+                "consented_at": lead.consented_at.isoformat() if lead.consented_at else None,
+            }
+            contact = {
+                "phone": lead.phone_e164,
+                "name": lead.name or lead.phone_e164,
+                "status": "pending",
+                "call_id": None,
+                "call_link_id": link_id,
+                "duration_s": None,
+                "answered_at": None,
+                "lead_id": str(lead.id),
+                "source_provider": snapshot["source_provider"],
+                "consent_status": snapshot["consent_status"],
+                "consent_text": snapshot["consent_text"],
+                "script_indexed_points": indexed_points,
+            }
+            contacts.append(contact)
+            campaign_contact_rows.append(
+                OutboundCampaignContact(
+                    campaign_id=campaign_id,
+                    outgoing_lead_id=lead.id,
+                    status="pending",
+                    call_link_id=link_id,
+                    snapshot=snapshot,
+                )
+            )
+            lead.call_status = LeadCallStatus.queued
+            db.add(lead)
+
+        campaign = OutboundCampaign(
+            id=campaign_id,
+            tenant_id=tenant_res.tenant_id,
+            name=name,
+            status=CampaignStatus.draft,
+            contacts=contacts,
+            doc_blob_path=doc_blob_path,
+            doc_text=doc_text,
+            from_number=caller_id,
+            total_count=len(contacts),
+        )
+        db.add(campaign)
+        for row in campaign_contact_rows:
+            db.add(row)
+        await db.commit()
+        await db.refresh(campaign)
+        return campaign
+
+    @staticmethod
     async def list_campaigns(tenant_res: TenantResources, db: AsyncSession) -> list[OutboundCampaign]:
         result = await db.execute(
             select(OutboundCampaign)
@@ -317,6 +425,22 @@ class OutboundCampaignService:
         base = public_base_url.rstrip("/")
         prefix = path_prefix.rstrip("/")
         contacts = list(campaign.contacts or [])
+        lead_ids: list[uuid.UUID] = []
+        for contact in contacts:
+            lead_id = contact.get("lead_id")
+            if not lead_id:
+                raise ValueError(
+                    "This campaign contains contacts without consented lead records. "
+                    "Create a new campaign from eligible Outgoing Agent leads."
+                )
+            try:
+                lead_ids.append(uuid.UUID(str(lead_id)))
+            except ValueError as exc:
+                raise ValueError("Campaign contains an invalid lead reference.") from exc
+        leads = await OutgoingLeadService.validate_callable_leads(tenant_res, db, lead_ids)
+        callable_by_id = {str(lead.id): lead for lead in leads if lead_is_callable(lead)}
+        if len(callable_by_id) != len(contacts):
+            raise ValueError("Campaign contains leads that are no longer callable.")
 
         campaign.status = CampaignStatus.running
         campaign.started_at = datetime.now(timezone.utc)
@@ -376,6 +500,12 @@ class OutboundCampaignService:
             target["status"] = "answered"
             target["answered_at"] = datetime.now(timezone.utc).isoformat()
             campaign.answered_count = (campaign.answered_count or 0) + 1
+            if target.get("lead_id"):
+                lead_res = await db.execute(select(OutgoingLead).where(OutgoingLead.id == uuid.UUID(str(target["lead_id"]))))
+                lead = lead_res.scalars().first()
+                if lead:
+                    lead.call_status = LeadCallStatus.called
+                    db.add(lead)
 
         elif event_type in ("call.hangup", "call.failed", "call.machine.detection.ended"):
             hangup_cause = payload.get("hangup_cause", "")
@@ -385,7 +515,59 @@ class OutboundCampaignService:
             duration = payload.get("duration_seconds") or 0
             target["duration_s"] = int(duration)
 
+            # Close the outcome loop: any record the agent created during
+            # this call gets its outcome derived from the call disposition,
+            # and a follow-up callback is auto-scheduled for no_show /
+            # failed_followup states.
+            try:
+                from app.services.outcome_tracker import OutcomeTracker
+                from app.models.tenant_resources import TenantResources
+
+                tr_res = await db.execute(
+                    select(TenantResources).where(TenantResources.tenant_id == campaign.tenant_id)
+                )
+                tr = tr_res.scalars().first()
+                org_id = tr.organization_id if tr else None
+                created_record_ids = list(target.get("created_record_ids") or [])
+                if org_id:
+                    for rec_id in created_record_ids:
+                        try:
+                            rec_uuid = uuid.UUID(str(rec_id))
+                        except (TypeError, ValueError):
+                            continue
+                        await OutcomeTracker.record_from_disposition(
+                            db,
+                            organization_id=org_id,
+                            record_id=rec_uuid,
+                            disposition=target["status"],
+                            notes=f"hangup_cause={hangup_cause}" if hangup_cause else None,
+                        )
+                        await OutcomeTracker.auto_followup_if_needed(
+                            db,
+                            organization_id=org_id,
+                            record_id=rec_uuid,
+                        )
+            except Exception:
+                pass
+
         campaign.contacts = contacts
+        contact_res = await db.execute(
+            select(OutboundCampaignContact).where(
+                OutboundCampaignContact.campaign_id == campaign.id,
+                OutboundCampaignContact.call_link_id == call_link_id,
+            )
+        )
+        campaign_contact = contact_res.scalars().first()
+        if campaign_contact:
+            campaign_contact.status = target.get("status") or campaign_contact.status
+            campaign_contact.call_id = target.get("call_id") or campaign_contact.call_id
+            campaign_contact.snapshot = {
+                **dict(campaign_contact.snapshot or {}),
+                "duration_s": target.get("duration_s"),
+                "answered_at": target.get("answered_at"),
+                "last_status_payload": payload,
+            }
+            db.add(campaign_contact)
 
         # Check if all calls are terminal
         terminal = {"answered", "no_answer", "failed"}

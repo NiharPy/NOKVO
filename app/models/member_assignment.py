@@ -35,6 +35,7 @@ class OrganizationMemberAssignmentSettings(Base):
     max_active_requests = Column(Integer, nullable=False, server_default="3", default=3)
     max_requests_per_day = Column(Integer, nullable=True)
     max_requests_per_hour = Column(Integer, nullable=False, server_default="6", default=6)
+    appointment_duration_minutes = Column(Integer, nullable=False, server_default="30", default=30)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
@@ -78,6 +79,27 @@ class MemberBlockedSlot(Base):
     member_id = Column(
         UUID(as_uuid=True),
         ForeignKey("organization_users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    start_time = Column(DateTime(timezone=True), nullable=False)
+    end_time = Column(DateTime(timezone=True), nullable=False)
+    reason = Column(String, nullable=True)
+    repeat_rule = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class OrganizationBlockedSlot(Base):
+    """Organisation-wide closure (public holiday, festival, maintenance day).
+    Applied to every assignable member during scheduler conflict checks."""
+
+    __tablename__ = "organization_blocked_slots"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
     )

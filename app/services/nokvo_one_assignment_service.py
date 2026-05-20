@@ -14,6 +14,7 @@ from app.models.member_assignment import (
     ClinicMemberScheduleSettings,
     MemberBlockedSlot,
     NokvoOneAssignmentAuditLog,
+    OrganizationBlockedSlot,
     OrganizationMemberAssignmentSettings,
 )
 from app.models.nokvo_one_tool_record import NokvoOneToolRecord
@@ -38,6 +39,7 @@ EMERGENCY_KEYWORDS = {
     "severe pain",
 }
 ASSIGNMENT_TIMEZONE = "Asia/Kolkata"
+SLOT_SEARCH_HORIZON_DAYS = 14
 
 
 @dataclass
@@ -47,6 +49,8 @@ class AssignmentCandidate:
     active_load: int
     daily_count: int
     hourly_count: int
+    scheduled_at: datetime
+    shift_minutes: int
 
 
 def _coerce_zoneinfo(value: str | None) -> ZoneInfo:
@@ -104,6 +108,21 @@ def _is_clinic_emergency(organization: Organization, request_type: str, summary:
     return any(keyword in text for keyword in EMERGENCY_KEYWORDS)
 
 
+def _appointment_start_from_record(record: NokvoOneToolRecord) -> datetime | None:
+    data = record.data or {}
+    raw = data.get("scheduled_time") or data.get("appointment_start") or data.get("requested_time")
+    if raw is None:
+        raw = record.created_at
+    if raw is None:
+        return None
+    if isinstance(raw, datetime):
+        return _aware_utc(raw)
+    try:
+        return _aware_utc(datetime.fromisoformat(str(raw).replace("Z", "+00:00")))
+    except ValueError:
+        return _aware_utc(record.created_at) if record.created_at else None
+
+
 class NokvoOneAssignmentService:
     @staticmethod
     async def assign_request(
@@ -159,6 +178,9 @@ class NokvoOneAssignmentService:
                 "reason": "urgent_escalation_requires_staff_review",
                 "active_load_count": None,
                 "skipped_member_reasons": skipped,
+                "requested_time": requested_at,
+                "scheduled_time": None,
+                "time_adjusted": False,
                 "timestamp": now,
             }
             await NokvoOneAssignmentService._audit(db, result)
@@ -182,50 +204,61 @@ class NokvoOneAssignmentService:
                 reasons.append("not_assignable")
             if settings is not None and request_type not in set(settings.request_types or []):
                 reasons.append("request_type_not_supported")
-            if settings is not None and not _within_working_window(settings, requested_at):
-                reasons.append("outside_working_hours")
-
-            active_load = NokvoOneAssignmentService._active_load(records, member.id)
-            daily_count = NokvoOneAssignmentService._daily_count(records, member.id, requested_at, settings)
-            hourly_count = NokvoOneAssignmentService._hourly_count(records, member.id, requested_at, settings)
-            if (
-                settings is not None
-                and getattr(settings, "max_active_requests", None) is not None
-                and active_load >= int(settings.max_active_requests)
-            ):
-                reasons.append("active_request_capacity_reached")
-            if (
-                settings is not None
-                and getattr(settings, "max_requests_per_hour", None) is not None
-                and hourly_count >= int(settings.max_requests_per_hour)
-            ):
-                reasons.append("hourly_request_capacity_reached")
-            if (
-                organization.industry != "clinics"
-                and NokvoOneAssignmentService._blocked_slot_conflict(
-                    requested_at,
-                    blocked_slots_by_member.get(member.id, []),
-                )
-            ):
-                reasons.append("blocked_slot_conflict")
-
-            if organization.industry == "clinics" and settings is not None:
-                clinic_reasons = NokvoOneAssignmentService._clinic_skip_reasons(
-                    request_type,
-                    requested_at,
-                    member.id,
-                    clinic_settings_by_member.get(member.id),
-                    blocked_slots_by_member.get(member.id, []),
-                    records,
-                    settings,
-                )
-                reasons.extend(clinic_reasons)
 
             if reasons:
                 skipped[str(member.id)] = reasons
                 continue
-            if settings is not None:
-                candidates.append(AssignmentCandidate(member, settings, active_load, daily_count, hourly_count))
+            if settings is None:
+                continue
+
+            active_load = NokvoOneAssignmentService._active_load(records, member.id)
+            if (
+                getattr(settings, "max_active_requests", None) is not None
+                and active_load >= int(settings.max_active_requests)
+            ):
+                skipped[str(member.id)] = ["active_request_capacity_reached"]
+                continue
+
+            clinic_settings = clinic_settings_by_member.get(member.id)
+            if organization.industry == "clinics" and clinic_settings is not None:
+                consultation_types = set(clinic_settings.consultation_types or [])
+                if (
+                    consultation_types
+                    and request_type not in consultation_types
+                    and request_type != "appointment"
+                ):
+                    skipped[str(member.id)] = ["consultation_type_not_supported"]
+                    continue
+
+            member_blocks = list(blocked_slots_by_member.get(member.id, []))
+            member_blocks.extend(blocked_slots_by_member.get("_org_wide", []))  # type: ignore[arg-type]
+            slot_result = NokvoOneAssignmentService._find_next_available_slot(
+                member_id=member.id,
+                requested_at=requested_at,
+                settings=settings,
+                clinic_settings=clinic_settings if organization.industry == "clinics" else None,
+                blocked_slots=member_blocks,
+                records=records,
+                exclude_record_id=record.id,
+            )
+            if slot_result is None:
+                skipped[str(member.id)] = ["no_available_slot_within_horizon"]
+                continue
+
+            scheduled_at, shift_minutes = slot_result
+            daily_count = NokvoOneAssignmentService._daily_count(records, member.id, scheduled_at, settings)
+            hourly_count = NokvoOneAssignmentService._hourly_count(records, member.id, scheduled_at, settings)
+            candidates.append(
+                AssignmentCandidate(
+                    member=member,
+                    settings=settings,
+                    active_load=active_load,
+                    daily_count=daily_count,
+                    hourly_count=hourly_count,
+                    scheduled_at=scheduled_at,
+                    shift_minutes=shift_minutes,
+                )
+            )
 
         if not candidates:
             reason = "no_members_matched_assignment_rules"
@@ -258,12 +291,27 @@ class NokvoOneAssignmentService:
                 "reason": reason,
                 "active_load_count": None,
                 "skipped_member_reasons": skipped,
+                "requested_time": requested_at,
+                "scheduled_time": None,
+                "time_adjusted": False,
                 "timestamp": now,
             }
             await NokvoOneAssignmentService._audit(db, result)
             return result
 
-        selected = sorted(candidates, key=lambda item: (item.active_load, item.hourly_count, item.daily_count, item.member.created_at or now))[0]
+        selected = sorted(
+            candidates,
+            key=lambda item: (
+                item.shift_minutes,
+                item.active_load,
+                item.hourly_count,
+                item.daily_count,
+                item.member.created_at or now,
+            ),
+        )[0]
+        scheduled_at = selected.scheduled_at
+        time_adjusted = scheduled_at != requested_at
+
         data = dict(record.data or {})
         data.update(
             {
@@ -271,7 +319,10 @@ class NokvoOneAssignmentService:
                 "assigned_member_id": str(selected.member.id),
                 "assigned_member_name": selected.member.full_name,
                 "assigned_at": now.isoformat(),
-                "requested_time": requested_at.isoformat(),
+                "requested_time": scheduled_at.isoformat(),
+                "scheduled_time": scheduled_at.isoformat(),
+                "original_requested_time": requested_at.isoformat(),
+                "time_adjusted": time_adjusted,
                 "assignment_method": "lowest_load",
                 "assignment_status": "assigned",
             }
@@ -279,10 +330,13 @@ class NokvoOneAssignmentService:
         if organization.industry == "clinics" and record.record_type == "appointment":
             data["doctor"] = selected.member.full_name
             data["assigned_doctor_id"] = str(selected.member.id)
+            data["appointment_time"] = scheduled_at.isoformat()
+            data["appointment_start"] = scheduled_at.isoformat()
         elif organization.industry == "real_estate":
             data["agent"] = selected.member.full_name
             data["assigned_agent_id"] = str(selected.member.id)
             data["assigned_to"] = selected.member.full_name
+            data["visit_at"] = scheduled_at.isoformat()
         record.status = "assigned"
         record.data = data
         db.add(record)
@@ -298,6 +352,9 @@ class NokvoOneAssignmentService:
             "reason": None,
             "active_load_count": selected.active_load,
             "skipped_member_reasons": skipped,
+            "requested_time": requested_at,
+            "scheduled_time": scheduled_at,
+            "time_adjusted": time_adjusted,
             "timestamp": now,
         }
         await NokvoOneAssignmentService._audit(db, result)
@@ -382,12 +439,33 @@ class NokvoOneAssignmentService:
 
     @staticmethod
     async def _load_blocked_slots(db: AsyncSession, organization_id: uuid.UUID) -> dict[uuid.UUID, list[MemberBlockedSlot]]:
+        """Per-member blocked slots PLUS org-wide closures (public holidays,
+        festivals, maintenance days). Org-wide slots are materialised against
+        every member that has at least one entry so the scheduler treats them
+        uniformly — and added under a sentinel `None` member key so members
+        with no individual blocks still inherit them.
+        """
         res = await db.execute(
             select(MemberBlockedSlot).where(MemberBlockedSlot.organization_id == organization_id)
         )
         slots: dict[uuid.UUID, list[MemberBlockedSlot]] = {}
         for item in res.scalars().all():
             slots.setdefault(item.member_id, []).append(item)
+
+        # Org-wide closures: load and wrap each one in a MemberBlockedSlot-shaped
+        # object so the existing conflict logic keeps working unchanged. We
+        # attach them under a fresh key on lookup (see _find_next_available_slot).
+        try:
+            org_res = await db.execute(
+                select(OrganizationBlockedSlot).where(
+                    OrganizationBlockedSlot.organization_id == organization_id
+                )
+            )
+            org_blocks = list(org_res.scalars().all())
+        except Exception:
+            org_blocks = []
+        if org_blocks:
+            slots.setdefault("_org_wide", []).extend(org_blocks)  # type: ignore[arg-type]
         return slots
 
     @staticmethod
@@ -440,7 +518,10 @@ class NokvoOneAssignmentService:
                 continue
             if str((record.data or {}).get("assigned_member_id")) != member_key:
                 continue
-            if _same_local_day(record.created_at, day, tz):
+            appointment_at = _appointment_start_from_record(record)
+            if appointment_at is None:
+                continue
+            if appointment_at.astimezone(tz).date() == day:
                 count += 1
         return count
 
@@ -462,75 +543,200 @@ class NokvoOneAssignmentService:
                 continue
             if str((record.data or {}).get("assigned_member_id")) != member_key:
                 continue
-            request_value = (record.data or {}).get("requested_time") or record.created_at
-            try:
-                record_at = datetime.fromisoformat(request_value) if isinstance(request_value, str) else request_value
-            except ValueError:
-                record_at = record.created_at
-            if record_at is None:
+            appointment_at = _appointment_start_from_record(record)
+            if appointment_at is None:
                 continue
-            record_local = _aware_utc(record_at).astimezone(tz)
+            record_local = appointment_at.astimezone(tz)
             if record_local.date() == requested_local.date() and record_local.hour == requested_local.hour:
                 count += 1
         return count
 
     @staticmethod
-    def _clinic_skip_reasons(
-        request_type: str,
-        requested_at: datetime,
+    def _existing_intervals_for_member(
+        records: list[NokvoOneToolRecord],
         member_id: uuid.UUID,
+        default_duration_minutes: int,
+        exclude_record_id: uuid.UUID | None,
+    ) -> list[tuple[datetime, datetime]]:
+        member_key = str(member_id)
+        intervals: list[tuple[datetime, datetime]] = []
+        for record in records:
+            if record.status in NON_DAILY_COUNT_STATUSES:
+                continue
+            if exclude_record_id is not None and record.id == exclude_record_id:
+                continue
+            if str((record.data or {}).get("assigned_member_id")) != member_key:
+                continue
+            start = _appointment_start_from_record(record)
+            if start is None:
+                continue
+            duration = int((record.data or {}).get("appointment_duration_minutes") or default_duration_minutes)
+            intervals.append((start, start + timedelta(minutes=max(1, duration))))
+        return intervals
+
+    @staticmethod
+    def _next_working_window_start(
+        settings: OrganizationMemberAssignmentSettings,
+        from_at: datetime,
+        tz: ZoneInfo,
+        horizon: datetime,
+    ) -> datetime | None:
+        working_days = set(settings.working_days or [])
+        if not working_days or not settings.start_time or not settings.end_time:
+            return None
+        cursor = from_at.astimezone(tz)
+        for _ in range(SLOT_SEARCH_HORIZON_DAYS + 1):
+            day_slug = DAY_INDEX[cursor.weekday()]
+            if day_slug in working_days:
+                start_local = cursor.replace(
+                    hour=settings.start_time.hour,
+                    minute=settings.start_time.minute,
+                    second=0,
+                    microsecond=0,
+                )
+                end_local = cursor.replace(
+                    hour=settings.end_time.hour,
+                    minute=settings.end_time.minute,
+                    second=0,
+                    microsecond=0,
+                )
+                local_t = cursor.time().replace(tzinfo=None)
+                if settings.start_time <= local_t <= settings.end_time:
+                    candidate = cursor
+                elif local_t < settings.start_time:
+                    candidate = start_local
+                else:
+                    candidate = None
+                if candidate is not None and candidate <= end_local:
+                    utc_candidate = candidate.astimezone(timezone.utc)
+                    if utc_candidate > horizon:
+                        return None
+                    return utc_candidate
+            cursor = (cursor + timedelta(days=1)).replace(
+                hour=settings.start_time.hour,
+                minute=settings.start_time.minute,
+                second=0,
+                microsecond=0,
+            )
+            if cursor.astimezone(timezone.utc) > horizon:
+                return None
+        return None
+
+    @staticmethod
+    def _working_window_end_for(
+        settings: OrganizationMemberAssignmentSettings,
+        moment: datetime,
+        tz: ZoneInfo,
+    ) -> datetime:
+        local = moment.astimezone(tz)
+        end_local = local.replace(
+            hour=settings.end_time.hour,
+            minute=settings.end_time.minute,
+            second=0,
+            microsecond=0,
+        )
+        return end_local.astimezone(timezone.utc)
+
+    @staticmethod
+    def _find_next_available_slot(
+        *,
+        member_id: uuid.UUID,
+        requested_at: datetime,
+        settings: OrganizationMemberAssignmentSettings,
         clinic_settings: ClinicMemberScheduleSettings | None,
         blocked_slots: list[MemberBlockedSlot],
         records: list[NokvoOneToolRecord],
-        assignment_settings: OrganizationMemberAssignmentSettings,
-    ) -> list[str]:
-        consultation_types = set(clinic_settings.consultation_types or []) if clinic_settings is not None else set()
-        consultation_supported = (
-            not consultation_types
-            or request_type in consultation_types
-            or request_type == "appointment"
+        exclude_record_id: uuid.UUID | None,
+    ) -> tuple[datetime, int] | None:
+        tz = _coerce_zoneinfo(settings.timezone)
+        general_duration = int(getattr(settings, "appointment_duration_minutes", None) or 30)
+        clinic_duration = int(getattr(clinic_settings, "appointment_duration_minutes", None) or general_duration) if clinic_settings else general_duration
+        duration = max(5, clinic_duration if clinic_settings else general_duration)
+        buffer_minutes = int(getattr(clinic_settings, "buffer_minutes", None) or 0) if clinic_settings else 0
+        max_per_hour = (
+            int(clinic_settings.max_patients_per_hour)
+            if clinic_settings and clinic_settings.max_patients_per_hour is not None
+            else int(getattr(settings, "max_requests_per_hour", None) or 0) or None
         )
-        if not consultation_supported:
-            return ["consultation_type_not_supported"]
+        max_per_day = (
+            int(clinic_settings.max_patients_per_day)
+            if clinic_settings and clinic_settings.max_patients_per_day is not None
+            else (int(settings.max_requests_per_day) if settings.max_requests_per_day is not None else None)
+        )
+        intervals = NokvoOneAssignmentService._existing_intervals_for_member(
+            records, member_id, duration, exclude_record_id
+        )
+        step = max(5, min(duration, 15))
+        horizon = requested_at + timedelta(days=SLOT_SEARCH_HORIZON_DAYS)
 
-        duration = int((clinic_settings.appointment_duration_minutes if clinic_settings else None) or 30)
-        buffer_minutes = int((clinic_settings.buffer_minutes if clinic_settings else None) or 0)
-        end_at = requested_at + timedelta(minutes=duration + buffer_minutes)
-        for slot in blocked_slots:
-            slot_start = _aware_utc(slot.start_time)
-            slot_end = _aware_utc(slot.end_time)
-            if requested_at < slot_end and end_at > slot_start:
-                return ["blocked_slot_conflict"]
+        candidate = requested_at
+        guard = 0
+        while candidate <= horizon and guard < 5000:
+            guard += 1
+            if not _within_working_window(settings, candidate):
+                next_start = NokvoOneAssignmentService._next_working_window_start(
+                    settings, candidate, tz, horizon
+                )
+                if next_start is None:
+                    return None
+                candidate = next_start
+                continue
 
-        tz = _coerce_zoneinfo(assignment_settings.timezone)
-        member_key = str(member_id)
-        requested_local = requested_at.astimezone(tz)
-        hour_count = 0
-        day_count = 0
-        for record in records:
-            if str((record.data or {}).get("assigned_member_id")) != member_key:
+            candidate_end = candidate + timedelta(minutes=duration + buffer_minutes)
+            window_end = NokvoOneAssignmentService._working_window_end_for(settings, candidate, tz)
+            if candidate_end > window_end:
+                next_day = (candidate.astimezone(tz) + timedelta(days=1)).replace(
+                    hour=settings.start_time.hour,
+                    minute=settings.start_time.minute,
+                    second=0,
+                    microsecond=0,
+                )
+                candidate = next_day.astimezone(timezone.utc)
                 continue
-            if record.status == "cancelled":
-                continue
-            appointment_value = (record.data or {}).get("requested_time") or (record.data or {}).get("appointment_start")
-            try:
-                appointment_at = datetime.fromisoformat(appointment_value) if appointment_value else record.created_at
-            except ValueError:
-                appointment_at = record.created_at
-            if appointment_at is None:
-                continue
-            appointment_at = _aware_utc(appointment_at)
-            appointment_local = appointment_at.astimezone(tz)
-            if appointment_local.date() == requested_local.date():
-                day_count += 1
-                if appointment_local.hour == requested_local.hour:
-                    hour_count += 1
 
-        if clinic_settings is not None and clinic_settings.max_patients_per_hour is not None and hour_count >= int(clinic_settings.max_patients_per_hour):
-            return ["hourly_patient_capacity_reached"]
-        if clinic_settings is not None and clinic_settings.max_patients_per_day is not None and day_count >= int(clinic_settings.max_patients_per_day):
-            return ["daily_patient_capacity_reached"]
-        return []
+            if NokvoOneAssignmentService._blocked_slot_conflict(
+                candidate, blocked_slots, duration_minutes=duration + buffer_minutes
+            ):
+                candidate = candidate + timedelta(minutes=step)
+                continue
+
+            overlap = False
+            for start, end in intervals:
+                if candidate < end and candidate_end > start:
+                    overlap = True
+                    candidate = end
+                    break
+            if overlap:
+                continue
+
+            local = candidate.astimezone(tz)
+            hour_count = 0
+            day_count = 0
+            for start, _end in intervals:
+                start_local = start.astimezone(tz)
+                if start_local.date() == local.date():
+                    day_count += 1
+                    if start_local.hour == local.hour:
+                        hour_count += 1
+            if max_per_hour is not None and hour_count >= max_per_hour:
+                next_hour_local = (local.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
+                candidate = next_hour_local.astimezone(timezone.utc)
+                continue
+            if max_per_day is not None and day_count >= max_per_day:
+                next_day_local = (local + timedelta(days=1)).replace(
+                    hour=settings.start_time.hour,
+                    minute=settings.start_time.minute,
+                    second=0,
+                    microsecond=0,
+                )
+                candidate = next_day_local.astimezone(timezone.utc)
+                continue
+
+            shift_seconds = int((candidate - requested_at).total_seconds())
+            shift_minutes = max(0, shift_seconds // 60)
+            return candidate, shift_minutes
+
+        return None
 
     @staticmethod
     async def _audit(db: AsyncSession, result: dict[str, Any]) -> None:

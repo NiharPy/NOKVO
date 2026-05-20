@@ -43,6 +43,61 @@ from app.services.prosody import DEFAULT_TONE, ProsodyChunk, prosody_for, stream
 from app.services.sarvam_voice_service import SarvamVoiceService
 
 
+# Short utterances the user produces while the agent is still composing the
+# previous answer. We acknowledge with a short "yes, one moment…" instead of
+# treating these as barge-ins — the pending answer continues unmodified.
+_CHECK_IN_EXACT = {
+    "hello", "hello?", "hellooo", "hi", "hi?", "hey", "hey?",
+    "hello hello", "hello are you there", "are you there",
+    "are you there?", "you there", "you there?",
+    "still there", "still there?", "you still there",
+    "anyone there", "anyone there?", "can you hear me",
+    "can you hear me?", "you hear me", "you listening",
+    "are you listening", "hello can you hear me",
+    "हलो", "हैलो", "हेलो", "हैलो?", "क्या आप हैं",
+    "क्या आप वहाँ हैं", "हो क्या", "क्या आप सुन रहे हैं",
+    "హలో", "హలో?", "ఉన్నారా", "మీరు ఉన్నారా",
+    "ஹலோ", "இருக்கீங்களா", "கேக்குதா",
+}
+_CHECK_IN_CONTAINS = (
+    "are you there",
+    "you still there",
+    "can you hear me",
+    "are you listening",
+    "anyone there",
+    "क्या आप हैं",
+    "सुन रहे हैं",
+    "మీరు ఉన్నారా",
+    "இருக்கீங்களா",
+)
+
+
+def _is_check_in_utterance(text: str) -> bool:
+    cleaned = " ".join((text or "").lower().split())
+    cleaned = cleaned.rstrip("?.,!।؟")
+    if not cleaned:
+        return False
+    if len(cleaned.split()) > 6:
+        return False
+    if cleaned in _CHECK_IN_EXACT:
+        return True
+    return any(needle in cleaned for needle in _CHECK_IN_CONTAINS)
+
+
+def _quick_ack_text(language: str | None) -> str:
+    return {
+        "hi": "जी हाँ, सुन रहा हूँ।",
+        "ta": "ஆமா, கேக்குறேன்.",
+        "te": "అవును, వింటున్నాను.",
+        "bn": "হ্যাঁ, শুনছি।",
+        "kn": "ಹೌದು, ಕೇಳ್ತಾ ಇದೀನಿ.",
+        "ml": "അതെ, കേൾക്കുന്നു.",
+        "mr": "हो, ऐकतोय.",
+        "gu": "હા, સાંભળું છું.",
+        "pa": "ਹਾਂ, ਸੁਣ ਰਿਹਾ ਹਾਂ।",
+    }.get(language or "en", "Yes, I'm here.")
+
+
 class NokvoOneVoiceStreamService:
     @staticmethod
     async def _company_name(db: AsyncSession | None, tenant_res: TenantResources) -> str:
@@ -67,6 +122,123 @@ class NokvoOneVoiceStreamService:
         if lang == "hi":
             return "नमस्ते, आप जिस भाषा में सहज हैं उसमें बात कीजिए। मैं उसी भाषा में आगे बात करूंगा। मैं कैसे मदद कर सकता हूं?"
         return "Hello, please speak in the language you're comfortable with. I'll continue in that language. How can I help?"
+
+    @staticmethod
+    async def _load_recent_record_for_phone(
+        db: AsyncSession | None,
+        organization_id: Any,
+        phone: str | None,
+    ) -> dict[str, Any] | None:
+        """Look up the most recent open record for a returning caller. Returns
+        a small summary dict (record_type, name, reason/summary, when) or None.
+        Used to enrich the inbound opener: "Hi again — still about your eye
+        blurriness checkup, or something new?"."""
+        if db is None or not phone or organization_id is None:
+            return None
+        from app.models.nokvo_one_tool_record import NokvoOneToolRecord
+        from sqlalchemy import select
+
+        # Normalise the phone: keep last 10 digits since that's what most
+        # records use for Indian numbers.
+        digits = "".join(c for c in str(phone) if c.isdigit())
+        if len(digits) < 10:
+            return None
+        suffix = digits[-10:]
+        OPEN_STATUSES = ("new", "requested", "assigned", "open", "scheduled", "in_progress")
+        stmt = (
+            select(NokvoOneToolRecord)
+            .where(NokvoOneToolRecord.organization_id == organization_id)
+            .where(NokvoOneToolRecord.status.in_(OPEN_STATUSES))
+            .order_by(NokvoOneToolRecord.created_at.desc())
+            .limit(20)
+        )
+        try:
+            res = await db.execute(stmt)
+        except Exception:
+            return None
+        for rec in res.scalars().all():
+            phone_value = "".join(c for c in str(rec.contact_phone or "") if c.isdigit())
+            if not phone_value:
+                # Fall back to data.phone / data.contact_phone
+                data = rec.data or {}
+                phone_value = "".join(c for c in str(data.get("phone") or data.get("contact_phone") or "") if c.isdigit())
+            if phone_value and phone_value[-10:] == suffix:
+                data = rec.data or {}
+                return {
+                    "record_id": str(rec.id),
+                    "record_type": rec.record_type,
+                    "status": rec.status,
+                    "name": (
+                        data.get("patient_name")
+                        or data.get("name")
+                        or data.get("customer_name")
+                        or data.get("guest_name")
+                    ),
+                    "summary": (
+                        data.get("reason")
+                        or data.get("care_need")
+                        or data.get("subject")
+                        or data.get("issue_summary")
+                        or data.get("description")
+                        or data.get("notes")
+                    ),
+                    "when": (
+                        data.get("appointment_time")
+                        or data.get("visit_at")
+                        or data.get("callback_at")
+                        or data.get("requested_time")
+                    ),
+                }
+        return None
+
+    @staticmethod
+    def _returning_caller_opener(
+        record: dict[str, Any],
+        language: str | None,
+        *,
+        outcome_history: list[dict[str, Any]] | None = None,
+    ) -> str:
+        lang = SarvamVoiceService.normalize_language(language)
+        name = str(record.get("name") or "").strip()
+        summary = str(record.get("summary") or "").strip()
+        rt = str(record.get("record_type") or "")
+        topic = summary or {
+            "appointment": "your appointment",
+            "lead": "your enquiry",
+            "ticket": "your support ticket",
+            "callback": "the callback we have on file",
+            "request": "your previous request",
+        }.get(rt, "your previous request")
+        # Adapt tone to outcome history: if the caller no-showed last time,
+        # the opener acknowledges that gently and offers a reminder SMS.
+        last_outcome = None
+        for entry in outcome_history or []:
+            status = ((entry or {}).get("outcome") or {}).get("status")
+            if status:
+                last_outcome = status
+                break
+        if last_outcome in {"no_show", "failed_followup"}:
+            if lang == "te":
+                prefix = f"హలో {name} గారు — last time miss అయ్యింది."
+                return f"{prefix} ఈసారి appointment confirm చేయడానికి reminder pampāli ah?"
+            if lang == "hi":
+                prefix = f"नमस्ते {name} ji — पिछली बार miss हो गया था।"
+                return f"{prefix} इस बार reminder SMS भेज दूँ कन्फर्म करने के लिए?"
+            return (
+                f"Hi {name} — last time the visit got missed. "
+                "Want me to send a reminder SMS this time so it doesn't slip?"
+            )
+        if lang == "te":
+            if name:
+                return f"హలో {name} గారు — ఇది ఇంకా {topic} గురించేనా, లేక కొత్త విషయమా?"
+            return f"హలో — ఇది ఇంకా {topic} గురించేనా, లేక కొత్త విషయమా?"
+        if lang == "hi":
+            if name:
+                return f"नमस्ते {name} ji — क्या ये अभी भी {topic} के बारे में है, या कुछ नया?"
+            return f"नमस्ते — क्या ये अभी भी {topic} के बारे में है, या कुछ नया?"
+        if name:
+            return f"Hi {name} — still about {topic}, or something new?"
+        return f"Hi again — still about {topic}, or something new?"
 
     @staticmethod
     async def _log_voice_call(
@@ -133,6 +305,7 @@ class NokvoOneVoiceStreamService:
         campaign_context: dict[str, Any] | None = None,
         source: str = "manual",
         retrieval_text: str | None = None,
+        turn_state: dict[str, Any] | None = None,
     ) -> None:
         cleaned = " ".join((text or "").split())
         if not cleaned:
@@ -156,6 +329,10 @@ class NokvoOneVoiceStreamService:
             # caller hears "Sorry, I missed that" or worse.
             if len(cleaned.split()) <= 7:
                 pure_switch_request = True
+
+        def _mark_speaking() -> None:
+            if turn_state is not None:
+                turn_state["speaking"] = True
 
         if pure_switch_request:
             ack = {
@@ -184,6 +361,7 @@ class NokvoOneVoiceStreamService:
                 }
             )
             prosody = prosody_for("warm")
+            _mark_speaking()
             try:
                 await SarvamVoiceService.stream_sentence_tts(
                     websocket,
@@ -258,6 +436,7 @@ class NokvoOneVoiceStreamService:
                         }
                     )
                     prosody = prosody_for(tone)
+                    _mark_speaking()
                     try:
                         await SarvamVoiceService.stream_sentence_tts(
                             websocket,
@@ -326,20 +505,31 @@ class NokvoOneVoiceStreamService:
         company_name: str | None,
         campaign_context: dict[str, Any] | None,
         session_locked_language: list[str | None],
+        prev_turn: asyncio.Task | None = None,
+        prev_turn_state: dict[str, Any] | None = None,
+        turn_state: dict[str, Any] | None = None,
     ) -> None:
         """One Blob → one turn. Used by the frontend-VAD ("vad_blob") capture
         mode where the browser handles end-of-utterance detection and sends
         a complete recorded WebM/Opus blob per turn."""
         if not audio_bytes:
             return
+        # The frontend now ships 16-kHz mono WAV blobs (it used to send
+        # WebM/Opus via MediaRecorder, which dropped leading phonemes because
+        # the recorder spun up *after* VAD detection). We sniff RIFF magic so
+        # legacy clients still work.
+        is_wav = audio_bytes.startswith(b"RIFF") and audio_bytes[8:12] == b"WAVE"
+        filename = "utt.wav" if is_wav else "utt.webm"
+        content_type = "audio/wav" if is_wav else "audio/webm"
+
         # Run native + translate STT concurrently. Cap each so a slow Sarvam
         # response can't blow the first-sentence latency budget.
         async def _native() -> dict[str, Any]:
             return await SarvamVoiceService.transcribe_rest(
                 tenant_res,
                 audio_bytes,
-                filename="utt.webm",
-                content_type="audio/webm",
+                filename=filename,
+                content_type=content_type,
             )
 
         async def _translated() -> str:
@@ -350,8 +540,8 @@ class NokvoOneVoiceStreamService:
                     SarvamVoiceService.transcribe_translate(
                         tenant_res,
                         audio_bytes,
-                        filename="utt.webm",
-                        content_type="audio/webm",
+                        filename=filename,
+                        content_type=content_type,
                     ),
                     timeout=1.5,
                 )
@@ -419,6 +609,44 @@ class NokvoOneVoiceStreamService:
             }
         )
 
+        # If the previous turn is still composing (no TTS audio sent yet) and
+        # the user just said "hello, are you there?" — acknowledge with a quick
+        # "yes" and keep the queued answer running. The original reply will
+        # play right after the ack.
+        prev_alive = (
+            prev_turn is not None
+            and not prev_turn.done()
+            and not (prev_turn_state or {}).get("speaking")
+        )
+        if prev_alive and _is_check_in_utterance(transcript):
+            ack_lang = session_locked_language[0] or detected_lang
+            ack = _quick_ack_text(ack_lang)
+            await websocket.send_json(
+                {
+                    "type": "agent_sentence",
+                    "turn_id": f"ack-{uuid.uuid4().hex[:8]}",
+                    "sentence": ack,
+                    "tone": "warm",
+                    "cache_hit": False,
+                    "source": "check_in_ack",
+                }
+            )
+            try:
+                await SarvamVoiceService.stream_sentence_tts(
+                    websocket,
+                    tenant_res,
+                    ack,
+                    language=ack_lang,
+                    purpose="check_in_ack",
+                )
+            except Exception:
+                pass
+            return
+
+        # Real new turn — cancel the previous and run the new answer.
+        if prev_turn is not None and not prev_turn.done():
+            prev_turn.cancel()
+
         # Resolve reply language with the same precedence as the streaming path.
         requested = detect_language_switch(transcript)
         if requested:
@@ -447,6 +675,7 @@ class NokvoOneVoiceStreamService:
             campaign_context=campaign_context,
             source="sarvam_rest_vad_blob",
             retrieval_text=english_text or None,
+            turn_state=turn_state,
         )
 
     @staticmethod
@@ -563,6 +792,11 @@ class NokvoOneVoiceStreamService:
         call_id = call_id or str(uuid.uuid4())
         company_name = await NokvoOneVoiceStreamService._company_name(db, tenant_res)
         current_turn: asyncio.Task | None = None
+        # Mutable state shared with the in-flight _run_text_turn so the dispatcher
+        # can tell whether the answer has begun streaming TTS. Used to decide
+        # whether a fresh utterance is a barge-in or a "hello, are you there?"
+        # check-in arriving during the agent's composing latency.
+        turn_state: dict[str, Any] = {"speaking": False}
         stt_ws: Any = None
         stt_reader_task: asyncio.Task | None = None
         audio_buffer = bytearray()
@@ -616,10 +850,45 @@ class NokvoOneVoiceStreamService:
             if inbound_opener_played[0] or (campaign_context or {}).get("opening_message"):
                 return
             inbound_opener_played[0] = True
+            # Returning-caller awareness: if the caller's phone is known and
+            # matches an open record, switch to a context-aware greeting.
+            opening_text = NokvoOneVoiceStreamService._inbound_opening_text(language)
+            caller_phone = (
+                (campaign_context or {}).get("contact", {}).get("phone")
+                if isinstance((campaign_context or {}).get("contact"), dict)
+                else None
+            ) or (campaign_context or {}).get("from_phone")
+            if caller_phone:
+                try:
+                    record = await NokvoOneVoiceStreamService._load_recent_record_for_phone(
+                        db, tenant_res.organization_id, caller_phone
+                    )
+                except Exception:
+                    record = None
+                # Outcome history (#32): if a recent visit was a no-show or
+                # failed_followup, the opener gets a softer, reminder-aware
+                # tone. The agent learns from past calls instead of greeting
+                # a no-show caller the same as a first-timer.
+                outcome_history: list[dict[str, Any]] = []
+                try:
+                    from app.services.outcome_tracker import OutcomeTracker
+
+                    outcome_history = await OutcomeTracker.recent_outcomes_for_caller(
+                        db,
+                        organization_id=tenant_res.organization_id,
+                        phone=caller_phone,
+                        limit=3,
+                    )
+                except Exception:
+                    outcome_history = []
+                if record:
+                    opening_text = NokvoOneVoiceStreamService._returning_caller_opener(
+                        record, language, outcome_history=outcome_history,
+                    )
             await NokvoOneVoiceStreamService._play_opener(
                 websocket,
                 tenant_res,
-                NokvoOneVoiceStreamService._inbound_opening_text(language),
+                opening_text,
                 language=language,
                 call_id=call_id,
                 campaign_context=campaign_context,
@@ -631,11 +900,47 @@ class NokvoOneVoiceStreamService:
         utterance_audio = bytearray()
 
         async def _fire_turn() -> None:
-            nonlocal current_turn
+            nonlocal current_turn, turn_state
             text = " ".join(s for s in utterance_segments if s).strip()
             if not text:
                 return
             utterance_segments.clear()
+
+            # "Hello, are you there?" while the previous answer is still being
+            # composed: keep the queued reply running and inject a quick "yes"
+            # ack. Only valid if the prior turn hasn't started speaking yet.
+            prev_turn = current_turn
+            prev_state = turn_state
+            if (
+                prev_turn is not None
+                and not prev_turn.done()
+                and not (prev_state or {}).get("speaking")
+                and _is_check_in_utterance(text)
+            ):
+                ack_lang = session_locked_language[0] or utterance_language[0]
+                ack = _quick_ack_text(ack_lang)
+                await websocket.send_json(
+                    {
+                        "type": "agent_sentence",
+                        "turn_id": f"ack-{uuid.uuid4().hex[:8]}",
+                        "sentence": ack,
+                        "tone": "warm",
+                        "cache_hit": False,
+                        "source": "check_in_ack",
+                    }
+                )
+                try:
+                    await SarvamVoiceService.stream_sentence_tts(
+                        websocket,
+                        tenant_res,
+                        ack,
+                        language=ack_lang,
+                        purpose="check_in_ack",
+                    )
+                except Exception:
+                    pass
+                utterance_audio.clear()
+                return
 
             # Resolve the reply language. Priority:
             #   1) Explicit switch request in THIS turn ("speak in Telugu")
@@ -676,6 +981,8 @@ class NokvoOneVoiceStreamService:
 
             if current_turn and not current_turn.done():
                 current_turn.cancel()
+            turn_state = {"speaking": False}
+            new_state = turn_state
 
             if translate_audio:
                 # Kick the translate call with a hard timeout. We'd rather
@@ -720,6 +1027,7 @@ class NokvoOneVoiceStreamService:
                         campaign_context=campaign_context,
                         source="sarvam_stt",
                         retrieval_text=english or None,
+                        turn_state=new_state,
                     )
 
                 current_turn = asyncio.create_task(_run_with_translate())
@@ -735,6 +1043,7 @@ class NokvoOneVoiceStreamService:
                         company_name=company_name,
                         campaign_context=campaign_context,
                         source="sarvam_stt",
+                        turn_state=new_state,
                     )
                 )
 
@@ -790,21 +1099,22 @@ class NokvoOneVoiceStreamService:
                             continue
                         event_type = parsed.get("type")
                         if event_type == "speech_start":
-                            agent_speaking = current_turn is not None and not current_turn.done()
+                            turn_alive = current_turn is not None and not current_turn.done()
+                            agent_speaking = turn_alive and bool((turn_state or {}).get("speaking"))
                             if agent_speaking:
-                                # True barge-in: caller is interrupting the agent.
-                                # Cancel the reply, drop the pending utterance,
-                                # notify the frontend so it stops playback.
+                                # True barge-in: agent is already playing audio,
+                                # the caller is talking over it.
                                 current_turn.cancel()
                                 _cancel_eou_timer()
                                 utterance_segments.clear()
                                 utterance_audio.clear()
                                 await websocket.send_json({"type": "barge_in_detected", "call_id": call_id})
                             else:
-                                # Continuation: user paused mid-thought and is
-                                # speaking again. Cancel the EOU timer so we
-                                # don't fire mid-sentence, but KEEP the buffer
-                                # — new segments get appended to it.
+                                # Either the agent hasn't started speaking yet
+                                # (still composing the previous answer) OR no
+                                # turn is in flight. Don't cancel — the user
+                                # might be saying "hello, are you there?" which
+                                # we'll detect once finals arrive in _fire_turn.
                                 _cancel_eou_timer()
                             continue
                         if event_type == "speech_end":
@@ -884,10 +1194,17 @@ class NokvoOneVoiceStreamService:
                     if capture_mode[0] == "vad_blob":
                         # Frontend already segmented the utterance with its own
                         # VAD — each binary frame is ONE complete utterance,
-                        # not a streaming PCM chunk. Dispatch a REST STT call
-                        # (+ optional translate-STT) and run the pipeline.
-                        if current_turn and not current_turn.done():
-                            current_turn.cancel()
+                        # not a streaming PCM chunk. We hand off both the new
+                        # blob *and* a reference to the previous turn so
+                        # _process_blob_utterance can transcribe first and
+                        # decide: a check-in ("hello, are you there?") arriving
+                        # while the prior answer is still composing should be
+                        # acknowledged with a quick "yes" without cancelling
+                        # the queued reply.
+                        prev_turn = current_turn
+                        prev_state = turn_state
+                        new_state: dict[str, Any] = {"speaking": False}
+                        turn_state = new_state
                         current_turn = asyncio.create_task(
                             NokvoOneVoiceStreamService._process_blob_utterance(
                                 websocket,
@@ -899,6 +1216,9 @@ class NokvoOneVoiceStreamService:
                                 company_name=company_name,
                                 campaign_context=campaign_context,
                                 session_locked_language=session_locked_language,
+                                prev_turn=prev_turn,
+                                prev_turn_state=prev_state,
+                                turn_state=new_state,
                             )
                         )
                         continue
@@ -952,6 +1272,7 @@ class NokvoOneVoiceStreamService:
                 if event_type in {"text_query", "transcript"}:
                     if current_turn and not current_turn.done():
                         current_turn.cancel()
+                    turn_state = {"speaking": False}
                     current_turn = asyncio.create_task(
                         NokvoOneVoiceStreamService._run_text_turn(
                             websocket,
@@ -963,6 +1284,7 @@ class NokvoOneVoiceStreamService:
                             company_name=company_name,
                             campaign_context=campaign_context,
                             source="manual",
+                            turn_state=turn_state,
                         )
                     )
                     continue
@@ -981,6 +1303,7 @@ class NokvoOneVoiceStreamService:
                             )
                             text = stt.get("transcript") or ""
                             if text:
+                                turn_state = {"speaking": False}
                                 await NokvoOneVoiceStreamService._run_text_turn(
                                     websocket,
                                     tenant_res,
@@ -991,6 +1314,7 @@ class NokvoOneVoiceStreamService:
                                     company_name=company_name,
                                     campaign_context=campaign_context,
                                     source="sarvam_rest_stt",
+                                    turn_state=turn_state,
                                 )
                         except Exception as exc:
                             await websocket.send_json({"type": "stt_error", "error_message": str(exc)[:220]})

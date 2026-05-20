@@ -838,18 +838,16 @@ class NokvoOneVoicePipeline:
         db: AsyncSession | None,
         tenant_res: TenantResources,
     ) -> tuple[Organization, dict[str, Any], list[dict[str, Any]]] | None:
-        if db is None:
+        """Thin wrapper around the unified runtime-context builder.
+        Keeps the legacy tuple shape so existing pipeline branches don't
+        need to change in one go — new code should call
+        :func:`agent_runtime_context.build` directly."""
+        from app.services.agent_runtime_context import build as _build_runtime_context
+
+        ctx = await _build_runtime_context(db, tenant_res, surface="voice_inbound")
+        if ctx is None:
             return None
-        try:
-            org_res = await db.execute(select(Organization).where(Organization.id == tenant_res.organization_id))
-            organization = org_res.scalars().first()
-        except Exception:
-            return None
-        if organization is None:
-            return None
-        provider_status = dict(tenant_res.provider_status or {})
-        overrides = dict(provider_status.get("business_template_schema_overrides") or {})
-        return organization, overrides, custom_tabs_from_overrides(provider_status)
+        return ctx.as_legacy_business_context_tuple()
 
     @staticmethod
     def _parse_appointment_date(value: Any, *, now: datetime | None = None) -> datetime.date:
@@ -858,6 +856,19 @@ class NokvoOneVoicePipeline:
         today = local_now.date()
         if not raw:
             raise _AppointmentToolInputError("preferred_date", "Which date should I note for the appointment?")
+        # ISO `YYYY-MM-DD` (or `YYYY-MM-DDTHH:MM:SS…`) — emitted by the
+        # slot-acceptance path and by any external integration. The legacy
+        # numeric regex below treats this as DD/MM and produces month=20
+        # nonsense, hence the explicit branch.
+        iso_match = re.match(r"^\s*(\d{4})-(\d{1,2})-(\d{1,2})", raw)
+        if iso_match:
+            try:
+                year = int(iso_match.group(1))
+                month = int(iso_match.group(2))
+                day = int(iso_match.group(3))
+                return datetime(year, month, day, tzinfo=_APPOINTMENT_LOCAL_TZ).date()
+            except ValueError:
+                pass
         if "day after tomorrow" in raw:
             return today + timedelta(days=2)
         if "tomorrow" in raw:
@@ -969,6 +980,18 @@ class NokvoOneVoicePipeline:
 
     @staticmethod
     def _appointment_datetime_iso(appointment: dict[str, Any]) -> str:
+        # Fast path: caller already accepted a proposed slot, which left a
+        # canonical UTC ISO on the appointment. Trust it and skip re-parsing.
+        proposed = appointment.get("appointment_time")
+        if isinstance(proposed, str) and proposed:
+            try:
+                parsed = datetime.fromisoformat(proposed.replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                if parsed.astimezone(_APPOINTMENT_LOCAL_TZ) > datetime.now(_APPOINTMENT_LOCAL_TZ):
+                    return parsed.astimezone(timezone.utc).isoformat()
+            except ValueError:
+                pass
         local_date = NokvoOneVoicePipeline._parse_appointment_date(appointment.get("preferred_date"))
         local_time = NokvoOneVoicePipeline._parse_appointment_time(appointment.get("preferred_time"))
         local_dt = datetime.combine(local_date, local_time, tzinfo=_APPOINTMENT_LOCAL_TZ)
@@ -1014,21 +1037,254 @@ class NokvoOneVoicePipeline:
                 f"Appointment request create అయ్యింది for {patient} on {local_when}. "
                 "Clinic team exact availability confirm చేస్తారు."
             )
+        phone = str(args.get("phone") or "").strip()
+        # End-of-call audit + proactive SMS offer. Reads back the captured
+        # phone (digit-by-digit so TTS doesn't munge it) and asks if the
+        # caller wants a written confirmation.
+        sms_offer = ""
+        if phone:
+            spoken_phone = " ".join(list(phone[-10:])) if phone[-10:].isdigit() else phone
+            if lang == "te":
+                sms_offer = f" {spoken_phone} కి confirmation SMS పంపాలా?"
+            elif lang == "hi":
+                sms_offer = f" क्या {spoken_phone} पर confirmation SMS भेज दूँ?"
+            else:
+                sms_offer = f" Want me to send a confirmation SMS to {spoken_phone}?"
         if assignment_status == "assigned" and assigned_name:
             return (
                 f"I have created the appointment request for {patient} on {local_when}. "
-                f"It has been assigned to {assigned_name}."
+                f"It has been assigned to {assigned_name}.{sms_offer}"
             )
         if assignment_status == "no_available_member":
             return (
                 f"I have created the appointment request for {patient} on {local_when}. "
                 "That time is noted, but I could not find an available doctor in the system for that slot, "
-                "so the clinic team will confirm availability."
+                f"so the clinic team will confirm availability.{sms_offer}"
             )
         return (
             f"I have created the appointment request for {patient} on {local_when}. "
-            "The clinic team can confirm exact availability."
+            f"The clinic team can confirm exact availability.{sms_offer}"
         )
+
+    @staticmethod
+    async def _handle_availability_check(
+        tenant_res: TenantResources,
+        db: AsyncSession | None,
+        turn_policy: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Consult the scheduler when the caller asks "is X available?" /
+        "when can you book me?". Works across business types — picks the
+        right request_type from the active flow or the industry default.
+        Returns ``None`` when no scheduling-shaped flow applies (e.g.,
+        ecommerce ticket creation), so the pipeline can fall back to RAG."""
+
+        def _first_truthy(mapping: dict[str, Any], keys: tuple[str, ...]) -> Any:
+            for key in keys:
+                value = mapping.get(key)
+                if value:
+                    return value
+            return None
+
+        from app.services.nokvo_one_assignment_service import (
+            NokvoOneAssignmentService,
+            _aware_utc,
+        )
+
+        if db is None:
+            return None
+        context = await NokvoOneVoicePipeline._voice_business_context(db, tenant_res)
+        if context is None:
+            return None
+        organization, _overrides, _custom_tabs = context
+
+        # Identify the request_type to schedule against. Priority:
+        #   1) the active appointment FSM (clinics) → "appointment"
+        #   2) the active generic tool_flow → derived from flow_key
+        #   3) industry default
+        # If no scheduling-shaped flow applies, return None.
+        state_patch = turn_policy.get("state_patch") or {}
+        appointment = dict(state_patch.get("appointment") or {})
+        tool_flow_state = dict(state_patch.get("tool_flow") or {})
+        flow_key = str(tool_flow_state.get("flow_key") or "")
+        industry = (organization.industry or "").lower()
+        _FLOW_TO_REQUEST_TYPE = {
+            "real_estate_site_visit": "site_visit",
+        }
+        _INDUSTRY_DEFAULT = {
+            "clinics": "appointment",
+            "real_estate": "site_visit",
+            "hospitality": "callback",
+        }
+        request_type = _FLOW_TO_REQUEST_TYPE.get(flow_key) or _INDUSTRY_DEFAULT.get(industry)
+        if not request_type:
+            return None
+
+        entities = turn_policy.get("entities") or {}
+        language = turn_policy.get("language")
+
+        # Resolve the candidate datetime in priority order:
+        #   1) this turn's spoken date+time
+        #   2) the in-progress appointment slot values
+        #   3) "now" — caller asked "when can you book?" with no time
+        # Source of the requested time: this turn's entities, or the in-progress
+        # appointment / tool_flow slots, depending on which flow is active.
+        collected = dict(tool_flow_state.get("collected") or {})
+        date_slot_value = (
+            entities.get("date_text")
+            or appointment.get("preferred_date")
+            or _first_truthy(collected, ("visit_date", "callback_date", "preferred_date", "date"))
+        )
+        time_slot_value = (
+            entities.get("time_text")
+            or appointment.get("preferred_time")
+            or _first_truthy(collected, ("visit_time", "callback_time", "preferred_time", "time"))
+        )
+
+        # Tool_flow flows often store a combined "visit_at" / "callback_at" ISO
+        # string instead of split date/time — try those before falling back.
+        requested_at: datetime | None = None
+        if not (date_slot_value and time_slot_value):
+            for combined_key in ("visit_at", "callback_at", "confirm_at", "scheduled_at"):
+                combined = collected.get(combined_key)
+                if combined:
+                    try:
+                        parsed_combined = datetime.fromisoformat(
+                            str(combined).replace("Z", "+00:00")
+                        )
+                        requested_at = parsed_combined.astimezone(timezone.utc)
+                    except Exception:
+                        pass
+                    break
+
+        if requested_at is None and date_slot_value and time_slot_value:
+            try:
+                local_date = NokvoOneVoicePipeline._parse_appointment_date(date_slot_value)
+                local_time = NokvoOneVoicePipeline._parse_appointment_time(time_slot_value)
+                local_dt = datetime.combine(local_date, local_time, tzinfo=_APPOINTMENT_LOCAL_TZ)
+                requested_at = local_dt.astimezone(timezone.utc)
+            except (_AppointmentToolInputError, Exception):
+                requested_at = None
+        # Adaptive disambiguation: caller gave a date but no time. Use
+        # start-of-working-day (9 AM local) as the anchor so the scheduler
+        # surfaces the first free slot on that date.
+        if requested_at is None and date_slot_value and not time_slot_value:
+            try:
+                local_date = NokvoOneVoicePipeline._parse_appointment_date(date_slot_value)
+                local_dt = datetime.combine(local_date, time(9, 0), tzinfo=_APPOINTMENT_LOCAL_TZ)
+                requested_at = local_dt.astimezone(timezone.utc)
+            except Exception:
+                requested_at = None
+        if requested_at is None:
+            now_local = datetime.now(_APPOINTMENT_LOCAL_TZ)
+            # Round up to the next 15-minute mark — feels less robotic than
+            # "available at 14:37". Caller can refine afterwards.
+            minute = (now_local.minute // 15 + 1) * 15
+            if minute >= 60:
+                now_local = now_local.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+            else:
+                now_local = now_local.replace(minute=minute, second=0, microsecond=0)
+            requested_at = now_local.astimezone(timezone.utc)
+
+        # Load members + scheduling state.
+        members = await NokvoOneAssignmentService._load_members(db, organization.id)
+        settings_map = await NokvoOneAssignmentService._load_assignment_settings(db, organization.id)
+        clinic_map = await NokvoOneAssignmentService._load_clinic_settings(db, organization.id)
+        blocked_map = await NokvoOneAssignmentService._load_blocked_slots(db, organization.id)
+        records = await NokvoOneAssignmentService._load_request_records(db, organization.id)
+
+        _ROLE_LABEL = {
+            "clinics": "doctor",
+            "real_estate": "agent",
+            "hospitality": "host",
+        }
+        member_role_label = _ROLE_LABEL.get(industry, "team member")
+
+        best: tuple[datetime, int, str] | None = None  # (when_utc, shift_min, member_name)
+        for member in members:
+            settings = settings_map.get(member.id)
+            if settings is None or not settings.is_assignable:
+                continue
+            if request_type not in set(settings.request_types or []):
+                continue
+            member_blocks = list(blocked_map.get(member.id, []))
+            member_blocks.extend(blocked_map.get("_org_wide", []))  # type: ignore[arg-type]
+            slot = NokvoOneAssignmentService._find_next_available_slot(
+                member_id=member.id,
+                requested_at=_aware_utc(requested_at),
+                settings=settings,
+                clinic_settings=clinic_map.get(member.id) if industry == "clinics" else None,
+                blocked_slots=member_blocks,
+                records=records,
+                exclude_record_id=None,
+            )
+            if slot is None:
+                continue
+            when_utc, shift_min = slot
+            if best is None or shift_min < best[1]:
+                best = (when_utc, shift_min, member.full_name or f"the on-call {member_role_label}")
+                if shift_min == 0:
+                    break  # exact match — no need to keep looking
+
+        if best is None:
+            answer = (
+                "I checked the calendar and nothing fits within the working hours. "
+                "Could you share another date or time?"
+            )
+            patch: dict[str, Any] = {}
+            if appointment:
+                patch["appointment"] = appointment
+            if tool_flow_state:
+                patch["tool_flow"] = tool_flow_state
+            return {
+                "answer": answer,
+                "state_patch": patch,
+                "state_slot": "availability_check_empty",
+                "route_reason": "scheduler returned no slot",
+                "tool_calls": [],
+            }
+
+        when_utc, shift_min, member_name = best
+        when_local = when_utc.astimezone(_APPOINTMENT_LOCAL_TZ)
+        when_label = when_local.strftime("%d %b at %I:%M %p").lstrip("0")
+        if shift_min == 0:
+            answer = (
+                f"Yes, {when_label} is open with {member_name}. "
+                "Want me to lock that in?"
+            )
+            slot_label = "availability_exact"
+        else:
+            requested_local = requested_at.astimezone(_APPOINTMENT_LOCAL_TZ)
+            requested_label = requested_local.strftime("%d %b at %I:%M %p").lstrip("0")
+            answer = (
+                f"{requested_label} is taken — the next free slot is {when_label} with {member_name}. "
+                "Want me to book that?"
+            )
+            slot_label = "availability_next"
+
+        # Stash the offered slot on whichever flow is active. The follow-up
+        # turn's policy looks at awaiting_slot_confirm in both shapes.
+        if appointment or industry == "clinics":
+            appointment["proposed_slot_utc"] = when_utc.isoformat()
+            appointment["proposed_slot_label"] = when_label
+            appointment["awaiting_slot_confirm"] = True
+            appointment["active"] = True
+        elif tool_flow_state:
+            tool_flow_state["proposed_slot_utc"] = when_utc.isoformat()
+            tool_flow_state["proposed_slot_label"] = when_label
+            tool_flow_state["awaiting_slot_confirm"] = True
+            tool_flow_state["active"] = True
+        patch: dict[str, Any] = {}
+        if appointment:
+            patch["appointment"] = appointment
+        if tool_flow_state:
+            patch["tool_flow"] = tool_flow_state
+        return {
+            "answer": answer,
+            "state_patch": patch,
+            "state_slot": slot_label,
+            "route_reason": "scheduler answered availability question",
+            "tool_calls": [],
+        }
 
     @staticmethod
     async def _maybe_execute_turn_policy_action(
@@ -1037,6 +1293,10 @@ class NokvoOneVoicePipeline:
         db: AsyncSession | None,
         turn_policy: dict[str, Any],
     ) -> dict[str, Any] | None:
+        if turn_policy.get("intent") == "availability_check":
+            return await NokvoOneVoicePipeline._handle_availability_check(
+                tenant_res, db, turn_policy
+            )
         if turn_policy.get("intent") != "appointment_flow" or turn_policy.get("state_slot") != "complete":
             return None
         appointment = dict(((turn_policy.get("state_patch") or {}).get("appointment") or {}))
@@ -1077,27 +1337,93 @@ class NokvoOneVoicePipeline:
             "appointment_time": appointment_time,
             "reason": appointment["reason"],
         }
-        try:
-            result = await PredefinedToolsService.execute(
-                db,
-                tenant_res.organization_id,
-                None,
-                tool,
-                args,
-                session_id=call_id,
-            )
-            await db.commit()
-        except Exception as exc:
-            if db is not None:
-                await db.rollback()
+        # Confirmation / audit metadata is patched onto the created record
+        # *after* execution (it'd be rejected by the tool's strict
+        # additionalProperties:false schema if passed as args).
+        record_metadata: dict[str, Any] = {}
+        for key in ("confirmations", "audit_trail", "proposed_slot_accepted"):
+            value = appointment.get(key)
+            if value:
+                record_metadata[key] = value
+        # Inline retry + graceful fallback. Retry count + delay come from the
+        # canonical agent spec (:class:`RetryPolicy`) — not hardcoded.
+        from app.services.agent_spec import RETRY_POLICY
+
+        result = None
+        last_exc: Exception | None = None
+        max_inline_attempts = 1 + RETRY_POLICY.inline_retries
+        for attempt in range(max_inline_attempts):
+            try:
+                result = await PredefinedToolsService.execute(
+                    db,
+                    tenant_res.organization_id,
+                    None,
+                    tool,
+                    args,
+                    session_id=call_id,
+                )
+                await db.commit()
+                last_exc = None
+                break
+            except Exception as exc:  # noqa: BLE001 — voice tool entry, broad catch by design
+                last_exc = exc
+                if db is not None:
+                    try:
+                        await db.rollback()
+                    except Exception:
+                        pass
+                if attempt < max_inline_attempts - 1:
+                    await asyncio.sleep(RETRY_POLICY.inline_delay_seconds)
+        if result is None:
+            # Inline retries exhausted — persist to the retry queue so a
+            # worker / admin / cron can pick it back up once the underlying
+            # issue clears. The caller's data is *not* lost.
+            try:
+                from app.services.tool_retry_service import ToolRetryService
+
+                await ToolRetryService.enqueue(
+                    db,
+                    organization_id=tenant_res.organization_id,
+                    tool_key=tool.key,
+                    arguments=args,
+                    context={
+                        "call_id": call_id,
+                        "language": turn_policy.get("language"),
+                        "intent": "appointment",
+                    },
+                    last_error=str(last_exc) if last_exc else None,
+                )
+            except Exception:
+                pass
             appointment["completed"] = False
             appointment["pending_slot"] = None
+            appointment["needs_callback"] = True
+            from app.services.flow_session import append_audit_trail
+            append_audit_trail(appointment, "tool_retry_enqueued", detail=str(last_exc)[:200] if last_exc else None)
+            lang = SarvamVoiceService.normalize_language(turn_policy.get("language"))
+            if lang == "te":
+                fallback = (
+                    "I have all the details, kāni system temporarily unavailable. "
+                    "Clinic team mīkū call back chestāru same number ki."
+                )
+            elif lang == "hi":
+                fallback = (
+                    "मेरे पास सारी जानकारी है, पर सिस्टम अभी temporarily unavailable है. "
+                    "Clinic team आपके इसी नंबर पर call back करेगी."
+                )
+            else:
+                fallback = (
+                    "I have all your details, but I'm having trouble saving them right now. "
+                    "The clinic team will call you back on this number to confirm — your booking won't be missed."
+                )
             return {
-                "answer": f"I collected the appointment details, but I could not create the appointment record: {str(exc)[:180]}",
+                "answer": fallback,
                 "state_patch": {"appointment": appointment},
                 "state_slot": "tool_error",
-                "route_reason": "appointment tool failed",
-                "tool_calls": [{"tool": tool.key, "arguments": args, "ok": False, "error": str(exc)[:240]}],
+                "route_reason": "appointment tool failed after retry",
+                "tool_calls": [
+                    {"tool": tool.key, "arguments": args, "ok": False, "error": str(last_exc)[:240]},
+                ],
             }
 
         appointment.update(
@@ -1111,6 +1437,12 @@ class NokvoOneVoicePipeline:
                 "assigned_member_name": result.get("assigned_member_name"),
             }
         )
+        # Patch the persisted record with confirmation/audit metadata so
+        # downstream consumers see what the caller actually confirmed.
+        if record_metadata and result.get("id") and db is not None:
+            await NokvoOneVoicePipeline._patch_record_metadata(
+                db, result["id"], record_metadata
+            )
         return {
             "answer": NokvoOneVoicePipeline._appointment_tool_answer(
                 result,
@@ -1124,11 +1456,57 @@ class NokvoOneVoicePipeline:
         }
 
     @staticmethod
+    async def _patch_record_metadata(
+        db: AsyncSession,
+        record_id: Any,
+        metadata: dict[str, Any],
+    ) -> None:
+        """Merge ``metadata`` keys into a NokvoOneToolRecord.data after the
+        tool has created it. Used to attach confirmation status, audit trail,
+        proposed-slot acceptance — fields we can't pass in tool args because
+        the tool schemas reject unknown properties."""
+        from app.models.nokvo_one_tool_record import NokvoOneToolRecord
+        from sqlalchemy import select
+        import uuid as _uuid
+
+        try:
+            rid = _uuid.UUID(str(record_id))
+        except (TypeError, ValueError):
+            return
+        try:
+            res = await db.execute(select(NokvoOneToolRecord).where(NokvoOneToolRecord.id == rid))
+            record = res.scalars().first()
+            if record is None:
+                return
+            merged = dict(record.data or {})
+            for key, value in metadata.items():
+                merged[key] = value
+            record.data = merged
+            db.add(record)
+            await db.commit()
+        except Exception:
+            try:
+                await db.rollback()
+            except Exception:
+                pass
+
+    @staticmethod
     def _tool_flow_success_answer(result: dict[str, Any], args: dict[str, Any], *, flow_key: str, language: str | None) -> str:
         lang = SarvamVoiceService.normalize_language(language)
         assigned_name = result.get("assigned_member_name")
         assignment_status = result.get("assignment_status")
         name = str(args.get("name") or args.get("customer_name") or args.get("phone") or "the customer")
+        phone = str(args.get("phone") or args.get("contact_phone") or "").strip()
+        # End-of-call audit + SMS offer (mirrors clinic flow).
+        sms_offer = ""
+        if phone:
+            spoken_phone = " ".join(list(phone[-10:])) if phone[-10:].isdigit() else phone
+            if lang == "te":
+                sms_offer = f" {spoken_phone} కి confirmation SMS పంపాలా?"
+            elif lang == "hi":
+                sms_offer = f" क्या {spoken_phone} पर confirmation SMS भेज दूँ?"
+            else:
+                sms_offer = f" Want me to send a confirmation SMS to {spoken_phone}?"
         if flow_key == "real_estate_site_visit":
             when = str(args.get("visit_at") or "the requested time")
             try:
@@ -1138,21 +1516,21 @@ class NokvoOneVoicePipeline:
                 local_when = when
             if lang == "te":
                 if assignment_status == "assigned" and assigned_name:
-                    return f"Site visit request create అయ్యింది for {name} on {local_when}. It has been assigned to {assigned_name}."
-                return f"Site visit request create అయ్యింది for {name} on {local_when}. Team availability confirm చేస్తారు."
+                    return f"Site visit request create అయ్యింది for {name} on {local_when}. It has been assigned to {assigned_name}.{sms_offer}"
+                return f"Site visit request create అయ్యింది for {name} on {local_when}. Team availability confirm చేస్తారు.{sms_offer}"
             if lang == "hi":
                 if assignment_status == "assigned" and assigned_name:
-                    return f"Site visit request create हो गया for {name} on {local_when}. It has been assigned to {assigned_name}."
-                return f"Site visit request create हो गया for {name} on {local_when}. Team availability confirm करेगी."
+                    return f"Site visit request create हो गया for {name} on {local_when}. It has been assigned to {assigned_name}.{sms_offer}"
+                return f"Site visit request create हो गया for {name} on {local_when}. Team availability confirm करेगी.{sms_offer}"
             if assignment_status == "assigned" and assigned_name:
-                return f"I have created the site visit request for {name} on {local_when}. It has been assigned to {assigned_name}."
-            return f"I have created the site visit request for {name} on {local_when}. The team will confirm availability."
+                return f"I have created the site visit request for {name} on {local_when}. It has been assigned to {assigned_name}.{sms_offer}"
+            return f"I have created the site visit request for {name} on {local_when}. The team will confirm availability.{sms_offer}"
 
         if lang == "te":
-            return f"Lead create అయ్యింది for {name}. Team follow up చేస్తారు."
+            return f"Lead create అయ్యింది for {name}. Team follow up చేస్తారు.{sms_offer}"
         if lang == "hi":
-            return f"Lead create हो गया for {name}. Team follow up करेगी."
-        return f"I have created the lead for {name}. The team will follow up."
+            return f"Lead create हो गया for {name}. Team follow up करेगी.{sms_offer}"
+        return f"I have created the lead for {name}. The team will follow up.{sms_offer}"
 
     @staticmethod
     async def _maybe_execute_tool_flow_action(
@@ -1211,28 +1589,83 @@ class NokvoOneVoicePipeline:
                 args["notes"] = "Additional details: " + json.dumps(extra, ensure_ascii=False, default=str)
         else:
             args = {k: v for k, v in raw_args.items() if v not in (None, "")}
-        try:
-            result = await PredefinedToolsService.execute(
-                db,
-                tenant_res.organization_id,
-                None,
-                tool,
-                args,
-                session_id=call_id,
-            )
-            await db.commit()
-        except Exception as exc:
-            if db is not None:
-                await db.rollback()
+        # Same retry shape as the clinic appointment path — reads from spec.
+        from app.services.agent_spec import RETRY_POLICY
+
+        result = None
+        last_exc: Exception | None = None
+        max_inline_attempts = 1 + RETRY_POLICY.inline_retries
+        for attempt in range(max_inline_attempts):
+            try:
+                result = await PredefinedToolsService.execute(
+                    db,
+                    tenant_res.organization_id,
+                    None,
+                    tool,
+                    args,
+                    session_id=call_id,
+                )
+                await db.commit()
+                last_exc = None
+                break
+            except Exception as exc:  # noqa: BLE001 — voice tool entry, broad catch by design
+                last_exc = exc
+                if db is not None:
+                    try:
+                        await db.rollback()
+                    except Exception:
+                        pass
+                if attempt < max_inline_attempts - 1:
+                    await asyncio.sleep(RETRY_POLICY.inline_delay_seconds)
+        if result is None:
+            try:
+                from app.services.tool_retry_service import ToolRetryService
+
+                await ToolRetryService.enqueue(
+                    db,
+                    organization_id=tenant_res.organization_id,
+                    tool_key=tool.key,
+                    arguments=args,
+                    context={
+                        "call_id": call_id,
+                        "language": language,
+                        "intent": "tool_flow",
+                        "flow_key": flow_key,
+                    },
+                    last_error=str(last_exc) if last_exc else None,
+                )
+            except Exception:
+                pass
             flow_state = dict(((tool_flow.get("state_patch") or {}).get("tool_flow") or {}))
             flow_state["active"] = False
-            flow_state["tool_error"] = str(exc)[:180]
+            flow_state["tool_error"] = str(last_exc)[:180]
+            flow_state["needs_callback"] = True
+            from app.services.flow_session import append_audit_trail
+            append_audit_trail(flow_state, "tool_retry_enqueued", detail=str(last_exc)[:200] if last_exc else None)
+            lang = SarvamVoiceService.normalize_language(language)
+            phone_hint = str(args.get("phone") or args.get("contact_phone") or "this number")
+            spoken_phone = " ".join(list(phone_hint[-10:])) if phone_hint[-10:].isdigit() else phone_hint
+            if lang == "te":
+                fallback = (
+                    f"Details అన్నీ note చేశాను, kāni system temporarily unavailable. "
+                    f"Team మీకు {spoken_phone} mīda call back chestāru — booking miss avadu."
+                )
+            elif lang == "hi":
+                fallback = (
+                    f"मेरे पास सारी जानकारी है, पर system अभी temporarily unavailable है. "
+                    f"Team {spoken_phone} पर call back करेगी — booking miss नहीं होगी."
+                )
+            else:
+                fallback = (
+                    f"I have all your details, but I'm having trouble saving them right now. "
+                    f"The team will call you back on {spoken_phone} to confirm — your request won't be missed."
+                )
             return {
-                "answer": f"I collected the details, but I could not create the record: {str(exc)[:180]}",
+                "answer": fallback,
                 "state_patch": {"tool_flow": flow_state},
                 "state_slot": "tool_error",
-                "route_reason": "tool flow tool failed",
-                "tool_calls": [{"tool": tool.key, "arguments": args, "ok": False, "error": str(exc)[:240]}],
+                "route_reason": "tool flow tool failed after retry",
+                "tool_calls": [{"tool": tool.key, "arguments": args, "ok": False, "error": str(last_exc)[:240]}],
             }
 
         flow_state = dict(((tool_flow.get("state_patch") or {}).get("tool_flow") or {}))
@@ -1245,6 +1678,16 @@ class NokvoOneVoicePipeline:
                 "assigned_member_name": result.get("assigned_member_name"),
             }
         )
+        # Same as the clinic path: patch confirmation/audit metadata onto the
+        # persisted record now that we have its id.
+        record_metadata: dict[str, Any] = {}
+        for key in ("confirmations", "audit_trail", "proposed_slot_accepted"):
+            value = flow_state.get(key)
+            if value:
+                record_metadata[key] = value
+        created_id = flow_state.get("created_record_id")
+        if record_metadata and created_id and db is not None:
+            await NokvoOneVoicePipeline._patch_record_metadata(db, created_id, record_metadata)
         return {
             "answer": NokvoOneVoicePipeline._tool_flow_success_answer(result, args, flow_key=flow_key, language=language),
             "state_patch": {"tool_flow": flow_state},
@@ -1514,6 +1957,86 @@ class NokvoOneVoicePipeline:
         return None
 
     @staticmethod
+    async def _caller_is_verified(
+        tenant_res: TenantResources,
+        db: AsyncSession | None,
+        call_id: str | None,
+        user_text: str,
+    ) -> dict[str, Any]:
+        """Return {"verified": bool, "challenged": bool, "challenge": str?} —
+        true when the conversation history (or this turn) contains a phone
+        that matches the contact_phone on an existing record for the org.
+        ``challenged`` is True once we've already asked the caller to verify
+        in this session, so we don't loop on the same challenge."""
+        if db is None or call_id is None:
+            # Without DB/session we can't gate; default to permitting (the
+            # legacy behaviour) so we don't break the existing flow.
+            return {"verified": True, "challenged": False}
+
+        state = await AgentSessionStore.get_state(tenant_res, call_id) or {}
+        if state.get("identity_verified"):
+            return {"verified": True, "challenged": True}
+
+        history = await AgentSessionStore.get_history(tenant_res, call_id) or []
+        # Pull every phone-looking token from the conversation + this turn.
+        from app.services.voice_turn_policy import normalize_phone_number
+
+        phones: list[str] = []
+        for turn in history[-12:]:
+            if turn.get("role") != "user":
+                continue
+            phone = normalize_phone_number(str(turn.get("content") or ""), expected=True)
+            if phone:
+                phones.append(phone)
+        this_phone = normalize_phone_number(user_text or "", expected=True)
+        if this_phone:
+            phones.append(this_phone)
+
+        if not phones:
+            return {
+                "verified": False,
+                "challenged": bool(state.get("identity_verification_pending")),
+                "challenge": (
+                    "Before I can change a booking, I need to verify you — "
+                    "could you share the phone number the booking is under?"
+                ),
+            }
+
+        from app.models.nokvo_one_tool_record import NokvoOneToolRecord
+        from sqlalchemy import select
+
+        stmt = (
+            select(NokvoOneToolRecord)
+            .where(NokvoOneToolRecord.organization_id == tenant_res.organization_id)
+            .order_by(NokvoOneToolRecord.created_at.desc())
+            .limit(50)
+        )
+        try:
+            res = await db.execute(stmt)
+        except Exception:
+            return {"verified": False, "challenged": True}
+
+        suffixes = {p[-10:] for p in phones if len(p) >= 10}
+        for rec in res.scalars().all():
+            phone_value = "".join(c for c in str(rec.contact_phone or "") if c.isdigit())
+            if not phone_value:
+                data = rec.data or {}
+                phone_value = "".join(c for c in str(data.get("phone") or data.get("contact_phone") or "") if c.isdigit())
+            if phone_value and phone_value[-10:] in suffixes:
+                await AgentSessionStore.set_state(
+                    tenant_res, call_id, {"identity_verified": True}
+                )
+                return {"verified": True, "challenged": True}
+        return {
+            "verified": False,
+            "challenged": True,
+            "challenge": (
+                "I couldn't match that number to a booking on file. "
+                "Could you share the phone number used at booking?"
+            ),
+        }
+
+    @staticmethod
     def _active_policy_cards(tenant_res: TenantResources) -> list[dict[str, Any]]:
         provider_status = dict(tenant_res.provider_status or {})
         return list(provider_status.get(AGENT_POLICY_CARDS_KEY) or [])
@@ -1680,9 +2203,31 @@ class NokvoOneVoicePipeline:
         """
         intent_result = FastIntentRouter.classify(user_text, language=language)
 
+        # 0) FSM precedence: if the appointment / tool_flow is *expecting* a
+        # yes-or-no answer this turn (slot offered, name to confirm, phone to
+        # confirm, etc.), the SMALLTALK fast-path must NOT short-circuit with
+        # "Sure, go ahead." A bare "Yes" must reach the FSM so it can lock
+        # the booking. We probe state once and skip the template branch when
+        # any awaiting_* flag is set.
+        state_pre_check = await AgentSessionStore.get_state(tenant_res, call_id)
+        suppress_template = False
+        if isinstance(state_pre_check, dict):
+            appt_pre = state_pre_check.get("appointment") or {}
+            tool_pre = state_pre_check.get("tool_flow") or {}
+            awaiting_flags = (
+                "awaiting_slot_confirm",
+                "awaiting_name_confirmation",
+                "awaiting_phone_confirmation",
+                "awaiting_id_confirmation",
+                "awaiting_past_time_shift",
+            )
+            suppress_template = any(
+                bool(appt_pre.get(flag)) or bool(tool_pre.get(flag)) for flag in awaiting_flags
+            )
+
         # 1) Greeting / thanks / goodbye / smalltalk — no LLM, no cache, no embeddings.
         templated = NokvoOneVoicePipeline._template_reply(intent_result.intent, language, company_name)
-        if templated:
+        if templated and not suppress_template:
             if intent_result.intent == INTENT_GREETING and NokvoOneVoicePipeline._single_prompt_guidance(tenant_res):
                 return {
                     "route": "smalltalk_llm",
@@ -1773,7 +2318,13 @@ class NokvoOneVoicePipeline:
                     )
                 turn_policy = None
 
-        if turn_policy and turn_policy.get("answer"):
+        # Availability check is the one policy intent that doesn't carry its
+        # own answer — the pipeline must consult the scheduler to fill it in.
+        needs_availability_lookup = (
+            turn_policy is not None
+            and turn_policy.get("intent") == "availability_check"
+        )
+        if turn_policy and (turn_policy.get("answer") or needs_availability_lookup):
             action = await NokvoOneVoicePipeline._maybe_execute_turn_policy_action(
                 tenant_res,
                 call_id,
@@ -1781,10 +2332,14 @@ class NokvoOneVoicePipeline:
                 turn_policy,
             )
             if action:
-                turn_policy["answer"] = action.get("answer") or turn_policy["answer"]
+                turn_policy["answer"] = action.get("answer") or turn_policy.get("answer") or ""
                 turn_policy["state_patch"] = action.get("state_patch") or turn_policy.get("state_patch") or {}
                 turn_policy["state_slot"] = action.get("state_slot") or turn_policy.get("state_slot")
                 turn_policy["reason"] = action.get("route_reason") or turn_policy.get("reason")
+            elif needs_availability_lookup and not turn_policy.get("answer"):
+                # No business context (e.g., not a clinic) — fall through to
+                # the normal RAG/template path by clearing the intent.
+                turn_policy = None
             metadata = {
                 **(intent_result.metadata or {}),
                 "turn_policy_intent": turn_policy.get("intent"),
@@ -1914,7 +2469,41 @@ class NokvoOneVoicePipeline:
                 }
 
         # 3) Sensitive policy intents (cancellation/refund) → deterministic engine.
-        if intent_result.intent in (INTENT_CANCELLATION_REQUEST, INTENT_REFUND_ELIGIBILITY):
+        # The set of "sensitive" intents lives in :mod:`agent_spec` so chat /
+        # voice / outbound all read the same list.
+        from app.services.agent_spec import IDENTITY_POLICY
+
+        if intent_result.intent in IDENTITY_POLICY.sensitive_intents or intent_result.intent in (
+            INTENT_CANCELLATION_REQUEST,
+            INTENT_REFUND_ELIGIBILITY,
+        ):
+            # Caller identity gate: before answering anything actionable
+            # about a cancellation or refund, require a phone number that
+            # matches an existing record. Without this anyone can call in
+            # and "cancel my appointment" — a hard policy hole.
+            verified = await NokvoOneVoicePipeline._caller_is_verified(
+                tenant_res, db, call_id, user_text
+            )
+            if not verified["verified"]:
+                if not verified.get("challenged"):
+                    challenge = verified.get("challenge") or (
+                        "Before I can change a booking, I need to verify you — "
+                        "could you share the phone number the booking is under?"
+                    )
+                    await AgentSessionStore.set_state(
+                        tenant_res, call_id, {"identity_verification_pending": True}
+                    )
+                    return {
+                        "route": "identity_verification",
+                        "answer": challenge,
+                        "intent_result": intent_result,
+                        "safe_to_cache": False,
+                        "sensitive": True,
+                        "state_patch": {"identity_verification_pending": True},
+                        "state_slot": "identity_verification",
+                        "route_reason": "identity verification required",
+                        "tool_calls": [],
+                    }
             policy_cards = NokvoOneVoicePipeline._active_policy_cards(tenant_res)
             # Prefer authoritative live context (CRM/order service) when
             # available, otherwise mine the conversation history for what

@@ -3,7 +3,7 @@
   - STARTER_PACKS shape per business_type.
   - materialize_starter_pack honors business_type, drops unsupported tools,
     falls back to default-on outcomes when nothing is selected.
-  - RequireMFACompleted dep returns 403 for users with no TOTP secret.
+  - RequireMFACompleted dep only blocks once a TOTP secret exists.
   - mfa_pending property on OrganizationUser.
 
 The HTTP-level integration of the dep is exercised indirectly — these tests
@@ -158,18 +158,15 @@ def _run(coro):
     return asyncio.new_event_loop().run_until_complete(coro)
 
 
-def test_require_mfa_completed_blocks_user_without_totp():
+def test_require_mfa_completed_passes_user_without_totp():
     dep = RequireMFACompleted()
     user = SimpleNamespace(
         totp_secret_encrypted=None,
         totp_secret_encrypted_v2=None,
     )
     token = _make_jwt(mfa_completed=False)
-    with pytest.raises(Exception) as exc_info:
-        _run(dep(user=user, token=token))
-    detail = getattr(exc_info.value, "detail", {})
-    assert isinstance(detail, dict)
-    assert detail.get("code") == "mfa_setup_required"
+    result = _run(dep(user=user, token=token))
+    assert result is user
 
 
 def test_require_mfa_completed_blocks_session_without_mfa_claim():

@@ -40,6 +40,9 @@ def _assignment_response(result: dict) -> NokvoOneRequestAssignResponse:
         reason=result.get("reason"),
         active_load_count=result.get("active_load_count"),
         skipped_member_reasons=result.get("skipped_member_reasons") or {},
+        requested_time=result.get("requested_time"),
+        scheduled_time=result.get("scheduled_time"),
+        time_adjusted=bool(result.get("time_adjusted")),
         timestamp=result["timestamp"],
     )
 

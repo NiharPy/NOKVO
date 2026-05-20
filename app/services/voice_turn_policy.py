@@ -2,7 +2,16 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
+
+
+_APPOINTMENT_LOCAL_TZ = ZoneInfo("Asia/Kolkata")
+_MONTH_LOOKUP = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
 
 
 _PHONE_HINT_RE = re.compile(
@@ -76,8 +85,55 @@ _NO_URGENT_RE = re.compile(
     r"(లేదు|లేవు|ఏం\s*లేవు|అలాంటివి\s*లేవు|కాదు|नहीं|नही|कुछ\s*नहीं|ऐसा\s*नहीं)",
     re.IGNORECASE,
 )
+# "Is X available?" / "can you book me at X?" / "when can you book?" — the
+# caller wants the agent to consult its own calendar rather than just collect
+# values. Two flavours:
+#   1) explicit slot question containing "available/free/open/slot/booked/taken"
+#   2) explicit booking request ("book me at 4 PM", "can you book me on …")
+#   3) "when can you book", "next available", "earliest available", "any slot"
+# The matcher is intentionally lax — false positives just trigger an extra
+# scheduler lookup, which is cheap and self-correcting.
+_AVAILABILITY_QUERY_RE = re.compile(
+    r"\b("
+    r"(?:available|availability|free\s+slot|open\s+slot|slot(?:s)?\s+(?:available|free|open)|"
+    r"booked|taken|"
+    r"(?:can|could|would|will)\s+you\s+book(?:\s+me)?\s+(?:at|on|for|in)\s+|"
+    r"book\s+me\s+(?:at|on|for|in)\s+|"
+    r"when\s+(?:can|could|will)\s+you\s+(?:book|fit\s+me|see\s+me)|"
+    r"(?:next|earliest|first)\s+(?:available|free|open)|"
+    r"any(?:thing)?\s+(?:available|free|open)|"
+    r"any\s+(?:slot|opening|time)|"
+    r"how\s+about\s+\d|"
+    r"what(?:'s|\s+is)\s+(?:available|free|open|the\s+(?:next|earliest|first)))"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
 _NAME_PREFIX_RE = re.compile(
-    r"^(?:my\s+name\s+is|name\s+is|i\s+am|this\s+is|నా\s+పేరు|పేరు|मेरा\s+नाम|नाम\s+है)\s+(.+)$",
+    r"^(?:"
+    # English: covers "the full name of the patient is X", "patient's name is X",
+    # "patient name is X", "his/her name is X", "the name is X", "name is X",
+    # "my name is X", "I am X", "I'm X", "this is X", "it is X", "call me X".
+    r"the\s+(?:full\s+)?name\s+of\s+(?:the\s+)?(?:patient|person|caller|customer)\s+is|"
+    r"(?:the\s+)?patient(?:'s|s)?\s+(?:full\s+)?name\s+is|"
+    r"(?:the\s+)?caller(?:'s|s)?\s+(?:full\s+)?name\s+is|"
+    r"(?:the\s+)?customer(?:'s|s)?\s+(?:full\s+)?name\s+is|"
+    r"(?:the\s+)?person(?:'s|s)?\s+(?:full\s+)?name\s+is|"
+    r"(?:his|her|their)\s+(?:full\s+)?name\s+is|"
+    r"(?:the\s+)?(?:full\s+)?name\s+is|"
+    r"my\s+name\s+is|"
+    r"i(?:'m|\s+am)|"
+    r"this\s+is|"
+    r"call\s+me|"
+    r"it(?:'s|\s+is)|"
+    # Telugu / Hindi prefixes (kept from prior list, plus a couple of extras).
+    r"నా\s+పేరు|పేరు|"
+    r"पేషెంట్\s+పేరు|"
+    r"मेरा\s+नाम|नाम\s+है|"
+    r"मरीज(?:\s+का)?\s+नाम\s+है|"
+    r"रोगी\s+का\s+नाम\s+है"
+    r")\s+(.+)$",
     re.IGNORECASE,
 )
 
@@ -324,7 +380,23 @@ def _extract_patient_name(text: str) -> str | None:
         return None
     match = _NAME_PREFIX_RE.search(value)
     if match:
-        value = _strip_name_suffix(match.group(1))
+        # The caller explicitly introduced the name ("the full name of the
+        # patient is …", "my name is …"). Validate the *candidate* (post
+        # prefix), so utterances like "It's actually about eye pain" still
+        # get filtered by the exclusion regex.
+        candidate = _strip_name_suffix(match.group(1))
+        if not candidate:
+            return None
+        if (
+            _QUESTION_RE.search(candidate)
+            or _NAME_EXCLUSION_RE.search(candidate)
+            or any(c.isdigit() for c in candidate)
+        ):
+            return None
+        words = candidate.split()
+        if not (1 <= len(words) <= 6) or len(candidate) > 120:
+            return None
+        return candidate if _unicode_lettersish(candidate) else None
     return value if _looks_like_name(value) else None
 
 
@@ -352,6 +424,311 @@ def _looks_like_reason(text: str) -> bool:
     if normalize_phone_number(value) or _DATE_RE.search(value) or _TIME_RE.search(value):
         return False
     return 2 <= len(value.split()) <= 28
+
+
+def _parse_slot_date(raw: str | None) -> date | None:
+    """Best-effort parse of slot-fill date strings.
+
+    Mirrors the lighter cases handled by ``NokvoOneVoicePipeline._parse_appointment_date``
+    so the policy layer can detect "appointment is in the past" *before* the
+    tool round-trip, instead of letting the caller finish four more questions
+    and only then be told to start over.
+    """
+    if not raw:
+        return None
+    text = re.sub(r"\s+", " ", str(raw).strip().lower())
+    if not text:
+        return None
+    today = datetime.now(_APPOINTMENT_LOCAL_TZ).date()
+    if text in {"today"}:
+        return today
+    if text in {"tomorrow"}:
+        return today + timedelta(days=1)
+    if text in {"day after tomorrow"}:
+        return today + timedelta(days=2)
+    # 20 may 2026 / 20th may / may 20 / 20-05-2026 / 20/05
+    match = re.match(
+        r"(\d{1,2})(?:st|nd|rd|th)?\s+([a-z]{3,9})(?:\s+(\d{2,4}))?$",
+        text,
+    )
+    if match:
+        day = int(match.group(1))
+        month = _MONTH_LOOKUP.get(match.group(2)[:3])
+        year = int(match.group(3)) if match.group(3) else today.year
+        if year < 100:
+            year += 2000
+        if month and 1 <= day <= 31:
+            try:
+                candidate = date(year, month, day)
+                if candidate < today and not match.group(3):
+                    candidate = date(year + 1, month, day)
+                return candidate
+            except ValueError:
+                return None
+    match = re.match(r"([a-z]{3,9})\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s+(\d{2,4}))?$", text)
+    if match:
+        month = _MONTH_LOOKUP.get(match.group(1)[:3])
+        day = int(match.group(2))
+        year = int(match.group(3)) if match.group(3) else today.year
+        if year < 100:
+            year += 2000
+        if month and 1 <= day <= 31:
+            try:
+                candidate = date(year, month, day)
+                if candidate < today and not match.group(3):
+                    candidate = date(year + 1, month, day)
+                return candidate
+            except ValueError:
+                return None
+    match = re.match(r"(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?$", text)
+    if match:
+        day = int(match.group(1))
+        month = int(match.group(2))
+        year = int(match.group(3)) if match.group(3) else today.year
+        if year < 100:
+            year += 2000
+        if 1 <= month <= 12 and 1 <= day <= 31:
+            try:
+                return date(year, month, day)
+            except ValueError:
+                return None
+    return None
+
+
+def _parse_slot_time(raw: str | None) -> time | None:
+    if not raw:
+        return None
+    text = re.sub(r"\s+", " ", str(raw).strip().lower())
+    if not text:
+        return None
+    named = {
+        "morning": time(9, 0), "afternoon": time(14, 0),
+        "evening": time(17, 0), "night": time(19, 0), "noon": time(12, 0),
+    }
+    for label, value in named.items():
+        if label in text:
+            return value
+    ampm = re.search(r"\b(\d{1,2})(?::([0-5]\d))?\s*(am|pm)\b", text)
+    if ampm:
+        hour = int(ampm.group(1))
+        minute = int(ampm.group(2) or 0)
+        suffix = ampm.group(3)
+        if 1 <= hour <= 12:
+            if suffix == "pm" and hour != 12:
+                hour += 12
+            if suffix == "am" and hour == 12:
+                hour = 0
+            return time(hour, minute)
+    twenty_four = re.search(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", text)
+    if twenty_four:
+        return time(int(twenty_four.group(1)), int(twenty_four.group(2)))
+    return None
+
+
+def _appointment_is_past(date_text: str | None, time_text: str | None) -> bool:
+    parsed_date = _parse_slot_date(date_text)
+    parsed_time = _parse_slot_time(time_text)
+    if not parsed_date or not parsed_time:
+        return False
+    local_dt = datetime.combine(parsed_date, parsed_time, tzinfo=_APPOINTMENT_LOCAL_TZ)
+    return local_dt <= datetime.now(_APPOINTMENT_LOCAL_TZ)
+
+
+def _name_confirmation_prompt(name: str, language: str | None) -> str:
+    lang = _language_code(language)
+    if lang == "te":
+        return f"Just to confirm — patient పేరు {name} అని. Right ఆ?"
+    if lang == "hi":
+        return f"बस कन्फर्म करना है — मरीज़ का नाम {name} है। सही है?"
+    return f"Just to confirm — the patient's name is {name}. Is that right?"
+
+
+def _is_high_confidence_phone(phone: str) -> bool:
+    """Phones in canonical formats are skip-confirmation candidates: 10 digits
+    starting with [6-9] for Indian mobiles, or +91 / 91 prefixed equivalents.
+    Anything weird (too short, leading zero, repeated digit, etc.) keeps
+    triggering the confirmation handshake."""
+    digits = _digits(phone or "")
+    if not digits:
+        return False
+    if digits.startswith("91") and len(digits) == 12:
+        digits = digits[2:]
+    if len(digits) != 10 or digits[0] not in "6789":
+        return False
+    # Reject obvious STT garbage like "9999999999" / "8888888888".
+    if len(set(digits)) <= 2:
+        return False
+    return True
+
+
+def _format_phone_for_speech(phone: str) -> str:
+    """Render a phone number as space-separated digits so TTS reads it
+    digit-by-digit (avoids "nine billion one hundred seventy-seven million…")."""
+    digits = _digits(phone or "")
+    if not digits:
+        return phone or ""
+    # Group last 10 digits in 5-5 for Indian numbers, prefix with country code if any.
+    if len(digits) > 10:
+        prefix = digits[:-10]
+        body = digits[-10:]
+        return " ".join(list(prefix)) + " " + " ".join(list(body[:5])) + " " + " ".join(list(body[5:]))
+    if len(digits) == 10:
+        return " ".join(list(digits[:5])) + " " + " ".join(list(digits[5:]))
+    return " ".join(list(digits))
+
+
+def _phone_confirmation_prompt(phone: str, language: str | None) -> str:
+    spoken = _format_phone_for_speech(phone)
+    lang = _language_code(language)
+    if lang == "te":
+        return f"Just to confirm — {spoken}. Right ఆ?"
+    if lang == "hi":
+        return f"बस कन्फर्म करना है — {spoken}. सही है?"
+    return f"Just to confirm — {spoken}. Is that the right number?"
+
+
+def _email_confirmation_prompt(email: str, language: str | None) -> str:
+    lang = _language_code(language)
+    if lang == "te":
+        return f"Just to confirm — email {email} అని. Right ఆ?"
+    if lang == "hi":
+        return f"कन्फर्म करना है — ईमेल {email} है। सही है?"
+    return f"Just to confirm — {email}. Is that the right email?"
+
+
+def _id_confirmation_prompt(value: str, slot_label: str, language: str | None) -> str:
+    spoken = " ".join(list(str(value))) if str(value).isdigit() else str(value)
+    lang = _language_code(language)
+    if lang == "te":
+        return f"Just to confirm — {slot_label} {spoken}. Right ఆ?"
+    if lang == "hi":
+        return f"कन्फर्म करना है — {slot_label} {spoken}. सही है?"
+    return f"Just to confirm — {slot_label} {spoken}. Is that right?"
+
+
+def _past_appointment_prompt(language: str | None) -> str:
+    lang = _language_code(language)
+    if lang == "te":
+        return "ఆ time అప్పటికే past లో ఉంది. ఏ future date మరియు time note చేయాలి?"
+    if lang == "hi":
+        return "वो समय बीत चुका है। कौन सी आगे की तारीख और समय नोट करूं?"
+    return "That appointment time is already past. Which future date and time should I note?"
+
+
+def _format_friendly_date(parsed: date, language: str | None) -> str:
+    lang = _language_code(language)
+    return parsed.strftime("%d %b").lstrip("0")
+
+
+def _shift_to_next_day_prompt(
+    original_date: str | None,
+    original_time: str | None,
+    language: str | None,
+) -> tuple[str, str, str] | None:
+    """When the requested datetime has passed today, suggest the SAME time
+    on the next valid day instead of clearing both slots. Returns
+    (next_date_iso, next_date_label, prompt) or None if we can't infer a
+    sensible suggestion."""
+    parsed_time = _parse_slot_time(original_time)
+    parsed_date = _parse_slot_date(original_date)
+    if not parsed_time or not parsed_date:
+        return None
+    next_date = parsed_date + timedelta(days=1)
+    # Surface the suggestion in IST-friendly form (e.g. "21 May at 11 AM").
+    nice_date = _format_friendly_date(next_date, language)
+    nice_time = original_time.strip()
+    lang = _language_code(language)
+    if lang == "te":
+        prompt = (
+            f"{original_time} ఇవాళ అప్పటికే past లో ఉంది. "
+            f"Same time on {nice_date} ({nice_time}) book చేయనా?"
+        )
+    elif lang == "hi":
+        prompt = (
+            f"{original_time} आज बीत चुका है। "
+            f"{nice_date} को उसी समय ({nice_time}) बुक करूं?"
+        )
+    else:
+        prompt = (
+            f"{original_time} today has already passed. "
+            f"Shall I book the same time on {nice_date} ({nice_time}) instead?"
+        )
+    return next_date.isoformat(), nice_date, prompt
+
+
+_AFFIRMATIVE_RE = re.compile(
+    r"^\s*(yes|yeah|yep|yup|sure|ok(?:ay)?|please|please\s+do|"
+    r"go\s+ahead|sounds\s+good|that\s+works|that(?:'s|\s+is)\s+(?:fine|correct|right)|"
+    r"do\s+(?:it|that)|book\s+it|"
+    r"అవును|సరే|ఓకే|"
+    r"हाँ|हां|जी|ठीक है|कर दो)\b",
+    re.IGNORECASE,
+)
+
+
+_NEGATIVE_RE = re.compile(
+    r"^\s*(no|nope|nah|not\s+(?:really|correct|right)|that(?:'s|\s+is)\s+(?:not|wrong|incorrect)|"
+    r"wrong|incorrect|change|"
+    r"కాదు|లేదు|"
+    r"नहीं|नही|गलत|बदलो)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_affirmative(text: str) -> bool:
+    return bool(_AFFIRMATIVE_RE.match(_clean(text)))
+
+
+def _looks_negative(text: str) -> bool:
+    return bool(_NEGATIVE_RE.match(_clean(text)))
+
+
+# Cues volunteered in the reason text that tell us this is a first visit /
+# follow-up / has no urgent symptoms, so we don't need to ritually re-ask.
+_REASON_FIRST_VISIT_RE = re.compile(
+    r"\b(first\s+(?:visit|time|appointment|consult)|new\s+patient|never\s+been\s+here\s+before|"
+    r"haven['']?t\s+been\s+here\s+before)\b|"
+    r"(మొదటి\s+(?:విజిట్|సారి)|మొదటిసారి|"
+    r"पहली\s+(?:बार|विजिट)|नया\s+मरीज)",
+    re.IGNORECASE,
+)
+_REASON_FOLLOW_UP_RE = re.compile(
+    r"\b(follow[-\s]?up|review|coming\s+back|already\s+been\s+here|"
+    r"already\s+visited|old\s+patient|return\s+visit)\b|"
+    r"(ఫాలో|రివ్యూ|మళ్లీ|"
+    r"फॉलो|रिव्यू|दोबारा|पुराना\s+मरीज)",
+    re.IGNORECASE,
+)
+_REASON_NO_URGENT_RE = re.compile(
+    r"\b(routine|regular|annual|yearly|just\s+a\s+)?check[-\s]?up\b|"
+    r"\b(general\s+(?:check|review)|nothing\s+(?:urgent|major|serious|critical)|"
+    r"not\s+(?:urgent|emergency|emergencies?)|no\s+(?:emergency|urgency|pain))\b|"
+    r"(రెగ్యులర్\s+చెకప్|జనరల్\s+చెకప్|అత్యవసరం\s+కాదు|"
+    r"रेगुलर\s+चेकअप|जनरल\s+चेकअप|कोई\s+इमरजेंसी\s+नहीं)",
+    re.IGNORECASE,
+)
+
+
+def _infer_implicit_slots(text: str, appointment: dict[str, Any]) -> list[str]:
+    """Pre-fill visit_type and urgent_symptoms when the caller volunteered
+    them in the same utterance. Returns the slot names we filled, so the
+    caller can audit which questions we skipped."""
+    filled: list[str] = []
+    if not text:
+        return filled
+    cleaned = _clean(text).lower()
+    if not appointment.get("visit_type"):
+        if _REASON_FIRST_VISIT_RE.search(cleaned):
+            appointment["visit_type"] = "first_visit"
+            filled.append("visit_type")
+        elif _REASON_FOLLOW_UP_RE.search(cleaned):
+            appointment["visit_type"] = "follow_up"
+            filled.append("visit_type")
+    if not appointment.get("urgent_symptoms"):
+        if _REASON_NO_URGENT_RE.search(cleaned) and not _URGENT_SYMPTOM_RE.search(cleaned):
+            appointment["urgent_symptoms"] = "none_reported"
+            filled.append("urgent_symptoms")
+    return filled
 
 
 def _next_appointment_slot(appointment: dict[str, Any]) -> str | None:
@@ -573,6 +950,29 @@ def evaluate_voice_turn_policy(
         _APPOINTMENT_INTENT_RE.search(value)
     ) or (expected_slot in _APPOINTMENT_SLOTS and not appointment_closed)
 
+    # Availability lookup: caller is asking the agent to check its own
+    # calendar ("is 11:30 AM available?", "when can you book?", "any slot
+    # tomorrow?"). Return an intent the pipeline will resolve against the
+    # scheduler instead of falling through to a slow RAG path.
+    if active_appointment and _AVAILABILITY_QUERY_RE.search(value):
+        availability_entities: dict[str, Any] = {}
+        if entities.get("date_text"):
+            availability_entities["date_text"] = entities["date_text"]
+        if entities.get("time_text"):
+            availability_entities["time_text"] = entities["time_text"]
+        # Carry the in-progress appointment so the handler can offer to slot
+        # the matched time straight into preferred_date/preferred_time on
+        # caller confirmation.
+        return {
+            "answer": None,  # filled in by the pipeline handler
+            "intent": "availability_check",
+            "entities": availability_entities,
+            "language": _language_code(language),
+            "state_patch": {"appointment": appointment},
+            "state_slot": "availability_check",
+            "reason": "caller asked about specific or next-available slot",
+        }
+
     # Yield to RAG when the caller pivots to a KB question. This must run on
     # FIRST-turn pivots ("Before I book, what services do you offer?") as well
     # as mid-booking digressions — the only condition is that the booking
@@ -583,6 +983,53 @@ def evaluate_voice_turn_policy(
     # so a first-turn pivot doesn't get an inappropriate resumption prefix.
     if active_appointment and _is_side_question_during_booking(value, entities=entities):
         return None
+
+    # Caller answering "yes/no" to a slot we just offered ("11:30 is taken,
+    # next free is 12:00 — want me to book that?").
+    if appointment.get("awaiting_slot_confirm"):
+        if _looks_affirmative(value):
+            proposed_utc = appointment.pop("proposed_slot_utc", None)
+            proposed_label = appointment.pop("proposed_slot_label", None)
+            appointment["awaiting_slot_confirm"] = False
+            if proposed_utc:
+                try:
+                    parsed = datetime.fromisoformat(proposed_utc.replace("Z", "+00:00"))
+                    local = parsed.astimezone(_APPOINTMENT_LOCAL_TZ)
+                    # Store the date in a format the appointment-date parser
+                    # actually accepts ("22 May 2026"), not bare ISO — the
+                    # parser regex doesn't match `YYYY-MM-DD` and we'd lose
+                    # the locked slot to a "That date does not look valid"
+                    # rejection later in the flow.
+                    appointment["preferred_date"] = local.strftime("%d %b %Y")
+                    appointment["preferred_time"] = local.strftime("%I:%M %p").lstrip("0")
+                    # And persist the canonical ISO so the tool path can
+                    # short-circuit re-parsing entirely.
+                    appointment["appointment_time"] = proposed_utc
+                    from app.services.flow_session import stamp_proposed_slot_accepted
+                    stamp_proposed_slot_accepted(
+                        appointment, slot_utc_iso=proposed_utc, member_name=proposed_label,
+                    )
+                except Exception:
+                    pass
+            appointment["active"] = True
+            # Continue down to next_slot computation so the agent moves on
+            # to whichever field is still missing (or completes the booking).
+        elif _looks_negative(value):
+            appointment["awaiting_slot_confirm"] = False
+            appointment.pop("proposed_slot_utc", None)
+            appointment.pop("proposed_slot_label", None)
+            appointment["pending_slot"] = "preferred_date"
+            return {
+                "answer": _appointment_question("preferred_date", language),
+                "intent": "appointment_flow",
+                "entities": entities,
+                "language": _language_code(language),
+                "state_patch": {"appointment": appointment},
+                "state_slot": "preferred_date",
+                "reason": "caller declined offered slot",
+            }
+        # If the caller said something else, fall through — the rest of the
+        # block may pick up new entities from the utterance.
 
     if active_appointment:
         appointment["active"] = True
@@ -609,11 +1056,118 @@ def evaluate_voice_turn_policy(
             and _VISIT_REASON_HINT_RE.search(value)
         ):
             appointment["reason"] = _strip_polite_suffix(value)
-        if expected_slot == "patient_name":
+        # Name confirmation handshake: if we just captured the name on the
+        # previous turn and asked the caller to confirm, treat this turn as
+        # the answer to that confirmation. We accept "yes" verbatim, take any
+        # spelled-out replacement as the corrected name, and reject explicit
+        # "no" by re-asking for the name.
+        if appointment.get("awaiting_name_confirmation"):
+            appointment["awaiting_name_confirmation"] = False
+            if _looks_affirmative(value):
+                # Name stays as-is, proceed to next slot below.
+                from app.services.flow_session import record_confirmation, append_audit_trail
+                record_confirmation(appointment, "patient_name", appointment.get("patient_name"))
+                append_audit_trail(appointment, "name_confirmed", detail=appointment.get("patient_name"))
+            elif _looks_negative(value):
+                appointment["patient_name"] = None
+                appointment["pending_slot"] = "patient_name"
+                return {
+                    "answer": _appointment_question("patient_name", language),
+                    "intent": "appointment_flow",
+                    "entities": entities,
+                    "language": _language_code(language),
+                    "state_patch": {"appointment": appointment},
+                    "state_slot": "patient_name",
+                    "reason": "name confirmation rejected",
+                }
+            else:
+                # Treat the new utterance as the correction.
+                replacement = _extract_patient_name(value)
+                if replacement:
+                    appointment["patient_name"] = replacement
+                    appointment["awaiting_name_confirmation"] = True
+                    return {
+                        "answer": _name_confirmation_prompt(replacement, language),
+                        "intent": "appointment_flow",
+                        "entities": entities,
+                        "language": _language_code(language),
+                        "state_patch": {"appointment": appointment},
+                        "state_slot": "patient_name_confirm",
+                        "reason": "name corrected, awaiting confirmation",
+                    }
+        elif expected_slot == "patient_name":
             patient_name = _extract_patient_name(value)
             if patient_name:
                 appointment["patient_name"] = patient_name
-        if entities.get("phone"):
+                appointment["awaiting_name_confirmation"] = True
+                appointment["pending_slot"] = "patient_name_confirm"
+                return {
+                    "answer": _name_confirmation_prompt(patient_name, language),
+                    "intent": "appointment_flow",
+                    "entities": entities,
+                    "language": _language_code(language),
+                    "state_patch": {"appointment": appointment},
+                    "state_slot": "patient_name_confirm",
+                    "reason": "name captured, awaiting confirmation",
+                }
+        # Phone confirmation handshake — STT mis-hears digits often, so we read
+        # the captured number back and require a yes before persisting it.
+        if appointment.get("awaiting_phone_confirmation"):
+            appointment["awaiting_phone_confirmation"] = False
+            if _looks_affirmative(value):
+                from app.services.flow_session import record_confirmation, append_audit_trail
+                record_confirmation(appointment, "phone", appointment.get("phone"))
+                append_audit_trail(appointment, "phone_confirmed", detail=appointment.get("phone"))
+            elif _looks_negative(value):
+                appointment["phone"] = None
+                appointment["pending_slot"] = "phone"
+                return {
+                    "answer": _appointment_question("phone", language),
+                    "intent": "appointment_flow",
+                    "entities": entities,
+                    "language": _language_code(language),
+                    "state_patch": {"appointment": appointment},
+                    "state_slot": "phone",
+                    "reason": "phone confirmation rejected",
+                }
+            elif entities.get("phone"):
+                appointment["phone"] = entities["phone"]
+                appointment["awaiting_phone_confirmation"] = True
+                appointment["pending_slot"] = "phone_confirm"
+                return {
+                    "answer": _phone_confirmation_prompt(entities["phone"], language),
+                    "intent": "appointment_flow",
+                    "entities": entities,
+                    "language": _language_code(language),
+                    "state_patch": {"appointment": appointment},
+                    "state_slot": "phone_confirm",
+                    "reason": "phone corrected, awaiting confirmation",
+                }
+        elif expected_slot == "phone" and entities.get("phone") and not appointment.get("phone"):
+            appointment["phone"] = entities["phone"]
+            # Spec gate: skip confirmation only when the policy allows the
+            # high-confidence shortcut AND the value waives it.
+            from app.services.agent_spec import CONFIRMATION_POLICY
+
+            allow_skip = (
+                CONFIRMATION_POLICY.confirm_phone_unless_high_confidence
+                and _is_high_confidence_phone(entities["phone"])
+            )
+            if allow_skip:
+                pass
+            else:
+                appointment["awaiting_phone_confirmation"] = True
+                appointment["pending_slot"] = "phone_confirm"
+                return {
+                    "answer": _phone_confirmation_prompt(entities["phone"], language),
+                    "intent": "appointment_flow",
+                    "entities": entities,
+                    "language": _language_code(language),
+                    "state_patch": {"appointment": appointment},
+                    "state_slot": "phone_confirm",
+                    "reason": "phone captured, awaiting confirmation",
+                }
+        elif entities.get("phone"):
             appointment["phone"] = entities["phone"]
         if entities.get("date_text"):
             appointment["preferred_date"] = entities["date_text"]
@@ -624,6 +1178,81 @@ def evaluate_voice_turn_policy(
         if expected_slot == "urgent_symptoms" and _NO_URGENT_RE.search(value):
             appointment["urgent_symptoms"] = "none_reported"
 
+        # Mine the same utterance for visit_type / urgent_symptoms cues the
+        # caller volunteered (e.g. reason was "routine checkup, first visit,
+        # nothing urgent"). Stops the agent from ritually re-asking later.
+        inferred_slots = _infer_implicit_slots(value, appointment)
+        if inferred_slots:
+            entities["inferred_slots"] = inferred_slots
+
+        # If both date and time are now filled, check immediately whether the
+        # combined datetime is in the past. Instead of clearing both, we keep
+        # the time and offer the same time on the next day — closer to what
+        # a real receptionist would say.
+        if appointment.get("preferred_date") and appointment.get("preferred_time"):
+            if _appointment_is_past(appointment.get("preferred_date"), appointment.get("preferred_time")):
+                shift = _shift_to_next_day_prompt(
+                    appointment.get("preferred_date"),
+                    appointment.get("preferred_time"),
+                    language,
+                )
+                if shift is not None:
+                    next_iso, _label, prompt = shift
+                    appointment["proposed_date"] = next_iso
+                    appointment["awaiting_past_time_shift"] = True
+                    appointment["pending_slot"] = "preferred_date_shift_confirm"
+                    return {
+                        "answer": prompt,
+                        "intent": "appointment_flow",
+                        "entities": entities,
+                        "language": _language_code(language),
+                        "state_patch": {"appointment": appointment},
+                        "state_slot": "preferred_date_shift_confirm",
+                        "reason": "appointment time past — offered same time next day",
+                    }
+                # Fallback (couldn't parse): clear both and ask again.
+                appointment["preferred_date"] = None
+                appointment["preferred_time"] = None
+                appointment["pending_slot"] = "preferred_date"
+                return {
+                    "answer": _past_appointment_prompt(language),
+                    "intent": "appointment_flow",
+                    "entities": entities,
+                    "language": _language_code(language),
+                    "state_patch": {"appointment": appointment},
+                    "state_slot": "preferred_date",
+                    "reason": "appointment time in the past",
+                }
+
+        # Handle the user's answer to the "same time tomorrow?" question.
+        if appointment.get("awaiting_past_time_shift"):
+            appointment["awaiting_past_time_shift"] = False
+            proposed = appointment.pop("proposed_date", None)
+            if _looks_affirmative(value) and proposed:
+                appointment["preferred_date"] = proposed
+                # preferred_time stays as the caller originally said it
+            else:
+                # Caller declined — either gave a new date/time in this turn,
+                # or wants to pick fresh. Honour the new entities if any,
+                # else clear and ask again.
+                if not entities.get("date_text") and not entities.get("time_text"):
+                    appointment["preferred_date"] = None
+                    appointment["preferred_time"] = None
+                    appointment["pending_slot"] = "preferred_date"
+                    return {
+                        "answer": _past_appointment_prompt(language),
+                        "intent": "appointment_flow",
+                        "entities": entities,
+                        "language": _language_code(language),
+                        "state_patch": {"appointment": appointment},
+                        "state_slot": "preferred_date",
+                        "reason": "shift declined, re-asking",
+                    }
+                if entities.get("date_text"):
+                    appointment["preferred_date"] = entities["date_text"]
+                if entities.get("time_text"):
+                    appointment["preferred_time"] = entities["time_text"]
+
         next_slot = _next_appointment_slot(appointment)
         appointment["pending_slot"] = next_slot
         # Consume the digression marker (if any) so the resumption is
@@ -631,6 +1260,25 @@ def evaluate_voice_turn_policy(
         resumed_from_kb = bool(appointment.pop("deferred_for_kb", False))
         patch = {"appointment": appointment}
         if next_slot:
+            # Adaptive disambiguation: when the caller has given a date but
+            # not a time yet, query the scheduler for the earliest free slot
+            # on that date instead of asking "what time?" in a vacuum.
+            if (
+                next_slot == "preferred_time"
+                and appointment.get("preferred_date")
+                and not appointment.get("preferred_time")
+                and not appointment.get("offered_disambiguation")
+            ):
+                appointment["offered_disambiguation"] = True
+                return {
+                    "answer": None,
+                    "intent": "availability_check",
+                    "entities": {"date_text": appointment["preferred_date"]},
+                    "language": _language_code(language),
+                    "state_patch": {"appointment": appointment},
+                    "state_slot": "availability_disambiguation",
+                    "reason": "date given without time — offering concrete slot",
+                }
             prefix = _coming_back_prefix(language) if resumed_from_kb else ""
             return {
                 "answer": prefix + _appointment_question(next_slot, language),

@@ -139,7 +139,11 @@ async def get_current_active_organization_user(
 ) -> OrganizationUser:
     payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
     mfa_completed: bool = payload.get("mfa_completed", False)
-    if current_user.mfa_required and not mfa_completed:
+    has_totp = bool(
+        getattr(current_user, "totp_secret_encrypted", None)
+        or getattr(current_user, "totp_secret_encrypted_v2", None)
+    )
+    if current_user.mfa_required and has_totp and not mfa_completed:
         raise HTTPException(status_code=403, detail="Organization MFA required")
     if current_user.status not in {"active", "invited"}:
         raise HTTPException(status_code=403, detail="Organization user account is not active")
@@ -228,13 +232,9 @@ class RequireProductTier:
 class RequireMFACompleted:
     """Step-up gate for sensitive actions.
 
-    Blocks endpoints that must not be reachable until the calling user has
-    actually completed MFA at least once (and the current session token
-    reflects that). Used to backstop the v2 deferred-MFA onboarding flow.
-
-    Raises 403 with detail='mfa_setup_required' when the user has never set
-    up TOTP, or 403 with detail='mfa_step_up_required' when TOTP exists but
-    the current session is not MFA-elevated.
+    When the user has no TOTP secret, MFA is treated as not enrolled and this
+    dependency lets the action pass. Once TOTP exists, the current session must
+    be MFA-elevated.
     """
 
     async def __call__(
@@ -242,17 +242,12 @@ class RequireMFACompleted:
         user: OrganizationUser = Depends(get_current_active_organization_user),
         token: str = Depends(oauth2_scheme),
     ) -> OrganizationUser:
-        if not getattr(user, "totp_secret_encrypted", None) and not getattr(user, "totp_secret_encrypted_v2", None):
-            raise HTTPException(
-                status_code=403,
-                detail={
-                    "code": "mfa_setup_required",
-                    "message": (
-                        "This action requires MFA. Set up an authenticator app from your "
-                        "dashboard, then try again."
-                    ),
-                },
-            )
+        has_totp = bool(
+            getattr(user, "totp_secret_encrypted", None)
+            or getattr(user, "totp_secret_encrypted_v2", None)
+        )
+        if not has_totp:
+            return user
         try:
             payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
         except jwt.PyJWTError:

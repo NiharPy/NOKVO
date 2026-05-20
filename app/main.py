@@ -42,6 +42,7 @@ from app.api import (
     nokvo_one_members,
     nokvo_one_agents,
     nokvo_one_knowledge_base,
+    nokvo_one_outcomes,
     nokvo_one_requests,
     nokvo_one_voice,
 )
@@ -51,6 +52,7 @@ app.include_router(organization_auth.router, prefix="/api/org-auth", tags=["orga
 app.include_router(superadmin_tenant_provisioning.router, prefix="/superadmin/tenants", tags=["tenant-provisioning"])
 app.include_router(nokvo_one_auth.router, prefix="/api/nokvo-one", tags=["nokvo-one"])
 app.include_router(nokvo_one_requests.router, prefix="/api/nokvo-one", tags=["nokvo-one-requests"])
+app.include_router(nokvo_one_outcomes.router, prefix="/api/nokvo-one", tags=["nokvo-one-outcomes"])
 app.include_router(nokvo_one_members.router, prefix="/api/nokvo-one/members", tags=["nokvo-one-members"])
 app.include_router(nokvo_one_agents.router, prefix="/api/nokvo-one/agents", tags=["nokvo-one-agents"])
 app.include_router(
@@ -75,3 +77,18 @@ if _AMBIENCE_DIR.exists():
 @app.get("/health")
 async def health_check():
     return {"status": "ok"}
+
+
+# In-process retry-queue scheduler: drains pending_tool_retries on a 2-minute
+# cadence so the operator doesn't have to wire a separate worker process.
+from app.services.retry_scheduler import start_scheduler, stop_scheduler  # noqa: E402
+
+
+@app.on_event("startup")
+async def _start_retry_scheduler() -> None:
+    start_scheduler()
+
+
+@app.on_event("shutdown")
+async def _stop_retry_scheduler() -> None:
+    await stop_scheduler()

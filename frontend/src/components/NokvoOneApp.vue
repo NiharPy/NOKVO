@@ -73,13 +73,14 @@ const settingsMenuOpen = ref(false);
 const errorMsg = ref('');
 const infoMsg = ref('');
 const isAuthenticating = ref(false);
-const currentPage = ref('dashboard'); // dashboard | members | tickets | leads | appointments | agent | knowledge_base
+const currentPage = ref('dashboard'); // dashboard | members | tickets | leads | appointments | agent | outgoing_agent | knowledge_base
 
 const signup = ref({ org_name: '', admin_name: '', admin_email: '', password: '' });
 const login = ref({ email: '', password: '' });
 const totpCode = ref('');
 const totpUri = ref('');
 const totpSecret = ref('');
+const mfaSetupMode = ref('signup'); // signup | session_setup | session_verify
 const setupToken = ref('');
 const loginTempToken = ref('');
 
@@ -136,9 +137,37 @@ const phoneLink = ref(null);
 const phoneLinkInput = ref('');
 const isSavingPhoneLink = ref(false);
 const campaigns = ref([]);
-const campaignForm = ref({ name: '', from_number: '', excel_file: null, doc_file: null });
+const campaignForm = ref({ name: '', from_number: '', doc_file: null });
 const isCreatingCampaign = ref(false);
 const isLaunchingCampaign = ref(null);
+const outgoingTab = ref('leads');
+const leadConnections = ref([]);
+const leadForms = ref([]);
+const outgoingLeads = ref([]);
+const selectedLeadIds = ref([]);
+const isLoadingLeadSources = ref(false);
+const isSyncingLeadConnection = ref(null);
+const connectionAccountInputs = ref({});
+const nokvoLeadForm = ref({
+  name: '',
+  consent_text: 'I agree to receive a phone call from this business about my enquiry.',
+  fields: [
+    { key: 'email', label: 'Email', type: 'email', required: false },
+  ],
+});
+const externalLeadForm = ref({
+  provider: 'google_forms',
+  name: '',
+  provider_form_id: '',
+  source_connection_id: '',
+  field_mapping: '{\n  "name": "name",\n  "phone": "phone",\n  "email": "email"\n}',
+  consent_field_key: '',
+  consent_text: '',
+  default_call_consent: false,
+});
+const selectedCallableLeads = computed(() =>
+  outgoingLeads.value.filter((lead) => selectedLeadIds.value.includes(lead.id) && lead.callable),
+);
 const voice = ref({
   ws: null,
   audioCtx: null,
@@ -318,6 +347,9 @@ const switchPage = (page) => {
   if (page === 'agent') {
     loadRuntimeStatus();
     loadPhoneLink();
+  }
+  if (page === 'outgoing_agent') {
+    loadOutgoingAgentWorkspace();
     loadCampaigns();
   }
   if (['leads', 'tickets', 'appointments'].includes(page)) {
@@ -332,6 +364,7 @@ const resetLoginState = () => {
   totpUri.value = '';
   totpSecret.value = '';
   totpCode.value = '';
+  mfaSetupMode.value = 'signup';
   loginTempToken.value = '';
   authState.value = 'login';
 };
@@ -387,6 +420,8 @@ const stepDescription = (name, status, summary) => {
 
 const extractErrorMessage = (err, fallback) => {
   const detail = err?.response?.data?.detail;
+  if (!detail && err?.response?.data?.message) return err.response.data.message;
+  if (!detail && err?.message && !err.response) return err.message;
   if (!detail) return fallback;
   if (typeof detail === 'string') return detail;
   if (detail.message) return detail.message;
@@ -904,6 +939,7 @@ const assignmentForMember = (memberId) =>
     max_active_requests: 100,
     max_requests_per_day: null,
     max_requests_per_hour: 6,
+    appointment_duration_minutes: 30,
     active_request_count: 0,
     availability_summary: 'Not assignable',
   };
@@ -982,6 +1018,7 @@ const withScheduleDefaults = (settings = {}, { enable = false, force = false } =
     max_active_requests: settings.max_active_requests || 100,
     max_requests_per_day: settings.max_requests_per_day || null,
     max_requests_per_hour: settings.max_requests_per_hour || 6,
+    appointment_duration_minutes: settings.appointment_duration_minutes || 30,
   };
 };
 
@@ -1099,6 +1136,7 @@ const saveAssignmentSettings = async () => {
       max_active_requests: settings.max_active_requests || 100,
       max_requests_per_day: null,
       max_requests_per_hour: settings.max_requests_per_hour || 6,
+      appointment_duration_minutes: settings.appointment_duration_minutes || 30,
     };
     const { data } = await api.put(`/members/${member.id}/assignment-settings`, payload, { headers: authHeader() });
     const idx = assignmentSettings.value.findIndex((item) => item.member_id === member.id);
@@ -1130,6 +1168,7 @@ const saveMemberSchedule = async () => {
       max_active_requests: settings.max_active_requests || 100,
       max_requests_per_day: null,
       max_requests_per_hour: settings.max_requests_per_hour || 6,
+      appointment_duration_minutes: settings.appointment_duration_minutes || 30,
     };
     const { data } = await api.put(`/members/${member.id}/assignment-settings`, payload, { headers: authHeader() });
     const idx = assignmentSettings.value.findIndex((item) => item.member_id === member.id);
@@ -1413,6 +1452,7 @@ const beginTotpSetup = async () => {
     setupToken.value = data.setup_token;
     totpUri.value = data.uri;
     totpSecret.value = data.secret;
+    mfaSetupMode.value = 'signup';
     authState.value = 'mfa_setup';
   } catch (err) {
     errorMsg.value = extractErrorMessage(err, 'Could not initialise TOTP.');
@@ -1421,10 +1461,54 @@ const beginTotpSetup = async () => {
   }
 };
 
+const startSessionTotpSetup = async () => {
+  errorMsg.value = '';
+  infoMsg.value = '';
+  isAuthenticating.value = true;
+  try {
+    const { data } = await api.post('/mfa/totp/setup', {}, { headers: authHeader() });
+    setupToken.value = data.setup_token || '';
+    totpUri.value = data.uri;
+    totpSecret.value = data.secret;
+    totpCode.value = '';
+    mfaSetupMode.value = 'session_setup';
+    authState.value = 'mfa_setup';
+  } catch (err) {
+    errorMsg.value = extractErrorMessage(err, 'Could not initialise MFA.');
+  } finally {
+    isAuthenticating.value = false;
+  }
+};
+
+const startSessionTotpVerify = () => {
+  errorMsg.value = '';
+  infoMsg.value = 'Enter your authenticator code to unlock this action.';
+  totpUri.value = '';
+  totpSecret.value = '';
+  totpCode.value = '';
+  mfaSetupMode.value = 'session_verify';
+  authState.value = 'mfa_setup';
+};
+
 const verifySignupTotp = async () => {
   errorMsg.value = '';
   isAuthenticating.value = true;
   try {
+    if (mfaSetupMode.value === 'session_setup' || mfaSetupMode.value === 'session_verify') {
+      const { data } = await api.post(
+        '/mfa/totp/verify',
+        { code: totpCode.value },
+        { headers: authHeader() },
+      );
+      persistSession(data);
+      totpCode.value = '';
+      totpUri.value = '';
+      totpSecret.value = '';
+      mfaSetupMode.value = 'signup';
+      infoMsg.value = 'MFA is active for this session.';
+      await enterWorkspaceAfterAuth();
+      return;
+    }
     await api.post('/signup/totp/verify', { setup_token: setupToken.value, code: totpCode.value });
     infoMsg.value = 'TOTP enrolled. Your organization is pending Nokvo activation. Sign in once approved.';
     resetLoginState();
@@ -1434,6 +1518,36 @@ const verifySignupTotp = async () => {
   } finally {
     isAuthenticating.value = false;
   }
+};
+
+const cancelTotpSetup = () => {
+  if (mfaSetupMode.value === 'session_setup' || mfaSetupMode.value === 'session_verify') {
+    totpCode.value = '';
+    totpUri.value = '';
+    totpSecret.value = '';
+    mfaSetupMode.value = 'signup';
+    authState.value = 'ready';
+    return;
+  }
+  resetLoginState();
+};
+
+const handleMfaProtectedError = async (err) => {
+  const detail = err?.response?.data?.detail;
+  if (detail === 'Organization MFA required' || detail === 'MFA required') {
+    startSessionTotpVerify();
+    return true;
+  }
+  if (!detail || typeof detail !== 'object') return false;
+  if (detail.code === 'mfa_setup_required') {
+    await startSessionTotpSetup();
+    return true;
+  }
+  if (detail.code === 'mfa_step_up_required') {
+    startSessionTotpVerify();
+    return true;
+  }
+  return false;
 };
 
 const handleLogin = async () => {
@@ -1535,6 +1649,7 @@ const inviteMember = async () => {
     inviteForm.value = { email: '', full_name: '', role: 'member' };
     await loadWorkspace();
   } catch (err) {
+    if (await handleMfaProtectedError(err)) return;
     errorMsg.value = extractErrorMessage(err, 'Invite failed.');
   } finally {
     isSavingMember.value = false;
@@ -2123,6 +2238,7 @@ const savePhoneLink = async () => {
     );
     phoneLink.value = data;
   } catch (err) {
+    if (await handleMfaProtectedError(err)) return;
     errorMsg.value = extractErrorMessage(err, 'Failed to save phone link.');
   } finally {
     isSavingPhoneLink.value = false;
@@ -2138,13 +2254,149 @@ const loadCampaigns = async () => {
   }
 };
 
+const loadLeadConnections = async () => {
+  const { data } = await agentsApi.get('/lead-sources/connections', { headers: authHeader() });
+  leadConnections.value = data || [];
+  const nextInputs = { ...connectionAccountInputs.value };
+  for (const connection of leadConnections.value) {
+    nextInputs[connection.id] = connection.provider_account_id || connection.metadata?.customer_id || '';
+  }
+  connectionAccountInputs.value = nextInputs;
+};
+
+const loadLeadForms = async () => {
+  const { data } = await agentsApi.get('/lead-sources/forms', { headers: authHeader() });
+  leadForms.value = data || [];
+};
+
+const loadOutgoingLeads = async () => {
+  const { data } = await agentsApi.get('/lead-sources/leads', {
+    headers: authHeader(),
+    params: { limit: 300 },
+  });
+  outgoingLeads.value = data || [];
+  selectedLeadIds.value = selectedLeadIds.value.filter((id) =>
+    outgoingLeads.value.some((lead) => lead.id === id && lead.callable),
+  );
+};
+
+const loadOutgoingAgentWorkspace = async () => {
+  isLoadingLeadSources.value = true;
+  try {
+    await Promise.all([loadLeadConnections(), loadLeadForms(), loadOutgoingLeads()]);
+  } catch (err) {
+    errorMsg.value = extractErrorMessage(err, 'Failed to load outgoing lead sources.');
+  } finally {
+    isLoadingLeadSources.value = false;
+  }
+};
+
+const startLeadOAuth = async (provider) => {
+  try {
+    const { data } = await agentsApi.post(
+      '/lead-sources/oauth/start',
+      { provider, mode: provider === 'google_forms' ? 'forms' : 'ads' },
+      { headers: authHeader() },
+    );
+    if (data.authorization_url) window.location.href = data.authorization_url;
+  } catch (err) {
+    if (await handleMfaProtectedError(err)) return;
+    errorMsg.value = extractErrorMessage(err, 'Could not start OAuth.');
+  }
+};
+
+const saveConnectionAccount = async (connection) => {
+  try {
+    const accountId = (connectionAccountInputs.value[connection.id] || '').trim();
+    await agentsApi.patch(
+      `/lead-sources/connections/${connection.id}`,
+      {
+        provider_account_id: accountId || null,
+        metadata: connection.provider === 'google_ads' ? { customer_id: accountId } : {},
+      },
+      { headers: authHeader() },
+    );
+    await loadLeadConnections();
+  } catch (err) {
+    if (await handleMfaProtectedError(err)) return;
+    errorMsg.value = extractErrorMessage(err, 'Could not update connection.');
+  }
+};
+
+const syncLeadConnection = async (connectionId) => {
+  isSyncingLeadConnection.value = connectionId;
+  try {
+    const { data } = await agentsApi.post(`/lead-sources/connections/${connectionId}/sync`, {}, { headers: authHeader() });
+    await Promise.all([loadLeadConnections(), loadLeadForms(), loadOutgoingLeads()]);
+    infoMsg.value = `Synced ${data.leads || 0} lead(s).`;
+  } catch (err) {
+    if (await handleMfaProtectedError(err)) return;
+    errorMsg.value = extractErrorMessage(err, 'Lead sync failed.');
+  } finally {
+    isSyncingLeadConnection.value = null;
+  }
+};
+
+const createNokvoLeadForm = async () => {
+  try {
+    await agentsApi.post('/lead-sources/nokvo-forms', nokvoLeadForm.value, { headers: authHeader() });
+    nokvoLeadForm.value = {
+      name: '',
+      consent_text: 'I agree to receive a phone call from this business about my enquiry.',
+      fields: [{ key: 'email', label: 'Email', type: 'email', required: false }],
+    };
+    await loadLeadForms();
+    infoMsg.value = 'Nokvo lead form created.';
+  } catch (err) {
+    if (await handleMfaProtectedError(err)) return;
+    errorMsg.value = extractErrorMessage(err, 'Could not create Nokvo form.');
+  }
+};
+
+const registerExternalLeadForm = async () => {
+  try {
+    let mapping = {};
+    if (externalLeadForm.value.field_mapping.trim()) {
+      mapping = JSON.parse(externalLeadForm.value.field_mapping);
+    }
+    await agentsApi.post(
+      '/lead-sources/forms',
+      {
+        provider: externalLeadForm.value.provider,
+        name: externalLeadForm.value.name,
+        provider_form_id: externalLeadForm.value.provider_form_id,
+        source_connection_id: externalLeadForm.value.source_connection_id || null,
+        field_mapping: mapping,
+        consent_field_key: externalLeadForm.value.consent_field_key || null,
+        consent_text: externalLeadForm.value.consent_text || null,
+        default_call_consent: externalLeadForm.value.default_call_consent,
+      },
+      { headers: authHeader() },
+    );
+    externalLeadForm.value.name = '';
+    externalLeadForm.value.provider_form_id = '';
+    await loadLeadForms();
+    infoMsg.value = 'External form registered.';
+  } catch (err) {
+    if (await handleMfaProtectedError(err)) return;
+    errorMsg.value = extractErrorMessage(err, 'Could not register form.');
+  }
+};
+
+const toggleLeadSelection = (lead) => {
+  if (!lead.callable) return;
+  const idx = selectedLeadIds.value.indexOf(lead.id);
+  if (idx >= 0) selectedLeadIds.value.splice(idx, 1);
+  else selectedLeadIds.value.push(lead.id);
+};
+
 const onCampaignFile = (event, key) => {
   campaignForm.value[key] = event.target.files?.[0] || null;
 };
 
 const createCampaign = async () => {
-  if (!campaignForm.value.name.trim() || !campaignForm.value.excel_file || !campaignForm.value.doc_file) {
-    errorMsg.value = 'Campaign name, contacts (.xlsx), and script document are required.';
+  if (!campaignForm.value.name.trim() || !selectedCallableLeads.value.length || !campaignForm.value.doc_file) {
+    errorMsg.value = 'Campaign name, at least one consented lead, and script document are required.';
     return;
   }
   isCreatingCampaign.value = true;
@@ -2152,13 +2404,16 @@ const createCampaign = async () => {
     const fd = new FormData();
     fd.append('name', campaignForm.value.name.trim());
     if (campaignForm.value.from_number.trim()) fd.append('from_number', campaignForm.value.from_number.trim());
-    fd.append('excel_file', campaignForm.value.excel_file);
+    fd.append('lead_ids', JSON.stringify(selectedCallableLeads.value.map((lead) => lead.id)));
     fd.append('doc_file', campaignForm.value.doc_file);
     await agentsApi.post('/campaigns', fd, { headers: { ...authHeader(), 'Content-Type': 'multipart/form-data' } });
-    campaignForm.value = { name: '', from_number: '', excel_file: null, doc_file: null };
+    campaignForm.value = { name: '', from_number: '', doc_file: null };
+    selectedLeadIds.value = [];
     await loadCampaigns();
+    await loadOutgoingLeads();
     infoMsg.value = 'Campaign created and script ingested.';
   } catch (err) {
+    if (await handleMfaProtectedError(err)) return;
     errorMsg.value = extractErrorMessage(err, 'Failed to create campaign.');
   } finally {
     isCreatingCampaign.value = false;
@@ -2171,6 +2426,7 @@ const launchCampaign = async (id) => {
     await agentsApi.post(`/campaigns/${id}/launch`, {}, { headers: authHeader() });
     await loadCampaigns();
   } catch (err) {
+    if (await handleMfaProtectedError(err)) return;
     errorMsg.value = extractErrorMessage(err, 'Failed to launch campaign.');
   } finally {
     isLaunchingCampaign.value = null;
@@ -2182,6 +2438,7 @@ const cancelCampaign = async (id) => {
     await agentsApi.post(`/campaigns/${id}/cancel`, {}, { headers: authHeader() });
     await loadCampaigns();
   } catch (err) {
+    if (await handleMfaProtectedError(err)) return;
     errorMsg.value = extractErrorMessage(err, 'Failed to cancel campaign.');
   }
 };
@@ -2300,27 +2557,60 @@ const stopAllPlayback = () => {
 };
 
 // ── VAD-based recorder (browser-side end-of-utterance detection) ──
-// Replaces continuous raw-PCM streaming with: record while user is speaking,
-// stop on sustained silence, send one WebM blob per utterance to the server.
-// Ported from agent_lab/useVoiceCall.ts. Tunables below match the lab.
-const VAD_SPEECH_THRESHOLD = 0.04;        // RMS over this counts as speech
-const VAD_BARGE_THRESHOLD = 0.08;         // higher threshold during agent playback to avoid echo bleeding
-const VAD_END_SILENCE_MS = 700;           // silence duration that marks end of utterance
-const VAD_MIN_UTTERANCE_MS = 250;         // ignore taps / coughs shorter than this
-const VAD_POLL_INTERVAL_MS = 50;
+// We continuously capture raw PCM via a ScriptProcessorNode into a small
+// rolling pre-roll buffer. When the VAD detects speech we copy the pre-roll
+// into the utterance buffer and keep appending live frames; on silence we
+// wrap the whole utterance as 16-kHz mono WAV and send it to the server.
+//
+// Why not MediaRecorder? Starting MediaRecorder *after* VAD says "speech"
+// loses the first ~50-100ms of the utterance (one VAD poll cycle + recorder
+// spin-up). That clips leading consonants like "h-", "y-", "I'd", which is
+// the symptom users see as "STT is not picking up my words."
+const VAD_SPEECH_THRESHOLD = 0.022;       // RMS over this counts as speech (was 0.04 — too high for soft-gain mics)
+const VAD_BARGE_THRESHOLD = 0.07;         // higher threshold during agent playback to avoid echo bleeding
+const VAD_END_SILENCE_MS = 750;           // silence that marks end of utterance — short enough to stay snappy, long enough that natural mid-thought pauses (≤500ms) don't fire early
+const VAD_MIN_UTTERANCE_MS = 220;         // ignore taps / coughs shorter than this
+const VAD_POLL_INTERVAL_MS = 30;          // faster polling so speech-start fires sooner
+const PRE_ROLL_MS = 320;                  // how much audio *before* VAD detection we include in the utterance
+const PRE_ROLL_RING_MS = 600;             // ring-buffer capacity (must exceed PRE_ROLL_MS)
+const TARGET_STT_SAMPLE_RATE = 16000;     // backend / Sarvam STT expects 16-kHz mono
 const PLAYBACK_CAPTURE_GRACE_MS = 350;    // ignore mic for this long after agent stops playing
 
-const pickRecorderMime = () => {
-  const candidates = [
-    'audio/webm;codecs=opus',
-    'audio/webm',
-    'audio/ogg;codecs=opus',
-    'audio/mp4',
-  ];
-  for (const m of candidates) {
-    if (window.MediaRecorder && MediaRecorder.isTypeSupported(m)) return m;
+const writeWavString = (view, offset, text) => {
+  for (let i = 0; i < text.length; i++) view.setUint8(offset + i, text.charCodeAt(i));
+};
+
+const pcm16ToWav = (int16, sampleRate) => {
+  const dataSize = int16.byteLength;
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+  writeWavString(view, 0, 'RIFF');
+  view.setUint32(4, 36 + dataSize, true);
+  writeWavString(view, 8, 'WAVE');
+  writeWavString(view, 12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeWavString(view, 36, 'data');
+  view.setUint32(40, dataSize, true);
+  new Uint8Array(buffer, 44).set(new Uint8Array(int16.buffer, int16.byteOffset, int16.byteLength));
+  return buffer;
+};
+
+const concatFloat32 = (chunks) => {
+  let total = 0;
+  for (const c of chunks) total += c.length;
+  const out = new Float32Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    out.set(c, offset);
+    offset += c.length;
   }
-  return 'audio/webm';
+  return out;
 };
 
 const tickVad = () => {
@@ -2355,7 +2645,7 @@ const tickVad = () => {
     if (!voice.value.isInSpeech) {
       voice.value.isInSpeech = true;
       voice.value.speechStartTime = now;
-      startRecorder();
+      beginUtteranceCapture();
       voice.value.status = 'recording';
     }
   } else if (voice.value.isInSpeech) {
@@ -2365,52 +2655,116 @@ const tickVad = () => {
       voice.value.isInSpeech = false;
       voice.value.silenceStartTime = 0;
       if (duration > VAD_MIN_UTTERANCE_MS) {
-        stopRecorderAndSend();
+        finishUtteranceCaptureAndSend();
         voice.value.status = 'thinking';
       } else {
-        discardRecorder();
+        discardUtteranceCapture();
         voice.value.status = 'listening';
       }
     }
   }
 };
 
-const startRecorder = () => {
-  if (!voice.value.micStream) return;
-  if (voice.value.recorder && voice.value.recorder.state === 'recording') return;
-  voice.value.recordedChunks = [];
-  try {
-    voice.value.recorder = new MediaRecorder(voice.value.micStream, { mimeType: voice.value.recorderMime });
-  } catch {
-    voice.value.recorder = new MediaRecorder(voice.value.micStream);
+const setupPcmCapture = (audioCtx, micStream) => {
+  const inputRate = audioCtx.sampleRate;
+  const source = audioCtx.createMediaStreamSource(micStream);
+  // ScriptProcessor must have a sink to keep firing onaudioprocess; we route
+  // the captured signal through a zero-gain node so it never reaches the
+  // speakers (otherwise the agent's TTS gets echo-mixed with the user's voice).
+  const processor = audioCtx.createScriptProcessor(2048, 1, 1);
+  const muteGain = audioCtx.createGain();
+  muteGain.gain.value = 0;
+  source.connect(processor);
+  processor.connect(muteGain);
+  muteGain.connect(audioCtx.destination);
+
+  voice.value.pcmInputRate = inputRate;
+  voice.value.pcmRing = [];
+  voice.value.pcmRingDurationMs = 0;
+  voice.value.utteranceChunks = [];
+
+  processor.onaudioprocess = (e) => {
+    const input = e.inputBuffer.getChannelData(0);
+    const copy = new Float32Array(input.length);
+    copy.set(input);
+    const chunkMs = (copy.length / inputRate) * 1000;
+    voice.value.pcmRing.push(copy);
+    voice.value.pcmRingDurationMs += chunkMs;
+    while (voice.value.pcmRingDurationMs > PRE_ROLL_RING_MS && voice.value.pcmRing.length > 1) {
+      const removed = voice.value.pcmRing.shift();
+      voice.value.pcmRingDurationMs -= (removed.length / inputRate) * 1000;
+    }
+    if (voice.value.isInSpeech && voice.value.utteranceChunks) {
+      voice.value.utteranceChunks.push(copy);
+    }
+  };
+
+  voice.value.pcmProcessor = processor;
+  voice.value.pcmMuteGain = muteGain;
+  voice.value.pcmSource = source;
+};
+
+const teardownPcmCapture = () => {
+  if (voice.value.pcmProcessor) {
+    try { voice.value.pcmProcessor.onaudioprocess = null; } catch {}
+    try { voice.value.pcmProcessor.disconnect(); } catch {}
   }
-  voice.value.recorder.ondataavailable = (e) => {
-    if (e.data && e.data.size > 0) voice.value.recordedChunks.push(e.data);
-  };
-  voice.value.recorder.start();
+  if (voice.value.pcmMuteGain) {
+    try { voice.value.pcmMuteGain.disconnect(); } catch {}
+  }
+  if (voice.value.pcmSource) {
+    try { voice.value.pcmSource.disconnect(); } catch {}
+  }
+  voice.value.pcmProcessor = null;
+  voice.value.pcmMuteGain = null;
+  voice.value.pcmSource = null;
+  voice.value.pcmRing = [];
+  voice.value.pcmRingDurationMs = 0;
+  voice.value.utteranceChunks = [];
+  voice.value.pcmInputRate = 0;
 };
 
-const stopRecorderAndSend = () => {
-  const r = voice.value.recorder;
-  if (!r || r.state !== 'recording') return;
-  r.onstop = async () => {
-    if (!voice.value.recordedChunks.length) return;
-    if (!voice.value.ws || voice.value.ws.readyState !== WebSocket.OPEN) return;
-    const blob = new Blob(voice.value.recordedChunks, { type: voice.value.recorderMime });
-    voice.value.recordedChunks = [];
-    const buf = await blob.arrayBuffer();
-    voice.value.ws.send(buf);
-  };
-  r.stop();
-  voice.value.recorder = null;
+const beginUtteranceCapture = () => {
+  // Seed the utterance buffer with the last PRE_ROLL_MS of audio so we never
+  // miss the leading consonant of the user's first word.
+  const inputRate = voice.value.pcmInputRate || 48000;
+  const ring = voice.value.pcmRing || [];
+  const wanted = (PRE_ROLL_MS / 1000) * inputRate;
+  let total = 0;
+  const fromEnd = [];
+  for (let i = ring.length - 1; i >= 0 && total < wanted; i--) {
+    fromEnd.unshift(ring[i]);
+    total += ring[i].length;
+  }
+  // Trim oldest pre-roll samples down to exactly PRE_ROLL_MS worth.
+  if (fromEnd.length > 0 && total > wanted) {
+    const drop = total - wanted;
+    fromEnd[0] = fromEnd[0].subarray(Math.floor(drop));
+  }
+  voice.value.utteranceChunks = fromEnd.length ? [...fromEnd] : [];
 };
 
-const discardRecorder = () => {
-  const r = voice.value.recorder;
-  if (!r) return;
-  r.onstop = () => { voice.value.recordedChunks = []; };
-  try { r.stop(); } catch {}
-  voice.value.recorder = null;
+const finishUtteranceCaptureAndSend = () => {
+  const inputRate = voice.value.pcmInputRate || 48000;
+  const chunks = voice.value.utteranceChunks || [];
+  voice.value.utteranceChunks = [];
+  if (!chunks.length) return;
+  if (!voice.value.ws || voice.value.ws.readyState !== WebSocket.OPEN) return;
+  const merged = concatFloat32(chunks);
+  const downsampled = inputRate === TARGET_STT_SAMPLE_RATE
+    ? merged
+    : downsampleTo16k(merged, inputRate);
+  const int16 = floatToInt16(downsampled);
+  const wav = pcm16ToWav(int16, TARGET_STT_SAMPLE_RATE);
+  try {
+    voice.value.ws.send(wav);
+  } catch (err) {
+    console.warn('Failed to send utterance WAV', err);
+  }
+};
+
+const discardUtteranceCapture = () => {
+  voice.value.utteranceChunks = [];
 };
 
 const startAmbienceBed = (audioCtx) => {
@@ -2471,8 +2825,9 @@ const startVoiceCall = async () => {
   voice.value.speechStartTime = 0;
   voice.value.silenceStartTime = 0;
   voice.value.playbackCaptureBlockedUntil = 0;
-  voice.value.recordedChunks = [];
-  voice.value.recorder = null;
+  voice.value.utteranceChunks = [];
+  voice.value.pcmRing = [];
+  voice.value.pcmRingDurationMs = 0;
 
   const token = localStorage.getItem(ACCESS_TOKEN_KEY);
   if (!token) {
@@ -2512,7 +2867,8 @@ const startVoiceCall = async () => {
     voice.value.analyser = analyser;
     voice.value.analysisBuffer = new Uint8Array(analyser.fftSize);
 
-    voice.value.recorderMime = pickRecorderMime();
+    // Continuous PCM capture with rolling pre-roll buffer (replaces MediaRecorder).
+    setupPcmCapture(voice.value.audioCtx, stream);
 
     const wsUrl = `ws://localhost:8000/api/nokvo-one/agents/voice/ws?token=${encodeURIComponent(token)}`;
     const ws = new WebSocket(wsUrl);
@@ -2622,16 +2978,12 @@ const handleVoiceEvent = (msg) => {
 };
 
 const cleanupVoiceCall = () => {
-  // Stop VAD polling FIRST so it can't try to start a new recorder mid-cleanup.
+  // Stop VAD polling FIRST so it can't try to start a new capture mid-cleanup.
   if (voice.value.vadTimer) {
     try { clearInterval(voice.value.vadTimer); } catch {}
     voice.value.vadTimer = null;
   }
-  if (voice.value.recorder && voice.value.recorder.state === 'recording') {
-    try { voice.value.recorder.stop(); } catch {}
-  }
-  voice.value.recorder = null;
-  voice.value.recordedChunks = [];
+  teardownPcmCapture();
   stopAmbienceBed();
   if (voice.value.micNode) try { voice.value.micNode.disconnect(); } catch {}
   if (voice.value.micStream) voice.value.micStream.getTracks().forEach(t => t.stop());
@@ -2901,16 +3253,19 @@ onBeforeUnmount(() => {
         <!-- TOTP SETUP -->
         <div v-else-if="authState === 'mfa_setup'" class="mfa-panel">
           <div class="mfa-head">
-            <strong>Link Your Authenticator</strong>
-            <span>{{ signup.admin_email || inviteContext?.email }}</span>
+            <strong>{{ mfaSetupMode === 'session_verify' ? 'Verify MFA' : 'Link Your Authenticator' }}</strong>
+            <span>{{ currentUser?.email || signup.admin_email || inviteContext?.email }}</span>
           </div>
-          <p class="login-help compact">
+          <p v-if="mfaSetupMode === 'session_verify'" class="login-help compact">
+            Enter the 6-digit code from the authenticator already linked to this work email.
+          </p>
+          <p v-else class="login-help compact">
             Scan this QR with the authenticator for this work email. Your TOTP secret is encrypted at rest.
           </p>
-          <div class="qr-shell">
+          <div v-if="mfaSetupMode !== 'session_verify' && totpUri" class="qr-shell">
             <QrcodeVue :value="totpUri" :size="168" level="M" background="#ffffff" foreground="#111111" />
           </div>
-          <div class="secret-note">
+          <div v-if="mfaSetupMode !== 'session_verify' && totpSecret" class="secret-note">
             Manual entry key: <code>{{ totpSecret }}</code>
           </div>
           <label class="code-label" for="nokvo-one-totp-setup">6-digit code</label>
@@ -2924,9 +3279,9 @@ onBeforeUnmount(() => {
             placeholder="000000"
           />
           <div class="mfa-actions">
-            <button type="button" class="ghost-button" :disabled="isAuthenticating" @click="resetLoginState">Cancel</button>
+            <button type="button" class="ghost-button" :disabled="isAuthenticating" @click="cancelTotpSetup">Cancel</button>
             <button type="button" class="primary-button" :disabled="isAuthenticating" @click="verifySignupTotp">
-              {{ isAuthenticating ? 'Verifying...' : 'Verify & Continue' }}
+              {{ isAuthenticating ? 'Verifying...' : (mfaSetupMode === 'session_verify' ? 'Verify MFA' : 'Verify & Continue') }}
             </button>
           </div>
         </div>
@@ -3201,6 +3556,15 @@ onBeforeUnmount(() => {
             <button
               type="button"
               class="nav-page-button"
+              :class="{ active: currentPage === 'outgoing_agent' }"
+              @click="switchPage('outgoing_agent')"
+            >
+              <PhoneCall :size="17" />
+              <span>Outgoing Agent</span>
+            </button>
+            <button
+              type="button"
+              class="nav-page-button"
               :class="{ active: currentPage === 'knowledge_base' }"
               @click="switchPage('knowledge_base')"
             >
@@ -3332,7 +3696,7 @@ onBeforeUnmount(() => {
           Real calling, outbound campaigns, member invites, integrations, and data exports stay
           locked until you add an authenticator app. Takes 30 seconds.
         </span>
-        <button type="button" class="ghost-button compact" @click="authState = 'mfa_setup'">
+        <button type="button" class="ghost-button compact" :disabled="isAuthenticating" @click="startSessionTotpSetup">
           Set up MFA
         </button>
       </div>
@@ -4430,20 +4794,259 @@ onBeforeUnmount(() => {
             </div>
           </article>
         </div>
+      </section>
 
-        <!-- OUTBOUND CAMPAIGNS -->
-        <article class="dashboard-card campaign-card">
+      <!-- OUTGOING AGENT -->
+      <section v-if="currentPage === 'outgoing_agent'" class="dashboard-section outgoing-agent-section">
+        <div class="dashboard-section-head">
+          <div>
+            <span class="section-kicker">Outgoing Agent</span>
+            <h3>Call only consented leads.</h3>
+            <p>Connect Meta Ads, Google Ads, Google Forms, or share a Nokvo form. Campaigns can launch only from callable leads with consent evidence.</p>
+          </div>
+          <button type="button" class="dashboard-inline-button" :disabled="isLoadingLeadSources" @click="loadOutgoingAgentWorkspace">
+            <Search :size="16" />
+            Refresh
+          </button>
+        </div>
+
+        <div class="outgoing-tabs">
+          <button type="button" :class="{ active: outgoingTab === 'leads' }" @click="outgoingTab = 'leads'">
+            <Users :size="15" />
+            Leads
+          </button>
+          <button type="button" :class="{ active: outgoingTab === 'connections' }" @click="outgoingTab = 'connections'">
+            <Globe :size="15" />
+            Connections
+          </button>
+          <button type="button" :class="{ active: outgoingTab === 'forms' }" @click="outgoingTab = 'forms'">
+            <FileText :size="15" />
+            Forms
+          </button>
+          <button type="button" :class="{ active: outgoingTab === 'campaigns' }" @click="outgoingTab = 'campaigns'; loadCampaigns()">
+            <PhoneCall :size="15" />
+            Campaigns
+          </button>
+        </div>
+
+        <section v-if="outgoingTab === 'connections'" class="dashboard-grid agent-page-grid">
+          <article class="dashboard-card">
+            <div class="members-card-head">
+              <div>
+                <h3>Ad &amp; form connections</h3>
+                <p>OAuth connects source systems. Imported leads still need consent fields or form-level call consent before campaigns can use them.</p>
+              </div>
+            </div>
+            <div class="provider-grid provider-grid-dual outgoing-provider-grid">
+              <button type="button" class="provider-option" @click="startLeadOAuth('meta_ads')">
+                <strong class="provider-name">Meta Ads</strong>
+                <small>Facebook and Instagram instant-form leads via Lead Ads Retrieval.</small>
+              </button>
+              <button type="button" class="provider-option" @click="startLeadOAuth('google_ads')">
+                <strong class="provider-name">Google Ads</strong>
+                <small>Lead form submissions from a configured Google Ads customer ID.</small>
+              </button>
+              <button type="button" class="provider-option" @click="startLeadOAuth('google_forms')">
+                <strong class="provider-name">Google Forms</strong>
+                <small>Read form responses from registered Google Forms.</small>
+              </button>
+            </div>
+          </article>
+
+          <article class="dashboard-card">
+            <div class="members-card-head">
+              <div>
+                <h3>Connected sources</h3>
+                <p>Sync pulls forms and leads into Nokvo's consent gate.</p>
+              </div>
+              <span class="status-chip">{{ leadConnections.length }} connected</span>
+            </div>
+            <div class="agent-document-list">
+              <div v-if="!leadConnections.length" class="empty-state compact">No lead sources connected yet.</div>
+              <div v-for="connection in leadConnections" :key="connection.id" class="agent-document-row">
+                <div class="agent-document-main">
+                  <div class="agent-document-icon">
+                    <Globe :size="18" />
+                  </div>
+                  <div>
+                    <strong>{{ connection.display_name }}</strong>
+                    <small>{{ connection.provider }} · {{ connection.status }}<template v-if="connection.last_sync_at"> · synced {{ formatRelativeDate(connection.last_sync_at) }}</template></small>
+                    <div v-if="connection.provider === 'google_ads'" class="outgoing-inline-editor">
+                      <input v-model="connectionAccountInputs[connection.id]" class="db-input compact" type="text" placeholder="Google Ads customer ID" />
+                      <button type="button" class="ghost-button compact" @click="saveConnectionAccount(connection)">Save</button>
+                    </div>
+                    <p v-if="connection.last_error" class="agent-warning">{{ connection.last_error }}</p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  class="primary-button compact"
+                  :disabled="isSyncingLeadConnection === connection.id"
+                  @click="syncLeadConnection(connection.id)"
+                >
+                  <Search :size="15" />
+                  {{ isSyncingLeadConnection === connection.id ? 'Syncing…' : 'Sync' }}
+                </button>
+              </div>
+            </div>
+          </article>
+        </section>
+
+        <section v-else-if="outgoingTab === 'forms'" class="dashboard-grid agent-page-grid">
+          <article class="dashboard-card">
+            <div class="members-card-head">
+              <div>
+                <h3>Create Nokvo form</h3>
+                <p>Creates a public lead form link with a required call-consent checkbox.</p>
+              </div>
+            </div>
+            <div class="kb-form-grid">
+              <label class="kb-field">
+                <span>Form name</span>
+                <input v-model="nokvoLeadForm.name" type="text" placeholder="Site visit enquiry" />
+              </label>
+              <label class="kb-field kb-field-wide">
+                <span>Call consent text</span>
+                <input v-model="nokvoLeadForm.consent_text" type="text" />
+              </label>
+            </div>
+            <div class="kb-card-actions">
+              <button type="button" class="primary-button compact" @click="createNokvoLeadForm">
+                <Plus :size="15" />
+                Create form link
+              </button>
+            </div>
+          </article>
+
+          <article class="dashboard-card">
+            <div class="members-card-head">
+              <div>
+                <h3>Register external form</h3>
+                <p>Map Google Forms or ad form fields and define where call consent is stored.</p>
+              </div>
+            </div>
+            <div class="kb-form-grid">
+              <label class="kb-field">
+                <span>Provider</span>
+                <select v-model="externalLeadForm.provider">
+                  <option value="google_forms">Google Forms</option>
+                  <option value="meta_ads">Meta Ads</option>
+                  <option value="google_ads">Google Ads</option>
+                </select>
+              </label>
+              <label class="kb-field">
+                <span>Connection</span>
+                <select v-model="externalLeadForm.source_connection_id">
+                  <option value="">None</option>
+                  <option v-for="connection in leadConnections" :key="connection.id" :value="connection.id">
+                    {{ connection.display_name }}
+                  </option>
+                </select>
+              </label>
+              <label class="kb-field">
+                <span>Form name</span>
+                <input v-model="externalLeadForm.name" type="text" placeholder="Google Form leads" />
+              </label>
+              <label class="kb-field">
+                <span>Provider form ID</span>
+                <input v-model="externalLeadForm.provider_form_id" type="text" placeholder="1FAIpQL..." />
+              </label>
+              <label class="kb-field">
+                <span>Consent field key</span>
+                <input v-model="externalLeadForm.consent_field_key" type="text" placeholder="call_consent" />
+              </label>
+              <label class="kb-field">
+                <span>Consent text</span>
+                <input v-model="externalLeadForm.consent_text" type="text" placeholder="I agree to receive a call..." />
+              </label>
+              <label class="kb-field kb-field-wide">
+                <span>Field mapping JSON</span>
+                <textarea v-model="externalLeadForm.field_mapping" class="kb-prompt-textarea compact"></textarea>
+              </label>
+              <label class="custom-tab-required-toggle">
+                <input type="checkbox" v-model="externalLeadForm.default_call_consent" />
+                form submission itself is call consent
+              </label>
+            </div>
+            <div class="kb-card-actions">
+              <button type="button" class="primary-button compact" @click="registerExternalLeadForm">
+                <CheckCircle2 :size="15" />
+                Register form
+              </button>
+            </div>
+          </article>
+
+          <article class="dashboard-card wide-card">
+            <div class="members-card-head">
+              <div>
+                <h3>Forms</h3>
+                <p>Only active forms with consent mapping can produce callable leads.</p>
+              </div>
+              <span class="status-chip">{{ leadForms.length }} forms</span>
+            </div>
+            <div class="agent-document-list">
+              <div v-if="!leadForms.length" class="empty-state compact">No forms registered yet.</div>
+              <div v-for="form in leadForms" :key="form.id" class="agent-document-row">
+                <div class="agent-document-main">
+                  <div class="agent-document-icon">
+                    <FileText :size="18" />
+                  </div>
+                  <div>
+                    <strong>{{ form.name }}</strong>
+                    <small>{{ form.provider }} · {{ form.status }}<template v-if="form.provider_form_id"> · {{ form.provider_form_id }}</template></small>
+                    <p v-if="form.public_url" class="agent-warning">{{ form.public_url }}</p>
+                  </div>
+                </div>
+                <span class="status-chip">{{ form.consent_field_key || form.default_call_consent ? 'Consent mapped' : 'Needs consent map' }}</span>
+              </div>
+            </div>
+          </article>
+        </section>
+
+        <section v-else-if="outgoingTab === 'leads'" class="dashboard-card">
+          <div class="members-card-head">
+            <div>
+              <h3>Consented leads</h3>
+              <p>Select callable leads for the next campaign. Unknown-consent rows are visible but blocked.</p>
+            </div>
+            <span class="status-chip">{{ selectedCallableLeads.length }} selected</span>
+          </div>
+
+          <div class="outgoing-lead-list">
+            <div v-if="!outgoingLeads.length" class="empty-state compact">No leads imported yet. Connect a source or publish a Nokvo form.</div>
+            <button
+              v-for="lead in outgoingLeads"
+              :key="lead.id"
+              type="button"
+              class="agent-document-row outgoing-lead-row"
+              :class="{ active: selectedLeadIds.includes(lead.id), disabled: !lead.callable }"
+              @click="toggleLeadSelection(lead)"
+            >
+              <div class="agent-document-main">
+                <div class="agent-document-icon">
+                  <PhoneCall :size="18" />
+                </div>
+                <div>
+                  <strong>{{ lead.name || lead.phone_e164 || 'Unnamed lead' }}</strong>
+                  <small>{{ lead.source_provider }} · {{ lead.phone_e164 || 'no phone' }} · {{ lead.consent_status }}</small>
+                </div>
+              </div>
+              <span class="status-chip">{{ lead.callable ? 'Callable' : 'Blocked' }}</span>
+            </button>
+          </div>
+        </section>
+
+        <section v-else class="dashboard-card campaign-card">
           <div class="kb-card-head">
             <div class="kb-card-icon">
               <PhoneCall :size="18" />
             </div>
             <div>
               <h4>Outbound Campaigns</h4>
-              <p>Upload a script + an Excel of phone numbers. The script is ingested into RAG; calls fire on launch.</p>
+              <p>Create campaigns from selected consented leads. Excel contacts are no longer accepted for calling.</p>
             </div>
             <button type="button" class="ghost-button compact" @click="loadCampaigns">Refresh</button>
           </div>
-
           <div v-if="isAdmin" class="campaign-create">
             <div class="kb-form-grid">
               <label class="kb-field">
@@ -4455,21 +5058,21 @@ onBeforeUnmount(() => {
                 <input v-model="campaignForm.from_number" type="text" placeholder="+91XXXXXXXXXX" />
               </label>
               <label class="kb-field">
-                <span>Contacts (.xlsx — col A phone, col B name)</span>
-                <input type="file" accept=".xlsx,.xls" @change="onCampaignFile($event, 'excel_file')" />
-                <small v-if="campaignForm.excel_file">{{ campaignForm.excel_file.name }} · {{ formatBytes(campaignForm.excel_file.size) }}</small>
-              </label>
-              <label class="kb-field">
                 <span>Script document (PDF/DOCX/TXT)</span>
                 <input type="file" accept=".pdf,.docx,.txt,.md" @change="onCampaignFile($event, 'doc_file')" />
                 <small v-if="campaignForm.doc_file">{{ campaignForm.doc_file.name }} · {{ formatBytes(campaignForm.doc_file.size) }}</small>
               </label>
+              <div class="kb-field">
+                <span>Selected leads</span>
+                <strong>{{ selectedCallableLeads.length }} callable lead(s)</strong>
+                <small>Go to Leads tab to change selection.</small>
+              </div>
             </div>
             <div class="kb-card-actions">
               <button
                 type="button"
                 class="primary-button compact"
-                :disabled="isCreatingCampaign"
+                :disabled="isCreatingCampaign || !selectedCallableLeads.length"
                 @click="createCampaign"
               >
                 <Plus :size="15" />
@@ -4484,7 +5087,7 @@ onBeforeUnmount(() => {
               <PhoneCall :size="24" />
             </div>
             <strong>No outbound campaigns yet.</strong>
-            <span>Upload contacts and a script to start.</span>
+            <span>Select consented leads and add a script to start.</span>
           </div>
 
           <div v-else class="kb-doc-list">
@@ -4530,7 +5133,7 @@ onBeforeUnmount(() => {
               </div>
             </article>
           </div>
-        </article>
+        </section>
       </section>
 
       <!-- KNOWLEDGE BASE -->
@@ -5149,7 +5752,11 @@ onBeforeUnmount(() => {
               <span>MAX REQUESTS PER HOUR</span>
               <input v-model.number="assignmentEditor.settings.max_requests_per_hour" type="number" min="1" max="100" />
             </label>
-            <p>Uses IST for every schedule and assignment decision.</p>
+            <label>
+              <span>APPOINTMENT DURATION (MIN)</span>
+              <input v-model.number="assignmentEditor.settings.appointment_duration_minutes" type="number" min="5" max="480" />
+            </label>
+            <p>Uses IST for every schedule and assignment decision. The scheduler combines duration with max requests per hour to allot the next free slot when the requested time is taken.</p>
           </div>
 
           <div class="db-form-block">
@@ -7239,6 +7846,64 @@ onBeforeUnmount(() => {
   display: flex;
   gap: 0.6rem;
   flex-wrap: wrap;
+}
+
+.outgoing-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+}
+
+.outgoing-tabs button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  border: 1px solid rgba(196, 199, 199, 0.6);
+  background: rgba(255, 255, 255, 0.88);
+  color: #1b1c15;
+  border-radius: 999px;
+  padding: 0.6rem 0.85rem;
+  font-size: 0.8rem;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.outgoing-tabs button.active {
+  background: #1b1c15;
+  border-color: #1b1c15;
+  color: #ffffff;
+}
+
+.outgoing-provider-grid .provider-option {
+  text-align: left;
+  cursor: pointer;
+}
+
+.outgoing-inline-editor {
+  display: flex;
+  gap: 0.45rem;
+  margin-top: 0.55rem;
+  flex-wrap: wrap;
+}
+
+.outgoing-inline-editor .db-input {
+  min-width: 12rem;
+}
+
+.outgoing-lead-list {
+  display: grid;
+  gap: 0.7rem;
+  margin-top: 1rem;
+}
+
+.outgoing-lead-row {
+  width: 100%;
+  text-align: left;
+}
+
+.outgoing-lead-row.disabled {
+  opacity: 0.62;
+  cursor: not-allowed;
 }
 
 .mfa-pending-banner {

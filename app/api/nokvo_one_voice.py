@@ -24,6 +24,7 @@ Tenant isolation is enforced via TenantResources lookups for every path:
 """
 from __future__ import annotations
 
+import json
 import uuid
 from typing import Any
 
@@ -39,8 +40,8 @@ from fastapi import (
     WebSocket,
     status,
 )
-from fastapi.responses import PlainTextResponse
-from pydantic import BaseModel
+from fastapi.responses import PlainTextResponse, RedirectResponse
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
@@ -49,11 +50,23 @@ from app.api import deps
 from app.core.config import settings
 from app.models.organization import Organization
 from app.models.organization_user import OrganizationUser
+from app.models.outgoing_lead import (
+    LeadCaptureForm,
+    LeadSourceConnection,
+    LeadSourceProvider,
+    OutgoingLead,
+)
 from app.models.outbound_campaign import OutboundCampaign
 from app.models.tenant_resources import TenantResources
 from app.services.exotel_bridge_service import ExotelBridgeService, ExotelWebSocketAdapter
 from app.services.nokvo_one_voice_pipeline import NokvoOneVoicePipeline
 from app.services.nokvo_one_voice_stream_service import NokvoOneVoiceStreamService
+from app.services.outgoing_lead_service import (
+    OutgoingLeadService,
+    OutgoingLeadServiceError,
+    decode_oauth_state,
+    lead_is_callable,
+)
 from app.services.outbound_campaign_service import OutboundCampaignService
 
 router = APIRouter()
@@ -99,6 +112,23 @@ async def _tenant_by_tenant_id(db: AsyncSession, tenant_id: str) -> TenantResour
         select(TenantResources).where(TenantResources.tenant_id == tenant_id)
     )
     return res.scalars().first()
+
+
+async def _connection_for_user(
+    db: AsyncSession,
+    tenant_res: TenantResources,
+    connection_id: uuid.UUID,
+) -> LeadSourceConnection:
+    res = await db.execute(
+        select(LeadSourceConnection).where(
+            LeadSourceConnection.id == connection_id,
+            LeadSourceConnection.tenant_id == tenant_res.tenant_id,
+        )
+    )
+    connection = res.scalars().first()
+    if connection is None:
+        raise HTTPException(status_code=404, detail="Lead source connection not found")
+    return connection
 
 
 async def _ws_user(websocket: WebSocket, db: AsyncSession) -> OrganizationUser | None:
@@ -171,6 +201,112 @@ class PhoneLinkConfigRequest(BaseModel):
     link_id: str | None = None
 
 
+class LeadOauthStartRequest(BaseModel):
+    provider: str = Field(pattern="^(meta_ads|google_ads|google_forms)$")
+    mode: str = "ads"
+
+
+class LeadConnectionUpdateRequest(BaseModel):
+    display_name: str | None = None
+    provider_account_id: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class LeadExternalFormRequest(BaseModel):
+    provider: LeadSourceProvider
+    name: str
+    provider_form_id: str
+    source_connection_id: uuid.UUID | None = None
+    field_mapping: dict[str, Any] = Field(default_factory=dict)
+    consent_field_key: str | None = None
+    consent_text: str | None = None
+    default_call_consent: bool = False
+
+
+class LeadNokvoFormRequest(BaseModel):
+    name: str
+    fields: list[dict[str, Any]] = Field(default_factory=list)
+    consent_text: str
+
+
+class PublicLeadFormSubmitRequest(BaseModel):
+    fields: dict[str, Any] = Field(default_factory=dict)
+
+
+def _enum_value(value: Any) -> Any:
+    return value.value if hasattr(value, "value") else value
+
+
+def _connection_response(connection: LeadSourceConnection) -> dict[str, Any]:
+    return {
+        "id": str(connection.id),
+        "provider": _enum_value(connection.provider),
+        "status": _enum_value(connection.status),
+        "display_name": connection.display_name,
+        "provider_account_id": connection.provider_account_id,
+        "scopes": connection.scopes or [],
+        "metadata": connection.metadata_ or {},
+        "last_sync_at": connection.last_sync_at.isoformat() if connection.last_sync_at else None,
+        "last_error": connection.last_error,
+        "created_at": connection.created_at.isoformat() if connection.created_at else None,
+    }
+
+
+def _form_public_url(request: Request, form: LeadCaptureForm) -> str | None:
+    if not form.public_slug:
+        return None
+    base = f"{request.url.scheme}://{request.url.netloc}"
+    return f"{base}/api/nokvo-one/agents/lead-sources/nokvo-forms/public/{form.public_slug}"
+
+
+def _form_response(form: LeadCaptureForm, request: Request | None = None) -> dict[str, Any]:
+    return {
+        "id": str(form.id),
+        "provider": _enum_value(form.provider),
+        "status": _enum_value(form.status),
+        "name": form.name,
+        "provider_form_id": form.provider_form_id,
+        "provider_account_id": form.provider_account_id,
+        "source_connection_id": str(form.source_connection_id) if form.source_connection_id else None,
+        "public_slug": form.public_slug,
+        "public_url": _form_public_url(request, form) if request else None,
+        "external_url": form.external_url,
+        "field_schema": form.field_schema or [],
+        "field_mapping": form.field_mapping or {},
+        "consent_field_key": form.consent_field_key,
+        "consent_text": form.consent_text,
+        "default_call_consent": form.default_call_consent,
+        "metadata": form.metadata_ or {},
+        "last_synced_at": form.last_synced_at.isoformat() if form.last_synced_at else None,
+        "created_at": form.created_at.isoformat() if form.created_at else None,
+    }
+
+
+def _lead_response(lead: OutgoingLead) -> dict[str, Any]:
+    return {
+        "id": str(lead.id),
+        "source_provider": _enum_value(lead.source_provider),
+        "source_connection_id": str(lead.source_connection_id) if lead.source_connection_id else None,
+        "capture_form_id": str(lead.capture_form_id) if lead.capture_form_id else None,
+        "provider_lead_id": lead.provider_lead_id,
+        "name": lead.name,
+        "email": lead.email,
+        "phone_raw": lead.phone_raw,
+        "phone_e164": lead.phone_e164,
+        "fields": lead.fields or {},
+        "source_metadata": lead.source_metadata or {},
+        "consent_status": _enum_value(lead.consent_status),
+        "consent_text": lead.consent_text,
+        "consent_field_key": lead.consent_field_key,
+        "consented_at": lead.consented_at.isoformat() if lead.consented_at else None,
+        "submitted_at": lead.submitted_at.isoformat() if lead.submitted_at else None,
+        "opt_out_at": lead.opt_out_at.isoformat() if lead.opt_out_at else None,
+        "call_status": _enum_value(lead.call_status),
+        "callable": lead_is_callable(lead),
+        "created_at": lead.created_at.isoformat() if lead.created_at else None,
+    }
+
+
 def _phone_link_summary(request: Request, tr: TenantResources) -> dict[str, Any]:
     link = dict((tr.provider_status or {}).get("agent_phone_link") or {})
     link_id = link.get("link_id")
@@ -227,6 +363,255 @@ async def set_phone_link(
     await db.commit()
     await db.refresh(tr)
     return _phone_link_summary(request, tr)
+
+
+# ────────────────────────── Lead sources and consented leads ──────────────────────────
+
+
+@router.get("/lead-sources/connections")
+async def list_lead_connections(
+    user: OrganizationUser = Depends(_viewer_dep()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tr = await _tenant_for_user(db, user)
+    connections = await OutgoingLeadService.list_connections(tr, db)
+    return [_connection_response(c) for c in connections]
+
+
+@router.post("/lead-sources/oauth/start")
+async def start_lead_oauth(
+    payload: LeadOauthStartRequest,
+    user: OrganizationUser = Depends(_admin_dep()),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tr = await _tenant_for_user(db, user)
+    try:
+        return OutgoingLeadService.oauth_start_url(
+            tr,
+            organization_id=user.organization_id,
+            user_id=user.id,
+            provider=payload.provider,
+            mode=payload.mode,
+        )
+    except OutgoingLeadServiceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/lead-sources/oauth/{provider}/callback")
+async def lead_oauth_callback(
+    provider: str,
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+    db: AsyncSession = Depends(deps.get_db),
+):
+    public_base = settings.NOKVO_ONE_PUBLIC_BASE_URL.rstrip("/") or "http://localhost:5173"
+    if error:
+        return RedirectResponse(f"{public_base}?lead_connection=error&provider={provider}")
+    if not code or not state:
+        raise HTTPException(status_code=400, detail="OAuth code and state are required")
+    try:
+        state_data = decode_oauth_state(state)
+        if state_data.get("provider") != provider:
+            raise OutgoingLeadServiceError("OAuth provider does not match state.")
+        tr = await _tenant_by_tenant_id(db, str(state_data["tenant_id"]))
+        if tr is None:
+            raise OutgoingLeadServiceError("Tenant resources not found for OAuth callback.")
+        await OutgoingLeadService.exchange_oauth_code(
+            db,
+            tenant_res=tr,
+            user_id=uuid.UUID(str(state_data["user_id"])),
+            provider=provider,
+            mode=str(state_data.get("mode") or ""),
+            code=code,
+        )
+    except OutgoingLeadServiceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return RedirectResponse(f"{public_base}?lead_connection=success&provider={provider}")
+
+
+@router.patch("/lead-sources/connections/{connection_id}")
+async def update_lead_connection(
+    connection_id: uuid.UUID,
+    payload: LeadConnectionUpdateRequest,
+    user: OrganizationUser = Depends(_admin_dep()),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tr = await _tenant_for_user(db, user)
+    connection = await _connection_for_user(db, tr, connection_id)
+    connection = await OutgoingLeadService.update_connection_metadata(
+        connection,
+        db,
+        metadata=payload.metadata,
+        display_name=payload.display_name,
+        provider_account_id=payload.provider_account_id,
+    )
+    return _connection_response(connection)
+
+
+@router.post("/lead-sources/connections/{connection_id}/sync")
+async def sync_lead_connection(
+    connection_id: uuid.UUID,
+    user: OrganizationUser = Depends(_admin_dep()),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tr = await _tenant_for_user(db, user)
+    connection = await _connection_for_user(db, tr, connection_id)
+    try:
+        return await OutgoingLeadService.sync_connection(connection, db)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/lead-sources/forms")
+async def list_lead_forms(
+    request: Request,
+    user: OrganizationUser = Depends(_viewer_dep()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tr = await _tenant_for_user(db, user)
+    forms = await OutgoingLeadService.list_forms(tr, db)
+    return [_form_response(form, request) for form in forms]
+
+
+@router.post("/lead-sources/forms", status_code=status.HTTP_201_CREATED)
+async def register_external_lead_form(
+    payload: LeadExternalFormRequest,
+    request: Request,
+    user: OrganizationUser = Depends(_admin_dep()),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tr = await _tenant_for_user(db, user)
+    if payload.source_connection_id:
+        await _connection_for_user(db, tr, payload.source_connection_id)
+    try:
+        form = await OutgoingLeadService.register_external_form(
+            tr,
+            db,
+            created_by_user_id=user.id,
+            provider=payload.provider,
+            name=payload.name,
+            provider_form_id=payload.provider_form_id,
+            source_connection_id=payload.source_connection_id,
+            field_mapping=payload.field_mapping,
+            consent_field_key=payload.consent_field_key,
+            consent_text=payload.consent_text,
+            default_call_consent=payload.default_call_consent,
+        )
+    except OutgoingLeadServiceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _form_response(form, request)
+
+
+@router.post("/lead-sources/nokvo-forms", status_code=status.HTTP_201_CREATED)
+async def create_nokvo_lead_form(
+    payload: LeadNokvoFormRequest,
+    request: Request,
+    user: OrganizationUser = Depends(_admin_dep()),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tr = await _tenant_for_user(db, user)
+    try:
+        form = await OutgoingLeadService.create_nokvo_form(
+            tr,
+            db,
+            created_by_user_id=user.id,
+            name=payload.name,
+            fields=payload.fields,
+            consent_text=payload.consent_text,
+        )
+    except OutgoingLeadServiceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _form_response(form, request)
+
+
+@router.get("/lead-sources/nokvo-forms/public/{slug}")
+async def get_public_nokvo_form(slug: str, request: Request, db: AsyncSession = Depends(deps.get_db)):
+    form = await OutgoingLeadService.get_public_form(slug, db)
+    if form is None:
+        raise HTTPException(status_code=404, detail="Form not found")
+    return _form_response(form, request)
+
+
+@router.post("/lead-sources/nokvo-forms/public/{slug}/submit", status_code=status.HTTP_201_CREATED)
+async def submit_public_nokvo_form(
+    slug: str,
+    payload: PublicLeadFormSubmitRequest,
+    request: Request,
+    db: AsyncSession = Depends(deps.get_db),
+):
+    form = await OutgoingLeadService.get_public_form(slug, db)
+    if form is None:
+        raise HTTPException(status_code=404, detail="Form not found")
+    try:
+        lead = await OutgoingLeadService.submit_public_form(
+            form,
+            db,
+            fields=payload.fields,
+            request_metadata={
+                "ip": request.client.host if request.client else None,
+                "user_agent": request.headers.get("user-agent"),
+                "referer": request.headers.get("referer"),
+            },
+        )
+    except OutgoingLeadServiceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "lead_id": str(lead.id)}
+
+
+@router.get("/lead-sources/leads")
+async def list_outgoing_leads(
+    eligible_only: bool = False,
+    limit: int = 200,
+    user: OrganizationUser = Depends(_viewer_dep()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tr = await _tenant_for_user(db, user)
+    leads = await OutgoingLeadService.list_leads(tr, db, eligible_only=eligible_only, limit=limit)
+    return [_lead_response(lead) for lead in leads]
+
+
+@router.get("/lead-sources/meta/webhook")
+async def verify_meta_leadgen_webhook(request: Request):
+    params = request.query_params
+    if (
+        params.get("hub.mode") == "subscribe"
+        and params.get("hub.verify_token") == settings.META_LEADGEN_WEBHOOK_VERIFY_TOKEN
+    ):
+        return PlainTextResponse(params.get("hub.challenge") or "")
+    raise HTTPException(status_code=403, detail="Meta webhook verification failed")
+
+
+@router.post("/lead-sources/meta/webhook")
+async def receive_meta_leadgen_webhook(request: Request, db: AsyncSession = Depends(deps.get_db)):
+    payload = await request.json()
+    imported = 0
+    errors: list[str] = []
+    for entry in payload.get("entry") or []:
+        for change in entry.get("changes") or []:
+            if change.get("field") != "leadgen":
+                continue
+            value = change.get("value") or {}
+            leadgen_id = value.get("leadgen_id")
+            form_id = value.get("form_id")
+            if not leadgen_id or not form_id:
+                continue
+            try:
+                lead = await OutgoingLeadService.ingest_meta_leadgen_event(
+                    db,
+                    form_id=str(form_id),
+                    leadgen_id=str(leadgen_id),
+                )
+                if lead:
+                    imported += 1
+            except Exception as exc:
+                errors.append(str(exc)[:200])
+    return {"ok": True, "imported": imported, "errors": errors[:5]}
 
 
 # ────────────────────────── Exotel inbound ──────────────────────────
@@ -357,7 +742,8 @@ async def list_campaigns(
 @router.post("/campaigns", status_code=status.HTTP_201_CREATED)
 async def create_campaign(
     name: str = Form(...),
-    excel_file: UploadFile = File(...),
+    lead_ids: str | None = Form(None),
+    excel_file: UploadFile | None = File(None),
     doc_file: UploadFile = File(...),
     from_number: str | None = Form(None),
     user: OrganizationUser = Depends(_admin_dep()),
@@ -366,15 +752,26 @@ async def create_campaign(
 ):
     tr = await _tenant_for_user(db, user)
     try:
-        campaign = await OutboundCampaignService.create_campaign(
+        parsed_lead_ids: list[uuid.UUID] = []
+        if lead_ids:
+            raw_ids = json.loads(lead_ids) if lead_ids.strip().startswith("[") else [x.strip() for x in lead_ids.split(",")]
+            parsed_lead_ids = [uuid.UUID(str(item)) for item in raw_ids if str(item).strip()]
+        if not parsed_lead_ids:
+            raise ValueError(
+                "Outgoing Agent campaigns can only be created from consented leads imported from Meta Ads, "
+                "Google Ads, Google Forms, or Nokvo forms."
+            )
+        campaign = await OutboundCampaignService.create_campaign_from_leads(
             tr,
             db,
             name=name,
-            excel_file=excel_file,
+            lead_ids=parsed_lead_ids,
             doc_file=doc_file,
             from_number=from_number,
         )
     except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OutgoingLeadServiceError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

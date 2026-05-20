@@ -158,6 +158,7 @@ def _assignment_response(
         max_active_requests=int(settings.max_active_requests or 100),
         max_requests_per_day=settings.max_requests_per_day,
         max_requests_per_hour=int(getattr(settings, "max_requests_per_hour", None) or 6),
+        appointment_duration_minutes=int(getattr(settings, "appointment_duration_minutes", None) or 30),
         active_request_count=active_count,
         availability_summary=summary,
     )
@@ -177,6 +178,7 @@ def _default_assignment_settings(organization_id: uuid.UUID, member_id: uuid.UUI
         max_active_requests=100,
         max_requests_per_day=None,
         max_requests_per_hour=6,
+        appointment_duration_minutes=30,
     )
 
 
@@ -267,6 +269,7 @@ async def update_assignment_settings(
     settings.max_active_requests = payload.max_active_requests
     settings.max_requests_per_day = payload.max_requests_per_day
     settings.max_requests_per_hour = payload.max_requests_per_hour
+    settings.appointment_duration_minutes = payload.appointment_duration_minutes
     db.add(settings)
     if organization.industry == "clinics" and settings.is_assignable:
         clinic_res = await db.execute(

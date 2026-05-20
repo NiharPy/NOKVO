@@ -36,6 +36,10 @@ class GoogleOAuthService:
                 audience=settings.GOOGLE_OAUTH_CLIENT_ID,
                 issuer=list(GOOGLE_ISSUERS),
             )
+        except jwt.PyJWKClientConnectionError as exc:
+            raise GoogleOAuthError("Could not reach Google to verify sign-in. Check backend network access and try again.") from exc
+        except jwt.PyJWKClientError as exc:
+            raise GoogleOAuthError("Google sign-in key verification failed. Try again in a moment.") from exc
         except jwt.PyJWTError as exc:
             raise GoogleOAuthError("Google OAuth token verification failed") from exc
 

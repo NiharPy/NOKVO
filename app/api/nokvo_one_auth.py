@@ -736,16 +736,15 @@ async def nokvo_one_login(
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
     if not user.totp_secret_encrypted_v2:
-        # Edge case: user has password but never finished TOTP setup. Re-issue setup token.
-        setup_token = _issue_setup_token(user.id, organization.id, stage="totp_setup")
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "code": "totp_setup_required",
-                "message": "Complete TOTP setup to continue.",
-                "setup_token": setup_token,
-            },
-        )
+        user.mfa_required = False
+        if user.status in {"invited", "pending_totp"}:
+            user.status = "active"
+        if organization.status == "pending_totp":
+            organization.status = "pending_approval"
+        db.add(user)
+        db.add(organization)
+        await db.flush()
+        return await _issue_full_session(db, request, user, organization, mfa_completed=False)
 
     temp_access = _issue_login_temp_token(user, organization.id)
     return {
@@ -798,6 +797,77 @@ async def nokvo_one_login_totp_verify(
         await db.flush()
 
     return await _issue_full_session(db, request, user, organization)
+
+
+# ─────────── Session MFA setup / step-up ───────────
+
+
+@router.post("/mfa/totp/setup", response_model=NokvoOneTOTPSetupResponse)
+@limiter.limit("10/hour")
+async def nokvo_one_session_totp_setup(
+    request: Request,
+    user: OrganizationUser = Depends(deps.get_current_organization_user),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Start TOTP setup from an already authenticated deferred-MFA session."""
+    org_res = await db.execute(select(Organization).where(Organization.id == user.organization_id))
+    organization = org_res.scalars().first()
+    if organization is None or organization.product_tier != "nokvo_one":
+        raise HTTPException(status_code=403, detail="Not a Nokvo One organization")
+    if organization.status not in {"pending_approval", "active", "suspended"}:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Organization status '{organization.status}' is not permitted on this endpoint",
+        )
+    if user.totp_secret_encrypted_v2:
+        raise HTTPException(status_code=409, detail="TOTP is already configured for this account")
+    secret = security.generate_totp_secret()
+    user.totp_secret_encrypted_v2 = encrypt_totp_secret(secret)
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+
+    setup_token = _issue_setup_token(user.id, user.organization_id, stage="totp_setup")
+    provisioning_uri = pyotp.TOTP(secret).provisioning_uri(name=user.email, issuer_name="Nokvo One")
+    return NokvoOneTOTPSetupResponse(
+        email=user.email,
+        secret=secret,
+        uri=provisioning_uri,
+        setup_token=setup_token,
+    )
+
+
+@router.post("/mfa/totp/verify", response_model=NokvoOneSessionResponse)
+@limiter.limit("20/hour")
+async def nokvo_one_session_totp_verify(
+    request: Request,
+    payload: NokvoOneLoginTOTPRequest,
+    user: OrganizationUser = Depends(deps.get_current_organization_user),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Verify TOTP for the current session and return an MFA-elevated token."""
+    if not user.totp_secret_encrypted_v2:
+        raise HTTPException(status_code=400, detail="TOTP has not been configured")
+    try:
+        secret = decrypt_totp_secret(user.totp_secret_encrypted_v2)
+    except TOTPDecryptionError as exc:
+        raise HTTPException(status_code=500, detail="TOTP secret could not be decrypted") from exc
+    if not security.verify_totp(secret, payload.code):
+        raise HTTPException(status_code=401, detail="Invalid TOTP code")
+
+    org_res = await db.execute(select(Organization).where(Organization.id == user.organization_id))
+    organization = org_res.scalars().first()
+    if organization is None or organization.product_tier != "nokvo_one":
+        raise HTTPException(status_code=403, detail="Not a Nokvo One organization")
+    if organization.status == "pending_totp":
+        organization.status = "pending_approval"
+        db.add(organization)
+    if user.status in {"invited", "pending_totp"}:
+        user.status = "active"
+    user.mfa_required = True
+    db.add(user)
+    await db.flush()
+    return await _issue_full_session(db, request, user, organization, mfa_completed=True)
 
 
 # ─────────── Google auth (sign-in AND sign-up) ───────────
@@ -912,9 +982,9 @@ async def nokvo_one_google_login(
             email=email,
             full_name=identity.get("full_name"),
             role="admin",
-            status="pending_totp",
+            status="active",
             auth_provider="google",
-            mfa_required=True,
+            mfa_required=False,
             email_verified=True,
         )
         db.add(user)
@@ -938,20 +1008,13 @@ async def nokvo_one_google_login(
             cleanup_required=False,
         )
         db.add(tenant_resources)
-        await db.commit()
-        await db.refresh(user)
-        await db.refresh(organization)
-
-        setup_token = _issue_setup_token(user.id, organization.id, stage="totp_setup")
-        return {
-            "code": "totp_setup_required",
-            "message": "Nokvo One organization created. Set up TOTP to finish signup.",
-            "setup_token": setup_token,
-            "organization_id": str(organization.id),
-            "email": email,
-            "created_via_google": True,
-            "provisioning": _summary_from_provision_dict(provision).model_dump(),
-        }
+        organization.status = "pending_approval"
+        await db.flush()
+        session = await _issue_full_session(db, request, user, organization, mfa_completed=False)
+        session_payload = session.model_dump(mode="json")
+        session_payload["created_via_google"] = True
+        session_payload["provisioning"] = _summary_from_provision_dict(provision).model_dump(mode="json")
+        return session_payload
 
     # ── Existing org path (sign-in) ───────────────────────────────────────────
     if organization.status == "suspended":
@@ -979,17 +1042,16 @@ async def nokvo_one_google_login(
 
     user.email_verified = True
     if not user.totp_secret_encrypted_v2:
-        setup_token = _issue_setup_token(user.id, organization.id, stage="totp_setup")
+        user.full_name = user.full_name or identity.get("full_name")
+        user.mfa_required = False
+        if user.status in {"invited", "pending_totp"}:
+            user.status = "active"
+        if organization.status == "pending_totp":
+            organization.status = "pending_approval"
         db.add(user)
-        await db.commit()
-        return {
-            "code": "totp_setup_required",
-            "message": "Complete TOTP setup to continue.",
-            "setup_token": setup_token,
-            "organization_id": str(organization.id),
-            "email": email,
-            "created_via_google": False,
-        }
+        db.add(organization)
+        await db.flush()
+        return await _issue_full_session(db, request, user, organization, mfa_completed=False)
 
     user.full_name = user.full_name or identity.get("full_name")
     db.add(user)
@@ -1052,7 +1114,7 @@ async def nokvo_one_refresh(
 
     access_token = security.create_access_token(
         subject=user.id,
-        mfa_completed=True,
+        mfa_completed=False,
         session_id=str(new_session.id),
         extra_claims={
             "principal_type": "organization_user",

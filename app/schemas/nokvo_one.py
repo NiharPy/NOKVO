@@ -340,6 +340,7 @@ class NokvoOneAssignmentSettingsResponse(BaseModel):
     max_active_requests: int = 100
     max_requests_per_day: Optional[int] = None
     max_requests_per_hour: int = 6
+    appointment_duration_minutes: int = 30
     active_request_count: int = 0
     availability_summary: str = "Not assignable"
 
@@ -354,6 +355,7 @@ class NokvoOneAssignmentSettingsUpdateRequest(BaseModel):
     max_active_requests: int = Field(default=100, ge=1, le=100)
     max_requests_per_day: Optional[int] = Field(default=None, ge=1, le=1000)
     max_requests_per_hour: int = Field(default=6, ge=1, le=100)
+    appointment_duration_minutes: int = Field(default=30, ge=5, le=480)
 
     @field_validator("timezone")
     @classmethod
@@ -441,6 +443,9 @@ class NokvoOneRequestAssignResponse(BaseModel):
     reason: Optional[str] = None
     active_load_count: Optional[int] = None
     skipped_member_reasons: dict[str, list[str]] = Field(default_factory=dict)
+    requested_time: Optional[datetime] = None
+    scheduled_time: Optional[datetime] = None
+    time_adjusted: bool = False
     timestamp: datetime
 
 

@@ -298,13 +298,29 @@ class SarvamVoiceService:
         )
         if not transcript and event_type not in {"speech_start", "speech_end", "data", "transcript"}:
             return None
-        is_final = event_type in {"data", "transcript"} or bool(
+        explicit_final = bool(
             data.get("is_final")
             or data.get("final")
             or data.get("finished")
             or payload.get("is_final")
             or payload.get("final")
         )
+        explicit_partial = bool(
+            data.get("is_partial")
+            or data.get("partial")
+            or payload.get("is_partial")
+            or payload.get("partial")
+        )
+        # Sarvam emits incremental "data" frames during a single utterance. Treat
+        # those as final ONLY when the payload doesn't explicitly flag them as
+        # partial — otherwise we accept partials as finals and the dedup logic
+        # downstream drops words mid-thought.
+        if event_type == "transcript":
+            is_final = True
+        elif event_type == "data":
+            is_final = (explicit_final or not explicit_partial) and bool(transcript)
+        else:
+            is_final = explicit_final
         language_code = data.get("language_code") or payload.get("language_code")
         return {
             "type": event_type or ("transcript" if transcript else "event"),

@@ -522,6 +522,9 @@ class PredefinedToolsService:
             if assignment.get("selected_member_name"):
                 response["assigned_member_name"] = assignment["selected_member_name"]
             response["assignment_status"] = assignment.get("assignment_status")
+            response["scheduled_time"] = assignment.get("scheduled_time")
+            response["requested_time"] = assignment.get("requested_time")
+            response["time_adjusted"] = bool(assignment.get("time_adjusted"))
         return response
 
     @staticmethod
@@ -920,6 +923,7 @@ class PredefinedToolsService:
                 "assignment_source": tool.key,
             },
         )
+        scheduled_time = (assignment or {}).get("scheduled_time")
         return {
             "ok": True,
             "lead_id": str(lead.id),
@@ -928,6 +932,9 @@ class PredefinedToolsService:
             "assignment": assignment,
             "assigned_member_name": assignment.get("selected_member_name") if assignment else None,
             "assignment_status": assignment.get("assignment_status") if assignment else None,
+            "scheduled_time": scheduled_time,
+            "requested_time": args["appointment_time"],
+            "time_adjusted": bool((assignment or {}).get("time_adjusted")),
         }
 
     @staticmethod
@@ -988,13 +995,16 @@ class PredefinedToolsService:
                 "assignment_source": tool.key,
             },
         )
+        scheduled_visit = (assignment or {}).get("scheduled_time") or args["visit_at"]
         return {
             "ok": True,
             "lead_id": str(lead.id),
             "lead_status": lead.status,
             "callback_id": str(callback.id),
             "callback_status": callback.status,
-            "scheduled_for": args["visit_at"],
+            "scheduled_for": scheduled_visit,
+            "requested_for": args["visit_at"],
+            "time_adjusted": bool((assignment or {}).get("time_adjusted")),
             "assignment": assignment,
             "assigned_member_name": assignment.get("selected_member_name") if assignment else None,
             "assignment_status": assignment.get("assignment_status") if assignment else None,
@@ -1201,12 +1211,17 @@ async def _assign_existing_record(
         metadata=metadata or {},
         record_type=rec.record_type,
     )
+    scheduled_time = assignment.get("scheduled_time")
+    requested_at_resp = assignment.get("requested_time")
     return {
         "assignment_status": assignment.get("assignment_status"),
         "selected_member_id": str(assignment["selected_member_id"]) if assignment.get("selected_member_id") else None,
         "selected_member_name": assignment.get("selected_member_name"),
         "reason": assignment.get("reason"),
         "skipped_member_reasons": assignment.get("skipped_member_reasons") or {},
+        "requested_time": requested_at_resp.isoformat() if isinstance(requested_at_resp, datetime) else requested_at_resp,
+        "scheduled_time": scheduled_time.isoformat() if isinstance(scheduled_time, datetime) else scheduled_time,
+        "time_adjusted": bool(assignment.get("time_adjusted")),
     }
 
 
