@@ -20,7 +20,13 @@ _openai_client: AsyncOpenAI | None = None
 _tenant_client_cache: dict[str, tuple[AsyncAzureOpenAI, str]] = {}
 _tenant_embedding_cache: dict[str, tuple[float, list[float]]] = {}
 _tenant_embedding_inflight: dict[str, asyncio.Task[list[float]]] = {}
-_EMBEDDING_CACHE_TTL_SECONDS = 30.0
+# Embedding vectors are stable for a given (tenant, deployment, normalized
+# text) pair. A 5-minute TTL keeps the vector for the lifetime of a typical
+# voice call so a repeated FAQ question (e.g. caller asks "what are your
+# hours" twice, or two callers ask within minutes) avoids the Azure
+# embedding round-trip entirely. The 512-entry LRU bound keeps the memory
+# footprint bounded (1536 floats × 4 bytes × 512 ≈ 3 MB).
+_EMBEDDING_CACHE_TTL_SECONDS = 300.0
 _EMBEDDING_CACHE_MAX_ITEMS = 512
 
 

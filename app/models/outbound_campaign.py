@@ -32,6 +32,22 @@ class OutboundCampaign(Base):
     doc_blob_path = Column(String, nullable=True)   # Azure Blob path
     doc_text = Column(Text, nullable=True)           # Full extracted text
 
+    # Proactive-agent configuration (separate from the KB context held
+    # in ``doc_text``). Shape::
+    #
+    #   {
+    #     "agent_prompt":   str,         # role / tone / drive instructions
+    #     "objectives":     [str, ...],  # ordered list of questions to land
+    #     "exit_conditions": [str, ...], # signals that the call is "done"
+    #     "tone":           str | null,  # "warm" | "neutral" | …
+    #   }
+    #
+    # Used by :func:`agent_outbound_context.load_outbound_context` to
+    # compose the per-campaign system prompt. When the column is empty
+    # the outbound agent falls back to the legacy ``campaign_goal``
+    # one-liner so existing campaigns keep working.
+    agent_config = Column(JSONB, nullable=False, default=dict, server_default="{}")
+
     # The Telnyx number used as caller ID for this campaign
     from_number = Column(String, nullable=True)
 

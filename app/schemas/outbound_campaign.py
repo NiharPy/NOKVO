@@ -42,3 +42,4 @@ class CampaignOut(BaseModel):
 
 class CampaignDetailOut(CampaignOut):
     contacts: list[dict[str, Any]] = []
+    agent_config: dict[str, Any] = {}

@@ -1,24 +1,17 @@
 <script setup>
-import { ref } from 'vue';
+import { ref, onMounted } from 'vue';
 import { Shield, LockKeyhole, Mail, KeyRound } from 'lucide-vue-next';
 import axios from 'axios';
 import QrcodeVue from 'qrcode.vue';
 import SuperAdminDashboard from './SuperAdminDashboard.vue';
 
-defineProps({
-  theme: {
-    type: String,
-    required: true,
-  },
-  toggleTheme: {
-    type: Function,
-    required: true,
-  },
-  homeSignal: {
-    type: Number,
-    required: true,
-  },
-});
+
+const theme = ref(localStorage.getItem('nokvo_dashboard_theme') || 'dark');
+const toggleTheme = () => {
+  theme.value = theme.value === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('nokvo_dashboard_theme', theme.value);
+  document.documentElement.dataset.theme = theme.value;
+};
 
 const email = ref('');
 const password = ref('');
@@ -131,8 +124,6 @@ const handleLogout = async () => {
   }
 };
 
-import { onMounted } from 'vue';
-
 onMounted(async () => {
   const token = localStorage.getItem(SUPERADMIN_ACCESS_TOKEN_KEY);
   if (token) {
@@ -150,7 +141,8 @@ onMounted(async () => {
 </script>
 
 <template>
-  <SuperAdminDashboard v-if="authStep === 'success'" :theme="theme" :toggle-theme="toggleTheme" :home-signal="homeSignal" @logout="handleLogout" />
+  <div :class="`theme-${theme}`" style="min-height:100vh;display:flex;align-items:center;justify-content:center;">
+  <SuperAdminDashboard v-if="authStep === 'success'" :theme="theme" :toggle-theme="toggleTheme" :home-signal="0" @logout="handleLogout" />
   <div v-else class="login-card">
     <div class="card-header">
       <div class="shield-container">
@@ -308,6 +300,7 @@ onMounted(async () => {
       <hr class="footer-divider" />
       <p class="footer-text">UNAUTHORIZED ACCESS IS LOGGED AND TRACED.</p>
     </div>
+  </div>
   </div>
 </template>
 

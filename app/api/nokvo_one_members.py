@@ -35,6 +35,7 @@ from app.schemas.nokvo_one import (
     NokvoOneInvitationContextResponse,
     NokvoOneInvitationResponse,
     NokvoOneMemberInviteRequest,
+    NokvoOneMemberTimetableResponse,
     NokvoOneTOTPSetupResponse,
     NokvoOneUserResponse,
 )
@@ -219,6 +220,116 @@ async def list_assignment_settings(
         )
         for member in members
     ]
+
+
+# ─────────── Member self-service ───────────
+#
+# A member-role user can't touch other members' settings, but they need
+# to see their own timetable and add/remove their own buffer or
+# unavailability blocks. These ``/me/...`` routes are registered BEFORE
+# the ``/{member_id}/...`` routes so FastAPI matches the literal ``me``
+# before attempting UUID coercion.
+
+
+@router.get("/me/timetable", response_model=NokvoOneMemberTimetableResponse)
+async def get_my_timetable(
+    user: OrganizationUser = Depends(
+        deps.RequireNokvoOneOrganization(allowed_statuses=["pending_approval", "active"])
+    ),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Caller's own assignment settings + blocked slots.
+
+    Members never get to see anyone else's schedule via this endpoint,
+    so it's safe to expose without a role gate beyond the org-membership
+    check.
+    """
+    organization = await _get_organization(db, user.organization_id)
+    res = await db.execute(
+        select(OrganizationMemberAssignmentSettings).where(
+            OrganizationMemberAssignmentSettings.organization_id == organization.id,
+            OrganizationMemberAssignmentSettings.member_id == user.id,
+        )
+    )
+    settings = res.scalars().first()
+    if settings is None:
+        settings = _default_assignment_settings(organization.id, user.id)
+    records = await NokvoOneAssignmentService._load_request_records(db, organization.id)
+    active_count = NokvoOneAssignmentService._active_load(records, user.id)
+    blocks_res = await db.execute(
+        select(MemberBlockedSlot)
+        .where(
+            MemberBlockedSlot.organization_id == organization.id,
+            MemberBlockedSlot.member_id == user.id,
+        )
+        .order_by(MemberBlockedSlot.start_time.asc())
+    )
+    blocked = [NokvoOneBlockedSlotResponse.model_validate(slot) for slot in blocks_res.scalars().all()]
+    return NokvoOneMemberTimetableResponse(
+        assignment=_assignment_response(settings, active_count),
+        blocked_slots=blocked,
+    )
+
+
+@router.post(
+    "/me/blocked-slots",
+    response_model=NokvoOneBlockedSlotResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_my_blocked_slot(
+    payload: NokvoOneBlockedSlotCreateRequest,
+    user: OrganizationUser = Depends(
+        deps.RequireNokvoOneOrganization(allowed_statuses=["pending_approval", "active"])
+    ),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Member adds a block on their own calendar.
+
+    Reused for both **buffer** (short break between requests) and
+    **unavailable** (longer time off). The semantic distinction lives in
+    the ``reason`` field — the scheduler treats both as hard blocks.
+    """
+    if payload.end_time <= payload.start_time:
+        raise HTTPException(status_code=400, detail="Blocked slot end_time must be after start_time")
+    slot = MemberBlockedSlot(
+        id=uuid.uuid4(),
+        organization_id=user.organization_id,
+        member_id=user.id,
+        start_time=payload.start_time,
+        end_time=payload.end_time,
+        reason=payload.reason,
+        repeat_rule=payload.repeat_rule,
+    )
+    db.add(slot)
+    await db.commit()
+    await db.refresh(slot)
+    return NokvoOneBlockedSlotResponse.model_validate(slot)
+
+
+@router.delete("/me/blocked-slots/{slot_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_my_blocked_slot(
+    slot_id: uuid.UUID,
+    user: OrganizationUser = Depends(
+        deps.RequireNokvoOneOrganization(allowed_statuses=["pending_approval", "active"])
+    ),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Member cancels one of their own blocks (mistaken buffer, came
+    back early from leave, etc.). Other members' blocks are invisible
+    here — the where-clause scopes by ``member_id == user.id``."""
+    res = await db.execute(
+        select(MemberBlockedSlot).where(
+            MemberBlockedSlot.id == slot_id,
+            MemberBlockedSlot.organization_id == user.organization_id,
+            MemberBlockedSlot.member_id == user.id,
+        )
+    )
+    slot = res.scalars().first()
+    if slot is None:
+        raise HTTPException(status_code=404, detail="Blocked slot not found")
+    await db.delete(slot)
+    await db.commit()
+    return None
 
 
 @router.put("/{member_id}/assignment-settings", response_model=NokvoOneAssignmentSettingsResponse)
@@ -432,6 +543,75 @@ async def create_blocked_slot(
     return NokvoOneBlockedSlotResponse.model_validate(slot)
 
 
+@router.delete("/{member_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def remove_member(
+    member_id: uuid.UUID,
+    inviter: OrganizationUser = Depends(
+        deps.RequireNokvoOneOrganization(
+            allowed_statuses=["pending_approval", "active"],
+            allowed_roles=["admin"],
+        )
+    ),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Soft-remove a member.
+
+    Login is disabled (``password_hash`` and ``totp_secret`` cleared,
+    ``status="removed"``) and any open invitations for them are
+    revoked. We don't hard-delete the row because several FKs
+    (``nokvo_one_agents.created_by``, ``nokvo_one_tool_records.created_by``,
+    ``outgoing_leads.created_by_user_id``, ``invited_by`` self-references)
+    don't cascade — preserving the row keeps audit trails intact and
+    lets the admin re-invite later by clearing ``status``.
+    """
+    if member_id == inviter.id:
+        raise HTTPException(status_code=400, detail="You can't remove your own account")
+    member = await _get_member(db, inviter.organization_id, member_id)
+    if member.status == "removed":
+        # Idempotent — already gone.
+        return None
+
+    # Block removing the last remaining admin so the org doesn't lock
+    # itself out.
+    if member.role == "admin":
+        other_admins_res = await db.execute(
+            select(OrganizationUser).where(
+                OrganizationUser.organization_id == inviter.organization_id,
+                OrganizationUser.role == "admin",
+                OrganizationUser.status != "removed",
+                OrganizationUser.id != member.id,
+            )
+        )
+        if other_admins_res.scalars().first() is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Can't remove the last admin. Promote another member to admin first.",
+            )
+
+    # Revoke any in-flight invitations for this user so the email link
+    # can't be used after removal.
+    now = datetime.now(timezone.utc)
+    invites_res = await db.execute(
+        select(MemberInvitation).where(
+            MemberInvitation.organization_user_id == member.id,
+            MemberInvitation.accepted_at.is_(None),
+            MemberInvitation.revoked_at.is_(None),
+        )
+    )
+    for invitation in invites_res.scalars().all():
+        invitation.revoked_at = now
+        db.add(invitation)
+
+    member.status = "removed"
+    member.password_hash = None
+    member.totp_secret_encrypted_v2 = None
+    member.email_verified = False
+    db.add(member)
+    await db.commit()
+    return None
+
+
 @router.post(
     "/invite",
     response_model=NokvoOneInvitationResponse,
@@ -464,29 +644,65 @@ async def invite_member(
             detail="Invitees must share the organization's work-email domain",
         )
 
+    # Re-invite policy: if a user row already exists for this email we
+    # only block when the seat is actively in use (``active`` /
+    # ``pending_totp`` — they've started or finished onboarding). Rows
+    # in ``invited`` (email never reached them) or ``removed`` (admin
+    # took them out and now wants them back) are recycled so we don't
+    # accumulate orphan rows + the admin can always resend.
     existing_res = await db.execute(
         select(OrganizationUser).where(
             OrganizationUser.organization_id == organization.id,
             OrganizationUser.email == email,
         )
     )
-    if existing_res.scalars().first() is not None:
-        raise HTTPException(status_code=409, detail="A member with this email already exists")
-
-    invitee = OrganizationUser(
-        id=uuid.uuid4(),
-        organization_id=organization.id,
-        invited_by=inviter.id,
-        email=email,
-        full_name=payload.full_name,
-        role=payload.role,
-        status="invited",
-        auth_provider="password",
-        mfa_required=True,
-        email_verified=False,
-    )
-    db.add(invitee)
-    await db.flush()
+    existing = existing_res.scalars().first()
+    now = datetime.now(timezone.utc)
+    if existing is not None:
+        if existing.status in {"active", "pending_totp"}:
+            raise HTTPException(
+                status_code=409,
+                detail="A member with this email already exists",
+            )
+        # Recycle the row. Reset auth state so the new invite link is
+        # the only path to access; revoke any prior open invitations so
+        # an older email link can't be redeemed concurrently.
+        existing.role = payload.role
+        existing.status = "invited"
+        existing.full_name = payload.full_name or existing.full_name
+        existing.invited_by = inviter.id
+        existing.auth_provider = "password"
+        existing.mfa_required = True
+        existing.email_verified = False
+        existing.password_hash = None
+        existing.totp_secret_encrypted_v2 = None
+        old_invites_res = await db.execute(
+            select(MemberInvitation).where(
+                MemberInvitation.organization_user_id == existing.id,
+                MemberInvitation.accepted_at.is_(None),
+                MemberInvitation.revoked_at.is_(None),
+            )
+        )
+        for invitation in old_invites_res.scalars().all():
+            invitation.revoked_at = now
+            db.add(invitation)
+        db.add(existing)
+        invitee = existing
+    else:
+        invitee = OrganizationUser(
+            id=uuid.uuid4(),
+            organization_id=organization.id,
+            invited_by=inviter.id,
+            email=email,
+            full_name=payload.full_name,
+            role=payload.role,
+            status="invited",
+            auth_provider="password",
+            mfa_required=True,
+            email_verified=False,
+        )
+        db.add(invitee)
+        await db.flush()
 
     raw = secrets.token_urlsafe(32)
     invitation = MemberInvitation(
@@ -497,7 +713,7 @@ async def invite_member(
         email=email,
         role=payload.role,
         token_hash=_hash_token(raw),
-        expires_at=datetime.now(timezone.utc) + timedelta(hours=settings.NOKVO_ONE_INVITE_TOKEN_TTL_HOURS),
+        expires_at=now + timedelta(hours=settings.NOKVO_ONE_INVITE_TOKEN_TTL_HOURS),
     )
     db.add(invitation)
     await db.commit()

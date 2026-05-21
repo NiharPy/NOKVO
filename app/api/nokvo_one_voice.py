@@ -179,6 +179,22 @@ async def get_runtime_status(
     return NokvoOneVoicePipeline.runtime_status(tr)
 
 
+@router.get("/runtime/health")
+async def get_runtime_health(
+    window_hours: int = 24,
+    user: OrganizationUser = Depends(_viewer_dep()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Operator triage view: retry queue depth, recent outcome
+    distribution + failure rate, and KB source freshness. ``window_hours``
+    bounds the outcome window (default 24h)."""
+    from app.services.agent_runtime_health import build_health_report
+
+    tr = await _tenant_for_user(db, user)
+    window = max(1, min(int(window_hours), 24 * 30))
+    return await build_health_report(db, tr, window_hours=window)
+
+
 # ────────────────────────── Browser voice tester ──────────────────────────
 
 
@@ -722,11 +738,29 @@ def _campaign_response(c: OutboundCampaign) -> dict[str, Any]:
         "answered_count": c.answered_count or 0,
         "failed_count": c.failed_count or 0,
         "contacts": c.contacts or [],
+        "agent_config": c.agent_config or {},
         "doc_blob_path": c.doc_blob_path,
         "created_at": c.created_at.isoformat() if c.created_at else None,
         "started_at": c.started_at.isoformat() if c.started_at else None,
         "completed_at": c.completed_at.isoformat() if c.completed_at else None,
     }
+
+
+def _parse_campaign_list_field(value: str | None) -> list[str]:
+    if not value:
+        return []
+    raw = value.strip()
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        parsed = raw.splitlines()
+    if isinstance(parsed, str):
+        parsed = parsed.splitlines()
+    if not isinstance(parsed, list):
+        return []
+    return [str(item).strip() for item in parsed if str(item).strip()]
 
 
 @router.get("/campaigns")
@@ -746,6 +780,11 @@ async def create_campaign(
     excel_file: UploadFile | None = File(None),
     doc_file: UploadFile = File(...),
     from_number: str | None = Form(None),
+    agent_prompt: str | None = Form(None),
+    objectives: str | None = Form(None),
+    exit_conditions: str | None = Form(None),
+    tone: str | None = Form(None),
+    silence_timeout_seconds: float | None = Form(None),
     user: OrganizationUser = Depends(_admin_dep()),
     _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
     db: AsyncSession = Depends(deps.get_db),
@@ -768,6 +807,13 @@ async def create_campaign(
             lead_ids=parsed_lead_ids,
             doc_file=doc_file,
             from_number=from_number,
+            agent_config={
+                "agent_prompt": agent_prompt,
+                "objectives": _parse_campaign_list_field(objectives),
+                "exit_conditions": _parse_campaign_list_field(exit_conditions),
+                "tone": tone,
+                "silence_timeout_seconds": silence_timeout_seconds,
+            },
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

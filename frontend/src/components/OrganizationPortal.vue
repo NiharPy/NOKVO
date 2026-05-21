@@ -1,5 +1,6 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue';
+import { useRouter } from 'vue-router';
 import {
   ArrowUpDown,
   Bell,
@@ -35,6 +36,13 @@ const ORG_REFRESH_TOKEN_KEY = 'org_refresh_token';
 const ORG_THEME_MODE_KEY = 'org_theme_mode';
 const TOOLKIT_REGISTRY_PREVIEW_LIMIT = 4;
 
+const props = defineProps({
+  initialAuthState: {
+    type: String,
+    default: 'login',
+  },
+});
+const router = useRouter();
 const authConfig = ref(null);
 const orgShellRef = ref(null);
 const authState = ref('loading');

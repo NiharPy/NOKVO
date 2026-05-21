@@ -288,7 +288,7 @@ class OutgoingLeadService:
         if provider == "meta_ads":
             token_data = await OutgoingLeadService._exchange_meta_code(code)
             scopes = META_SCOPES
-            display_name = "Meta Ads"
+            display_name = "Instagram Ads" if mode == "instagram_ads" else "Facebook Ads"
             provider_enum = LeadSourceProvider.meta_ads
         elif provider in {"google_ads", "google_forms"}:
             token_data = await OutgoingLeadService._exchange_google_code(code)

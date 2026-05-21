@@ -426,6 +426,16 @@ class NokvoOneBlockedSlotResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class NokvoOneMemberTimetableResponse(BaseModel):
+    """Caller's own timetable: working-hours assignment + blocked slots.
+
+    Returned by ``GET /members/me/timetable``. The member dashboard
+    renders this directly without needing admin-scoped endpoints.
+    """
+    assignment: NokvoOneAssignmentSettingsResponse
+    blocked_slots: list[NokvoOneBlockedSlotResponse] = Field(default_factory=list)
+
+
 class NokvoOneRequestAssignRequest(BaseModel):
     request_type: str = Field(min_length=1, max_length=80)
     record_type: str = Field(default="request", max_length=40)

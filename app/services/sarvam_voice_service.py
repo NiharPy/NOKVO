@@ -35,6 +35,22 @@ _BCP47_TO_SHORT = {item["bcp47"].lower(): item["code"] for item in SARVAM_LANGUA
 
 
 class SarvamVoiceService:
+    # Shared httpx client for Sarvam REST endpoints (STT + TTS). The previous
+    # implementation opened a fresh AsyncClient per call, which paid a TLS
+    # handshake every TTS sentence and every STT fragment. A long-lived
+    # client keeps the connection pool warm so subsequent calls re-use the
+    # established TLS session — typically saves 80-200 ms per request.
+    _http: httpx.AsyncClient | None = None
+
+    @classmethod
+    def http_client(cls) -> httpx.AsyncClient:
+        if cls._http is None or cls._http.is_closed:
+            cls._http = httpx.AsyncClient(
+                timeout=httpx.Timeout(35.0),
+                limits=httpx.Limits(max_connections=32, max_keepalive_connections=16),
+            )
+        return cls._http
+
     @staticmethod
     def normalize_language(language: str | None) -> str:
         raw = (language or "en").strip().lower()
@@ -164,13 +180,13 @@ class SarvamVoiceService:
             data["mode"] = stt_mode
         files = {"file": (filename, audio_bytes, content_type or "application/octet-stream")}
         endpoint = provider_status.get("sarvam_stt_rest_url") or settings.SARVAM_STT_REST_URL
-        async with httpx.AsyncClient(timeout=httpx.Timeout(35.0)) as client:
-            response = await SarvamVoiceService._stt_post_with_retry(
-                client, endpoint, api_key, data, files
-            )
-            if response.status_code >= 400:
-                raise RuntimeError(f"Sarvam STT failed ({response.status_code}): {response.text[:300]}")
-            payload = response.json()
+        client = SarvamVoiceService.http_client()
+        response = await SarvamVoiceService._stt_post_with_retry(
+            client, endpoint, api_key, data, files
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(f"Sarvam STT failed ({response.status_code}): {response.text[:300]}")
+        payload = response.json()
         language_code = payload.get("language_code")
         return {
             "request_id": payload.get("request_id"),
@@ -208,15 +224,15 @@ class SarvamVoiceService:
         if "/speech-to-text-translate" not in translate_endpoint:
             translate_endpoint = "https://api.sarvam.ai/speech-to-text-translate"
         files = {"file": (filename, audio_bytes, content_type or "application/octet-stream")}
-        async with httpx.AsyncClient(timeout=httpx.Timeout(20.0)) as client:
-            response = await SarvamVoiceService._stt_post_with_retry(
-                client, translate_endpoint, api_key, {"model": translate_model}, files,
+        client = SarvamVoiceService.http_client()
+        response = await SarvamVoiceService._stt_post_with_retry(
+            client, translate_endpoint, api_key, {"model": translate_model}, files,
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"Sarvam translate STT failed ({response.status_code}): {response.text[:300]}"
             )
-            if response.status_code >= 400:
-                raise RuntimeError(
-                    f"Sarvam translate STT failed ({response.status_code}): {response.text[:300]}"
-                )
-            payload = response.json()
+        payload = response.json()
         return {
             "request_id": payload.get("request_id"),
             "transcript": str(payload.get("transcript") or "").strip(),
@@ -368,29 +384,31 @@ class SarvamVoiceService:
         if loudness is not None:
             prosody_body["loudness"] = max(0.1, min(3.0, float(loudness)))
         body.update(prosody_body)
-        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+        client = SarvamVoiceService.http_client()
+        response = await client.post(
+            endpoint,
+            headers={"api-subscription-key": api_key, "Content-Type": "application/json"},
+            json=body,
+            timeout=httpx.Timeout(30.0),
+        )
+        # Retry once without prosody params if the server rejects the
+        # request — saves the entire turn from going silent when a
+        # tenant is on a model that doesn't support pace/pitch/loudness.
+        if response.status_code >= 400 and prosody_body:
+            first_err = response.text[:300]
+            print(f"[NOKVO-TTS] Sarvam rejected prosody params ({response.status_code}): {first_err!r}; retrying without prosody")
+            retry_body = {k: v for k, v in body.items() if k not in prosody_body}
             response = await client.post(
                 endpoint,
                 headers={"api-subscription-key": api_key, "Content-Type": "application/json"},
-                json=body,
+                json=retry_body,
+                timeout=httpx.Timeout(30.0),
             )
-            # Retry once without prosody params if the server rejects the
-            # request — saves the entire turn from going silent when a
-            # tenant is on a model that doesn't support pace/pitch/loudness.
-            if response.status_code >= 400 and prosody_body:
-                first_err = response.text[:300]
-                print(f"[NOKVO-TTS] Sarvam rejected prosody params ({response.status_code}): {first_err!r}; retrying without prosody")
-                retry_body = {k: v for k, v in body.items() if k not in prosody_body}
-                response = await client.post(
-                    endpoint,
-                    headers={"api-subscription-key": api_key, "Content-Type": "application/json"},
-                    json=retry_body,
-                )
-            if response.status_code >= 400:
-                error_body = response.text[:300]
-                print(f"[NOKVO-TTS] Sarvam TTS failed ({response.status_code}): {error_body!r}")
-                raise RuntimeError(f"Sarvam TTS failed ({response.status_code}): {error_body}")
-            payload = response.json()
+        if response.status_code >= 400:
+            error_body = response.text[:300]
+            print(f"[NOKVO-TTS] Sarvam TTS failed ({response.status_code}): {error_body!r}")
+            raise RuntimeError(f"Sarvam TTS failed ({response.status_code}): {error_body}")
+        payload = response.json()
         return {
             "request_id": payload.get("request_id"),
             "audios": list(payload.get("audios") or []),

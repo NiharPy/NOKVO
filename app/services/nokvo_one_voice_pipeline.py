@@ -24,6 +24,20 @@ from app.services.agent_knowledge_service import (
     AGENT_SINGLE_PROMPT_CONFIG_KEY,
     AgentKnowledgeService,
 )
+from app.services.agent_outbound_context import (
+    OutboundCampaignContext,
+    compose_outbound_system_section,
+)
+from app.services.agent_robustness import (
+    CLARIFY_ESCALATE,
+    CLARIFY_NUDGE,
+    CLARIFY_OFFER_OPTIONS,
+    CLARIFY_RESET,
+    ClarificationState,
+    clarification_prompt,
+    is_turn_vague,
+)
+from app.services.agent_runtime_bundle import RuntimeBundle, get_bundle as get_runtime_bundle
 from app.services.dynamic_tool_resolver import resolve_index
 from app.services.agent_session_store import AgentSessionStore
 from app.services.azure_keyvault_service import AzureKeyVaultService
@@ -73,7 +87,7 @@ from app.services.qdrant_service import QdrantService
 from app.services.sarvam_voice_service import SARVAM_LANGUAGE_OPTIONS, SarvamVoiceService
 from app.services.text_embedding_service import TextEmbeddingService
 from app.services.tool_flow_policy import evaluate_tool_flow_policy
-from app.services.tool_flow_questions import build_tool_flow_questions
+from app.services.tool_flow_questions import build_tool_flow_questions, format_field_questions_prompt
 from app.services.voice_turn_policy import evaluate_voice_turn_policy
 
 
@@ -449,6 +463,42 @@ class NokvoOneVoicePipeline:
         }.get(language, "I do not have enough information to answer that. I can escalate this to support.")
 
     @staticmethod
+    def _is_refusal(answer: str, language: str) -> bool:
+        """Single source of truth for the LLM-refused check. Previously
+        inlined as ``answer == _refusal(language)`` in both
+        ``answer_text`` and ``stream_answer_sentences`` — identical
+        logic in two places. Centralising it means a change to the
+        refusal phrase flows through one comparator."""
+        if not answer:
+            return True
+        return str(answer).strip() == NokvoOneVoicePipeline._refusal(language).strip()
+
+    @staticmethod
+    def _no_context_answer(
+        user_text: str,
+        *,
+        intent: str | None,
+        language: str,
+        company_name: str | None,
+    ) -> tuple[str, bool]:
+        """Pick the caller-facing reply for the no-retrieved-chunks path.
+
+        Returns ``(answer, refused)``. The branches were previously
+        duplicated between ``answer_text`` and ``stream_answer_sentences``;
+        drift between the two copies would surface as a chat reply that
+        differs from the voice reply for the same input. One helper
+        keeps them honest.
+        """
+        if _SMALLTALK_RE.match(user_text or ""):
+            return (
+                NokvoOneVoicePipeline._smalltalk_reply(user_text, language, company_name),
+                False,
+            )
+        if intent == INTENT_UNKNOWN_GENERAL:
+            return NokvoOneVoicePipeline._open_question(language), False
+        return NokvoOneVoicePipeline._refusal(language), True
+
+    @staticmethod
     def _rate_limited_reply(language: str) -> str:
         """Specific fallback for Azure OpenAI 429s. The generic refusal sounds
         like 'I can't help' — this sounds like 'try again', which is the
@@ -602,9 +652,30 @@ class NokvoOneVoicePipeline:
         campaign_id: str | None = None,
         intent_result: IntentResult | None = None,
         english_text: str | None = None,
+        dual_retrieval: bool = False,
     ) -> dict[str, Any]:
         if not query.strip():
             return {"query": query, "chunks": [], "refusal": "Empty query."}
+        # Dual retrieval (code-switching path): when the call is actively
+        # code-switching between two languages, embedding only the
+        # "best" form of the query misses chunks indexed under the other
+        # form. We embed BOTH the primary and the secondary form, search
+        # in parallel, and union the chunks by chunk_id. Cost: one extra
+        # Qdrant search + one extra embedding (almost always a cache hit).
+        if (
+            dual_retrieval
+            and english_text
+            and _normalize(english_text).lower() != _normalize(query).lower()
+        ):
+            return await NokvoOneVoicePipeline._retrieve_dual(
+                tenant_res,
+                primary=query,
+                secondary=english_text,
+                db=db,
+                top_k=top_k,
+                campaign_id=campaign_id,
+                intent_result=intent_result,
+            )
         provider_status = dict(tenant_res.provider_status or {})
         policy_version = str(provider_status.get("agent_policy_version") or "")
 
@@ -775,6 +846,86 @@ class NokvoOneVoicePipeline:
         }
 
     @staticmethod
+    async def _retrieve_dual(
+        tenant_res: TenantResources,
+        *,
+        primary: str,
+        secondary: str,
+        db: AsyncSession | None,
+        top_k: int | None,
+        campaign_id: str | None,
+        intent_result: IntentResult | None,
+    ) -> dict[str, Any]:
+        """Code-switch retrieval helper.
+
+        Runs the primary and secondary queries against Qdrant in parallel
+        and unions the chunks by ``chunk_id``, keeping the higher score
+        for any duplicates. Limits the merged set to a reasonable
+        ``top_k`` so the LLM prompt stays bounded.
+        """
+        # We deliberately recurse into ``retrieve`` with dual_retrieval=
+        # False so each side does its own single-query search.
+        primary_task = asyncio.create_task(
+            NokvoOneVoicePipeline.retrieve(
+                tenant_res,
+                primary,
+                db=db,
+                top_k=top_k,
+                campaign_id=campaign_id,
+                intent_result=intent_result,
+                english_text=None,
+                dual_retrieval=False,
+            )
+        )
+        secondary_task = asyncio.create_task(
+            NokvoOneVoicePipeline.retrieve(
+                tenant_res,
+                secondary,
+                db=db,
+                top_k=top_k,
+                campaign_id=campaign_id,
+                intent_result=intent_result,
+                english_text=None,
+                dual_retrieval=False,
+            )
+        )
+        primary_res, secondary_res = await asyncio.gather(
+            primary_task, secondary_task, return_exceptions=False
+        )
+
+        merged: dict[str, dict[str, Any]] = {}
+        for source_label, res in (("primary", primary_res), ("secondary", secondary_res)):
+            for chunk in res.get("chunks") or []:
+                key = str(chunk.get("chunk_id") or chunk.get("document_id") or "")
+                if not key:
+                    continue
+                if key not in merged or float(chunk.get("score") or 0.0) > float(
+                    merged[key].get("score") or 0.0
+                ):
+                    merged[key] = chunk
+        chunks = sorted(
+            merged.values(),
+            key=lambda c: float(c.get("score") or 0.0),
+            reverse=True,
+        )
+        # Bound the merged list to a sensible cap — code-switch retrieval
+        # naturally inflates the chunk count and we don't want to pay
+        # the prompt-size cost.
+        effective_top_k = top_k or settings.AGENT_RETRIEVAL_TOP_K
+        chunks = chunks[: max(effective_top_k, 4)]
+        sensitive = bool(intent_result and intent_result.sensitive)
+        return {
+            "query": primary,
+            "secondary_query": secondary,
+            "chunks": chunks,
+            "refusal": None if chunks else "No indexed tenant context matched this question.",
+            "sensitive": sensitive,
+            "min_score": primary_res.get("min_score") or secondary_res.get("min_score"),
+            "top_k": effective_top_k,
+            "dual_retrieval": True,
+        }
+
+    @staticmethod
     def _policy_card_chunks(tenant_res: TenantResources, policy_version: str) -> list[dict[str, Any]]:
         """Synthesize retrieval chunks from active policy cards.
 
@@ -823,6 +974,10 @@ class NokvoOneVoicePipeline:
 
     @staticmethod
     def _single_prompt_guidance(tenant_res: TenantResources) -> str:
+        # Synchronous read straight off ``provider_status`` — used by
+        # branches that can't await (template router decisions). The async
+        # ``_voice_business_context`` path uses the cached bundle which
+        # contains the same string.
         provider_status = dict(tenant_res.provider_status or {})
         config = provider_status.get(AGENT_SINGLE_PROMPT_CONFIG_KEY) or {}
         if not isinstance(config, dict) or not config.get("enabled"):
@@ -839,16 +994,11 @@ class NokvoOneVoicePipeline:
         db: AsyncSession | None,
         tenant_res: TenantResources,
     ) -> tuple[Organization, dict[str, Any], list[dict[str, Any]]] | None:
-        """Thin wrapper around the unified runtime-context builder.
-        Keeps the legacy tuple shape so existing pipeline branches don't
-        need to change in one go — new code should call
-        :func:`agent_runtime_context.build` directly."""
-        from app.services.agent_runtime_context import build as _build_runtime_context
-
-        ctx = await _build_runtime_context(db, tenant_res, surface="voice_inbound")
-        if ctx is None:
-            return None
-        return ctx.as_legacy_business_context_tuple()
+        """Resolve the ``(organization, overrides, custom_tabs)`` tuple via
+        the per-tenant :class:`RuntimeBundle` cache so repeat turns avoid a
+        DB round-trip and a custom_tabs rebuild."""
+        bundle = await get_runtime_bundle(db, tenant_res)
+        return bundle.as_business_context_tuple()
 
     @staticmethod
     def _parse_appointment_date(value: Any, *, now: datetime | None = None) -> datetime.date:
@@ -1849,6 +1999,9 @@ class NokvoOneVoicePipeline:
         company_name: str | None = None,
         campaign_goal: str | None = None,
         single_prompt_guidance: str | None = None,
+        outbound_context: OutboundCampaignContext | None = None,
+        covered_objectives: list[str] | None = None,
+        field_questions_prompt: str | None = None,
     ) -> list[dict[str, str]]:
         language_label = SarvamVoiceService.language_label(language)
         context_parts: list[str] = []
@@ -1862,11 +2015,21 @@ class NokvoOneVoicePipeline:
             remaining -= len(excerpt)
             if remaining <= 0:
                 break
-        campaign_rule = (
-            f"Campaign goal: {campaign_goal}. Follow this goal, but still use only the supplied context."
-            if campaign_goal
-            else "This is an inbound support conversation unless campaign context says otherwise."
+        # Outbound campaign system fragment. When the campaign config
+        # has an explicit agent_prompt + objectives we drop in a full
+        # proactive-mode block; otherwise we fall back to the legacy
+        # one-liner that previously lived here.
+        outbound_section = compose_outbound_system_section(
+            outbound_context, covered_objectives=covered_objectives
         )
+        if outbound_section:
+            campaign_rule = outbound_section
+        elif campaign_goal:
+            campaign_rule = (
+                f"Campaign goal: {campaign_goal}. Follow this goal, but still use only the supplied context."
+            )
+        else:
+            campaign_rule = "This is an inbound support conversation unless campaign context says otherwise."
         custom_guidance = (single_prompt_guidance or "").strip()
         brand = "the configured business" if custom_guidance else (company_name or "the tenant")
         custom_guidance_section = (
@@ -1952,7 +2115,12 @@ class NokvoOneVoicePipeline:
             "If they accepted but hadn't started preparing, 80% is refundable. Do you know the status when you cancelled?'\n"
             "7. Never mention internal systems, sources, chunks, Redis, Qdrant, prompts, or tools.\n\n"
             f"# CAMPAIGN\n{campaign_rule}\n\n"
-            f"# REMINDER\nReply in {language_label}. Do not switch languages."
+            + (
+                f"{field_questions_prompt}\n\n"
+                if field_questions_prompt
+                else ""
+            )
+            + f"# REMINDER\nReply in {language_label}. Do not switch languages."
         )
 
         messages: list[dict[str, str]] = [
@@ -2175,6 +2343,72 @@ class NokvoOneVoicePipeline:
         return list(provider_status.get(AGENT_POLICY_CARDS_KEY) or [])
 
     @staticmethod
+    async def _apply_clarification(
+        tenant_res: TenantResources,
+        call_id: str | None,
+        *,
+        turn_cache: dict[str, Any],
+        user_text: str,
+        route: str,
+        intent: str | None,
+        refused: bool,
+        chunks: list[dict[str, Any]] | None,
+        state_slot: str | None,
+        language: str,
+        original_answer: str,
+    ) -> tuple[str, str | None, ClarificationState]:
+        """Apply the clarification FSM to a freshly-completed turn.
+
+        Returns a tuple ``(answer, action, state)`` where:
+
+        * ``answer`` is the final caller-facing text. When the FSM has
+          escalated, the original ``original_answer`` is replaced with
+          the matching multilingual prompt (options menu or handoff).
+        * ``action`` is the FSM verdict (``CLARIFY_RESET`` /
+          ``CLARIFY_NUDGE`` / ``CLARIFY_OFFER_OPTIONS`` /
+          ``CLARIFY_ESCALATE``) for logging.
+        * ``state`` is the updated :class:`ClarificationState` to be
+          persisted back to the session blob.
+
+        The FSM is hydrated from ``turn_cache["state"]`` (already loaded
+        by ``_prime_turn_cache``) so this method never adds an extra
+        Redis round-trip.
+        """
+        session_state = dict(turn_cache.get("state") or {})
+        state = ClarificationState.from_dict(session_state.get("clarification"))
+        vague = is_turn_vague(
+            route=route,
+            intent=intent,
+            refused=refused,
+            chunks=chunks,
+            user_text=user_text,
+            state_slot=state_slot,
+        )
+        if not vague:
+            if state.consecutive_vague_turns:
+                state.reset()
+                if call_id:
+                    await AgentSessionStore.merge_state(
+                        tenant_res, call_id, {"clarification": state.to_dict()}
+                    )
+            return original_answer, CLARIFY_RESET, state
+
+        state.bump(user_text)
+        action = state.action()
+        # NUDGE: leave the existing ``original_answer`` (open-question /
+        # refusal). OFFER_OPTIONS + ESCALATE override the answer so the
+        # caller hears something concrete instead of the third "sorry,
+        # I missed that" in a row.
+        answer = original_answer
+        if action in (CLARIFY_OFFER_OPTIONS, CLARIFY_ESCALATE):
+            answer = clarification_prompt(action, language)
+        if call_id:
+            await AgentSessionStore.merge_state(
+                tenant_res, call_id, {"clarification": state.to_dict()}
+            )
+        return answer, action, state
+
+    @staticmethod
     def _log_route(route_payload: dict[str, Any]) -> None:
         """Single structured log line per turn. Customer responses are never
         included here; only routing metadata for observability."""
@@ -2293,6 +2527,80 @@ class NokvoOneVoicePipeline:
         return None
 
     @staticmethod
+    async def _turn_history(
+        tenant_res: TenantResources,
+        call_id: str | None,
+        turn_cache: dict[str, Any],
+    ) -> list[dict[str, str]]:
+        """Cached ``get_history``. The first call within a turn fetches from
+        Redis; later calls within the same turn return the in-memory copy.
+        This collapses the previous 2-3 Redis GETs per turn into one."""
+        cached = turn_cache.get("history")
+        if cached is not None:
+            return list(cached)
+        history = await AgentSessionStore.get_history(tenant_res, call_id)
+        turn_cache["history"] = list(history)
+        return list(history)
+
+    @staticmethod
+    async def _turn_state(
+        tenant_res: TenantResources,
+        call_id: str | None,
+        turn_cache: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Cached ``get_state``. See :meth:`_turn_history`."""
+        cached = turn_cache.get("state")
+        if cached is not None:
+            return dict(cached)
+        state = await AgentSessionStore.get_state(tenant_res, call_id)
+        turn_cache["state"] = dict(state or {})
+        return dict(state or {})
+
+    @staticmethod
+    async def _turn_bundle(
+        db: AsyncSession | None,
+        tenant_res: TenantResources,
+        turn_cache: dict[str, Any],
+    ) -> RuntimeBundle:
+        """Cached runtime-bundle resolver. Shared by the inline ``industry``
+        lookup, ``_voice_business_context``, and any other helper that
+        needs tenant-stable state within the same turn."""
+        cached = turn_cache.get("bundle")
+        if cached is not None:
+            return cached
+        bundle = await get_runtime_bundle(db, tenant_res)
+        turn_cache["bundle"] = bundle
+        return bundle
+
+    @staticmethod
+    async def _prime_turn_cache(
+        db: AsyncSession | None,
+        tenant_res: TenantResources,
+        call_id: str | None,
+    ) -> dict[str, Any]:
+        """Run the three independent turn-startup fetches concurrently and
+        return a ``turn_cache`` dict pre-populated with all three results.
+
+        Previously the pipeline called ``get_history``, ``get_state`` and
+        ``_voice_business_context`` serially at the top of the turn, which
+        added together roughly = (history latency) + (state latency) +
+        (organization DB roundtrip). With this primer, total turn-startup
+        latency drops to ``max(...)`` of the three — usually the bundle
+        load on a cold tenant, ~5 ms on a warm one.
+        """
+        history_task = asyncio.create_task(AgentSessionStore.get_history(tenant_res, call_id))
+        state_task = asyncio.create_task(AgentSessionStore.get_state(tenant_res, call_id))
+        bundle_task = asyncio.create_task(get_runtime_bundle(db, tenant_res))
+        history, state, bundle = await asyncio.gather(
+            history_task, state_task, bundle_task, return_exceptions=False
+        )
+        return {
+            "history": list(history or []),
+            "state": dict(state or {}),
+            "bundle": bundle,
+        }
+
+    @staticmethod
     async def _await_prefetched_retrieval(route: dict[str, Any]) -> dict[str, Any] | None:
         retrieval = route.get("prefetched_retrieval") if isinstance(route, dict) else None
         if isinstance(retrieval, asyncio.Task):
@@ -2319,6 +2627,8 @@ class NokvoOneVoicePipeline:
         db: AsyncSession | None = None,
         top_k: int | None = None,
         campaign_id: str | None = None,
+        turn_cache: dict[str, Any] | None = None,
+        code_switching: bool = False,
     ) -> dict[str, Any]:
         """Intent-first router. Returns a decision dict with one of:
 
@@ -2329,12 +2639,19 @@ class NokvoOneVoicePipeline:
         checks while still preserving the caller's exact words for the LLM
         and for language-switch detection.
 
+        ``turn_cache`` is an optional dict the caller pre-populates with the
+        results of the turn-startup ``asyncio.gather`` (history / state /
+        runtime bundle). When provided, this method reuses those values
+        instead of re-fetching from Redis or rebuilding the business
+        context — eliminating ~2 Redis GETs and a DB roundtrip per turn.
+
         - ``route == 'template'``: local canned reply (greeting/thanks/goodbye/smalltalk).
         - ``route == 'answer_card'``: matched a Q/A answer card.
         - ``route == 'policy_card'``: matched a deterministic policy card.
         - ``route == 'rag'``: falls through to embeddings/Qdrant/LLM. ``intent_result`` is set so the retrieval layer can apply sensitive-topic settings.
         """
         intent_result = FastIntentRouter.classify(user_text, language=language)
+        turn_cache = turn_cache if turn_cache is not None else {}
 
         # 0) FSM precedence: if the appointment / tool_flow is *expecting* a
         # yes-or-no answer this turn (slot offered, name to confirm, phone to
@@ -2342,7 +2659,9 @@ class NokvoOneVoicePipeline:
         # "Sure, go ahead." A bare "Yes" must reach the FSM so it can lock
         # the booking. We probe state once and skip the template branch when
         # any awaiting_* flag is set.
-        state_pre_check = await AgentSessionStore.get_state(tenant_res, call_id)
+        state_pre_check = await NokvoOneVoicePipeline._turn_state(
+            tenant_res, call_id, turn_cache
+        )
         suppress_template = False
         if isinstance(state_pre_check, dict):
             appt_pre = state_pre_check.get("appointment") or {}
@@ -2395,8 +2714,8 @@ class NokvoOneVoicePipeline:
                 "card_id": card.get("id"),
             }
 
-        history_for_turn = await AgentSessionStore.get_history(tenant_res, call_id)
-        state_for_turn = await AgentSessionStore.get_state(tenant_res, call_id)
+        history_for_turn = await NokvoOneVoicePipeline._turn_history(tenant_res, call_id, turn_cache)
+        state_for_turn = await NokvoOneVoicePipeline._turn_state(tenant_res, call_id, turn_cache)
         prior_appointment = dict((state_for_turn or {}).get("appointment") or {})
         prior_in_booking_flow = bool(prior_appointment.get("active")) and not (
             prior_appointment.get("completed") and not prior_appointment.get("pending_slot")
@@ -2408,18 +2727,11 @@ class NokvoOneVoicePipeline:
         # / ecommerce must NOT see those prompts even if the generic
         # tool_flow's prior turn happens to contain a word like "పేరు" that
         # the clinic slot inferrer would otherwise latch onto.
-        organization_industry: str | None = None
-        try:
-            from sqlalchemy import select
-            from app.models.organization import Organization
-
-            org_res = await db.execute(
-                select(Organization.industry).where(Organization.id == tenant_res.organization_id)
-            )
-            organization_industry = org_res.scalar()
-        except Exception:
-            organization_industry = None
-        is_clinic_org = (organization_industry or "").lower() == "clinics"
+        #
+        # Industry comes off the cached runtime bundle — no DB round trip
+        # per turn anymore.
+        bundle = await NokvoOneVoicePipeline._turn_bundle(db, tenant_res, turn_cache)
+        is_clinic_org = bundle.organization_industry.lower() == "clinics"
 
         turn_policy = (
             evaluate_voice_turn_policy(
@@ -2524,7 +2836,7 @@ class NokvoOneVoicePipeline:
                 "tool_calls": (action or {}).get("tool_calls") or [],
             }
 
-        business_context = await NokvoOneVoicePipeline._voice_business_context(db, tenant_res)
+        business_context = bundle.as_business_context_tuple()
         if business_context is not None:
             organization, overrides, custom_tabs = business_context
             prior_tool_flow = dict((state_for_turn or {}).get("tool_flow") or {})
@@ -2717,7 +3029,7 @@ class NokvoOneVoicePipeline:
                 user_text,
             )
             if not live_context:
-                history = await AgentSessionStore.get_history(tenant_res, call_id)
+                history = await NokvoOneVoicePipeline._turn_history(tenant_res, call_id, turn_cache)
                 live_context = extract_live_context_from_history(
                     history,
                     current_user_text=extractor_text,
@@ -2781,6 +3093,7 @@ class NokvoOneVoicePipeline:
                     campaign_id=campaign_id,
                     intent_result=intent_result,
                     english_text=english_text or location_retrieval_query,
+                    dual_retrieval=code_switching,
                 )
             )
             return {
@@ -2848,9 +3161,10 @@ class NokvoOneVoicePipeline:
                 campaign_id=campaign_id,
                 intent_result=intent_result,
                 english_text=english_text,
+                dual_retrieval=code_switching,
             )
         )
-        history = await AgentSessionStore.get_history(tenant_res, call_id)
+        history = await NokvoOneVoicePipeline._turn_history(tenant_res, call_id, turn_cache)
         classifier_text = (
             f"{user_text}\n(English translation: {english_text})"
             if english_text and english_text.strip() and english_text.strip() != user_text.strip()
@@ -2936,6 +3250,7 @@ class NokvoOneVoicePipeline:
                     campaign_id=campaign_id,
                     intent_result=intent_result,
                     english_text=english_text,
+                    dual_retrieval=code_switching,
                 )
             probe_chunks = probe.get("chunks") or []
             if probe_chunks:
@@ -3059,7 +3374,13 @@ class NokvoOneVoicePipeline:
         started = perf_counter()
         user_text = _normalize(query)
         language = SarvamVoiceService.normalize_language(response_language)
-        history = (conversation_history or []) + await AgentSessionStore.get_history(tenant_res, call_id)
+
+        # Parallel turn startup: history fetch, state fetch, and the
+        # per-tenant runtime bundle all run concurrently. Without this
+        # primer the pipeline would fetch each value separately as it was
+        # needed, paying a full Redis round trip every time.
+        turn_cache = await NokvoOneVoicePipeline._prime_turn_cache(db, tenant_res, call_id)
+        history = (conversation_history or []) + list(turn_cache.get("history") or [])
 
         # English-translated transcript (when caller spoke a non-English
         # language). retrieval_text holds the translate-STT output from the
@@ -3081,9 +3402,11 @@ class NokvoOneVoicePipeline:
             db=db,
             top_k=top_k,
             campaign_id=campaign_id,
+            turn_cache=turn_cache,
         )
         intent_result: IntentResult = route["intent_result"]
-        single_prompt_guidance = NokvoOneVoicePipeline._single_prompt_guidance(tenant_res)
+        bundle: RuntimeBundle = turn_cache["bundle"]
+        single_prompt_guidance = bundle.single_prompt_guidance
         if route["route"] in {"template", "answer_card", "policy_card"}:
             answer = route["answer"]
             await NokvoOneVoicePipeline._apply_route_state(tenant_res, call_id, route)
@@ -3172,7 +3495,8 @@ class NokvoOneVoicePipeline:
 
         # Reuse the probe retrieval done by _route_turn when it overrode
         # an out_of_scope decision — avoids a duplicate embed+Qdrant call
-        # on the hot path.
+        # on the hot path. (answer_text path — chat/non-voice surface, so
+        # code_switching defaults to False.)
         retrieval = await NokvoOneVoicePipeline._await_prefetched_retrieval(route)
         if not retrieval:
             retrieval = await NokvoOneVoicePipeline.retrieve(
@@ -3195,19 +3519,12 @@ class NokvoOneVoicePipeline:
             for chunk in chunks
         ]
         if not chunks and not single_prompt_guidance:
-            if _SMALLTALK_RE.match(user_text):
-                answer = NokvoOneVoicePipeline._smalltalk_reply(user_text, language, company_name)
-                refused = False
-            elif intent_result.intent == INTENT_UNKNOWN_GENERAL:
-                # No retrieved context AND no specific intent — caller said
-                # something we can't ground on (e.g. "can you hear me",
-                # "uh I was wondering"). Ask an open question rather than
-                # refusing formally.
-                answer = NokvoOneVoicePipeline._open_question(language)
-                refused = False
-            else:
-                answer = NokvoOneVoicePipeline._refusal(language)
-                refused = True
+            answer, refused = NokvoOneVoicePipeline._no_context_answer(
+                user_text,
+                intent=intent_result.intent,
+                language=language,
+                company_name=company_name,
+            )
             await AgentSessionStore.append_turn(tenant_res, call_id, user_text, answer)
             return {
                 "query": query,
@@ -3234,6 +3551,9 @@ class NokvoOneVoicePipeline:
                 "intent": {"type": "RAG_ALWAYS_ON", "should_retrieve": True, "reason": "pre-indexed tenant retrieval"},
             }
 
+        field_questions_prompt = NokvoOneVoicePipeline._field_questions_prompt_for_bundle(
+            bundle, language=language
+        )
         messages = NokvoOneVoicePipeline._messages(
             user_text,
             chunks,
@@ -3242,13 +3562,14 @@ class NokvoOneVoicePipeline:
             company_name=company_name,
             campaign_goal=campaign_goal,
             single_prompt_guidance=single_prompt_guidance,
+            field_questions_prompt=field_questions_prompt,
         )
         timeout = max(0.8, (latency_budget_ms or settings.AGENT_LLM_TIMEOUT_MS) / 1000)
         llm_error = None
         try:
             answer = await asyncio.wait_for(AzureGroundedLLM.complete(tenant_res, messages), timeout=timeout)
             answer = NokvoOneVoicePipeline._sanitize_answer(answer) or NokvoOneVoicePipeline._refusal(language)
-            refused = answer == NokvoOneVoicePipeline._refusal(language)
+            refused = NokvoOneVoicePipeline._is_refusal(answer, language)
         except Exception as exc:
             llm_error = str(exc)[:240]
             answer = NokvoOneVoicePipeline._refusal(language)
@@ -3310,6 +3631,26 @@ class NokvoOneVoicePipeline:
         }
 
     @staticmethod
+    def _field_questions_prompt_for_bundle(
+        bundle: "RuntimeBundle",
+        *,
+        language: str,
+    ) -> str:
+        """Build the "use these exact phrasings" prompt block from the
+        per-tenant runtime bundle. Empty string when no record-creation
+        fields are configured — keeps the prompt lean for inbound calls
+        that aren't collecting structured records."""
+        try:
+            catalog = build_tool_flow_questions(
+                bundle.organization_industry,
+                bundle.overrides,
+                bundle.custom_tabs,
+            )
+        except Exception:
+            return ""
+        return format_field_questions_prompt(catalog, language=language)
+
+    @staticmethod
     async def stream_answer_sentences(
         tenant_res: TenantResources,
         query: str,
@@ -3322,11 +3663,16 @@ class NokvoOneVoicePipeline:
         campaign_id: str | None = None,
         campaign_goal: str | None = None,
         company_name: str | None = None,
+        code_switching: bool = False,
+        outbound_context: OutboundCampaignContext | None = None,
+        covered_objectives: list[str] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         started = perf_counter()
         user_text = _normalize(query)
         language = SarvamVoiceService.normalize_language(response_language)
-        history = await AgentSessionStore.get_history(tenant_res, call_id)
+
+        turn_cache = await NokvoOneVoicePipeline._prime_turn_cache(db, tenant_res, call_id)
+        history = list(turn_cache.get("history") or [])
 
         english_text = retrieval_text if retrieval_text and _normalize(retrieval_text) != user_text else None
         retrieval_query = NokvoOneVoicePipeline.retrieval_query_for(user_text, english_text)
@@ -3341,14 +3687,32 @@ class NokvoOneVoicePipeline:
             db=db,
             top_k=top_k,
             campaign_id=campaign_id,
+            turn_cache=turn_cache,
+            code_switching=code_switching,
         )
         intent_result: IntentResult = route["intent_result"]
-        single_prompt_guidance = NokvoOneVoicePipeline._single_prompt_guidance(tenant_res)
+        bundle: RuntimeBundle = turn_cache["bundle"]
+        single_prompt_guidance = bundle.single_prompt_guidance
         if route["route"] in {"template", "answer_card", "policy_card"}:
             answer = route["answer"]
             yield {"type": "sentence", "text": answer, "language": language, "cache_hit": False}
             await NokvoOneVoicePipeline._apply_route_state(tenant_res, call_id, route)
             await AgentSessionStore.append_turn(tenant_res, call_id, user_text, answer)
+            # A deterministic route delivered an answer — reset the
+            # clarification escalation counter if it had been bumped.
+            await NokvoOneVoicePipeline._apply_clarification(
+                tenant_res,
+                call_id,
+                turn_cache=turn_cache,
+                user_text=user_text,
+                route=route["route"],
+                intent=intent_result.intent,
+                refused=False,
+                chunks=[],
+                state_slot=route.get("state_slot"),
+                language=language,
+                original_answer=answer,
+            )
             total_ms = int((perf_counter() - started) * 1000)
             NokvoOneVoicePipeline._log_route(
                 {
@@ -3394,7 +3758,7 @@ class NokvoOneVoicePipeline:
         if route["route"] == "smalltalk_llm":
             classified = route.get("classified") or {}
             sentiment = str(classified.get("sentiment") or "neutral")
-            history = await AgentSessionStore.get_history(tenant_res, call_id)
+            history = await NokvoOneVoicePipeline._turn_history(tenant_res, call_id, turn_cache)
             messages = NokvoOneVoicePipeline._messages_smalltalk(
                 user_text,
                 language=language,
@@ -3489,6 +3853,7 @@ class NokvoOneVoicePipeline:
                 campaign_id=campaign_id,
                 intent_result=intent_result,
                 english_text=english_text,
+                dual_retrieval=code_switching,
             )
         chunks = retrieval.get("chunks") or []
         citations = [
@@ -3501,18 +3866,30 @@ class NokvoOneVoicePipeline:
             for chunk in chunks
         ]
         if not chunks and not single_prompt_guidance:
-            if _SMALLTALK_RE.match(user_text):
-                answer = NokvoOneVoicePipeline._smalltalk_reply(user_text, language, company_name)
-                refused = False
-            elif intent_result.intent == INTENT_UNKNOWN_GENERAL:
-                # No retrieved context AND no specific intent — caller said
-                # something we can't ground on. Ask an open question rather
-                # than dumping the formal refusal.
-                answer = NokvoOneVoicePipeline._open_question(language)
-                refused = False
-            else:
-                answer = NokvoOneVoicePipeline._refusal(language)
-                refused = True
+            answer, refused = NokvoOneVoicePipeline._no_context_answer(
+                user_text,
+                intent=intent_result.intent,
+                language=language,
+                company_name=company_name,
+            )
+            # Clarification FSM: escalate once the caller has produced
+            # several consecutive low-information turns. After two the
+            # agent offers concrete options; after three it hands off to
+            # support instead of looping the same "sorry, missed that"
+            # reply.
+            answer, clarify_action, _ = await NokvoOneVoicePipeline._apply_clarification(
+                tenant_res,
+                call_id,
+                turn_cache=turn_cache,
+                user_text=user_text,
+                route="no_context_refusal",
+                intent=intent_result.intent,
+                refused=refused,
+                chunks=[],
+                state_slot=None,
+                language=language,
+                original_answer=answer,
+            )
             yield {"type": "sentence", "text": answer, "language": language}
             await AgentSessionStore.append_turn(tenant_res, call_id, user_text, answer)
             yield {
@@ -3521,10 +3898,18 @@ class NokvoOneVoicePipeline:
                 "refused": refused,
                 "chunks": [],
                 "citations": [],
-                "runtime": {"graph": "nokvo_rag_pipeline", "mode": "no_context_refusal", "latency_ms": int((perf_counter() - started) * 1000)},
+                "runtime": {
+                    "graph": "nokvo_rag_pipeline",
+                    "mode": "no_context_refusal",
+                    "clarification": clarify_action,
+                    "latency_ms": int((perf_counter() - started) * 1000),
+                },
             }
             return
 
+        field_questions_prompt = NokvoOneVoicePipeline._field_questions_prompt_for_bundle(
+            bundle, language=language
+        )
         messages = NokvoOneVoicePipeline._messages(
             user_text,
             chunks,
@@ -3533,6 +3918,9 @@ class NokvoOneVoicePipeline:
             company_name=company_name,
             campaign_goal=campaign_goal,
             single_prompt_guidance=single_prompt_guidance,
+            outbound_context=outbound_context,
+            covered_objectives=covered_objectives,
+            field_questions_prompt=field_questions_prompt,
         )
         # Prosody-aware streaming: the LLM is asked to wrap each sentence in a
         # [tone]…[/tone] tag. The parser strips the tags and emits one chunk
@@ -3562,7 +3950,24 @@ class NokvoOneVoicePipeline:
             refused = False
         else:
             answer = NokvoOneVoicePipeline._sanitize_answer(" ".join(answer_parts)) or NokvoOneVoicePipeline._refusal(language)
-            refused = answer == NokvoOneVoicePipeline._refusal(language)
+            refused = NokvoOneVoicePipeline._is_refusal(answer, language)
+        # Clarification FSM after the grounded RAG turn: if the LLM
+        # ended up refusing despite retrieval finding no chunks the
+        # caller is effectively still vague — bump the counter so a
+        # third such turn escalates instead of looping refusals.
+        answer, clarify_action, _ = await NokvoOneVoicePipeline._apply_clarification(
+            tenant_res,
+            call_id,
+            turn_cache=turn_cache,
+            user_text=user_text,
+            route=("qdrant_rag" if chunks else "single_prompt_rag"),
+            intent=intent_result.intent,
+            refused=refused,
+            chunks=chunks,
+            state_slot=None,
+            language=language,
+            original_answer=answer,
+        )
         await AgentSessionStore.append_turn(tenant_res, call_id, user_text, answer)
         cache_eligible = not intent_result.sensitive and NokvoOneVoicePipeline._cacheable(retrieval_query, answer, chunks)
         if cache_eligible:

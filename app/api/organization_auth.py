@@ -1861,12 +1861,34 @@ async def list_agent_campaigns(
     return await OutboundCampaignService.list_campaigns(tenant_res, db)
 
 
+def _parse_campaign_list_field(value: str | None) -> list[str]:
+    if not value:
+        return []
+    raw = value.strip()
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        parsed = raw.splitlines()
+    if isinstance(parsed, str):
+        parsed = parsed.splitlines()
+    if not isinstance(parsed, list):
+        return []
+    return [str(item).strip() for item in parsed if str(item).strip()]
+
+
 @router.post("/agent/campaigns", response_model=CampaignDetailOut)
 async def create_agent_campaign(
     name: str = Form(...),
     contacts_file: UploadFile = File(...),
     script_file: UploadFile = File(...),
     from_number: str | None = Form(None),
+    agent_prompt: str | None = Form(None),
+    objectives: str | None = Form(None),
+    exit_conditions: str | None = Form(None),
+    tone: str | None = Form(None),
+    silence_timeout_seconds: float | None = Form(None),
     current_user: OrganizationUser = Depends(deps.RequireOrganizationRole(["admin"])),
     _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
     db: AsyncSession = Depends(deps.get_db),
@@ -1880,6 +1902,13 @@ async def create_agent_campaign(
             excel_file=contacts_file,
             doc_file=script_file,
             from_number=from_number,
+            agent_config={
+                "agent_prompt": agent_prompt,
+                "objectives": _parse_campaign_list_field(objectives),
+                "exit_conditions": _parse_campaign_list_field(exit_conditions),
+                "tone": tone,
+                "silence_timeout_seconds": silence_timeout_seconds,
+            },
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

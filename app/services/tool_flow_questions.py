@@ -248,3 +248,114 @@ def ensure_tool_flow_questions(
 def generated_questions_from_status(provider_status: dict[str, Any] | None) -> dict[str, Any]:
     value = (provider_status or {}).get(TOOL_FLOW_QUESTIONS_KEY) or {}
     return value if isinstance(value, dict) else {}
+
+
+_RECORD_TAB_LABELS = {
+    "leads": "lead",
+    "leads_create": "lead",
+    "appointments": "appointment",
+    "real_estate_site_visit": "site visit",
+    "tickets": "ticket",
+    "callbacks": "callback",
+    "complaints": "complaint",
+}
+
+
+def format_field_questions_prompt(
+    catalog: dict[str, Any] | None,
+    *,
+    language: str = "en",
+) -> str:
+    """Format a ``build_tool_flow_questions`` catalog into a prompt block.
+
+    The voice agent paraphrases slot questions on its own when no
+    deterministic FSM is driving the turn — fine for free-form chat but
+    wrong for record creation, where operators expect the agent to ask
+    using the exact field labels they configured (e.g. a clinic that
+    renamed ``patient_name`` to ``guest_name`` should hear "guest name",
+    not "patient name"). This formatter renders the catalog into a
+    "use these exact phrasings" block the LLM is told to honour
+    verbatim when collecting fields.
+
+    Returns an empty string when the catalog has no usable flows / tabs.
+    """
+    if not isinstance(catalog, dict):
+        return ""
+    flows = catalog.get("flows") or {}
+    tabs = catalog.get("tabs") or {}
+    if not isinstance(flows, dict):
+        flows = {}
+    if not isinstance(tabs, dict):
+        tabs = {}
+    if not flows and not tabs:
+        return ""
+
+    def _pick_question(qmap: dict[str, Any] | None, label: str) -> str:
+        if isinstance(qmap, dict):
+            for candidate in (language, "en"):
+                value = qmap.get(candidate)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        return f"Please share {label}."
+
+    sections: list[str] = []
+
+    # Flows first — these are the booking / lead / appointment FSMs,
+    # the most common record-creation paths.
+    for flow_key, flow in flows.items():
+        if not isinstance(flow, dict):
+            continue
+        slots = flow.get("slots") or []
+        if not isinstance(slots, list) or not slots:
+            continue
+        record_label = _RECORD_TAB_LABELS.get(str(flow.get("tab") or flow_key), str(flow_key))
+        lines = [f"## {record_label} ({flow_key})"]
+        for slot in slots:
+            if not isinstance(slot, dict):
+                continue
+            key = str(slot.get("key") or "").strip()
+            label = str(slot.get("label") or key or "field").strip()
+            question = _pick_question(slot.get("questions") or {}, label)
+            required = "required" if slot.get("required") else "optional"
+            lines.append(f'  - {key} ({label}, {required}): "{question}"')
+        sections.append("\n".join(lines))
+
+    # Tabs (writable fields per record type). These cover ticket /
+    # callback / custom tabs that aren't necessarily wrapped in a flow
+    # but still need consistent phrasing when the agent collects info.
+    for tab_key, tab in tabs.items():
+        if not isinstance(tab, dict):
+            continue
+        fields = tab.get("fields") or {}
+        if not isinstance(fields, dict) or not fields:
+            continue
+        # Skip tabs that are also present as flows — avoids duplication
+        # since the flow already lists those slots.
+        if tab_key in flows:
+            continue
+        record_label = _RECORD_TAB_LABELS.get(str(tab_key), str(tab.get("label") or tab_key))
+        lines = [f"## {record_label} ({tab_key})"]
+        for field_key, field in fields.items():
+            if not isinstance(field, dict):
+                continue
+            label = str(field.get("label") or field_key or "field").strip()
+            question = _pick_question(field.get("questions") or {}, label)
+            required = "required" if field.get("required") else "optional"
+            lines.append(f'  - {field_key} ({label}, {required}): "{question}"')
+        if len(lines) > 1:
+            sections.append("\n".join(lines))
+
+    if not sections:
+        return ""
+
+    header = (
+        "# FIELD-COLLECTION SCRIPT — use these EXACT phrasings\n"
+        "When you are creating a ticket, lead, appointment, callback, or any\n"
+        "record listed below, ask for each field using the operator-configured\n"
+        "question text. Do NOT paraphrase, summarise, translate freely, or\n"
+        "invent your own wording for these fields. Required fields must be\n"
+        "asked before the record can be created; optional ones may be skipped.\n"
+        "If multiple fields are still pending, ask ONE at a time, in the order\n"
+        "below."
+    )
+    return header + "\n\n" + "\n\n".join(sections)

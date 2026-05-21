@@ -1,7 +1,9 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import { useRouter } from 'vue-router';
 import axios from 'axios';
 import QrcodeVue from 'qrcode.vue';
+import nokvoLogo from '../assets/nokvo-one-logo.png';
 import {
   Activity,
   Bell,
@@ -9,7 +11,11 @@ import {
   Bot,
   Brain,
   CalendarDays,
+  CalendarOff,
   CheckCircle2,
+  Clock,
+  ChevronLeft,
+  ChevronRight,
   Cpu,
   Database,
   FileText,
@@ -44,7 +50,14 @@ const ACCESS_TOKEN_KEY = 'nokvo_one_access_token';
 const REFRESH_TOKEN_KEY = 'nokvo_one_refresh_token';
 const THEME_KEY = 'nokvo_one_theme_mode';
 
+const props = defineProps({
+  initialAuthState: {
+    type: String,
+    default: 'login',
+  },
+});
 defineEmits(['switch-mode']);
+const router = useRouter();
 
 const api = axios.create({ baseURL: API_BASE_URL });
 
@@ -55,7 +68,7 @@ const authConfig = ref(null);
 const googleLoginButtonRef = ref(null);
 const googleSignupButtonRef = ref(null);
 
-const authState = ref('login'); // login | signup | check_email | mfa_setup | mfa_verify | login_totp | accept_invite | business_type_setup | outcome_setup | sample_upload | ready
+const authState = ref(props.initialAuthState || 'login'); // login | signup | check_email | mfa_setup | mfa_verify | login_totp | accept_invite | business_type_setup | outcome_setup | sample_upload | ready
 const onboardingV2Enabled = ref(false);
 const outcomeWizard = ref({
   outcomes: [],
@@ -92,6 +105,7 @@ const clinicScheduleSettings = ref({});
 const blockedSlots = ref({});
 const tabRecords = ref({ leads: [], tickets: [], appointments: [] });
 const tabRecordsLoading = ref({});
+const timetableViewer = ref({ member: null, isLoading: false, selectedDate: '', visibleMonth: '' });
 const agents = ref([]);
 const predefinedTools = ref([]);
 const toolCatalogGroups = ref([]);
@@ -137,7 +151,29 @@ const phoneLink = ref(null);
 const phoneLinkInput = ref('');
 const isSavingPhoneLink = ref(false);
 const campaigns = ref([]);
-const campaignForm = ref({ name: '', from_number: '', doc_file: null });
+const defaultCampaignObjectives = [
+  'Confirm this is a good time to talk.',
+  'Briefly explain why we are calling.',
+  'Understand whether the lead is interested and what they need.',
+  'Capture the next step: appointment, callback, site visit, demo, or opt-out.',
+].join('\n');
+const defaultCampaignExitConditions = [
+  'Lead asks not to be called again.',
+  'Lead says they are not interested.',
+  'Lead says this is the wrong number.',
+  'Lead is busy and asks for a callback.',
+].join('\n');
+const emptyCampaignForm = () => ({
+  name: '',
+  from_number: '',
+  doc_file: null,
+  agent_prompt: 'You are making a consented outbound call. Be concise, explain the reason for the call, and guide the lead toward one clear next step.',
+  objectives: defaultCampaignObjectives,
+  exit_conditions: defaultCampaignExitConditions,
+  tone: 'warm, direct, and respectful',
+  silence_timeout_seconds: 5,
+});
+const campaignForm = ref(emptyCampaignForm());
 const isCreatingCampaign = ref(false);
 const isLaunchingCampaign = ref(null);
 const outgoingTab = ref('leads');
@@ -147,6 +183,7 @@ const outgoingLeads = ref([]);
 const selectedLeadIds = ref([]);
 const isLoadingLeadSources = ref(false);
 const isSyncingLeadConnection = ref(null);
+const pendingLeadOAuth = ref(null);
 const connectionAccountInputs = ref({});
 const nokvoLeadForm = ref({
   name: '',
@@ -316,9 +353,83 @@ const inviteValidationMessage = computed(() => {
 });
 
 const filteredMembers = computed(() => {
-  const list = [...members.value];
+  // Removed members stay in the table for audit but are hidden from the
+  // default roster — they're not real teammates anymore.
+  const list = members.value.filter((m) => m.status !== 'removed');
   list.sort((a, b) => String(a.full_name || '').localeCompare(String(b.full_name || '')));
   return list;
+});
+
+const serviceStatusIsBad = (status) => {
+  const value = String(status || '').toLowerCase();
+  return ['error', 'failed', 'offline', 'unhealthy', 'degraded'].includes(value);
+};
+
+const organizationHealth = computed(() => {
+  const approvedDocs = kbStats.value.approved;
+  const kbIssueCount = kbStats.value.pending + kbStats.value.errors;
+  const runtimeServices = [runtimeStatus.value?.stt, runtimeStatus.value?.llm, runtimeStatus.value?.tts].filter(Boolean);
+  const runtimeHasBadStatus = runtimeServices.some((service) => serviceStatusIsBad(service.status));
+  const callableLeadCount = outgoingLeads.value.filter((lead) => lead.callable).length;
+  const provisioningStatus = String(provisioning.value?.provisioning_status || '').toLowerCase();
+
+  const checks = [
+    {
+      key: 'security',
+      label: 'Access security',
+      state: currentUser.value?.mfa_pending ? 'blocked' : 'good',
+      detail: currentUser.value?.mfa_pending ? 'MFA is required before advanced actions unlock.' : 'MFA is active for this workspace.',
+    },
+    {
+      key: 'agent',
+      label: 'Agent readiness',
+      state: agents.value.length ? 'good' : 'blocked',
+      detail: agents.value.length ? 'At least one agent is configured and ready to test.' : 'Create an agent before live workflows can run.',
+    },
+    {
+      key: 'knowledge',
+      label: 'Knowledge base',
+      state: approvedDocs ? (kbIssueCount ? 'warn' : 'good') : 'warn',
+      detail: approvedDocs
+        ? `${approvedDocs} approved document${approvedDocs === 1 ? '' : 's'}${kbIssueCount ? `, ${kbIssueCount} item${kbIssueCount === 1 ? '' : 's'} need review.` : '.'}`
+        : 'No approved knowledge documents yet.',
+    },
+    {
+      key: 'runtime',
+      label: 'Voice runtime',
+      state: runtimeHasBadStatus ? 'blocked' : (runtimeStatus.value ? 'good' : 'warn'),
+      detail: runtimeHasBadStatus ? 'One or more voice services are reporting errors.' : (runtimeStatus.value ? 'STT, LLM, and TTS status checked.' : 'Runtime status has not reported yet.'),
+    },
+    {
+      key: 'outbound',
+      label: 'Outbound readiness',
+      state: currentOrganization.value?.calling_enabled
+        ? (leadConnections.value.length && callableLeadCount ? 'good' : 'warn')
+        : 'blocked',
+      detail: currentOrganization.value?.calling_enabled
+        ? (leadConnections.value.length ? `${callableLeadCount} callable lead${callableLeadCount === 1 ? '' : 's'} available.` : 'Connect a consented lead source before outbound campaigns.')
+        : 'Calling is still gated for this organization.',
+    },
+    {
+      key: 'provisioning',
+      label: 'Provisioning',
+      state: provisioningStatus === 'success' ? 'good' : (provisioningStatus === 'failed' ? 'blocked' : 'warn'),
+      detail: provisioningStatus === 'success' ? 'Tenant infrastructure is provisioned.' : (provisioningStatus || 'Provisioning status unavailable.'),
+    },
+  ];
+
+  const valueForState = { good: 1, warn: 0.55, blocked: 0 };
+  const score = Math.round((checks.reduce((sum, check) => sum + valueForState[check.state], 0) / checks.length) * 100);
+  const label = score >= 85 ? 'Healthy' : (score >= 60 ? 'Needs attention' : 'Action required');
+  const state = score >= 85 ? 'good' : (score >= 60 ? 'warn' : 'blocked');
+  return {
+    checks,
+    score,
+    label,
+    state,
+    openIssues: checks.filter((check) => check.state !== 'good').length,
+    ringStyle: `conic-gradient(${state === 'good' ? '#2f6d3a' : state === 'warn' ? '#b7791f' : '#b42318'} ${score}%, #e7e6dc 0)`,
+  };
 });
 
 const updateCursorGlow = (event) => {
@@ -340,6 +451,10 @@ const switchPage = (page) => {
   currentPage.value = page;
   errorMsg.value = '';
   infoMsg.value = '';
+  if (page === 'my_timetable') {
+    loadMyTimetable();
+    return;
+  }
   if (page === 'knowledge_base') {
     loadKnowledgeDocuments();
     loadSinglePromptAgent();
@@ -355,6 +470,14 @@ const switchPage = (page) => {
   if (['leads', 'tickets', 'appointments'].includes(page)) {
     loadTabRecords(page);
   }
+};
+
+const scrollToDashboardMembers = async () => {
+  currentPage.value = 'dashboard';
+  errorMsg.value = '';
+  infoMsg.value = '';
+  await nextTick();
+  document.getElementById('dashboard-members')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
 };
 
 const resetLoginState = () => {
@@ -551,6 +674,17 @@ const loadBusinessTemplate = async () => {
 };
 
 const enterWorkspaceAfterAuth = async () => {
+  // Member-role users skip the admin onboarding gates entirely and land
+  // straight on their own timetable. Business-type setup is an
+  // admin-only concern (the admin completes it before sending invites),
+  // and ``loadWorkspace`` pulls a bunch of admin-scoped resources we
+  // don't want the member dashboard depending on.
+  if (isMemberOnly.value) {
+    authState.value = 'ready';
+    currentPage.value = 'my_timetable';
+    await loadMyTimetable();
+    return;
+  }
   await loadBusinessTypeOptions();
   if (businessTypeRequired.value) {
     selectedBusinessType.value = '';
@@ -565,13 +699,18 @@ const enterWorkspaceAfterAuth = async () => {
 const loadWorkspace = async () => {
   isLoadingMembers.value = true;
   try {
-    const [m, a, t, p, s, c] = await Promise.allSettled([
+    const [m, a, t, p, s, c, r, k, lc, lf, ll] = await Promise.allSettled([
       api.get('/members/', { headers: authHeader() }),
       api.get('/agents/', { headers: authHeader() }),
       api.get('/agents/tools/catalog', { headers: authHeader() }),
       api.get('/me/provisioning', { headers: authHeader() }),
       api.get('/members/assignment-settings', { headers: authHeader() }),
       api.get('/business-template/custom-tabs', { headers: authHeader() }),
+      api.get('/agents/runtime/status', { headers: authHeader() }),
+      api.get('/knowledge-base/documents', { headers: authHeader() }),
+      api.get('/agents/lead-sources/connections', { headers: authHeader() }),
+      api.get('/agents/lead-sources/forms', { headers: authHeader() }),
+      api.get('/agents/lead-sources/leads', { headers: authHeader(), params: { limit: 300 } }),
     ]);
     if (c.status === 'fulfilled') customTabs.value = c.value.data || [];
     if (m.status === 'fulfilled') members.value = m.value.data;
@@ -587,6 +726,11 @@ const loadWorkspace = async () => {
     }
     if (p.status === 'fulfilled') provisioning.value = p.value.data;
     if (s.status === 'fulfilled') assignmentSettings.value = s.value.data;
+    if (r.status === 'fulfilled') runtimeStatus.value = r.value.data;
+    if (k.status === 'fulfilled') kbDocuments.value = k.value.data?.documents || [];
+    if (lc.status === 'fulfilled') leadConnections.value = lc.value.data || [];
+    if (lf.status === 'fulfilled') leadForms.value = lf.value.data || [];
+    if (ll.status === 'fulfilled') outgoingLeads.value = ll.value.data || [];
     if (m.status === 'fulfilled') await loadMemberScheduleExtras(m.value.data);
     if (['leads', 'tickets', 'appointments'].includes(currentPage.value)) {
       await loadTabRecords(currentPage.value);
@@ -1279,6 +1423,251 @@ const formatCalendarTime = (value) => {
   return new Date(value).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
 };
 
+const parseRecordDate = (value) => {
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+};
+
+const localDateKey = (value) => {
+  const date = value instanceof Date ? value : parseRecordDate(value);
+  if (!date) return '';
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+};
+
+const dateFromKey = (key) => {
+  if (!key) return null;
+  const [year, month, day] = key.split('-').map(Number);
+  if (!year || !month || !day) return null;
+  return new Date(year, month - 1, day);
+};
+
+const todayKey = () => localDateKey(new Date());
+
+const recordScheduledDate = (record) =>
+  parseRecordDate(firstRecordValue(record, [
+    'scheduled_time',
+    'appointment_time',
+    'appointment_start',
+    'visit_at',
+    'visit_date',
+    'callback_at',
+    'follow_up_at',
+    'due_at',
+    'due_date',
+    'requested_time',
+    'preferred_time',
+    'scheduled_at',
+  ]));
+
+const recordCalendarDate = (record) =>
+  recordScheduledDate(record) || parseRecordDate(record?.created_at);
+
+const scheduleRecordTypeLabel = (record) => {
+  if (record.record_type === 'appointment') return 'Appointment';
+  if (record.record_type === 'lead') return 'Lead';
+  if (record.record_type === 'ticket') return 'Ticket';
+  return 'Request';
+};
+
+const recordAssignedToMember = (record, member) => {
+  const data = recordData(record);
+  const memberId = String(member?.id || '');
+  const memberName = String(member?.full_name || '').trim().toLowerCase();
+  const memberEmail = String(member?.email || '').trim().toLowerCase();
+  const directIds = [
+    data.assigned_member_id,
+    data.assigned_doctor_id,
+    data.assigned_agent_id,
+    data.selected_member_id,
+    record?.selected_member_id,
+  ].filter(Boolean).map(String);
+  if (directIds.includes(memberId)) return true;
+  const assignedNames = [
+    data.assigned_member_name,
+    data.doctor,
+    data.assigned_to,
+    data.agent,
+    data.owner,
+    data.assigned_member_email,
+    data.owner_email,
+    data.agent_email,
+  ].filter(Boolean).map((value) => String(value).trim().toLowerCase());
+  return (!!memberName && assignedNames.includes(memberName)) || (!!memberEmail && assignedNames.includes(memberEmail));
+};
+
+const scheduleRecordLabel = (record) => {
+  if (record.record_type === 'appointment') return appointmentRecordTitle(record);
+  if (record.record_type === 'lead') return leadRecordTitle(record);
+  if (record.record_type === 'ticket') return ticketRecordTitle(record);
+  return formatRecordValue(firstRecordValue(record, ['summary', 'reason', 'name']), 'Scheduled item');
+};
+
+const scheduleRecordDetail = (record) => {
+  if (record.record_type === 'appointment') return appointmentRecordSubtitle(record);
+  if (record.record_type === 'lead') return leadRecordSubtitle(record);
+  if (record.record_type === 'ticket') return ticketRecordSubtitle(record);
+  return formatRecordValue(firstRecordValue(record, ['summary', 'request_type']), '');
+};
+
+const memberAssignedWorkItems = computed(() => {
+  const member = timetableViewer.value.member;
+  if (!member) return [];
+  const records = [
+    ...(tabRecords.value.appointments || []),
+    ...(tabRecords.value.leads || []),
+    ...(tabRecords.value.tickets || []),
+  ];
+  const matchedRecords = records.filter((record) => recordAssignedToMember(record, member));
+  const activeStatuses = new Set(['assigned', 'in_progress', 'scheduled', 'open']);
+  const fallbackRecords = !matchedRecords.length && assignmentForMember(member.id).active_request_count
+    ? records.filter((record) => activeStatuses.has(String(record.status || '').toLowerCase()))
+    : [];
+  const sourceRecords = matchedRecords.length ? matchedRecords : fallbackRecords;
+  return sourceRecords
+    .map((record) => {
+      const start = recordCalendarDate(record);
+      const duration = assignmentForMember(member.id).appointment_duration_minutes || 30;
+      const end = start ? new Date(start.getTime() + duration * 60000) : null;
+      return {
+        id: record.id,
+        type: record.record_type || 'request',
+        typeLabel: scheduleRecordTypeLabel(record),
+        title: scheduleRecordLabel(record),
+        detail: scheduleRecordDetail(record),
+        status: record.status || 'scheduled',
+        priority: record.record_type === 'ticket' ? ticketRecordPriority(record) : null,
+        owner: record.record_type === 'ticket' ? ticketRecordOwner(record) : null,
+        phone: recordPhone(record),
+        phoneHref: phoneHref(recordPhone(record)),
+        createdAt: record.created_at,
+        start,
+        end,
+        isBlocked: false,
+      };
+    });
+});
+
+const memberScheduleItems = computed(() => {
+  const member = timetableViewer.value.member;
+  if (!member) return [];
+  const blocked = (blockedSlots.value[member.id] || []).map((slot) => ({
+    id: slot.id,
+    type: 'blocked',
+    typeLabel: 'Blocked',
+    title: slot.reason || 'Unavailable',
+    detail: 'Blocked time',
+    status: 'blocked',
+    start: parseRecordDate(slot.start_time),
+    end: parseRecordDate(slot.end_time),
+    isBlocked: true,
+  }));
+  return [...memberAssignedWorkItems.value, ...blocked]
+    .filter((item) => item.start)
+    .sort((a, b) => a.start.getTime() - b.start.getTime());
+});
+
+const memberQueuedItems = computed(() =>
+  memberAssignedWorkItems.value
+    .filter((item) => !item.start)
+    .sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime()),
+);
+
+const selectedTimetableDate = computed(() => dateFromKey(timetableViewer.value.selectedDate) || new Date());
+
+const selectedTimetableItems = computed(() => {
+  const selected = timetableViewer.value.selectedDate;
+  if (!selected) return [];
+  return memberScheduleItems.value.filter((item) => localDateKey(item.start) === selected);
+});
+
+const selectedTimetableLabel = computed(() =>
+  selectedTimetableDate.value.toLocaleDateString(undefined, {
+    weekday: 'long',
+    month: 'long',
+    day: 'numeric',
+  }),
+);
+
+const timetableMonthLabel = computed(() => {
+  const visibleDate = dateFromKey(timetableViewer.value.visibleMonth) || selectedTimetableDate.value;
+  return visibleDate.toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
+});
+
+const timetableCalendarDays = computed(() => {
+  const selected = timetableViewer.value.selectedDate || todayKey();
+  const visibleDate = dateFromKey(timetableViewer.value.visibleMonth) || dateFromKey(selected) || new Date();
+  const firstOfMonth = new Date(visibleDate.getFullYear(), visibleDate.getMonth(), 1);
+  const gridStart = new Date(firstOfMonth);
+  gridStart.setDate(firstOfMonth.getDate() - firstOfMonth.getDay());
+  const today = todayKey();
+  return Array.from({ length: 42 }, (_, index) => {
+    const date = new Date(gridStart);
+    date.setDate(gridStart.getDate() + index);
+    const key = localDateKey(date);
+    const items = memberScheduleItems.value.filter((item) => localDateKey(item.start) === key);
+    return {
+      key,
+      dayNumber: date.getDate(),
+      inMonth: date.getMonth() === visibleDate.getMonth(),
+      isToday: key === today,
+      isSelected: key === selected,
+      ticketCount: items.filter((item) => item.type === 'ticket').length,
+      itemCount: items.length,
+    };
+  });
+});
+
+const memberScheduleDays = computed(() => {
+  const byDay = new Map();
+  for (const item of memberScheduleItems.value) {
+    const key = item.start.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
+    if (!byDay.has(key)) byDay.set(key, []);
+    byDay.get(key).push(item);
+  }
+  return Array.from(byDay.entries()).map(([label, items]) => ({ label, items }));
+});
+
+const selectTimetableDate = (key) => {
+  timetableViewer.value = {
+    ...timetableViewer.value,
+    selectedDate: key,
+    visibleMonth: key.slice(0, 7) + '-01',
+  };
+};
+
+const shiftTimetableMonth = (offset) => {
+  const visibleDate = dateFromKey(timetableViewer.value.visibleMonth) || selectedTimetableDate.value;
+  const next = new Date(visibleDate.getFullYear(), visibleDate.getMonth() + offset, 1);
+  timetableViewer.value = {
+    ...timetableViewer.value,
+    visibleMonth: localDateKey(next),
+  };
+};
+
+const openMemberTimetable = async (member) => {
+  const initialDate = todayKey();
+  timetableViewer.value = { member, isLoading: true, selectedDate: initialDate, visibleMonth: `${initialDate.slice(0, 7)}-01` };
+  const loads = [loadTabRecords('leads'), loadTabRecords('tickets')];
+  if (showAppointmentsTab.value) loads.push(loadTabRecords('appointments'));
+  await Promise.allSettled(loads);
+  const todayHasWork = memberScheduleItems.value.some((item) => localDateKey(item.start) === initialDate);
+  const selectedDate = todayHasWork ? initialDate : (memberScheduleItems.value[0] ? localDateKey(memberScheduleItems.value[0].start) : initialDate);
+  timetableViewer.value = {
+    member,
+    isLoading: false,
+    selectedDate,
+    visibleMonth: `${selectedDate.slice(0, 7)}-01`,
+  };
+};
+
+const closeMemberTimetable = () => {
+  timetableViewer.value = { member: null, isLoading: false, selectedDate: '', visibleMonth: '' };
+};
+
 const addField = () => {
   fieldEditor.value.fields.push({
     key: `custom_${fieldEditor.value.fields.length + 1}`,
@@ -1656,6 +2045,36 @@ const inviteMember = async () => {
   }
 };
 
+const removingMemberId = ref(null);
+
+const removeMember = async (member) => {
+  if (!member?.id) return;
+  if (member.id === currentUser.value?.id) {
+    errorMsg.value = "You can't remove your own account.";
+    return;
+  }
+  const label = member.full_name || member.email;
+  // window.confirm is the cheapest UX for a low-frequency destructive
+  // action; if this grows into batch removal we'll swap in a modal.
+  const ok = window.confirm(
+    `Remove ${label}? They'll lose access immediately. Pending invites for them will be revoked.`,
+  );
+  if (!ok) return;
+  errorMsg.value = '';
+  removingMemberId.value = member.id;
+  try {
+    await api.delete(`/members/${member.id}`, { headers: authHeader() });
+    infoMsg.value = `Removed ${label}.`;
+    const { data } = await api.get('/members/', { headers: authHeader() });
+    members.value = data;
+  } catch (err) {
+    if (await handleMfaProtectedError(err)) return;
+    errorMsg.value = extractErrorMessage(err, 'Failed to remove member.');
+  } finally {
+    removingMemberId.value = null;
+  }
+};
+
 const toggleAgentTool = (key) => {
   const idx = newAgent.value.tool_keys.indexOf(key);
   if (idx >= 0) newAgent.value.tool_keys.splice(idx, 1);
@@ -1735,6 +2154,119 @@ const discardDraft = async (id) => {
 };
 
 const isAdmin = computed(() => currentUser.value?.role === 'admin');
+// Members + viewers see a stripped-down dashboard: own timetable + the
+// two actions they're allowed to perform (add buffer, mark unavailable).
+// Everything else in the sidebar and main area is gated off for them.
+const isMemberOnly = computed(() => ['member', 'viewer'].includes(currentUser.value?.role));
+
+const myTimetable = ref(null);
+const isLoadingMyTimetable = ref(false);
+const isMutatingMyBlock = ref(false);
+const bufferForm = ref({ start_time: '', duration_minutes: 30, reason: 'Buffer' });
+const unavailableForm = ref({ start_time: '', end_time: '', reason: '' });
+const bufferDurationOptions = [
+  { minutes: 15, label: '15 min' },
+  { minutes: 30, label: '30 min' },
+  { minutes: 45, label: '45 min' },
+  { minutes: 60, label: '1 hr' },
+  { minutes: 90, label: '1.5 hr' },
+];
+
+const loadMyTimetable = async () => {
+  isLoadingMyTimetable.value = true;
+  try {
+    const { data } = await api.get('/members/me/timetable', { headers: authHeader() });
+    myTimetable.value = data;
+  } catch (err) {
+    errorMsg.value = extractErrorMessage(err, 'Failed to load your timetable.');
+  } finally {
+    isLoadingMyTimetable.value = false;
+  }
+};
+
+const addBuffer = async () => {
+  if (!bufferForm.value.start_time) {
+    errorMsg.value = 'Pick a start time for the buffer.';
+    return;
+  }
+  const start = new Date(bufferForm.value.start_time);
+  const end = new Date(start.getTime() + Number(bufferForm.value.duration_minutes) * 60 * 1000);
+  isMutatingMyBlock.value = true;
+  try {
+    await api.post(
+      '/members/me/blocked-slots',
+      {
+        start_time: start.toISOString(),
+        end_time: end.toISOString(),
+        reason: bufferForm.value.reason || 'Buffer',
+      },
+      { headers: authHeader() },
+    );
+    infoMsg.value = 'Buffer added to your calendar.';
+    bufferForm.value = { start_time: '', duration_minutes: 30, reason: 'Buffer' };
+    await loadMyTimetable();
+  } catch (err) {
+    errorMsg.value = extractErrorMessage(err, 'Failed to add buffer.');
+  } finally {
+    isMutatingMyBlock.value = false;
+  }
+};
+
+const addUnavailability = async () => {
+  if (!unavailableForm.value.start_time || !unavailableForm.value.end_time) {
+    errorMsg.value = 'Pick both a start and end time for your unavailability.';
+    return;
+  }
+  const start = new Date(unavailableForm.value.start_time);
+  const end = new Date(unavailableForm.value.end_time);
+  if (end <= start) {
+    errorMsg.value = 'End time must be after start time.';
+    return;
+  }
+  isMutatingMyBlock.value = true;
+  try {
+    await api.post(
+      '/members/me/blocked-slots',
+      {
+        start_time: start.toISOString(),
+        end_time: end.toISOString(),
+        reason: unavailableForm.value.reason || 'Unavailable',
+      },
+      { headers: authHeader() },
+    );
+    infoMsg.value = 'Unavailability added.';
+    unavailableForm.value = { start_time: '', end_time: '', reason: '' };
+    await loadMyTimetable();
+  } catch (err) {
+    errorMsg.value = extractErrorMessage(err, 'Failed to add unavailability.');
+  } finally {
+    isMutatingMyBlock.value = false;
+  }
+};
+
+const removeMyBlock = async (id) => {
+  if (!id) return;
+  isMutatingMyBlock.value = true;
+  try {
+    await api.delete(`/members/me/blocked-slots/${id}`, { headers: authHeader() });
+    infoMsg.value = 'Block removed.';
+    await loadMyTimetable();
+  } catch (err) {
+    errorMsg.value = extractErrorMessage(err, 'Failed to remove block.');
+  } finally {
+    isMutatingMyBlock.value = false;
+  }
+};
+
+const formatSlotRange = (slot) => {
+  if (!slot?.start_time || !slot?.end_time) return '';
+  const start = new Date(slot.start_time);
+  const end = new Date(slot.end_time);
+  const sameDay = start.toDateString() === end.toDateString();
+  const opts = { dateStyle: 'medium', timeStyle: 'short' };
+  const tail = sameDay ? end.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : end.toLocaleString([], opts);
+  return `${start.toLocaleString([], opts)} → ${tail}`;
+};
 
 const kbApi = axios.create({ baseURL: 'http://localhost:8000/api/nokvo-one/knowledge-base' });
 
@@ -1981,6 +2513,19 @@ const formatRecordDateTime = (value) => {
     hour: '2-digit',
     minute: '2-digit',
   });
+};
+
+const recordPhone = (record) =>
+  formatRecordValue(
+    firstRecordValue(record, ['contact_phone', 'phone', 'phone_number', 'patient_phone', 'mobile', 'mobile_number']),
+    '',
+  );
+
+const phoneHref = (phone) => {
+  const value = String(phone || '').trim();
+  if (!value) return '';
+  const cleaned = value.replace(/[^\d+]/g, '');
+  return cleaned ? `tel:${cleaned}` : '';
 };
 
 const appointmentRecordTitle = (record) =>
@@ -2338,11 +2883,40 @@ const loadOutgoingAgentWorkspace = async () => {
   }
 };
 
-const startLeadOAuth = async (provider) => {
+const leadOAuthMode = (provider, channel = null) => {
+  if (provider === 'meta_ads') return channel || 'facebook_ads';
+  return provider === 'google_forms' ? 'forms' : 'ads';
+};
+
+const requestLeadOAuth = (provider, channel = null) => {
+  if (provider === 'meta_ads' && channel === 'instagram_ads') {
+    pendingLeadOAuth.value = {
+      provider,
+      channel,
+      title: 'Connect Instagram Ads',
+      actionLabel: 'Continue with Meta',
+    };
+    return;
+  }
+  startLeadOAuth(provider, channel);
+};
+
+const closeLeadOAuthNotice = () => {
+  pendingLeadOAuth.value = null;
+};
+
+const continuePendingLeadOAuth = async () => {
+  const pending = pendingLeadOAuth.value;
+  pendingLeadOAuth.value = null;
+  if (!pending) return;
+  await startLeadOAuth(pending.provider, pending.channel);
+};
+
+const startLeadOAuth = async (provider, channel = null) => {
   try {
     const { data } = await agentsApi.post(
       '/lead-sources/oauth/start',
-      { provider, mode: provider === 'google_forms' ? 'forms' : 'ads' },
+      { provider, mode: leadOAuthMode(provider, channel) },
       { headers: authHeader() },
     );
     if (data.authorization_url) window.location.href = data.authorization_url;
@@ -2451,10 +3025,15 @@ const createCampaign = async () => {
     const fd = new FormData();
     fd.append('name', campaignForm.value.name.trim());
     if (campaignForm.value.from_number.trim()) fd.append('from_number', campaignForm.value.from_number.trim());
+    if (campaignForm.value.agent_prompt.trim()) fd.append('agent_prompt', campaignForm.value.agent_prompt.trim());
+    if (campaignForm.value.objectives.trim()) fd.append('objectives', JSON.stringify(campaignForm.value.objectives.split('\n').map((item) => item.trim()).filter(Boolean)));
+    if (campaignForm.value.exit_conditions.trim()) fd.append('exit_conditions', JSON.stringify(campaignForm.value.exit_conditions.split('\n').map((item) => item.trim()).filter(Boolean)));
+    if (campaignForm.value.tone.trim()) fd.append('tone', campaignForm.value.tone.trim());
+    fd.append('silence_timeout_seconds', String(campaignForm.value.silence_timeout_seconds || 5));
     fd.append('lead_ids', JSON.stringify(selectedCallableLeads.value.map((lead) => lead.id)));
     fd.append('doc_file', campaignForm.value.doc_file);
     await agentsApi.post('/campaigns', fd, { headers: { ...authHeader(), 'Content-Type': 'multipart/form-data' } });
-    campaignForm.value = { name: '', from_number: '', doc_file: null };
+    campaignForm.value = emptyCampaignForm();
     selectedLeadIds.value = [];
     await loadCampaigns();
     await loadOutgoingLeads();
@@ -3136,16 +3715,25 @@ onBeforeUnmount(() => {
     </div>
 
     <div class="mode-bar">
-      <button type="button" class="mode-link" @click="$emit('switch-mode')">
-        <Shield :size="14" />
-        Nokvo Prime / SuperAdmin
+      <button type="button" class="mode-link" @click="toggleThemeMode">
+        <SunMedium v-if="themeMode === 'dark'" :size="14" />
+        <Moon v-else :size="14" />
+        {{ themeToggleLabel }}
+      </button>
+      <button
+        v-if="authState === 'ready'"
+        type="button"
+        class="mode-link"
+        @click="handleLogout"
+      >
+        <LogOut :size="14" />
+        Log Out
       </button>
     </div>
 
     <main v-if="authState !== 'ready'" class="login-layout">
       <div class="brand-block">
-        <h1>NOKVO ONE</h1>
-        <p>Simple agent ops for teams that ship today.</p>
+        <img class="brand-block-logo" :src="nokvoLogo" alt="Nokvo One" />
       </div>
 
       <div class="login-card">
@@ -3540,38 +4128,34 @@ onBeforeUnmount(() => {
       <div class="floating-top-nav">
         <nav class="dashboard-nav">
           <div class="dashboard-brand">
-            <div class="brand-mark">N1</div>
-            <div class="brand-copy">
-              <strong>NOKVO ONE</strong>
-              <span>{{ currentOrganization?.name }}</span>
-            </div>
+            <img class="brand-logo" :src="nokvoLogo" alt="Nokvo One" />
           </div>
 
           <div class="dashboard-nav-actions">
-            <button type="button" class="nav-page-button" :class="{ active: currentPage === 'dashboard' }" @click="switchPage('dashboard')">
+            <button
+              v-if="isMemberOnly"
+              type="button"
+              class="nav-page-button"
+              :class="{ active: currentPage === 'my_timetable' }"
+              @click="switchPage('my_timetable')"
+            >
+              <CalendarDays :size="17" />
+              <span>My Timetable</span>
+            </button>
+            <button v-if="!isMemberOnly" type="button" class="nav-page-button" :class="{ active: currentPage === 'dashboard' }" @click="switchPage('dashboard')">
               <Database :size="17" />
               <span>Dashboard</span>
             </button>
-            <button
-              v-if="!onboardingV2Enabled"
-              type="button"
-              class="nav-page-button"
-              :class="{ active: currentPage === 'members' }"
-              @click="switchPage('members')"
-            >
-              <Users :size="17" />
-              <span>{{ memberPageLabel }}</span>
-            </button>
-            <button type="button" class="nav-page-button" :class="{ active: currentPage === 'tickets' }" @click="switchPage('tickets')">
+            <button v-if="!isMemberOnly" type="button" class="nav-page-button" :class="{ active: currentPage === 'tickets' }" @click="switchPage('tickets')">
               <MessageSquare :size="17" />
               <span>Tickets</span>
             </button>
-            <button type="button" class="nav-page-button" :class="{ active: currentPage === 'leads' }" @click="switchPage('leads')">
+            <button v-if="!isMemberOnly" type="button" class="nav-page-button" :class="{ active: currentPage === 'leads' }" @click="switchPage('leads')">
               <UserPlus :size="17" />
               <span>Leads</span>
             </button>
             <button
-              v-if="showAppointmentsTab"
+              v-if="!isMemberOnly && showAppointmentsTab"
               type="button"
               class="nav-page-button"
               :class="{ active: currentPage === 'appointments' }"
@@ -3581,7 +4165,7 @@ onBeforeUnmount(() => {
               <span>Appointments</span>
             </button>
             <button
-              v-if="!onboardingV2Enabled"
+              v-if="!isMemberOnly && !onboardingV2Enabled"
               type="button"
               class="nav-page-button"
               :class="{ active: currentPage === 'agent' }"
@@ -3591,7 +4175,7 @@ onBeforeUnmount(() => {
               <span>Agent Studio</span>
             </button>
             <button
-              v-if="onboardingV2Enabled"
+              v-if="!isMemberOnly && onboardingV2Enabled"
               type="button"
               class="nav-page-button"
               :class="{ active: currentPage === 'agent' }"
@@ -3601,6 +4185,7 @@ onBeforeUnmount(() => {
               <span>Try Agent</span>
             </button>
             <button
+              v-if="!isMemberOnly"
               type="button"
               class="nav-page-button"
               :class="{ active: currentPage === 'outgoing_agent' }"
@@ -3610,6 +4195,7 @@ onBeforeUnmount(() => {
               <span>Outgoing Agent</span>
             </button>
             <button
+              v-if="!isMemberOnly"
               type="button"
               class="nav-page-button"
               :class="{ active: currentPage === 'knowledge_base' }"
@@ -3618,10 +4204,10 @@ onBeforeUnmount(() => {
               <BookOpen :size="17" />
               <span>Knowledge Base</span>
             </button>
-            <button type="button" class="nav-icon-button">
+            <button v-if="!isMemberOnly" type="button" class="nav-icon-button">
               <Bell :size="18" />
             </button>
-            <div v-if="onboardingV2Enabled" class="nav-settings-wrap">
+            <div v-if="!isMemberOnly && onboardingV2Enabled" class="nav-settings-wrap">
               <button
                 type="button"
                 class="nav-icon-button"
@@ -3634,7 +4220,7 @@ onBeforeUnmount(() => {
                 <button
                   type="button"
                   class="nav-settings-item"
-                  @click="settingsMenuOpen = false; switchPage('members')"
+                  @click="settingsMenuOpen = false; scrollToDashboardMembers()"
                 >
                   <strong>Team &amp; assignment</strong>
                   <small>Invite teammates, set working hours and request caps.</small>
@@ -3665,16 +4251,12 @@ onBeforeUnmount(() => {
                 </button>
               </div>
             </div>
-            <button v-else type="button" class="nav-icon-button">
+            <button v-else-if="!isMemberOnly" type="button" class="nav-icon-button">
               <Settings2 :size="18" />
             </button>
-            <button type="button" class="theme-toggle-button" @click="toggleThemeMode">
-              <SunMedium v-if="themeMode === 'dark'" :size="17" />
-              <Moon v-else :size="17" />
-              <span>{{ themeToggleLabel }}</span>
-            </button>
             <button type="button" class="org-avatar-button" @click="handleLogout">
-              <span>{{ organizationInitial }}</span>
+              <span class="org-avatar-initial">{{ organizationInitial }}</span>
+              <span class="org-avatar-name">{{ currentOrganization?.name }}</span>
             </button>
           </div>
         </nav>
@@ -3684,49 +4266,12 @@ onBeforeUnmount(() => {
         <div>
           <span class="section-kicker">Nokvo One Workspace</span>
           <h2>{{ currentOrganization?.name }}</h2>
-          <p>
-            Signed in as {{ currentUser?.email }}. Scoped to <strong>{{ currentOrganization?.email_domain }}</strong>.
-            Business Type: <strong>{{ businessTypeLabel }}</strong>. Use predefined tools to keep agent actions safe and auditable.
-          </p>
         </div>
         <div class="dashboard-header-actions">
-          <button type="button" class="dashboard-secondary-button" @click="handleLogout">
-            <LogOut :size="16" />
-            Log Out
-          </button>
-        </div>
-      </section>
-
-      <section v-if="currentPage === 'dashboard'" class="dashboard-summary-bar">
-        <div class="summary-pill-group">
-          <div class="summary-pill">
-            <span>Domain</span>
-            <strong>{{ currentOrganization?.email_domain }}</strong>
-          </div>
-          <div class="summary-pill">
-            <span>{{ memberPageLabel }}</span>
-            <strong>{{ members.length }}</strong>
-          </div>
-          <div class="summary-pill">
-            <span>Agents</span>
-            <strong>{{ agents.length }}</strong>
-          </div>
-          <div class="summary-pill">
-            <span>Business Type</span>
-            <strong>{{ businessTypeLabel }}</strong>
-          </div>
-          <div class="summary-pill">
-            <span>Status</span>
-            <strong>{{ currentOrganization?.status }}</strong>
-          </div>
-          <div class="summary-pill">
-            <span>Calling</span>
-            <strong>{{ currentOrganization?.calling_enabled ? 'Enabled' : 'Gated' }}</strong>
-          </div>
-          <div class="summary-pill">
-            <span>Role</span>
-            <strong>{{ currentUser?.role }}</strong>
-          </div>
+          <span class="dashboard-context-pill">
+            <Shield :size="15" />
+            {{ currentUser?.role || 'Workspace' }}
+          </span>
         </div>
       </section>
 
@@ -3736,14 +4281,16 @@ onBeforeUnmount(() => {
       <!-- DASHBOARD: MFA-pending banner -->
       <div
         v-if="onboardingV2Enabled && currentUser?.mfa_pending && currentPage === 'dashboard'"
-        class="dashboard-message warning mfa-pending-banner"
+        class="mfa-pending-banner"
       >
-        <strong>Set up MFA to unlock advanced actions.</strong>
-        <span>
-          Real calling, outbound campaigns, member invites, integrations, and data exports stay
-          locked until you add an authenticator app. Takes 30 seconds.
-        </span>
-        <button type="button" class="ghost-button compact" :disabled="isAuthenticating" @click="startSessionTotpSetup">
+        <div class="mfa-pending-icon">
+          <Shield :size="18" />
+        </div>
+        <div class="mfa-pending-copy">
+          <strong>Secure advanced actions</strong>
+          <span>Enable MFA to unlock calling, campaigns, invites, and integrations.</span>
+        </div>
+        <button type="button" class="primary-button compact" :disabled="isAuthenticating" @click="startSessionTotpSetup">
           Set up MFA
         </button>
       </div>
@@ -3783,14 +4330,199 @@ onBeforeUnmount(() => {
         </article>
       </section>
 
+      <!-- MEMBER TIMETABLE — own schedule + buffer/unavailable actions -->
+      <section v-if="currentPage === 'my_timetable'" class="dashboard-section member-timetable-section">
+        <div class="dashboard-section-head">
+          <div>
+            <span class="section-kicker">Your schedule</span>
+            <h3>My timetable</h3>
+          </div>
+          <p>View your working window, add a buffer, or mark yourself unavailable. Changes apply immediately.</p>
+        </div>
+
+        <div v-if="isLoadingMyTimetable && !myTimetable" class="empty-state">Loading your timetable…</div>
+
+        <div v-else class="member-timetable-grid">
+          <article class="dashboard-card member-timetable-card">
+            <div class="dashboard-card-glow"></div>
+            <div class="member-timetable-card-head">
+              <h4>Working window</h4>
+              <span class="readonly-tag">Set by admin</span>
+            </div>
+            <dl class="dashboard-detail-list">
+              <div>
+                <dt>Days</dt>
+                <dd>{{ (myTimetable?.assignment?.working_days || []).join(', ') || 'No days configured yet' }}</dd>
+              </div>
+              <div>
+                <dt>Hours</dt>
+                <dd>
+                  <template v-if="myTimetable?.assignment?.start_time && myTimetable?.assignment?.end_time">
+                    {{ myTimetable.assignment.start_time }} – {{ myTimetable.assignment.end_time }}
+                    ({{ myTimetable.assignment.timezone || 'Asia/Kolkata' }})
+                  </template>
+                  <template v-else>Not set</template>
+                </dd>
+              </div>
+              <div>
+                <dt>Status</dt>
+                <dd>
+                  <span v-if="myTimetable?.assignment?.is_assignable">Accepting work</span>
+                  <span v-else>Not assignable yet</span>
+                </dd>
+              </div>
+              <div v-if="(myTimetable?.assignment?.request_types || []).length">
+                <dt>Handles</dt>
+                <dd>{{ (myTimetable.assignment.request_types || []).join(', ') }}</dd>
+              </div>
+            </dl>
+          </article>
+
+          <article class="dashboard-card member-timetable-card member-action-card buffer-card">
+            <div class="dashboard-card-glow"></div>
+            <header class="member-action-head">
+              <div class="member-action-icon">
+                <Clock :size="20" />
+              </div>
+              <div class="member-action-title">
+                <h4>Add buffer</h4>
+                <p>Short break between requests — lunch, a quick call, or back-to-back recovery.</p>
+              </div>
+            </header>
+            <form class="member-action-form" @submit.prevent="addBuffer">
+              <label class="member-field member-field-wide">
+                <span class="member-field-label">Start time</span>
+                <input
+                  v-model="bufferForm.start_time"
+                  type="datetime-local"
+                  class="member-field-input"
+                  required
+                />
+              </label>
+              <div class="member-field member-field-wide">
+                <span class="member-field-label">Duration</span>
+                <div class="member-duration-pills" role="radiogroup" aria-label="Buffer duration">
+                  <button
+                    v-for="opt in bufferDurationOptions"
+                    :key="opt.minutes"
+                    type="button"
+                    role="radio"
+                    :aria-checked="bufferForm.duration_minutes === opt.minutes"
+                    class="member-duration-pill"
+                    :class="{ active: bufferForm.duration_minutes === opt.minutes }"
+                    @click="bufferForm.duration_minutes = opt.minutes"
+                  >
+                    {{ opt.label }}
+                  </button>
+                </div>
+              </div>
+              <label class="member-field member-field-wide">
+                <span class="member-field-label">Note <small>(optional)</small></span>
+                <input
+                  v-model="bufferForm.reason"
+                  type="text"
+                  maxlength="240"
+                  class="member-field-input"
+                  placeholder="e.g. lunch break"
+                />
+              </label>
+              <button
+                type="submit"
+                class="member-action-submit"
+                :disabled="isMutatingMyBlock || !bufferForm.start_time"
+              >
+                <Plus :size="16" />
+                {{ isMutatingMyBlock ? 'Adding…' : 'Add buffer' }}
+              </button>
+            </form>
+          </article>
+
+          <article class="dashboard-card member-timetable-card member-action-card unavailable-card">
+            <div class="dashboard-card-glow"></div>
+            <header class="member-action-head">
+              <div class="member-action-icon unavailable-icon">
+                <CalendarOff :size="20" />
+              </div>
+              <div class="member-action-title">
+                <h4>Mark unavailable</h4>
+                <p>Longer time off — leave, an offsite, or anything that takes you out of rotation.</p>
+              </div>
+            </header>
+            <form class="member-action-form" @submit.prevent="addUnavailability">
+              <label class="member-field">
+                <span class="member-field-label">From</span>
+                <input
+                  v-model="unavailableForm.start_time"
+                  type="datetime-local"
+                  class="member-field-input"
+                  required
+                />
+              </label>
+              <label class="member-field">
+                <span class="member-field-label">Until</span>
+                <input
+                  v-model="unavailableForm.end_time"
+                  type="datetime-local"
+                  class="member-field-input"
+                  required
+                />
+              </label>
+              <label class="member-field member-field-wide">
+                <span class="member-field-label">Reason <small>(optional)</small></span>
+                <input
+                  v-model="unavailableForm.reason"
+                  type="text"
+                  maxlength="240"
+                  class="member-field-input"
+                  placeholder="e.g. annual leave, training, doctor's appointment"
+                />
+              </label>
+              <button
+                type="submit"
+                class="member-action-submit unavailable-submit"
+                :disabled="isMutatingMyBlock || !unavailableForm.start_time || !unavailableForm.end_time"
+              >
+                <CalendarOff :size="16" />
+                {{ isMutatingMyBlock ? 'Saving…' : 'Mark unavailable' }}
+              </button>
+            </form>
+          </article>
+
+          <article class="dashboard-card member-timetable-card member-timetable-card-wide">
+            <div class="dashboard-card-glow"></div>
+            <h4>Upcoming blocks</h4>
+            <p v-if="!(myTimetable?.blocked_slots || []).length" class="empty-state">
+              No buffers or unavailability scheduled.
+            </p>
+            <ul v-else class="member-timetable-blocks">
+              <li v-for="slot in myTimetable.blocked_slots" :key="slot.id" class="member-timetable-block">
+                <div class="member-timetable-block-meta">
+                  <strong>{{ slot.reason || 'Block' }}</strong>
+                  <span>{{ formatSlotRange(slot) }}</span>
+                </div>
+                <button
+                  type="button"
+                  class="dashboard-inline-button"
+                  :disabled="isMutatingMyBlock"
+                  @click="removeMyBlock(slot.id)"
+                >
+                  <Trash2 :size="14" />
+                  Remove
+                </button>
+              </li>
+            </ul>
+          </article>
+        </div>
+      </section>
+
       <!-- DASHBOARD -->
       <section v-if="currentPage === 'dashboard'" class="dashboard-section">
         <div class="dashboard-section-head">
           <div>
             <span class="section-kicker">Overview</span>
-            <h3>Organization Snapshot</h3>
+            <h3>Organization analytics</h3>
           </div>
-          <p>Workspace status, agent readiness, and access health in one glance.</p>
+          <p>Live readiness across security, agent setup, knowledge, runtime, outbound, and infrastructure.</p>
         </div>
 
         <div class="dashboard-grid overview-grid">
@@ -3810,37 +4542,29 @@ onBeforeUnmount(() => {
               </span>
             </div>
 
-            <p class="organization-description">
-              Signed in as {{ currentUser?.email }}. This workspace is scoped to {{ currentOrganization?.email_domain }}.
-              Predefined tools keep agent actions auditable; outbound calling unlocks after Nokvo activation.
-            </p>
+            <div class="health-tracker">
+              <div class="health-score-card" :class="`health-${organizationHealth.state}`">
+                <div class="health-ring" :style="{ background: organizationHealth.ringStyle }">
+                  <div>
+                    <strong>{{ organizationHealth.score }}</strong>
+                    <span>/100</span>
+                  </div>
+                </div>
+                <div>
+                  <span class="micro-label">Workspace health</span>
+                  <h4>{{ organizationHealth.label }}</h4>
+                  <p>{{ organizationHealth.openIssues ? `${organizationHealth.openIssues} area${organizationHealth.openIssues === 1 ? '' : 's'} need attention.` : 'All critical areas are clear.' }}</p>
+                </div>
+              </div>
 
-            <div class="usage-block">
-              <div class="usage-labels">
-                <span>Agent Coverage</span>
-                <strong>{{ agents.length }} agent(s) configured</strong>
-              </div>
-              <div class="usage-track">
-                <div class="usage-fill" :style="{ width: `${Math.min(agents.length * 25, 100)}%` }"></div>
-              </div>
-            </div>
-
-            <div class="organization-metrics">
-              <div>
-                <span>{{ memberPageLabel }}</span>
-                <strong>{{ members.length }}</strong>
-              </div>
-              <div>
-                <span>Predefined Tools</span>
-                <strong>{{ predefinedTools.length }}</strong>
-              </div>
-              <div>
-                <span>Region</span>
-                <strong>{{ currentOrganization?.region }}</strong>
-              </div>
-              <div>
-                <span>Environment</span>
-                <strong>{{ currentOrganization?.environment }}</strong>
+              <div class="health-check-grid">
+                <div v-for="item in organizationHealth.checks" :key="item.key" class="health-check" :data-state="item.state">
+                  <span class="health-check-dot"></span>
+                  <div>
+                    <strong>{{ item.label }}</strong>
+                    <small>{{ item.detail }}</small>
+                  </div>
+                </div>
               </div>
             </div>
           </article>
@@ -3852,13 +4576,13 @@ onBeforeUnmount(() => {
               </div>
               <div>
                 <h3>Agent Studio</h3>
-                <p>{{ agents.length ? `${agents.length} agent(s) created` : 'No agents yet' }}</p>
+                <p>{{ agents.length ? 'Ready for testing' : 'No agent yet' }}</p>
               </div>
             </div>
             <dl class="dashboard-detail-list">
               <div>
-                <dt>Predefined Tools</dt>
-                <dd>{{ predefinedTools.length }} available</dd>
+                <dt>Primary Agent</dt>
+                <dd>{{ activeAgent?.name || agents[0]?.name || 'Not created' }}</dd>
               </div>
               <div>
                 <dt>Calling</dt>
@@ -3878,162 +4602,131 @@ onBeforeUnmount(() => {
               Open Agent Studio
             </button>
           </article>
-
-          <article class="dashboard-card compact-card access-card">
-            <div class="compact-card-head">
-              <div class="compact-icon-shell">
-                <UserPlus :size="18" />
-              </div>
-              <div>
-                <h3>Access</h3>
-                <p>Invite teammates under @{{ currentOrganization?.email_domain }}</p>
-              </div>
-            </div>
-            <dl class="dashboard-detail-list">
-              <div>
-                <dt>Total {{ memberPageLabel }}</dt>
-                <dd>{{ members.length }}</dd>
-              </div>
-              <div>
-                <dt>Pending Invites</dt>
-                <dd>{{ members.filter((m) => m.status === 'invited' || m.status === 'pending_totp').length }}</dd>
-              </div>
-              <div>
-                <dt>Auth</dt>
-                <dd>Password + TOTP (encrypted)</dd>
-              </div>
-            </dl>
-            <button type="button" class="dashboard-inline-button" @click="switchPage('members')">
-              <Users :size="15" />
-              Manage {{ memberPageLabel }}
-            </button>
-          </article>
         </div>
-
-        <div class="dashboard-section-head">
-          <div>
-            <span class="section-kicker">Infrastructure</span>
-            <h3>Tenant Provisioning</h3>
-          </div>
-          <p>What Nokvo One created in Azure, Qdrant, Redis, and Exotel for your organization.</p>
-        </div>
-
-        <article class="dashboard-card wide-card provisioning-card">
-          <div v-if="!provisioning" class="empty-state">Provisioning state will appear here.</div>
-          <div v-else>
-            <div class="members-card-head">
-              <div>
-                <h3>Resources for tenant {{ provisioning.tenant_id }}</h3>
-                <p>{{ provisioning.azure_resource_group_name || 'Resource group' }} · {{ provisioning.azure_region }}</p>
-              </div>
-              <span class="status-chip" :class="{ active: provisioning.provisioning_status === 'success' }">
-                <span class="status-dot"></span>
-                {{ provisioning.provisioning_status }}
-              </span>
-            </div>
-            <ul class="provisioning-steps">
-              <li v-for="step in provisioning.steps" :key="step.name" :data-state="step.status">
-                <span class="step-marker" :data-state="step.status"></span>
-                <div>
-                  <strong>{{ stepLabel(step.name) }}</strong>
-                  <small>{{ stepDescription(step.name, step.status, provisioning) }}</small>
-                </div>
-                <span class="step-state">{{ step.status }}</span>
-              </li>
-            </ul>
-          </div>
-        </article>
 
         <div class="dashboard-section-head">
           <div>
             <span class="section-kicker">Controls</span>
             <h3>Quick Actions</h3>
           </div>
-          <p>Invite teammates and review your workspace profile.</p>
+          <p>Invite teammates under your verified workspace domain.</p>
         </div>
 
         <div class="dashboard-grid control-grid">
-          <article class="dashboard-card invite-card">
-            <div class="compact-card-head">
-              <div class="compact-icon-shell">
-                <UserPlus :size="18" />
+          <article class="dashboard-card invite-card wide-card expanded-invite-card">
+            <div class="invite-context-panel">
+              <div class="compact-card-head">
+                <div class="compact-icon-shell">
+                  <UserPlus :size="18" />
+                </div>
+                <div>
+                  <h3>Invite {{ memberPageLabel }}</h3>
+                  <p>Email invite link. Invitee sets their own password and TOTP.</p>
+                </div>
               </div>
-              <div>
-                <h3>Invite {{ memberPageLabel }}</h3>
-                <p>Email invite link. Invitee sets their own password and TOTP.</p>
+              <div class="invite-domain-banner">
+                <span>Allowed Domain</span>
+                <strong>{{ currentOrganization?.email_domain }}</strong>
+                <small>Invites are restricted to verified work email addresses from this domain.</small>
               </div>
-            </div>
-            <div class="invite-domain-banner">
-              <span>Allowed Domain</span>
-              <strong>{{ currentOrganization?.email_domain }}</strong>
             </div>
             <form class="invite-form dashboard-invite-form" @submit.prevent="inviteMember">
-              <label class="invite-field">
-                <span>Work Email</span>
-                <input v-model="inviteForm.email" type="email" placeholder="name@yourcompany.com" required />
-              </label>
-              <label class="invite-field">
-                <span>Full Name</span>
-                <input v-model="inviteForm.full_name" type="text" placeholder="Full name" />
-              </label>
-              <label class="invite-field">
-                <span>Role</span>
-                <select v-model="inviteForm.role">
-                  <option value="member">Member</option>
-                  <option value="manager">Manager</option>
-                  <option value="viewer">Viewer</option>
-                  <option value="admin">Admin</option>
-                </select>
-              </label>
+              <div class="invite-field-grid">
+                <label class="invite-field invite-field-wide">
+                  <span>Work Email</span>
+                  <input v-model="inviteForm.email" type="email" placeholder="name@yourcompany.com" required />
+                </label>
+                <label class="invite-field">
+                  <span>Full Name</span>
+                  <input v-model="inviteForm.full_name" type="text" placeholder="Full name" />
+                </label>
+                <label class="invite-field">
+                  <span>Role</span>
+                  <select v-model="inviteForm.role">
+                    <option value="member">Member</option>
+                    <option value="manager">Manager</option>
+                    <option value="viewer">Viewer</option>
+                    <option value="admin">Admin</option>
+                  </select>
+                </label>
+              </div>
               <div class="invite-action-block">
-                <button type="submit" :disabled="isSavingMember || !inviteCanSubmit">
-                  {{ isSavingMember ? 'Inviting...' : 'Send Invite' }}
-                </button>
                 <p :class="['invite-helper', { invalid: !isInviteDomainValid }]">
                   {{ inviteValidationMessage }}
                 </p>
+                <button type="submit" :disabled="isSavingMember || !inviteCanSubmit">
+                  <UserPlus :size="15" />
+                  {{ isSavingMember ? 'Inviting...' : 'Send Invite' }}
+                </button>
               </div>
             </form>
           </article>
-
-          <article class="dashboard-card workspace-card">
-            <div class="compact-card-head">
-              <div class="compact-icon-shell">
-                <Shield :size="18" />
-              </div>
-              <div>
-                <h3>Workspace Profile</h3>
-                <p>Identity and tier metadata for this Nokvo One organization.</p>
-              </div>
-            </div>
-            <div class="workspace-profile-grid">
-              <div>
-                <span>Name</span>
-                <strong>{{ currentOrganization?.name }}</strong>
-              </div>
-              <div>
-                <span>Domain</span>
-                <strong>{{ currentOrganization?.email_domain }}</strong>
-              </div>
-              <div>
-                <span>Admin</span>
-                <strong>{{ currentOrganization?.admin_email || 'Not set' }}</strong>
-              </div>
-              <div>
-                <span>Tier</span>
-                <strong>{{ currentOrganization?.product_tier }}</strong>
-              </div>
-              <div>
-                <span>Business Type</span>
-                <strong>{{ businessTypeLabel }}</strong>
-              </div>
-            </div>
-          </article>
         </div>
+
+        <article id="dashboard-members" class="dashboard-card wide-card members-card dashboard-team-card">
+          <div class="members-card-head">
+            <div>
+              <span class="section-kicker">Access</span>
+              <h3>{{ memberPageLabel }}</h3>
+              <p>Manage access and assignment availability for incoming calls, leads, tickets, and appointments.</p>
+            </div>
+            <div class="members-summary">
+              <span>{{ filteredMembers.length }} visible</span>
+              <span>{{ members.length }} total</span>
+            </div>
+          </div>
+
+          <div v-if="isLoadingMembers" class="empty-state">Loading members...</div>
+          <div v-else-if="!filteredMembers.length" class="empty-state">No members match the current filter.</div>
+          <div v-else class="team-card-grid">
+            <div v-for="m in filteredMembers" :key="m.id" class="team-member-card">
+              <div class="team-member-main">
+                <div class="team-avatar">{{ (m.full_name || m.email || 'N').trim().charAt(0).toUpperCase() }}</div>
+                <div class="team-identity">
+                  <strong>{{ m.full_name || 'Unnamed member' }}</strong>
+                  <small>{{ m.email }}</small>
+                </div>
+                <div class="team-badges">
+                  <span>{{ m.role }}</span>
+                  <span :class="{ active: m.status === 'active' }">{{ m.status }}</span>
+                </div>
+              </div>
+
+              <div class="team-assignment-panel">
+                <div>
+                  <span class="micro-label">Availability</span>
+                  <p>{{ assignmentForMember(m.id).availability_summary }}</p>
+                </div>
+                <div class="team-load-pill">
+                  <span>Current load</span>
+                  <strong>{{ assignmentForMember(m.id).active_request_count || 0 }}</strong>
+                </div>
+                <button type="button" class="ghost-button compact" @click="openMemberTimetable(m)">
+                  <CalendarDays :size="15" />
+                  Timetable
+                </button>
+                <button type="button" class="ghost-button compact" @click="startAssignmentEdit(m)">
+                  <CalendarDays :size="15" />
+                  Schedule
+                </button>
+                <button
+                  v-if="isAdmin && m.id !== currentUser?.id"
+                  type="button"
+                  class="ghost-button compact danger"
+                  :disabled="removingMemberId === m.id"
+                  @click="removeMember(m)"
+                >
+                  <Trash2 :size="15" />
+                  {{ removingMemberId === m.id ? 'Removing…' : 'Remove' }}
+                </button>
+              </div>
+            </div>
+          </div>
+        </article>
       </section>
 
       <!-- MEMBERS -->
-      <section v-if="currentPage === 'members'" class="dashboard-section">
+      <section v-if="false" class="dashboard-section">
         <div class="dashboard-section-head">
           <div>
             <span class="section-kicker">Access</span>
@@ -4202,6 +4895,10 @@ onBeforeUnmount(() => {
               <div class="tab-record-primary">
                 <strong>{{ ticketRecordTitle(record) }}</strong>
                 <small>{{ ticketRecordSubtitle(record) }}</small>
+                <a v-if="phoneHref(recordPhone(record))" class="record-call-link" :href="phoneHref(recordPhone(record))">
+                  <PhoneCall :size="14" />
+                  Call {{ recordPhone(record) }}
+                </a>
               </div>
               <div class="tab-record-meta">
                 <div>
@@ -4303,6 +5000,10 @@ onBeforeUnmount(() => {
               <div class="tab-record-primary">
                 <strong>{{ leadRecordTitle(record) }}</strong>
                 <small>{{ leadRecordSubtitle(record) }}</small>
+                <a v-if="phoneHref(recordPhone(record))" class="record-call-link" :href="phoneHref(recordPhone(record))">
+                  <PhoneCall :size="14" />
+                  Call {{ recordPhone(record) }}
+                </a>
               </div>
               <div class="tab-record-meta">
                 <div>
@@ -4384,6 +5085,10 @@ onBeforeUnmount(() => {
               <div class="tab-record-primary">
                 <strong>{{ appointmentRecordTitle(record) }}</strong>
                 <small>{{ appointmentRecordSubtitle(record) }}</small>
+                <a v-if="phoneHref(recordPhone(record))" class="record-call-link" :href="phoneHref(recordPhone(record))">
+                  <PhoneCall :size="14" />
+                  Call {{ recordPhone(record) }}
+                </a>
               </div>
               <div class="tab-record-meta">
                 <div>
@@ -4951,7 +5656,7 @@ onBeforeUnmount(() => {
           <div>
             <span class="section-kicker">Outgoing Agent</span>
             <h3>Call only consented leads.</h3>
-            <p>Connect Meta Ads, Google Ads, Google Forms, or share a Nokvo form. Campaigns can launch only from callable leads with consent evidence.</p>
+            <p>Connect Facebook Ads, Instagram Ads, Google Ads, Google Forms, or share a Nokvo form. Campaigns can launch only from callable leads with consent evidence.</p>
           </div>
           <button type="button" class="dashboard-inline-button" :disabled="isLoadingLeadSources" @click="loadOutgoingAgentWorkspace">
             <Search :size="16" />
@@ -4987,15 +5692,19 @@ onBeforeUnmount(() => {
               </div>
             </div>
             <div class="provider-grid provider-grid-dual outgoing-provider-grid">
-              <button type="button" class="provider-option" @click="startLeadOAuth('meta_ads')">
-                <strong class="provider-name">Meta Ads</strong>
-                <small>Facebook and Instagram instant-form leads via Lead Ads Retrieval.</small>
+              <button type="button" class="provider-option" @click="requestLeadOAuth('meta_ads', 'facebook_ads')">
+                <strong class="provider-name">Facebook Ads</strong>
+                <small>Connect Facebook Page lead forms through Meta Lead Ads Retrieval.</small>
               </button>
-              <button type="button" class="provider-option" @click="startLeadOAuth('google_ads')">
+              <button type="button" class="provider-option" @click="requestLeadOAuth('meta_ads', 'instagram_ads')">
+                <strong class="provider-name">Instagram Ads</strong>
+                <small>Connect Instagram instant-form leads through Meta Business access.</small>
+              </button>
+              <button type="button" class="provider-option" @click="requestLeadOAuth('google_ads')">
                 <strong class="provider-name">Google Ads</strong>
                 <small>Lead form submissions from a configured Google Ads customer ID.</small>
               </button>
-              <button type="button" class="provider-option" @click="startLeadOAuth('google_forms')">
+              <button type="button" class="provider-option" @click="requestLeadOAuth('google_forms')">
                 <strong class="provider-name">Google Forms</strong>
                 <small>Read form responses from registered Google Forms.</small>
               </button>
@@ -5163,13 +5872,16 @@ onBeforeUnmount(() => {
 
           <div class="outgoing-lead-list">
             <div v-if="!outgoingLeads.length" class="empty-state compact">No leads imported yet. Connect a source or publish a Nokvo form.</div>
-            <button
+            <article
               v-for="lead in outgoingLeads"
               :key="lead.id"
-              type="button"
+              role="button"
+              tabindex="0"
               class="agent-document-row outgoing-lead-row"
               :class="{ active: selectedLeadIds.includes(lead.id), disabled: !lead.callable }"
               @click="toggleLeadSelection(lead)"
+              @keydown.enter.prevent="toggleLeadSelection(lead)"
+              @keydown.space.prevent="toggleLeadSelection(lead)"
             >
               <div class="agent-document-main">
                 <div class="agent-document-icon">
@@ -5180,8 +5892,19 @@ onBeforeUnmount(() => {
                   <small>{{ lead.source_provider }} · {{ lead.phone_e164 || 'no phone' }} · {{ lead.consent_status }}</small>
                 </div>
               </div>
-              <span class="status-chip">{{ lead.callable ? 'Callable' : 'Blocked' }}</span>
-            </button>
+              <div class="outgoing-lead-actions">
+                <a
+                  v-if="phoneHref(lead.phone_e164 || lead.phone_raw)"
+                  class="record-call-link"
+                  :href="phoneHref(lead.phone_e164 || lead.phone_raw)"
+                  @click.stop
+                >
+                  <PhoneCall :size="14" />
+                  Call
+                </a>
+                <span class="status-chip">{{ lead.callable ? 'Callable' : 'Blocked' }}</span>
+              </div>
+            </article>
           </div>
         </section>
 
@@ -5205,6 +5928,26 @@ onBeforeUnmount(() => {
               <label class="kb-field">
                 <span>From number (optional)</span>
                 <input v-model="campaignForm.from_number" type="text" placeholder="+91XXXXXXXXXX" />
+              </label>
+              <label class="kb-field">
+                <span>Agent prompt</span>
+                <textarea v-model="campaignForm.agent_prompt" rows="3" placeholder="Role, tone, and call strategy"></textarea>
+              </label>
+              <label class="kb-field">
+                <span>Objectives</span>
+                <textarea v-model="campaignForm.objectives" rows="4" placeholder="One objective per line"></textarea>
+              </label>
+              <label class="kb-field">
+                <span>Exit conditions</span>
+                <textarea v-model="campaignForm.exit_conditions" rows="4" placeholder="One exit condition per line"></textarea>
+              </label>
+              <label class="kb-field">
+                <span>Tone</span>
+                <input v-model="campaignForm.tone" type="text" placeholder="warm, direct, and respectful" />
+              </label>
+              <label class="kb-field">
+                <span>Silence nudge after seconds</span>
+                <input v-model.number="campaignForm.silence_timeout_seconds" type="number" min="2" max="20" step="1" />
               </label>
               <label class="kb-field">
                 <span>Script document (PDF/DOCX/TXT)</span>
@@ -5256,6 +5999,8 @@ onBeforeUnmount(() => {
                   <span><strong>{{ c.answered_count }}</strong> answered</span>
                   <span v-if="c.failed_count"><strong>{{ c.failed_count }}</strong> failed</span>
                   <span v-if="c.from_number">from {{ c.from_number }}</span>
+                  <span v-if="c.agent_config?.objectives?.length"><strong>{{ c.agent_config.objectives.length }}</strong> objectives</span>
+                  <span v-if="c.agent_config?.silence_timeout_seconds">nudges after {{ c.agent_config.silence_timeout_seconds }}s</span>
                   <span v-if="c.created_at">created {{ formatRelativeDate(c.created_at) }}</span>
                 </div>
               </div>
@@ -5746,6 +6491,176 @@ onBeforeUnmount(() => {
       </section>
     </main>
 
+    <div v-if="pendingLeadOAuth" class="field-modal-shell">
+      <div class="field-modal-backdrop" @click="closeLeadOAuthNotice"></div>
+      <section class="field-modal lead-oauth-modal">
+        <div class="members-card-head">
+          <div>
+            <h3>{{ pendingLeadOAuth.title }}</h3>
+            <p>Instagram lead forms are retrieved through Meta Lead Ads access. Meta may show Facebook Login because the lead permissions are attached to the Meta business, ad account, and Page assets behind the Instagram ad.</p>
+          </div>
+          <button type="button" class="ghost-button compact" @click="closeLeadOAuthNotice">Close</button>
+        </div>
+
+        <div class="lead-oauth-note">
+          <strong>Before continuing</strong>
+          <p>The account authorizing this must be able to advertise on the ad account and access the Page or Meta business asset that owns the Instagram lead form. If the client only has an Instagram login with no Meta business/Page lead access, this connector cannot pull Lead Ads data for outbound calls.</p>
+        </div>
+
+        <div class="field-modal-actions">
+          <button type="button" class="ghost-button compact" @click="outgoingTab = 'forms'; closeLeadOAuthNotice()">
+            <FileText :size="15" />
+            Use Nokvo form
+          </button>
+          <button type="button" class="primary-button compact" @click="continuePendingLeadOAuth">
+            {{ pendingLeadOAuth.actionLabel }}
+          </button>
+        </div>
+      </section>
+    </div>
+
+    <div v-if="timetableViewer.member" class="field-modal-shell">
+      <div class="field-modal-backdrop" @click="closeMemberTimetable"></div>
+      <section class="field-modal timetable-modal">
+        <div class="members-card-head">
+          <div>
+            <span class="section-kicker">Calendar</span>
+            <h3>{{ timetableViewer.member.full_name || timetableViewer.member.email }}</h3>
+            <p>Scheduled meetings, ticket work, and blocked time from the assignment engine.</p>
+          </div>
+          <button type="button" class="ghost-button compact" @click="closeMemberTimetable">Close</button>
+        </div>
+
+        <div class="timetable-summary-row">
+          <div>
+            <span>Current load</span>
+            <strong>{{ assignmentForMember(timetableViewer.member.id).active_request_count || 0 }}</strong>
+          </div>
+          <div>
+            <span>Working hours</span>
+            <strong>{{ formatSimpleTime(assignmentForMember(timetableViewer.member.id).start_time) }} - {{ formatSimpleTime(assignmentForMember(timetableViewer.member.id).end_time) }}</strong>
+          </div>
+          <div>
+            <span>Duration</span>
+            <strong>{{ assignmentForMember(timetableViewer.member.id).appointment_duration_minutes || 30 }} min</strong>
+          </div>
+        </div>
+
+        <div v-if="timetableViewer.isLoading" class="empty-state compact">Loading timetable...</div>
+        <template v-else>
+          <div class="timetable-calendar-shell">
+            <section class="timetable-calendar-card">
+              <div class="timetable-calendar-head">
+                <button type="button" class="ghost-button compact icon-only" aria-label="Previous month" @click="shiftTimetableMonth(-1)">
+                  <ChevronLeft :size="16" />
+                </button>
+                <strong>{{ timetableMonthLabel }}</strong>
+                <button type="button" class="ghost-button compact icon-only" aria-label="Next month" @click="shiftTimetableMonth(1)">
+                  <ChevronRight :size="16" />
+                </button>
+              </div>
+              <div class="timetable-weekdays">
+                <span v-for="day in ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']" :key="day">{{ day }}</span>
+              </div>
+              <div class="timetable-month-grid">
+                <button
+                  v-for="day in timetableCalendarDays"
+                  :key="day.key"
+                  type="button"
+                  class="timetable-date-cell"
+                  :class="{ muted: !day.inMonth, today: day.isToday, active: day.isSelected, busy: day.itemCount }"
+                  @click="selectTimetableDate(day.key)"
+                >
+                  <span>{{ day.dayNumber }}</span>
+                  <small v-if="day.ticketCount">{{ day.ticketCount }} ticket{{ day.ticketCount === 1 ? '' : 's' }}</small>
+                  <small v-else-if="day.itemCount">{{ day.itemCount }} item{{ day.itemCount === 1 ? '' : 's' }}</small>
+                </button>
+              </div>
+            </section>
+
+            <section class="timetable-selected-day">
+              <div class="timetable-queue-head">
+                <div>
+                  <span class="section-kicker">Selected date</span>
+                  <h4>{{ selectedTimetableLabel }}</h4>
+                </div>
+                <span class="status-chip">{{ selectedTimetableItems.length }} item{{ selectedTimetableItems.length === 1 ? '' : 's' }}</span>
+              </div>
+
+              <div v-if="!selectedTimetableItems.length" class="kb-empty compact">
+                <div class="kb-empty-icon">
+                  <CalendarDays :size="22" />
+                </div>
+                <strong>No tickets on this date.</strong>
+                <span>Choose a highlighted date to see scheduled tickets, appointments, and blocked slots.</span>
+              </div>
+
+              <div v-else class="timetable-day-list">
+                <article v-for="item in selectedTimetableItems" :key="`${item.type}-${item.id}`" class="timetable-event" :class="{ blocked: item.isBlocked }">
+                  <div class="timetable-time">
+                    <strong>{{ formatCalendarTime(item.start) }}</strong>
+                    <span>{{ item.end ? formatCalendarTime(item.end) : '' }}</span>
+                  </div>
+                  <div class="timetable-event-main">
+                    <div>
+                      <strong>{{ item.title }}</strong>
+                      <span>{{ item.detail || item.type }}</span>
+                      <a v-if="item.phoneHref" class="record-call-link timetable-call-link" :href="item.phoneHref">
+                        <PhoneCall :size="14" />
+                        Call {{ item.phone }}
+                      </a>
+                    </div>
+                    <small>{{ item.typeLabel || item.status }}</small>
+                  </div>
+                </article>
+              </div>
+            </section>
+          </div>
+
+          <div v-if="memberQueuedItems.length" class="timetable-queue">
+            <div class="timetable-queue-head">
+              <div>
+                <span class="section-kicker">Assigned queue</span>
+                <h4>Tickets and requests without a booked time</h4>
+              </div>
+              <span class="status-chip">{{ memberQueuedItems.length }} item{{ memberQueuedItems.length === 1 ? '' : 's' }}</span>
+            </div>
+            <div class="timetable-ticket-list">
+              <article v-for="item in memberQueuedItems" :key="`${item.type}-${item.id}`" class="timetable-ticket-card">
+                <div class="timetable-ticket-primary">
+                  <span class="timetable-type-pill">{{ item.typeLabel }}</span>
+                  <strong>{{ item.title }}</strong>
+                  <small>{{ item.detail || 'No details captured yet.' }}</small>
+                  <a v-if="item.phoneHref" class="record-call-link timetable-call-link" :href="item.phoneHref">
+                    <PhoneCall :size="14" />
+                    Call {{ item.phone }}
+                  </a>
+                </div>
+                <div class="timetable-ticket-meta">
+                  <div>
+                    <span>Status</span>
+                    <strong>{{ item.status || 'open' }}</strong>
+                  </div>
+                  <div v-if="item.priority">
+                    <span>Priority</span>
+                    <strong>{{ item.priority }}</strong>
+                  </div>
+                  <div v-if="item.owner">
+                    <span>Owner</span>
+                    <strong>{{ item.owner }}</strong>
+                  </div>
+                  <div>
+                    <span>Created</span>
+                    <strong>{{ formatRelativeDate(item.createdAt) || 'Unknown' }}</strong>
+                  </div>
+                </div>
+              </article>
+            </div>
+          </div>
+        </template>
+      </section>
+    </div>
+
     <div v-if="fieldEditor.key" class="field-modal-shell">
       <div class="field-modal-backdrop" @click="closeFieldEdit"></div>
       <section class="field-modal">
@@ -6088,6 +7003,7 @@ onBeforeUnmount(() => {
   padding: 1.5rem 2rem 0;
   display: flex;
   justify-content: flex-end;
+  gap: 0.5rem;
 }
 
 .mode-link {
@@ -6119,12 +7035,38 @@ onBeforeUnmount(() => {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 1.5rem;
+  gap: 100px;
   max-width: 460px;
 }
 
 .brand-block {
   text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.brand-block-logo {
+  display: block;
+  width: clamp(17rem, 34vw, 26rem);
+  max-width: 100%;
+  /* Source PNG is 500×500 with whitespace below the "ONE" wordmark.
+     Force a 500/420 box and crop with object-fit so only the top portion
+     (logo glyph + NOKVO + ONE) renders. */
+  aspect-ratio: 500 / 325;
+  height: auto;
+  object-fit: cover;
+  object-position: center top;
+  transition: filter 0.2s ease;
+}
+
+.org-shell.dark .brand-block-logo,
+.org-shell.dark .brand-logo {
+  /* The PNG is dark ink on a light background. In dark mode the surrounding
+     surface is dark, so the logo would vanish — invert the pixel values to
+     keep contrast without shipping a second asset. */
+  filter: invert(1) hue-rotate(180deg);
 }
 
 .brand-block h1 {
@@ -6135,7 +7077,7 @@ onBeforeUnmount(() => {
 }
 
 .brand-block p {
-  margin-top: 0.6rem;
+  margin: 0;
   color: #5f5f53;
   font-size: 1rem;
 }
@@ -6547,6 +7489,31 @@ onBeforeUnmount(() => {
 
 .assignment-modal {
   width: min(1040px, 100%);
+}
+
+.lead-oauth-modal {
+  width: min(620px, 100%);
+}
+
+.lead-oauth-note {
+  display: grid;
+  gap: 0.45rem;
+  margin-top: 1rem;
+  padding: 1rem;
+  border: 1px solid #d9e2d1;
+  border-radius: 0.85rem;
+  background: #f7fbf1;
+  color: #394232;
+}
+
+.lead-oauth-note strong {
+  color: #1f2d1b;
+}
+
+.lead-oauth-note p {
+  margin: 0;
+  color: #586151;
+  line-height: 1.55;
 }
 
 .assignment-form-grid,
@@ -7113,7 +8080,45 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 0.8rem;
   border-bottom: 1px solid #e4e3d7;
-  padding-bottom: 1rem;
+  padding-bottom: 0.4rem;
+}
+
+.brand-logo {
+  display: block;
+  width: 9.5rem;
+  max-width: 100%;
+  height: auto;
+  object-fit: contain;
+}
+
+.org-avatar-initial {
+  width: 1.8rem;
+  height: 1.8rem;
+  flex: 0 0 1.8rem;
+  border-radius: 999px;
+  background: #1b1c15;
+  color: #fffef8;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-family: Manrope, sans-serif;
+  font-weight: 800;
+  font-size: 0.78rem;
+}
+
+.org-avatar-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+}
+
+.dashboard-nav-actions .org-avatar-button {
+  justify-content: flex-start;
+  gap: 0.55rem;
+  padding: 0.55rem 0.75rem;
 }
 
 .brand-mark {
@@ -7133,6 +8138,7 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   gap: 0.1rem;
+  min-width: 0;
 }
 
 .brand-copy strong {
@@ -7266,6 +8272,7 @@ onBeforeUnmount(() => {
 .dashboard-primary-button,
 .dashboard-secondary-button,
 .dashboard-chip-button,
+.dashboard-context-pill,
 .dashboard-inline-button {
   display: inline-flex;
   align-items: center;
@@ -7285,6 +8292,13 @@ onBeforeUnmount(() => {
 
 .dashboard-secondary-button {
   border-radius: 0.8rem;
+}
+
+.dashboard-context-pill {
+  border-radius: 999px;
+  border: 1px solid rgba(21, 58, 27, 0.14);
+  background: rgba(255, 254, 248, 0.86);
+  color: #172714;
 }
 
 .dashboard-summary-bar {
@@ -7369,6 +8383,306 @@ onBeforeUnmount(() => {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 1.5rem;
+}
+
+.member-timetable-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1.25rem;
+}
+
+.member-timetable-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+  padding: 1.2rem;
+}
+
+.member-timetable-card h4 {
+  margin: 0;
+  font-family: Manrope, sans-serif;
+  font-size: 1.05rem;
+  letter-spacing: -0.01em;
+}
+
+.member-timetable-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.member-timetable-card-wide {
+  grid-column: span 3;
+}
+
+.member-timetable-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.7rem;
+}
+
+.member-timetable-form .invite-field-wide {
+  grid-column: span 2;
+}
+
+.member-timetable-form button[type="submit"] {
+  grid-column: span 2;
+  justify-self: start;
+}
+
+/* ── Polished buffer / unavailable cards ───────────────────────────── */
+
+.member-action-card {
+  padding: 1.35rem 1.4rem 1.5rem;
+}
+
+.member-action-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.85rem;
+  margin-bottom: 1.15rem;
+}
+
+.member-action-icon {
+  width: 2.4rem;
+  height: 2.4rem;
+  flex: 0 0 2.4rem;
+  border-radius: 0.85rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: linear-gradient(145deg, rgba(23, 63, 29, 0.16), rgba(23, 63, 29, 0.05));
+  color: #173f1d;
+  box-shadow: inset 0 0 0 1px rgba(23, 63, 29, 0.18);
+}
+
+.member-action-icon.unavailable-icon {
+  background: linear-gradient(145deg, rgba(193, 80, 56, 0.18), rgba(193, 80, 56, 0.05));
+  color: #b1452a;
+  box-shadow: inset 0 0 0 1px rgba(193, 80, 56, 0.22);
+}
+
+.member-action-title h4 {
+  margin: 0 0 0.15rem;
+  font-family: Manrope, sans-serif;
+  font-size: 1.05rem;
+  letter-spacing: -0.01em;
+}
+
+.member-action-title p {
+  margin: 0;
+  color: var(--nokvo-muted, #6c706a);
+  font-size: 0.82rem;
+  line-height: 1.4;
+}
+
+.member-action-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.85rem;
+}
+
+.member-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.member-field-wide {
+  grid-column: 1 / -1;
+}
+
+.member-field-label {
+  font-family: Manrope, sans-serif;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--nokvo-muted, #6c706a);
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.35rem;
+}
+
+.member-field-label small {
+  font-size: 0.7rem;
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
+  opacity: 0.7;
+}
+
+.member-field-input {
+  width: 100%;
+  padding: 0.7rem 0.85rem;
+  border-radius: 0.75rem;
+  border: 1px solid rgba(196, 199, 199, 0.55);
+  background: rgba(255, 255, 255, 0.85);
+  color: var(--nokvo-ink, #1b1c15);
+  font-family: inherit;
+  font-size: 0.92rem;
+  line-height: 1.2;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
+}
+
+.member-field-input::placeholder {
+  color: rgba(108, 112, 106, 0.7);
+}
+
+.member-field-input:hover {
+  border-color: rgba(23, 63, 29, 0.35);
+}
+
+.member-field-input:focus {
+  outline: none;
+  border-color: rgba(23, 63, 29, 0.6);
+  background: #ffffff;
+  box-shadow: 0 0 0 3px rgba(23, 63, 29, 0.12);
+}
+
+.member-duration-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.member-duration-pill {
+  flex: 1 1 auto;
+  min-width: 4rem;
+  padding: 0.55rem 0.8rem;
+  border-radius: 999px;
+  border: 1px solid rgba(196, 199, 199, 0.55);
+  background: rgba(255, 255, 255, 0.7);
+  color: var(--nokvo-ink, #1b1c15);
+  font-family: Manrope, sans-serif;
+  font-size: 0.85rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+.member-duration-pill:hover {
+  border-color: rgba(23, 63, 29, 0.4);
+  background: rgba(255, 255, 255, 0.95);
+  transform: translateY(-1px);
+}
+
+.member-duration-pill.active {
+  background: linear-gradient(180deg, #1f4a26, #173f1d);
+  border-color: #173f1d;
+  color: #fffef8;
+  box-shadow: 0 10px 22px -16px rgba(23, 63, 29, 0.75);
+}
+
+.member-duration-pill.active:hover {
+  transform: translateY(-1px);
+}
+
+.member-action-submit {
+  grid-column: 1 / -1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  padding: 0.85rem 1rem;
+  border-radius: 0.85rem;
+  border: 1px solid #173f1d;
+  background: linear-gradient(180deg, #1f4a26, #173f1d);
+  color: #fffef8;
+  font-family: Manrope, sans-serif;
+  font-size: 0.92rem;
+  font-weight: 800;
+  letter-spacing: 0.01em;
+  cursor: pointer;
+  margin-top: 0.25rem;
+  transition: transform 0.15s ease, box-shadow 0.15s ease, opacity 0.15s ease;
+  box-shadow: 0 14px 30px -22px rgba(23, 63, 29, 0.7);
+}
+
+.member-action-submit:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 18px 36px -22px rgba(23, 63, 29, 0.78);
+}
+
+.member-action-submit:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.member-action-submit.unavailable-submit {
+  border-color: #a93a1d;
+  background: linear-gradient(180deg, #c15038, #a93a1d);
+  box-shadow: 0 14px 30px -22px rgba(169, 58, 29, 0.7);
+}
+
+.member-action-submit.unavailable-submit:hover:not(:disabled) {
+  box-shadow: 0 18px 36px -22px rgba(169, 58, 29, 0.78);
+}
+
+.member-timetable-blocks {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.member-timetable-block {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.9rem;
+  padding: 0.75rem 0.9rem;
+  border: 1px solid rgba(196, 199, 199, 0.45);
+  border-radius: 0.85rem;
+  background: rgba(255, 255, 255, 0.6);
+}
+
+.member-timetable-block-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  min-width: 0;
+}
+
+.member-timetable-block-meta strong {
+  font-family: Manrope, sans-serif;
+  font-weight: 700;
+}
+
+.member-timetable-block-meta span {
+  color: var(--nokvo-muted, #6c706a);
+  font-size: 0.82rem;
+}
+
+@media (max-width: 1080px) {
+  .member-timetable-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .member-timetable-card-wide {
+    grid-column: span 2;
+  }
+}
+
+@media (max-width: 720px) {
+  .member-timetable-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .member-timetable-card-wide {
+    grid-column: span 1;
+  }
+  .member-timetable-form,
+  .member-action-form {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .member-timetable-form .invite-field-wide,
+  .member-timetable-form button[type="submit"],
+  .member-field-wide,
+  .member-action-submit {
+    grid-column: span 1;
+  }
 }
 
 .overview-grid .organization-card {
@@ -7502,6 +8816,124 @@ onBeforeUnmount(() => {
   color: #444748;
   font-size: 0.96rem;
   line-height: 1.75;
+}
+
+.health-tracker {
+  display: grid;
+  gap: 1.15rem;
+  margin-top: 1.25rem;
+}
+
+.health-score-card {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 1rem;
+  padding: 1rem;
+  border: 1px solid rgba(196, 199, 199, 0.34);
+  border-radius: 1rem;
+  background: linear-gradient(135deg, rgba(249, 251, 244, 0.96), rgba(239, 246, 232, 0.82));
+}
+
+.health-score-card.health-warn {
+  background: linear-gradient(135deg, rgba(255, 250, 235, 0.96), rgba(249, 241, 216, 0.84));
+}
+
+.health-score-card.health-blocked {
+  background: linear-gradient(135deg, rgba(255, 245, 243, 0.96), rgba(249, 226, 222, 0.84));
+}
+
+.health-ring {
+  width: 5.4rem;
+  height: 5.4rem;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  box-shadow: inset 0 0 0 1px rgba(27, 28, 21, 0.06);
+}
+
+.health-ring > div {
+  display: grid;
+  place-items: center;
+  width: 4.15rem;
+  height: 4.15rem;
+  border-radius: 999px;
+  background: #fffef8;
+}
+
+.health-ring strong {
+  color: #1b1c15;
+  font-family: Manrope, sans-serif;
+  font-size: 1.35rem;
+  line-height: 1;
+}
+
+.health-ring span {
+  color: #77786d;
+  font-size: 0.72rem;
+  font-weight: 800;
+}
+
+.health-score-card h4 {
+  margin: 0.16rem 0 0;
+  color: #1b1c15;
+  font-family: Manrope, sans-serif;
+  font-size: 1.35rem;
+}
+
+.health-score-card p {
+  margin-top: 0.22rem;
+}
+
+.health-check-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+
+.health-check {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 0.65rem;
+  min-height: 4.4rem;
+  padding: 0.85rem;
+  border: 1px solid rgba(196, 199, 199, 0.28);
+  border-radius: 0.85rem;
+  background: rgba(255, 255, 255, 0.62);
+}
+
+.health-check-dot {
+  width: 0.62rem;
+  height: 0.62rem;
+  margin-top: 0.32rem;
+  border-radius: 999px;
+  background: #2f6d3a;
+  box-shadow: 0 0 0 4px rgba(47, 109, 58, 0.12);
+}
+
+.health-check[data-state="warn"] .health-check-dot {
+  background: #b7791f;
+  box-shadow: 0 0 0 4px rgba(183, 121, 31, 0.14);
+}
+
+.health-check[data-state="blocked"] .health-check-dot {
+  background: #b42318;
+  box-shadow: 0 0 0 4px rgba(180, 35, 24, 0.12);
+}
+
+.health-check strong {
+  display: block;
+  color: #20231c;
+  font-family: Manrope, sans-serif;
+  font-size: 0.92rem;
+}
+
+.health-check small {
+  display: block;
+  margin-top: 0.18rem;
+  color: #62665b;
+  font-size: 0.78rem;
+  line-height: 1.4;
 }
 
 .usage-block {
@@ -8047,6 +9479,7 @@ onBeforeUnmount(() => {
 
 .outgoing-lead-row {
   width: 100%;
+  cursor: pointer;
   text-align: left;
 }
 
@@ -8055,27 +9488,511 @@ onBeforeUnmount(() => {
   cursor: not-allowed;
 }
 
-.mfa-pending-banner {
-  display: flex;
+.outgoing-lead-row:hover {
+  border-color: rgba(27, 28, 21, 0.28);
+  background: rgba(255, 255, 255, 0.92);
+}
+
+.outgoing-lead-actions {
+  display: inline-flex;
   align-items: center;
-  gap: 0.85rem;
+  justify-content: flex-end;
+  gap: 0.5rem;
   flex-wrap: wrap;
 }
 
-.mfa-pending-banner strong {
-  font-family: Manrope, sans-serif;
+.mfa-pending-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.9rem;
+  padding: 0.8rem 0.9rem;
+  border: 1px solid rgba(75, 116, 62, 0.18);
+  border-radius: 0.85rem;
+  background: linear-gradient(135deg, #f8fbf2 0%, #eef6e8 100%);
+  box-shadow: 0 16px 44px -34px rgba(35, 54, 28, 0.45);
 }
 
-.mfa-pending-banner span {
+.mfa-pending-icon {
+  display: grid;
+  place-items: center;
+  width: 2.35rem;
+  height: 2.35rem;
+  flex: 0 0 auto;
+  border-radius: 0.75rem;
+  background: #233a1d;
+  color: #f8fbf2;
+}
+
+.mfa-pending-copy {
   flex: 1;
-  font-size: 0.86rem;
-  line-height: 1.45;
+  min-width: 0;
+  display: grid;
+  gap: 0.1rem;
+}
+
+.mfa-pending-copy strong {
+  font-family: Manrope, sans-serif;
+  color: #1d2b19;
+  font-size: 0.95rem;
+}
+
+.mfa-pending-copy span {
+  color: #596652;
+  font-size: 0.84rem;
+  line-height: 1.35;
 }
 
 .dashboard-message.warning {
   background: rgba(159, 95, 16, 0.08);
   border-color: rgba(159, 95, 16, 0.25);
   color: #6b3f0a;
+}
+
+/* Nokvo Prime aesthetic */
+.org-shell {
+  --nokvo-ink: #151710;
+  --nokvo-muted: #67685f;
+  --nokvo-soft: #f6f4ea;
+  --nokvo-panel: rgba(255, 254, 248, 0.88);
+  --nokvo-panel-solid: #fffef8;
+  --nokvo-line: rgba(26, 43, 23, 0.13);
+  --nokvo-green: #173f1d;
+  --nokvo-green-2: #23572a;
+  --nokvo-green-soft: #e8f1e0;
+  --nokvo-warn: #b66514;
+  background:
+    linear-gradient(180deg, rgba(255, 253, 245, 0.98), rgba(247, 245, 235, 0.98)),
+    #f8f6ec;
+  color: var(--nokvo-ink);
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+.ambient-orb {
+  display: none;
+}
+
+.dashboard-layout {
+  width: min(calc(100% - 288px), 1360px);
+  margin-left: 268px;
+  padding-top: 2.25rem;
+}
+
+.floating-top-nav {
+  width: 240px;
+  padding: 0 1.15rem;
+}
+
+.dashboard-nav {
+  min-height: calc(100vh - 2.5rem);
+  border-radius: 1.25rem;
+  border-color: var(--nokvo-line);
+  background: rgba(255, 254, 248, 0.8);
+  box-shadow: 0 22px 70px -46px rgba(21, 23, 16, 0.35);
+}
+
+.dashboard-brand {
+  flex-direction: column;
+  align-items: center;
+  padding: 0.88rem 0.72rem 0.4rem;
+  border-bottom-color: var(--nokvo-line);
+}
+
+.dashboard-brand .brand-copy span {
+  display: block;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.brand-mark,
+.organization-mark,
+.compact-icon-shell,
+.mfa-pending-icon {
+  border-radius: 0.75rem;
+  background: linear-gradient(145deg, var(--nokvo-green), #0f2c15);
+  color: #fffef8;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18), 0 12px 28px -20px rgba(23, 63, 29, 0.7);
+}
+
+.brand-copy strong {
+  color: var(--nokvo-ink);
+  font-size: 0.95rem;
+  letter-spacing: 0.02em;
+}
+
+.brand-copy span,
+.dashboard-section-head p,
+.compact-card-head p,
+.members-card-head p,
+.organization-card p,
+.provider-option small,
+.health-check small,
+.mfa-pending-copy span,
+.kb-field > span,
+.dashboard-detail-list dt,
+.invite-helper,
+.empty-state,
+.readonly-tag {
+  color: var(--nokvo-muted);
+}
+
+.dashboard-nav-actions {
+  gap: 0.46rem;
+}
+
+.nav-page-button,
+.theme-toggle-button,
+.dashboard-nav-actions .nav-icon-button,
+.dashboard-nav-actions .org-avatar-button {
+  min-height: 3rem;
+  border-radius: 0.85rem;
+  border-color: transparent;
+  background: transparent;
+  color: var(--nokvo-ink);
+  font-size: 0.9rem;
+  font-weight: 700;
+}
+
+.nav-page-button svg,
+.theme-toggle-button svg {
+  color: #1f241c;
+}
+
+.nav-page-button:hover,
+.theme-toggle-button:hover,
+.dashboard-nav-actions .nav-icon-button:hover,
+.dashboard-nav-actions .org-avatar-button:hover {
+  background: rgba(23, 63, 29, 0.06);
+  box-shadow: none;
+}
+
+.nav-page-button.active {
+  border-color: rgba(23, 63, 29, 0.1);
+  background: linear-gradient(180deg, var(--nokvo-green-2), var(--nokvo-green));
+  color: #fffef8;
+  box-shadow: 0 14px 26px -20px rgba(23, 63, 29, 0.8);
+}
+
+.nav-page-button.active svg {
+  color: #fffef8;
+}
+
+.dashboard-nav-actions > .nav-icon-button:first-of-type {
+  margin-top: 0.85rem;
+  border-top: 1px solid var(--nokvo-line);
+  padding-top: 0.95rem;
+}
+
+.dashboard-header {
+  align-items: center;
+  min-height: 6.2rem;
+}
+
+.dashboard-header h2,
+.brand-block h1,
+.dashboard-section-head h3,
+.try-agent-card h3,
+.organization-card h3,
+.compact-card-head h3,
+.members-card-head h3,
+.health-score-card h4 {
+  font-family: Georgia, "Times New Roman", serif;
+  font-weight: 700;
+  letter-spacing: -0.035em;
+}
+
+.dashboard-header h2 {
+  font-size: clamp(3rem, 5.4vw, 4.25rem);
+}
+
+.section-kicker,
+.micro-label,
+.summary-pill span,
+.db-label,
+.kb-field > span,
+.dashboard-detail-list dt,
+.tab-record-meta span {
+  color: #77786f;
+  font-size: 0.72rem;
+  letter-spacing: 0.18em;
+  font-weight: 800;
+}
+
+.dashboard-header-actions {
+  align-items: center;
+}
+
+.dashboard-secondary-button,
+.dashboard-context-pill,
+.dashboard-chip-button,
+.dashboard-inline-button,
+.ghost-button {
+  border-color: var(--nokvo-line);
+  background: rgba(255, 254, 248, 0.9);
+  color: var(--nokvo-ink);
+  box-shadow: 0 12px 28px -24px rgba(21, 23, 16, 0.35);
+}
+
+.primary-button,
+.dashboard-primary-button {
+  background: linear-gradient(180deg, var(--nokvo-green-2), var(--nokvo-green));
+  color: #fffef8;
+  box-shadow: 0 16px 30px -22px rgba(23, 63, 29, 0.8);
+}
+
+.dashboard-card,
+.login-card,
+.field-modal {
+  border-radius: 1.15rem;
+  border-color: var(--nokvo-line);
+  background: var(--nokvo-panel);
+  box-shadow: 0 22px 70px -52px rgba(21, 23, 16, 0.36);
+}
+
+.dashboard-grid {
+  gap: 1.35rem;
+}
+
+.dashboard-section {
+  gap: 1.25rem;
+}
+
+.dashboard-section-head {
+  padding: 0.25rem 0.15rem;
+}
+
+.dashboard-section-head h3 {
+  font-size: 1.85rem;
+}
+
+.mfa-pending-banner {
+  min-height: 5.6rem;
+  padding: 1rem 1.25rem;
+  border-color: var(--nokvo-line);
+  border-radius: 1.1rem;
+  background: linear-gradient(90deg, rgba(255, 254, 248, 0.92), rgba(240, 247, 234, 0.92));
+}
+
+.mfa-pending-copy strong {
+  color: var(--nokvo-ink);
+  font-size: 1.05rem;
+}
+
+.try-agent-card {
+  position: relative;
+  min-height: 15rem;
+  justify-content: center;
+  padding: 2rem;
+  border-radius: 1.2rem;
+  border-color: rgba(26, 43, 23, 0.13);
+  background:
+    linear-gradient(110deg, rgba(255, 254, 248, 0.94) 0%, rgba(255, 254, 248, 0.94) 48%, rgba(233, 242, 224, 0.78) 100%);
+}
+
+.try-agent-card::after {
+  content: "...";
+  position: absolute;
+  right: 15%;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 5rem;
+  height: 5rem;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  background: linear-gradient(180deg, var(--nokvo-green-2), var(--nokvo-green));
+  color: #fffef8;
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 2.2rem;
+  line-height: 1;
+  letter-spacing: 0.12em;
+  box-shadow: 0 22px 50px -28px rgba(23, 63, 29, 0.8);
+}
+
+.try-agent-copy,
+.try-agent-actions {
+  position: relative;
+  z-index: 1;
+  max-width: 34rem;
+}
+
+.try-agent-card h3 {
+  font-size: 1.75rem;
+}
+
+.try-agent-actions .primary-button,
+.try-agent-actions .ghost-button {
+  min-width: 13rem;
+}
+
+.health-score-card,
+.health-check,
+.provider-option,
+.schema-preview,
+.agent-document-row,
+.tab-record-row,
+.member-row,
+.invite-domain-banner,
+.week-day-card,
+.time-planner-card,
+.schedule-calendar-card,
+.capacity-planner-card,
+.blocked-slot-row,
+.kb-result-card,
+.kb-doc-card,
+.outgoing-tabs button {
+  border-color: var(--nokvo-line);
+  background: rgba(255, 254, 248, 0.78);
+}
+
+.health-score-card {
+  background: linear-gradient(135deg, rgba(255, 254, 248, 0.94), rgba(232, 241, 224, 0.78));
+}
+
+.health-ring > div {
+  background: var(--nokvo-panel-solid);
+}
+
+.status-chip {
+  border: 1px solid rgba(182, 101, 20, 0.16);
+  background: #eeead9;
+  color: #4b3a17;
+  border-radius: 999px;
+}
+
+.status-chip.active {
+  border-color: rgba(47, 109, 58, 0.18);
+  background: #e8f1e0;
+  color: #173f1d;
+}
+
+.provider-option {
+  border-radius: 1rem;
+}
+
+.provider-option:hover,
+.agent-document-row.toolkit-list-row:hover,
+.tab-record-row:hover {
+  border-color: rgba(23, 63, 29, 0.24);
+  background: rgba(255, 254, 248, 0.94);
+  transform: translateY(-1px);
+}
+
+.provider-option.active,
+.outgoing-tabs button.active {
+  border-color: var(--nokvo-green);
+  background: var(--nokvo-green);
+  color: #fffef8;
+  box-shadow: 0 12px 24px -20px rgba(23, 63, 29, 0.78);
+}
+
+.provider-option.active .provider-name,
+.provider-option.active small {
+  color: #fffef8;
+}
+
+.outgoing-tabs {
+  gap: 0.65rem;
+}
+
+.outgoing-tabs button {
+  min-height: 2.55rem;
+  padding: 0.65rem 0.95rem;
+}
+
+.db-input,
+.totp-input,
+.field-editor-row input[type="text"],
+.field-editor-row select,
+.kb-field input,
+.kb-field select,
+.kb-field textarea,
+.kb-search-bar input,
+.invite-field input,
+.invite-field select,
+.assignment-two-col input,
+.assignment-two-col select,
+.blocked-slot-form input,
+.time-input-card input,
+.capacity-planner-card input {
+  border-color: var(--nokvo-line);
+  background: rgba(255, 254, 248, 0.88);
+  color: var(--nokvo-ink);
+  border-radius: 0.85rem;
+}
+
+.db-input:focus,
+.totp-input:focus,
+.kb-field input:focus,
+.kb-field select:focus,
+.kb-field textarea:focus,
+.kb-search-bar input:focus,
+.invite-field input:focus,
+.invite-field select:focus {
+  border-color: rgba(23, 63, 29, 0.5);
+  box-shadow: 0 0 0 4px rgba(23, 63, 29, 0.09);
+}
+
+.organization-card {
+  min-height: 26rem;
+}
+
+.organization-card-head,
+.compact-card-head,
+.members-card-head {
+  align-items: center;
+}
+
+.dashboard-detail-list dd,
+.workspace-profile-grid strong,
+.organization-metrics strong,
+.health-check strong,
+.provider-name {
+  color: var(--nokvo-ink);
+}
+
+.message {
+  border: 1px solid var(--nokvo-line);
+}
+
+.message.info {
+  background: rgba(232, 241, 224, 0.72);
+  color: #18351b;
+}
+
+.message.error {
+  background: #fff2ee;
+  color: #8a2a1a;
+  border-color: rgba(138, 42, 26, 0.18);
+}
+
+.portal-footer {
+  color: var(--nokvo-muted);
+}
+
+@media (max-width: 1080px) {
+  .dashboard-layout {
+    width: 100%;
+    margin-left: 0;
+    padding-left: 6.5rem;
+  }
+
+  .try-agent-card::after {
+    display: none;
+  }
+}
+
+@media (max-width: 720px) {
+  .dashboard-layout {
+    padding-left: 5.7rem;
+  }
+
+  .dashboard-header h2 {
+    font-size: 2.6rem;
+  }
+
+  .dashboard-context-pill {
+    width: 100%;
+  }
 }
 
 .agent-document-actions {
@@ -8326,16 +10243,6 @@ onBeforeUnmount(() => {
   font-weight: 700;
 }
 
-.invite-form {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 1rem;
-}
-
-.dashboard-invite-form {
-  margin-top: 1.15rem;
-}
-
 .invite-domain-banner {
   margin-top: 1rem;
   padding: 0.9rem 1rem;
@@ -8356,8 +10263,37 @@ onBeforeUnmount(() => {
 }
 
 .invite-domain-banner strong {
+  display: block;
   font-family: Manrope, sans-serif;
-  font-size: 1rem;
+  font-size: 1.3rem;
+  overflow-wrap: anywhere;
+}
+
+.invite-domain-banner small {
+  display: block;
+  margin-top: 0.45rem;
+  color: #5f5f53;
+  font-size: 0.86rem;
+  line-height: 1.45;
+}
+
+.invite-form {
+  display: grid;
+  gap: 1.1rem;
+}
+
+.dashboard-invite-form {
+  margin-top: 1.15rem;
+}
+
+.invite-field-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(220px, 0.85fr);
+  gap: 1rem;
+}
+
+.invite-field-wide {
+  grid-column: 1 / -1;
 }
 
 .invite-field {
@@ -8367,9 +10303,13 @@ onBeforeUnmount(() => {
 
 .invite-action-block {
   display: flex;
-  flex-direction: column;
+  align-items: center;
   justify-content: space-between;
   gap: 0.75rem;
+  padding: 0.95rem;
+  border: 1px solid rgba(196, 199, 199, 0.34);
+  border-radius: 1rem;
+  background: rgba(246, 244, 234, 0.62);
 }
 
 .invite-card,
@@ -8377,24 +10317,59 @@ onBeforeUnmount(() => {
   min-height: 100%;
 }
 
+.expanded-invite-card {
+  display: grid;
+  grid-template-columns: minmax(260px, 0.6fr) minmax(0, 1.4fr);
+  gap: 1.4rem;
+  align-items: start;
+  padding: 1.65rem;
+}
+
+.expanded-invite-card .compact-card-head {
+  align-items: flex-start;
+}
+
+.expanded-invite-card .invite-domain-banner {
+  margin-top: 1.1rem;
+}
+
+.expanded-invite-card .dashboard-invite-form {
+  margin-top: 0;
+}
+
+.invite-context-panel {
+  min-height: 100%;
+  padding: 1rem;
+  border: 1px solid rgba(196, 199, 199, 0.32);
+  border-radius: 1rem;
+  background: rgba(255, 254, 248, 0.72);
+}
+
 .invite-form input,
 .invite-form select {
   width: 100%;
-  border-radius: 0.85rem;
+  min-height: 3.25rem;
+  border-radius: 0.95rem;
   border: 1px solid #d9d8ce;
   background: rgba(255, 255, 255, 0.8);
   color: #1b1c15;
-  padding: 0.9rem 1rem;
-  font-size: 0.95rem;
+  padding: 1rem 1.05rem;
+  font-size: 1rem;
 }
 
 .invite-form button {
-  border-radius: 0.9rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.45rem;
+  min-width: 10.5rem;
+  min-height: 3rem;
+  border-radius: 0.95rem;
   border: none;
   background: #1d1c0f;
   color: #ffffff;
-  padding: 0.95rem 1.1rem;
-  font-weight: 700;
+  padding: 0.95rem 1.2rem;
+  font-weight: 800;
 }
 
 .invite-form button:disabled {
@@ -8403,6 +10378,7 @@ onBeforeUnmount(() => {
 }
 
 .invite-helper {
+  margin: 0;
   color: #5f5f53;
   font-size: 0.82rem;
   line-height: 1.6;
@@ -8419,6 +10395,513 @@ onBeforeUnmount(() => {
 
 .dashboard-member-table {
   margin-top: 1.2rem;
+}
+
+.team-card-grid {
+  display: grid;
+  gap: 0.9rem;
+  margin-top: 1.25rem;
+}
+
+.team-member-card {
+  display: grid;
+  gap: 0.9rem;
+  padding: 1rem;
+  border: 1px solid var(--nokvo-line);
+  border-radius: 1rem;
+  background: rgba(255, 254, 248, 0.82);
+}
+
+.team-member-main {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.85rem;
+}
+
+.team-avatar {
+  width: 2.8rem;
+  height: 2.8rem;
+  display: grid;
+  place-items: center;
+  border-radius: 0.85rem;
+  background: linear-gradient(145deg, #e9f1df, #f7f4e9);
+  color: #173f1d;
+  font-family: Manrope, sans-serif;
+  font-weight: 900;
+}
+
+.team-identity {
+  min-width: 0;
+  display: grid;
+  gap: 0.15rem;
+}
+
+.team-identity strong {
+  color: var(--nokvo-ink);
+  font-family: Manrope, sans-serif;
+  font-size: 1rem;
+}
+
+.team-identity small {
+  color: var(--nokvo-muted);
+  overflow-wrap: anywhere;
+}
+
+.team-badges {
+  display: inline-flex;
+  gap: 0.45rem;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.team-badges span,
+.team-load-pill {
+  border: 1px solid var(--nokvo-line);
+  border-radius: 999px;
+  background: rgba(246, 244, 234, 0.86);
+  color: #3f443a;
+  padding: 0.42rem 0.62rem;
+  font-size: 0.72rem;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.team-badges span.active {
+  background: #e8f1e0;
+  color: #173f1d;
+}
+
+.team-assignment-panel {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 0.85rem;
+  padding: 0.85rem;
+  border-radius: 0.85rem;
+  background: rgba(246, 244, 234, 0.68);
+}
+
+.team-assignment-panel p {
+  margin: 0.18rem 0 0;
+  color: #3f443a;
+  line-height: 1.5;
+}
+
+.team-load-pill {
+  display: grid;
+  place-items: center;
+  min-width: 5.4rem;
+  border-radius: 0.8rem;
+  text-align: center;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.team-load-pill span {
+  color: var(--nokvo-muted);
+  font-size: 0.68rem;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.team-load-pill strong {
+  color: var(--nokvo-ink);
+  font-size: 1.2rem;
+}
+
+.timetable-modal {
+  width: min(980px, 100%);
+}
+
+.timetable-summary-row {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.75rem;
+  margin-top: 1rem;
+}
+
+.timetable-summary-row > div {
+  padding: 0.85rem;
+  border: 1px solid var(--nokvo-line);
+  border-radius: 0.85rem;
+  background: rgba(246, 244, 234, 0.72);
+}
+
+.timetable-summary-row span {
+  display: block;
+  color: var(--nokvo-muted);
+  font-size: 0.7rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.timetable-summary-row strong {
+  display: block;
+  margin-top: 0.18rem;
+  color: var(--nokvo-ink);
+  font-family: Manrope, sans-serif;
+}
+
+.timetable-calendar-shell {
+  display: grid;
+  grid-template-columns: minmax(320px, 0.9fr) minmax(0, 1.1fr);
+  gap: 1rem;
+  align-items: start;
+  margin-top: 1rem;
+}
+
+.timetable-calendar-card,
+.timetable-selected-day {
+  border: 1px solid var(--nokvo-line);
+  border-radius: 0.9rem;
+  background: rgba(255, 254, 248, 0.9);
+}
+
+.timetable-calendar-card {
+  overflow: hidden;
+}
+
+.timetable-selected-day {
+  display: grid;
+  gap: 0.85rem;
+  padding: 0.9rem;
+}
+
+.timetable-calendar-head {
+  display: grid;
+  grid-template-columns: 2.4rem minmax(0, 1fr) 2.4rem;
+  align-items: center;
+  gap: 0.6rem;
+  border-bottom: 1px solid var(--nokvo-line);
+  background: rgba(246, 244, 234, 0.72);
+  padding: 0.75rem;
+}
+
+.timetable-calendar-head strong {
+  color: var(--nokvo-ink);
+  font-family: Manrope, sans-serif;
+  text-align: center;
+}
+
+.ghost-button.icon-only {
+  width: 2.35rem;
+  height: 2.35rem;
+  justify-content: center;
+  padding: 0;
+}
+
+.timetable-weekdays,
+.timetable-month-grid {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+}
+
+.timetable-weekdays {
+  border-bottom: 1px solid var(--nokvo-line);
+  background: rgba(255, 254, 248, 0.78);
+}
+
+.timetable-weekdays span {
+  padding: 0.58rem 0.25rem;
+  color: var(--nokvo-muted);
+  font-size: 0.68rem;
+  font-weight: 900;
+  letter-spacing: 0.06em;
+  text-align: center;
+  text-transform: uppercase;
+}
+
+.timetable-date-cell {
+  display: grid;
+  align-content: start;
+  gap: 0.25rem;
+  min-height: 4.7rem;
+  border: 0;
+  border-right: 1px solid var(--nokvo-line);
+  border-bottom: 1px solid var(--nokvo-line);
+  background: rgba(255, 254, 248, 0.76);
+  color: var(--nokvo-ink);
+  cursor: pointer;
+  padding: 0.58rem;
+  text-align: left;
+  transition: background 0.18s ease, box-shadow 0.18s ease, transform 0.18s ease;
+}
+
+.timetable-date-cell:nth-child(7n) {
+  border-right: 0;
+}
+
+.timetable-date-cell:nth-last-child(-n + 7) {
+  border-bottom: 0;
+}
+
+.timetable-date-cell:hover {
+  background: rgba(241, 244, 234, 0.96);
+}
+
+.timetable-date-cell span {
+  display: grid;
+  place-items: center;
+  width: 1.72rem;
+  height: 1.72rem;
+  border-radius: 999px;
+  font-family: Manrope, sans-serif;
+  font-size: 0.86rem;
+  font-weight: 900;
+}
+
+.timetable-date-cell small {
+  color: var(--nokvo-muted);
+  font-size: 0.68rem;
+  font-weight: 800;
+  line-height: 1.25;
+}
+
+.timetable-date-cell.muted {
+  background: rgba(246, 244, 234, 0.44);
+  color: rgba(21, 23, 16, 0.38);
+}
+
+.timetable-date-cell.today span {
+  background: rgba(23, 63, 29, 0.08);
+  color: var(--nokvo-green);
+}
+
+.timetable-date-cell.busy {
+  background: rgba(232, 243, 239, 0.72);
+}
+
+.timetable-date-cell.active {
+  background: var(--nokvo-green);
+  color: #fffef8;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.16);
+}
+
+.timetable-date-cell.active span {
+  background: rgba(255, 254, 248, 0.18);
+  color: #fffef8;
+}
+
+.timetable-date-cell.active small {
+  color: rgba(255, 254, 248, 0.88);
+}
+
+.timetable-day-list {
+  display: grid;
+  gap: 0.65rem;
+}
+
+.timetable-day-list .timetable-event {
+  border-left: 4px solid var(--nokvo-green);
+}
+
+.timetable-day-list .timetable-event.blocked {
+  border-left-color: var(--nokvo-warn);
+}
+
+.timetable-day-list .timetable-event::before {
+  display: none;
+}
+
+.timetable-days {
+  display: grid;
+  gap: 1rem;
+  margin-top: 1rem;
+}
+
+.timetable-day {
+  display: grid;
+  grid-template-columns: 8rem minmax(0, 1fr);
+  gap: 1rem;
+}
+
+.timetable-day-label {
+  color: var(--nokvo-ink);
+  font-family: Manrope, sans-serif;
+  font-weight: 900;
+  padding-top: 0.35rem;
+}
+
+.timetable-track {
+  position: relative;
+  display: grid;
+  gap: 0.65rem;
+  padding-left: 1rem;
+  border-left: 1px solid rgba(23, 63, 29, 0.18);
+}
+
+.timetable-event {
+  position: relative;
+  display: grid;
+  grid-template-columns: 6rem minmax(0, 1fr);
+  gap: 0.8rem;
+  padding: 0.8rem;
+  border: 1px solid var(--nokvo-line);
+  border-radius: 0.9rem;
+  background: rgba(255, 254, 248, 0.9);
+}
+
+.timetable-event::before {
+  content: "";
+  position: absolute;
+  left: calc(-1rem - 5px);
+  top: 1.05rem;
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+  background: var(--nokvo-green);
+}
+
+.timetable-event.blocked::before {
+  background: var(--nokvo-warn);
+}
+
+.timetable-event.blocked {
+  background: rgba(255, 248, 235, 0.86);
+}
+
+.timetable-time {
+  display: grid;
+  align-content: start;
+  gap: 0.15rem;
+}
+
+.timetable-time strong {
+  color: var(--nokvo-ink);
+  font-family: Manrope, sans-serif;
+}
+
+.timetable-time span,
+.timetable-event-main span,
+.timetable-event-main small {
+  color: var(--nokvo-muted);
+}
+
+.timetable-event-main {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.85rem;
+  min-width: 0;
+}
+
+.timetable-event-main strong {
+  display: block;
+  color: var(--nokvo-ink);
+  font-family: Manrope, sans-serif;
+}
+
+.timetable-event-main small {
+  flex: 0 0 auto;
+  align-self: start;
+  border: 1px solid var(--nokvo-line);
+  border-radius: 999px;
+  padding: 0.28rem 0.5rem;
+  font-size: 0.72rem;
+  font-weight: 800;
+}
+
+.timetable-queue {
+  display: grid;
+  gap: 0.85rem;
+  margin-top: 1.15rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--nokvo-line);
+}
+
+.timetable-queue-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.timetable-queue-head h4 {
+  margin: 0.12rem 0 0;
+  color: var(--nokvo-ink);
+  font-family: Manrope, sans-serif;
+  font-size: 1rem;
+  letter-spacing: 0;
+}
+
+.timetable-ticket-list {
+  display: grid;
+  gap: 0.7rem;
+}
+
+.timetable-ticket-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(0, 1.85fr);
+  gap: 1rem;
+  align-items: center;
+  padding: 0.9rem;
+  border: 1px solid var(--nokvo-line);
+  border-radius: 0.9rem;
+  background: rgba(255, 254, 248, 0.92);
+}
+
+.timetable-ticket-primary {
+  display: grid;
+  gap: 0.24rem;
+  min-width: 0;
+}
+
+.timetable-ticket-primary strong {
+  min-width: 0;
+  color: var(--nokvo-ink);
+  font-family: Manrope, sans-serif;
+  overflow-wrap: anywhere;
+}
+
+.timetable-ticket-primary small {
+  color: var(--nokvo-muted);
+  line-height: 1.45;
+}
+
+.timetable-type-pill {
+  width: fit-content;
+  border: 1px solid rgba(52, 119, 108, 0.22);
+  border-radius: 999px;
+  background: rgba(232, 243, 239, 0.84);
+  color: var(--nokvo-green);
+  font-size: 0.68rem;
+  font-weight: 900;
+  letter-spacing: 0.06em;
+  padding: 0.24rem 0.5rem;
+  text-transform: uppercase;
+}
+
+.timetable-ticket-meta {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.7rem;
+  min-width: 0;
+}
+
+.timetable-ticket-meta div {
+  min-width: 0;
+}
+
+.timetable-ticket-meta span {
+  display: block;
+  margin-bottom: 0.18rem;
+  color: var(--nokvo-muted);
+  font-size: 0.68rem;
+  font-weight: 900;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.timetable-ticket-meta strong {
+  display: block;
+  min-width: 0;
+  color: var(--nokvo-ink);
+  font-family: Manrope, sans-serif;
+  font-size: 0.88rem;
+  overflow-wrap: anywhere;
 }
 
 .member-row {
@@ -8492,6 +10975,31 @@ onBeforeUnmount(() => {
 
 .tab-record-primary small {
   line-height: 1.45;
+}
+
+.record-call-link {
+  display: inline-flex;
+  width: fit-content;
+  align-items: center;
+  gap: 0.35rem;
+  margin-top: 0.28rem;
+  border: 1px solid rgba(52, 119, 108, 0.22);
+  border-radius: 999px;
+  background: rgba(232, 243, 239, 0.72);
+  color: var(--nokvo-green);
+  font-size: 0.78rem;
+  font-weight: 900;
+  padding: 0.32rem 0.56rem;
+  text-decoration: none;
+}
+
+.record-call-link:hover {
+  background: rgba(232, 243, 239, 0.96);
+  transform: translateY(-1px);
+}
+
+.timetable-call-link {
+  margin-top: 0.42rem;
 }
 
 .tab-record-meta {
@@ -8637,6 +11145,10 @@ onBeforeUnmount(() => {
   border-color: #f2f1e5;
 }
 
+.org-shell.dark .brand-logo {
+  filter: invert(1);
+}
+
 .org-shell.dark .db-input,
 .org-shell.dark .totp-input,
 .org-shell.dark .invite-form input,
@@ -8714,6 +11226,27 @@ onBeforeUnmount(() => {
 
 .org-shell.dark .provider-option small {
   color: #d0d0c3;
+}
+
+.org-shell.dark .health-score-card,
+.org-shell.dark .health-check {
+  background: rgba(30, 34, 28, 0.86);
+  border-color: rgba(102, 108, 92, 0.38);
+}
+
+.org-shell.dark .health-ring > div {
+  background: #171a15;
+}
+
+.org-shell.dark .health-ring strong,
+.org-shell.dark .health-score-card h4,
+.org-shell.dark .health-check strong {
+  color: #f6f5ea;
+}
+
+.org-shell.dark .health-ring span,
+.org-shell.dark .health-check small {
+  color: #b8b7ab;
 }
 
 .org-shell.dark .schema-preview strong,
@@ -8883,6 +11416,23 @@ onBeforeUnmount(() => {
     grid-template-columns: 1fr;
   }
 
+  .expanded-invite-card {
+    grid-template-columns: 1fr;
+  }
+
+  .invite-field-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .invite-action-block {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .timetable-calendar-shell {
+    grid-template-columns: 1fr;
+  }
+
   .overview-grid .organization-card,
   .overview-grid .access-card,
   .control-grid .invite-card,
@@ -8892,6 +11442,12 @@ onBeforeUnmount(() => {
 
   .invite-form,
   .member-row,
+  .team-member-main,
+  .team-assignment-panel,
+  .timetable-summary-row,
+  .timetable-day,
+  .timetable-event,
+  .timetable-ticket-card,
   .tab-record-row {
     grid-template-columns: 1fr;
   }
@@ -8930,6 +11486,7 @@ onBeforeUnmount(() => {
 
   .time-preset-row,
   .tab-record-meta,
+  .timetable-ticket-meta,
   .capacity-planner-card,
   .easy-block-form {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -8954,7 +11511,12 @@ onBeforeUnmount(() => {
 
   .dashboard-brand {
     justify-content: center;
+    align-items: center;
     padding-bottom: 0.7rem;
+  }
+
+  .brand-logo {
+    width: 2.7rem;
   }
 
   .brand-copy,
@@ -9025,6 +11587,7 @@ onBeforeUnmount(() => {
   }
 
   .organization-metrics,
+  .health-check-grid,
   .workspace-profile-grid,
   .business-type-grid,
   .schema-preview-grid,
@@ -9032,6 +11595,7 @@ onBeforeUnmount(() => {
   .field-editor-row,
   .assignment-two-col,
   .tab-record-meta,
+  .timetable-ticket-meta,
   .blocked-slot-row {
     grid-template-columns: 1fr;
   }

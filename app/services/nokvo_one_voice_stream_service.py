@@ -8,6 +8,46 @@ from time import perf_counter
 from typing import Any
 
 
+def _extract_pcm_from_wav(wav: bytes) -> tuple[bytes, int] | None:
+    """Return (pcm_data, sample_rate) for a RIFF/WAVE PCM16 mono blob, or
+    ``None`` if the blob is not a parseable PCM16-mono WAV.
+
+    Used by the audio-quality probe — Sarvam can also accept WebM/Opus
+    but those need ffmpeg to decode, so we only score WAV blobs locally
+    and let other formats pass through unscored.
+    """
+    if len(wav) < 44 or wav[:4] != b"RIFF" or wav[8:12] != b"WAVE":
+        return None
+    pos = 12
+    fmt: tuple[int, int, int] | None = None
+    data: bytes | None = None
+    while pos + 8 <= len(wav):
+        chunk_id = wav[pos : pos + 4]
+        size = int.from_bytes(wav[pos + 4 : pos + 8], "little")
+        body_start = pos + 8
+        body_end = body_start + size
+        if body_end > len(wav):
+            break
+        if chunk_id == b"fmt ":
+            if size >= 16:
+                audio_format = int.from_bytes(wav[body_start : body_start + 2], "little")
+                channels = int.from_bytes(wav[body_start + 2 : body_start + 4], "little")
+                sample_rate = int.from_bytes(wav[body_start + 4 : body_start + 8], "little")
+                bps = int.from_bytes(wav[body_start + 14 : body_start + 16], "little")
+                fmt = (audio_format, channels, sample_rate, bps)
+        elif chunk_id == b"data":
+            data = wav[body_start:body_end]
+        pos = body_end + (size & 1)  # word-align
+        if fmt is not None and data is not None:
+            break
+    if not fmt or data is None:
+        return None
+    audio_format, channels, sample_rate, bps = fmt
+    if audio_format != 1 or channels != 1 or bps != 16:
+        return None
+    return data, sample_rate
+
+
 def _pcm16le_to_wav(pcm: bytes, *, sample_rate: int, channels: int = 1) -> bytes:
     """Wrap raw 16-bit little-endian PCM mono audio in a minimal WAV header.
 
@@ -35,6 +75,29 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.models.organization import Organization
 from app.models.tenant_resources import TenantResources
+from app.services.agent_outbound_context import (
+    OutboundCampaignContext,
+    PROACTIVE_NUDGE_PROMPT,
+    ProactiveSilenceWatchdog,
+    infer_covered_objectives,
+    load_outbound_context,
+)
+from app.services.agent_robustness import (
+    AudioQualityProbe,
+    ClarificationState,
+    LanguageState,
+    QUALITY_UNUSABLE,
+    RobustnessContext,
+    TURN_SPEAKING,
+    TurnArbiter,
+    clarification_prompt,
+    is_turn_vague,
+    repeat_prompt,
+    CLARIFY_RESET,
+    CLARIFY_NUDGE,
+    CLARIFY_OFFER_OPTIONS,
+    CLARIFY_ESCALATE,
+)
 from app.services.agent_session_store import AgentSessionStore
 from app.services.language_intent import detect_language_switch
 from app.services.nokvo_one_voice_pipeline import NokvoOneVoicePipeline
@@ -70,6 +133,164 @@ _CHECK_IN_CONTAINS = (
     "మీరు ఉన్నారా",
     "இருக்கீங்களா",
 )
+
+
+# How many sentences may be combined into a single TTS call after the first
+# one has been spoken. The first sentence is ALWAYS dispatched on its own so
+# first-audio latency stays minimal; sentences that arrive while the worker
+# is busy synthesising are coalesced up to this size to amortise the Sarvam
+# REST roundtrip across multiple sentences.
+_TTS_BATCH_MAX = 2
+
+
+async def _drain_turn(task: asyncio.Task | None) -> None:
+    """Cancel ``task`` and wait for it to fully exit.
+
+    The voice session shares a single AsyncSession across the WebSocket's
+    lifetime. ``AsyncSession`` is *not* safe for concurrent use — if a
+    cancelled turn is still mid-``await db.execute(...)`` when the next
+    turn starts its own ``db.execute(...)``, SQLAlchemy raises
+    ``greenlet_spawn has not been called; can't call await_only() here``.
+    Awaiting the cancellation lets the asyncpg connection unwind before
+    any new code path touches ``db``.
+    """
+    if task is None or task.done():
+        return
+    task.cancel()
+    try:
+        await task
+    except BaseException:
+        pass
+
+
+class _TtsPump:
+    """Background TTS dispatcher that batches sentences after the first one.
+
+    Calling ``submit(sentence, tone)`` is non-blocking — the sentence is
+    enqueued and the LLM stream loop continues to read the next token
+    without waiting for TTS network latency. A single worker drains the
+    queue in order, firing the first sentence as soon as it lands and then
+    coalescing any sentences that piled up while TTS was in flight into a
+    single batched Sarvam call (up to :data:`_TTS_BATCH_MAX`).
+
+    Ordering is preserved end-to-end: the worker awaits each TTS call
+    before pulling the next, so the audio packets emitted on the websocket
+    arrive in sentence order.
+    """
+
+    def __init__(
+        self,
+        *,
+        websocket: WebSocket,
+        tenant_res: TenantResources,
+        language: str,
+        turn_id: str,
+        purpose: str = "answer",
+        speaking_mark: Any | None = None,
+    ) -> None:
+        self._websocket = websocket
+        self._tenant_res = tenant_res
+        self._language = language
+        self._turn_id = turn_id
+        self._purpose = purpose
+        self._speaking_mark = speaking_mark
+        self._queue: asyncio.Queue[tuple[str, str] | None] = asyncio.Queue()
+        self._worker: asyncio.Task[None] | None = None
+        self._first_audio_fired = False
+
+    def start(self) -> None:
+        if self._worker is None:
+            self._worker = asyncio.create_task(self._run())
+
+    async def submit(self, sentence: str, tone: str) -> None:
+        if not sentence:
+            return
+        await self._queue.put((sentence, tone))
+
+    async def close(self) -> None:
+        """Send the end-of-stream sentinel and wait for the worker to flush
+        all buffered sentences. Safe to call multiple times."""
+        if self._worker is None:
+            return
+        await self._queue.put(None)
+        try:
+            await self._worker
+        except asyncio.CancelledError:
+            raise
+        finally:
+            self._worker = None
+
+    async def cancel(self) -> None:
+        if self._worker is None:
+            return
+        self._worker.cancel()
+        try:
+            await self._worker
+        except (asyncio.CancelledError, Exception):
+            pass
+        self._worker = None
+
+    async def _run(self) -> None:
+        while True:
+            item = await self._queue.get()
+            if item is None:
+                return
+            batch: list[tuple[str, str]] = [item]
+            # First sentence: dispatch alone so first audio lands as fast
+            # as possible. After that, opportunistically drain any extra
+            # sentences that piled up while the previous TTS call was in
+            # flight — they collapse into one Sarvam round trip.
+            if self._first_audio_fired:
+                while len(batch) < _TTS_BATCH_MAX:
+                    try:
+                        more = self._queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    if more is None:
+                        await self._flush(batch)
+                        return
+                    batch.append(more)
+            await self._flush(batch)
+            self._first_audio_fired = True
+
+    async def _flush(self, batch: list[tuple[str, str]]) -> None:
+        if not batch:
+            return
+        text = " ".join(s for s, _ in batch).strip()
+        if not text:
+            return
+        # Use the tone of the first sentence in the batch for prosody —
+        # adjacent sentences from the same LLM completion almost always
+        # carry the same emotional register.
+        prosody = prosody_for(batch[0][1] or DEFAULT_TONE)
+        if self._speaking_mark is not None:
+            try:
+                self._speaking_mark()
+            except Exception:
+                pass
+        try:
+            await SarvamVoiceService.stream_sentence_tts(
+                self._websocket,
+                self._tenant_res,
+                text,
+                language=self._language,
+                purpose=self._purpose,
+                pace=prosody.pace,
+                pitch=prosody.pitch,
+                loudness=prosody.loudness,
+            )
+        except Exception as exc:
+            try:
+                await self._websocket.send_json(
+                    {
+                        "type": "tts_error",
+                        "turn_id": self._turn_id,
+                        "error_message": str(exc)[:240],
+                        "provider": "sarvam",
+                    }
+                )
+            except Exception:
+                pass
 
 
 def _is_check_in_utterance(text: str) -> bool:
@@ -113,6 +334,55 @@ class NokvoOneVoiceStreamService:
     @staticmethod
     async def _emit_runtime_status(websocket: WebSocket, tenant_res: TenantResources) -> None:
         await websocket.send_json({"type": "runtime_status", **NokvoOneVoicePipeline.runtime_status(tenant_res)})
+
+    @staticmethod
+    async def _dispatch_quality_recovery(
+        websocket: WebSocket,
+        tenant_res: TenantResources,
+        *,
+        language: str,
+        source: str = "audio_quality_recovery",
+    ) -> None:
+        """Emit a multilingual "could you say that again" prompt and
+        speak it via TTS. Used by both the vad_blob and streaming-STT
+        paths when the :class:`AudioQualityProbe` returns UNUSABLE.
+        Previously both call sites inlined ~30 lines of identical
+        websocket / TTS plumbing."""
+        recover_text = repeat_prompt(language)
+        recover_turn_id = f"recover-{uuid.uuid4().hex[:8]}"
+        try:
+            await websocket.send_json(
+                {
+                    "type": "agent_sentence",
+                    "turn_id": recover_turn_id,
+                    "sentence": recover_text,
+                    "tone": "warm",
+                    "cache_hit": False,
+                    "source": source,
+                }
+            )
+        except Exception:
+            pass
+        try:
+            await SarvamVoiceService.stream_sentence_tts(
+                websocket,
+                tenant_res,
+                recover_text,
+                language=language,
+                purpose=source,
+            )
+        except Exception:
+            pass
+        try:
+            await websocket.send_json(
+                {
+                    "type": "turn_complete",
+                    "turn_id": recover_turn_id,
+                    "context_source": source,
+                }
+            )
+        except Exception:
+            pass
 
     @staticmethod
     def _inbound_opening_text(language: str | None) -> str:
@@ -306,10 +576,20 @@ class NokvoOneVoiceStreamService:
         source: str = "manual",
         retrieval_text: str | None = None,
         turn_state: dict[str, Any] | None = None,
+        arbiter: TurnArbiter | None = None,
+        language_state: LanguageState | None = None,
+        outbound_context: OutboundCampaignContext | None = None,
+        after_turn=None,
     ) -> None:
         cleaned = " ".join((text or "").split())
         if not cleaned:
             return
+        if outbound_context is not None and call_id and source != "proactive_silence":
+            await AgentSessionStore.merge_state(
+                tenant_res,
+                call_id,
+                {"proactive_silence_nudges": 0},
+            )
         turn_id = str(uuid.uuid4())[:8]
         started = perf_counter()
 
@@ -333,6 +613,8 @@ class NokvoOneVoiceStreamService:
         def _mark_speaking() -> None:
             if turn_state is not None:
                 turn_state["speaking"] = True
+            if arbiter is not None:
+                arbiter.mark_speaking()
 
         if pure_switch_request:
             ack = {
@@ -404,6 +686,38 @@ class NokvoOneVoiceStreamService:
         answer_parts: list[str] = []
         final_payload: dict[str, Any] | None = None
         first_sentence_ms: int | None = None
+        # Decouple LLM stream consumption from TTS roundtrips: the pump
+        # owns the Sarvam calls so the LLM token loop never blocks waiting
+        # on TTS, and adjacent sentences are batched into a single REST
+        # call after the first one has been dispatched.
+        tts_pump = _TtsPump(
+            websocket=websocket,
+            tenant_res=tenant_res,
+            language=language,
+            turn_id=turn_id,
+            purpose="answer",
+            speaking_mark=_mark_speaking,
+        )
+        tts_pump.start()
+        if arbiter is not None:
+            arbiter.attach_pump(tts_pump)
+        # Hand the code-switch flag to the pipeline so dual retrieval
+        # fires when the call has been mixing languages turn-to-turn or
+        # the current transcript itself is script-mixed.
+        is_code_switching = bool(language_state and language_state.needs_dual_retrieval())
+        # Hydrate the per-call objective-progress list from the session
+        # state so the LLM sees which campaign objectives are still
+        # outstanding on this turn. The clarification / progress writer
+        # lives below — for now we read what's already been recorded.
+        covered_objectives: list[str] = []
+        if outbound_context is not None:
+            try:
+                session_state = await AgentSessionStore.get_state(tenant_res, call_id)
+                covered_objectives = list(
+                    (session_state or {}).get("campaign_objectives_covered") or []
+                )
+            except Exception:
+                covered_objectives = []
         try:
             async for event in NokvoOneVoicePipeline.stream_answer_sentences(
                 tenant_res,
@@ -416,6 +730,9 @@ class NokvoOneVoiceStreamService:
                 campaign_goal=(campaign_context or {}).get("goal"),
                 company_name=company_name,
                 retrieval_text=retrieval_text,
+                code_switching=is_code_switching,
+                outbound_context=outbound_context,
+                covered_objectives=covered_objectives,
             ):
                 if event.get("type") == "sentence":
                     sentence = str(event.get("text") or "").strip()
@@ -435,40 +752,45 @@ class NokvoOneVoiceStreamService:
                             "cache_hit": bool(event.get("cache_hit")),
                         }
                     )
-                    prosody = prosody_for(tone)
-                    _mark_speaking()
-                    try:
-                        await SarvamVoiceService.stream_sentence_tts(
-                            websocket,
-                            tenant_res,
-                            sentence,
-                            language=language,
-                            purpose="answer",
-                            pace=prosody.pace,
-                            pitch=prosody.pitch,
-                            loudness=prosody.loudness,
-                        )
-                    except Exception as exc:
-                        await websocket.send_json(
-                            {
-                                "type": "tts_error",
-                                "turn_id": turn_id,
-                                "error_message": str(exc)[:240],
-                                "provider": "sarvam",
-                            }
-                        )
+                    await tts_pump.submit(sentence, tone)
                 elif event.get("type") == "final":
                     final_payload = event
+            await tts_pump.close()
         except asyncio.CancelledError:
+            await tts_pump.cancel()
             await websocket.send_json({"type": "turn_cancelled", "turn_id": turn_id})
             raise
         except Exception as exc:
+            await tts_pump.cancel()
             fallback = NokvoOneVoicePipeline._refusal(language)
             answer_parts = [fallback]
             final_payload = {"answer": fallback, "refused": True, "chunks": [], "citations": [], "runtime": {"error": str(exc)[:240]}}
             await websocket.send_json({"type": "agent_error", "turn_id": turn_id, "error": str(exc)[:240]})
 
         answer = str((final_payload or {}).get("answer") or " ".join(answer_parts)).strip()
+        if outbound_context is not None and call_id:
+            updated_objectives = infer_covered_objectives(
+                outbound_context,
+                caller_text=cleaned,
+                agent_answer=answer,
+                already_covered=covered_objectives,
+            )
+            if updated_objectives != covered_objectives:
+                await AgentSessionStore.merge_state(
+                    tenant_res,
+                    call_id,
+                    {"campaign_objectives_covered": updated_objectives},
+                )
+                try:
+                    await websocket.send_json(
+                        {
+                            "type": "campaign_objective_progress",
+                            "covered": updated_objectives,
+                            "remaining": outbound_context.remaining_objectives(updated_objectives),
+                        }
+                    )
+                except Exception:
+                    pass
         await websocket.send_json(
             {
                 "type": "agent_answer",
@@ -492,6 +814,12 @@ class NokvoOneVoiceStreamService:
                 "filler_played": False,
             }
         )
+        if arbiter is not None:
+            arbiter.mark_done()
+        if after_turn is not None:
+            result = after_turn()
+            if asyncio.iscoroutine(result):
+                await result
 
     @staticmethod
     async def _process_blob_utterance(
@@ -508,6 +836,9 @@ class NokvoOneVoiceStreamService:
         prev_turn: asyncio.Task | None = None,
         prev_turn_state: dict[str, Any] | None = None,
         turn_state: dict[str, Any] | None = None,
+        robustness: RobustnessContext | None = None,
+        outbound_context: OutboundCampaignContext | None = None,
+        after_turn=None,
     ) -> None:
         """One Blob → one turn. Used by the frontend-VAD ("vad_blob") capture
         mode where the browser handles end-of-utterance detection and sends
@@ -521,6 +852,42 @@ class NokvoOneVoiceStreamService:
         is_wav = audio_bytes.startswith(b"RIFF") and audio_bytes[8:12] == b"WAVE"
         filename = "utt.wav" if is_wav else "utt.webm"
         content_type = "audio/wav" if is_wav else "audio/webm"
+
+        # Robustness layer — audio quality probe. We only score WAV
+        # blobs (PCM16 mono); other formats need ffmpeg to decode and
+        # we'd rather pay STT and let it return empty than block on a
+        # decode here. When the verdict is "unusable" we short-circuit
+        # the turn with a multilingual "could you repeat that" prompt
+        # instead of running STT → LLM → TTS on garbage.
+        if is_wav:
+            extracted = _extract_pcm_from_wav(audio_bytes)
+            if extracted is not None:
+                pcm, pcm_sample_rate = extracted
+                quality = AudioQualityProbe.score(pcm, sample_rate=pcm_sample_rate)
+                try:
+                    await websocket.send_json(
+                        {
+                            "type": "audio_quality",
+                            "verdict": quality.verdict,
+                            "reason": quality.reason,
+                            "rms": round(quality.rms, 4),
+                            "clip_ratio": round(quality.clip_ratio, 4),
+                            "silence_ratio": round(quality.silence_ratio, 4),
+                            "duration_ms": quality.duration_ms,
+                        }
+                    )
+                except Exception:
+                    pass
+                if quality.verdict == QUALITY_UNUSABLE:
+                    recover_lang = (
+                        session_locked_language[0]
+                        if session_locked_language and session_locked_language[0]
+                        else fallback_language
+                    )
+                    await NokvoOneVoiceStreamService._dispatch_quality_recovery(
+                        websocket, tenant_res, language=recover_lang,
+                    )
+                    return
 
         # Run native + translate STT concurrently. Cap each so a slow Sarvam
         # response can't blow the first-sentence latency budget.
@@ -609,16 +976,28 @@ class NokvoOneVoiceStreamService:
             }
         )
 
-        # If the previous turn is still composing (no TTS audio sent yet) and
-        # the user just said "hello, are you there?" — acknowledge with a quick
-        # "yes" and keep the queued answer running. The original reply will
-        # play right after the ack.
-        prev_alive = (
-            prev_turn is not None
-            and not prev_turn.done()
-            and not (prev_turn_state or {}).get("speaking")
-        )
-        if prev_alive and _is_check_in_utterance(transcript):
+        # Turn arbitration. Prefer the explicit arbiter when available —
+        # its phase tracking + atomic cancellation replaces the legacy
+        # ``prev_turn`` + ``prev_turn_state["speaking"]`` pair. The
+        # legacy path is still honoured so callers that haven't migrated
+        # to the arbiter keep their existing behaviour.
+        is_check_in = _is_check_in_utterance(transcript)
+        if arbiter := (robustness.arbiter if robustness else None):
+            verdict = arbiter.classify_incoming(is_check_in=is_check_in)
+        else:
+            prev_alive = (
+                prev_turn is not None
+                and not prev_turn.done()
+                and not (prev_turn_state or {}).get("speaking")
+            )
+            if prev_alive and is_check_in:
+                verdict = "check_in"
+            elif prev_turn is not None and not prev_turn.done():
+                verdict = "barge_in"
+            else:
+                verdict = "proceed"
+
+        if verdict == "check_in":
             ack_lang = session_locked_language[0] or detected_lang
             ack = _quick_ack_text(ack_lang)
             await websocket.send_json(
@@ -642,10 +1021,22 @@ class NokvoOneVoiceStreamService:
             except Exception:
                 pass
             return
+        if verdict == "barge_in":
+            await websocket.send_json({"type": "barge_in_detected", "call_id": call_id})
+            if arbiter is not None:
+                await arbiter.cancel()
+            elif prev_turn is not None and not prev_turn.done():
+                await _drain_turn(prev_turn)
 
-        # Real new turn — cancel the previous and run the new answer.
-        if prev_turn is not None and not prev_turn.done():
-            prev_turn.cancel()
+        # Real new turn — make sure the prior one is fully cancelled.
+        # The arbiter path already handled this above when verdict was
+        # barge_in; the legacy ``prev_turn`` fallback handles the rest.
+        if (
+            (robustness is None or robustness.arbiter is None)
+            and prev_turn is not None
+            and not prev_turn.done()
+        ):
+            await _drain_turn(prev_turn)
 
         # Resolve reply language with the same precedence as the streaming path.
         requested = detect_language_switch(transcript)
@@ -664,6 +1055,12 @@ class NokvoOneVoiceStreamService:
         else:
             turn_language = detected_lang
 
+        # Track the language history for code-switch awareness.
+        if robustness is not None:
+            robustness.language_state.observe(detected_lang, transcript)
+            if requested:
+                robustness.language_state.lock(turn_language)
+
         await NokvoOneVoiceStreamService._run_text_turn(
             websocket,
             tenant_res,
@@ -676,6 +1073,10 @@ class NokvoOneVoiceStreamService:
             source="sarvam_rest_vad_blob",
             retrieval_text=english_text or None,
             turn_state=turn_state,
+            arbiter=(robustness.arbiter if robustness else None),
+            language_state=(robustness.language_state if robustness else None),
+            outbound_context=outbound_context,
+            after_turn=after_turn,
         )
 
     @staticmethod
@@ -797,6 +1198,78 @@ class NokvoOneVoiceStreamService:
         # whether a fresh utterance is a barge-in or a "hello, are you there?"
         # check-in arriving during the agent's composing latency.
         turn_state: dict[str, Any] = {"speaking": False}
+        # Centralised robustness context — owns the turn arbiter (atomic
+        # cancellation of the LLM stream + TTS pump on barge-in), the
+        # language-state history (for code-switch detection), and the
+        # clarification escalation FSM (hydrated from the Redis session
+        # blob on each turn).
+        robustness = RobustnessContext()
+        # Outbound campaign context. Loaded once per call when the
+        # session is initiated as part of a campaign — drives the
+        # proactive system prompt + objective tracking. None for plain
+        # inbound calls.
+        outbound_context: OutboundCampaignContext | None = None
+        campaign_id_for_session = (campaign_context or {}).get("campaign_id")
+        if campaign_id_for_session:
+            try:
+                outbound_context = await load_outbound_context(
+                    db,
+                    campaign_id_for_session,
+                    goal=(campaign_context or {}).get("goal"),
+                )
+            except Exception as exc:
+                # Pipeline still works without the proactive config —
+                # it falls back to the legacy goal-only behaviour.
+                print(f"[NOKVO-OUTBOUND] load_outbound_context failed: {exc!r}")
+                outbound_context = None
+        proactive_watchdog: ProactiveSilenceWatchdog | None = None
+
+        async def _arm_proactive_watchdog() -> None:
+            if proactive_watchdog is not None:
+                proactive_watchdog.arm()
+
+        async def _fire_proactive_nudge() -> None:
+            nonlocal current_turn, turn_state
+            if outbound_context is None or not outbound_context.is_proactive:
+                return
+            if current_turn is not None and not current_turn.done():
+                return
+            state = await AgentSessionStore.get_state(tenant_res, call_id) or {}
+            nudge_count = int(state.get("proactive_silence_nudges") or 0)
+            if nudge_count >= 2:
+                return
+            await AgentSessionStore.merge_state(
+                tenant_res,
+                call_id,
+                {"proactive_silence_nudges": nudge_count + 1},
+            )
+            turn_state = {"speaking": False}
+            new_state = turn_state
+            current_turn = asyncio.create_task(
+                NokvoOneVoiceStreamService._run_text_turn(
+                    websocket,
+                    tenant_res,
+                    PROACTIVE_NUDGE_PROMPT,
+                    db=db,
+                    language=session_locked_language[0] or language,
+                    call_id=call_id,
+                    company_name=company_name,
+                    campaign_context=campaign_context,
+                    source="proactive_silence",
+                    turn_state=new_state,
+                    arbiter=robustness.arbiter,
+                    language_state=robustness.language_state,
+                    outbound_context=outbound_context,
+                    after_turn=_arm_proactive_watchdog,
+                )
+            )
+            robustness.arbiter.begin(turn_id="proactive-silence", task=current_turn)
+
+        if outbound_context is not None and outbound_context.is_proactive:
+            proactive_watchdog = ProactiveSilenceWatchdog(
+                timeout_seconds=outbound_context.silence_timeout_seconds,
+                on_fire=_fire_proactive_nudge,
+            )
         stt_ws: Any = None
         stt_reader_task: asyncio.Task | None = None
         audio_buffer = bytearray()
@@ -906,6 +1379,45 @@ class NokvoOneVoiceStreamService:
                 return
             utterance_segments.clear()
 
+            # Audio-quality probe on the streaming path. The vad_blob
+            # branch already scores its WAV input; this brings the same
+            # safety net to the WebSocket-streaming branch using the raw
+            # PCM accumulated in ``utterance_audio``. When the probe is
+            # confidently UNUSABLE we ask the caller to repeat instead
+            # of running STT/LLM/TTS on a noisy buffer that already
+            # produced a transcript.
+            if utterance_audio:
+                quality = AudioQualityProbe.score(bytes(utterance_audio), sample_rate=sample_rate)
+                try:
+                    await websocket.send_json(
+                        {
+                            "type": "audio_quality",
+                            "verdict": quality.verdict,
+                            "reason": quality.reason,
+                            "rms": round(quality.rms, 4),
+                            "clip_ratio": round(quality.clip_ratio, 4),
+                            "silence_ratio": round(quality.silence_ratio, 4),
+                            "duration_ms": quality.duration_ms,
+                            "source": "stream_pcm",
+                        }
+                    )
+                except Exception:
+                    pass
+                # Only short-circuit when the transcript is also short
+                # (< 4 words). A long, intelligible transcript that
+                # happens to ride on low-SNR audio is fine — Sarvam
+                # already proved it could read it.
+                if (
+                    quality.verdict == QUALITY_UNUSABLE
+                    and len(text.split()) < 4
+                ):
+                    recover_lang = session_locked_language[0] or utterance_language[0]
+                    await NokvoOneVoiceStreamService._dispatch_quality_recovery(
+                        websocket, tenant_res, language=recover_lang,
+                    )
+                    utterance_audio.clear()
+                    return
+
             # "Hello, are you there?" while the previous answer is still being
             # composed: keep the queued reply running and inject a quick "yes"
             # ack. Only valid if the prior turn hasn't started speaking yet.
@@ -979,8 +1491,7 @@ class NokvoOneVoiceStreamService:
                 translate_audio = bytes(utterance_audio)
             utterance_audio.clear()
 
-            if current_turn and not current_turn.done():
-                current_turn.cancel()
+            await _drain_turn(current_turn)
             turn_state = {"speaking": False}
             new_state = turn_state
 
@@ -1016,6 +1527,10 @@ class NokvoOneVoiceStreamService:
                             )
                         except Exception:
                             pass
+                    # Record the per-turn language history for code-switch
+                    # detection (driven from the streaming-STT path's
+                    # detected language).
+                    robustness.language_state.observe(turn_language, text)
                     await NokvoOneVoiceStreamService._run_text_turn(
                         websocket,
                         tenant_res,
@@ -1028,10 +1543,16 @@ class NokvoOneVoiceStreamService:
                         source="sarvam_stt",
                         retrieval_text=english or None,
                         turn_state=new_state,
+                        arbiter=robustness.arbiter,
+                        language_state=robustness.language_state,
+                        outbound_context=outbound_context,
+                        after_turn=_arm_proactive_watchdog,
                     )
 
                 current_turn = asyncio.create_task(_run_with_translate())
+                robustness.arbiter.begin(turn_id="stream-translate", task=current_turn)
             else:
+                robustness.language_state.observe(turn_language, text)
                 current_turn = asyncio.create_task(
                     NokvoOneVoiceStreamService._run_text_turn(
                         websocket,
@@ -1044,8 +1565,13 @@ class NokvoOneVoiceStreamService:
                         campaign_context=campaign_context,
                         source="sarvam_stt",
                         turn_state=new_state,
+                        arbiter=robustness.arbiter,
+                        language_state=robustness.language_state,
+                        outbound_context=outbound_context,
+                        after_turn=_arm_proactive_watchdog,
                     )
                 )
+                robustness.arbiter.begin(turn_id="stream-direct", task=current_turn)
 
         def _cancel_eou_timer() -> None:
             nonlocal eou_timer_task
@@ -1099,22 +1625,22 @@ class NokvoOneVoiceStreamService:
                             continue
                         event_type = parsed.get("type")
                         if event_type == "speech_start":
-                            turn_alive = current_turn is not None and not current_turn.done()
-                            agent_speaking = turn_alive and bool((turn_state or {}).get("speaking"))
-                            if agent_speaking:
-                                # True barge-in: agent is already playing audio,
-                                # the caller is talking over it.
-                                current_turn.cancel()
+                            # Arbiter classifies speech_start without a
+                            # transcript yet. If the agent is already in
+                            # the SPEAKING phase this is a real barge-in
+                            # and we cancel atomically (LLM stream + TTS
+                            # pump). Otherwise we just rewind the EOU
+                            # timer and wait for the transcript to come
+                            # in so _fire_turn can do check-in vs
+                            # barge-in classification.
+                            verdict = robustness.arbiter.classify_incoming(is_check_in=False)
+                            if verdict == "barge_in" and robustness.arbiter.phase == TURN_SPEAKING:
+                                await robustness.arbiter.cancel()
                                 _cancel_eou_timer()
                                 utterance_segments.clear()
                                 utterance_audio.clear()
                                 await websocket.send_json({"type": "barge_in_detected", "call_id": call_id})
                             else:
-                                # Either the agent hasn't started speaking yet
-                                # (still composing the previous answer) OR no
-                                # turn is in flight. Don't cancel — the user
-                                # might be saying "hello, are you there?" which
-                                # we'll detect once finals arrive in _fire_turn.
                                 _cancel_eou_timer()
                             continue
                         if event_type == "speech_end":
@@ -1180,6 +1706,7 @@ class NokvoOneVoiceStreamService:
                 call_id=call_id,
                 campaign_context=campaign_context,
             )
+            await _arm_proactive_watchdog()
         else:
             async def _delayed_inbound_opener() -> None:
                 try:
@@ -1195,6 +1722,8 @@ class NokvoOneVoiceStreamService:
                 message = await websocket.receive()
                 if message.get("type") == "websocket.disconnect":
                     break
+                if proactive_watchdog is not None:
+                    proactive_watchdog.cancel()
                 if message.get("bytes") is not None:
                     chunk = message.get("bytes") or b""
                     if capture_mode[0] == "vad_blob":
@@ -1225,8 +1754,12 @@ class NokvoOneVoiceStreamService:
                                 prev_turn=prev_turn,
                                 prev_turn_state=prev_state,
                                 turn_state=new_state,
+                                robustness=robustness,
+                                outbound_context=outbound_context,
+                                after_turn=_arm_proactive_watchdog,
                             )
                         )
+                        robustness.arbiter.begin(turn_id="vad-blob", task=current_turn)
                         continue
                     audio_buffer.extend(chunk)
                     # Side-buffer the same chunk for the per-utterance translate-STT
@@ -1262,22 +1795,27 @@ class NokvoOneVoiceStreamService:
                         capture_mode[0] = requested_mode
                         print(f"[NOKVO-VOICE] capture_mode set to {capture_mode[0]} for call {call_id}")
                     await NokvoOneVoiceStreamService._emit_runtime_status(websocket, tenant_res)
-                    if inbound_opener_task and not inbound_opener_task.done():
-                        inbound_opener_task.cancel()
+                    # The delayed-opener task may still be mid-``db.execute``
+                    # (it looks up returning-caller history). Drain it before
+                    # we run the opener inline so the two paths don't race
+                    # on the shared ``db`` AsyncSession.
+                    await _drain_turn(inbound_opener_task)
+                    inbound_opener_task = None
                     await _play_default_inbound_opener()
                     continue
                 if event_type == "interrupt":
                     # Client-side barge-in: user started speaking while agent
-                    # was playing audio. Cancel the in-flight turn.
-                    if current_turn and not current_turn.done():
-                        current_turn.cancel()
+                    # was playing audio. Drain the in-flight turn so the
+                    # next message handler doesn't race it on the shared
+                    # ``db`` AsyncSession (see ``_drain_turn``).
+                    await _drain_turn(current_turn)
+                    current_turn = None
                     _cancel_eou_timer()
                     utterance_segments.clear()
                     utterance_audio.clear()
                     continue
                 if event_type in {"text_query", "transcript"}:
-                    if current_turn and not current_turn.done():
-                        current_turn.cancel()
+                    await _drain_turn(current_turn)
                     turn_state = {"speaking": False}
                     current_turn = asyncio.create_task(
                         NokvoOneVoiceStreamService._run_text_turn(
@@ -1291,6 +1829,10 @@ class NokvoOneVoiceStreamService:
                             campaign_context=campaign_context,
                             source="manual",
                             turn_state=turn_state,
+                            arbiter=robustness.arbiter,
+                            language_state=robustness.language_state,
+                            outbound_context=outbound_context,
+                            after_turn=_arm_proactive_watchdog,
                         )
                     )
                     continue
@@ -1321,21 +1863,24 @@ class NokvoOneVoiceStreamService:
                                     campaign_context=campaign_context,
                                     source="sarvam_rest_stt",
                                     turn_state=turn_state,
+                                    arbiter=robustness.arbiter,
+                                    language_state=robustness.language_state,
+                                    outbound_context=outbound_context,
+                                    after_turn=_arm_proactive_watchdog,
                                 )
                         except Exception as exc:
                             await websocket.send_json({"type": "stt_error", "error_message": str(exc)[:220]})
                     if event_type == "stop":
                         break
         finally:
-            if inbound_opener_task and not inbound_opener_task.done():
-                inbound_opener_task.cancel()
+            # Drain every task that may still be touching the shared
+            # ``db`` AsyncSession before ``_log_voice_call`` runs its own
+            # query against it.
+            await _drain_turn(inbound_opener_task)
+            if proactive_watchdog is not None:
+                proactive_watchdog.cancel()
             _cancel_eou_timer()
-            if current_turn and not current_turn.done():
-                current_turn.cancel()
-                try:
-                    await current_turn
-                except BaseException:
-                    pass
+            await _drain_turn(current_turn)
             if stt_reader_task and not stt_reader_task.done():
                 stt_reader_task.cancel()
             if stt_ws is not None:

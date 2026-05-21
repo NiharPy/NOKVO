@@ -101,7 +101,21 @@ _GOODBYE_RE = re.compile(
     re.IGNORECASE,
 )
 _SMALLTALK_RE = re.compile(
-    r"^\s*(ok(?:ay)?|alright|got\s+it|cool|sure|fine|yes|no|hmm+|uh+huh?)[\s!.?,]*$",
+    "|".join([
+        # English / romanised
+        r"^\s*(?:ok(?:ay)?|alright|got\s+it|cool|sure|fine|yes|yeah|yep|nope|no|hmm+|uh+huh?|haan|nahi|nai|aaha|achha|theek|theek\s+hai)[\s!.?,]*$",
+        # Native-script affirmatives / negatives. Common confirmations in
+        # the booking FSM ("అవును", "हाँ", "சரி") otherwise fall through to
+        # the LLM classifier on every confirmation step.
+        r"^\s*(?:అవును|లేదు|సరే|ఆ|ఆహా)[\s!.?,।]*$",     # Telugu
+        r"^\s*(?:हाँ|हां|नहीं|नही|ठीक|ठीक\s+है|जी|जी\s+हाँ|जी\s+नहीं|अच्छा)[\s!.?,।]*$",  # Hindi
+        r"^\s*(?:ஆம்|இல்லை|சரி|சரி\s+சரி)[\s!.?,।]*$",  # Tamil
+        r"^\s*(?:ಹೌದು|ಇಲ್ಲ|ಸರಿ)[\s!.?,।]*$",            # Kannada
+        r"^\s*(?:അതെ|ഇല്ല|ശരി)[\s!.?,।]*$",              # Malayalam
+        r"^\s*(?:হ্যাঁ|না|ঠিক|ঠিক\s+আছে)[\s!.?,।]*$",   # Bengali
+        r"^\s*(?:હા|ના|બરાબર)[\s!.?,।]*$",                # Gujarati
+        r"^\s*(?:ਹਾਂ|ਨਹੀਂ|ਠੀਕ)[\s!.?,।]*$",                # Punjabi
+    ]),
     re.IGNORECASE,
 )
 # Audio-check / presence-probe phrases — the caller is testing the line, not

@@ -26,6 +26,7 @@ from app.models.outbound_campaign import CampaignStatus, OutboundCampaign
 from app.models.tenant_resources import TenantResources
 from app.services.agent_knowledge_service import AGENT_KNOWLEDGE_SOURCE_TYPE, AgentKnowledgeService
 from app.services.exotel_service import ExotelService
+from app.services.agent_outbound_context import build_agent_config, invalidate as invalidate_outbound_context
 from app.services.outgoing_lead_service import OutgoingLeadService, lead_is_callable
 from app.services.qdrant_service import QdrantService
 from app.services.text_embedding_service import TextEmbeddingService
@@ -181,6 +182,7 @@ class OutboundCampaignService:
         excel_file: UploadFile,
         doc_file: UploadFile,
         from_number: str | None = None,
+        agent_config: dict[str, Any] | None = None,
     ) -> OutboundCampaign:
         excel_bytes = await excel_file.read()
         doc_bytes = await doc_file.read()
@@ -246,12 +248,14 @@ class OutboundCampaignService:
             contacts=contacts,
             doc_blob_path=doc_blob_path,
             doc_text=doc_text,
+            agent_config=build_agent_config(**dict(agent_config or {})),
             from_number=caller_id,
             total_count=len(contacts),
         )
         db.add(campaign)
         await db.commit()
         await db.refresh(campaign)
+        invalidate_outbound_context(campaign.id)
         # Keep a small denormalized marker for the operator console without
         # altering the campaign table.
         for contact in campaign.contacts or []:
@@ -267,6 +271,7 @@ class OutboundCampaignService:
         lead_ids: list[uuid.UUID],
         doc_file: UploadFile,
         from_number: str | None = None,
+        agent_config: dict[str, Any] | None = None,
     ) -> OutboundCampaign:
         leads = await OutgoingLeadService.validate_callable_leads(tenant_res, db, lead_ids)
         doc_bytes = await doc_file.read()
@@ -354,6 +359,7 @@ class OutboundCampaignService:
             contacts=contacts,
             doc_blob_path=doc_blob_path,
             doc_text=doc_text,
+            agent_config=build_agent_config(**dict(agent_config or {})),
             from_number=caller_id,
             total_count=len(contacts),
         )
@@ -362,6 +368,7 @@ class OutboundCampaignService:
             db.add(row)
         await db.commit()
         await db.refresh(campaign)
+        invalidate_outbound_context(campaign.id)
         return campaign
 
     @staticmethod
