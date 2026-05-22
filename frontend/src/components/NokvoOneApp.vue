@@ -28,6 +28,7 @@ import {
   Moon,
   PhoneCall,
   Play,
+  Plug,
   Plus,
   Radio,
   Search,
@@ -60,6 +61,7 @@ defineEmits(['switch-mode']);
 const router = useRouter();
 
 const api = axios.create({ baseURL: API_BASE_URL });
+const connectApi = axios.create({ baseURL: 'http://localhost:8000/api/nokvo-one/connect' });
 
 const orgShellRef = ref(null);
 const themeMode = ref(localStorage.getItem(THEME_KEY) || 'light');
@@ -83,6 +85,87 @@ const sampleUpload = ref({
   isUploading: false,
 });
 const settingsMenuOpen = ref(false);
+
+// ── Nokvo Connect — API key management state ────────────────────────────────
+const connect = ref({
+  isLoadingList: false,
+  isCreating: false,
+  keys: [],
+  errorMsg: '',
+  newKeySecret: '',
+  newWebhookSecret: '',
+  draft: {
+    label: '',
+    mode: 'live',
+    rate_limit_rpm: 60,
+    max_concurrent_sessions: 5,
+    allowed_origins_raw: '',
+    webhook_url: '',
+  },
+});
+
+const loadConnectKeys = async () => {
+  if (authState.value !== 'ready') return;
+  connect.value.isLoadingList = true;
+  connect.value.errorMsg = '';
+  try {
+    const { data } = await connectApi.get('/api-keys', { headers: authHeader() });
+    connect.value.keys = Array.isArray(data) ? data : [];
+  } catch (exc) {
+    connect.value.errorMsg = exc?.response?.data?.detail || 'Failed to load API keys.';
+  } finally {
+    connect.value.isLoadingList = false;
+  }
+};
+
+const createConnectKey = async () => {
+  connect.value.errorMsg = '';
+  connect.value.newKeySecret = '';
+  connect.value.newWebhookSecret = '';
+  connect.value.isCreating = true;
+  try {
+    const draft = connect.value.draft;
+    const allowed = (draft.allowed_origins_raw || '')
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+    const payload = {
+      label: draft.label,
+      mode: draft.mode || 'live',
+      rate_limit_rpm: Number(draft.rate_limit_rpm) || 60,
+      max_concurrent_sessions: Number(draft.max_concurrent_sessions) || 5,
+      allowed_origins: allowed,
+    };
+    if (draft.webhook_url) payload.webhook_url = draft.webhook_url;
+    const { data } = await connectApi.post('/api-keys', payload, { headers: authHeader() });
+    connect.value.newKeySecret = data.secret;
+    connect.value.newWebhookSecret = data.webhook_secret || '';
+    connect.value.draft.label = '';
+    connect.value.draft.webhook_url = '';
+    connect.value.draft.allowed_origins_raw = '';
+    await loadConnectKeys();
+  } catch (exc) {
+    connect.value.errorMsg = exc?.response?.data?.detail || 'Failed to mint API key.';
+  } finally {
+    connect.value.isCreating = false;
+  }
+};
+
+const revokeConnectKey = async (keyId) => {
+  if (!keyId) return;
+  connect.value.errorMsg = '';
+  try {
+    await connectApi.post(`/api-keys/${keyId}/revoke`, {}, { headers: authHeader() });
+    await loadConnectKeys();
+  } catch (exc) {
+    connect.value.errorMsg = exc?.response?.data?.detail || 'Failed to revoke API key.';
+  }
+};
+
+const dismissConnectSecret = () => {
+  connect.value.newKeySecret = '';
+  connect.value.newWebhookSecret = '';
+};
 const errorMsg = ref('');
 const infoMsg = ref('');
 const isAuthenticating = ref(false);
@@ -469,6 +552,9 @@ const switchPage = (page) => {
   }
   if (['leads', 'tickets', 'appointments'].includes(page)) {
     loadTabRecords(page);
+  }
+  if (page === 'nokvo_connect_step2') {
+    loadConnectKeys();
   }
 };
 
@@ -3714,11 +3800,81 @@ onBeforeUnmount(() => {
       <div class="ambient-orb orb-bottom"></div>
     </div>
 
-    <div class="mode-bar">
+    <div
+      v-if="authState !== 'ready' || !['nokvo_connect', 'nokvo_connect_step2'].includes(currentPage)"
+      class="mode-bar"
+    >
       <button type="button" class="mode-link" @click="toggleThemeMode">
         <SunMedium v-if="themeMode === 'dark'" :size="14" />
         <Moon v-else :size="14" />
         {{ themeToggleLabel }}
+      </button>
+      <button
+        v-if="authState === 'ready' && !isMemberOnly"
+        type="button"
+        class="mode-link mode-link--icon"
+        aria-label="Notifications"
+        title="Notifications"
+      >
+        <Bell :size="14" />
+      </button>
+      <div
+        v-if="authState === 'ready' && !isMemberOnly && onboardingV2Enabled"
+        class="mode-link-wrap"
+      >
+        <button
+          type="button"
+          class="mode-link mode-link--icon"
+          :class="{ active: settingsMenuOpen }"
+          aria-label="Settings"
+          title="Settings"
+          @click="settingsMenuOpen = !settingsMenuOpen"
+        >
+          <Settings2 :size="14" />
+        </button>
+        <div v-if="settingsMenuOpen" class="nav-settings-menu mode-settings-menu">
+          <button
+            type="button"
+            class="nav-settings-item"
+            @click="settingsMenuOpen = false; scrollToDashboardMembers()"
+          >
+            <strong>Team &amp; assignment</strong>
+            <small>Invite teammates, set working hours and request caps.</small>
+          </button>
+          <button
+            type="button"
+            class="nav-settings-item"
+            @click="settingsMenuOpen = false; switchPage('dashboard')"
+          >
+            <strong>Business type &amp; fields</strong>
+            <small>Adjust the field schemas for leads, tickets, and appointments.</small>
+          </button>
+          <button
+            type="button"
+            class="nav-settings-item"
+            @click="settingsMenuOpen = false; switchPage('dashboard')"
+          >
+            <strong>Custom tabs</strong>
+            <small>Define org-specific resource tabs.</small>
+          </button>
+          <button
+            type="button"
+            class="nav-settings-item"
+            @click="settingsMenuOpen = false; switchPage('agent')"
+          >
+            <strong>Advanced tool config</strong>
+            <small>Pick individual agent tools and edit prompts.</small>
+          </button>
+        </div>
+      </div>
+      <button
+        v-else-if="authState === 'ready' && !isMemberOnly"
+        type="button"
+        class="mode-link mode-link--icon"
+        aria-label="Settings"
+        title="Settings"
+      >
+        <Settings2 :size="14" />
       </button>
       <button
         v-if="authState === 'ready'"
@@ -4124,6 +4280,139 @@ onBeforeUnmount(() => {
       </div>
     </main>
 
+    <main
+      v-else-if="currentPage === 'nokvo_connect'"
+      class="connect-layout"
+    >
+      <button
+        type="button"
+        class="connect-back-link"
+        @click="switchPage('dashboard')"
+      >
+        <ChevronLeft :size="16" />
+        <span>Go back to Nokvo One</span>
+      </button>
+      <h1 class="connect-title" aria-label="Nokvo Connect">
+        <span
+          v-for="(char, index) in 'Nokvo Connect'"
+          :key="index"
+          class="connect-title-char"
+          :class="{ 'connect-title-space': char === ' ' }"
+          :style="{ animationDelay: `${0.18 + index * 0.06}s` }"
+          aria-hidden="true"
+        >{{ char === ' ' ? ' ' : char }}</span>
+      </h1>
+      <button
+        type="button"
+        class="connect-continue-button"
+        @click="switchPage('nokvo_connect_step2')"
+      >
+        <span>Continue</span>
+        <ChevronRight :size="16" />
+      </button>
+    </main>
+
+    <main
+      v-else-if="currentPage === 'nokvo_connect_step2'"
+      class="connect-layout connect-layout--scroll"
+    >
+      <button
+        type="button"
+        class="connect-back-link"
+        @click="switchPage('nokvo_connect')"
+      >
+        <ChevronLeft :size="16" />
+        <span>Go back to Nokvo Connect</span>
+      </button>
+
+      <div class="connect-panel">
+        <header class="connect-panel-head">
+          <h2>API keys</h2>
+          <p>Mint a key, hand it to your app, and start streaming voice or text against your agent.</p>
+        </header>
+
+        <div v-if="connect.errorMsg" class="connect-alert error">{{ connect.errorMsg }}</div>
+
+        <section v-if="connect.newKeySecret" class="connect-secret-callout">
+          <strong>Your new API key</strong>
+          <p>Copy this now — we cannot show it again.</p>
+          <code class="connect-secret-value">{{ connect.newKeySecret }}</code>
+          <div v-if="connect.newWebhookSecret" class="connect-secret-subline">
+            <span>Webhook signing secret:</span>
+            <code>{{ connect.newWebhookSecret }}</code>
+          </div>
+          <button type="button" class="connect-secret-dismiss" @click="dismissConnectSecret">I've saved it</button>
+        </section>
+
+        <form class="connect-create-form" @submit.prevent="createConnectKey">
+          <div class="connect-form-row">
+            <label>
+              <span>Label</span>
+              <input v-model="connect.draft.label" type="text" placeholder="Production web SDK" required />
+            </label>
+            <label>
+              <span>Mode</span>
+              <select v-model="connect.draft.mode">
+                <option value="live">Live</option>
+                <option value="test">Test</option>
+              </select>
+            </label>
+          </div>
+          <div class="connect-form-row">
+            <label>
+              <span>Rate limit (req/min)</span>
+              <input v-model.number="connect.draft.rate_limit_rpm" type="number" min="1" max="10000" />
+            </label>
+            <label>
+              <span>Max concurrent sessions</span>
+              <input v-model.number="connect.draft.max_concurrent_sessions" type="number" min="1" max="200" />
+            </label>
+          </div>
+          <label class="connect-form-fullwidth">
+            <span>Allowed origins (one per line, leave empty for any)</span>
+            <textarea v-model="connect.draft.allowed_origins_raw" rows="2" placeholder="https://app.yourcompany.com"></textarea>
+          </label>
+          <label class="connect-form-fullwidth">
+            <span>Webhook URL (optional)</span>
+            <input v-model="connect.draft.webhook_url" type="url" placeholder="https://yourcompany.com/webhooks/nokvo" />
+          </label>
+          <button type="submit" class="connect-continue-button" :disabled="connect.isCreating">
+            <span>{{ connect.isCreating ? 'Creating…' : 'Mint API key' }}</span>
+            <ChevronRight v-if="!connect.isCreating" :size="16" />
+          </button>
+        </form>
+
+        <section class="connect-key-list">
+          <h3>Existing keys</h3>
+          <div v-if="connect.isLoadingList" class="connect-key-empty">Loading…</div>
+          <div v-else-if="!connect.keys.length" class="connect-key-empty">No keys yet. Create one above.</div>
+          <article v-for="key in connect.keys" :key="key.id" class="connect-key-card">
+            <div class="connect-key-card-head">
+              <div>
+                <strong>{{ key.label }}</strong>
+                <code>{{ key.key_prefix }}…</code>
+              </div>
+              <span class="connect-key-status" :class="key.status">{{ key.status }}</span>
+            </div>
+            <dl class="connect-key-card-meta">
+              <div><dt>Mode</dt><dd>{{ key.mode }}</dd></div>
+              <div><dt>Rate limit</dt><dd>{{ key.rate_limit_rpm }} rpm</dd></div>
+              <div><dt>Concurrency</dt><dd>{{ key.max_concurrent_sessions }}</dd></div>
+              <div><dt>Last used</dt><dd>{{ key.last_used_at ? new Date(key.last_used_at).toLocaleString() : '—' }}</dd></div>
+            </dl>
+            <button
+              v-if="key.status === 'active'"
+              type="button"
+              class="connect-revoke-button"
+              @click="revokeConnectKey(key.id)"
+            >
+              Revoke
+            </button>
+          </article>
+        </section>
+      </div>
+    </main>
+
     <main v-else class="workspace-layout dashboard-layout">
       <div class="floating-top-nav">
         <nav class="dashboard-nav">
@@ -4204,55 +4493,15 @@ onBeforeUnmount(() => {
               <BookOpen :size="17" />
               <span>Knowledge Base</span>
             </button>
-            <button v-if="!isMemberOnly" type="button" class="nav-icon-button">
-              <Bell :size="18" />
-            </button>
-            <div v-if="!isMemberOnly && onboardingV2Enabled" class="nav-settings-wrap">
-              <button
-                type="button"
-                class="nav-icon-button"
-                :class="{ active: settingsMenuOpen }"
-                @click="settingsMenuOpen = !settingsMenuOpen"
-              >
-                <Settings2 :size="18" />
-              </button>
-              <div v-if="settingsMenuOpen" class="nav-settings-menu">
-                <button
-                  type="button"
-                  class="nav-settings-item"
-                  @click="settingsMenuOpen = false; scrollToDashboardMembers()"
-                >
-                  <strong>Team &amp; assignment</strong>
-                  <small>Invite teammates, set working hours and request caps.</small>
-                </button>
-                <button
-                  type="button"
-                  class="nav-settings-item"
-                  @click="settingsMenuOpen = false; switchPage('dashboard')"
-                >
-                  <strong>Business type &amp; fields</strong>
-                  <small>Adjust the field schemas for leads, tickets, and appointments.</small>
-                </button>
-                <button
-                  type="button"
-                  class="nav-settings-item"
-                  @click="settingsMenuOpen = false; switchPage('dashboard')"
-                >
-                  <strong>Custom tabs</strong>
-                  <small>Define org-specific resource tabs.</small>
-                </button>
-                <button
-                  type="button"
-                  class="nav-settings-item"
-                  @click="settingsMenuOpen = false; switchPage('agent')"
-                >
-                  <strong>Advanced tool config</strong>
-                  <small>Pick individual agent tools and edit prompts.</small>
-                </button>
-              </div>
-            </div>
-            <button v-else-if="!isMemberOnly" type="button" class="nav-icon-button">
-              <Settings2 :size="18" />
+            <button
+              v-if="!isMemberOnly"
+              type="button"
+              class="nav-page-button"
+              :class="{ active: currentPage === 'nokvo_connect' }"
+              @click="switchPage('nokvo_connect')"
+            >
+              <Plug :size="17" />
+              <span>Nokvo Connect</span>
             </button>
             <button type="button" class="org-avatar-button" @click="handleLogout">
               <span class="org-avatar-initial">{{ organizationInitial }}</span>
@@ -7020,6 +7269,28 @@ onBeforeUnmount(() => {
   letter-spacing: 0.02em;
 }
 
+.mode-link--icon {
+  padding: 0.55rem;
+  width: 2.35rem;
+  height: 2.35rem;
+  justify-content: center;
+}
+
+.mode-link--icon.active {
+  background: rgba(27, 28, 21, 0.08);
+}
+
+.mode-link-wrap {
+  position: relative;
+  display: inline-flex;
+}
+
+.mode-settings-menu {
+  top: calc(100% + 0.45rem);
+  right: 0;
+  left: auto;
+}
+
 .login-layout,
 .workspace-layout {
   position: relative;
@@ -7028,6 +7299,458 @@ onBeforeUnmount(() => {
   width: min(100%, 1120px);
   margin: 0 auto;
   padding: 2rem 1.5rem 3rem;
+}
+
+.connect-layout {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 2rem;
+  background:
+    radial-gradient(circle at 12% 18%, rgba(255, 196, 110, 0.55), transparent 55%),
+    radial-gradient(circle at 88% 14%, rgba(124, 196, 255, 0.45), transparent 55%),
+    radial-gradient(circle at 50% 95%, rgba(199, 130, 255, 0.4), transparent 55%),
+    linear-gradient(135deg, #f4e8d2 0%, #f6c8a3 35%, #b3c8f0 70%, #d9b8f5 100%);
+  background-size: 180% 180%, 180% 180%, 180% 180%, 200% 200%;
+  background-position: 0% 0%, 100% 0%, 50% 100%, 0% 50%;
+  color: #1b1c15;
+  overflow: hidden;
+  animation: connect-bg-drift 18s ease-in-out infinite alternate,
+    connect-layout-in 0.55s ease-out both;
+}
+
+@keyframes connect-layout-in {
+  0% { opacity: 0; transform: scale(0.985); }
+  100% { opacity: 1; transform: scale(1); }
+}
+
+@keyframes connect-bg-drift {
+  0%   { background-position: 0% 0%, 100% 0%, 50% 100%, 0% 50%; }
+  100% { background-position: 15% 25%, 85% 30%, 45% 80%, 100% 50%; }
+}
+
+.connect-back-link {
+  position: absolute;
+  top: 1.5rem;
+  left: 1.5rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.65rem 1rem;
+  border-radius: 999px;
+  border: 1px solid rgba(27, 28, 21, 0.18);
+  background: rgba(255, 255, 255, 0.72);
+  color: #1b1c15;
+  font-family: Manrope, sans-serif;
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+  backdrop-filter: blur(6px);
+  transition: background 0.15s ease, transform 0.15s ease;
+}
+
+.connect-back-link:hover {
+  background: rgba(255, 255, 255, 0.92);
+  transform: translateX(-2px);
+}
+
+.connect-title {
+  font-family: 'Playfair Display', Manrope, serif;
+  font-size: clamp(2.75rem, 6vw, 4.75rem);
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  text-align: center;
+  margin: 0;
+  text-shadow: 0 2px 24px rgba(255, 255, 255, 0.35);
+  display: inline-flex;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.connect-title-char {
+  display: inline-block;
+  opacity: 0;
+  transform: translateY(0.55em) rotate(-3deg);
+  filter: blur(6px);
+  animation: connect-char-in 0.7s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+
+.connect-title-space {
+  width: 0.35em;
+}
+
+.connect-continue-button {
+  margin-top: 2rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.85rem 1.6rem;
+  border-radius: 999px;
+  border: 1px solid rgba(27, 28, 21, 0.18);
+  background: rgba(27, 28, 21, 0.88);
+  color: #f4f0e1;
+  font-family: Manrope, sans-serif;
+  font-size: 0.95rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  cursor: pointer;
+  backdrop-filter: blur(6px);
+  box-shadow: 0 8px 24px rgba(27, 28, 21, 0.18);
+  opacity: 0;
+  transform: translateY(8px);
+  animation: connect-continue-in 0.55s 1.1s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+  transition: transform 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
+}
+
+.connect-continue-button:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 12px 30px rgba(27, 28, 21, 0.24);
+  background: #1b1c15;
+}
+
+.connect-continue-button:active {
+  transform: translateY(0);
+}
+
+@keyframes connect-continue-in {
+  0%   { opacity: 0; transform: translateY(8px); }
+  100% { opacity: 1; transform: translateY(0); }
+}
+
+.org-shell.dark .connect-continue-button {
+  background: rgba(244, 240, 225, 0.92);
+  color: #1b1c15;
+  border-color: rgba(244, 240, 225, 0.3);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+
+.org-shell.dark .connect-continue-button:hover {
+  background: #ffffff;
+}
+
+.connect-layout--scroll {
+  justify-content: flex-start;
+  padding-top: 5rem;
+  padding-bottom: 3rem;
+  overflow-y: auto;
+  align-items: stretch;
+}
+
+.connect-panel {
+  width: min(100%, 720px);
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+  background: rgba(255, 255, 255, 0.72);
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(27, 28, 21, 0.12);
+  border-radius: 18px;
+  padding: 1.75rem;
+  box-shadow: 0 18px 48px rgba(27, 28, 21, 0.12);
+  color: #1b1c15;
+}
+
+.connect-panel-head h2 {
+  font-family: 'Playfair Display', Manrope, serif;
+  font-size: 1.6rem;
+  margin: 0 0 0.35rem;
+}
+
+.connect-panel-head p {
+  color: #5f5f53;
+  font-size: 0.92rem;
+  margin: 0;
+}
+
+.connect-alert {
+  border-radius: 10px;
+  padding: 0.7rem 0.9rem;
+  font-size: 0.85rem;
+}
+
+.connect-alert.error {
+  background: rgba(220, 64, 64, 0.12);
+  color: #8a1f1f;
+}
+
+.connect-secret-callout {
+  background: #1b1c15;
+  color: #f4f0e1;
+  border-radius: 12px;
+  padding: 1rem 1.1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+}
+
+.connect-secret-callout strong {
+  font-family: Manrope, sans-serif;
+  font-size: 0.95rem;
+}
+
+.connect-secret-callout p {
+  margin: 0;
+  font-size: 0.85rem;
+  color: rgba(244, 240, 225, 0.78);
+}
+
+.connect-secret-value {
+  display: block;
+  background: rgba(244, 240, 225, 0.12);
+  border-radius: 8px;
+  padding: 0.65rem 0.8rem;
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.8rem;
+  word-break: break-all;
+}
+
+.connect-secret-subline {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  font-size: 0.78rem;
+  color: rgba(244, 240, 225, 0.78);
+}
+
+.connect-secret-subline code {
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #f4f0e1;
+  word-break: break-all;
+}
+
+.connect-secret-dismiss {
+  align-self: flex-end;
+  background: rgba(244, 240, 225, 0.12);
+  border: 1px solid rgba(244, 240, 225, 0.22);
+  color: #f4f0e1;
+  padding: 0.4rem 0.85rem;
+  border-radius: 999px;
+  cursor: pointer;
+  font-size: 0.78rem;
+}
+
+.connect-create-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+}
+
+.connect-form-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.85rem;
+}
+
+.connect-form-fullwidth {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.connect-create-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  font-size: 0.82rem;
+  color: #5f5f53;
+}
+
+.connect-create-form input,
+.connect-create-form select,
+.connect-create-form textarea {
+  border: 1px solid rgba(27, 28, 21, 0.18);
+  background: #fff;
+  border-radius: 8px;
+  padding: 0.6rem 0.75rem;
+  font-size: 0.9rem;
+  color: #1b1c15;
+  font-family: inherit;
+}
+
+.connect-create-form textarea {
+  resize: vertical;
+  min-height: 60px;
+}
+
+.connect-create-form .connect-continue-button {
+  align-self: flex-start;
+  margin-top: 0.25rem;
+  animation: none;
+  opacity: 1;
+  transform: none;
+}
+
+.connect-key-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+}
+
+.connect-key-list h3 {
+  font-family: Manrope, sans-serif;
+  font-size: 0.95rem;
+  margin: 0.5rem 0 0;
+}
+
+.connect-key-empty {
+  color: #5f5f53;
+  font-size: 0.88rem;
+  padding: 0.75rem 0;
+}
+
+.connect-key-card {
+  border: 1px solid rgba(27, 28, 21, 0.12);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.86);
+  padding: 0.85rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+}
+
+.connect-key-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.connect-key-card-head strong {
+  display: block;
+  font-family: Manrope, sans-serif;
+  font-size: 0.92rem;
+}
+
+.connect-key-card-head code {
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.78rem;
+  color: #5f5f53;
+}
+
+.connect-key-status {
+  font-size: 0.7rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 0.15rem 0.5rem;
+  border-radius: 999px;
+  background: rgba(30, 130, 70, 0.12);
+  color: #1a6a3b;
+}
+
+.connect-key-status.revoked {
+  background: rgba(150, 80, 80, 0.12);
+  color: #8a1f1f;
+}
+
+.connect-key-card-meta {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 0.45rem 1rem;
+  margin: 0;
+  font-size: 0.78rem;
+  color: #5f5f53;
+}
+
+.connect-key-card-meta div {
+  display: flex;
+  justify-content: space-between;
+}
+
+.connect-key-card-meta dt {
+  color: #5f5f53;
+}
+
+.connect-key-card-meta dd {
+  margin: 0;
+  color: #1b1c15;
+  font-weight: 600;
+}
+
+.connect-revoke-button {
+  align-self: flex-start;
+  border: 1px solid rgba(220, 64, 64, 0.4);
+  background: transparent;
+  color: #8a1f1f;
+  padding: 0.4rem 0.85rem;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  cursor: pointer;
+}
+
+.connect-revoke-button:hover {
+  background: rgba(220, 64, 64, 0.08);
+}
+
+.org-shell.dark .connect-panel {
+  background: rgba(28, 29, 24, 0.72);
+  border-color: rgba(244, 240, 225, 0.16);
+  color: #f4f0e1;
+}
+
+.org-shell.dark .connect-panel-head p,
+.org-shell.dark .connect-create-form label,
+.org-shell.dark .connect-key-card-meta,
+.org-shell.dark .connect-key-card-head code,
+.org-shell.dark .connect-key-empty {
+  color: rgba(244, 240, 225, 0.7);
+}
+
+.org-shell.dark .connect-create-form input,
+.org-shell.dark .connect-create-form select,
+.org-shell.dark .connect-create-form textarea {
+  background: rgba(28, 29, 24, 0.6);
+  border-color: rgba(244, 240, 225, 0.2);
+  color: #f4f0e1;
+}
+
+.org-shell.dark .connect-key-card {
+  background: rgba(28, 29, 24, 0.7);
+  border-color: rgba(244, 240, 225, 0.16);
+}
+
+.org-shell.dark .connect-key-card-meta dd {
+  color: #f4f0e1;
+}
+
+@keyframes connect-char-in {
+  0% {
+    opacity: 0;
+    transform: translateY(0.55em) rotate(-3deg);
+    filter: blur(6px);
+  }
+  60% {
+    opacity: 1;
+    filter: blur(0);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) rotate(0);
+    filter: blur(0);
+  }
+}
+
+.org-shell.dark .connect-layout {
+  color: #f4f0e1;
+  background:
+    radial-gradient(circle at 12% 18%, rgba(255, 168, 78, 0.4), transparent 55%),
+    radial-gradient(circle at 88% 14%, rgba(80, 140, 220, 0.45), transparent 55%),
+    radial-gradient(circle at 50% 95%, rgba(150, 90, 220, 0.45), transparent 55%),
+    linear-gradient(135deg, #1c1d18 0%, #2a2620 40%, #1d2a3d 75%, #2c1d3d 100%);
+}
+
+.org-shell.dark .connect-back-link {
+  border-color: rgba(244, 240, 225, 0.28);
+  background: rgba(28, 29, 24, 0.7);
+  color: #f4f0e1;
+}
+
+.org-shell.dark .connect-back-link:hover {
+  background: rgba(28, 29, 24, 0.9);
 }
 
 .login-layout {

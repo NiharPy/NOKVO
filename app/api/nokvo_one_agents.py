@@ -46,6 +46,17 @@ from app.services.nokvo_one_outcome_starter import (
 from app.services.predefined_tools_service import resolve_legacy_key
 
 
+
+def _safe_detail(exc: BaseException) -> str:
+    """Return a user-safe error detail (forward RuntimeError/ValueError text;
+    swallow internal exception messages and log them)."""
+    import logging
+    if isinstance(exc, (RuntimeError, ValueError)):
+        return str(exc)
+    logging.getLogger(__name__).exception("unexpected exception in request handler", exc_info=exc)
+    return "Operation failed"
+
+
 router = APIRouter()
 
 
@@ -193,7 +204,7 @@ def _normalize_tool_keys(
     try:
         return validate_resolved_tool_keys(resolved, business_type, overrides, custom_tabs)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
 
 
 @router.post("/", response_model=NokvoOneAgentResponse, status_code=status.HTTP_201_CREATED)
@@ -309,7 +320,7 @@ async def chat_with_agent(
             user_message=payload.message,
         )
     except NokvoOneAgentRuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        raise HTTPException(status_code=503, detail=_safe_detail(exc)) from exc
     return NokvoOneAgentChatResponse(reply=result["reply"], tool_calls=result.get("tool_calls", []))
 
 

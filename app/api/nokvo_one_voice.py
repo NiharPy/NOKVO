@@ -24,9 +24,14 @@ Tenant isolation is enforced via TenantResources lookups for every path:
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
+import logging
 import uuid
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 import jwt
 from fastapi import (
@@ -69,6 +74,17 @@ from app.services.outgoing_lead_service import (
 )
 from app.services.outbound_campaign_service import OutboundCampaignService
 
+
+def _safe_detail(exc: BaseException) -> str:
+    """Return a user-safe error detail (forward RuntimeError/ValueError text;
+    swallow internal exception messages and log them)."""
+    import logging
+    if isinstance(exc, (RuntimeError, ValueError)):
+        return str(exc)
+    logging.getLogger(__name__).exception("unexpected exception in request handler", exc_info=exc)
+    return "Operation failed"
+
+
 router = APIRouter()
 
 _ALLOWED_STATUSES = ["pending_approval", "active", "suspended"]
@@ -99,12 +115,16 @@ async def _tenant_for_user(db: AsyncSession, user: OrganizationUser) -> TenantRe
 
 
 async def _tenant_by_link_id(db: AsyncSession, link_id: str) -> TenantResources | None:
-    res = await db.execute(select(TenantResources))
-    for tr in res.scalars().all():
-        link = dict((tr.provider_status or {}).get("agent_phone_link") or {})
-        if link.get("link_id") == link_id and link.get("status") == "linked":
-            return tr
-    return None
+    # Push the filter into Postgres so we don't pull every tenant row into
+    # Python on each Exotel webhook. Still requires a JSONB GIN index for sub-
+    # linear lookup, but at minimum keeps the row scan in the DB.
+    res = await db.execute(
+        select(TenantResources).where(
+            TenantResources.provider_status["agent_phone_link"]["link_id"].astext == link_id,
+            TenantResources.provider_status["agent_phone_link"]["status"].astext == "linked",
+        )
+    )
+    return res.scalars().first()
 
 
 async def _tenant_by_tenant_id(db: AsyncSession, tenant_id: str) -> TenantResources | None:
@@ -133,8 +153,11 @@ async def _connection_for_user(
 
 async def _ws_user(websocket: WebSocket, db: AsyncSession) -> OrganizationUser | None:
     """Decode an organization_user JWT carried in ?token= or Authorization header.
-    Returns the user only when it belongs to an active Nokvo One organization the
-    caller is allowed to operate on."""
+    Returns the user only when it belongs to an active Nokvo One organization,
+    the session has not been revoked, and (when TOTP is enrolled) the token is
+    MFA-elevated."""
+    from app.models.organization_session import OrganizationSession
+
     token = websocket.query_params.get("token") or ""
     auth = websocket.headers.get("authorization") or ""
     if not token and auth.lower().startswith("bearer "):
@@ -154,10 +177,31 @@ async def _ws_user(websocket: WebSocket, db: AsyncSession) -> OrganizationUser |
         uid = uuid.UUID(user_id)
     except ValueError:
         return None
+
+    session_id = payload.get("sid")
+    if session_id:
+        try:
+            sess_res = await db.execute(
+                select(OrganizationSession).where(OrganizationSession.id == session_id)
+            )
+            session = sess_res.scalars().first()
+        except Exception:
+            return None
+        if not session or session.revoked_at is not None:
+            return None
+
     user_res = await db.execute(select(OrganizationUser).where(OrganizationUser.id == uid))
     user = user_res.scalars().first()
     if user is None or user.status == "disabled":
         return None
+
+    has_totp = bool(
+        getattr(user, "totp_secret_encrypted", None)
+        or getattr(user, "totp_secret_encrypted_v2", None)
+    )
+    if user.mfa_required and has_totp and not bool(payload.get("mfa_completed", False)):
+        return None
+
     org_res = await db.execute(select(Organization).where(Organization.id == user.organization_id))
     org = org_res.scalars().first()
     if org is None or (org.product_tier or "nokvo_prime") != "nokvo_one":
@@ -411,7 +455,7 @@ async def start_lead_oauth(
             mode=payload.mode,
         )
     except OutgoingLeadServiceError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
 
 
 @router.get("/lead-sources/oauth/{provider}/callback")
@@ -443,7 +487,7 @@ async def lead_oauth_callback(
             code=code,
         )
     except OutgoingLeadServiceError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
     return RedirectResponse(f"{public_base}?lead_connection=success&provider={provider}")
 
 
@@ -479,7 +523,7 @@ async def sync_lead_connection(
     try:
         return await OutgoingLeadService.sync_connection(connection, db)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
 
 
 @router.get("/lead-sources/forms")
@@ -519,7 +563,7 @@ async def register_external_lead_form(
             default_call_consent=payload.default_call_consent,
         )
     except OutgoingLeadServiceError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
     return _form_response(form, request)
 
 
@@ -542,7 +586,7 @@ async def create_nokvo_lead_form(
             consent_text=payload.consent_text,
         )
     except OutgoingLeadServiceError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
     return _form_response(form, request)
 
 
@@ -576,7 +620,7 @@ async def submit_public_nokvo_form(
             },
         )
     except OutgoingLeadServiceError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
     return {"ok": True, "lead_id": str(lead.id)}
 
 
@@ -603,9 +647,32 @@ async def verify_meta_leadgen_webhook(request: Request):
     raise HTTPException(status_code=403, detail="Meta webhook verification failed")
 
 
+def _verify_meta_signature(raw_body: bytes, header: str | None) -> bool:
+    """Verify Meta's X-Hub-Signature-256 header against the raw request body
+    using META_ADS_APP_SECRET. Returns False when secret is unset (fail closed)."""
+    if not header or not settings.META_ADS_APP_SECRET:
+        return False
+    prefix = "sha256="
+    if not header.startswith(prefix):
+        return False
+    expected = hmac.new(
+        settings.META_ADS_APP_SECRET.encode("utf-8"),
+        raw_body,
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(expected, header[len(prefix):])
+
+
 @router.post("/lead-sources/meta/webhook")
 async def receive_meta_leadgen_webhook(request: Request, db: AsyncSession = Depends(deps.get_db)):
-    payload = await request.json()
+    raw_body = await request.body()
+    signature = request.headers.get("x-hub-signature-256")
+    if not _verify_meta_signature(raw_body, signature):
+        raise HTTPException(status_code=403, detail="Meta webhook signature verification failed")
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise HTTPException(status_code=400, detail="Invalid Meta webhook payload")
     imported = 0
     errors: list[str] = []
     for entry in payload.get("entry") or []:
@@ -816,11 +883,11 @@ async def create_campaign(
             },
         )
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
     except OutgoingLeadServiceError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
     return _campaign_response(campaign)
 
 
@@ -859,7 +926,7 @@ async def launch_campaign(
             tenant_res=tr,
         )
     except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise HTTPException(status_code=409, detail=_safe_detail(exc)) from exc
     return _campaign_response(campaign)
 
 
@@ -877,5 +944,5 @@ async def cancel_campaign(
     try:
         campaign = await OutboundCampaignService.cancel_campaign(campaign, db)
     except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise HTTPException(status_code=409, detail=_safe_detail(exc)) from exc
     return _campaign_response(campaign)

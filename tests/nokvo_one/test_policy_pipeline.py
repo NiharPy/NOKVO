@@ -356,10 +356,21 @@ def test_telugu_appointment_flow_collects_reason_name_phone_and_no_urgent():
     )
     assert name is not None
     assert name["state_patch"]["appointment"]["patient_name"] == "నిహార్"
-    assert name["state_slot"] == "phone"
-    assert "phone number" in name["answer"]
+    assert name["state_slot"] == "patient_name_confirm"
+    assert name["state_patch"]["appointment"]["awaiting_name_confirmation"] is True
 
-    phone = evaluate_voice_turn_policy("7569672503", history=[], state=name["state_patch"], language="te")
+    # Confirm the captured name so the FSM advances to phone capture.
+    name_confirmed = evaluate_voice_turn_policy(
+        "yes",
+        history=[],
+        state=name["state_patch"],
+        language="te",
+    )
+    assert name_confirmed is not None
+    assert name_confirmed["state_slot"] == "phone"
+    assert "phone number" in name_confirmed["answer"]
+
+    phone = evaluate_voice_turn_policy("7569672503", history=[], state=name_confirmed["state_patch"], language="te")
     assert phone is not None
     assert phone["state_patch"]["appointment"]["phone"] == "7569672503"
     assert phone["state_slot"] == "preferred_date"
@@ -1277,3 +1288,153 @@ def test_extractor_produces_full_zapeats_matrix():
     assert OUTCOME_FULL_REFUND_WALLET in outcomes
     assert OUTCOME_EIGHTY_PERCENT_REFUND in outcomes
     assert OUTCOME_NO_CANCELLATION in outcomes
+
+
+# ── Regression: real-call transcript bugs ───────────────────────────────────
+#
+# These cover the live-call issues a real-estate caller hit on 2026-05-23:
+#   - "Ya" wasn't recognised as yes during name / slot confirmation.
+#   - "No, my name is Nihar" wasn't parsed as a correction — the agent
+#     re-asked for the name from scratch.
+#   - Devanagari name "निहार।" carried the danda through to the booking.
+# Together they validate the changes in voice_turn_policy and tool_flow_policy.
+
+
+def test_name_confirmation_accepts_informal_ya():
+    """STT routinely emits 'Ya' for a spoken 'yes'. The confirmation
+    handshake must treat that as affirmative — otherwise it consumes the
+    utterance as a new name and the caller is stuck."""
+    state = {
+        "appointment": {
+            "active": True,
+            "patient_name": "Nihar",
+            "awaiting_name_confirmation": True,
+            "pending_slot": "patient_name_confirm",
+        }
+    }
+    result = evaluate_voice_turn_policy("Ya", history=[], state=state, language="en")
+    assert result is not None
+    appt = result["state_patch"]["appointment"]
+    assert appt["patient_name"] == "Nihar"
+    assert appt["awaiting_name_confirmation"] is False
+    assert result["state_slot"] != "patient_name_confirm"
+
+
+def test_name_confirmation_extracts_embedded_correction():
+    """When the caller says "No, my name is Nihar" we must use the
+    corrected name instead of re-asking from scratch."""
+    state = {
+        "appointment": {
+            "active": True,
+            "patient_name": "Yaa",
+            "awaiting_name_confirmation": True,
+            "pending_slot": "patient_name_confirm",
+        }
+    }
+    result = evaluate_voice_turn_policy(
+        "No, my name is Nihar.",
+        history=[],
+        state=state,
+        language="en",
+    )
+    assert result is not None
+    appt = result["state_patch"]["appointment"]
+    assert appt["patient_name"] == "Nihar"
+    assert appt["awaiting_name_confirmation"] is True
+    assert result["state_slot"] == "patient_name_confirm"
+
+
+def test_name_extraction_strips_indic_danda():
+    """STT often appends the Devanagari ।, which would otherwise be
+    recited back literally and stored on the booking record."""
+    state = {"appointment": {"active": True, "reason": "checkup", "pending_slot": "patient_name"}}
+    result = evaluate_voice_turn_policy("निहार।", history=[], state=state, language="hi")
+    assert result is not None
+    appt = result["state_patch"]["appointment"]
+    assert appt["patient_name"] == "निहार"
+
+
+def test_tool_flow_name_correction_extracts_embedded_name():
+    """Mirror of the voice_turn test for the generic tool_flow path
+    (real estate / hospitality / ecommerce). 'No, my name is Nihar'
+    should keep the conversation moving."""
+    provider_status, _ = ensure_tool_flow_questions({}, "real_estate")
+    state = {
+        "tool_flow": {
+            "active": True,
+            "flow_key": "real_estate_site_visit",
+            "tool_key": "qualify_lead_and_schedule_visit",
+            "collected": {"name": "Yaa"},
+            "pending_slot": "name_confirm",
+            "awaiting_name_confirmation": True,
+            "name_confirmation_slot": "name",
+        }
+    }
+    result = evaluate_tool_flow_policy(
+        "No, my name is Nihar.",
+        business_type="real_estate",
+        provider_status=provider_status,
+        history=[],
+        state=state,
+        language="en",
+    )
+    assert result is not None
+    flow = result["state_patch"]["tool_flow"]
+    assert flow["collected"]["name"] == "Nihar"
+    assert flow.get("awaiting_name_confirmation") is True
+
+
+def test_tool_flow_name_extraction_strips_indic_danda():
+    provider_status, _ = ensure_tool_flow_questions({}, "real_estate")
+    state = {
+        "tool_flow": {
+            "active": True,
+            "flow_key": "real_estate_site_visit",
+            "tool_key": "qualify_lead_and_schedule_visit",
+            "collected": {},
+            "pending_slot": "name",
+        }
+    }
+    result = evaluate_tool_flow_policy(
+        "निहार।",
+        business_type="real_estate",
+        provider_status=provider_status,
+        history=[],
+        state=state,
+        language="hi",
+    )
+    assert result is not None
+    flow = result["state_patch"]["tool_flow"]
+    assert flow["collected"]["name"] == "निहार"
+
+
+def test_tool_flow_slot_confirm_accepts_ya():
+    """After the agent proposes a slot, 'Ya' must accept it."""
+    from datetime import datetime as _dt, timezone as _tz
+
+    provider_status, _ = ensure_tool_flow_questions({}, "real_estate")
+    proposed = _dt(2026, 5, 23, 9, 0, tzinfo=_tz.utc).isoformat()
+    state = {
+        "tool_flow": {
+            "active": True,
+            "flow_key": "real_estate_site_visit",
+            "tool_key": "qualify_lead_and_schedule_visit",
+            "collected": {"name": "Nihar", "phone": "7569672503"},
+            "pending_slot": "visit_time",
+            "awaiting_slot_confirm": True,
+            "proposed_slot_utc": proposed,
+            "proposed_slot_label": "23 May at 9:00 AM",
+        }
+    }
+    result = evaluate_tool_flow_policy(
+        "Ya",
+        business_type="real_estate",
+        provider_status=provider_status,
+        history=[],
+        state=state,
+        language="en",
+    )
+    assert result is not None
+    flow = result["state_patch"]["tool_flow"]
+    assert flow.get("awaiting_slot_confirm") is False
+    assert "proposed_slot_utc" not in flow

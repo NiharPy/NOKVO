@@ -19,6 +19,17 @@ from app.schemas.nokvo_one import (
 from app.services.nokvo_one_assignment_service import NokvoOneAssignmentService
 
 
+
+def _safe_detail(exc: BaseException) -> str:
+    """Return a user-safe error detail (forward RuntimeError/ValueError text;
+    swallow internal exception messages and log them)."""
+    import logging
+    if isinstance(exc, (RuntimeError, ValueError)):
+        return str(exc)
+    logging.getLogger(__name__).exception("unexpected exception in request handler", exc_info=exc)
+    return "Operation failed"
+
+
 router = APIRouter()
 
 
@@ -68,7 +79,7 @@ async def assign_new_request(
         )
     except ValueError as exc:
         await db.rollback()
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
     await db.commit()
     return _assignment_response(result)
 
@@ -96,7 +107,7 @@ async def assign_existing_request(
         )
     except ValueError as exc:
         await db.rollback()
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
     await db.commit()
     return _assignment_response(result)
 

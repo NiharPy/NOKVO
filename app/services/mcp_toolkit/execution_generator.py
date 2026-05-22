@@ -10,6 +10,25 @@ from app.services.mcp_toolkit.models import ToolPlan
 from app.services.mcp_toolkit.pii_policy import PIIPolicyBuilder
 
 
+_SAFE_LITERAL_RE = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
+
+
+def _safe_status_literal(value: Any, fallback: str) -> str:
+    """Whitelist status-like literals embedded in generated SQL.
+
+    `source_status` / `target_status` come from LLM-derived plan.intent_signals
+    and end up inside fixed mutation SQL via string interpolation. Restricting
+    to a conservative alphanumeric/underscore/hyphen set defeats quote-injection
+    without breaking realistic status vocabularies (e.g., "in_progress", "out-for-delivery").
+    """
+    if value is None:
+        return fallback
+    text = str(value).strip()
+    if not text or not _SAFE_LITERAL_RE.match(text):
+        return fallback
+    return text
+
+
 BLOCKED_READ_STATEMENTS = [
     "DROP",
     "ALTER",
@@ -124,8 +143,8 @@ class ExecutionGenerator:
             status_column = "order_status" if "order_status" in columns else "status" if "status" in columns else ""
         if not status_column:
             return ""
-        source_status = (plan.intent_signals or {}).get("source_status") or "pending"
-        target_status = (plan.intent_signals or {}).get("target_status") or "delivered"
+        source_status = _safe_status_literal((plan.intent_signals or {}).get("source_status"), "pending")
+        target_status = _safe_status_literal((plan.intent_signals or {}).get("target_status"), "delivered")
         if not policy_approved:
             return (
                 "SELECT COUNT(*)::int AS affected_count_preview "

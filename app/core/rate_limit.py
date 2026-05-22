@@ -6,10 +6,14 @@ from slowapi.util import get_remote_address
 
 
 def _composite_key(request) -> str:
-    """Rate-limit key that combines client IP with request body email/domain when available.
+    """Rate-limit key.
 
-    Falls back to IP when the body cannot be inspected (e.g., the route hasn't parsed it
-    yet — slowapi runs key extraction before Pydantic). The IP alone is still a valid limit.
+    SlowAPI's key extractor runs before Pydantic parses the request body, so
+    we can't reach into JSON to compose IP + email. Falls back to the client
+    IP, which is sufficient for the documented brute-force-protection use
+    cases (login, OTP verify, password reset) where the attacker controls
+    only one side of the bucket. Per-email rate-limiting should be done in
+    the route body, not here.
     """
     return get_remote_address(request)
 

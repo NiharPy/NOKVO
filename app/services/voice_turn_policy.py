@@ -48,6 +48,11 @@ _VISIT_REASON_HINT_RE = re.compile(
 )
 _NAME_EXCLUSION_RE = re.compile(
     r"\b("
+    # Negation / correction tokens that should never be mistaken for a name.
+    # Without these, "no that's wrong" parses as a 3-word name candidate.
+    r"no|nope|not|wrong|incorrect|right|correct|that(?:'s| is)|"
+    r"yes|yeah|yep|yup|ya|yah|sure|ok|okay|alright|"
+    # Existing clinical / appointment vocabulary.
     r"it(?:'s| is)|actually|appointment|consultation|visit|checkup|check-up|eye|eyes|"
     r"red|redness|pain|watering|itching|irritation|blurred|vision|dry|strain|"
     r"spectacles|power|problem|concern|issue|symptom"
@@ -368,16 +373,54 @@ def _unicode_lettersish(value: str) -> bool:
     return has_letter
 
 
+_INDIC_TRAILING_PUNCT = "।॥।।…・「」（）"
+
+
 def _strip_name_suffix(value: str) -> str:
     value = _clean(value)
     value = re.sub(r"(?:గారు|అండి|ండి|sir|madam|ji|जी)\.?\s*$", "", value, flags=re.IGNORECASE)
-    return _clean(value.strip(" ,.-"))
+    # Strip Indic sentence terminators (Devanagari ।, double-danda ॥) plus
+    # ASCII punctuation. STT often appends a danda or full stop to the
+    # spoken name; carrying it through would store the name as "निहार।"
+    # and recite it back literally.
+    stripped = value.strip(" ,.-" + _INDIC_TRAILING_PUNCT)
+    return _clean(stripped)
 
 
 def _extract_patient_name(text: str) -> str | None:
+    name, _high_confidence = _extract_patient_name_with_confidence(text)
+    return name
+
+
+_LEADING_NEGATION_RE = re.compile(
+    r"^\s*(?:no|nope|nah|not\s+really|actually|wait|sorry)\b[\s,]*",
+    re.IGNORECASE,
+)
+
+
+def _extract_name_after_negation(text: str) -> str | None:
+    """Strip a leading negation ("No,", "Actually,", "Sorry,") and re-run
+    name extraction on the remainder. Lets utterances like "No, my name
+    is Nihar" yield a corrected name during the confirmation handshake
+    instead of being thrown away as a plain negative."""
+    cleaned = _LEADING_NEGATION_RE.sub("", text or "")
+    if not cleaned or cleaned == text:
+        return None
+    return _extract_patient_name(cleaned)
+
+
+def _extract_patient_name_with_confidence(text: str) -> tuple[str | None, bool]:
+    """Return (name, high_confidence).
+
+    ``high_confidence`` is True when the caller introduced the name with an
+    explicit prefix ("my name is X", "నా పేరు X", "मेरा नाम X"). Callers can
+    use the flag to skip the name-confirmation handshake, which exists to
+    catch STT errors on bare-name utterances and would otherwise stall a
+    happy path where the caller already framed the name unambiguously.
+    """
     value = _strip_name_suffix(text)
     if not value:
-        return None
+        return None, False
     match = _NAME_PREFIX_RE.search(value)
     if match:
         # The caller explicitly introduced the name ("the full name of the
@@ -386,18 +429,22 @@ def _extract_patient_name(text: str) -> str | None:
         # get filtered by the exclusion regex.
         candidate = _strip_name_suffix(match.group(1))
         if not candidate:
-            return None
+            return None, False
         if (
             _QUESTION_RE.search(candidate)
             or _NAME_EXCLUSION_RE.search(candidate)
             or any(c.isdigit() for c in candidate)
         ):
-            return None
+            return None, False
         words = candidate.split()
         if not (1 <= len(words) <= 6) or len(candidate) > 120:
-            return None
-        return candidate if _unicode_lettersish(candidate) else None
-    return value if _looks_like_name(value) else None
+            return None, False
+        if not _unicode_lettersish(candidate):
+            return None, False
+        return candidate, True
+    if _looks_like_name(value):
+        return value, False
+    return None, False
 
 
 def _looks_like_name(text: str) -> bool:
@@ -660,10 +707,24 @@ def _shift_to_next_day_prompt(
 # Indic affirmatives use (?=\s|$|[.,!?]) lookahead instead — Python's \b only
 # considers ASCII word chars, so the Devanagari/Telugu branches in the old
 # combined regex never fired at all.
+#
+# Voice STT regularly emits informal yes-equivalents ("ya", "yah", "mhm",
+# "uh huh", "right", "correct") — keeping the alternation conservative
+# misclassifies these as new names / corrections / unrelated input. The
+# expanded set captures realistic call audio without colliding with words
+# like "right now" / "right away" (we anchor at start-of-utterance).
 _AFFIRMATIVE_ASCII_RE = re.compile(
-    r"^\s*(yes|yeah|yep|yup|sure|ok(?:ay)?|please|please\s+do|"
-    r"go\s+ahead|sounds\s+good|that\s+works|that(?:'s|\s+is)\s+(?:fine|correct|right)|"
-    r"do\s+(?:it|that)|book\s+it)\b",
+    r"^\s*(?:"
+    r"yes|yea|yeah|yeahh?|yep+|yup+|ya|yah|yass+|yess+|"
+    r"sure|ok(?:ay)?|alright|"
+    r"please|please\s+do|"
+    r"go\s+ahead|sounds\s+good|that\s+works|"
+    r"that(?:'s|\s+is)\s+(?:fine|correct|right)|"
+    r"correct|right|absolutely|definitely|of\s+course|"
+    r"mm[\- ]?hmm?|uh[\- ]?huh|mhm+|"
+    r"do\s+(?:it|that)|book\s+it|book\s+that|confirm(?:ed)?|"
+    r"lock\s+(?:it|that)\s+in"
+    r")\b",
     re.IGNORECASE,
 )
 _AFFIRMATIVE_INDIC_RE = re.compile(
@@ -674,8 +735,13 @@ _AFFIRMATIVE_INDIC_RE = re.compile(
 
 
 _NEGATIVE_ASCII_RE = re.compile(
-    r"^\s*(no|nope|nah|not\s+(?:really|correct|right)|that(?:'s|\s+is)\s+(?:not|wrong|incorrect)|"
-    r"wrong|incorrect|change)\b",
+    r"^\s*(?:"
+    r"no|nope|nah|naw|"
+    r"not\s+(?:really|correct|right|quite)|"
+    r"that(?:'s|\s+is)\s+(?:not|wrong|incorrect)|"
+    r"wrong|incorrect|change|"
+    r"actually(?:[,]?\s+(?:no|not))?"
+    r")\b",
     re.IGNORECASE,
 )
 _NEGATIVE_INDIC_RE = re.compile(
@@ -1075,12 +1141,38 @@ def evaluate_voice_turn_policy(
         # "no" by re-asking for the name.
         if appointment.get("awaiting_name_confirmation"):
             appointment["awaiting_name_confirmation"] = False
+            # Priority order is important:
+            #   1. Affirmative ("yes", "yes that's right") → confirm as-is.
+            #   2. Negative with embedded correction ("No, my name is Nihar")
+            #      → use the corrected name and re-confirm, instead of
+            #      throwing away the correction and re-asking from scratch.
+            #   3. Plain negative ("no") → clear and re-ask.
+            #   4. Anything else → try to extract a corrected name; if none,
+            #      re-ask.
             if _looks_affirmative(value):
                 # Name stays as-is, proceed to next slot below.
                 from app.services.flow_session import record_confirmation, append_audit_trail
                 record_confirmation(appointment, "patient_name", appointment.get("patient_name"))
                 append_audit_trail(appointment, "name_confirmed", detail=appointment.get("patient_name"))
             elif _looks_negative(value):
+                # Look for an embedded correction first so "No, my name is
+                # Nihar" still keeps the conversation moving. The plain
+                # ``_extract_patient_name`` won't match because the
+                # leading "No" trips the exclusion list — use the
+                # negation-aware helper.
+                embedded_correction = _extract_name_after_negation(value)
+                if embedded_correction:
+                    appointment["patient_name"] = embedded_correction
+                    appointment["awaiting_name_confirmation"] = True
+                    return {
+                        "answer": _name_confirmation_prompt(embedded_correction, language),
+                        "intent": "appointment_flow",
+                        "entities": entities,
+                        "language": _language_code(language),
+                        "state_patch": {"appointment": appointment},
+                        "state_slot": "patient_name_confirm",
+                        "reason": "name corrected, awaiting confirmation",
+                    }
                 appointment["patient_name"] = None
                 appointment["pending_slot"] = "patient_name"
                 return {
@@ -1093,7 +1185,8 @@ def evaluate_voice_turn_policy(
                     "reason": "name confirmation rejected",
                 }
             else:
-                # Treat the new utterance as the correction.
+                # Treat the new utterance as the correction when it parses
+                # as a name.
                 replacement = _extract_patient_name(value)
                 if replacement:
                     appointment["patient_name"] = replacement

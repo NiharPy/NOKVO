@@ -26,6 +26,10 @@ next call without restarting the process.
 
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 import asyncio
 import re
 import time
@@ -417,7 +421,7 @@ class ProactiveSilenceWatchdog:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            print(f"[NOKVO-OUTBOUND] silence watchdog on_fire failed: {exc!r}")
+            logger.warning(f"NOKVO-OUTBOUND: silence watchdog on_fire failed: {exc!r}")
 
 
 __all__ = [

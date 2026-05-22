@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 import base64
 import json
 from time import perf_counter
@@ -396,7 +400,7 @@ class SarvamVoiceService:
         # tenant is on a model that doesn't support pace/pitch/loudness.
         if response.status_code >= 400 and prosody_body:
             first_err = response.text[:300]
-            print(f"[NOKVO-TTS] Sarvam rejected prosody params ({response.status_code}): {first_err!r}; retrying without prosody")
+            logger.warning(f"NOKVO-TTS: Sarvam rejected prosody params ({response.status_code}): {first_err!r}; retrying without prosody")
             retry_body = {k: v for k, v in body.items() if k not in prosody_body}
             response = await client.post(
                 endpoint,
@@ -406,7 +410,7 @@ class SarvamVoiceService:
             )
         if response.status_code >= 400:
             error_body = response.text[:300]
-            print(f"[NOKVO-TTS] Sarvam TTS failed ({response.status_code}): {error_body!r}")
+            logger.warning(f"NOKVO-TTS: Sarvam TTS failed ({response.status_code}): {error_body!r}")
             raise RuntimeError(f"Sarvam TTS failed ({response.status_code}): {error_body}")
         payload = response.json()
         return {

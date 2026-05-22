@@ -19,6 +19,10 @@ Outputs are CONSUMED by ``NokvoOneVoicePipeline._route_turn`` to decide:
 
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 import asyncio
 import json
 import re
@@ -206,17 +210,17 @@ class LLMIntentClassifier:
                 timeout=timeout_ms / 1000,
             )
         except asyncio.TimeoutError:
-            print(f"[NOKVO-CLASSIFIER] timeout after {timeout_ms}ms; using safe default")
+            logger.warning(f"NOKVO-CLASSIFIER: timeout after {timeout_ms}ms; using safe default")
             return _safe_default("classifier timeout")
         except NokvoOneAgentRuntimeError as exc:
-            print(f"[NOKVO-CLASSIFIER] runtime error: {exc!r}")
+            logger.warning(f"NOKVO-CLASSIFIER: runtime error: {exc!r}")
             return _safe_default(f"runtime: {exc}"[:120])
         except Exception as exc:
-            print(f"[NOKVO-CLASSIFIER] unexpected error: {exc!r}")
+            logger.warning(f"NOKVO-CLASSIFIER: unexpected error: {exc!r}")
             return _safe_default(f"error: {exc}"[:120])
 
         parsed = _parse_response(raw or "")
         if parsed is None:
-            print(f"[NOKVO-CLASSIFIER] unparseable response: {(raw or '')[:200]!r}")
+            logger.warning(f"NOKVO-CLASSIFIER: unparseable response: {(raw or '')[:200]!r}")
             return _safe_default("unparseable JSON")
         return parsed

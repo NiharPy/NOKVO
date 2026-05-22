@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 from datetime import datetime, timezone
 import hashlib
 import re
@@ -585,7 +589,7 @@ class AgentKnowledgeService:
         except Exception as exc:
             import traceback
             tb = traceback.format_exc()
-            print(f"[NOKVO-KB] blob upload failed for {filename!r}: {exc!r}\n{tb[:1200]}")
+            logger.warning(f"NOKVO-KB: blob upload failed for {filename!r}: {exc!r}\n{tb[:1200]}")
             blob = {"blob_path": None, "blob_name": None}
             blob_error = f"Blob upload failed: {str(exc)[:200]}"
 
@@ -598,7 +602,7 @@ class AgentKnowledgeService:
         except Exception as exc:
             import traceback
             tb = traceback.format_exc()
-            print(f"[NOKVO-KB] extract/chunk failed for {filename!r}: {exc!r}\n{tb[:1200]}")
+            logger.warning(f"NOKVO-KB: extract/chunk failed for {filename!r}: {exc!r}\n{tb[:1200]}")
             chunks = []
             extracted_text = ""
             blob_error = (blob_error + "; " if blob_error else "") + f"Extract/chunk failed: {str(exc)[:200]}"
@@ -663,7 +667,7 @@ class AgentKnowledgeService:
                 # tiktoken edge cases — all should surface here.
                 import traceback
                 tb = traceback.format_exc()
-                print(f"[NOKVO-KB] upload_document chunk-upsert failed: {exc!r}\n{tb[:1500]}")
+                logger.warning(f"NOKVO-KB: upload_document chunk-upsert failed: {exc!r}\n{tb[:1500]}")
                 document["status"] = "error"
                 document["approval_status"] = "rejected"
                 document["approved_at"] = None
@@ -673,7 +677,7 @@ class AgentKnowledgeService:
         documents = AgentKnowledgeService._documents(provider_status)
         documents.append(document)
         AgentKnowledgeService._set_documents(provider_status, documents)
-        print(f"[NOKVO-KB] registered document {document['id']} ({document['name']!r}) status={document['status']} approval={document['approval_status']} chunks={document['chunk_count']}")
+        logger.warning(f"NOKVO-KB: registered document {document['id']} ({document['name']!r}) status={document['status']} approval={document['approval_status']} chunks={document['chunk_count']}")
         if not (chunks and document["status"] == "ok"):
             provider_status.setdefault(AGENT_POLICY_VERSION_KEY, "pv_default")
         tenant_res.provider_status = provider_status
@@ -685,7 +689,7 @@ class AgentKnowledgeService:
         except Exception as exc:
             import traceback
             tb = traceback.format_exc()
-            print(f"[NOKVO-KB] upload_document commit failed: {exc!r}\n{tb[:1500]}")
+            logger.warning(f"NOKVO-KB: upload_document commit failed: {exc!r}\n{tb[:1500]}")
             await db.rollback()
             # If we got this far, surface the doc-with-error rather than
             # raising — the caller asked for an upload and we managed to
@@ -900,7 +904,7 @@ class AgentKnowledgeService:
             reconciled_docs.append(
                 {"document_id": doc_id, "name": document["name"], "chunks": len(chunks)}
             )
-            print(f"[NOKVO-KB] reconciled document {doc_id} ({document['name']!r}) with {len(chunks)} chunks")
+            logger.warning(f"NOKVO-KB: reconciled document {doc_id} ({document['name']!r}) with {len(chunks)} chunks")
 
             # Generate policy cards on the fly so cancellation/refund routing
             # works immediately for the reconciled doc.
@@ -910,7 +914,7 @@ class AgentKnowledgeService:
                     existing_cards = AgentKnowledgeService._policy_cards(provider_status)
                     AgentKnowledgeService._set_policy_cards(provider_status, existing_cards + policy_cards)
             except Exception as exc:
-                print(f"[NOKVO-KB] reconcile: policy card generation failed for {doc_id}: {exc!r}")
+                logger.warning(f"NOKVO-KB: reconcile: policy card generation failed for {doc_id}: {exc!r}")
 
         AgentKnowledgeService._set_documents(provider_status, documents)
         # Align the global agent_policy_version with what the reconciled
@@ -1022,12 +1026,12 @@ class AgentKnowledgeService:
                 {"source_type": AGENT_KNOWLEDGE_SOURCE_TYPE, "document_id": document_id},
                 db=db,
             )
-            print(f"[NOKVO-KB] delete: removed Qdrant points for document_id={document_id}")
+            logger.warning(f"NOKVO-KB: delete: removed Qdrant points for document_id={document_id}")
         except Exception as exc:
             qdrant_deleted = False
             import traceback
             tb = traceback.format_exc()
-            print(f"[NOKVO-KB] delete: Qdrant delete failed for {document_id}: {exc!r}\n{tb[:1000]}")
+            logger.warning(f"NOKVO-KB: delete: Qdrant delete failed for {document_id}: {exc!r}\n{tb[:1000]}")
 
         # 2) Prune answer + policy cards belonging to this document.
         remaining_answer_cards = [
@@ -1057,7 +1061,7 @@ class AgentKnowledgeService:
         except Exception as exc:
             import traceback
             tb = traceback.format_exc()
-            print(f"[NOKVO-KB] delete: blob sweep failed for {document_id}: {exc!r}\n{tb[:1000]}")
+            logger.warning(f"NOKVO-KB: delete: blob sweep failed for {document_id}: {exc!r}\n{tb[:1000]}")
 
         # 4) Remove from the registry and bump policy_version so any cached
         #    answers tied to the prior version age out.

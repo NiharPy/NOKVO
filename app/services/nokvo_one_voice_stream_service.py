@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 import asyncio
 import json
 import struct
@@ -914,10 +918,10 @@ class NokvoOneVoiceStreamService:
                 )
                 return str(result.get("transcript") or "").strip()
             except asyncio.TimeoutError:
-                print("[NOKVO-TRANSLATE] timeout in vad_blob mode; using native only")
+                logger.warning("NOKVO-TRANSLATE: timeout in vad_blob mode; using native only")
                 return ""
             except Exception as exc:
-                print(f"[NOKVO-TRANSLATE] failed: {exc!r}")
+                logger.warning(f"NOKVO-TRANSLATE: failed: {exc!r}")
                 return ""
 
         native_task = asyncio.create_task(_native())
@@ -955,7 +959,7 @@ class NokvoOneVoiceStreamService:
                     "The voice transcription service is rate-limited. "
                     "Please try speaking again in a moment."
                 )
-                print(f"[NOKVO-VOICE] STT rate-limited after retries: {err_text[:200]!r}")
+                logger.warning(f"NOKVO-VOICE: STT rate-limited after retries: {err_text[:200]!r}")
             await websocket.send_json(payload)
             return
 
@@ -1220,7 +1224,7 @@ class NokvoOneVoiceStreamService:
             except Exception as exc:
                 # Pipeline still works without the proactive config —
                 # it falls back to the legacy goal-only behaviour.
-                print(f"[NOKVO-OUTBOUND] load_outbound_context failed: {exc!r}")
+                logger.warning(f"NOKVO-OUTBOUND: load_outbound_context failed: {exc!r}")
                 outbound_context = None
         proactive_watchdog: ProactiveSilenceWatchdog | None = None
 
@@ -1516,7 +1520,7 @@ class NokvoOneVoiceStreamService:
                     except asyncio.TimeoutError:
                         # Don't block the user on a slow translate — proceed
                         # with the native transcript for retrieval.
-                        print(f"[NOKVO-TRANSLATE] timeout after {TRANSLATE_TIMEOUT_S}s; falling back to native")
+                        logger.warning(f"NOKVO-TRANSLATE: timeout after {TRANSLATE_TIMEOUT_S}s; falling back to native")
                     except Exception as exc:
                         try:
                             await websocket.send_json(
@@ -1674,7 +1678,7 @@ class NokvoOneVoiceStreamService:
                             # Restart debounce; we'll fire if speech_end never arrives.
                             _restart_eou_timer()
                 except Exception as exc:
-                    print(f"[NOKVO-VOICE] Sarvam reader exception: {exc!r}")
+                    logger.warning(f"NOKVO-VOICE: Sarvam reader exception: {exc!r}")
 
             stt_reader_task = asyncio.create_task(_reader())
 
@@ -1793,7 +1797,7 @@ class NokvoOneVoiceStreamService:
                     requested_mode = str(payload.get("mode") or "").strip().lower()
                     if requested_mode in {"vad_blob", "stream"}:
                         capture_mode[0] = requested_mode
-                        print(f"[NOKVO-VOICE] capture_mode set to {capture_mode[0]} for call {call_id}")
+                        logger.warning(f"NOKVO-VOICE: capture_mode set to {capture_mode[0]} for call {call_id}")
                     await NokvoOneVoiceStreamService._emit_runtime_status(websocket, tenant_res)
                     # The delayed-opener task may still be mid-``db.execute``
                     # (it looks up returning-caller history). Drain it before

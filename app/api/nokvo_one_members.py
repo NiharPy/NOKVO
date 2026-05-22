@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import secrets
 import uuid
 from datetime import datetime, time, timedelta, timezone
@@ -51,7 +52,15 @@ router = APIRouter()
 
 
 def _hash_token(raw: str) -> str:
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    # HMAC over the raw token using SECRET_KEY so token-hash leakage (without
+    # SECRET_KEY) can't be rainbow-tabled. Token entropy is already 256 bits,
+    # but the HMAC is defense in depth and bounds blast radius if the column
+    # is exfiltrated separately from the JWT secret.
+    return hmac.new(
+        settings.SECRET_KEY.encode("utf-8"),
+        raw.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
 
 
 def _issue_invite_setup_token(user_id: uuid.UUID, organization_id: uuid.UUID) -> str:

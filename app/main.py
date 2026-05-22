@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 
 from fastapi import FastAPI, Depends, Request
@@ -11,14 +12,16 @@ from app.core.config import settings
 from app.core.rate_limit import limiter
 import redis.asyncio as redis
 
+logger = logging.getLogger(__name__)
+
 app = FastAPI(title=settings.PROJECT_NAME)
 
-try:
-    app.state.limiter = limiter
-    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-    app.add_middleware(SlowAPIMiddleware)
-except Exception as e:
-    print(f"Rate limiter setup error: {e}")
+# Rate limiter wiring is required — if it fails here we want to fail fast
+# rather than start an unlimited service. The previous swallow-and-print
+# masked misconfiguration in production.
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,8 +33,8 @@ app.add_middleware(
         }
     ),
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["authorization", "content-type", "x-requested-with"],
 )
 
 from app.api import (
@@ -45,6 +48,8 @@ from app.api import (
     nokvo_one_outcomes,
     nokvo_one_requests,
     nokvo_one_voice,
+    connect_admin,
+    connect_public,
 )
 
 app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
@@ -65,6 +70,13 @@ app.include_router(
     prefix="/api/nokvo-one/knowledge-base",
     tags=["nokvo-one-knowledge-base"],
 )
+
+# Nokvo Connect — Nokvo One organizations only. Admin key management lives
+# under the Nokvo One prefix so it shares JWT semantics with the rest of the
+# Nokvo One portal; the public voice/text API is namespace-neutral because
+# customer apps will hit it directly with an API key.
+app.include_router(connect_admin.router, prefix="/api/nokvo-one/connect", tags=["connect-admin"])
+app.include_router(connect_public.router, prefix="/api/voice", tags=["connect-public"])
 
 # Serve CC0 call-center ambience clips bundled in app/assets/audio/ so the
 # frontend can mix them under the live agent voice. Path is public — the

@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 import asyncio
 from datetime import datetime, time, timedelta, timezone
 import json
@@ -344,7 +348,7 @@ class AzureGroundedLLM:
                 )
                 await asyncio.sleep(wait_for)
                 continue
-            print(f"[NOKVO-LLM] 429 (complete) — giving up after {attempt + 1} attempt(s); retry_after={retry_after_hdr!r}")
+            logger.warning(f"NOKVO-LLM: 429 (complete) — giving up after {attempt + 1} attempt(s); retry_after={retry_after_hdr!r}")
             raise NokvoOneAgentRateLimited(
                 f"Azure OpenAI rate-limited (429): {response.text[:300]}",
                 retry_after_seconds=retry_after or None,
@@ -413,7 +417,7 @@ class AzureGroundedLLM:
                         )
                         await asyncio.sleep(wait_for)
                         continue
-                    print(f"[NOKVO-LLM] 429 — giving up after {attempt + 1} attempt(s); retry_after={retry_after_hdr!r}")
+                    logger.warning(f"NOKVO-LLM: 429 — giving up after {attempt + 1} attempt(s); retry_after={retry_after_hdr!r}")
                     raise NokvoOneAgentRateLimited(
                         f"Azure OpenAI rate-limited (429): {body_text}",
                         retry_after_seconds=retry_after or None,
@@ -889,9 +893,13 @@ class NokvoOneVoicePipeline:
                 dual_retrieval=False,
             )
         )
-        primary_res, secondary_res = await asyncio.gather(
-            primary_task, secondary_task, return_exceptions=False
+        primary_raw, secondary_raw = await asyncio.gather(
+            primary_task, secondary_task, return_exceptions=True
         )
+        # When one side fails (e.g., embedding service blip on the code-switch
+        # arm), keep whichever results did come back rather than losing the turn.
+        primary_res = primary_raw if not isinstance(primary_raw, BaseException) else {}
+        secondary_res = secondary_raw if not isinstance(secondary_raw, BaseException) else {}
 
         merged: dict[str, dict[str, Any]] = {}
         for source_label, res in (("primary", primary_res), ("secondary", secondary_res)):
@@ -1156,11 +1164,28 @@ class NokvoOneVoicePipeline:
         return local_dt.astimezone(timezone.utc).isoformat()
 
     @staticmethod
+    def _should_offer_sms_confirmation(tenant_res: TenantResources | None) -> bool:
+        """Return True only when the tenant has explicitly opted into the
+        end-of-booking SMS confirmation offer. The platform default is False
+        because SMS dispatch isn't wired in yet — offering a confirmation
+        that never arrives is a worse caller experience than offering
+        nothing. Tenants enable it via
+        ``provider_status['agent_offer_sms_confirmation'] = True`` once
+        their SMS gateway is connected."""
+        if tenant_res is None:
+            return bool(settings.NOKVO_AGENT_OFFER_SMS_CONFIRMATION)
+        override = (tenant_res.provider_status or {}).get("agent_offer_sms_confirmation")
+        if override is None:
+            return bool(settings.NOKVO_AGENT_OFFER_SMS_CONFIRMATION)
+        return bool(override)
+
+    @staticmethod
     def _appointment_tool_answer(
         result: dict[str, Any],
         args: dict[str, Any],
         *,
         language: str | None = None,
+        offer_sms: bool = False,
     ) -> str:
         patient = str(args.get("patient_name") or "the patient")
         when = str(args.get("appointment_time") or "the requested time")
@@ -1189,11 +1214,10 @@ class NokvoOneVoicePipeline:
                 "Clinic team exact availability confirm చేస్తారు."
             )
         phone = str(args.get("phone") or "").strip()
-        # End-of-call audit + proactive SMS offer. Reads back the captured
-        # phone (digit-by-digit so TTS doesn't munge it) and asks if the
-        # caller wants a written confirmation.
+        # End-of-call SMS offer is opt-in: empty unless the tenant has
+        # wired SMS dispatch and toggled ``agent_offer_sms_confirmation``.
         sms_offer = ""
-        if phone:
+        if offer_sms and phone:
             spoken_phone = " ".join(list(phone[-10:])) if phone[-10:].isdigit() else phone
             if lang == "te":
                 sms_offer = f" {spoken_phone} కి confirmation SMS పంపాలా?"
@@ -1307,12 +1331,17 @@ class NokvoOneVoicePipeline:
                         pass
                     break
 
+        # Track whether the caller actually specified a time — used below to
+        # decide between "X is taken — next free is Y" (specific) and a
+        # cleaner "The next available slot is Y" (open-ended).
+        caller_specified_time = False
         if requested_at is None and date_slot_value and time_slot_value:
             try:
                 local_date = NokvoOneVoicePipeline._parse_appointment_date(date_slot_value)
                 local_time = NokvoOneVoicePipeline._parse_appointment_time(time_slot_value)
                 local_dt = datetime.combine(local_date, local_time, tzinfo=_APPOINTMENT_LOCAL_TZ)
                 requested_at = local_dt.astimezone(timezone.utc)
+                caller_specified_time = True
             except (_AppointmentToolInputError, Exception):
                 requested_at = None
         # Adaptive disambiguation: caller gave a date but no time. Use
@@ -1403,11 +1432,22 @@ class NokvoOneVoicePipeline:
                 "Want me to lock that in?"
             )
             slot_label = "availability_exact"
-        else:
+        elif caller_specified_time:
+            # Caller named a specific time — acknowledge it's taken and
+            # propose the next free slot.
             requested_local = requested_at.astimezone(_APPOINTMENT_LOCAL_TZ)
             requested_label = requested_local.strftime("%d %b at %I:%M %p").lstrip("0")
             answer = (
                 f"{requested_label} is taken — the next free slot is {when_label} with {member_name}. "
+                "Want me to book that?"
+            )
+            slot_label = "availability_next"
+        else:
+            # Caller asked open-endedly ("when is it available?"). The
+            # "X is taken" preamble makes no sense here — just lead with
+            # the proposal.
+            answer = (
+                f"The next available slot is {when_label} with {member_name}. "
                 "Want me to book that?"
             )
             slot_label = "availability_next"
@@ -1599,6 +1639,7 @@ class NokvoOneVoicePipeline:
                 result,
                 args,
                 language=turn_policy.get("language"),
+                offer_sms=NokvoOneVoicePipeline._should_offer_sms_confirmation(tenant_res),
             ),
             "state_patch": {"appointment": appointment},
             "state_slot": "complete",
@@ -1748,15 +1789,16 @@ class NokvoOneVoicePipeline:
                 pass
 
     @staticmethod
-    def _tool_flow_success_answer(result: dict[str, Any], args: dict[str, Any], *, flow_key: str, language: str | None) -> str:
+    def _tool_flow_success_answer(result: dict[str, Any], args: dict[str, Any], *, flow_key: str, language: str | None, offer_sms: bool = False) -> str:
         lang = SarvamVoiceService.normalize_language(language)
         assigned_name = result.get("assigned_member_name")
         assignment_status = result.get("assignment_status")
         name = str(args.get("name") or args.get("customer_name") or args.get("phone") or "the customer")
         phone = str(args.get("phone") or args.get("contact_phone") or "").strip()
-        # End-of-call audit + SMS offer (mirrors clinic flow).
+        # End-of-call SMS offer is opt-in (mirrors clinic flow). Disabled
+        # by default because SMS dispatch isn't wired in yet.
         sms_offer = ""
-        if phone:
+        if offer_sms and phone:
             spoken_phone = " ".join(list(phone[-10:])) if phone[-10:].isdigit() else phone
             if lang == "te":
                 sms_offer = f" {spoken_phone} కి confirmation SMS పంపాలా?"
@@ -1972,7 +2014,13 @@ class NokvoOneVoicePipeline:
                 pass
 
         return {
-            "answer": NokvoOneVoicePipeline._tool_flow_success_answer(result, args, flow_key=flow_key, language=language),
+            "answer": NokvoOneVoicePipeline._tool_flow_success_answer(
+                result,
+                args,
+                flow_key=flow_key,
+                language=language,
+                offer_sms=NokvoOneVoicePipeline._should_offer_sms_confirmation(tenant_res),
+            ),
             "state_patch": {"tool_flow": flow_state},
             "state_slot": "complete",
             "route_reason": "tool flow tool executed",
@@ -2430,9 +2478,9 @@ class NokvoOneVoicePipeline:
                 compact["llm_intent"] = cls.get("intent")
                 compact["llm_needs_kb"] = cls.get("needs_kb")
                 compact["llm_fallback"] = cls.get("fallback")
-            print(f"[NOKVO-AGENT-ROUTE] {compact}")
+            logger.warning(f"NOKVO-AGENT-ROUTE: {compact}")
             return
-        print(f"[NOKVO-AGENT-ROUTE-DEBUG] {route_payload}")
+        logger.warning(f"NOKVO-AGENT-ROUTE-DEBUG: {route_payload}")
 
     @staticmethod
     def _cancel_retrieval_task(task: asyncio.Task | None) -> None:
@@ -2466,7 +2514,7 @@ class NokvoOneVoicePipeline:
         except Exception as exc:
             # Don't let a state-store hiccup poison the route; the user just
             # won't get the "Coming back" prefix on the next turn.
-            print(f"[NOKVO-ROUTE] failed to mark appointment deferred: {exc!r}")
+            logger.warning(f"NOKVO-ROUTE: failed to mark appointment deferred: {exc!r}")
 
     @staticmethod
     async def _mark_tool_flow_deferred(
@@ -2486,7 +2534,7 @@ class NokvoOneVoicePipeline:
         try:
             await AgentSessionStore.merge_state(tenant_res, call_id, patch)
         except Exception as exc:
-            print(f"[NOKVO-ROUTE] failed to mark tool_flow deferred: {exc!r}")
+            logger.warning(f"NOKVO-ROUTE: failed to mark tool_flow deferred: {exc!r}")
 
     @staticmethod
     async def _llm_check_booking_digression(
@@ -2511,7 +2559,7 @@ class NokvoOneVoicePipeline:
                 timeout_ms=500,
             )
         except Exception as exc:
-            print(f"[NOKVO-DIGRESSION] classifier failed: {exc!r}")
+            logger.warning(f"NOKVO-DIGRESSION: classifier failed: {exc!r}")
             return None
         if result.fallback:
             return None
@@ -2561,14 +2609,24 @@ class NokvoOneVoicePipeline:
         db: AsyncSession | None,
         tenant_res: TenantResources,
         turn_cache: dict[str, Any],
-    ) -> RuntimeBundle:
+    ) -> RuntimeBundle | None:
         """Cached runtime-bundle resolver. Shared by the inline ``industry``
         lookup, ``_voice_business_context``, and any other helper that
-        needs tenant-stable state within the same turn."""
+        needs tenant-stable state within the same turn.
+
+        Returns ``None`` if the bundle can't be loaded (e.g., partial
+        ``tenant_res`` test stub without ``organization_id``, or a db that
+        can't execute). Callers must default safely on ``None``.
+        """
         cached = turn_cache.get("bundle")
         if cached is not None:
             return cached
-        bundle = await get_runtime_bundle(db, tenant_res)
+        if db is None or getattr(tenant_res, "organization_id", None) is None:
+            return None
+        try:
+            bundle = await get_runtime_bundle(db, tenant_res)
+        except Exception:
+            return None
         turn_cache["bundle"] = bundle
         return bundle
 
@@ -2591,9 +2649,18 @@ class NokvoOneVoicePipeline:
         history_task = asyncio.create_task(AgentSessionStore.get_history(tenant_res, call_id))
         state_task = asyncio.create_task(AgentSessionStore.get_state(tenant_res, call_id))
         bundle_task = asyncio.create_task(get_runtime_bundle(db, tenant_res))
-        history, state, bundle = await asyncio.gather(
-            history_task, state_task, bundle_task, return_exceptions=False
+        history_res, state_res, bundle_res = await asyncio.gather(
+            history_task, state_task, bundle_task, return_exceptions=True
         )
+        # Degrade gracefully: a transient Redis/DB hiccup on the primer must
+        # not crash the turn. Fall back to empty history/state and let bundle
+        # load lazily later if it failed here.
+        history = history_res if not isinstance(history_res, BaseException) else []
+        state = state_res if not isinstance(state_res, BaseException) else {}
+        if isinstance(bundle_res, BaseException):
+            bundle = None
+        else:
+            bundle = bundle_res
         return {
             "history": list(history or []),
             "state": dict(state or {}),
@@ -2608,8 +2675,11 @@ class NokvoOneVoicePipeline:
                 return await retrieval
             except asyncio.CancelledError:
                 return None
-            except Exception as exc:
-                print(f"[NOKVO-RETRIEVE] prefetched retrieval failed: {exc!r}")
+            except Exception:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "prefetched retrieval failed", exc_info=True
+                )
                 return None
         if isinstance(retrieval, dict):
             return retrieval
@@ -2728,10 +2798,26 @@ class NokvoOneVoicePipeline:
         # tool_flow's prior turn happens to contain a word like "పేరు" that
         # the clinic slot inferrer would otherwise latch onto.
         #
-        # Industry comes off the cached runtime bundle — no DB round trip
-        # per turn anymore.
+        # Industry comes off the cached runtime bundle when available;
+        # otherwise we fall through to ``_voice_business_context`` (which is
+        # the older path tests monkeypatch). When neither yields an industry,
+        # default to running the clinic FSM — the FSM is text-based and safe
+        # to run on non-clinics, and at worst returns ``None`` so the route
+        # falls through to the generic tool_flow path.
         bundle = await NokvoOneVoicePipeline._turn_bundle(db, tenant_res, turn_cache)
-        is_clinic_org = bundle.organization_industry.lower() == "clinics"
+        industry = ""
+        if bundle is not None:
+            industry = str(bundle.organization_industry or "").strip()
+        if not industry:
+            try:
+                context_for_industry = await NokvoOneVoicePipeline._voice_business_context(db, tenant_res)
+            except Exception:
+                context_for_industry = None
+            if context_for_industry is not None:
+                org_obj, _overrides, _tabs = context_for_industry
+                if org_obj is not None:
+                    industry = str(getattr(org_obj, "industry", "") or "").strip()
+        is_clinic_org = (industry.lower() == "clinics") if industry else True
 
         turn_policy = (
             evaluate_voice_turn_policy(
@@ -2836,7 +2922,17 @@ class NokvoOneVoicePipeline:
                 "tool_calls": (action or {}).get("tool_calls") or [],
             }
 
-        business_context = bundle.as_business_context_tuple()
+        # Reuse the bundle's tuple when available; fall back to the
+        # ``_voice_business_context`` helper so test-stub paths (which
+        # monkeypatch only that helper) still hit the tool_flow branch.
+        business_context: tuple[Any, dict[str, Any], list[dict[str, Any]]] | None = None
+        if bundle is not None:
+            business_context = bundle.as_business_context_tuple()
+        if business_context is None:
+            try:
+                business_context = await NokvoOneVoicePipeline._voice_business_context(db, tenant_res)
+            except Exception:
+                business_context = None
         if business_context is not None:
             organization, overrides, custom_tabs = business_context
             prior_tool_flow = dict((state_for_turn or {}).get("tool_flow") or {})
@@ -3776,7 +3872,7 @@ class NokvoOneVoicePipeline:
                     answer_parts.append(sentence)
                     yield {"type": "sentence", "text": sentence, "language": language, "tone": chunk.tone}
             except NokvoOneAgentRateLimited as exc:
-                print(f"[NOKVO-LLM] smalltalk rate-limited: {exc}")
+                logger.warning(f"NOKVO-LLM: smalltalk rate-limited: {exc}")
                 fallback = NokvoOneVoicePipeline._rate_limited_reply(language)
                 answer_parts = [fallback]
                 yield {"type": "sentence", "text": fallback, "language": language, "tone": "warm"}
@@ -3939,7 +4035,7 @@ class NokvoOneVoicePipeline:
             # Azure deployment is throttled. Tell the caller specifically —
             # "I'm busy, try again" sounds far better than "I do not have
             # enough information", and it's the actual truth.
-            print(f"[NOKVO-LLM] stream rate-limited: {exc}")
+            logger.warning(f"NOKVO-LLM: stream rate-limited: {exc}")
             rate_limited = True
             fallback = NokvoOneVoicePipeline._rate_limited_reply(language)
             answer_parts = [fallback]

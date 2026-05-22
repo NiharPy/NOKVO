@@ -33,20 +33,20 @@ class AzureBlobService:
         credential = AzureAuth.get_credential()
             
         try:
-            blob_service_client = BlobServiceClient(account_url=account_url, credential=credential)
-            container_client = blob_service_client.get_container_client(container_name)
-            
-            # Create container if it doesn't exist
-            if not container_client.exists():
-                container_client.create_container()
-                
-            # Create prefix markers
-            folders = ["tools/", "documents/", "recordings/", "exports/", "logs/"]
-            for folder in folders:
-                blob_client = container_client.get_blob_client(f"{prefix}{folder}.keep")
-                blob_client.upload_blob(b"", overwrite=True)
-                
-            return result
+            with BlobServiceClient(account_url=account_url, credential=credential) as blob_service_client:
+                container_client = blob_service_client.get_container_client(container_name)
+
+                # Create container if it doesn't exist
+                if not container_client.exists():
+                    container_client.create_container()
+
+                # Create prefix markers
+                folders = ["tools/", "documents/", "recordings/", "exports/", "logs/"]
+                for folder in folders:
+                    blob_client = container_client.get_blob_client(f"{prefix}{folder}.keep")
+                    blob_client.upload_blob(b"", overwrite=True)
+
+                return result
         except Exception as e:
             raise RuntimeError(f"Failed to provision Azure Blob prefixes: {str(e)}")
 
@@ -78,17 +78,17 @@ class AzureBlobService:
         account_url = f"https://{account_name}.blob.core.windows.net"
         credential = AzureAuth.get_credential()
         try:
-            blob_service_client = BlobServiceClient(account_url=account_url, credential=credential)
-            container_client = blob_service_client.get_container_client(container_name)
-            if not container_client.exists():
-                container_client.create_container()
-            blob_client = container_client.get_blob_client(blob_name)
-            blob_client.upload_blob(
-                content,
-                overwrite=True,
-                content_settings=ContentSettings(content_type=result["content_type"]),
-            )
-            return result
+            with BlobServiceClient(account_url=account_url, credential=credential) as blob_service_client:
+                container_client = blob_service_client.get_container_client(container_name)
+                if not container_client.exists():
+                    container_client.create_container()
+                blob_client = container_client.get_blob_client(blob_name)
+                blob_client.upload_blob(
+                    content,
+                    overwrite=True,
+                    content_settings=ContentSettings(content_type=result["content_type"]),
+                )
+                return result
         except Exception as e:
             raise RuntimeError(f"Failed to upload Agent Knowledge document: {str(e)}")
 
@@ -114,7 +114,10 @@ class AzureBlobService:
         """
         account_name = settings.AZURE_SHARED_STORAGE_ACCOUNT
         if not account_name:
-            print(f"[NOKVO-BLOB] no AZURE_SHARED_STORAGE_ACCOUNT, skipping delete for {blob_path!r}")
+            import logging as _logging
+            _logging.getLogger(__name__).info(
+                "no AZURE_SHARED_STORAGE_ACCOUNT, skipping delete for %r", blob_path
+            )
             return 0
         container_name = settings.AZURE_SHARED_STORAGE_CONTAINER
 
@@ -136,40 +139,42 @@ class AzureBlobService:
         account_url = f"https://{account_name}.blob.core.windows.net"
         credential = AzureAuth.get_credential()
         deleted = 0
+        import logging as _logging
+        _logger = _logging.getLogger(__name__)
         try:
-            blob_service_client = BlobServiceClient(account_url=account_url, credential=credential)
-            container_client = blob_service_client.get_container_client(container_name)
+            with BlobServiceClient(account_url=account_url, credential=credential) as blob_service_client:
+                container_client = blob_service_client.get_container_client(container_name)
 
-            # Track names we've already deleted so the explicit-path step
-            # doesn't double-count when it overlaps with the prefix sweep.
-            seen: set[str] = set()
+                # Track names we've already deleted so the explicit-path step
+                # doesn't double-count when it overlaps with the prefix sweep.
+                seen: set[str] = set()
 
-            if sweep_prefix:
-                try:
-                    for blob in container_client.list_blobs(name_starts_with=sweep_prefix):
-                        try:
-                            container_client.delete_blob(blob.name)
-                            seen.add(blob.name)
-                            deleted += 1
-                        except Exception as exc:
-                            print(f"[NOKVO-BLOB] failed to delete {blob.name}: {exc!r}")
-                except Exception as exc:
-                    print(f"[NOKVO-BLOB] list under {sweep_prefix!r} failed: {exc!r}")
+                if sweep_prefix:
+                    try:
+                        for blob in container_client.list_blobs(name_starts_with=sweep_prefix):
+                            try:
+                                container_client.delete_blob(blob.name)
+                                seen.add(blob.name)
+                                deleted += 1
+                            except Exception:
+                                _logger.warning("blob delete failed for %s", blob.name, exc_info=True)
+                    except Exception:
+                        _logger.warning("blob list under %r failed", sweep_prefix, exc_info=True)
 
-            if explicit_blob_name and explicit_blob_name not in seen:
-                try:
-                    container_client.get_blob_client(explicit_blob_name).delete_blob()
-                    deleted += 1
-                except Exception as exc:
-                    # 404 / already-gone is fine; anything else gets logged.
-                    if "BlobNotFound" not in str(exc) and "404" not in str(exc):
-                        print(f"[NOKVO-BLOB] failed to delete {explicit_blob_name}: {exc!r}")
-        except Exception as exc:
-            print(f"[NOKVO-BLOB] delete_agent_knowledge_document outer failure: {exc!r}")
+                if explicit_blob_name and explicit_blob_name not in seen:
+                    try:
+                        container_client.get_blob_client(explicit_blob_name).delete_blob()
+                        deleted += 1
+                    except Exception as exc:
+                        # 404 / already-gone is fine; anything else gets logged.
+                        if "BlobNotFound" not in str(exc) and "404" not in str(exc):
+                            _logger.warning("blob delete failed for %s", explicit_blob_name, exc_info=True)
+        except Exception:
+            _logger.warning("delete_agent_knowledge_document outer failure", exc_info=True)
             return deleted
 
-        print(
-            f"[NOKVO-BLOB] deleted {deleted} blob(s) for document_id={document_id!r} "
-            f"under prefix={sweep_prefix!r}"
+        _logger.info(
+            "deleted %s blob(s) for document_id=%r under prefix=%r",
+            deleted, document_id, sweep_prefix,
         )
         return deleted

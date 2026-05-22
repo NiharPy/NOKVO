@@ -75,6 +75,17 @@ from app.services.nokvo_one_business_templates import (
 from app.services.tool_flow_questions import ensure_tool_flow_questions
 
 
+
+def _safe_detail(exc: BaseException) -> str:
+    """Return a user-safe error detail (forward RuntimeError/ValueError text;
+    swallow internal exception messages and log them)."""
+    import logging
+    if isinstance(exc, (RuntimeError, ValueError)):
+        return str(exc)
+    logging.getLogger(__name__).exception("unexpected exception in request handler", exc_info=exc)
+    return "Operation failed"
+
+
 router = APIRouter()
 
 
@@ -306,27 +317,30 @@ async def _enforce_signup_attempt_quotas(db: AsyncSession, email: str, domain: s
     """
     window_start = datetime.now(timezone.utc) - timedelta(hours=24)
 
-    email_count_res = await db.execute(
-        select(EmailVerification).where(
+    from sqlalchemy import func as sa_func
+    email_count_scalar = await db.execute(
+        select(sa_func.count(EmailVerification.id)).where(
             EmailVerification.email == email,
             EmailVerification.created_at >= window_start,
         )
     )
-    email_count = len(email_count_res.scalars().all())
+    email_count = email_count_scalar.scalar() or 0
     if email_count >= 3:
         raise HTTPException(
             status_code=429,
             detail="Too many signup attempts for this email in the last 24 hours",
         )
 
-    # Domain quota: join through organization rows since EmailVerification stores the literal email.
+    # Domain quota: still uses a trailing-wildcard LIKE (no index can serve
+    # that), but at minimum we count in the DB instead of pulling every
+    # matching row across the wire and len()-ing it in Python.
     domain_res = await db.execute(
-        select(EmailVerification).where(
+        select(sa_func.count(EmailVerification.id)).where(
             EmailVerification.email.like(f"%@{domain}"),
             EmailVerification.created_at >= window_start,
         )
     )
-    if len(domain_res.scalars().all()) >= 10:
+    if (domain_res.scalar() or 0) >= 10:
         raise HTTPException(
             status_code=429,
             detail="Too many signup attempts for this email domain in the last 24 hours",
@@ -926,13 +940,13 @@ async def nokvo_one_google_login(
     try:
         identity = await GoogleOAuthService.verify_id_token(payload.id_token)
     except GoogleOAuthError as exc:
-        raise HTTPException(status_code=401, detail=str(exc)) from exc
+        raise HTTPException(status_code=401, detail=_safe_detail(exc)) from exc
 
     email = normalize_email(identity["email"])
     try:
         validate_work_email(email)
     except ValueError as exc:
-        raise HTTPException(status_code=403, detail=str(exc)) from exc
+        raise HTTPException(status_code=403, detail=_safe_detail(exc)) from exc
 
     domain = extract_email_domain(email)
     organization = await _lookup_org_by_domain(db, domain)
@@ -1304,7 +1318,7 @@ async def nokvo_one_create_custom_tab(
     try:
         slug = normalize_custom_tab_slug(payload.slug)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
 
     tenant_res = await _tenant_resources_for_org(db, user.organization_id)
     provider_status = dict(tenant_res.provider_status or {})
@@ -1354,7 +1368,7 @@ async def nokvo_one_delete_custom_tab(
     try:
         slug = normalize_custom_tab_slug(slug)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
 
     tenant_res = await _tenant_resources_for_org(db, user.organization_id)
     provider_status = dict(tenant_res.provider_status or {})

@@ -5,8 +5,26 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
 import json
+import logging
 from urllib.parse import quote_plus
 import uuid
+
+logger = logging.getLogger(__name__)
+
+
+def _safe_detail(exc: BaseException) -> str:
+    """Return a user-safe error detail.
+
+    Integration services intentionally raise RuntimeError / ValueError with
+    operator-meaningful messages ("Shiprocket credentials missing", etc.) —
+    forward those. Anything else (asyncpg integrity errors, unexpected
+    AttributeErrors, etc.) is logged and replaced with a generic message so
+    we don't leak internal state in API responses.
+    """
+    if isinstance(exc, (RuntimeError, ValueError)):
+        return str(exc)
+    logger.exception("unexpected exception in request handler", exc_info=exc)
+    return "Operation failed"
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, WebSocket, status
 from fastapi.responses import PlainTextResponse, RedirectResponse
@@ -239,6 +257,9 @@ async def _get_registered_tool_definitions(
 
 
 def _build_org_access_token(user: OrganizationUser, session_id: str) -> str:
+    # This is the post-MFA-verify path: callers must route TOTP-enrolled users
+    # through _build_org_temp_token + /mfa/totp/verify first. Issuing this
+    # token directly from a password/Google login flow would bypass MFA.
     return security.create_access_token(
         subject=user.id,
         mfa_completed=True,
@@ -310,12 +331,15 @@ def _agent_phone_link_response(tenant_res: TenantResources) -> dict:
 
 
 async def _get_tenant_resources_by_agent_phone_link(db: AsyncSession, link_id: str) -> TenantResources | None:
-    result = await db.execute(select(TenantResources))
-    for tenant_res in result.scalars().all():
-        link = dict((tenant_res.provider_status or {}).get("agent_phone_link") or {})
-        if link.get("link_id") == link_id and link.get("status") == "linked":
-            return tenant_res
-    return None
+    # Push the filter into Postgres rather than scanning every tenant row in
+    # Python on each Exotel/Twilio webhook hit.
+    result = await db.execute(
+        select(TenantResources).where(
+            TenantResources.provider_status["agent_phone_link"]["link_id"].astext == link_id,
+            TenantResources.provider_status["agent_phone_link"]["status"].astext == "linked",
+        )
+    )
+    return result.scalars().first()
 
 
 async def _get_tenant_resources_by_tenant_id(db: AsyncSession, tenant_id: str) -> TenantResources | None:
@@ -458,13 +482,13 @@ async def google_login(
     try:
         identity = await GoogleOAuthService.verify_id_token(payload.id_token)
     except GoogleOAuthError as exc:
-        raise HTTPException(status_code=401, detail=str(exc)) from exc
+        raise HTTPException(status_code=401, detail=_safe_detail(exc)) from exc
 
     email = normalize_email(identity["email"])
     try:
         validate_work_email(email)
     except ValueError as exc:
-        raise HTTPException(status_code=403, detail=str(exc)) from exc
+        raise HTTPException(status_code=403, detail=_safe_detail(exc)) from exc
 
     organization = await _resolve_organization_for_identity(
         db,
@@ -551,7 +575,7 @@ async def verify_organization_totp(
         id=uuid.uuid4(),
         organization_user_id=current_user.id,
         refresh_token_hash=token_hash,
-        ip_address=request.client.host,
+        ip_address=request.client.host if request.client else None,
         user_agent=request.headers.get("user-agent"),
         expires_at=datetime.now(timezone.utc) + timedelta(hours=4),
     )
@@ -560,7 +584,7 @@ async def verify_organization_totp(
         current_user.status = "active"
     current_user.email_verified = True
     current_user.last_login_at = datetime.now(timezone.utc)
-    current_user.last_login_ip = request.client.host
+    current_user.last_login_ip = request.client.host if request.client else None
 
     db.add(session)
     db.add(current_user)
@@ -608,7 +632,7 @@ async def refresh_organization_token(
         id=uuid.uuid4(),
         organization_user_id=user.id,
         refresh_token_hash=token_hash,
-        ip_address=request.client.host,
+        ip_address=request.client.host if request.client else None,
         user_agent=request.headers.get("user-agent"),
         expires_at=datetime.now(timezone.utc) + timedelta(hours=4),
     )
@@ -767,7 +791,7 @@ async def connect_organization_database(
             payload.connection_string,
         )
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
 
     provider_status = dict(tenant_res.provider_status or {})
     provider_status.update(
@@ -817,7 +841,7 @@ async def connect_organization_crm(
         )
         index_result = await CRMIntegrationService.index_schema_embeddings(tenant_res, scan_result)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
 
     provider_status = dict(tenant_res.provider_status or {})
     provider_status.update(
@@ -888,7 +912,7 @@ async def connect_organization_erp(
         tenant_res.provider_status = provider_status
         db.add(tenant_res)
         await db.commit()
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
 
     provider_status = dict(tenant_res.provider_status or {})
     provider_status.update(
@@ -958,7 +982,7 @@ async def connect_organization_shipping(
         tenant_res.provider_status = provider_status
         db.add(tenant_res)
         await db.commit()
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
 
     provider_status = dict(tenant_res.provider_status or {})
     provider_status.update(
@@ -1009,7 +1033,7 @@ async def connect_organization_zoho_desk(
         _, scan_result = await ZohoDeskService.connect_and_scan(credentials)
         index_result = await ZohoDeskService.index_desk_embeddings(tenant_res, scan_result)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
 
     provider_status = dict(tenant_res.provider_status or {})
     provider_status.update(
@@ -1170,7 +1194,7 @@ async def create_organization_zoho_desk_ticket(
         request_payload = {key: value for key, value in request_payload.items() if value not in (None, "", {})}
         ticket = await ZohoDeskService.create_ticket(credentials, org_id, request_payload)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
 
     return OrganizationZohoDeskTicketResponse(
         id=str(ticket.get("id") or ""),
@@ -1212,7 +1236,7 @@ async def update_organization_zoho_desk_ticket(
         request_payload = {key: value for key, value in request_payload.items() if value not in (None, "", {})}
         ticket = await ZohoDeskService.update_ticket(credentials, org_id, ticket_id, request_payload)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
 
     return OrganizationZohoDeskTicketResponse(
         id=str(ticket.get("id") or ticket_id),
@@ -1239,7 +1263,7 @@ async def execute_organization_tally_xml(
             raise RuntimeError("Tally ERP must be connected before executing Tally XML")
         response_xml = await ERPIntegrationService.execute_tally_xml(credentials, payload.xml_payload)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
 
     return OrganizationTallyXMLResponse(response_xml=response_xml)
 
@@ -1262,7 +1286,7 @@ async def check_shiprocket_serviceability(
         credentials = await _load_shiprocket_credentials(tenant_res)
         result = await ShippingIntegrationService.check_serviceability(credentials, payload.model_dump(exclude_none=True))
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
     return OrganizationShiprocketAPIResponse(raw=result)
 
 
@@ -1277,7 +1301,7 @@ async def create_shiprocket_order(
         credentials = await _load_shiprocket_credentials(tenant_res)
         result = await ShippingIntegrationService.create_order(credentials, payload.payload)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
     return OrganizationShiprocketAPIResponse(raw=result)
 
 
@@ -1293,7 +1317,7 @@ async def assign_shiprocket_awb(
         credentials = await _load_shiprocket_credentials(tenant_res)
         result = await ShippingIntegrationService.assign_awb(credentials, request_payload)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
     return OrganizationShiprocketAPIResponse(raw=result)
 
 
@@ -1309,7 +1333,7 @@ async def generate_shiprocket_pickup(
         credentials = await _load_shiprocket_credentials(tenant_res)
         result = await ShippingIntegrationService.generate_pickup(credentials, {"shipment_id": shipment_id})
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
     return OrganizationShiprocketAPIResponse(raw=result)
 
 
@@ -1328,7 +1352,7 @@ async def track_shiprocket_shipment(
             awb_code=payload.awb_code,
         )
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
     return OrganizationShiprocketAPIResponse(raw=result)
 
 
@@ -1668,7 +1692,7 @@ async def upload_agent_knowledge_document(
             content_type=payload.content_type,
         )
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
     return OrganizationAgentDocumentResponse(**document)
 
 
@@ -1691,9 +1715,9 @@ async def approve_agent_knowledge_document(
             notes=payload.notes,
         )
     except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail=_safe_detail(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
     return OrganizationAgentDocumentResponse(**document)
 
 
@@ -1716,9 +1740,9 @@ async def reject_agent_knowledge_document(
             notes=payload.notes,
         )
     except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail=_safe_detail(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
     return OrganizationAgentDocumentResponse(**document)
 
 
@@ -1732,7 +1756,7 @@ async def test_agent_knowledge_retrieval(
     try:
         result = await AgentKnowledgeService.test_retrieval(tenant_res, payload.query, top_k=payload.top_k, db=db)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
     return OrganizationAgentTestRetrievalResponse(**result)
 
 
@@ -1752,7 +1776,7 @@ async def test_agent_knowledge_answer(
             response_language=payload.response_language,
         )
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
     return OrganizationAgentTestAnswerResponse(**result)
 
 
@@ -1783,7 +1807,7 @@ async def chat_with_agent_runtime(
             conversation_history=payload.conversation_history,
         )
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
     return OrganizationAgentRuntimeChatResponse(**result)
 
 
@@ -1814,7 +1838,7 @@ async def link_agent_phone_number(
             public_base_url=public_base_url,
         )
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
     return OrganizationAgentPhoneLinkResponse(**link)
 
 
@@ -1828,7 +1852,7 @@ async def unlink_agent_phone_number(
     try:
         await ExotelService.unlink_agent_phone_number(tenant_res, db)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
     return OrganizationAgentPhoneLinkResponse(**_agent_phone_link_response(tenant_res))
 
 
@@ -1848,7 +1872,7 @@ async def test_agent_latency(
             response_language=payload.response_language,
         )
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
     return OrganizationAgentLatencyTestResponse(**result)
 
 
@@ -1911,7 +1935,7 @@ async def create_agent_campaign(
             },
         )
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
     return campaign
 
 
@@ -1944,7 +1968,7 @@ async def launch_agent_campaign(
         base_url = settings.AGENT_PUBLIC_BASE_URL or str(request.base_url).rstrip("/")
         campaign = await OutboundCampaignService.launch_campaign(campaign, db, public_base_url=base_url)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
     return campaign
 
 
@@ -1962,7 +1986,7 @@ async def cancel_agent_campaign(
     try:
         return await OutboundCampaignService.cancel_campaign(campaign, db)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
 
 
 @router.post("/agent/exotel/voice/{link_id}", response_class=PlainTextResponse)
@@ -2043,12 +2067,41 @@ async def exotel_outbound_media_websocket(websocket: WebSocket, call_link_id: st
         return
 
 
+def _verify_twilio_signature(request: Request, raw_body: bytes, form_params: dict[str, Any]) -> bool:
+    """Verify Twilio's X-Twilio-Signature against the request URL + sorted POST
+    params, HMAC-SHA1 keyed by TWILIO_AUTH_TOKEN. Returns False when the token
+    is unset (fail closed)."""
+    sig = request.headers.get("x-twilio-signature")
+    token = settings.TWILIO_AUTH_TOKEN
+    if not sig or not token:
+        return False
+    url = str(request.url)
+    if form_params:
+        sorted_keys = sorted(form_params.keys())
+        url = url + "".join(f"{k}{form_params[k]}" for k in sorted_keys)
+    digest = hmac.new(token.encode("utf-8"), url.encode("utf-8"), hashlib.sha1).digest()
+    expected = base64.b64encode(digest).decode("utf-8")
+    return hmac.compare_digest(expected, sig)
+
+
 @router.post("/agent/twilio/voice/{link_id}", response_class=PlainTextResponse)
 async def twilio_agent_voice_webhook(
     link_id: str,
     request: Request,
     db: AsyncSession = Depends(deps.get_db),
 ):
+    raw_body = await request.body()
+    try:
+        form = await request.form()
+        form_params = {k: v for k, v in form.multi_items()} if hasattr(form, "multi_items") else dict(form)
+    except Exception:
+        form_params = {}
+    if not _verify_twilio_signature(request, raw_body, form_params):
+        return PlainTextResponse(
+            "<Response><Say>Request rejected.</Say><Hangup/></Response>",
+            media_type="application/xml",
+            status_code=403,
+        )
     tenant_res = await _get_tenant_resources_by_agent_phone_link(db, link_id)
     if not tenant_res:
         return PlainTextResponse(
@@ -2135,7 +2188,7 @@ async def index_organization_database_selection(
             row_limit=payload.row_limit,
         )
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
 
     provider_status = dict(tenant_res.provider_status or {})
     provider_status.update(

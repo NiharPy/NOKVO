@@ -1,29 +1,48 @@
-from typing import Generator, Optional
-from fastapi import Depends, HTTPException, status
+from datetime import datetime, timezone
+from typing import AsyncGenerator, Optional
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.db.session import AsyncSessionLocal
+from app.core import api_keys as api_key_utils
+from app.models.connect_api_key import OrganizationApiKey
 from app.models.organization import Organization
 from app.models.organization_session import OrganizationSession
 from app.models.organization_user import OrganizationUser
 from app.models.user import SuperAdminUser
 from app.models.session import SuperAdminSession
+from app.models.tenant_resources import TenantResources
 from app.core.config import settings
 import jwt
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
-async def get_db() -> Generator:
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
     async with AsyncSessionLocal() as session:
         yield session
 
 async def get_current_session_id(token: str = Depends(oauth2_scheme)) -> Optional[str]:
     try:
         payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-        return payload.get("sid")
     except jwt.PyJWTError:
-        return None
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return payload.get("sid")
+
+async def _decode_token(token: str) -> dict:
+    try:
+        return jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+    except jwt.PyJWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
 
 async def get_current_user(
     db: AsyncSession = Depends(get_db),
@@ -34,45 +53,44 @@ async def get_current_user(
         detail="Could not validate credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
-    try:
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-        user_id: str = payload.get("sub")
-        session_id: str = payload.get("sid")
-        principal_type: str | None = payload.get("principal_type")
-        if user_id is None:
-            raise credentials_exception
-        if principal_type not in (None, "superadmin"):
-            raise credentials_exception
-    except jwt.PyJWTError:
+    payload = await _decode_token(token)
+    user_id: str = payload.get("sub")
+    session_id: str = payload.get("sid")
+    principal_type: str | None = payload.get("principal_type")
+    if user_id is None:
         raise credentials_exception
-        
+    if principal_type not in (None, "superadmin"):
+        raise credentials_exception
+
     if session_id:
         # Check if session is revoked
         res = await db.execute(select(SuperAdminSession).where(SuperAdminSession.id == session_id))
         session = res.scalars().first()
         if not session or session.revoked_at is not None:
             raise HTTPException(status_code=401, detail="Session has been revoked or logged out")
-    
+
     result = await db.execute(select(SuperAdminUser).where(SuperAdminUser.id == user_id))
     user = result.scalars().first()
-    
+
     if user is None:
         raise credentials_exception
     if user.status not in ["active", "pending"]:
         raise HTTPException(status_code=403, detail="User account is locked or disabled")
-        
+
+    # Stash the decoded payload on the user so downstream deps (e.g.,
+    # get_current_active_user) avoid a second decode.
+    setattr(user, "_jwt_payload", payload)
     return user
 
 async def get_current_active_user(
     current_user: SuperAdminUser = Depends(get_current_user),
-    token: str = Depends(oauth2_scheme)
 ) -> SuperAdminUser:
-    payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-    mfa_completed: bool = payload.get("mfa_completed", False)
-    
+    payload = getattr(current_user, "_jwt_payload", None) or {}
+    mfa_completed: bool = bool(payload.get("mfa_completed", False))
+
     if current_user.mfa_required and not mfa_completed:
         raise HTTPException(status_code=403, detail="MFA required")
-        
+
     return current_user
 
 async def get_current_user_require_mfa_setup(
@@ -86,11 +104,18 @@ async def get_current_user_require_mfa_setup(
 async def get_current_org_session_id(token: str = Depends(oauth2_scheme)) -> Optional[str]:
     try:
         payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-        if payload.get("principal_type") != "organization_user":
-            return None
-        return payload.get("sid")
     except jwt.PyJWTError:
-        return None
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate organization credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if payload.get("principal_type") != "organization_user":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Organization credentials required",
+        )
+    return payload.get("sid")
 
 
 async def get_current_organization_user(
@@ -102,15 +127,12 @@ async def get_current_organization_user(
         detail="Could not validate organization credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
-    try:
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-        user_id: str = payload.get("sub")
-        organization_id: str = payload.get("organization_id")
-        session_id: str = payload.get("sid")
-        principal_type: str | None = payload.get("principal_type")
-        if user_id is None or organization_id is None or principal_type != "organization_user":
-            raise credentials_exception
-    except jwt.PyJWTError:
+    payload = await _decode_token(token)
+    user_id: str = payload.get("sub")
+    organization_id: str = payload.get("organization_id")
+    session_id: str = payload.get("sid")
+    principal_type: str | None = payload.get("principal_type")
+    if user_id is None or organization_id is None or principal_type != "organization_user":
         raise credentials_exception
 
     if session_id:
@@ -130,15 +152,15 @@ async def get_current_organization_user(
         raise credentials_exception
     if user.status == "disabled":
         raise HTTPException(status_code=403, detail="Organization user account is disabled")
+    setattr(user, "_jwt_payload", payload)
     return user
 
 
 async def get_current_active_organization_user(
     current_user: OrganizationUser = Depends(get_current_organization_user),
-    token: str = Depends(oauth2_scheme),
 ) -> OrganizationUser:
-    payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-    mfa_completed: bool = payload.get("mfa_completed", False)
+    payload = getattr(current_user, "_jwt_payload", None) or {}
+    mfa_completed: bool = bool(payload.get("mfa_completed", False))
     has_totp = bool(
         getattr(current_user, "totp_secret_encrypted", None)
         or getattr(current_user, "totp_secret_encrypted_v2", None)
@@ -240,7 +262,6 @@ class RequireMFACompleted:
     async def __call__(
         self,
         user: OrganizationUser = Depends(get_current_active_organization_user),
-        token: str = Depends(oauth2_scheme),
     ) -> OrganizationUser:
         has_totp = bool(
             getattr(user, "totp_secret_encrypted", None)
@@ -248,10 +269,7 @@ class RequireMFACompleted:
         )
         if not has_totp:
             return user
-        try:
-            payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-        except jwt.PyJWTError:
-            raise HTTPException(status_code=401, detail="Could not validate credentials")
+        payload = getattr(user, "_jwt_payload", None) or {}
         if not bool(payload.get("mfa_completed", False)):
             raise HTTPException(
                 status_code=403,
@@ -294,3 +312,91 @@ class RequireNokvoOneOrganization:
                 detail=f"Operation not permitted. Required organization role: {self.allowed_roles}",
             )
         return user
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Nokvo Connect — public API-key auth
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def _resolve_api_key_from_request(request: Request) -> str | None:
+    """Pull the raw API key off the request. Accepts either header form so the
+    same key works from a server (Authorization: Bearer) and from a browser
+    SDK (X-Nokvo-API-Key)."""
+    api_key = request.headers.get("x-nokvo-api-key")
+    if api_key:
+        return api_key.strip()
+    authorization = request.headers.get("authorization") or ""
+    if authorization.lower().startswith("bearer "):
+        return authorization.split(" ", 1)[1].strip()
+    return None
+
+
+async def get_api_key_record(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> tuple[OrganizationApiKey, Organization, TenantResources]:
+    """Authenticate an inbound public-API request and return the (api_key,
+    organization, tenant_resources) triple every downstream call needs."""
+    raw = await _resolve_api_key_from_request(request)
+    parsed = api_key_utils.parse(raw)
+    if parsed is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or malformed API key",
+            headers={"WWW-Authenticate": 'ApiKey realm="nokvo-connect"'},
+        )
+    result = await db.execute(
+        select(OrganizationApiKey).where(OrganizationApiKey.key_prefix == parsed.key_prefix)
+    )
+    record = result.scalars().first()
+    if record is None or record.status != "active":
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
+    if record.expires_at is not None and record.expires_at <= datetime.now(timezone.utc):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="API key has expired")
+    if not api_key_utils.verify(parsed, record.secret_hash):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
+
+    # Origin allowlist — applies only when the request actually carried an
+    # Origin (i.e., from a browser). Server-to-server calls without Origin pass
+    # through; servers are expected to keep their key secret.
+    origin = request.headers.get("origin")
+    allowed = list(record.allowed_origins or [])
+    if origin and allowed and origin not in allowed:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Origin not permitted for this API key")
+
+    org_res = await db.execute(select(Organization).where(Organization.id == record.organization_id))
+    organization = org_res.scalars().first()
+    if organization is None:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Organization not available")
+    if (organization.product_tier or "nokvo_prime") != "nokvo_one":
+        # Nokvo Connect is a Nokvo One product. Keys can't be minted on
+        # Prime orgs (the admin route guards that), but refuse defensively
+        # at the public surface too in case a key outlives a tier downgrade.
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Nokvo Connect is available only on Nokvo One organizations",
+        )
+    if organization.status not in {"active", "pending_approval"}:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Organization is not active")
+
+    tr_res = await db.execute(
+        select(TenantResources).where(TenantResources.organization_id == organization.id)
+    )
+    tenant_res = tr_res.scalars().first()
+    if tenant_res is None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Tenant resources not provisioned")
+
+    # Bookkeeping — not in a transaction so a stale write here cannot break
+    # the request. Best-effort.
+    try:
+        record.last_used_at = datetime.now(timezone.utc)
+        db.add(record)
+        await db.commit()
+    except Exception:
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+
+    return record, organization, tenant_res

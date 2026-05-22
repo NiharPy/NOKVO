@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 import uuid
 import xml.etree.ElementTree as ET
 
+from app.core.url_guard import UnsafeURLError, assert_safe_url
 from app.models.tenant_resources import TenantResources
 from app.services.azure_keyvault_service import AzureKeyVaultService
 from app.services.qdrant_service import QdrantService
@@ -180,6 +181,10 @@ class ERPIntegrationService:
     ) -> str:
         normalized_url = ERPIntegrationService._normalize_tally_base_url(base_url)
         timeout = max(3, min(int(timeout_seconds or 20), 60))
+        try:
+            assert_safe_url(normalized_url)
+        except UnsafeURLError as exc:
+            raise RuntimeError(f"Tally API request rejected: {exc}") from exc
 
         def _work() -> str:
             request = urllib_request.Request(

@@ -163,9 +163,9 @@ def test_require_mfa_completed_passes_user_without_totp():
     user = SimpleNamespace(
         totp_secret_encrypted=None,
         totp_secret_encrypted_v2=None,
+        _jwt_payload={"mfa_completed": False},
     )
-    token = _make_jwt(mfa_completed=False)
-    result = _run(dep(user=user, token=token))
+    result = _run(dep(user=user))
     assert result is user
 
 
@@ -174,10 +174,10 @@ def test_require_mfa_completed_blocks_session_without_mfa_claim():
     user = SimpleNamespace(
         totp_secret_encrypted=None,
         totp_secret_encrypted_v2="encrypted",
+        _jwt_payload={"mfa_completed": False},
     )
-    token = _make_jwt(mfa_completed=False)
     with pytest.raises(Exception) as exc_info:
-        _run(dep(user=user, token=token))
+        _run(dep(user=user))
     detail = getattr(exc_info.value, "detail", {})
     assert isinstance(detail, dict)
     assert detail.get("code") == "mfa_step_up_required"
@@ -188,9 +188,9 @@ def test_require_mfa_completed_passes_when_user_and_session_are_mfa_ready():
     user = SimpleNamespace(
         totp_secret_encrypted=None,
         totp_secret_encrypted_v2="encrypted",
+        _jwt_payload={"mfa_completed": True},
     )
-    token = _make_jwt(mfa_completed=True)
-    result = _run(dep(user=user, token=token))
+    result = _run(dep(user=user))
     assert result is user
 
 

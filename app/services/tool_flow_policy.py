@@ -279,6 +279,10 @@ def _extract_value(text: str, slot_key: str, kind: str) -> Any:
     if kind == "name" or slot_key in {"name", "customer_name", "full_name"}:
         value = re.sub(r"^(?:my\s+name\s+is|name\s+is|i\s+am|this\s+is|నా\s+పేరు|పేరు|मेरा\s+नाम)\s+", "", value, flags=re.IGNORECASE)
         value = re.sub(r"(?:గారు|అండి|ండి|sir|madam|ji|जी)\.?\s*$", "", value, flags=re.IGNORECASE)
+        # Strip Indic sentence terminators (Devanagari ।, double-danda ॥)
+        # plus ASCII punctuation so the captured name doesn't carry STT
+        # noise like "निहार।" through to the booking record.
+        value = value.strip(" ,.-।॥…・「」（）")
         return _clean(value)
     return value
 
@@ -476,6 +480,35 @@ def evaluate_tool_flow_policy(
             record_confirmation(flow_state, confirmation_key, collected_now.get(confirmation_key))
             append_audit_trail(flow_state, "name_confirmed", detail=collected_now.get(confirmation_key))
         elif _looks_negative(value):
+            # Look for an embedded correction first so "No, my name is
+            # Nihar" still moves the conversation forward. Strip the
+            # leading negation so the name extractor doesn't carry the
+            # "no" into the extracted value.
+            stripped = re.sub(
+                r"^\s*(?:no|nope|nah|not\s+really|actually|wait|sorry)\b[\s,]*",
+                "",
+                value or "",
+                flags=re.IGNORECASE,
+            )
+            embedded_correction = (
+                _extract_value(stripped, confirmation_key, "name")
+                if confirmation_key and stripped and stripped != value
+                else None
+            )
+            if embedded_correction:
+                collected = dict(flow_state.get("collected") or {})
+                collected[confirmation_key] = embedded_correction
+                flow_state["collected"] = collected
+                flow_state["awaiting_name_confirmation"] = True
+                flow_state["name_confirmation_slot"] = confirmation_key
+                return {
+                    "answer": _name_confirmation_prompt(embedded_correction, language),
+                    "intent": "tool_flow",
+                    "flow_key": flow_key,
+                    "state_patch": {"tool_flow": flow_state},
+                    "state_slot": f"{confirmation_key}_confirm",
+                    "reason": "name corrected, awaiting confirmation",
+                }
             collected = dict(flow_state.get("collected") or {})
             if confirmation_key:
                 collected.pop(confirmation_key, None)
@@ -490,8 +523,7 @@ def evaluate_tool_flow_policy(
                 "reason": "name confirmation rejected",
             }
         else:
-            # Treat the new utterance as a correction.
-            replacement = _extract_value(value, confirmation_key, "name")
+            replacement = _extract_value(value, confirmation_key, "name") if confirmation_key else None
             if replacement:
                 collected = dict(flow_state.get("collected") or {})
                 collected[confirmation_key] = replacement
@@ -534,11 +566,17 @@ def evaluate_tool_flow_policy(
         if extracted:
             # ── 4) Name-kind slot → confirm before moving on ─────────────
             if kind == "name":
+                # When the slot was deferred for a side question, the
+                # "Coming back to your booking" prefix must precede the
+                # confirmation prompt — otherwise the caller hears the
+                # confirmation without acknowledgment of the detour.
+                resumed_from_kb = bool(flow_state.pop("deferred_for_kb", False))
+                prefix = _coming_back_prefix(language) if resumed_from_kb else ""
                 flow_state["awaiting_name_confirmation"] = True
                 flow_state["name_confirmation_slot"] = pending
                 flow_state["pending_slot"] = f"{pending}_confirm"
                 return {
-                    "answer": _name_confirmation_prompt(extracted, language),
+                    "answer": prefix + _name_confirmation_prompt(extracted, language),
                     "intent": "tool_flow",
                     "flow_key": flow_key,
                     "state_patch": {"tool_flow": flow_state},

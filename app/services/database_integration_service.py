@@ -288,6 +288,12 @@ class DatabaseIntegrationService:
                     ).fetchall()
                 ]
                 for table_name in table_names:
+                    # SQLite table names come from sqlite_master so they are
+                    # trusted, but guard against future callers passing
+                    # untrusted names: reject anything with a double-quote
+                    # character (the only way to break the quoted identifier).
+                    if '"' in table_name:
+                        continue
                     columns = []
                     for col in conn.execute(f'PRAGMA table_info("{table_name}")').fetchall():
                         columns.append(

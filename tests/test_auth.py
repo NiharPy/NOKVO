@@ -3,6 +3,7 @@ import pyotp
 import jwt
 from datetime import datetime, timedelta, timezone
 from app.core.config import settings
+from app.core.totp_crypto import encrypt_totp_secret
 from app.db.session import AsyncSessionLocal
 from app.models.user import SuperAdminUser
 from sqlalchemy import select
@@ -50,7 +51,7 @@ async def test_mfa_validation_failure(client):
     async with AsyncSessionLocal() as db:
         res = await db.execute(select(SuperAdminUser).where(SuperAdminUser.email == "test_superadmin@nokvo.ai"))
         u = res.scalars().first()
-        u.totp_secret_encrypted = pyotp.random_base32()
+        u.totp_secret_encrypted = encrypt_totp_secret(pyotp.random_base32())
         u.status = "active"
         db.add(u)
         await db.commit()

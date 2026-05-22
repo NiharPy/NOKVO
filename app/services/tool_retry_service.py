@@ -118,6 +118,10 @@ class ToolRetryService:
             select(PendingToolRetry)
             .where(PendingToolRetry.status == "pending")
             .where(PendingToolRetry.next_attempt_at <= now)
+            # SELECT FOR UPDATE SKIP LOCKED so two scheduler instances (or two
+            # passes that overlap) can't pick up the same retry row. The lock
+            # is released when this transaction commits below.
+            .with_for_update(skip_locked=True)
         )
         if organization_id is not None:
             stmt = stmt.where(PendingToolRetry.organization_id == organization_id)

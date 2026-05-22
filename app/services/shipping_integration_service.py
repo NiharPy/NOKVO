@@ -9,6 +9,7 @@ from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 import uuid
 
+from app.core.url_guard import UnsafeURLError, assert_safe_url
 from app.models.tenant_resources import TenantResources
 from app.services.azure_keyvault_service import AzureKeyVaultService
 from app.services.qdrant_service import QdrantService
@@ -70,6 +71,10 @@ class ShippingIntegrationService:
             cleaned_query = {key: value for key, value in query.items() if value is not None and value != ""}
             url = f"{url}?{urllib_parse.urlencode(cleaned_query, doseq=True)}"
         body = json.dumps(payload).encode("utf-8") if payload is not None else None
+        try:
+            assert_safe_url(url)
+        except UnsafeURLError as exc:
+            raise RuntimeError(f"Shiprocket API request rejected: {exc}") from exc
 
         def _work() -> dict[str, Any]:
             request = urllib_request.Request(url=url, data=body, method=method.upper())

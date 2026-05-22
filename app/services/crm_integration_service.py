@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 import asyncio
 from dataclasses import dataclass
 import json
@@ -10,6 +14,7 @@ from urllib import request as urllib_request
 import uuid
 
 from app.core.config import settings
+from app.core.url_guard import UnsafeURLError, assert_safe_url
 from app.models.tenant_resources import TenantResources
 from app.services.azure_keyvault_service import AzureKeyVaultService
 from app.services.qdrant_service import QdrantService
@@ -72,6 +77,11 @@ class CRMIntegrationService:
             body = urllib_parse.urlencode(form_payload).encode("utf-8")
         else:
             body = None
+
+        try:
+            assert_safe_url(url)
+        except UnsafeURLError as exc:
+            raise RuntimeError(f"CRM API request rejected: {exc}") from exc
 
         def _work() -> dict[str, Any] | None:
             req = urllib_request.Request(url=url, data=body, method=method.upper())

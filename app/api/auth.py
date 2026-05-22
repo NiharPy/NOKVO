@@ -9,18 +9,29 @@ from app.models.audit import SuperAdminAuditLog
 from app.schemas.user import LoginRequest, TOTPVerifyRequest
 from app.schemas.token import Token, RefreshRequest
 from app.core import security
+from app.core.rate_limit import limiter
+from app.core.totp_crypto import (
+    TOTPDecryptionError,
+    decrypt_totp_secret,
+    encrypt_totp_secret,
+)
 from typing import Any
 import uuid
 import pyotp
 
 router = APIRouter()
 
+
+def _client_ip(req: Request) -> str | None:
+    return req.client.host if req.client else None
+
+
 async def log_audit(db: AsyncSession, user_id: uuid.UUID, action: str, risk_level: str, req: Request, meta: dict = None):
     log = SuperAdminAuditLog(
         superadmin_id=user_id,
         action=action,
         risk_level=risk_level,
-        ip_address=req.client.host,
+        ip_address=_client_ip(req),
         user_agent=req.headers.get("user-agent"),
         metadata_=meta or {}
     )
@@ -28,6 +39,7 @@ async def log_audit(db: AsyncSession, user_id: uuid.UUID, action: str, risk_leve
     await db.commit()
 
 @router.post("/login", response_model=Token)
+@limiter.limit("10/minute")
 async def login(request: Request, login_data: LoginRequest, db: AsyncSession = Depends(deps.get_db)):
     result = await db.execute(select(SuperAdminUser).where(SuperAdminUser.email == login_data.email))
     user = result.scalars().first()
@@ -74,7 +86,7 @@ async def login(request: Request, login_data: LoginRequest, db: AsyncSession = D
             id=uuid.uuid4(),
             superadmin_id=user.id,
             refresh_token_hash=token_hash,
-            ip_address=request.client.host,
+            ip_address=_client_ip(request),
             user_agent=request.headers.get("user-agent"),
             expires_at=datetime.now(timezone.utc) + timedelta(hours=4)
         )
@@ -84,53 +96,58 @@ async def login(request: Request, login_data: LoginRequest, db: AsyncSession = D
             session_id=str(session.id),
             extra_claims={"principal_type": "superadmin", "role": user.role},
         )
-        
+
         db.add(session)
         user.last_login_at = datetime.now(timezone.utc)
-        user.last_login_ip = request.client.host
+        user.last_login_ip = _client_ip(request)
         db.add(user)
         await log_audit(db, user.id, "login_success", "low", request)
         await db.commit()
-        
+
         return {"access_token": access_token, "refresh_token": raw_refresh, "token_type": "bearer"}
 
 @router.post("/mfa/totp/setup")
+@limiter.limit("10/hour")
 async def setup_totp(request: Request, current_user: SuperAdminUser = Depends(deps.get_current_user_require_mfa_setup), db: AsyncSession = Depends(deps.get_db)):
     if current_user.totp_secret_encrypted:
         raise HTTPException(status_code=400, detail="TOTP already set up")
-    
+
     secret = security.generate_totp_secret()
-    # In a real system, you'd encrypt this before saving to DB using a master KMS key
-    current_user.totp_secret_encrypted = secret
+    current_user.totp_secret_encrypted = encrypt_totp_secret(secret)
     db.add(current_user)
     await log_audit(db, current_user.id, "totp_setup_initiated", "medium", request)
     await db.commit()
-    
-    # Return the secret so user can add to Google Authenticator
+
+    # Return the secret so the user can add it to Google Authenticator. This is
+    # the only point at which the plaintext is exposed; subsequent verify calls
+    # decrypt the column on read.
     return {"secret": secret, "uri": pyotp.totp.TOTP(secret).provisioning_uri(name=current_user.email, issuer_name="NOKVO SuperAdmin")}
 
 @router.post("/mfa/totp/verify", response_model=Token)
+@limiter.limit("10/minute")
 async def verify_totp(request: Request, data: TOTPVerifyRequest, current_user: SuperAdminUser = Depends(deps.get_current_user_require_mfa_setup), db: AsyncSession = Depends(deps.get_db)):
     if not current_user.totp_secret_encrypted:
         raise HTTPException(status_code=400, detail="TOTP not set up")
-        
-    # Decrypt secret in real app
-    secret = current_user.totp_secret_encrypted
-    
+
+    try:
+        secret = decrypt_totp_secret(current_user.totp_secret_encrypted)
+    except TOTPDecryptionError as exc:
+        raise HTTPException(status_code=500, detail="TOTP secret could not be decrypted") from exc
+
     if not security.verify_totp(secret, data.token):
         raise HTTPException(status_code=401, detail="Invalid TOTP token")
-        
+
     # If this is their first login (pending), mark active
     if current_user.status == "pending":
         current_user.status = "active"
-        
+
     raw_refresh, token_hash = security.create_refresh_token()
-    
+
     session = SuperAdminSession(
         id=uuid.uuid4(),
         superadmin_id=current_user.id,
         refresh_token_hash=token_hash,
-        ip_address=request.client.host,
+        ip_address=_client_ip(request),
         user_agent=request.headers.get("user-agent"),
         expires_at=datetime.now(timezone.utc) + timedelta(hours=4)
     )
@@ -140,18 +157,19 @@ async def verify_totp(request: Request, data: TOTPVerifyRequest, current_user: S
         session_id=str(session.id),
         extra_claims={"principal_type": "superadmin", "role": current_user.role},
     )
-    
+
     db.add(session)
     current_user.last_login_at = datetime.now(timezone.utc)
-    current_user.last_login_ip = request.client.host
+    current_user.last_login_ip = _client_ip(request)
     db.add(current_user)
-    
+
     await log_audit(db, current_user.id, "login_mfa_success", "low", request)
     await db.commit()
-    
+
     return {"access_token": access_token, "refresh_token": raw_refresh, "token_type": "bearer"}
 
 @router.post("/refresh", response_model=Token)
+@limiter.limit("30/minute")
 async def refresh_token(request: Request, data: RefreshRequest, db: AsyncSession = Depends(deps.get_db)):
     # Hash the provided token and find it in DB
     provided_hash = security.hashlib.sha256(data.refresh_token.encode()).hexdigest()
@@ -179,7 +197,7 @@ async def refresh_token(request: Request, data: RefreshRequest, db: AsyncSession
         id=uuid.uuid4(),
         superadmin_id=session.superadmin_id,
         refresh_token_hash=token_hash,
-        ip_address=request.client.host,
+        ip_address=_client_ip(request),
         user_agent=request.headers.get("user-agent"),
         expires_at=datetime.now(timezone.utc) + timedelta(hours=4)
     )

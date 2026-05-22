@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 import base64
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -21,6 +25,17 @@ from app.schemas.organization_auth import (
     OrganizationAgentTestRetrievalResponse,
 )
 from app.services.agent_knowledge_service import AgentKnowledgeService
+
+
+def _safe_detail(exc: BaseException) -> str:
+    """Return a user-safe error detail (forward RuntimeError/ValueError text;
+    swallow internal exception messages and log them)."""
+    import logging
+    if isinstance(exc, (RuntimeError, ValueError)):
+        return str(exc)
+    logging.getLogger(__name__).exception("unexpected exception in request handler", exc_info=exc)
+    return "Operation failed"
+
 
 router = APIRouter()
 
@@ -92,7 +107,7 @@ async def upload_document(
         # tail logs to debug a "Failed" badge in the UI.
         import traceback
         tb = traceback.format_exc()
-        print(f"[NOKVO-KB-API] upload_document raised: {exc!r}\n{tb[:1500]}")
+        logger.warning(f"NOKVO-KB-API: upload_document raised: {exc!r}\n{tb[:1500]}")
         message = str(exc) or repr(exc)
         # Distinguish rate-limit from genuine bad-request so the frontend
         # can show "Azure quota exhausted — retry in a minute" vs.
@@ -132,11 +147,11 @@ async def configure_single_prompt_agent(
             prompt=payload.prompt,
         )
     except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        raise HTTPException(status_code=422, detail=_safe_detail(exc)) from exc
     except Exception as exc:
         import traceback
         tb = traceback.format_exc()
-        print(f"[NOKVO-KB-API] single-prompt setup failed: {exc!r}\n{tb[:1500]}")
+        logger.warning(f"NOKVO-KB-API: single-prompt setup failed: {exc!r}\n{tb[:1500]}")
         raise HTTPException(status_code=400, detail=str(exc)[:500]) from exc
     return OrganizationAgentSinglePromptSetupResponse(**result)
 
@@ -172,9 +187,9 @@ async def approve_document(
             notes=payload.notes,
         )
     except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail=_safe_detail(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
     return OrganizationAgentDocumentResponse(**document)
 
 
@@ -196,9 +211,9 @@ async def reject_document(
             notes=payload.notes,
         )
     except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail=_safe_detail(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
     return OrganizationAgentDocumentResponse(**document)
 
 
@@ -217,8 +232,8 @@ async def reconcile_documents(
     except Exception as exc:
         import traceback
         tb = traceback.format_exc()
-        print(f"[NOKVO-KB-API] reconcile failed: {exc!r}\n{tb[:1500]}")
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        logger.warning(f"NOKVO-KB-API: reconcile failed: {exc!r}\n{tb[:1500]}")
+        raise HTTPException(status_code=500, detail=_safe_detail(exc)) from exc
 
 
 @router.post("/_debug/search")
@@ -294,7 +309,7 @@ async def get_document_chunks(
     try:
         return AgentKnowledgeService.get_document_chunks(tenant_res, document_id)
     except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail=_safe_detail(exc)) from exc
 
 
 @router.delete("/documents/{document_id}")
@@ -310,9 +325,9 @@ async def delete_document(
     try:
         result = await AgentKnowledgeService.delete_document(tenant_res, db, document_id)
     except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail=_safe_detail(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
     return result
 
 
@@ -328,7 +343,7 @@ async def test_retrieval(
             tenant_res, payload.query, top_k=payload.top_k, db=db
         )
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
     return OrganizationAgentTestRetrievalResponse(**result)
 
 
@@ -344,5 +359,5 @@ async def test_answer(
             tenant_res, payload.query, top_k=payload.top_k, db=db
         )
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
     return OrganizationAgentTestAnswerResponse(**result)

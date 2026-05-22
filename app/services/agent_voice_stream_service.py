@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import re
 import uuid
 from dataclasses import dataclass, field
@@ -33,6 +34,12 @@ from typing import Any, Callable
 
 from fastapi import WebSocket
 from websockets.asyncio.client import connect
+
+logger = logging.getLogger(__name__)
+
+# Strong refs for fire-and-forget background tasks (Redis write-through, etc.)
+# so they aren't garbage-collected while pending.
+_background_tasks: set[asyncio.Task] = set()
 
 from app.core.config import settings
 from app.models.tenant_resources import TenantResources
@@ -220,7 +227,7 @@ class AgentAnswerCache:
             })
             await self._redis.setex(self._key(query, language), ttl, payload)
         except Exception:
-            pass
+            logger.debug("swallowed exception", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -325,7 +332,7 @@ class SpeculativeCache:
                 if relevant:
                     await self._start_speculative_answer(text, tenant_res, relevant)
             except Exception:
-                pass
+                logger.debug("swallowed exception", exc_info=True)
 
         self.retrieval_task = asyncio.create_task(_retrieve())
 
@@ -354,7 +361,7 @@ class SpeculativeCache:
                         self.speculative_answer = answer
                         self.answer_text = text
             except Exception:
-                pass
+                logger.debug("swallowed exception", exc_info=True)
 
         self.answer_task = asyncio.create_task(_answer())
 
@@ -376,16 +383,25 @@ class SpeculativeCache:
         return True
 
     async def get_cached_result(self, final_text: str) -> dict[str, Any] | None:
+        # asyncio.shield() defeats the wait_for timeout — the shielded task
+        # keeps running past the deadline even though wait_for returns. Use
+        # asyncio.wait() with FIRST_COMPLETED so the timeout actually bounds
+        # how long we block here, without forcing cancellation of the
+        # speculative task (which other turns may still consume).
         if self.retrieval_task and not self.retrieval_task.done():
-            try:
-                await asyncio.wait_for(asyncio.shield(self.retrieval_task), timeout=0.15)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                pass
+            done, _ = await asyncio.wait({self.retrieval_task}, timeout=0.15)
+            if done:
+                try:
+                    self.retrieval_task.result()
+                except Exception:
+                    logger.debug("speculative retrieval failed", exc_info=True)
         if self.answer_task and not self.answer_task.done():
-            try:
-                await asyncio.wait_for(asyncio.shield(self.answer_task), timeout=0.08)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                pass
+            done, _ = await asyncio.wait({self.answer_task}, timeout=0.08)
+            if done:
+                try:
+                    self.answer_task.result()
+                except Exception:
+                    logger.debug("speculative answer failed", exc_info=True)
 
         async with self._lock:
             if not self.speculative_intent:
@@ -475,7 +491,7 @@ class WarmSonioxTTSStream:
                     "error_message": f"TTS warm connection failed: {str(exc)[:180]}",
                 })
             except Exception:
-                pass
+                logger.debug("swallowed exception", exc_info=True)
 
     async def ensure(self, language: str = "en"):
         language = AgentRuntimeService.normalize_language(language)
@@ -484,7 +500,7 @@ class WarmSonioxTTSStream:
             try:
                 await asyncio.shield(self._connect_task)
             except Exception:
-                pass
+                logger.debug("swallowed exception", exc_info=True)
         if self.tts_ws is not None and self.language == language and self.is_healthy():
             return self.tts_ws
         await self.close()
@@ -513,7 +529,7 @@ class WarmSonioxTTSStream:
                     "purpose": self.purpose,
                 })
         except Exception:
-            pass
+            logger.debug("swallowed exception", exc_info=True)
         return self.tts_ws
 
     async def stream(self, text: str, *, language: str = "en") -> bool:
@@ -561,7 +577,7 @@ class WarmSonioxTTSStream:
                 "purpose": self.purpose,
             })
         except Exception:
-            pass
+            logger.debug("swallowed exception", exc_info=True)
         first_audio_sent = False
         while True:
             timeout = (
@@ -585,7 +601,7 @@ class WarmSonioxTTSStream:
                             "done_reason": "idle_after_audio",
                         })
                     except Exception:
-                        pass
+                        logger.debug("swallowed exception", exc_info=True)
                     return True
                 raise RuntimeError("TTS first audio timeout")
             message = json.loads(raw)
@@ -608,7 +624,7 @@ class WarmSonioxTTSStream:
                             "purpose": self.purpose,
                         })
                     except Exception:
-                        pass
+                        logger.debug("swallowed exception", exc_info=True)
                 audio_end = bool(message.get("audio_end"))
                 try:
                     await self.websocket.send_json({
@@ -620,7 +636,7 @@ class WarmSonioxTTSStream:
                         "purpose": self.purpose,
                     })
                 except Exception:
-                    pass
+                    logger.debug("swallowed exception", exc_info=True)
                 if audio_end:
                     # Soniox signals end-of-stream inside the audio frame on a persistent
                     # WebSocket. "terminated" may follow later but we must not wait for it
@@ -633,7 +649,7 @@ class WarmSonioxTTSStream:
                             "purpose": self.purpose,
                         })
                     except Exception:
-                        pass
+                        logger.debug("swallowed exception", exc_info=True)
                     return True
             if message.get("error_code"):
                 error_msg = message.get("error_message") or message.get("error_code") or "TTS service error"
@@ -647,7 +663,7 @@ class WarmSonioxTTSStream:
                         "purpose": self.purpose,
                     })
                 except Exception:
-                    pass
+                    logger.debug("swallowed exception", exc_info=True)
                 return True
 
     async def close(self) -> None:
@@ -661,7 +677,7 @@ class WarmSonioxTTSStream:
             try:
                 await self.tts_ws.close()
             except Exception:
-                pass
+                logger.debug("swallowed exception", exc_info=True)
         self.tts_ws = None
 
 
@@ -718,7 +734,7 @@ class AgentVoiceStreamService:
                     "error_message": str(exc),
                 })
             except Exception:
-                pass
+                logger.debug("swallowed exception", exc_info=True)
             return
 
         provider_status = dict(tenant_res.provider_status or {})
@@ -746,7 +762,7 @@ class AgentVoiceStreamService:
                         "request_sent_ms": request_sent_ms,
                     })
                 except Exception:
-                    pass
+                    logger.debug("swallowed exception", exc_info=True)
                 first_audio_sent = False
                 while True:
                     raw = await tts_ws.recv()
@@ -765,7 +781,7 @@ class AgentVoiceStreamService:
                                     "request_sent_ms": request_sent_ms,
                                 })
                             except Exception:
-                                pass
+                                logger.debug("swallowed exception", exc_info=True)
                         try:
                             await websocket.send_json({
                                 "type": "tts_audio",
@@ -775,7 +791,7 @@ class AgentVoiceStreamService:
                                 "first_audio_latency_ms": first_audio_latency_ms,
                             })
                         except Exception:
-                            pass
+                            logger.debug("swallowed exception", exc_info=True)
                     if message.get("error_code"):
                         error_message = message.get("error_message") or "TTS service error"
                         if "balance" in str(error_message).lower() or "fund" in str(error_message).lower():
@@ -790,13 +806,13 @@ class AgentVoiceStreamService:
                                 "error_message": clean,
                             })
                         except Exception:
-                            pass
+                            logger.debug("swallowed exception", exc_info=True)
                         return
                     if message.get("terminated"):
                         try:
                             await websocket.send_json({"type": "tts_done", "stream_id": stream_id})
                         except Exception:
-                            pass
+                            logger.debug("swallowed exception", exc_info=True)
                         return
         except asyncio.CancelledError:
             raise
@@ -809,7 +825,7 @@ class AgentVoiceStreamService:
                     "error_message": f"Voice synthesis unavailable: {str(exc)[:200]}",
                 })
             except Exception:
-                pass
+                logger.debug("swallowed exception", exc_info=True)
 
     # -----------------------------------------------------------------------
     # Context resolver — cascades spec-cache → topic-continuity → live parallel
@@ -988,7 +1004,7 @@ class AgentVoiceStreamService:
         try:
             await websocket.send_json({"type": "agent_thinking", "query": query, "turn_id": turn_id})
         except Exception:
-            pass
+            logger.debug("swallowed exception", exc_info=True)
 
         # --- Filler coordination ------------------------------------------------
         # If the LLM doesn't produce a first sentence within FILLER_TRIGGER_MS,
@@ -1012,7 +1028,7 @@ class AgentVoiceStreamService:
                     except asyncio.CancelledError:
                         pass
                     except Exception:
-                        pass
+                        logger.debug("swallowed exception", exc_info=True)
                     finally:
                         _filler_done.set()
 
@@ -1042,7 +1058,7 @@ class AgentVoiceStreamService:
                 try:
                     on_speaking()
                 except Exception:
-                    pass
+                    logger.debug("swallowed exception", exc_info=True)
             if warm_tts is not None:
                 _st["tts_task"] = asyncio.create_task(
                     warm_tts.stream(sentence, language=resp_language)
@@ -1099,7 +1115,7 @@ class AgentVoiceStreamService:
                     try:
                         on_speaking()
                     except Exception:
-                        pass
+                        logger.debug("swallowed exception", exc_info=True)
 
                 result = {
                     "answer": answer,
@@ -1139,7 +1155,7 @@ class AgentVoiceStreamService:
                         try:
                             on_speaking()
                         except Exception:
-                            pass
+                            logger.debug("swallowed exception", exc_info=True)
                 elif chunks:
                     # Stream LLM, dispatch first sentence immediately, continue generating
                     async def _stream_llm() -> None:
@@ -1186,7 +1202,7 @@ class AgentVoiceStreamService:
                             try:
                                 on_speaking()
                             except Exception:
-                                pass
+                                logger.debug("swallowed exception", exc_info=True)
                 else:
                     answer = AgentRuntimeService.agent_refusal(resp_language)
                     answer = AgentRuntimeService.voice_sanitize_answer(answer)
@@ -1200,7 +1216,7 @@ class AgentVoiceStreamService:
                         try:
                             on_speaking()
                         except Exception:
-                            pass
+                            logger.debug("swallowed exception", exc_info=True)
 
                 result = {
                     "answer": answer or AgentRuntimeService.agent_refusal(resp_language),
@@ -1237,7 +1253,7 @@ class AgentVoiceStreamService:
             try:
                 await websocket.send_json({"type": "barge_in_detected", "turn_id": turn_id})
             except Exception:
-                pass
+                logger.debug("swallowed exception", exc_info=True)
             raise
 
         finally:
@@ -1261,7 +1277,7 @@ class AgentVoiceStreamService:
                 "intent": result.get("intent"),
             })
         except Exception:
-            pass
+            logger.debug("swallowed exception", exc_info=True)
 
         # --- Update session context --------------------------------------------
         if session_ctx is not None:
@@ -1280,9 +1296,18 @@ class AgentVoiceStreamService:
             and chunks
             and AgentAnswerCache.cacheable(query, result["answer"], chunks)
         ):
-            asyncio.create_task(
+            # Track the write-through task so it isn't GC'd mid-flight, and so
+            # we surface its exception via the logger on done.
+            cache_set_task = asyncio.create_task(
                 answer_cache.set(query, resp_language, result["answer"], chunks)
             )
+            cache_set_task.add_done_callback(
+                lambda t: t.exception() and logger.debug(
+                    "cache write-through failed: %r", t.exception()
+                )
+            )
+            _background_tasks.add(cache_set_task)
+            cache_set_task.add_done_callback(_background_tasks.discard)
 
         # --- TTS dispatch ------------------------------------------------------
         # First sentence may already be playing via _st["tts_task"].
@@ -1294,7 +1319,7 @@ class AgentVoiceStreamService:
             try:
                 await _st["tts_task"]
             except Exception:
-                pass
+                logger.debug("swallowed exception", exc_info=True)
             remainder = answer_text[len(_st["first_text"]):].strip()
             if remainder:
                 if warm_tts is not None:
@@ -1339,7 +1364,7 @@ class AgentVoiceStreamService:
             })
             await websocket.send_json({"type": "latency_profile", **latency_profile})
         except Exception:
-            pass
+            logger.debug("swallowed exception", exc_info=True)
 
         if speculative_cache:
             speculative_cache.reset()
@@ -1371,7 +1396,7 @@ class AgentVoiceStreamService:
                     AgentKnowledgeService.policy_version(tenant_res),
                 )
             except Exception:
-                pass
+                logger.debug("swallowed exception", exc_info=True)
 
         # Dual warm TTS: one for answers, one for filler
         warm_tts = WarmSonioxTTSStream(websocket, tenant_res, purpose="answer")
@@ -1397,7 +1422,7 @@ class AgentVoiceStreamService:
                     timeout=timeout_s,
                 )
             except asyncio.TimeoutError:
-                print(f"[NOKVO-TTS] warm timeout after {timeout_s:.1f}s; continuing with lazy reconnect")
+                logger.warning("TTS warm timeout after %.1fs; continuing with lazy reconnect", timeout_s)
 
         def _on_speaking() -> None:
             _s["state"] = TurnState.SPEAKING
@@ -1426,7 +1451,7 @@ class AgentVoiceStreamService:
                 try:
                     await websocket.send_json({"type": "agent_error", "error": str(exc)[:200]})
                 except Exception:
-                    pass
+                    logger.debug("swallowed exception", exc_info=True)
             finally:
                 _s["state"] = TurnState.IDLE
                 _s["answer_task"] = None
@@ -1441,7 +1466,7 @@ class AgentVoiceStreamService:
             try:
                 await websocket.send_json({"type": "stt_finished", "text": final_text})
             except Exception:
-                pass
+                logger.debug("swallowed exception", exc_info=True)
             await _run_answer(final_text)
 
         async def _debounce_endpoint(delay: float = 0.05) -> None:
@@ -1507,7 +1532,7 @@ class AgentVoiceStreamService:
                                     "is_final": is_final,
                                 })
                             except Exception:
-                                pass
+                                logger.debug("swallowed exception", exc_info=True)
 
                         if payload.get("finished"):
                             et = _s["endpoint_timer"]
@@ -1519,13 +1544,13 @@ class AgentVoiceStreamService:
                     try:
                         await websocket.send_json({"type": "stt_error", "error": str(exc)})
                     except Exception:
-                        pass
+                        logger.debug("swallowed exception", exc_info=True)
 
             _s["stt_reader"] = asyncio.create_task(_read_stt())
             try:
                 await websocket.send_json({"type": "voice_session_ready"})
             except Exception:
-                pass
+                logger.debug("swallowed exception", exc_info=True)
             return stt_conn
 
         try:
@@ -1534,7 +1559,7 @@ class AgentVoiceStreamService:
                     AgentRuntimeService.runtime_status(tenant_res) | {"type": "runtime_status"}
                 )
             except Exception:
-                pass
+                logger.debug("swallowed exception", exc_info=True)
 
             # Warm both TTS connections at session start so the first answer
             # does not pay the WebSocket/TLS handshake cost.
@@ -1544,7 +1569,17 @@ class AgentVoiceStreamService:
                 try:
                     message = await websocket.receive()
                 except RuntimeError as exc:
-                    if "disconnect message" in str(exc).lower():
+                    # Starlette raises RuntimeError for any "cannot receive"
+                    # state (already disconnected, send-side closed, protocol
+                    # error). All of these mean the socket is gone — break out
+                    # so cleanup runs, rather than re-raising past the finally.
+                    msg = str(exc).lower()
+                    if any(s in msg for s in (
+                        "disconnect message",
+                        "cannot call",
+                        "websocket is not connected",
+                        "websocket disconnected",
+                    )):
                         break
                     raise
                 if message.get("type") == "websocket.disconnect":
@@ -1583,7 +1618,7 @@ class AgentVoiceStreamService:
                                 "source": "manual",
                             })
                         except Exception:
-                            pass
+                            logger.debug("swallowed exception", exc_info=True)
                         asyncio.create_task(_run_answer(text))
 
                 elif event_type in {"stop", "finalize"}:
@@ -1595,7 +1630,7 @@ class AgentVoiceStreamService:
                         try:
                             await stt_conn.send(b"")
                         except Exception:
-                            pass
+                            logger.debug("swallowed exception", exc_info=True)
                     await _trigger_answer()
 
                 elif event_type == "close":
@@ -1617,11 +1652,11 @@ class AgentVoiceStreamService:
                 try:
                     await stt_conn.close()
                 except Exception:
-                    pass
+                    logger.debug("swallowed exception", exc_info=True)
             await warm_tts.close()
             await warm_tts_filler.close()
             if _redis_client is not None:
                 try:
                     await _redis_client.aclose()
                 except Exception:
-                    pass
+                    logger.debug("swallowed exception", exc_info=True)

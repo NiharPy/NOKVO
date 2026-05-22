@@ -253,6 +253,13 @@ class Settings(BaseSettings):
     AGENT_ANSWER_CACHE_ENABLED: bool = True
     AGENT_ANSWER_CACHE_TTL_SECONDS: int = 300
 
+    # End-of-booking SMS confirmation offer. Disabled by default because SMS
+    # dispatch isn't wired into the platform yet — offering it then silently
+    # not sending is a worse caller experience than not offering at all. Each
+    # tenant can opt in via provider_status["agent_offer_sms_confirmation"] =
+    # True once their SMS gateway is connected.
+    NOKVO_AGENT_OFFER_SMS_CONFIRMATION: bool = False
+
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=True, extra="ignore")
 
 settings = Settings()
