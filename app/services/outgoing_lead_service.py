@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlencode
+
+logger = logging.getLogger(__name__)
 
 import httpx
 import jwt
@@ -37,7 +40,21 @@ ALLOWED_CALL_SOURCES = {
     LeadSourceProvider.nokvo_form,
 }
 
-META_SCOPES = ["pages_show_list", "pages_read_engagement", "ads_read", "leads_retrieval"]
+META_SCOPES = [
+    # Discover the pages the user manages so we can offer them in the picker.
+    "pages_show_list",
+    # Read the page's posts/engagement we link to incoming leads.
+    "pages_read_engagement",
+    # Required by Graph API for ``/{page-id}/leadgen_forms`` — Meta gates this
+    # behind ad-management capability even when you only want to read forms.
+    # Without it, the lead-forms fetch returns ``(#200) Requires pages_manage_ads
+    # permission to manage the object`` even if leads_retrieval is granted.
+    "pages_manage_ads",
+    # Read aggregate ad performance for the analytics tab.
+    "ads_read",
+    # Pull the actual lead form submissions.
+    "leads_retrieval",
+]
 GOOGLE_ADS_SCOPES = ["https://www.googleapis.com/auth/adwords"]
 GOOGLE_FORMS_SCOPES = [
     "https://www.googleapis.com/auth/forms.body.readonly",
@@ -45,7 +62,12 @@ GOOGLE_FORMS_SCOPES = [
 ]
 
 
-class OutgoingLeadServiceError(Exception):
+class OutgoingLeadServiceError(RuntimeError):
+    """Intentional, caller-visible failure during a lead-source sync or OAuth
+    handshake. Inherits from ``RuntimeError`` so the API layer's ``_safe_detail``
+    helper forwards the message to clients instead of replacing it with a
+    generic "Operation failed"."""
+
     pass
 
 
@@ -239,7 +261,7 @@ class OutgoingLeadService:
 
         if provider == "google_ads":
             client_id = settings.GOOGLE_LEADS_OAUTH_CLIENT_ID or settings.GOOGLE_OAUTH_CLIENT_ID
-            redirect_uri = settings.GOOGLE_LEADS_OAUTH_REDIRECT_URI
+            redirect_uri = OutgoingLeadService._google_lead_redirect_uri(provider)
             if not client_id or not redirect_uri:
                 raise OutgoingLeadServiceError("Google OAuth client id or redirect URI is not configured.")
             query = urlencode(
@@ -257,7 +279,7 @@ class OutgoingLeadService:
 
         if provider == "google_forms":
             client_id = settings.GOOGLE_LEADS_OAUTH_CLIENT_ID or settings.GOOGLE_OAUTH_CLIENT_ID
-            redirect_uri = settings.GOOGLE_LEADS_OAUTH_REDIRECT_URI
+            redirect_uri = OutgoingLeadService._google_lead_redirect_uri(provider)
             if not client_id or not redirect_uri:
                 raise OutgoingLeadServiceError("Google OAuth client id or redirect URI is not configured.")
             query = urlencode(
@@ -291,7 +313,7 @@ class OutgoingLeadService:
             display_name = "Instagram Ads" if mode == "instagram_ads" else "Facebook Ads"
             provider_enum = LeadSourceProvider.meta_ads
         elif provider in {"google_ads", "google_forms"}:
-            token_data = await OutgoingLeadService._exchange_google_code(code)
+            token_data = await OutgoingLeadService._exchange_google_code(code, provider=provider)
             scopes = GOOGLE_ADS_SCOPES if provider == "google_ads" else GOOGLE_FORMS_SCOPES
             display_name = "Google Ads" if provider == "google_ads" else "Google Forms"
             provider_enum = LeadSourceProvider.google_ads if provider == "google_ads" else LeadSourceProvider.google_forms
@@ -353,10 +375,30 @@ class OutgoingLeadService:
             return data
 
     @staticmethod
-    async def _exchange_google_code(code: str) -> dict[str, Any]:
+    def _google_lead_redirect_uri(provider: str) -> str:
+        """Resolve the OAuth redirect URI for a Google-backed lead source.
+
+        Priority:
+          1. ``GOOGLE_LEADS_OAUTH_REDIRECT_URI`` if the admin set it
+             explicitly (e.g., when the leads OAuth client lives in a
+             different Google Cloud project than the SSO client).
+          2. Otherwise compose from ``AGENT_PUBLIC_BASE_URL`` so the
+             generic Nokvo One Google client (``GOOGLE_OAUTH_CLIENT_ID``)
+             can also drive the leads flow without extra setup — Google
+             accepts the same client across redirect URIs as long as
+             they're whitelisted in the Cloud Console.
+        """
+        explicit = (settings.GOOGLE_LEADS_OAUTH_REDIRECT_URI or "").strip()
+        if explicit:
+            return explicit
+        base = (settings.AGENT_PUBLIC_BASE_URL or "http://localhost:8000").rstrip("/")
+        return f"{base}/api/nokvo-one/agents/lead-sources/oauth/{provider}/callback"
+
+    @staticmethod
+    async def _exchange_google_code(code: str, *, provider: str = "google_ads") -> dict[str, Any]:
         client_id = settings.GOOGLE_LEADS_OAUTH_CLIENT_ID or settings.GOOGLE_OAUTH_CLIENT_ID
         client_secret = settings.GOOGLE_LEADS_OAUTH_CLIENT_SECRET or settings.GOOGLE_OAUTH_CLIENT_SECRET
-        redirect_uri = settings.GOOGLE_LEADS_OAUTH_REDIRECT_URI
+        redirect_uri = OutgoingLeadService._google_lead_redirect_uri(provider)
         if not client_id or not client_secret or not redirect_uri:
             raise OutgoingLeadServiceError("Google OAuth credentials are not configured.")
         async with httpx.AsyncClient(timeout=20.0) as client:
@@ -400,6 +442,63 @@ class OutgoingLeadService:
         if provider_account_id:
             connection.provider_account_id = provider_account_id
         flag_modified(connection, "metadata_")
+        db.add(connection)
+        await db.commit()
+        await db.refresh(connection)
+        return connection
+
+    @staticmethod
+    async def disconnect_connection(
+        connection: LeadSourceConnection,
+        db: AsyncSession,
+        *,
+        revoke_remote: bool = True,
+    ) -> LeadSourceConnection:
+        """Detach a lead-source connection.
+
+        * Best-effort revoke at the provider (Meta / Google) so the next
+          reconnect re-prompts the user for consent. Failures here are
+          logged but never block the local disconnect — once we've cleared
+          the encrypted token in our DB the connection cannot be used to
+          sync further leads anyway.
+        * Local state: status becomes ``disabled``, tokens cleared, last
+          error stamped so the dashboard reflects the disconnect.
+        """
+        provider = connection.provider
+        token: str | None = None
+        if connection.access_token_encrypted:
+            try:
+                token = decrypt_secret(connection.access_token_encrypted)
+            except Exception:
+                token = None
+
+        if revoke_remote and token:
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    if provider == LeadSourceProvider.meta_ads:
+                        # Graph: DELETE /me/permissions revokes every scope.
+                        await client.delete(
+                            f"https://graph.facebook.com/{settings.META_GRAPH_VERSION}/me/permissions",
+                            params={"access_token": token},
+                        )
+                    elif provider in (LeadSourceProvider.google_ads, LeadSourceProvider.google_forms):
+                        await client.post(
+                            "https://oauth2.googleapis.com/revoke",
+                            data={"token": token},
+                            headers={"Content-Type": "application/x-www-form-urlencoded"},
+                        )
+            except Exception:
+                logger.warning(
+                    "Remote token revoke failed for connection %s; clearing local credentials anyway",
+                    connection.id,
+                    exc_info=True,
+                )
+
+        connection.access_token_encrypted = None
+        connection.refresh_token_encrypted = None
+        connection.expires_at = None
+        connection.status = LeadConnectionStatus.disabled
+        connection.last_error = "Disconnected by admin"
         db.add(connection)
         await db.commit()
         await db.refresh(connection)
@@ -717,32 +816,102 @@ class OutgoingLeadService:
         )
 
     @staticmethod
+    def _explain_meta_error(exc: httpx.HTTPStatusError, *, step: str) -> OutgoingLeadServiceError:
+        """Turn a raw Graph API HTTPStatusError into a caller-facing message.
+
+        Meta's error envelope is ``{"error": {"message", "type", "code",
+        "error_subcode", "fbtrace_id"}}``. We surface ``message`` because it
+        usually explains the missing permission or expired token, while
+        suppressing ``fbtrace_id`` and other internal details. When the
+        message names a specific scope ("Requires pages_manage_ads permission"),
+        we lift it into the actionable guidance so the user knows exactly
+        which OAuth consent they need to re-grant.
+        """
+        import re as _re
+
+        status_code = exc.response.status_code if exc.response is not None else "?"
+        message: str | None = None
+        try:
+            payload = exc.response.json() if exc.response is not None else {}
+            err = (payload or {}).get("error") or {}
+            message = err.get("message") or err.get("type")
+        except Exception:
+            message = None
+        if not message:
+            message = (
+                "the access token may be expired or missing the required scopes"
+                if status_code in (401, 403)
+                else "Meta rejected the request"
+            )
+        guidance = ""
+        if status_code in (401, 403):
+            missing = _re.search(
+                r"Requires\s+([A-Za-z0-9_]+)\s+permission",
+                message,
+                _re.IGNORECASE,
+            )
+            if missing:
+                scope = missing.group(1)
+                guidance = (
+                    f" Reconnect Meta in Outgoing → Lead sources — the existing "
+                    f"token does not include the '{scope}' permission Meta now "
+                    "requires for lead-form access."
+                )
+            else:
+                guidance = (
+                    " Reconnect Meta in Outgoing → Lead sources and confirm "
+                    "the page has the leads_retrieval and pages_manage_ads "
+                    "permissions."
+                )
+        return OutgoingLeadServiceError(
+            f"Meta {step} failed ({status_code}): {message}.{guidance}"
+        )
+
+    @staticmethod
     async def _sync_meta(connection: LeadSourceConnection, db: AsyncSession) -> dict[str, Any]:
         token = _connection_token(connection)
         base = f"https://graph.facebook.com/{settings.META_GRAPH_VERSION}"
         imported_forms = 0
         imported_leads = 0
         async with httpx.AsyncClient(timeout=30.0) as client:
-            pages_resp = await client.get(
-                f"{base}/me/accounts",
-                params={"fields": "id,name,access_token", "access_token": token},
-            )
-            pages_resp.raise_for_status()
+            try:
+                pages_resp = await client.get(
+                    f"{base}/me/accounts",
+                    params={"fields": "id,name,access_token", "access_token": token},
+                )
+                pages_resp.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise OutgoingLeadService._explain_meta_error(exc, step="page lookup") from exc
+            except httpx.HTTPError as exc:
+                raise OutgoingLeadServiceError(f"Meta page lookup failed: {exc}") from exc
             pages = pages_resp.json().get("data") or []
             metadata = dict(connection.metadata_ or {})
             metadata["pages"] = [{"id": p.get("id"), "name": p.get("name")} for p in pages]
             connection.metadata_ = metadata
             flag_modified(connection, "metadata_")
+            if not pages:
+                raise OutgoingLeadServiceError(
+                    "Meta returned no Facebook pages for this account. "
+                    "Make sure the connected user is an admin/editor on at "
+                    "least one page that hosts the lead form."
+                )
             for page in pages:
                 page_id = page.get("id")
                 page_token = page.get("access_token") or token
                 if not page_id:
                     continue
-                forms_resp = await client.get(
-                    f"{base}/{page_id}/leadgen_forms",
-                    params={"fields": "id,name,status,questions", "limit": 100, "access_token": page_token},
-                )
-                forms_resp.raise_for_status()
+                try:
+                    forms_resp = await client.get(
+                        f"{base}/{page_id}/leadgen_forms",
+                        params={"fields": "id,name,status,questions", "limit": 100, "access_token": page_token},
+                    )
+                    forms_resp.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    raise OutgoingLeadService._explain_meta_error(
+                        exc, step=f"lead form lookup for page {page.get('name') or page_id}"
+                    ) from exc
+                except httpx.HTTPError as exc:
+                    raise OutgoingLeadServiceError(f"Meta lead form lookup failed: {exc}") from exc
                 forms = forms_resp.json().get("data") or []
                 for item in forms:
                     form = await OutgoingLeadService._upsert_provider_form(
@@ -756,11 +925,20 @@ class OutgoingLeadService:
                         metadata={"page_id": page_id, "page_name": page.get("name"), "status": item.get("status")},
                     )
                     imported_forms += 1
-                    leads_resp = await client.get(
-                        f"{base}/{item.get('id')}/leads",
-                        params={"fields": "id,created_time,field_data,ad_id,form_id,platform", "limit": 100, "access_token": page_token},
-                    )
-                    leads_resp.raise_for_status()
+                    try:
+                        leads_resp = await client.get(
+                            f"{base}/{item.get('id')}/leads",
+                            params={"fields": "id,created_time,field_data,ad_id,form_id,platform", "limit": 100, "access_token": page_token},
+                        )
+                        leads_resp.raise_for_status()
+                    except httpx.HTTPStatusError as exc:
+                        raise OutgoingLeadService._explain_meta_error(
+                            exc, step=f"lead retrieval for form {item.get('name') or item.get('id')}"
+                        ) from exc
+                    except httpx.HTTPError as exc:
+                        raise OutgoingLeadServiceError(
+                            f"Meta lead retrieval failed: {exc}"
+                        ) from exc
                     for lead_payload in leads_resp.json().get("data") or []:
                         fields = {
                             str(entry.get("name")): (entry.get("values") or [""])[0]

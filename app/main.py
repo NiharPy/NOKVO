@@ -94,13 +94,22 @@ async def health_check():
 # In-process retry-queue scheduler: drains pending_tool_retries on a 2-minute
 # cadence so the operator doesn't have to wire a separate worker process.
 from app.services.retry_scheduler import start_scheduler, stop_scheduler  # noqa: E402
+# Periodic lead-source sync: pulls fresh leads from connected providers every
+# 30 minutes so the dashboard always reflects the latest Meta/Google forms
+# without admins needing to click "Sync".
+from app.services.lead_sync_scheduler import (  # noqa: E402
+    start_scheduler as start_lead_sync_scheduler,
+    stop_scheduler as stop_lead_sync_scheduler,
+)
 
 
 @app.on_event("startup")
 async def _start_retry_scheduler() -> None:
     start_scheduler()
+    start_lead_sync_scheduler()
 
 
 @app.on_event("shutdown")
 async def _stop_retry_scheduler() -> None:
     await stop_scheduler()
+    await stop_lead_sync_scheduler()

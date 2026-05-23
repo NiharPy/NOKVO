@@ -82,7 +82,9 @@ from app.models.tenant_resources import TenantResources
 from app.services.agent_outbound_context import (
     OutboundCampaignContext,
     PROACTIVE_NUDGE_PROMPT,
+    PROACTIVE_OPENER_PROMPT,
     ProactiveSilenceWatchdog,
+    generate_outbound_opener_text,
     infer_covered_objectives,
     load_outbound_context,
 )
@@ -1190,6 +1192,7 @@ class NokvoOneVoiceStreamService:
         language: str = "en",
         call_id: str | None = None,
         campaign_context: dict[str, Any] | None = None,
+        outbound_context_override: OutboundCampaignContext | None = None,
     ) -> None:
         await websocket.accept()
         session_started = perf_counter()
@@ -1212,9 +1215,12 @@ class NokvoOneVoiceStreamService:
         # session is initiated as part of a campaign — drives the
         # proactive system prompt + objective tracking. None for plain
         # inbound calls.
-        outbound_context: OutboundCampaignContext | None = None
+        outbound_context: OutboundCampaignContext | None = outbound_context_override
+        # If the caller built a synthetic outbound context (e.g., the in-app
+        # tester needs an outbound persona without a saved campaign row), we
+        # trust it as-is and skip the DB lookup below.
         campaign_id_for_session = (campaign_context or {}).get("campaign_id")
-        if campaign_id_for_session:
+        if outbound_context is None and campaign_id_for_session:
             try:
                 outbound_context = await load_outbound_context(
                     db,
@@ -1325,6 +1331,12 @@ class NokvoOneVoiceStreamService:
 
         async def _play_default_inbound_opener() -> None:
             if inbound_opener_played[0] or (campaign_context or {}).get("opening_message"):
+                return
+            # Outbound proactive sessions own their opening line. Never
+            # play the inbound "How can I help?" greeting on an outgoing
+            # call — that's an inbound-only utterance.
+            if outbound_context is not None and outbound_context.is_proactive:
+                inbound_opener_played[0] = True
                 return
             inbound_opener_played[0] = True
             # Returning-caller awareness: if the caller's phone is known and
@@ -1701,11 +1713,31 @@ class NokvoOneVoiceStreamService:
         await websocket.send_json({"type": "voice_session_ready", "call_id": call_id})
 
         opening = (campaign_context or {}).get("opening_message")
+        # Outbound sessions (campaign-launched OR tester) must NOT play the
+        # inbound "How can I help?" greeting — they're outgoing calls. When
+        # the campaign pre-generated an ``opening_message`` we play it
+        # verbatim (zero LLM latency). Otherwise we kick the outbound agent
+        # off with PROACTIVE_OPENER_PROMPT so it generates a campaign-aware
+        # opener from the system fragment + brief.
+        _outbound_proactive = bool(outbound_context) and outbound_context.is_proactive
         if opening:
             await NokvoOneVoiceStreamService._play_opener(
                 websocket,
                 tenant_res,
                 opening,
+                language=language,
+                call_id=call_id,
+                campaign_context=campaign_context,
+            )
+            await _arm_proactive_watchdog()
+        elif _outbound_proactive:
+            # Use the deterministic, template-filled opener — no LLM call,
+            # ~150ms faster first audio. The LLM takes over from turn 2.
+            outbound_opening_text = generate_outbound_opener_text(outbound_context)
+            await NokvoOneVoiceStreamService._play_opener(
+                websocket,
+                tenant_res,
+                outbound_opening_text,
                 language=language,
                 call_id=call_id,
                 campaign_context=campaign_context,
@@ -1805,7 +1837,12 @@ class NokvoOneVoiceStreamService:
                     # on the shared ``db`` AsyncSession.
                     await _drain_turn(inbound_opener_task)
                     inbound_opener_task = None
-                    await _play_default_inbound_opener()
+                    # Defensive — never overlay the inbound greeting on an
+                    # outbound proactive session even if the lazy path is
+                    # somehow reached. The outbound opener has already been
+                    # dispatched above (or will be by the proactive watchdog).
+                    if not (outbound_context and outbound_context.is_proactive):
+                        await _play_default_inbound_opener()
                     continue
                 if event_type == "interrupt":
                     # Client-side barge-in: user started speaking while agent

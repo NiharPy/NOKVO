@@ -12,7 +12,11 @@ GOOGLE_JWKS_URL = "https://www.googleapis.com/oauth2/v3/certs"
 GOOGLE_ISSUERS = {"accounts.google.com", "https://accounts.google.com"}
 
 
-class GoogleOAuthError(Exception):
+class GoogleOAuthError(RuntimeError):
+    """Caller-facing Google OAuth verification error. RuntimeError so the API
+    layer's ``_safe_detail`` helper forwards the message instead of replacing
+    it with a generic "Operation failed"."""
+
     pass
 
 

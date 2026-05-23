@@ -254,6 +254,186 @@ async def voice_tester_websocket(websocket: WebSocket):
         return
 
 
+# ────────────────────────── Outbound tester session stash ──────────────────────────
+#
+# Doc text + system prompt are too big for query params and we don't want to
+# stuff them into the first WS frame (would require accept()-then-recv before
+# delegating to run_session, complicating cleanup). Instead the frontend
+# uploads them to a small REST endpoint, the server extracts text and parks
+# the pair in memory keyed by a one-shot token. The WS endpoint reads it
+# back, then evicts. Tokens auto-expire after 5 minutes regardless.
+#
+# In-memory is fine for single-uvicorn; promoting to Redis is a one-swap when
+# we scale, matching the rest of the platform.
+
+import time as _time
+from threading import Lock as _Lock
+
+_TESTER_STASH_TTL_SECONDS = 300
+_TESTER_STASH_MAX = 256
+_tester_stash: dict[str, dict[str, Any]] = {}
+_tester_stash_lock = _Lock()
+
+
+def _tester_stash_put(payload: dict[str, Any]) -> str:
+    token = uuid.uuid4().hex
+    expires_at = _time.monotonic() + _TESTER_STASH_TTL_SECONDS
+    with _tester_stash_lock:
+        # Drop expired entries opportunistically — cheap O(n) sweep.
+        now = _time.monotonic()
+        for stale in [k for k, v in _tester_stash.items() if v.get("_expires_at", 0) <= now]:
+            _tester_stash.pop(stale, None)
+        while len(_tester_stash) >= _TESTER_STASH_MAX:
+            # Drop oldest insertion.
+            _tester_stash.pop(next(iter(_tester_stash)), None)
+        _tester_stash[token] = {**payload, "_expires_at": expires_at}
+    return token
+
+
+def _tester_stash_pop(token: str | None) -> dict[str, Any] | None:
+    if not token:
+        return None
+    with _tester_stash_lock:
+        record = _tester_stash.pop(token, None)
+    if record is None:
+        return None
+    if record.get("_expires_at", 0) <= _time.monotonic():
+        return None
+    return {k: v for k, v in record.items() if not k.startswith("_")}
+
+
+@router.post("/lead-sources/outbound-tester/prepare")
+async def prepare_outbound_tester_session(
+    agent_prompt: str | None = Form(default=None),
+    doc_file: UploadFile | None = File(default=None),
+    user: OrganizationUser = Depends(_admin_dep()),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
+):
+    """Stash optional doc text + prompt for the live outbound tester WS.
+
+    Either input is optional and they compose: send only ``agent_prompt`` for a
+    pure single-prompt test, only ``doc_file`` to ground the agent in a brief,
+    or both. The doc is parsed with the same extractor outbound campaigns use,
+    so PDF/DOCX/TXT all work and the tester reflects production behavior.
+
+    Returns ``{tester_session_token, doc_chars, has_prompt}``. Token is single-
+    use, expires in 5 minutes, and the WS endpoint consumes it on open.
+    """
+    from app.services.outbound_campaign_service import _parse_document  # local import to avoid cycles
+
+    prompt = (agent_prompt or "").strip()
+    doc_text = ""
+    if doc_file is not None:
+        try:
+            content = await doc_file.read()
+        finally:
+            await doc_file.close()
+        doc_text = (_parse_document(doc_file.filename or "doc.txt", content) or "").strip()
+        if not doc_text:
+            raise HTTPException(
+                status_code=400,
+                detail="The uploaded document is empty or could not be parsed.",
+            )
+    if not prompt and not doc_text:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide a system prompt, a reference document, or both.",
+        )
+    token = _tester_stash_put({"agent_prompt": prompt, "doc_text": doc_text[:8000]})
+    return {
+        "tester_session_token": token,
+        "expires_in_seconds": _TESTER_STASH_TTL_SECONDS,
+        "doc_chars": len(doc_text),
+        "has_prompt": bool(prompt),
+    }
+
+
+@router.websocket("/voice/outbound-tester/ws")
+async def outbound_voice_tester_websocket(websocket: WebSocket):
+    """Live outbound-agent tester.
+
+    Mirrors :func:`voice_tester_websocket` for auth/tenant lookup, but
+    constructs a synthetic ``OutboundCampaignContext`` from query params
+    so admins can rehearse the outbound flow without persisting a draft
+    campaign first. Inputs (all optional, sensible defaults applied):
+
+      * ``goal`` — the call objective in plain language ("Confirm Friday's
+        site visit").
+      * ``agent_prompt`` — the system-prompt override the campaign would
+        normally store.
+      * ``objectives`` — newline- or pipe-separated checklist the agent
+        should land before exiting.
+      * ``exit_conditions`` — newline- or pipe-separated reasons to wrap
+        up the call.
+      * ``tone`` — short style hint.
+
+    Auth model is identical to the inbound tester: admin/manager role on
+    a Nokvo One organization, MFA already handled by the JWT.
+    """
+    from app.services.agent_outbound_context import (
+        OutboundCampaignContext,
+        build_agent_config,
+    )
+
+    async for db in deps.get_db():
+        user = await _ws_user(websocket, db)
+        if user is None or user.role not in {"admin", "manager"}:
+            await websocket.close(code=1008)
+            return
+        tr = await _tenant_for_user(db, user)
+
+        params = websocket.query_params
+
+        def _split_list(raw: str | None) -> list[str]:
+            if not raw:
+                return []
+            return [item.strip() for item in raw.replace("|", "\n").split("\n") if item.strip()]
+
+        # Pull doc text / system-prompt override from the one-shot stash if
+        # the frontend called /prepare first. The stash pop validates the
+        # token and clears it so it can't be reused.
+        stashed = _tester_stash_pop(params.get("tester_session_token")) or {}
+        prompt_override = stashed.get("agent_prompt") or params.get("agent_prompt")
+
+        agent_config = build_agent_config(
+            agent_prompt=prompt_override,
+            objectives=_split_list(params.get("objectives")),
+            exit_conditions=_split_list(params.get("exit_conditions")),
+            tone=params.get("tone"),
+            silence_timeout_seconds=params.get("silence_timeout_seconds"),
+            caller_name=params.get("caller_name"),
+            company_name=params.get("company_name"),
+            pitch_summary=params.get("pitch_summary"),
+            objective=params.get("objective"),
+        )
+        synthetic_id = f"tester-{uuid.uuid4()}"
+        outbound_context = OutboundCampaignContext(
+            campaign_id=synthetic_id,
+            name=params.get("name") or "Outbound tester",
+            goal=str(params.get("goal") or "").strip()[:1000],
+            agent_prompt=str(agent_config.get("agent_prompt") or "").strip()[:8000],
+            objectives=list(agent_config.get("objectives") or []),
+            exit_conditions=list(agent_config.get("exit_conditions") or []),
+            tone=(str(agent_config.get("tone")).strip() or None) if agent_config.get("tone") else None,
+            doc_text=(stashed.get("doc_text") or None) if stashed else None,
+            silence_timeout_seconds=float(agent_config.get("silence_timeout_seconds") or 8.0),
+            caller_name=str(agent_config.get("caller_name") or "Riya"),
+            company_name=str(agent_config.get("company_name") or ""),
+            pitch_summary=str(agent_config.get("pitch_summary") or ""),
+            objective=str(agent_config.get("objective") or "lead_qualification"),
+        )
+
+        await NokvoOneVoiceStreamService.run_session(
+            websocket,
+            tr,
+            db=db,
+            language=str(params.get("language") or "en"),
+            call_id=f"tester:{synthetic_id}",
+            outbound_context_override=outbound_context,
+        )
+        return
+
+
 # ────────────────────────── Phone link configuration ──────────────────────────
 
 
@@ -524,6 +704,22 @@ async def sync_lead_connection(
         return await OutgoingLeadService.sync_connection(connection, db)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
+
+
+@router.post("/lead-sources/connections/{connection_id}/disconnect")
+async def disconnect_lead_connection(
+    connection_id: uuid.UUID,
+    user: OrganizationUser = Depends(_admin_dep()),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tr = await _tenant_for_user(db, user)
+    connection = await _connection_for_user(db, tr, connection_id)
+    try:
+        connection = await OutgoingLeadService.disconnect_connection(connection, db)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
+    return _connection_response(connection)
 
 
 @router.get("/lead-sources/forms")

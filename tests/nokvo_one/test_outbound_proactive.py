@@ -87,7 +87,11 @@ def test_outbound_system_section_includes_pending_objectives_only():
         covered_objectives=["Confirm time to talk"],
     )
 
-    assert "PROACTIVE MODE" in section
+    # Outbound system fragment now leads with one of two headings —
+    # SALES / OUTREACH PERSONA (templated) or CUSTOM PERSONA (operator
+    # supplied an explicit agent_prompt). Either way the "OUTBOUND
+    # CAMPAIGN" anchor must appear.
+    assert "OUTBOUND CAMPAIGN" in section
     assert "Call as Rohit Eye Clinic." in section
     assert "Book appointment" in section
     assert "Still pending this call" in section

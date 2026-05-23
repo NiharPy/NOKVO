@@ -268,31 +268,96 @@ const isLoadingLeadSources = ref(false);
 const isSyncingLeadConnection = ref(null);
 const pendingLeadOAuth = ref(null);
 const connectionAccountInputs = ref({});
-const nokvoLeadForm = ref({
+const NOKVO_FORM_FIELD_TYPES = [
+  { value: 'text', label: 'Text' },
+  { value: 'email', label: 'Email' },
+  { value: 'phone', label: 'Phone' },
+  { value: 'textarea', label: 'Long text' },
+  { value: 'select', label: 'Dropdown' },
+  { value: 'number', label: 'Number' },
+];
+
+const _defaultNokvoLeadForm = () => ({
   name: '',
   consent_text: 'I agree to receive a phone call from this business about my enquiry.',
   fields: [
-    { key: 'email', label: 'Email', type: 'email', required: false },
+    { label: 'Email', type: 'email', required: false },
   ],
 });
-const externalLeadForm = ref({
-  provider: 'google_forms',
-  name: '',
-  provider_form_id: '',
-  source_connection_id: '',
-  field_mapping: '{\n  "name": "name",\n  "phone": "phone",\n  "email": "email"\n}',
-  consent_field_key: '',
-  consent_text: '',
-  default_call_consent: false,
-});
+
+const nokvoLeadForm = ref(_defaultNokvoLeadForm());
+const lastNokvoFormLink = ref(null); // Most recent public URL we minted, for one-click copy.
+
+const addNokvoFormField = () => {
+  nokvoLeadForm.value.fields.push({ label: '', type: 'text', required: false });
+};
+
+const removeNokvoFormField = (index) => {
+  nokvoLeadForm.value.fields.splice(index, 1);
+};
+
+const copyNokvoFormLink = async () => {
+  const link = lastNokvoFormLink.value;
+  if (!link) return;
+  try {
+    await navigator.clipboard.writeText(link);
+    infoMsg.value = 'Form link copied to clipboard.';
+  } catch {
+    // Clipboard access can be denied in test environments — fall through quietly.
+  }
+};
 const selectedCallableLeads = computed(() =>
   outgoingLeads.value.filter((lead) => selectedLeadIds.value.includes(lead.id) && lead.callable),
 );
+const OUTBOUND_OBJECTIVE_OPTIONS = [
+  { value: 'lead_qualification', label: 'Lead qualification' },
+  { value: 'demo_booking', label: 'Demo booking' },
+  { value: 'info_outreach', label: 'Info outreach' },
+  { value: 'survey', label: 'Survey' },
+  { value: 'renewal', label: 'Renewal' },
+];
+
+const outboundTester = ref({
+  // Campaign branding — the sales persona the agent introduces itself as.
+  // The deterministic opener stitches caller_name + company_name + pitch_summary
+  // into the first line; the system prompt template then takes over.
+  caller_name: 'Riya',
+  company_name: '',
+  pitch_summary: '',
+  objective: 'lead_qualification',
+  name: 'Outbound test call',
+  goal: '',
+  // Optional advanced overrides — leave both blank to use the default
+  // sales-persona template; set either to deviate.
+  agent_prompt: '',
+  doc_file: null,         // File object selected by the user
+  doc_filename: '',       // surface filename in the UI after selection
+  doc_chars: 0,           // populated after the /prepare call; null on reset
+  objectives: '',
+  exit_conditions: '',
+  tone: 'warm, direct, and respectful',
+  language: 'en',
+});
+
+const onOutboundTesterDocSelected = (event) => {
+  const file = event.target?.files?.[0] || null;
+  outboundTester.value.doc_file = file;
+  outboundTester.value.doc_filename = file ? file.name : '';
+  outboundTester.value.doc_chars = 0;
+};
+
+const clearOutboundTesterDoc = () => {
+  outboundTester.value.doc_file = null;
+  outboundTester.value.doc_filename = '';
+  outboundTester.value.doc_chars = 0;
+};
+
 const voice = ref({
   ws: null,
   audioCtx: null,
   micStream: null,
   micNode: null,
+  mode: 'inbound',
   status: 'idle', // idle | connecting | listening | thinking | speaking | error
   callId: null,
   language: 'en',
@@ -3044,49 +3109,69 @@ const syncLeadConnection = async (connectionId) => {
   }
 };
 
-const createNokvoLeadForm = async () => {
+const isDisconnectingLeadConnection = ref(null);
+
+const disconnectLeadConnection = async (connectionId, displayName) => {
+  const label = displayName ? `the connection "${displayName}"` : 'this connection';
+  if (!window.confirm(`Disconnect ${label}? You'll need to re-authorize to sync again.`)) return;
+  isDisconnectingLeadConnection.value = connectionId;
   try {
-    await agentsApi.post('/lead-sources/nokvo-forms', nokvoLeadForm.value, { headers: authHeader() });
-    nokvoLeadForm.value = {
-      name: '',
-      consent_text: 'I agree to receive a phone call from this business about my enquiry.',
-      fields: [{ key: 'email', label: 'Email', type: 'email', required: false }],
-    };
-    await loadLeadForms();
-    infoMsg.value = 'Nokvo lead form created.';
+    await agentsApi.post(`/lead-sources/connections/${connectionId}/disconnect`, {}, { headers: authHeader() });
+    await loadLeadConnections();
+    infoMsg.value = 'Connection disconnected.';
   } catch (err) {
     if (await handleMfaProtectedError(err)) return;
-    errorMsg.value = extractErrorMessage(err, 'Could not create Nokvo form.');
+    errorMsg.value = extractErrorMessage(err, 'Could not disconnect the lead source.');
+  } finally {
+    isDisconnectingLeadConnection.value = null;
   }
 };
 
-const registerExternalLeadForm = async () => {
+const createNokvoLeadForm = async () => {
+  // Trim labels and synthesize stable `key`s for the backend so admins
+  // never have to think about identifiers. The backend dedupes and
+  // injects name/phone/consent — see OutgoingLeadService.create_nokvo_form.
+  const cleanedFields = (nokvoLeadForm.value.fields || [])
+    .map((field) => ({
+      label: (field.label || '').trim(),
+      type: field.type || 'text',
+      required: Boolean(field.required),
+    }))
+    .filter((field) => field.label.length > 0)
+    .map((field) => ({
+      ...field,
+      key: field.label.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, ''),
+    }));
+
+  const payload = {
+    name: (nokvoLeadForm.value.name || '').trim(),
+    consent_text: (nokvoLeadForm.value.consent_text || '').trim(),
+    fields: cleanedFields,
+  };
+  if (!payload.name) {
+    errorMsg.value = 'Give the form a name first.';
+    return;
+  }
+  if (!payload.consent_text) {
+    errorMsg.value = 'Call-consent text is required.';
+    return;
+  }
+
   try {
-    let mapping = {};
-    if (externalLeadForm.value.field_mapping.trim()) {
-      mapping = JSON.parse(externalLeadForm.value.field_mapping);
-    }
-    await agentsApi.post(
-      '/lead-sources/forms',
-      {
-        provider: externalLeadForm.value.provider,
-        name: externalLeadForm.value.name,
-        provider_form_id: externalLeadForm.value.provider_form_id,
-        source_connection_id: externalLeadForm.value.source_connection_id || null,
-        field_mapping: mapping,
-        consent_field_key: externalLeadForm.value.consent_field_key || null,
-        consent_text: externalLeadForm.value.consent_text || null,
-        default_call_consent: externalLeadForm.value.default_call_consent,
-      },
+    const { data } = await agentsApi.post(
+      '/lead-sources/nokvo-forms',
+      payload,
       { headers: authHeader() },
     );
-    externalLeadForm.value.name = '';
-    externalLeadForm.value.provider_form_id = '';
+    lastNokvoFormLink.value = data?.public_url || data?.public_link || null;
+    nokvoLeadForm.value = _defaultNokvoLeadForm();
     await loadLeadForms();
-    infoMsg.value = 'External form registered.';
+    infoMsg.value = lastNokvoFormLink.value
+      ? 'Nokvo lead form created — copy the public link below.'
+      : 'Nokvo lead form created.';
   } catch (err) {
     if (await handleMfaProtectedError(err)) return;
-    errorMsg.value = extractErrorMessage(err, 'Could not register form.');
+    errorMsg.value = extractErrorMessage(err, 'Could not create Nokvo form.');
   }
 };
 
@@ -3520,9 +3605,67 @@ const stopAmbienceBed = () => {
   voice.value.ambienceGain = null;
 };
 
-const startVoiceCall = async () => {
+const _buildOutboundTesterWsUrl = (token, testerSessionToken) => {
+  const tester = outboundTester.value || {};
+  const params = new URLSearchParams({ token });
+  if (tester.language) params.set('language', tester.language);
+  // Campaign branding — drives the deterministic opener and the sales prompt.
+  if (tester.caller_name) params.set('caller_name', tester.caller_name.trim());
+  if (tester.company_name) params.set('company_name', tester.company_name.trim());
+  if (tester.pitch_summary) params.set('pitch_summary', tester.pitch_summary.trim());
+  if (tester.objective) params.set('objective', tester.objective);
+  if (tester.goal) params.set('goal', tester.goal.trim());
+  // Prompt + doc travel through the one-shot /prepare stash; the WS URL
+  // just references it. When neither is set, no stash call is needed and
+  // the agent runs with the platform default outbound persona.
+  if (testerSessionToken) params.set('tester_session_token', testerSessionToken);
+  if (tester.objectives) params.set('objectives', tester.objectives.trim());
+  if (tester.exit_conditions) params.set('exit_conditions', tester.exit_conditions.trim());
+  if (tester.tone) params.set('tone', tester.tone.trim());
+  if (tester.name) params.set('name', tester.name.trim());
+  return `ws://localhost:8000/api/nokvo-one/agents/voice/outbound-tester/ws?${params.toString()}`;
+};
+
+const _prepareOutboundTesterSession = async () => {
+  const tester = outboundTester.value || {};
+  const prompt = (tester.agent_prompt || '').trim();
+  const file = tester.doc_file;
+  if (!prompt && !file) {
+    // Allowed — caller wants the platform default outbound persona.
+    return { tester_session_token: null, doc_chars: 0, has_prompt: false };
+  }
+  const form = new FormData();
+  if (prompt) form.append('agent_prompt', prompt);
+  if (file) form.append('doc_file', file);
+  const { data } = await agentsApi.post(
+    '/lead-sources/outbound-tester/prepare',
+    form,
+    { headers: { ...authHeader(), 'Content-Type': 'multipart/form-data' } },
+  );
+  outboundTester.value.doc_chars = data?.doc_chars || 0;
+  return data || {};
+};
+
+const startVoiceCall = async (mode = 'inbound') => {
   if (voice.value.status !== 'idle' && voice.value.status !== 'error') return;
+  voice.value.mode = mode;
   voice.value.status = 'connecting';
+  // For the outbound tester we POST the optional prompt + doc to /prepare
+  // first so the WS URL stays short. Failures here surface to the user
+  // before we touch the mic — better than starting a call and getting a
+  // confusing close code.
+  let testerSessionToken = null;
+  if (mode === 'outbound') {
+    try {
+      const prepared = await _prepareOutboundTesterSession();
+      testerSessionToken = prepared?.tester_session_token || null;
+    } catch (err) {
+      if (await handleMfaProtectedError(err)) return;
+      voice.value.status = 'error';
+      voice.value.errorMsg = extractErrorMessage(err, 'Could not prepare the tester session.');
+      return;
+    }
+  }
   voice.value.errorMsg = '';
   voice.value.turns = [];
   voice.value.liveTranscript = '';
@@ -3582,7 +3725,9 @@ const startVoiceCall = async () => {
     // Continuous PCM capture with rolling pre-roll buffer (replaces MediaRecorder).
     setupPcmCapture(voice.value.audioCtx, stream);
 
-    const wsUrl = `ws://localhost:8000/api/nokvo-one/agents/voice/ws?token=${encodeURIComponent(token)}`;
+    const wsUrl = mode === 'outbound'
+      ? _buildOutboundTesterWsUrl(encodeURIComponent(token), testerSessionToken)
+      : `ws://localhost:8000/api/nokvo-one/agents/voice/ws?token=${encodeURIComponent(token)}`;
     const ws = new WebSocket(wsUrl);
     ws.binaryType = 'arraybuffer';
     voice.value.ws = ws;
@@ -5904,8 +6049,6 @@ onBeforeUnmount(() => {
         <div class="dashboard-section-head">
           <div>
             <span class="section-kicker">Outgoing Agent</span>
-            <h3>Call only consented leads.</h3>
-            <p>Connect Facebook Ads, Instagram Ads, Google Ads, Google Forms, or share a Nokvo form. Campaigns can launch only from callable leads with consent evidence.</p>
           </div>
           <button type="button" class="dashboard-inline-button" :disabled="isLoadingLeadSources" @click="loadOutgoingAgentWorkspace">
             <Search :size="16" />
@@ -5913,14 +6056,164 @@ onBeforeUnmount(() => {
           </button>
         </div>
 
+        <!-- Connections (always visible, no longer a tab) -->
+        <div class="dashboard-grid agent-page-grid outgoing-connections-pinned">
+          <article class="dashboard-card">
+            <div class="members-card-head">
+              <div>
+                <h3>Ad &amp; form connections</h3>
+                <p>OAuth connects source systems. Imported leads still need consent fields or form-level call consent before campaigns can use them.</p>
+              </div>
+            </div>
+            <div class="outgoing-provider-stack">
+              <button
+                type="button"
+                class="provider-icon-tile"
+                aria-label="Connect Facebook Ads"
+                title="Facebook Ads"
+                @click="requestLeadOAuth('meta_ads', 'facebook_ads')"
+              >
+                <svg viewBox="0 0 24 24" width="28" height="28" fill="#1877F2" aria-hidden="true">
+                  <path d="M22 12.07C22 6.51 17.52 2 12 2S2 6.51 2 12.07c0 5.02 3.66 9.18 8.44 9.93v-7.02H7.9v-2.91h2.54V9.86c0-2.51 1.49-3.9 3.77-3.9 1.09 0 2.24.2 2.24.2v2.47h-1.26c-1.24 0-1.63.77-1.63 1.56v1.88h2.77l-.44 2.91h-2.33V22c4.78-.75 8.44-4.91 8.44-9.93z"/>
+                </svg>
+                <span class="provider-icon-label">Facebook Ads</span>
+              </button>
+              <button
+                type="button"
+                class="provider-icon-tile"
+                aria-label="Connect Instagram Ads"
+                title="Instagram Ads"
+                @click="requestLeadOAuth('meta_ads', 'instagram_ads')"
+              >
+                <svg viewBox="0 0 24 24" width="28" height="28" aria-hidden="true">
+                  <defs>
+                    <linearGradient id="igGradient" x1="0%" y1="100%" x2="100%" y2="0%">
+                      <stop offset="0%" stop-color="#FED576"/>
+                      <stop offset="30%" stop-color="#F47133"/>
+                      <stop offset="60%" stop-color="#BC3081"/>
+                      <stop offset="100%" stop-color="#4C63D2"/>
+                    </linearGradient>
+                  </defs>
+                  <path
+                    fill="url(#igGradient)"
+                    d="M12 2.16c3.2 0 3.58.012 4.85.07 1.17.054 1.8.25 2.23.41.56.22.96.48 1.38.9.42.42.68.82.9 1.38.16.42.36 1.06.41 2.23.058 1.27.07 1.64.07 4.85s-.012 3.58-.07 4.85c-.054 1.17-.25 1.8-.41 2.23-.22.56-.48.96-.9 1.38-.42.42-.82.68-1.38.9-.42.16-1.06.36-2.23.41-1.27.058-1.64.07-4.85.07s-3.58-.012-4.85-.07c-1.17-.054-1.8-.25-2.23-.41a3.75 3.75 0 0 1-1.38-.9 3.75 3.75 0 0 1-.9-1.38c-.16-.42-.36-1.06-.41-2.23C2.172 15.58 2.16 15.2 2.16 12s.012-3.58.07-4.85c.054-1.17.25-1.8.41-2.23.22-.56.48-.96.9-1.38.42-.42.82-.68 1.38-.9.42-.16 1.06-.36 2.23-.41C8.42 2.172 8.8 2.16 12 2.16M12 0C8.74 0 8.33.014 7.05.072 5.78.13 4.9.336 4.14.63a5.92 5.92 0 0 0-2.14 1.39A5.92 5.92 0 0 0 .63 4.14C.336 4.9.13 5.78.072 7.05.014 8.33 0 8.74 0 12s.014 3.67.072 4.95c.058 1.27.264 2.15.558 2.91.3.79.71 1.46 1.39 2.14.68.68 1.35 1.09 2.14 1.39.76.294 1.64.5 2.91.558C8.33 23.986 8.74 24 12 24s3.67-.014 4.95-.072c1.27-.058 2.15-.264 2.91-.558a5.92 5.92 0 0 0 2.14-1.39 5.92 5.92 0 0 0 1.39-2.14c.294-.76.5-1.64.558-2.91.058-1.28.072-1.69.072-4.95s-.014-3.67-.072-4.95c-.058-1.27-.264-2.15-.558-2.91a5.92 5.92 0 0 0-1.39-2.14A5.92 5.92 0 0 0 19.86.63C19.1.336 18.22.13 16.95.072 15.67.014 15.26 0 12 0z"
+                  />
+                  <path fill="url(#igGradient)" d="M12 5.84A6.16 6.16 0 1 0 12 18.16 6.16 6.16 0 0 0 12 5.84zm0 10.16A4 4 0 1 1 12 8a4 4 0 0 1 0 8z"/>
+                  <circle fill="url(#igGradient)" cx="18.41" cy="5.59" r="1.44"/>
+                </svg>
+                <span class="provider-icon-label">Instagram Ads</span>
+              </button>
+              <button
+                type="button"
+                class="provider-icon-tile"
+                aria-label="Connect Google Ads"
+                title="Google Ads"
+                @click="requestLeadOAuth('google_ads')"
+              >
+                <svg viewBox="0 0 24 24" width="28" height="28" aria-hidden="true">
+                  <path fill="#FBBC04" d="M3.96 11.92 9.46 2.4a3.42 3.42 0 0 1 4.66-1.25 3.42 3.42 0 0 1 1.25 4.66l-5.5 9.52A3.42 3.42 0 0 1 5.21 16.6a3.42 3.42 0 0 1-1.25-4.68z"/>
+                  <path fill="#4285F4" d="M20.04 22h-2.1l-6.2-10.74 3.4-1.96L21.3 19.4a1.71 1.71 0 0 1-.62 2.34c-.27.16-.43.26-.64.26z"/>
+                  <circle fill="#34A853" cx="5.43" cy="18.57" r="3.43"/>
+                </svg>
+                <span class="provider-icon-label">Google Ads</span>
+              </button>
+              <button
+                type="button"
+                class="provider-icon-tile"
+                aria-label="Connect Google Forms"
+                title="Google Forms"
+                @click="requestLeadOAuth('google_forms')"
+              >
+                <svg viewBox="0 0 24 24" width="28" height="28" aria-hidden="true">
+                  <path fill="#673AB7" d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6z"/>
+                  <path fill="#9575CD" d="M14 2v6h6l-6-6z"/>
+                  <path fill="#FFFFFF" d="M7.7 11.3 8.85 12.4l1.8-1.85.7.7-2.5 2.55-1.85-1.85.7-.7zm4.05.3h4.5v1.1h-4.5v-1.1zm-4.05 3.05L8.85 15.7l1.8-1.85.7.7-2.5 2.55-1.85-1.85.7-.7zm4.05.4h4.5v1.1h-4.5v-1.1z"/>
+                </svg>
+                <span class="provider-icon-label">Google Forms</span>
+              </button>
+            </div>
+          </article>
+
+          <article class="dashboard-card">
+            <div class="members-card-head">
+              <div>
+                <h3>Create Nokvo form</h3>
+                <p>Public lead form with a required call-consent checkbox. Name and phone are added automatically.</p>
+              </div>
+            </div>
+            <div class="nokvo-form-builder">
+              <label class="kb-field">
+                <span>Form name</span>
+                <input v-model="nokvoLeadForm.name" type="text" placeholder="Site visit enquiry" />
+              </label>
+              <label class="kb-field kb-field-wide">
+                <span>Call-consent text</span>
+                <input v-model="nokvoLeadForm.consent_text" type="text" />
+              </label>
+
+              <div class="nokvo-form-fields">
+                <div class="nokvo-form-fields-head">
+                  <span>Custom fields</span>
+                  <button type="button" class="ghost-button compact" @click="addNokvoFormField">
+                    <Plus :size="14" />
+                    Add field
+                  </button>
+                </div>
+                <p v-if="!nokvoLeadForm.fields.length" class="nokvo-form-empty">
+                  No custom fields yet. Name, Phone, and the consent checkbox are always included.
+                </p>
+                <div
+                  v-for="(field, index) in nokvoLeadForm.fields"
+                  :key="index"
+                  class="nokvo-form-field-row"
+                >
+                  <input
+                    v-model="field.label"
+                    type="text"
+                    class="nokvo-form-field-label"
+                    placeholder="Field label (e.g. Email)"
+                  />
+                  <select v-model="field.type" class="nokvo-form-field-type">
+                    <option v-for="opt in NOKVO_FORM_FIELD_TYPES" :key="opt.value" :value="opt.value">
+                      {{ opt.label }}
+                    </option>
+                  </select>
+                  <label class="nokvo-form-field-required">
+                    <input type="checkbox" v-model="field.required" />
+                    <span>Required</span>
+                  </label>
+                  <button
+                    type="button"
+                    class="nokvo-form-field-remove"
+                    aria-label="Remove field"
+                    @click="removeNokvoFormField(index)"
+                  >
+                    <Trash2 :size="14" />
+                  </button>
+                </div>
+              </div>
+            </div>
+            <div class="kb-card-actions">
+              <button type="button" class="primary-button compact" @click="createNokvoLeadForm">
+                <Plus :size="15" />
+                Create form link
+              </button>
+            </div>
+            <div v-if="lastNokvoFormLink" class="nokvo-form-link-callout">
+              <strong>Share this URL with leads:</strong>
+              <code>{{ lastNokvoFormLink }}</code>
+              <button type="button" class="ghost-button compact" @click="copyNokvoFormLink">
+                Copy link
+              </button>
+            </div>
+          </article>
+
+        </div>
+
         <div class="outgoing-tabs">
           <button type="button" :class="{ active: outgoingTab === 'leads' }" @click="outgoingTab = 'leads'">
             <Users :size="15" />
             Leads
-          </button>
-          <button type="button" :class="{ active: outgoingTab === 'connections' }" @click="outgoingTab = 'connections'">
-            <Globe :size="15" />
-            Connections
           </button>
           <button type="button" :class="{ active: outgoingTab === 'forms' }" @click="outgoingTab = 'forms'">
             <FileText :size="15" />
@@ -5930,159 +6223,13 @@ onBeforeUnmount(() => {
             <PhoneCall :size="15" />
             Campaigns
           </button>
+          <button type="button" :class="{ active: outgoingTab === 'tester' }" @click="outgoingTab = 'tester'">
+            <Mic :size="15" />
+            Tester
+          </button>
         </div>
 
-        <section v-if="outgoingTab === 'connections'" class="dashboard-grid agent-page-grid">
-          <article class="dashboard-card">
-            <div class="members-card-head">
-              <div>
-                <h3>Ad &amp; form connections</h3>
-                <p>OAuth connects source systems. Imported leads still need consent fields or form-level call consent before campaigns can use them.</p>
-              </div>
-            </div>
-            <div class="provider-grid provider-grid-dual outgoing-provider-grid">
-              <button type="button" class="provider-option" @click="requestLeadOAuth('meta_ads', 'facebook_ads')">
-                <strong class="provider-name">Facebook Ads</strong>
-                <small>Connect Facebook Page lead forms through Meta Lead Ads Retrieval.</small>
-              </button>
-              <button type="button" class="provider-option" @click="requestLeadOAuth('meta_ads', 'instagram_ads')">
-                <strong class="provider-name">Instagram Ads</strong>
-                <small>Connect Instagram instant-form leads through Meta Business access.</small>
-              </button>
-              <button type="button" class="provider-option" @click="requestLeadOAuth('google_ads')">
-                <strong class="provider-name">Google Ads</strong>
-                <small>Lead form submissions from a configured Google Ads customer ID.</small>
-              </button>
-              <button type="button" class="provider-option" @click="requestLeadOAuth('google_forms')">
-                <strong class="provider-name">Google Forms</strong>
-                <small>Read form responses from registered Google Forms.</small>
-              </button>
-            </div>
-          </article>
-
-          <article class="dashboard-card">
-            <div class="members-card-head">
-              <div>
-                <h3>Connected sources</h3>
-                <p>Sync pulls forms and leads into Nokvo's consent gate.</p>
-              </div>
-              <span class="status-chip">{{ leadConnections.length }} connected</span>
-            </div>
-            <div class="agent-document-list">
-              <div v-if="!leadConnections.length" class="empty-state compact">No lead sources connected yet.</div>
-              <div v-for="connection in leadConnections" :key="connection.id" class="agent-document-row">
-                <div class="agent-document-main">
-                  <div class="agent-document-icon">
-                    <Globe :size="18" />
-                  </div>
-                  <div>
-                    <strong>{{ connection.display_name }}</strong>
-                    <small>{{ connection.provider }} · {{ connection.status }}<template v-if="connection.last_sync_at"> · synced {{ formatRelativeDate(connection.last_sync_at) }}</template></small>
-                    <div v-if="connection.provider === 'google_ads'" class="outgoing-inline-editor">
-                      <input v-model="connectionAccountInputs[connection.id]" class="db-input compact" type="text" placeholder="Google Ads customer ID" />
-                      <button type="button" class="ghost-button compact" @click="saveConnectionAccount(connection)">Save</button>
-                    </div>
-                    <p v-if="connection.last_error" class="agent-warning">{{ connection.last_error }}</p>
-                  </div>
-                </div>
-                <button
-                  type="button"
-                  class="primary-button compact"
-                  :disabled="isSyncingLeadConnection === connection.id"
-                  @click="syncLeadConnection(connection.id)"
-                >
-                  <Search :size="15" />
-                  {{ isSyncingLeadConnection === connection.id ? 'Syncing…' : 'Sync' }}
-                </button>
-              </div>
-            </div>
-          </article>
-        </section>
-
-        <section v-else-if="outgoingTab === 'forms'" class="dashboard-grid agent-page-grid">
-          <article class="dashboard-card">
-            <div class="members-card-head">
-              <div>
-                <h3>Create Nokvo form</h3>
-                <p>Creates a public lead form link with a required call-consent checkbox.</p>
-              </div>
-            </div>
-            <div class="kb-form-grid">
-              <label class="kb-field">
-                <span>Form name</span>
-                <input v-model="nokvoLeadForm.name" type="text" placeholder="Site visit enquiry" />
-              </label>
-              <label class="kb-field kb-field-wide">
-                <span>Call consent text</span>
-                <input v-model="nokvoLeadForm.consent_text" type="text" />
-              </label>
-            </div>
-            <div class="kb-card-actions">
-              <button type="button" class="primary-button compact" @click="createNokvoLeadForm">
-                <Plus :size="15" />
-                Create form link
-              </button>
-            </div>
-          </article>
-
-          <article class="dashboard-card">
-            <div class="members-card-head">
-              <div>
-                <h3>Register external form</h3>
-                <p>Map Google Forms or ad form fields and define where call consent is stored.</p>
-              </div>
-            </div>
-            <div class="kb-form-grid">
-              <label class="kb-field">
-                <span>Provider</span>
-                <select v-model="externalLeadForm.provider">
-                  <option value="google_forms">Google Forms</option>
-                  <option value="meta_ads">Meta Ads</option>
-                  <option value="google_ads">Google Ads</option>
-                </select>
-              </label>
-              <label class="kb-field">
-                <span>Connection</span>
-                <select v-model="externalLeadForm.source_connection_id">
-                  <option value="">None</option>
-                  <option v-for="connection in leadConnections" :key="connection.id" :value="connection.id">
-                    {{ connection.display_name }}
-                  </option>
-                </select>
-              </label>
-              <label class="kb-field">
-                <span>Form name</span>
-                <input v-model="externalLeadForm.name" type="text" placeholder="Google Form leads" />
-              </label>
-              <label class="kb-field">
-                <span>Provider form ID</span>
-                <input v-model="externalLeadForm.provider_form_id" type="text" placeholder="1FAIpQL..." />
-              </label>
-              <label class="kb-field">
-                <span>Consent field key</span>
-                <input v-model="externalLeadForm.consent_field_key" type="text" placeholder="call_consent" />
-              </label>
-              <label class="kb-field">
-                <span>Consent text</span>
-                <input v-model="externalLeadForm.consent_text" type="text" placeholder="I agree to receive a call..." />
-              </label>
-              <label class="kb-field kb-field-wide">
-                <span>Field mapping JSON</span>
-                <textarea v-model="externalLeadForm.field_mapping" class="kb-prompt-textarea compact"></textarea>
-              </label>
-              <label class="custom-tab-required-toggle">
-                <input type="checkbox" v-model="externalLeadForm.default_call_consent" />
-                form submission itself is call consent
-              </label>
-            </div>
-            <div class="kb-card-actions">
-              <button type="button" class="primary-button compact" @click="registerExternalLeadForm">
-                <CheckCircle2 :size="15" />
-                Register form
-              </button>
-            </div>
-          </article>
-
+        <section v-if="outgoingTab === 'forms'" class="dashboard-grid agent-page-grid">
           <article class="dashboard-card wide-card">
             <div class="members-card-head">
               <div>
@@ -6155,6 +6302,192 @@ onBeforeUnmount(() => {
               </div>
             </article>
           </div>
+        </section>
+
+        <section v-else-if="outgoingTab === 'tester'" class="dashboard-grid agent-page-grid">
+          <article class="dashboard-card">
+            <div class="members-card-head">
+              <div>
+                <h3>Outbound tester</h3>
+                <p>Rehearse the outbound agent live. Edit the goal, objectives, and tone, then call into the same pipeline that drives campaigns — no campaign row required.</p>
+              </div>
+            </div>
+            <div class="outbound-tester-form">
+              <label class="kb-field">
+                <span>Caller name</span>
+                <input v-model="outboundTester.caller_name" type="text" placeholder="Riya" />
+              </label>
+              <label class="kb-field">
+                <span>Company name</span>
+                <input v-model="outboundTester.company_name" type="text" placeholder="Raghava Constructions" />
+              </label>
+              <label class="kb-field kb-field-wide">
+                <span>Pitch summary <em>(one-liner the agent says in the opener)</em></span>
+                <input v-model="outboundTester.pitch_summary" type="text" placeholder="our new 2BHK apartments in Kompally starting at 78 lakhs" />
+              </label>
+              <label class="kb-field">
+                <span>Objective</span>
+                <select v-model="outboundTester.objective" :disabled="voice.status !== 'idle' && voice.status !== 'error'">
+                  <option v-for="opt in OUTBOUND_OBJECTIVE_OPTIONS" :key="opt.value" :value="opt.value">
+                    {{ opt.label }}
+                  </option>
+                </select>
+              </label>
+              <label class="kb-field">
+                <span>Language</span>
+                <select v-model="outboundTester.language" :disabled="voice.status !== 'idle' && voice.status !== 'error'">
+                  <option v-for="opt in voiceLanguageOptions" :key="opt.value" :value="opt.value">
+                    {{ opt.label }}
+                  </option>
+                </select>
+              </label>
+              <label class="kb-field kb-field-wide">
+                <span>Goal <em>(plain-language, e.g. "book demo for Saturday")</em></span>
+                <input v-model="outboundTester.goal" type="text" placeholder="Confirm the prospect can take a 15-minute site visit this week." />
+              </label>
+              <label class="kb-field">
+                <span>Session name</span>
+                <input v-model="outboundTester.name" type="text" placeholder="Outbound test call" />
+              </label>
+              <label class="kb-field kb-field-wide">
+                <span>System prompt (optional)</span>
+                <textarea v-model="outboundTester.agent_prompt" rows="3" placeholder="Drive a single-prompt persona, e.g. 'You're a Raghava sales rep confirming Saturday site visits in Kompally'. Leave blank to use the default outbound persona."></textarea>
+              </label>
+              <div class="kb-field kb-field-wide outbound-tester-doc">
+                <span>Reference document (optional)</span>
+                <p class="outbound-tester-hint">
+                  One PDF / DOCX / TXT. The agent grounds itself in this brief during the call. Use a prompt, a doc, or both.
+                </p>
+                <div class="outbound-tester-doc-row">
+                  <label class="ghost-button compact outbound-tester-doc-pick">
+                    <Upload :size="14" />
+                    <span>{{ outboundTester.doc_filename ? 'Replace document' : 'Choose document' }}</span>
+                    <input
+                      type="file"
+                      accept=".pdf,.docx,.doc,.txt,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain"
+                      @change="onOutboundTesterDocSelected"
+                    />
+                  </label>
+                  <button
+                    v-if="outboundTester.doc_filename"
+                    type="button"
+                    class="ghost-button compact danger"
+                    @click="clearOutboundTesterDoc"
+                  >
+                    <Trash2 :size="14" />
+                    Remove
+                  </button>
+                </div>
+                <p v-if="outboundTester.doc_filename" class="outbound-tester-doc-name">
+                  <FileText :size="14" />
+                  <span>{{ outboundTester.doc_filename }}</span>
+                  <span v-if="outboundTester.doc_chars" class="outbound-tester-doc-chars">{{ outboundTester.doc_chars.toLocaleString() }} characters parsed</span>
+                </p>
+              </div>
+              <label class="kb-field kb-field-wide">
+                <span>Objectives (one per line)</span>
+                <textarea v-model="outboundTester.objectives" rows="3"></textarea>
+              </label>
+              <label class="kb-field kb-field-wide">
+                <span>Exit conditions (one per line)</span>
+                <textarea v-model="outboundTester.exit_conditions" rows="2"></textarea>
+              </label>
+              <label class="kb-field">
+                <span>Tone</span>
+                <input v-model="outboundTester.tone" type="text" placeholder="warm, direct, and respectful" />
+              </label>
+            </div>
+          </article>
+
+          <article class="dashboard-card voice-tester-card outbound-tester-call">
+            <div class="kb-card-head">
+              <div class="kb-card-icon kb-card-icon-primary">
+                <Mic :size="18" />
+              </div>
+              <div>
+                <h4>Live test call</h4>
+                <p>Click Start, talk to the agent, and watch the same STT → LLM → TTS pipeline campaigns use.</p>
+              </div>
+              <div class="voice-status-badge" :class="`voice-status-${voice.status}`">
+                <span class="voice-status-dot"></span>
+                {{ voice.status }}
+              </div>
+            </div>
+
+            <div class="voice-controls">
+              <button
+                v-if="voice.status === 'idle' || voice.status === 'error'"
+                type="button"
+                class="primary-button compact"
+                @click="startVoiceCall('outbound')"
+              >
+                <PhoneCall :size="15" />
+                Start Test Call
+              </button>
+              <button
+                v-else
+                type="button"
+                class="ghost-button compact"
+                @click="endVoiceCall"
+              >
+                <Square :size="15" />
+                End Call
+              </button>
+              <button
+                type="button"
+                class="ghost-button compact"
+                :disabled="!voice.ws"
+                @click="sendTextToVoiceAgent"
+                title="Send a text-only turn through the same pipeline"
+              >
+                <MessageSquare :size="15" />
+                Send Text Turn
+              </button>
+              <input
+                v-if="voice.ws"
+                v-model="chatInput"
+                type="text"
+                class="voice-text-input"
+                placeholder="Type a reply to send through the pipeline"
+                @keyup.enter="sendTextToVoiceAgent"
+              />
+            </div>
+
+            <div v-if="voice.errorMsg" class="message error dashboard-message">{{ voice.errorMsg }}</div>
+
+            <div class="voice-live-row" v-if="voice.liveTranscript">
+              <Radio :size="14" />
+              <em>{{ voice.liveTranscript }}</em>
+              <span v-if="voice.transcriptLang" class="kb-pill kb-pill-soft">{{ voice.transcriptLang }}</span>
+            </div>
+
+            <div class="voice-latency-row" v-if="voice.firstSentenceMs || voice.ttsFirstAudioMs">
+              <span v-if="voice.firstSentenceMs">LLM first sentence: <strong>{{ voice.firstSentenceMs }}ms</strong></span>
+              <span v-if="voice.ttsFirstAudioMs">TTS first audio: <strong>{{ voice.ttsFirstAudioMs }}ms</strong></span>
+              <span v-if="voice.callId">call: <code>{{ voice.callId.slice(0, 8) }}</code></span>
+            </div>
+
+            <div v-if="!voice.turns.length && voice.status === 'idle'" class="kb-empty voice-empty">
+              Set the goal on the left, hit Start Test Call, and the agent will open the conversation.
+            </div>
+
+            <div class="voice-turns">
+              <div v-for="turn in voice.turns" :key="turn.id" class="voice-turn">
+                <div class="voice-turn-user">
+                  <strong>You</strong>
+                  <span>{{ turn.query }}</span>
+                </div>
+                <div class="voice-turn-agent">
+                  <strong>Agent</strong>
+                  <span>{{ turn.answer || turn.sentences.join(' ') }}</span>
+                </div>
+                <div class="voice-turn-meta">
+                  <span v-if="turn.latencyMs">{{ turn.latencyMs }}ms</span>
+                  <span v-if="turn.cacheHit" class="kb-pill kb-pill-soft">cache</span>
+                </div>
+              </div>
+            </div>
+          </article>
         </section>
 
         <section v-else class="dashboard-card campaign-card">
@@ -9783,6 +10116,29 @@ onBeforeUnmount(() => {
   background: rgba(255, 255, 255, 0.68);
 }
 
+.agent-document-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.ghost-button.compact.danger {
+  color: #8a1f1f;
+  border-color: rgba(220, 64, 64, 0.45);
+}
+
+.ghost-button.compact.danger:hover:not(:disabled) {
+  background: rgba(220, 64, 64, 0.08);
+}
+
+.ghost-button.compact.danger:disabled {
+  color: rgba(138, 31, 31, 0.5);
+  border-color: rgba(220, 64, 64, 0.2);
+  cursor: not-allowed;
+}
+
 .agent-document-row.active,
 .agent-document-row.toolkit-list-row:hover {
   border-color: rgba(27, 28, 21, 0.28);
@@ -10156,6 +10512,276 @@ onBeforeUnmount(() => {
   display: flex;
   flex-wrap: wrap;
   gap: 0.55rem;
+}
+
+.outgoing-connections-pinned {
+  margin: 0.5rem 0 1.25rem;
+}
+
+.outbound-tester-form {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.7rem;
+  margin-top: 0.6rem;
+}
+
+.outbound-tester-form .kb-field-wide {
+  grid-column: 1 / -1;
+}
+
+.outbound-tester-form textarea {
+  border: 1px solid rgba(27, 28, 21, 0.16);
+  background: #fff;
+  border-radius: 8px;
+  padding: 0.55rem 0.7rem;
+  font-size: 0.85rem;
+  font-family: inherit;
+  color: #1b1c15;
+  resize: vertical;
+}
+
+.outbound-tester-call {
+  align-self: start;
+}
+
+.outbound-tester-doc {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.outbound-tester-hint {
+  margin: 0;
+  font-size: 0.78rem;
+  color: #5f5f53;
+}
+
+.outbound-tester-doc-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  flex-wrap: wrap;
+}
+
+.outbound-tester-doc-pick {
+  cursor: pointer;
+}
+
+.outbound-tester-doc-pick input[type="file"] {
+  display: none;
+}
+
+.outbound-tester-doc-name {
+  margin: 0.2rem 0 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.82rem;
+  color: #1b1c15;
+}
+
+.outbound-tester-doc-chars {
+  color: #5f5f53;
+  font-size: 0.74rem;
+}
+
+.org-shell.dark .outbound-tester-hint,
+.org-shell.dark .outbound-tester-doc-chars {
+  color: rgba(244, 240, 225, 0.7);
+}
+
+.org-shell.dark .outbound-tester-doc-name {
+  color: #f4f0e1;
+}
+
+.org-shell.dark .outbound-tester-form textarea {
+  background: rgba(28, 29, 24, 0.6);
+  border-color: rgba(244, 240, 225, 0.2);
+  color: #f4f0e1;
+}
+
+.nokvo-form-builder {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.75rem;
+  margin-top: 0.6rem;
+}
+
+.nokvo-form-builder .kb-field-wide {
+  grid-column: 1 / -1;
+}
+
+.nokvo-form-fields {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding-top: 0.55rem;
+  border-top: 1px dashed rgba(27, 28, 21, 0.16);
+  margin-top: 0.25rem;
+}
+
+.nokvo-form-fields-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-family: Manrope, sans-serif;
+  font-size: 0.82rem;
+  color: #5f5f53;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.nokvo-form-empty {
+  margin: 0;
+  font-size: 0.8rem;
+  color: #5f5f53;
+}
+
+.nokvo-form-field-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(0, 0.9fr) auto auto;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.nokvo-form-field-label,
+.nokvo-form-field-type {
+  border: 1px solid rgba(27, 28, 21, 0.16);
+  background: #fff;
+  border-radius: 8px;
+  padding: 0.5rem 0.65rem;
+  font-size: 0.85rem;
+  font-family: inherit;
+  color: #1b1c15;
+}
+
+.nokvo-form-field-required {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.8rem;
+  color: #5f5f53;
+  white-space: nowrap;
+}
+
+.nokvo-form-field-remove {
+  border: 1px solid rgba(220, 64, 64, 0.4);
+  background: transparent;
+  color: #8a1f1f;
+  border-radius: 999px;
+  width: 1.95rem;
+  height: 1.95rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.nokvo-form-field-remove:hover {
+  background: rgba(220, 64, 64, 0.08);
+}
+
+.nokvo-form-link-callout {
+  margin-top: 0.85rem;
+  background: rgba(27, 28, 21, 0.04);
+  border: 1px solid rgba(27, 28, 21, 0.1);
+  border-radius: 10px;
+  padding: 0.7rem 0.85rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  align-items: flex-start;
+}
+
+.nokvo-form-link-callout code {
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.78rem;
+  word-break: break-all;
+  color: #1b1c15;
+}
+
+.org-shell.dark .nokvo-form-field-label,
+.org-shell.dark .nokvo-form-field-type {
+  background: rgba(28, 29, 24, 0.6);
+  border-color: rgba(244, 240, 225, 0.2);
+  color: #f4f0e1;
+}
+
+.org-shell.dark .nokvo-form-fields,
+.org-shell.dark .nokvo-form-link-callout {
+  border-color: rgba(244, 240, 225, 0.18);
+}
+
+.org-shell.dark .nokvo-form-link-callout {
+  background: rgba(28, 29, 24, 0.55);
+}
+
+.org-shell.dark .nokvo-form-link-callout code {
+  color: #f4f0e1;
+}
+
+.org-shell.dark .nokvo-form-empty,
+.org-shell.dark .nokvo-form-fields-head,
+.org-shell.dark .nokvo-form-field-required {
+  color: rgba(244, 240, 225, 0.72);
+}
+
+.outgoing-provider-stack {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 0.6rem;
+  margin-top: 1rem;
+}
+
+@media (min-width: 960px) {
+  .outgoing-provider-stack {
+    grid-template-columns: repeat(4, 1fr);
+  }
+}
+
+.provider-icon-tile {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.55rem;
+  padding: 1.05rem 0.85rem;
+  border-radius: 12px;
+  border: 1px solid rgba(27, 28, 21, 0.12);
+  background: rgba(255, 255, 255, 0.85);
+  color: #1b1c15;
+  cursor: pointer;
+  font-family: Manrope, sans-serif;
+  transition: background 0.15s ease, transform 0.15s ease, border-color 0.15s ease;
+  text-align: center;
+}
+
+.provider-icon-tile:hover {
+  background: #ffffff;
+  border-color: rgba(27, 28, 21, 0.22);
+  transform: translateY(-1px);
+}
+
+.provider-icon-tile svg {
+  flex-shrink: 0;
+}
+
+.provider-icon-label {
+  font-size: 0.9rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.org-shell.dark .provider-icon-tile {
+  background: rgba(28, 29, 24, 0.75);
+  border-color: rgba(244, 240, 225, 0.18);
+  color: #f4f0e1;
+}
+
+.org-shell.dark .provider-icon-tile:hover {
+  background: rgba(28, 29, 24, 0.92);
+  border-color: rgba(244, 240, 225, 0.28);
 }
 
 .outgoing-tabs button {

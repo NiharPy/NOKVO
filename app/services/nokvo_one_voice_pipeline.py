@@ -622,6 +622,52 @@ class NokvoOneVoicePipeline:
         }
 
     @staticmethod
+    def _chunks_from_outbound_doc(
+        outbound_context: OutboundCampaignContext | None,
+    ) -> list[dict[str, Any]]:
+        """Materialize the campaign-supplied brief as retrieval chunks.
+
+        Outbound is a different agent from inbound — its only data source
+        is whatever the operator pinned into the campaign config (the
+        ``doc_text`` field on :class:`OutboundCampaignContext`). We
+        return Qdrant-shaped chunks so the existing prompt builder
+        composes them the same way it does inbound retrievals. The
+        agent_prompt rides through the separate outbound system fragment
+        and does not need to be a chunk.
+        """
+        if outbound_context is None:
+            return []
+        text = (getattr(outbound_context, "doc_text", "") or "").strip()
+        if not text:
+            return []
+        # Split into ~350-word chunks so a long campaign brief doesn't
+        # blow the context window on a single LLM call. The reader sees
+        # them as ordered excerpts from "Campaign Brief".
+        words_per_chunk = 350
+        words = text.split()
+        out: list[dict[str, Any]] = []
+        for i in range(0, len(words), words_per_chunk):
+            slice_text = " ".join(words[i : i + words_per_chunk]).strip()
+            if not slice_text:
+                continue
+            out.append(
+                {
+                    "text": slice_text,
+                    "score": 1.0,
+                    "chunk_id": f"outbound_doc_chunk_{i // words_per_chunk}",
+                    "document_id": "outbound_campaign_brief",
+                    "document_name": "Campaign Brief",
+                    "metadata": {"source": "outbound_campaign", "approved": True},
+                }
+            )
+            if len(out) >= 6:
+                # Cap at 6 chunks so a very long brief doesn't dominate
+                # the prompt; the system fragment already carries the
+                # persona + objectives.
+                break
+        return out
+
+    @staticmethod
     def _expand_parent_section(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Replace a chunk's text with its parent section when the chunk came
         from a likely table/list section (cancellation/refund/policy). Sliced
@@ -3789,7 +3835,20 @@ class NokvoOneVoicePipeline:
         intent_result: IntentResult = route["intent_result"]
         bundle: RuntimeBundle = turn_cache["bundle"]
         single_prompt_guidance = bundle.single_prompt_guidance
-        if route["route"] in {"template", "answer_card", "policy_card"}:
+        # Outbound is a different agent — inbound tenant ``answer_card`` /
+        # ``policy_card`` matches must NOT short-circuit it. Smalltalk
+        # ``template`` replies (greetings, thanks) remain harmless and
+        # stay shared.
+        _outbound_active = bool(outbound_context) and (
+            bool((getattr(outbound_context, "doc_text", "") or "").strip())
+            or bool(outbound_context.agent_prompt.strip())
+        )
+        _deterministic_routes = (
+            {"template"}
+            if _outbound_active
+            else {"template", "answer_card", "policy_card"}
+        )
+        if route["route"] in _deterministic_routes:
             answer = route["answer"]
             yield {"type": "sentence", "text": answer, "language": language, "cache_hit": False}
             await NokvoOneVoicePipeline._apply_route_state(tenant_res, call_id, route)
@@ -3917,51 +3976,74 @@ class NokvoOneVoicePipeline:
             }
             return
 
-        cached = None
-        if not intent_result.sensitive:
-            cached = await AgentSessionStore.get_cached_answer(
-                tenant_res, retrieval_query, language, campaign_id=campaign_id
-            )
-        if cached and cached.get("answer"):
-            answer = str(cached["answer"])
-            yield {"type": "sentence", "text": answer, "language": language, "cache_hit": True}
-            await AgentSessionStore.append_turn(tenant_res, call_id, user_text, answer)
-            yield {
-                "type": "final",
-                "answer": answer,
-                "refused": False,
-                "chunks": cached.get("chunks") or [],
-                "citations": cached.get("citations") or [],
-                "runtime": {"graph": "nokvo_rag_pipeline", "mode": "semantic_cache", "latency_ms": int((perf_counter() - started) * 1000)},
-            }
-            return
+        # Outbound is a *different* agent: it doesn't read the inbound KB,
+        # and the tenant's inbound single-prompt guidance does not apply.
+        # The campaign's own ``agent_prompt`` + ``doc_text`` are the entire
+        # source. We synthesize chunks from the doc text so the existing
+        # prompt-assembly path keeps working without a second LLM call site.
+        outbound_mode = bool(outbound_context) and (
+            bool((getattr(outbound_context, "doc_text", "") or "").strip())
+            or bool(outbound_context.agent_prompt.strip())
+        )
+        if outbound_mode:
+            single_prompt_guidance = ""
+            chunks = NokvoOneVoicePipeline._chunks_from_outbound_doc(outbound_context)
+            citations = [
+                {
+                    "document_id": chunk.get("document_id"),
+                    "document_name": chunk.get("document_name"),
+                    "chunk_id": chunk.get("chunk_id"),
+                    "score": chunk.get("score"),
+                }
+                for chunk in chunks
+            ]
+            retrieval = {"chunks": chunks, "refusal": None}
+        else:
+            cached = None
+            if not intent_result.sensitive:
+                cached = await AgentSessionStore.get_cached_answer(
+                    tenant_res, retrieval_query, language, campaign_id=campaign_id
+                )
+            if cached and cached.get("answer"):
+                answer = str(cached["answer"])
+                yield {"type": "sentence", "text": answer, "language": language, "cache_hit": True}
+                await AgentSessionStore.append_turn(tenant_res, call_id, user_text, answer)
+                yield {
+                    "type": "final",
+                    "answer": answer,
+                    "refused": False,
+                    "chunks": cached.get("chunks") or [],
+                    "citations": cached.get("citations") or [],
+                    "runtime": {"graph": "nokvo_rag_pipeline", "mode": "semantic_cache", "latency_ms": int((perf_counter() - started) * 1000)},
+                }
+                return
 
-        # Reuse the probe retrieval done by _route_turn when it overrode
-        # an out_of_scope decision — avoids a duplicate embed+Qdrant call
-        # on the hot path.
-        retrieval = await NokvoOneVoicePipeline._await_prefetched_retrieval(route)
-        if not retrieval:
-            retrieval = await NokvoOneVoicePipeline.retrieve(
-                tenant_res,
-                retrieval_query,
-                db=db,
-                top_k=top_k,
-                campaign_id=campaign_id,
-                intent_result=intent_result,
-                english_text=english_text,
-                dual_retrieval=code_switching,
-            )
-        chunks = retrieval.get("chunks") or []
-        citations = [
-            {
-                "document_id": chunk.get("document_id"),
-                "document_name": chunk.get("document_name"),
-                "chunk_id": chunk.get("chunk_id"),
-                "score": chunk.get("score"),
-            }
-            for chunk in chunks
-        ]
-        if not chunks and not single_prompt_guidance:
+            # Reuse the probe retrieval done by _route_turn when it overrode
+            # an out_of_scope decision — avoids a duplicate embed+Qdrant call
+            # on the hot path.
+            retrieval = await NokvoOneVoicePipeline._await_prefetched_retrieval(route)
+            if not retrieval:
+                retrieval = await NokvoOneVoicePipeline.retrieve(
+                    tenant_res,
+                    retrieval_query,
+                    db=db,
+                    top_k=top_k,
+                    campaign_id=campaign_id,
+                    intent_result=intent_result,
+                    english_text=english_text,
+                    dual_retrieval=code_switching,
+                )
+            chunks = retrieval.get("chunks") or []
+            citations = [
+                {
+                    "document_id": chunk.get("document_id"),
+                    "document_name": chunk.get("document_name"),
+                    "chunk_id": chunk.get("chunk_id"),
+                    "score": chunk.get("score"),
+                }
+                for chunk in chunks
+            ]
+        if not chunks and not single_prompt_guidance and not outbound_mode:
             answer, refused = NokvoOneVoicePipeline._no_context_answer(
                 user_text,
                 intent=intent_result.intent,
