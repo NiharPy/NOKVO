@@ -148,6 +148,7 @@ class QdrantService:
                     payload=payload,
                 )
             )
+        await QdrantService._enforce_tenant_quota(collection_name, tenant_res, client, point_structs)
         client.upsert(collection_name=collection_name, points=point_structs)
         await QdrantService._audit(
             db,
@@ -188,6 +189,42 @@ class QdrantService:
             {"tenant_id": tenant_res.tenant_id, "limit": limit, "results_count": len(results)},
         )
         return results
+
+    @staticmethod
+    async def _tenant_point_count(collection_name: str, tenant_res: TenantResources, client: QdrantClient) -> int:
+        def _count() -> int:
+            response = client.count(
+                collection_name=collection_name,
+                count_filter=QdrantService._payload_filter(tenant_res),
+                exact=True,
+            )
+            return int(getattr(response, "count", 0) or 0)
+
+        return await asyncio.to_thread(_count)
+
+    @staticmethod
+    async def _enforce_tenant_quota(
+        collection_name: str,
+        tenant_res: TenantResources,
+        client: QdrantClient,
+        point_structs: list[PointStruct],
+    ) -> None:
+        if not point_structs:
+            return
+        max_batch = int(settings.QDRANT_MAX_UPSERT_POINTS or 0)
+        if max_batch > 0 and len(point_structs) > max_batch:
+            raise RuntimeError(
+                f"Qdrant upsert batch exceeds tenant limit ({len(point_structs)} > {max_batch})"
+            )
+        max_points = int(settings.QDRANT_MAX_POINTS_PER_TENANT or 0)
+        if max_points <= 0:
+            return
+        current = await QdrantService._tenant_point_count(collection_name, tenant_res, client)
+        incoming = len({str(point.id) for point in point_structs})
+        if current + incoming > max_points:
+            raise RuntimeError(
+                f"Tenant Qdrant storage quota exceeded ({current + incoming} > {max_points} points)"
+            )
 
     @staticmethod
     async def scroll_points(

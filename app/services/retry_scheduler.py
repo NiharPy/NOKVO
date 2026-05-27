@@ -25,6 +25,7 @@ import logging
 from contextlib import suppress
 
 from app.db.session import AsyncSessionLocal
+from app.services.scheduler_leader import scheduler_leader
 from app.services.tool_retry_service import ToolRetryService
 
 
@@ -43,8 +44,14 @@ async def _drain_once() -> None:
     """One pass over the queue. Opens its own session so it doesn't
     contend with a request-scoped session."""
     try:
-        async with AsyncSessionLocal() as db:
-            report = await ToolRetryService.process_due(db)
+        async with scheduler_leader(
+            "tool-retry",
+            ttl_seconds=RETRY_DRAIN_INTERVAL_SECONDS,
+        ) as is_leader:
+            if not is_leader:
+                return
+            async with AsyncSessionLocal() as db:
+                report = await ToolRetryService.process_due(db)
         if report:
             logger.info("Retry drain processed %s entries: %s", len(report), report)
     except Exception:

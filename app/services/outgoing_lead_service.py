@@ -18,6 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
+from app.core import security
 from app.core.config import settings
 from app.core.secret_crypto import decrypt_secret, encrypt_secret
 from app.models.outgoing_lead import (
@@ -205,26 +206,32 @@ def _oauth_state(
     provider: str,
     mode: str,
 ) -> str:
-    return jwt.encode(
+    return security.create_oauth_state(
         {
             "tenant_id": tenant_id,
             "organization_id": str(organization_id),
             "user_id": str(user_id),
             "provider": provider,
             "mode": mode,
-            "nonce": secrets.token_urlsafe(12),
-            "exp": datetime.utcnow() + timedelta(minutes=20),
         },
-        settings.SECRET_KEY,
-        algorithm=settings.ALGORITHM,
+        purpose="lead_source_oauth",
+        ttl=timedelta(minutes=20),
     )
 
 
 def decode_oauth_state(state: str) -> dict[str, Any]:
     try:
-        return jwt.decode(state, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        return security.decode_oauth_state(state, expected_purpose="lead_source_oauth")
     except jwt.PyJWTError as exc:
-        raise OutgoingLeadServiceError("Invalid or expired OAuth state.") from exc
+        # Short-lived backwards compatibility for OAuth callbacks that were
+        # already in flight when state moved from JWT to HMAC-signed payloads.
+        try:
+            payload = jwt.decode(state, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        except jwt.PyJWTError:
+            raise OutgoingLeadServiceError("Invalid or expired OAuth state.") from exc
+        if not isinstance(payload, dict):
+            raise OutgoingLeadServiceError("Invalid or expired OAuth state.") from exc
+        return payload
 
 
 class OutgoingLeadService:
@@ -588,7 +595,7 @@ class OutgoingLeadService:
             key = field.get("key")
             if field.get("required") and key and fields.get(key) in (None, "", False):
                 raise OutgoingLeadServiceError(f"{field.get('label') or key} is required.")
-        return await OutgoingLeadService.upsert_lead(
+        lead = await OutgoingLeadService.upsert_lead(
             form.tenant_id,
             db,
             source_provider=LeadSourceProvider.nokvo_form,
@@ -598,6 +605,8 @@ class OutgoingLeadService:
             source_metadata=request_metadata,
             submitted_at=_now(),
         )
+        await _notify_inbound_lead(db, lead, source_label=form.name or "Nokvo form")
+        return lead
 
     @staticmethod
     async def register_external_form(
@@ -803,7 +812,7 @@ class OutgoingLeadService:
             for entry in (lead_payload.get("field_data") or [])
             if entry.get("name")
         }
-        return await OutgoingLeadService.upsert_lead(
+        lead = await OutgoingLeadService.upsert_lead(
             connection.tenant_id,
             db,
             source_provider=LeadSourceProvider.meta_ads,
@@ -814,6 +823,8 @@ class OutgoingLeadService:
             source_metadata=lead_payload,
             submitted_at=_parse_datetime(lead_payload.get("created_time")),
         )
+        await _notify_inbound_lead(db, lead, source_label=connection.display_name or "Meta")
+        return lead
 
     @staticmethod
     def _explain_meta_error(exc: httpx.HTTPStatusError, *, step: str) -> OutgoingLeadServiceError:
@@ -1130,3 +1141,65 @@ class OutgoingLeadService:
         await db.commit()
         await db.refresh(form)
         return form
+
+
+async def _notify_inbound_lead(
+    db: AsyncSession,
+    lead: OutgoingLead,
+    *,
+    source_label: str,
+) -> None:
+    """Emit a P1 ``inbound_lead`` notification for a freshly captured lead.
+
+    Called by the single-event capture paths (public form submit, Meta
+    webhook). Bulk scheduler syncs deliberately don't call this — they
+    roll up into one summary notification instead so the inbox doesn't
+    flood when a quiet provider catches up.
+
+    Best-effort: a notification failure is logged and swallowed so the
+    capture path keeps the lead row regardless.
+    """
+    try:
+        # Avoid heavy imports at module load so the lead path doesn't pay
+        # the cost when notifications aren't being emitted.
+        from app.models.notification import (
+            NOTIFICATION_INBOUND_LEAD,
+            SEVERITY_P1,
+        )
+        from app.services.notification_service import NotificationService
+
+        res = await db.execute(
+            select(TenantResources.organization_id).where(
+                TenantResources.tenant_id == lead.tenant_id
+            )
+        )
+        org_id = res.scalar_one_or_none()
+        if org_id is None:
+            return
+        name = (lead.name or "").strip()
+        phone = (lead.phone_e164 or lead.phone_raw or "").strip()
+        title = f"New lead: {name}" if name else "New lead captured"
+        body_parts: list[str] = []
+        if phone:
+            body_parts.append(phone)
+        body_parts.append(f"via {source_label}")
+        await NotificationService.emit(
+            db,
+            organization_id=org_id,
+            tenant_id=lead.tenant_id,
+            type=NOTIFICATION_INBOUND_LEAD,
+            severity=SEVERITY_P1,
+            title=title[:200],
+            body=" · ".join(body_parts)[:400],
+            payload={
+                "lead_id": str(lead.id),
+                "source": source_label,
+                "phone": phone or None,
+                "email": (lead.email or "").strip() or None,
+            },
+            # Dedup by lead id so re-submits of the same form don't
+            # repeatedly buzz the operator.
+            dedup_key=f"inbound_lead:{lead.id}",
+        )
+    except Exception:
+        logger.exception("NOKVO-NOTIF: failed to emit inbound_lead")

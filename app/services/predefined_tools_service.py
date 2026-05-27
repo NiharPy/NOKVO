@@ -722,6 +722,8 @@ class PredefinedToolsService:
 
     @staticmethod
     async def _handle_call_log_search(db, org_id, user_id, tool, args):
+        from app.services.voice_data_audit_service import VoiceDataAuditService
+
         limit = int(args.get("limit") or 10)
         clauses = [
             NokvoOneToolRecord.organization_id == org_id,
@@ -739,6 +741,16 @@ class PredefinedToolsService:
         )
         result = await db.execute(stmt)
         rows = result.scalars().all()
+        await VoiceDataAuditService.log(
+            db,
+            organization_id=org_id,
+            actor_type="organization_user" if user_id else "system",
+            actor_id=str(user_id) if user_id else None,
+            access_type="read",
+            resource_type="call_log",
+            reason="call_log_search_tool",
+            metadata={"limit": limit, "results_count": len(rows)},
+        )
         return {
             "ok": True,
             "entries": [

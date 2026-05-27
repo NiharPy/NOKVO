@@ -7,7 +7,7 @@ logger = logging.getLogger(__name__)
 import base64
 import json
 from time import perf_counter
-from typing import Any
+from typing import Any, AsyncIterator
 from urllib import parse as urllib_parse
 
 import httpx
@@ -85,6 +85,10 @@ class SarvamVoiceService:
 
     @staticmethod
     async def api_key(tenant_res: TenantResources | None = None, role: str | None = None) -> str:
+        # Local/operator override takes precedence. Tenant Key Vault refs are
+        # provisioned snapshots and can lag behind a rotated platform key.
+        if settings.SARVAM_API_KEY:
+            return settings.SARVAM_API_KEY
         provider_status = dict(getattr(tenant_res, "provider_status", None) or {})
         secret_keys = [
             "sarvam_api_key_ref",
@@ -102,8 +106,6 @@ class SarvamVoiceService:
                 secret = None
             if secret:
                 return secret
-        if settings.SARVAM_API_KEY:
-            return settings.SARVAM_API_KEY
         raise RuntimeError("Sarvam API key is not configured.")
 
     @staticmethod
@@ -359,6 +361,7 @@ class SarvamVoiceService:
         pace: float | None = None,
         pitch: float | None = None,
         loudness: float | None = None,
+        enable_cached_responses: bool | None = None,
     ) -> dict[str, Any]:
         if not text.strip():
             return {"audios": [], "audio_format": settings.SARVAM_TTS_AUDIO_CODEC}
@@ -372,7 +375,11 @@ class SarvamVoiceService:
             "speaker": provider_status.get("sarvam_tts_speaker") or provider_status.get("tts_voice") or settings.SARVAM_TTS_SPEAKER,
             "model": model,
             "speech_sample_rate": int(provider_status.get("tts_sample_rate") or settings.SARVAM_TTS_SAMPLE_RATE),
-            "enable_cached_responses": bool(settings.SARVAM_TTS_ENABLE_CACHED_RESPONSES),
+            "enable_cached_responses": (
+                bool(settings.SARVAM_TTS_ENABLE_CACHED_RESPONSES)
+                if enable_cached_responses is None
+                else bool(enable_cached_responses)
+            ),
         }
         if model == "bulbul:v3":
             body["temperature"] = float(provider_status.get("sarvam_tts_temperature") or 0.6)
@@ -422,6 +429,127 @@ class SarvamVoiceService:
         }
 
     @staticmethod
+    async def synthesize_streaming(
+        tenant_res: TenantResources,
+        text: str,
+        *,
+        language: str | None = None,
+        pace: float | None = None,
+        pitch: float | None = None,
+        loudness: float | None = None,
+        enable_cached_responses: bool | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Streaming variant of :meth:`synthesize`.
+
+        Hits Sarvam's ``/text-to-speech/stream`` endpoint and yields audio
+        chunks as they arrive instead of waiting for the full payload. Each
+        yielded dict has shape ``{"audio_base64": str, "sample_rate": int,
+        "audio_format": str}``. First-chunk latency on Sarvam streaming is
+        ~80-180ms vs ~250-500ms for the REST path — meaningful on the hot
+        first-sentence path where every 100ms shows up at the caller's ear.
+
+        Falls back to the REST path on any streaming-side error so a Sarvam
+        streaming hiccup never silences the agent.
+        """
+        if not text.strip():
+            return
+        provider_status = dict(tenant_res.provider_status or {})
+        api_key = await SarvamVoiceService.api_key(tenant_res, "tts")
+        stream_endpoint = (
+            provider_status.get("sarvam_tts_stream_url")
+            or settings.SARVAM_TTS_STREAM_URL
+        )
+        model = provider_status.get("sarvam_tts_model") or provider_status.get("tts_model") or settings.SARVAM_TTS_MODEL
+        body: dict[str, Any] = {
+            "text": text[:3500],
+            "target_language_code": SarvamVoiceService.to_bcp47(language),
+            "speaker": provider_status.get("sarvam_tts_speaker") or provider_status.get("tts_voice") or settings.SARVAM_TTS_SPEAKER,
+            "model": model,
+            "speech_sample_rate": int(provider_status.get("tts_sample_rate") or settings.SARVAM_TTS_SAMPLE_RATE),
+            "enable_cached_responses": (
+                bool(settings.SARVAM_TTS_ENABLE_CACHED_RESPONSES)
+                if enable_cached_responses is None
+                else bool(enable_cached_responses)
+            ),
+        }
+        if model == "bulbul:v3":
+            body["temperature"] = float(provider_status.get("sarvam_tts_temperature") or 0.6)
+        prosody_body: dict[str, Any] = {}
+        if pace is not None:
+            prosody_body["pace"] = max(0.3, min(3.0, float(pace)))
+        if pitch is not None:
+            prosody_body["pitch"] = max(-0.75, min(0.75, float(pitch)))
+        if loudness is not None:
+            prosody_body["loudness"] = max(0.1, min(3.0, float(loudness)))
+        body.update(prosody_body)
+
+        sample_rate = int(provider_status.get("tts_sample_rate") or settings.SARVAM_TTS_SAMPLE_RATE)
+        audio_format = settings.SARVAM_TTS_AUDIO_CODEC
+
+        client = SarvamVoiceService.http_client()
+        async with client.stream(
+            "POST",
+            stream_endpoint,
+            headers={"api-subscription-key": api_key, "Content-Type": "application/json"},
+            json=body,
+            timeout=httpx.Timeout(30.0, connect=4.0),
+        ) as response:
+            if response.status_code >= 400:
+                # Pull the error body so the caller can fall back cleanly.
+                err_body = (await response.aread()).decode("utf-8", errors="replace")[:300]
+                raise RuntimeError(
+                    f"Sarvam TTS streaming failed ({response.status_code}): {err_body}"
+                )
+            # Sarvam streams NDJSON (one JSON object per line). Each object
+            # contains either an ``audios`` array (one or more base64 frames)
+            # or a terminal ``status``/``error`` marker. Tolerant parsing so
+            # an occasional malformed line doesn't kill the turn.
+            buffer = ""
+            async for chunk in response.aiter_text():
+                buffer += chunk
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+                    # Tolerate SSE-style ``data: …`` prefixes too in case
+                    # Sarvam returns them on this endpoint.
+                    if line.startswith("data:"):
+                        line = line[5:].strip()
+                    if line == "[DONE]":
+                        return
+                    try:
+                        payload = json.loads(line)
+                    except (ValueError, TypeError):
+                        continue
+                    audios = payload.get("audios") or []
+                    for audio_b64 in audios:
+                        if not audio_b64:
+                            continue
+                        yield {
+                            "audio_base64": audio_b64,
+                            "sample_rate": sample_rate,
+                            "audio_format": audio_format,
+                        }
+            # Drain any trailing partial JSON line.
+            tail = buffer.strip()
+            if tail:
+                if tail.startswith("data:"):
+                    tail = tail[5:].strip()
+                if tail and tail != "[DONE]":
+                    try:
+                        payload = json.loads(tail)
+                        for audio_b64 in payload.get("audios") or []:
+                            if audio_b64:
+                                yield {
+                                    "audio_base64": audio_b64,
+                                    "sample_rate": sample_rate,
+                                    "audio_format": audio_format,
+                                }
+                    except (ValueError, TypeError):
+                        pass
+
+    @staticmethod
     async def stream_sentence_tts(
         websocket: WebSocket,
         tenant_res: TenantResources,
@@ -432,6 +560,7 @@ class SarvamVoiceService:
         pace: float | None = None,
         pitch: float | None = None,
         loudness: float | None = None,
+        enable_cached_responses: bool | None = None,
     ) -> dict[str, Any]:
         stream_id = f"sarvam-tts-{int(perf_counter() * 1000)}"
         started = perf_counter()
@@ -439,43 +568,136 @@ class SarvamVoiceService:
             await websocket.send_json({"type": "tts_started", "stream_id": stream_id, "purpose": purpose, "provider": "sarvam"})
         except Exception:
             pass
-        result = await SarvamVoiceService.synthesize(
-            tenant_res,
-            text,
-            language=language,
-            pace=pace,
-            pitch=pitch,
-            loudness=loudness,
-        )
+
         first_audio_ms: int | None = None
-        for audio in result.get("audios") or []:
-            if not audio:
-                continue
-            if first_audio_ms is None:
-                first_audio_ms = int((perf_counter() - started) * 1000)
+        chunks_sent = 0
+        sample_rate = int(
+            (tenant_res.provider_status or {}).get("tts_sample_rate") or settings.SARVAM_TTS_SAMPLE_RATE
+        )
+        audio_format = settings.SARVAM_TTS_AUDIO_CODEC
+        used_streaming = False
+
+        # Try the streaming endpoint first — push each chunk to the WS as it
+        # arrives so the caller hears the start of the sentence ~150-300ms
+        # earlier than the REST path. Fall back to REST on any streaming
+        # error so a Sarvam streaming blip never silences the turn.
+        try:
+            async for chunk in SarvamVoiceService.synthesize_streaming(
+                tenant_res,
+                text,
+                language=language,
+                pace=pace,
+                pitch=pitch,
+                loudness=loudness,
+                enable_cached_responses=enable_cached_responses,
+            ):
+                used_streaming = True
+                audio = chunk.get("audio_base64")
+                if not audio:
+                    continue
+                if first_audio_ms is None:
+                    first_audio_ms = int((perf_counter() - started) * 1000)
+                    try:
+                        await websocket.send_json(
+                            {
+                                "type": "tts_first_audio",
+                                "stream_id": stream_id,
+                                "purpose": purpose,
+                                "first_audio_latency_ms": first_audio_ms,
+                                "provider": "sarvam",
+                                "audio_format": chunk.get("audio_format", audio_format),
+                                "sample_rate": chunk.get("sample_rate", sample_rate),
+                                "streaming": True,
+                            }
+                        )
+                    except Exception:
+                        pass
                 try:
                     await websocket.send_json(
                         {
-                            "type": "tts_first_audio",
+                            "type": "tts_audio",
                             "stream_id": stream_id,
                             "purpose": purpose,
-                            "first_audio_latency_ms": first_audio_ms,
-                            "provider": "sarvam",
-                            "audio_format": result.get("audio_format"),
-                            "sample_rate": result.get("sample_rate"),
+                            "audio_base64": audio,
+                            "audio_format": chunk.get("audio_format", audio_format),
+                            "sample_rate": chunk.get("sample_rate", sample_rate),
+                            "audio_end": False,
                         }
                     )
+                    chunks_sent += 1
                 except Exception:
                     pass
+        except Exception as exc:
+            logger.warning(
+                "NOKVO-TTS: Sarvam streaming TTS failed (%s); falling back to REST",
+                exc,
+            )
+            used_streaming = False
+            chunks_sent = 0
+            first_audio_ms = None
+
+        # REST fallback — same shape as the previous implementation. Fires
+        # when streaming raised OR returned no chunks (some Sarvam models
+        # ignore the /stream endpoint for short utterances).
+        if not used_streaming or chunks_sent == 0:
+            result = await SarvamVoiceService.synthesize(
+                tenant_res,
+                text,
+                language=language,
+                pace=pace,
+                pitch=pitch,
+                loudness=loudness,
+                enable_cached_responses=enable_cached_responses,
+            )
+            for audio in result.get("audios") or []:
+                if not audio:
+                    continue
+                if first_audio_ms is None:
+                    first_audio_ms = int((perf_counter() - started) * 1000)
+                    try:
+                        await websocket.send_json(
+                            {
+                                "type": "tts_first_audio",
+                                "stream_id": stream_id,
+                                "purpose": purpose,
+                                "first_audio_latency_ms": first_audio_ms,
+                                "provider": "sarvam",
+                                "audio_format": result.get("audio_format"),
+                                "sample_rate": result.get("sample_rate"),
+                                "streaming": False,
+                            }
+                        )
+                    except Exception:
+                        pass
+                try:
+                    await websocket.send_json(
+                        {
+                            "type": "tts_audio",
+                            "stream_id": stream_id,
+                            "purpose": purpose,
+                            "audio_base64": audio,
+                            "audio_format": result.get("audio_format"),
+                            "sample_rate": result.get("sample_rate"),
+                            "audio_end": True,
+                        }
+                    )
+                    chunks_sent += 1
+                except Exception:
+                    pass
+
+        # Send a terminal marker so the frontend playback scheduler knows
+        # this sentence is complete (streaming mode emits multiple chunks
+        # with audio_end=False then one tts_end frame here).
+        if used_streaming and chunks_sent:
             try:
                 await websocket.send_json(
                     {
                         "type": "tts_audio",
                         "stream_id": stream_id,
                         "purpose": purpose,
-                        "audio_base64": audio,
-                        "audio_format": result.get("audio_format"),
-                        "sample_rate": result.get("sample_rate"),
+                        "audio_base64": "",
+                        "audio_format": audio_format,
+                        "sample_rate": sample_rate,
                         "audio_end": True,
                     }
                 )

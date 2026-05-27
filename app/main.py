@@ -44,6 +44,7 @@ from app.api import (
     nokvo_one_auth,
     nokvo_one_members,
     nokvo_one_agents,
+    nokvo_one_billing,
     nokvo_one_knowledge_base,
     nokvo_one_outcomes,
     nokvo_one_requests,
@@ -70,13 +71,27 @@ app.include_router(
     prefix="/api/nokvo-one/knowledge-base",
     tags=["nokvo-one-knowledge-base"],
 )
+# Billing (per-call cost ledger summary) + notification inbox / live fanout
+app.include_router(
+    nokvo_one_billing.router,
+    prefix="/api/nokvo-one",
+    tags=["nokvo-one-billing"],
+)
 
 # Nokvo Connect — Nokvo One organizations only. Admin key management lives
 # under the Nokvo One prefix so it shares JWT semantics with the rest of the
 # Nokvo One portal; the public voice/text API is namespace-neutral because
 # customer apps will hit it directly with an API key.
-app.include_router(connect_admin.router, prefix="/api/nokvo-one/connect", tags=["connect-admin"])
-app.include_router(connect_public.router, prefix="/api/voice", tags=["connect-public"])
+#
+# Gated behind ``NOKVO_CONNECT_ENABLED``. When the flag is off (the default),
+# we never register the routers — every Connect URL falls through to FastAPI's
+# default 404 handler, so leftover API keys can't be used and the surface is
+# completely dormant until an operator opts in via .env. The frontend reads
+# the same flag off ``/api/nokvo-one/config`` and hides its nav button +
+# landing page so users don't see a dead-end UI.
+if settings.NOKVO_CONNECT_ENABLED:
+    app.include_router(connect_admin.router, prefix="/api/nokvo-one/connect", tags=["connect-admin"])
+    app.include_router(connect_public.router, prefix="/api/voice", tags=["connect-public"])
 
 # Serve CC0 call-center ambience clips bundled in app/assets/audio/ so the
 # frontend can mix them under the live agent voice. Path is public — the

@@ -68,6 +68,67 @@ def _parse_tts_audio(audio_bytes: bytes) -> tuple[np.ndarray, int]:
     return np.frombuffer(audio_bytes, dtype=np.int16).copy(), fallback_rate
 
 
+def _first_text(*values) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _start_custom_parameters(start: dict) -> dict:
+    custom = (
+        start.get("customParameters")
+        or start.get("custom_parameters")
+        or start.get("custom_params")
+        or {}
+    )
+    return custom if isinstance(custom, dict) else {}
+
+
+def _extract_start_call_context(payload: dict) -> dict[str, str]:
+    start = payload.get("start") if isinstance(payload.get("start"), dict) else {}
+    custom = _start_custom_parameters(start)
+    from_phone = _first_text(
+        start.get("from"),
+        start.get("fromNumber"),
+        start.get("from_number"),
+        start.get("caller"),
+        start.get("callerId"),
+        custom.get("from"),
+        custom.get("from_phone"),
+        custom.get("caller"),
+        custom.get("caller_phone"),
+        payload.get("from"),
+    )
+    to_phone = _first_text(
+        start.get("to"),
+        start.get("toNumber"),
+        start.get("to_number"),
+        custom.get("to"),
+        custom.get("to_phone"),
+        payload.get("to"),
+    )
+    call_sid = _first_text(
+        payload.get("callSid"),
+        payload.get("call_sid"),
+        start.get("callSid"),
+        start.get("call_sid"),
+        start.get("callId"),
+        start.get("call_id"),
+        custom.get("call_sid"),
+    )
+    return {
+        key: value
+        for key, value in {
+            "from_phone": from_phone,
+            "to_phone": to_phone,
+            "provider_call_id": call_sid,
+        }.items()
+        if value
+    }
+
+
 # ---------------------------------------------------------------------------
 # WebSocket adapter: makes a Twilio Media Stream look like a browser voice WS
 # ---------------------------------------------------------------------------
@@ -87,6 +148,7 @@ class TwilioWebSocketAdapter:
     def __init__(self, ws: WebSocket) -> None:
         self._ws = ws
         self._stream_sid = ""
+        self.call_context: dict[str, str] = {}
         backend = settings.AGENT_VOICE_BACKEND
         self._input_rate = self._BACKEND_INPUT_RATE.get(backend, 16000)
 
@@ -108,6 +170,7 @@ class TwilioWebSocketAdapter:
 
             if event == "start":
                 self._stream_sid = payload.get("streamSid", "")
+                self.call_context = _extract_start_call_context(payload)
 
             elif event == "media":
                 track = (payload.get("media") or {}).get("track")

@@ -22,6 +22,7 @@ from typing import Any
 import httpx
 import pytest
 
+from app.core.config import settings
 from app.services.sarvam_voice_service import SarvamVoiceService
 from app.services.nokvo_one_voice_pipeline import (
     AzureGroundedLLM,
@@ -34,6 +35,30 @@ def _run(coro):
 
 
 # ── Sarvam STT 429 burst ────────────────────────────────────────────────────
+
+
+def test_sarvam_api_key_prefers_env_override(monkeypatch):
+    """A freshly rotated platform key in .env must override stale tenant
+    Key Vault refs, otherwise local testing can keep using an old exhausted
+    Sarvam key after backend restart."""
+
+    async def fail_if_called(*args, **kwargs):
+        raise AssertionError("tenant secret ref should not be read when SARVAM_API_KEY is set")
+
+    monkeypatch.setattr(settings, "SARVAM_API_KEY", "env-sarvam-key")
+    monkeypatch.setattr(
+        "app.services.sarvam_voice_service.AzureKeyVaultService.get_secret_value",
+        fail_if_called,
+    )
+
+    tenant_res = SimpleNamespace(
+        provider_status={
+            "stt_api_key_secret_ref": "old-stt-secret",
+            "tts_api_key_secret_ref": "old-tts-secret",
+        }
+    )
+
+    assert _run(SarvamVoiceService.api_key(tenant_res, "stt")) == "env-sarvam-key"
 
 
 class _ControlledResponse:

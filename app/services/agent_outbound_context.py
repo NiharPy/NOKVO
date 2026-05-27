@@ -45,7 +45,7 @@ from app.models.outbound_campaign import OutboundCampaign
 
 _CAMPAIGN_TTL_SECONDS = 120.0
 _CAMPAIGN_CACHE_MAX = 256
-_DEFAULT_SILENCE_TIMEOUT_SECONDS = 5.0
+_DEFAULT_SILENCE_TIMEOUT_SECONDS = 12.0
 
 DEFAULT_AGENT_PROMPT = (
     "You are making a consented outbound call for the configured business. "
@@ -207,7 +207,7 @@ def _coerce_timeout(value: Any) -> float:
         timeout = float(value)
     except (TypeError, ValueError):
         timeout = _DEFAULT_SILENCE_TIMEOUT_SECONDS
-    return max(2.0, min(20.0, timeout))
+    return max(2.0, min(30.0, timeout))
 
 
 def build_agent_config(
@@ -221,6 +221,7 @@ def build_agent_config(
     company_name: str | None = None,
     pitch_summary: str | None = None,
     objective: str | None = None,
+    language: str | None = None,
 ) -> dict[str, Any]:
     """Normalize campaign proactive-agent config.
 
@@ -248,6 +249,17 @@ def build_agent_config(
     # and the override stays empty.
     if not prompt and not company and not pitch:
         prompt = DEFAULT_AGENT_PROMPT
+    # Normalise the language hint (BCP-47 → two-letter code). Stored on
+    # the campaign so the outbound dialer / opener / system prompt all
+    # agree on which language to drive the call in. ``""`` means
+    # "auto-detect" (legacy behaviour).
+    lang_raw = (str(language or "").strip().lower() or "")
+    if lang_raw == "unknown":
+        lang_raw = ""
+    if lang_raw:
+        lang_short = lang_raw.split("-", 1)[0][:2]
+    else:
+        lang_short = ""
     return {
         "agent_prompt": prompt,
         "objectives": objective_list,
@@ -258,6 +270,7 @@ def build_agent_config(
         "company_name": company,
         "pitch_summary": pitch,
         "objective": obj,
+        "language": lang_short,
     }
 
 
@@ -320,6 +333,10 @@ async def load_outbound_context(
                     tone=ctx.tone,
                     doc_text=ctx.doc_text,
                     silence_timeout_seconds=ctx.silence_timeout_seconds,
+                    caller_name=ctx.caller_name,
+                    company_name=ctx.company_name,
+                    pitch_summary=ctx.pitch_summary,
+                    objective=ctx.objective,
                 )
             return ctx
 
@@ -364,49 +381,111 @@ def invalidate_all() -> None:
 
 
 _OUTBOUND_BASE_TEMPLATE = """# OUTBOUND CAMPAIGN — SALES / OUTREACH PERSONA
-You're {caller_name}, calling on behalf of {company_name}. You're calling a potential customer (not the other way around). Treat this like a respectful outbound sales / outreach call.
+You're {caller_name}, calling on behalf of {company_name}. You're a real human-sounding sales rep on an outbound call. You called the prospect — they didn't call you.
 
 # Goal for this call
 {objective_description}
 
-# Personality & voice
-- Warm, conversational, human. Use contractions ("I'll", "we're", "you're").
-- Don't sound scripted. Don't read out company slogans. Talk like a colleague who happens to know the product.
+# WHO YOU ARE — internalize this
+You're a calm, attentive outreach rep. You're talking to a real person mid-day; their attention is borrowed. Sound natural and useful, not scripted or pushy.
 
-# Conversation flow (DON'T follow rigidly — use as a guide)
-1. OPENER: a templated intro has already been played — you'll see it as the previous assistant turn. Don't repeat it.
-2. PERMISSION: if they say "yes" or "go on", continue. If they say "now's not a good time" or "I'm busy", politely thank them and offer to call back later. If they say "I'm not interested", thank them and end gracefully.
-3. PITCH: briefly say what's in it for THEM. Don't list features — describe the problem you solve.
-4. QUALIFY: 1-2 short questions to understand if they fit. Listen — don't ignore what they say to push the script.
-5. CLOSE: based on the GOAL above, propose the next step. Confirm. Recap. Thank.
+# LISTEN FIRST — latest caller utterance wins
+- First understand what the prospect just said. If they asked a question, answer it briefly before moving on.
+- If they gave an objection, preference, budget, name, phone number, timing, or site-visit detail, use it. Do not re-ask it and do not ignore it to push the script.
+- If their answer changes the path, adapt the next question to that answer. The objective list is a guide, not permission to monologue.
+- If the previous assistant turn asked "Is now a good time?" and the prospect says "yes", "yeah", "ok", "sure", or similar, do NOT give a feature pitch. Ask exactly one discovery question next.
+
+# TURN STRUCTURE — every reply follows this shape
+1. **One acknowledgment (3–7 words, optional)** — vary it. Examples: "Mm, lovely.", "Cool.", "Right, makes sense.", "Awesome.", "Perfect.", "Mm-hm got it.", "Nice.", "Fair enough.", "Oh nice.", "Wonderful.", "Cool cool." Never repeat the same opener two turns in a row. Skip the acknowledgment entirely if it doesn't fit (e.g., after a question you asked).
+2. **ONE concrete next step** — either a single short pitch beat (one specific benefit from the brief, not a list), a single qualifying question, OR a proposed close. Never stack two questions; never list three features; never give a paragraph.
+Total reply length: 1–2 sentences. Period. If a third sentence feels necessary, you are probably saying too much.
+Keep each sentence under 16 words unless confirming a final next step.
+
+# BANNED OPENERS — variety is required
+Never start more than 2 consecutive replies with the same word. Specifically forbidden as repeated openers:
+  - "Great!" / "Great to hear that!"
+  - "Got it!"
+  - "Thanks for your time."
+  - "Mm-hm."
+  - "Sure."
+  - The company name (don't say "Raghava Skyline" in every reply — they know).
+
+# BANNED STANDALONE REPLIES — never end a turn with only one of these
+- "Sure." / "Sure, go ahead." / "Go on." / "Go ahead." / "Mm-hm." / "Mhm."
+- "Got it." / "Right." / "Okay." / "Alright."
+- "Thanks for your time." (only allowed as the first half of a wrap-up; never alone mid-call)
+If your draft reply is only one of these, you're NOT done — append the next concrete action.
+
+# NO STACKING — one question per turn
+Forbidden patterns (these all stack questions):
+  - "What's your name and phone number?" → ask "What's your name?" ONLY. The phone comes on the next turn.
+  - "Can you give me the date and time?" → ask date OR time, not both.
+  - "Want me to share details and schedule a visit?" → propose one, not two.
+Single-focus replies feel natural; stacked ones feel like a form.
+
+# HANDLING SHORT / FILLER CALLER REPLIES
+- "Yes" / "Yeah" / "Sure" / "Ok" mid-call: treat as **permission to continue**. Your next reply opens the pitch or asks the next qualifier. Do NOT echo "go ahead" / "sure" back.
+- If that short reply is permission after the opener, ask the next qualifier directly. Example: "[warm]Great.[/warm] [question]Is this for self-use or investment?[/question]"
+- "Hmm" / "Mm" / "Uh" / "Let me think" / "I would say" / similar filler: gently nudge with "Take your time" + restate the prior question. Example: "[warm]No rush.[/warm] [question]Weekdays or weekends easier for the visit?[/question]" Don't change topic.
+- Long substantive reply (name + phone in one breath, BHK + budget together): acknowledge once briefly, then progress one step — don't re-ask anything they already told you.
 
 # Hard rules — non-negotiable
-- If asked "are you a real person?" or anything similar: be honest. Say "I'm an AI assistant calling on behalf of {company_name}." Continue helpfully.
-- If they ask to be removed from the call list ("don't call again", "remove me", "do not call"): apologise briefly, confirm you'll mark them on the do-not-call list, end the call politely. Do not push back.
-- If they say no twice — accept and end the call gracefully. Don't escalate.
-- If they're frustrated or angry, drop the pitch entirely. Apologise. Offer to remove them and end.
-- Keep replies SHORT — 1 to 2 sentences. Even more important on outbound because you're imposing on their time.
-- Never claim you took an action you can't take ("I've booked your demo"). Instead say "I'll have someone reach out to confirm a demo time" and rely on the human team for actual booking.
+- If asked "are you a real person?" or similar: be honest. "I'm an AI assistant calling on behalf of {company_name}." Continue helpfully.
+- "Don't call again" / "remove me" / "do not call": apologise briefly, confirm DNC, end politely. Don't push back.
+- They say no twice — accept and end gracefully. Don't escalate.
+- Frustrated / angry — drop the pitch. Apologise. Offer to end.
+- Never claim an action you can't take ("I've booked your demo"). Use "I'll have someone reach out to lock that in".
 
-# Pitch facts (from the campaign brief — DO NOT INVENT specifics not in here)
-The retrieved CONTEXT chunks earlier in the prompt come from the campaign's pitch document. Use them for any factual claim (pricing, features, terms, time-bound offers). If a specific they ask about isn't in CONTEXT, say honestly "I don't have that detail in front of me — I'll have someone get back to you on that."
+# Pitch facts (from the campaign brief — DO NOT INVENT)
+The retrieved CONTEXT chunks come from the campaign's pitch document. Use them for any factual claim (pricing, features, terms, offers). If a specific isn't in CONTEXT, say honestly "I don't have that detail in front of me — I'll have someone get back to you on that."
 
-# Short or vague replies ("yes", "ok", "hmm")
-- "Yes" mid-call usually means "go on" — keep moving.
-- "Ok" can be assent or polite stalling — read the conversation, don't auto-assume buying intent.
-- "Hmm" / silence: ask one short clarifier like "Does that make sense?" or "Want me to send the details over instead?"
+# NEVER DO
+- Don't use formal "Dear sir/madam".
+- Don't quote the script verbatim — paraphrase.
+- Don't ignore an objection by repeating the pitch.
+- Don't read filenames or doc IDs.
+- Don't re-ask for information the caller already gave (name, phone, BHK, budget, location).
+- Don't repeat the company name every turn — they heard it in the opener.
 
-# Never do
-- Never use formal "Dear sir/madam".
-- Never quote the script verbatim — paraphrase.
-- Never ignore an objection by repeating the pitch. Address it directly or move on.
-- Never read out filenames or doc IDs."""
+# FEW-SHOT — copy this exact shape, vary the wording
+Each AGENT line is one acknowledgment + one next step. Never two questions, never list features, never repeat the same opener.
+
+CALLER: Yes
+AGENT: [warm]Mm, lovely.[/warm] [question]Quick check — self-use or investment?[/question]
+
+CALLER: 4 BHK, around 1 crore.
+AGENT: [warm]Awesome — that fits the upper floors.[/warm] [question]Want me to set up a quick site visit?[/question]
+
+CALLER: Nihar.
+AGENT: [warm]Hey Nihar — best number to reach you on?[/question]
+
+CALLER: മ്മ്.
+AGENT: [warm]No rush.[/warm] [question]Weekday or weekend, whichever's lighter?[/question]
+
+CALLER: 10 AM.
+AGENT: [excited]Done — 10 AM on the 25th.[/excited] [neutral]I'll have the team confirm and send the brochure.[/neutral]
+
+CALLER: Don't call me again.
+AGENT: [empathy]Of course — sorry about the interruption.[/empathy] [neutral]I'll mark you do-not-call. Have a good one.[/neutral]"""
+
+
+_OUTBOUND_UNIVERSAL_TURN_RULES = """# OUTBOUND TURN-TAKING RULES — ALWAYS FOLLOW
+- Listen to the latest caller message before following the campaign objective.
+- Reply in 1 to 2 short sentences only.
+- Keep each sentence under 16 words.
+- Ask at most one question per turn.
+- Take only one next step per turn: answer their question, handle their objection, ask one qualifier, or propose one close.
+- After a short permission reply to the opener, ask one discovery question. Do not pitch features first.
+- If they already gave a detail, use it and move forward; do not ask again.
+- If they are busy, not interested, wrong number, frustrated, or ask not to be called, stop pitching and close politely.
+- Do not push past their answer. A respectful outbound call sounds like a conversation, not a script."""
 
 
 def compose_outbound_system_section(
     context: OutboundCampaignContext | None,
     *,
     covered_objectives: list[str] | None = None,
+    outbound_memory: dict[str, Any] | None = None,
 ) -> str:
     """Build the system-prompt fragment for an outbound turn.
 
@@ -433,6 +512,7 @@ def compose_outbound_system_section(
                 objective_description=context.objective_description,
             )
         )
+    parts.append(_OUTBOUND_UNIVERSAL_TURN_RULES)
     # Campaign overview always rendered so the model has goal + pitch even
     # when the custom-persona branch was taken.
     overview_parts: list[str] = []
@@ -451,6 +531,9 @@ def compose_outbound_system_section(
         else:
             section += "\n\nAll objectives covered — confirm the next step and wrap the call politely."
         parts.append(section)
+    memory_section = render_outbound_memory(outbound_memory)
+    if memory_section:
+        parts.append(memory_section)
     if context.exit_conditions:
         exit_render = "\n".join(f"  - {item}" for item in context.exit_conditions)
         parts.append(f"# EXIT CONDITIONS (when ANY is met, close the call warmly)\n{exit_render}")
@@ -459,17 +542,63 @@ def compose_outbound_system_section(
     return "\n\n".join(parts)
 
 
-def generate_outbound_opener_text(context: OutboundCampaignContext) -> str:
+def generate_outbound_opener_text(
+    context: OutboundCampaignContext,
+    *,
+    language: str | None = None,
+) -> str:
     """Deterministic, template-filled opener.
 
     Mirrors the reference's ``generate_opener_text`` — runs without an LLM
     call so the first audio is on the wire ~150ms faster than waiting for
     a stream. Includes prosody tags so :func:`stream_prosody_chunks` can
     render the line with proper tones.
+
+    ``language`` switches the opener template so Telugu / Hindi campaigns
+    don't start every call with English. The opener uses the same natural
+    code-switching style the system prompt mandates downstream (English
+    loanwords + native particles), so the first impression matches the
+    rest of the call's register.
     """
     caller = (context.caller_name or "Riya").strip() or "Riya"
     company = (context.company_name or "").strip()
     pitch = (context.pitch_summary or context.goal or "").strip()
+    code = (language or "").strip().lower()[:2]
+
+    if code == "te":
+        intro_te = (
+            f"Hello, nenu {caller}, {company} nundi maatalaadutunna."
+            if company
+            else f"Hello, nenu {caller} maatalaadutunna."
+        )
+        if pitch:
+            return (
+                f"[warm]{intro_te}[/warm] "
+                f"[neutral]{pitch} gurinchi call chesthunna.[/neutral] "
+                "[question]Ippudu okka minute maatalaadagalara?[/question]"
+            )
+        return (
+            f"[warm]{intro_te}[/warm] "
+            "[question]Ippudu okka minute maatalaadagalara?[/question]"
+        )
+
+    if code == "hi":
+        intro_hi = (
+            f"Namaste, main {caller} bol raha hoon, {company} se."
+            if company
+            else f"Namaste, main {caller} bol raha hoon."
+        )
+        if pitch:
+            return (
+                f"[warm]{intro_hi}[/warm] "
+                f"[neutral]{pitch} ke liye call kiya hai.[/neutral] "
+                "[question]Kya abhi ek minute baat kar sakte hain?[/question]"
+            )
+        return (
+            f"[warm]{intro_hi}[/warm] "
+            "[question]Kya abhi ek minute baat kar sakte hain?[/question]"
+        )
+
     intro = (
         f"Hi, this is {caller} from {company}."
         if company
@@ -529,9 +658,176 @@ def infer_covered_objectives(
     return covered
 
 
+_BHK_WORDS = {
+    "one": "1",
+    "two": "2",
+    "three": "3",
+    "four": "4",
+    "five": "5",
+    "six": "6",
+}
+
+_OUTBOUND_MEMORY_LABELS = {
+    "name": "Name",
+    "phone": "Phone",
+    "purpose": "Buying purpose",
+    "bhk": "BHK preference",
+    "budget": "Budget",
+    "timeline": "Timeline",
+    "location_preference": "Location preference",
+    "visit_preference": "Visit preference",
+    "requested_info": "Requested info",
+    "objection": "Objection / constraint",
+}
+
+
+def _remember(memory: dict[str, str], key: str, value: str | None) -> None:
+    text = re.sub(r"\s+", " ", str(value or "")).strip(" .,:;")
+    if not text:
+        return
+    memory[key] = text[:120]
+
+
+def _extract_name(text: str) -> str | None:
+    match = re.search(
+        r"\b(?:my name is|this is|i am|i'm|call me)\s+([A-Za-z][A-Za-z.'-]*(?:\s+[A-Za-z][A-Za-z.'-]*){0,2})",
+        text,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    candidate = " ".join(match.group(1).split())
+    first = candidate.split()[0].lower()
+    if first in {
+        "looking", "interested", "busy", "not", "calling", "thinking", "going",
+        "planning", "buying", "searching", "available", "ok", "okay",
+    }:
+        return None
+    return candidate.title()
+
+
+def update_outbound_memory(
+    existing: dict[str, Any] | None,
+    *,
+    caller_text: str,
+    agent_answer: str = "",
+) -> dict[str, str]:
+    """Extract stable call facts for outbound turn memory.
+
+    The LLM already sees raw transcript history, but important sales-call
+    facts can be buried across turns. This lightweight memory is deliberately
+    deterministic and conservative: it stores only explicit caller-provided
+    details and a few common real-estate/outreach signals.
+    """
+    memory: dict[str, str] = {
+        str(key): str(value)
+        for key, value in (existing or {}).items()
+        if key in _OUTBOUND_MEMORY_LABELS and value
+    }
+    text = re.sub(r"\s+", " ", caller_text or "").strip()
+    lower = text.lower()
+    if not text:
+        return memory
+
+    name = _extract_name(text)
+    if name:
+        _remember(memory, "name", name)
+
+    phone_match = re.search(r"(?<!\d)(?:\+?91[\s-]?)?([6-9](?:[\s-]?\d){9})(?!\d)", text)
+    if phone_match:
+        digits = re.sub(r"\D", "", phone_match.group(0))
+        _remember(memory, "phone", digits[-10:] if len(digits) >= 10 else digits)
+
+    bhk_match = re.search(r"\b([1-6])\s*(?:bhk|bed(?:room)?s?)\b", lower)
+    if not bhk_match:
+        word_pattern = "|".join(_BHK_WORDS)
+        bhk_match = re.search(rf"\b({word_pattern})\s*(?:bhk|bed(?:room)?s?)\b", lower)
+    if bhk_match:
+        raw = bhk_match.group(1)
+        _remember(memory, "bhk", f"{_BHK_WORDS.get(raw, raw)} BHK")
+
+    budget_match = re.search(
+        r"\b(?:budget(?:\s+is)?|around|about|upto|up to|under|within|near)?\s*"
+        r"(?:rs\.?|inr|₹)?\s*([0-9]+(?:\.[0-9]+)?\s*(?:cr|crore|crores|lakh|lakhs|lac|lacs))\b",
+        lower,
+    )
+    if budget_match:
+        _remember(memory, "budget", budget_match.group(1))
+
+    if re.search(r"\b(self[-\s]?use|own use|end use|family|to live|for living)\b", lower):
+        _remember(memory, "purpose", "self-use")
+    elif re.search(r"\b(invest|investment|investor|rental|rent out|roi)\b", lower):
+        _remember(memory, "purpose", "investment")
+
+    timeline_match = re.search(
+        r"\b(immediately|as soon as possible|this month|next month|this year|next year|"
+        r"within\s+[0-9]+\s+(?:days|weeks|months)|in\s+[0-9]+\s+(?:days|weeks|months))\b",
+        lower,
+    )
+    if timeline_match:
+        _remember(memory, "timeline", timeline_match.group(1))
+
+    if re.search(r"\b(weekday|weekdays|weekend|weekends|morning|afternoon|evening)\b", lower):
+        _remember(memory, "visit_preference", re.search(r"\b(weekday|weekdays|weekend|weekends|morning|afternoon|evening)\b", lower).group(1))
+    date_or_time_match = re.search(
+        r"\b(?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+        r"[0-3]?\d(?:st|nd|rd|th)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*|"
+        r"(?:[01]?\d|2[0-3])(?::[0-5]\d)?\s*(?:am|pm))\b",
+        lower,
+    )
+    if date_or_time_match:
+        current = memory.get("visit_preference")
+        value = date_or_time_match.group(0)
+        _remember(memory, "visit_preference", f"{current}; {value}" if current and value not in current else value)
+
+    location_match = re.search(r"\b(?:near|around|in|at)\s+([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,3})\b", text)
+    if location_match and location_match.group(1).lower() not in {"this", "that"}:
+        _remember(memory, "location_preference", location_match.group(1))
+
+    info_hits = []
+    for label, pattern in (
+        ("details", r"\b(details?|information|info)\b"),
+        ("brochure", r"\bbrochure\b"),
+        ("pricing", r"\b(price|pricing|cost|rate|quotation)\b"),
+        ("RERA number", r"\brera\b"),
+        ("floor plans", r"\bfloor\s*plans?\b"),
+        ("callback", r"\b(call back|callback)\b"),
+        ("WhatsApp details", r"\bwhatsapp\b"),
+    ):
+        if re.search(pattern, lower):
+            info_hits.append(label)
+    if info_hits:
+        prior = [item.strip() for item in memory.get("requested_info", "").split(",") if item.strip()]
+        combined = list(dict.fromkeys(prior + info_hits))
+        _remember(memory, "requested_info", ", ".join(combined))
+
+    if re.search(r"\b(not interested|don't call|do not call|remove me|wrong number|busy|call later)\b", lower):
+        _remember(memory, "objection", text)
+    elif re.search(r"\b(expensive|costly|too high|out of budget)\b", lower):
+        _remember(memory, "objection", "price concern")
+
+    return memory
+
+
+def render_outbound_memory(memory: dict[str, Any] | None) -> str:
+    items = []
+    for key, label in _OUTBOUND_MEMORY_LABELS.items():
+        value = str((memory or {}).get(key) or "").strip()
+        if value:
+            items.append(f"  - {label}: {value}")
+    if not items:
+        return ""
+    return (
+        "# CONVERSATION MEMORY — already known\n"
+        "Use these facts as memory from this call. Do not ask for them again; "
+        "build the next reply around them.\n"
+        + "\n".join(items)
+    )
+
+
 PROACTIVE_NUDGE_PROMPT = (
-    "(no caller response — agent should keep the conversation moving toward the "
-    "campaign goal; ask the next outstanding objective or wrap the call politely)"
+    "(no caller response — do not monologue. Give one brief nudge tied to the "
+    "last question, ask only the next outstanding objective, or wrap politely)"
 )
 
 
@@ -608,4 +904,6 @@ __all__ = [
     "invalidate",
     "invalidate_all",
     "load_outbound_context",
+    "render_outbound_memory",
+    "update_outbound_memory",
 ]

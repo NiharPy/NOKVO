@@ -42,6 +42,7 @@ import {
   UserPlus,
   Users,
   Volume2,
+  Wallet,
   Wrench,
   XCircle,
 } from 'lucide-vue-next';
@@ -72,6 +73,16 @@ const googleSignupButtonRef = ref(null);
 
 const authState = ref(props.initialAuthState || 'login'); // login | signup | check_email | mfa_setup | mfa_verify | login_totp | accept_invite | business_type_setup | outcome_setup | sample_upload | ready
 const onboardingV2Enabled = ref(false);
+// Nokvo Connect is feature-flagged on the backend (settings.NOKVO_CONNECT_ENABLED).
+// We mirror the flag here so the nav button + landing pages stay hidden until
+// the operator turns it on in .env. Defaults to ``false`` so a /config fetch
+// failure leaves Connect dormant instead of broken-and-visible.
+const nokvoConnectEnabled = ref(false);
+// Knowledge-base document upload is off by default and only surfaces
+// when NOKVO_KB_DOCUMENT_UPLOAD_ENABLED=true in the backend .env. The
+// /config endpoint reflects that flag; we hide the Upload card here
+// rather than disabling the route, so we don't half-render a busted UI.
+const kbDocumentUploadEnabled = ref(false);
 const outcomeWizard = ref({
   outcomes: [],
   selected: {},
@@ -106,6 +117,9 @@ const connect = ref({
 
 const loadConnectKeys = async () => {
   if (authState.value !== 'ready') return;
+  // Feature-flagged off — backend has unregistered these routes and would
+  // return 404, so don't bother calling.
+  if (!nokvoConnectEnabled.value) return;
   connect.value.isLoadingList = true;
   connect.value.errorMsg = '';
   try {
@@ -230,6 +244,20 @@ const kbQuery = ref('');
 const kbResults = ref([]);
 const isSearchingKb = ref(false);
 const runtimeStatus = ref(null);
+// Per-organization conversation cost summary. Backed by
+// GET /api/nokvo-one/cost-summary — today / this-month / all-time totals
+// at ₹8 / minute. ``null`` until the first load resolves.
+const costSummary = ref(null);
+const isLoadingCostSummary = ref(false);
+// Notifications — REST-loaded inbox + live WS fanout.
+// ``unreadCount`` powers the bell badge. The WS is opened once on login
+// and re-opened on token rotation; ``notificationsSocket`` holds the
+// live instance so onBeforeUnmount + logout can close it cleanly.
+const notifications = ref([]);
+const unreadCount = ref(0);
+const isNotificationsOpen = ref(false);
+const isLoadingNotifications = ref(false);
+const notificationsSocket = ref(null);
 const phoneLink = ref(null);
 const phoneLinkInput = ref('');
 const isSavingPhoneLink = ref(false);
@@ -317,7 +345,11 @@ const OUTBOUND_OBJECTIVE_OPTIONS = [
   { value: 'renewal', label: 'Renewal' },
 ];
 
-const outboundTester = ref({
+// localStorage key that scopes a saved tester preset to the signed-in org
+// user so two operators on the same browser don't see each other's drafts.
+const OUTBOUND_TESTER_STORAGE_KEY = 'nokvo_one_outbound_tester_preset_v1';
+
+const _defaultOutboundTester = () => ({
   // Campaign branding — the sales persona the agent introduces itself as.
   // The deterministic opener stitches caller_name + company_name + pitch_summary
   // into the first line; the system prompt template then takes over.
@@ -330,7 +362,7 @@ const outboundTester = ref({
   // Optional advanced overrides — leave both blank to use the default
   // sales-persona template; set either to deviate.
   agent_prompt: '',
-  doc_file: null,         // File object selected by the user
+  doc_file: null,         // File object selected by the user (NOT persisted)
   doc_filename: '',       // surface filename in the UI after selection
   doc_chars: 0,           // populated after the /prepare call; null on reset
   objectives: '',
@@ -338,6 +370,62 @@ const outboundTester = ref({
   tone: 'warm, direct, and respectful',
   language: 'en',
 });
+
+const outboundTester = ref(_defaultOutboundTester());
+const outboundTesterSaved = ref({ savedAt: null, hasPreset: false });
+
+const _hydrateOutboundTesterFromStorage = () => {
+  try {
+    const raw = localStorage.getItem(OUTBOUND_TESTER_STORAGE_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return;
+    // File handles aren't persistable — keep whatever the current session
+    // has selected. Everything else hydrates from the saved preset.
+    const currentFile = outboundTester.value.doc_file;
+    const currentFilename = outboundTester.value.doc_filename;
+    outboundTester.value = {
+      ..._defaultOutboundTester(),
+      ...parsed,
+      doc_file: currentFile,
+      doc_filename: currentFilename,
+      doc_chars: 0,
+    };
+    outboundTesterSaved.value = {
+      savedAt: parsed.__saved_at || null,
+      hasPreset: true,
+    };
+  } catch {
+    // Corrupt JSON in storage — silently ignore and stick with defaults.
+  }
+};
+
+const saveOutboundTesterPreset = () => {
+  try {
+    const { doc_file: _docFile, doc_chars: _docChars, ...persistable } = outboundTester.value;
+    const payload = { ...persistable, __saved_at: new Date().toISOString() };
+    localStorage.setItem(OUTBOUND_TESTER_STORAGE_KEY, JSON.stringify(payload));
+    outboundTesterSaved.value = {
+      savedAt: payload.__saved_at,
+      hasPreset: true,
+    };
+    infoMsg.value = 'Tester preset saved on this browser.';
+  } catch (err) {
+    errorMsg.value = 'Could not save the tester preset (browser storage unavailable).';
+  }
+};
+
+const clearOutboundTesterPreset = () => {
+  if (!window.confirm('Clear the saved tester preset?')) return;
+  try {
+    localStorage.removeItem(OUTBOUND_TESTER_STORAGE_KEY);
+  } catch {
+    // ignore
+  }
+  outboundTester.value = _defaultOutboundTester();
+  outboundTesterSaved.value = { savedAt: null, hasPreset: false };
+  infoMsg.value = 'Tester preset cleared.';
+};
 
 const onOutboundTesterDocSelected = (event) => {
   const file = event.target?.files?.[0] || null;
@@ -352,6 +440,16 @@ const clearOutboundTesterDoc = () => {
   outboundTester.value.doc_chars = 0;
 };
 
+// Hydrate the preset on script load. Safe to call even before auth — the
+// preset lives in localStorage, not in any backend table.
+_hydrateOutboundTesterFromStorage();
+
+// Per-second billing rate matches the server (₹8/minute → ₹2/15 per
+// second). We display the precise live total; the persisted ledger
+// uses the same Decimal math on the backend, so the dashboard tile
+// reconciles exactly with what the meter shows when the call ends.
+const COST_RUPEES_PER_SECOND = 8 / 60;
+
 const voice = ref({
   ws: null,
   audioCtx: null,
@@ -360,6 +458,12 @@ const voice = ref({
   mode: 'inbound',
   status: 'idle', // idle | connecting | listening | thinking | speaking | error
   callId: null,
+  // Live cost meter. ``callStartedAt`` is the wall-clock anchor the
+  // backend uses too (set when the WS opens); ``elapsedSeconds`` ticks
+  // up via a 1s interval while the call is active. Cleared on cleanup.
+  callStartedAt: null,
+  elapsedSeconds: 0,
+  costTimer: null,
   language: 'en',
   liveTranscript: '',
   transcriptLang: '',
@@ -438,12 +542,49 @@ const currentBusinessTemplate = computed(() =>
   || null,
 );
 const businessTypeLabel = computed(() => currentBusinessTemplate.value?.label || 'Not selected');
+const isRealEstateTemplate = computed(() => currentOrganization.value?.industry === 'real_estate');
+const ticketsTabLabel = computed(() => (isRealEstateTemplate.value ? 'Site Visits' : 'Tickets'));
+const ticketSingularLabel = computed(() => (isRealEstateTemplate.value ? 'site visit' : 'ticket'));
+const ticketTitleLabel = computed(() => (isRealEstateTemplate.value ? 'Site Visit' : 'Ticket'));
+const ticketFieldTitle = computed(() => `${ticketTitleLabel.value} Fields`);
+const businessTypeTabsLabel = (option) => {
+  const ticketsLabel = option?.value === 'real_estate' ? 'Site Visits' : 'Tickets';
+  return option?.tabs?.includes('appointments')
+    ? `Leads, ${ticketsLabel}, and Appointments`
+    : `Leads and ${ticketsLabel}`;
+};
 const memberPageLabel = computed(() => currentBusinessTemplate.value?.member_label || 'Members');
 const businessTypeRequired = computed(() => !currentOrganization.value?.industry);
 const businessTemplateTabs = computed(() => currentBusinessTemplate.value?.tabs || []);
 const showAppointmentsTab = computed(() => businessTemplateTabs.value.includes('appointments'));
 const isClinicTemplate = computed(() => currentOrganization.value?.industry === 'clinics');
 const schemaFor = (key) => currentBusinessTemplate.value?.schemas?.[key] || [];
+
+// Field-type → label/icon mapping used by the beautified schema cards
+// on the Site Visits and Leads tabs. Type strings come straight from
+// the business template so the table covers everything the editor
+// emits (text, phone, email, select, date, currency, textarea, …).
+// Falling back to FileText + capitalised name keeps unknown types
+// readable without crashing.
+const fieldTypeIcon = (type) => {
+  const normalised = String(type || '').toLowerCase();
+  if (normalised === 'phone') return PhoneCall;
+  if (normalised === 'email') return MessageSquare;
+  if (normalised === 'select') return Layers;
+  if (normalised === 'multiselect' || normalised === 'multi_select') return Layers;
+  if (normalised === 'date' || normalised === 'datetime') return CalendarDays;
+  if (normalised === 'currency' || normalised === 'number') return Wallet;
+  if (normalised === 'url' || normalised === 'website') return Globe;
+  if (normalised === 'textarea' || normalised === 'longtext') return FileText;
+  if (normalised === 'user' || normalised === 'person') return Users;
+  return FileText;
+};
+
+const fieldTypeLabel = (type) => {
+  const s = String(type || '').replace(/_/g, ' ').trim();
+  if (!s) return 'Text';
+  return s.charAt(0).toUpperCase() + s.slice(1);
+};
 const fieldTypes = ['text', 'phone', 'email', 'number', 'currency', 'date', 'datetime', 'select'];
 const scheduleDays = [
   { value: 'mon', label: 'Mon', full: 'Monday' },
@@ -596,6 +737,13 @@ const toggleThemeMode = () => {
 
 const switchPage = (page) => {
   if (page === 'appointments' && !showAppointmentsTab.value) return;
+  // Nokvo Connect is feature-flagged. When disabled, swallow any attempt to
+  // navigate to its landing pages (nav button is already hidden, but this
+  // catches deep-links / programmatic calls) so the user can't reach a
+  // broken view.
+  if ((page === 'nokvo_connect' || page === 'nokvo_connect_step2') && !nokvoConnectEnabled.value) {
+    return;
+  }
   currentPage.value = page;
   errorMsg.value = '';
   infoMsg.value = '';
@@ -795,9 +943,13 @@ const fetchAuthConfig = async () => {
     const { data } = await api.get('/config');
     authConfig.value = data;
     onboardingV2Enabled.value = !!data?.onboarding_v2_enabled;
+    nokvoConnectEnabled.value = !!data?.nokvo_connect_enabled;
+    kbDocumentUploadEnabled.value = !!data?.kb_document_upload_enabled;
   } catch (_) {
     authConfig.value = { google_client_id: '', google_login_enabled: false };
     onboardingV2Enabled.value = false;
+    nokvoConnectEnabled.value = false;
+    kbDocumentUploadEnabled.value = false;
   }
 };
 
@@ -883,6 +1035,16 @@ const loadWorkspace = async () => {
     if (lf.status === 'fulfilled') leadForms.value = lf.value.data || [];
     if (ll.status === 'fulfilled') outgoingLeads.value = ll.value.data || [];
     if (m.status === 'fulfilled') await loadMemberScheduleExtras(m.value.data);
+    // Cost summary is a small additional GET — fire it after the main
+    // bundle so a billing-endpoint hiccup can't fail the whole load.
+    // We don't await it; the card renders a skeleton until the data
+    // arrives a few hundred ms later.
+    loadCostSummary();
+    // Notifications: bulk inbox load + live WS subscription. Both are
+    // fire-and-forget; failures are silent so a notifications outage
+    // doesn't degrade the rest of the workspace.
+    loadNotifications();
+    connectNotificationsSocket();
     if (['leads', 'tickets', 'appointments'].includes(currentPage.value)) {
       await loadTabRecords(currentPage.value);
     }
@@ -891,6 +1053,147 @@ const loadWorkspace = async () => {
   } finally {
     isLoadingMembers.value = false;
   }
+};
+
+// Render a cost-summary bucket's ``seconds`` (Decimal-as-string from the
+// server) as a 1-dp minutes label. We keep the conversion on the client
+// because the server already ships the raw seconds — re-quantising to
+// minutes here means we never lie about the ledger duration, just round
+// the display. ``—`` is the empty-state for "no data yet".
+const formatMinutes = (seconds) => {
+  if (seconds === null || seconds === undefined || seconds === '') return '—';
+  const n = Number(seconds);
+  if (!Number.isFinite(n) || n < 0) return '—';
+  if (n === 0) return '0 min';
+  if (n < 60) return `${Math.round(n)}s`;
+  return `${(n / 60).toFixed(1)} min`;
+};
+
+const loadCostSummary = async () => {
+  // Idempotent reloader for the dashboard cost card. The endpoint
+  // returns today / this-month / all-time totals — we never recompute
+  // from durations on the client because the server has the rate-lock
+  // logic for tariff changes.
+  if (isLoadingCostSummary.value) return;
+  isLoadingCostSummary.value = true;
+  try {
+    const { data } = await api.get('/cost-summary', { headers: authHeader() });
+    costSummary.value = data;
+  } catch {
+    // Silent failure — the card stays in its skeleton state, which is
+    // less alarming than a red banner for a non-critical widget.
+  } finally {
+    isLoadingCostSummary.value = false;
+  }
+};
+
+// ── Notifications ────────────────────────────────────────────────────
+//
+// Two-track design:
+//   1. REST  — initial bulk load on login + a reload on bell open. This
+//              is what the user sees on a fresh page open or after a
+//              reconnect; it covers anything that arrived while the WS
+//              was down.
+//   2. WS    — live fanout on /api/nokvo-one/notifications/ws. We prepend
+//              fresh notifications and bump the badge in real time.
+//
+// On logout / unmount we close the socket so the in-process bus on the
+// server can drop our queue.
+
+const loadNotifications = async () => {
+  if (isLoadingNotifications.value) return;
+  isLoadingNotifications.value = true;
+  try {
+    const [{ data: inbox }, { data: count }] = await Promise.all([
+      api.get('/notifications', { headers: authHeader(), params: { limit: 50 } }),
+      api.get('/notifications/unread-count', { headers: authHeader() }),
+    ]);
+    notifications.value = inbox?.items || [];
+    unreadCount.value = Number(count?.unread || 0);
+  } catch {
+    // Silent — the bell stays in its current state. A failed inbox
+    // shouldn't block the rest of the app.
+  } finally {
+    isLoadingNotifications.value = false;
+  }
+};
+
+const openNotifications = async () => {
+  isNotificationsOpen.value = !isNotificationsOpen.value;
+  if (isNotificationsOpen.value) {
+    // Refresh on open so the panel reflects anything the WS may have
+    // missed during a brief disconnect.
+    await loadNotifications();
+  }
+};
+
+const markNotificationRead = async (notification) => {
+  if (!notification || notification.read_at) return;
+  try {
+    await api.post(`/notifications/${notification.id}/read`, {}, { headers: authHeader() });
+    // Optimistic local mutation — avoids a re-fetch round-trip for a
+    // single-row state change the user just performed.
+    notification.read_at = new Date().toISOString();
+    unreadCount.value = Math.max(0, unreadCount.value - 1);
+  } catch {
+    // No-op — the next refresh will reconcile.
+  }
+};
+
+const markAllNotificationsRead = async () => {
+  try {
+    await api.post('/notifications/read-all', {}, { headers: authHeader() });
+    const now = new Date().toISOString();
+    notifications.value = notifications.value.map((n) =>
+      n.read_at ? n : { ...n, read_at: now }
+    );
+    unreadCount.value = 0;
+  } catch {
+    // No-op.
+  }
+};
+
+const closeNotificationsSocket = () => {
+  const sock = notificationsSocket.value;
+  notificationsSocket.value = null;
+  if (sock && sock.readyState !== WebSocket.CLOSED) {
+    try { sock.close(); } catch { /* swallow */ }
+  }
+};
+
+const connectNotificationsSocket = () => {
+  // We open one WS per session. If a previous one is alive (e.g., the
+  // user just rotated their token) close it first so the in-process
+  // bus on the server doesn't hold a stale subscriber.
+  closeNotificationsSocket();
+  const token = localStorage.getItem(ACCESS_TOKEN_KEY);
+  if (!token) return;
+  const url = `ws://localhost:8000/api/nokvo-one/notifications/ws?token=${encodeURIComponent(token)}`;
+  let sock;
+  try {
+    sock = new WebSocket(url);
+  } catch {
+    return;
+  }
+  notificationsSocket.value = sock;
+  sock.onmessage = (evt) => {
+    let payload;
+    try { payload = JSON.parse(evt.data); } catch { return; }
+    if (payload?.type !== 'notification' || !payload?.data) return;
+    const fresh = payload.data;
+    // Drop dupes the REST inbox may already carry — the live fanout
+    // and the REST load can race on a fresh page open.
+    const existing = notifications.value.findIndex((n) => n.id === fresh.id);
+    if (existing >= 0) {
+      notifications.value.splice(existing, 1, fresh);
+    } else {
+      notifications.value = [fresh, ...notifications.value].slice(0, 100);
+    }
+    if (!fresh.read_at) unreadCount.value += 1;
+  };
+  sock.onclose = () => {
+    if (notificationsSocket.value === sock) notificationsSocket.value = null;
+  };
 };
 
 const loadTabRecords = async (tab) => {
@@ -1003,6 +1306,7 @@ const beginOutcomeWizard = async () => {
     authState.value = 'ready';
   }
 };
+
 
 const toggleWizardOutcome = (slug) => {
   outcomeWizard.value.selected[slug] = !outcomeWizard.value.selected[slug];
@@ -2313,6 +2617,11 @@ const isMemberOnly = computed(() => ['member', 'viewer'].includes(currentUser.va
 const myTimetable = ref(null);
 const isLoadingMyTimetable = ref(false);
 const isMutatingMyBlock = ref(false);
+// Records assigned to the current member (site visits / leads / tickets).
+// Loaded alongside the timetable so the calendar can light up dates that
+// have customer work, mirroring what the admin sees in the timetable
+// modal — but scoped to the calling user only.
+const myAssignedRecords = ref([]);
 const bufferForm = ref({ start_time: '', duration_minutes: 30, reason: 'Buffer' });
 const unavailableForm = ref({ start_time: '', end_time: '', reason: '' });
 const bufferDurationOptions = [
@@ -2326,13 +2635,183 @@ const bufferDurationOptions = [
 const loadMyTimetable = async () => {
   isLoadingMyTimetable.value = true;
   try {
-    const { data } = await api.get('/members/me/timetable', { headers: authHeader() });
-    myTimetable.value = data;
+    // Pull the timetable + the member's assigned work in parallel so the
+    // calendar page renders with both data sources in one round trip.
+    // Assigned-records failure is non-fatal — the calendar still renders
+    // the timetable bits even if the records call errors.
+    const [timetable, assigned] = await Promise.allSettled([
+      api.get('/members/me/timetable', { headers: authHeader() }),
+      api.get('/members/me/assigned-records', { headers: authHeader() }),
+    ]);
+    if (timetable.status === 'fulfilled') myTimetable.value = timetable.value.data;
+    else throw timetable.reason;
+    myAssignedRecords.value = assigned.status === 'fulfilled' ? (assigned.value.data || []) : [];
   } catch (err) {
     errorMsg.value = extractErrorMessage(err, 'Failed to load your timetable.');
   } finally {
     isLoadingMyTimetable.value = false;
   }
+};
+
+// ── Member calendar view ─────────────────────────────────────────────
+//
+// The admin already gets a month-grid timetable in the member-roster
+// modal. Members get the same shape here, driven by their own
+// /members/me/timetable payload (assignment + blocked_slots).
+//
+// We don't fetch the member's assigned tickets/appointments yet — the
+// /me/timetable endpoint doesn't expose them. The calendar will surface
+// the recurring working window + one-off buffer/unavailable blocks,
+// which is the contract for what "their timetable" means today.
+
+const myCalendarSelectedDate = ref(todayKey());
+const myCalendarVisibleMonth = ref(`${todayKey().slice(0, 7)}-01`);
+
+// Map server weekday names → JS getDay() indexes so the calendar grid
+// can tell which dates fall on the member's configured working days.
+const _WEEKDAY_INDEX = {
+  sunday: 0, sun: 0,
+  monday: 1, mon: 1,
+  tuesday: 2, tue: 2,
+  wednesday: 3, wed: 3,
+  thursday: 4, thu: 4,
+  friday: 5, fri: 5,
+  saturday: 6, sat: 6,
+};
+
+const myWorkingDayIndexes = computed(() => {
+  const days = myTimetable.value?.assignment?.working_days || [];
+  const out = new Set();
+  for (const d of days) {
+    const idx = _WEEKDAY_INDEX[String(d).trim().toLowerCase()];
+    if (idx !== undefined) out.add(idx);
+  }
+  return out;
+});
+
+// Customer work assigned to the calling member, in the same {start, end,
+// title, ...} shape the calendar consumes. Each record's start comes from
+// scheduleRecordDate which already knows where appointments / leads /
+// tickets stash their scheduled timestamp.
+const myAssignedScheduleItems = computed(() => {
+  const duration = Number(myTimetable.value?.assignment?.appointment_duration_minutes || 30);
+  return myAssignedRecords.value
+    .map((record) => {
+      const start = recordCalendarDate(record);
+      const end = start ? new Date(start.getTime() + duration * 60000) : null;
+      return {
+        id: record.id,
+        recordType: record.record_type,
+        title: scheduleRecordLabel(record),
+        typeLabel: scheduleRecordTypeLabel(record),
+        detail: scheduleRecordDetail(record),
+        status: record.status,
+        phone: recordPhone(record),
+        phoneHref: phoneHref(recordPhone(record)),
+        createdAt: record.created_at,
+        start,
+        end,
+        isBlocked: false,
+      };
+    });
+});
+
+const myAssignedQueuedItems = computed(() =>
+  myAssignedScheduleItems.value
+    .filter((item) => !item.start)
+    .sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime()),
+);
+
+const myCalendarBlocks = computed(() => {
+  const slots = myTimetable.value?.blocked_slots || [];
+  const blocks = slots
+    .map((slot) => ({
+      id: slot.id,
+      recordType: 'blocked',
+      title: slot.reason || 'Block',
+      typeLabel: 'Blocked',
+      isBlocked: true,
+      start: parseRecordDate(slot.start_time),
+      end: parseRecordDate(slot.end_time),
+    }));
+  // Merge blocked slots + scheduled customer work into a single ordered
+  // stream — the calendar renders both kinds with their own visual.
+  return [...blocks, ...myAssignedScheduleItems.value.filter((item) => item.start)]
+    .filter((item) => item.start)
+    .sort((a, b) => a.start.getTime() - b.start.getTime());
+});
+
+const myCalendarMonthLabel = computed(() => {
+  const visible = dateFromKey(myCalendarVisibleMonth.value) || new Date();
+  return visible.toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
+});
+
+const myCalendarDays = computed(() => {
+  // Same 42-cell month grid as the admin timetable modal. We don't reuse
+  // ``timetableCalendarDays`` because that one is scoped to the admin
+  // viewer state (timetableViewer.member) and the member view needs its
+  // own independent selection.
+  const selected = myCalendarSelectedDate.value;
+  const visibleDate = dateFromKey(myCalendarVisibleMonth.value) || new Date();
+  const firstOfMonth = new Date(visibleDate.getFullYear(), visibleDate.getMonth(), 1);
+  const gridStart = new Date(firstOfMonth);
+  gridStart.setDate(firstOfMonth.getDate() - firstOfMonth.getDay());
+  const today = todayKey();
+  const workingDays = myWorkingDayIndexes.value;
+  return Array.from({ length: 42 }, (_, index) => {
+    const date = new Date(gridStart);
+    date.setDate(gridStart.getDate() + index);
+    const key = localDateKey(date);
+    const itemsOnDay = myCalendarBlocks.value.filter(
+      (item) => localDateKey(item.start) === key,
+    );
+    // Separate visit count from block count so the cell badge can read
+    // "1 visit + 1 block" cleanly without lumping them together.
+    const visitCount = itemsOnDay.filter((i) => !i.isBlocked).length;
+    const blockCount = itemsOnDay.filter((i) => i.isBlocked).length;
+    return {
+      key,
+      dayNumber: date.getDate(),
+      inMonth: date.getMonth() === visibleDate.getMonth(),
+      isToday: key === today,
+      isSelected: key === selected,
+      isWorkingDay: workingDays.has(date.getDay()),
+      itemCount: itemsOnDay.length,
+      visitCount,
+      blockCount,
+    };
+  });
+});
+
+const myCalendarSelectedLabel = computed(() => {
+  const date = dateFromKey(myCalendarSelectedDate.value) || new Date();
+  return date.toLocaleDateString(undefined, {
+    weekday: 'long',
+    month: 'long',
+    day: 'numeric',
+  });
+});
+
+const myCalendarSelectedIsWorking = computed(() => {
+  const date = dateFromKey(myCalendarSelectedDate.value) || new Date();
+  return myWorkingDayIndexes.value.has(date.getDay());
+});
+
+const myCalendarSelectedItems = computed(() =>
+  myCalendarBlocks.value.filter(
+    (item) => localDateKey(item.start) === myCalendarSelectedDate.value,
+  ),
+);
+
+const selectMyCalendarDate = (key) => {
+  myCalendarSelectedDate.value = key;
+  myCalendarVisibleMonth.value = `${key.slice(0, 7)}-01`;
+};
+
+const shiftMyCalendarMonth = (offset) => {
+  const visible = dateFromKey(myCalendarVisibleMonth.value) || new Date();
+  const next = new Date(visible.getFullYear(), visible.getMonth() + offset, 1);
+  myCalendarVisibleMonth.value = localDateKey(next);
 };
 
 const addBuffer = async () => {
@@ -3217,6 +3696,8 @@ const createCampaign = async () => {
   }
 };
 
+
+
 const launchCampaign = async (id) => {
   isLaunchingCampaign.value = id;
   try {
@@ -3452,13 +3933,41 @@ const tickVad = () => {
       voice.value.isInSpeech = false;
       voice.value.silenceStartTime = 0;
       if (duration > VAD_MIN_UTTERANCE_MS) {
-        finishUtteranceCaptureAndSend();
+        // Streaming STT: every PCM chunk has already been pushed to the
+        // server during speech. Tell it we're done so it flushes Sarvam
+        // and fires the turn immediately — no REST roundtrip.
+        if (voice.value.ws && voice.value.ws.readyState === WebSocket.OPEN) {
+          try {
+            voice.value.ws.send(JSON.stringify({ type: 'end_of_utterance' }));
+          } catch {
+            // Closed; cleanup will handle the rest.
+          }
+        }
+        voice.value.utteranceChunks = [];
         voice.value.status = 'thinking';
       } else {
         discardUtteranceCapture();
         voice.value.status = 'listening';
       }
     }
+  }
+};
+
+const _streamPcmChunkToServer = (chunk) => {
+  // Send a single PCM frame as a binary WS message during streaming STT.
+  // The server (mode=stream) forwards each frame to the Sarvam STT WS so
+  // transcription happens IN PARALLEL with the user still speaking — by
+  // the time end-of-speech fires, the transcript is almost ready.
+  if (!voice.value.ws || voice.value.ws.readyState !== WebSocket.OPEN) return;
+  const inputRate = voice.value.pcmInputRate || 48000;
+  const downsampled = inputRate === TARGET_STT_SAMPLE_RATE
+    ? chunk
+    : downsampleTo16k(chunk, inputRate);
+  const int16 = floatToInt16(downsampled);
+  try {
+    voice.value.ws.send(int16.buffer);
+  } catch (err) {
+    // Closed mid-send; the call-cleanup path will surface the error.
   }
 };
 
@@ -3491,8 +4000,15 @@ const setupPcmCapture = (audioCtx, micStream) => {
       const removed = voice.value.pcmRing.shift();
       voice.value.pcmRingDurationMs -= (removed.length / inputRate) * 1000;
     }
-    if (voice.value.isInSpeech && voice.value.utteranceChunks) {
-      voice.value.utteranceChunks.push(copy);
+    if (voice.value.isInSpeech) {
+      // Streaming STT path: push every chunk straight to the server as
+      // it's captured. The server pipes them into Sarvam STT WS so we
+      // never pay for a post-EOU REST roundtrip. ``utteranceChunks``
+      // is still maintained as a fallback for vad_blob mode.
+      _streamPcmChunkToServer(copy);
+      if (voice.value.utteranceChunks) {
+        voice.value.utteranceChunks.push(copy);
+      }
     }
   };
 
@@ -3539,6 +4055,13 @@ const beginUtteranceCapture = () => {
     fromEnd[0] = fromEnd[0].subarray(Math.floor(drop));
   }
   voice.value.utteranceChunks = fromEnd.length ? [...fromEnd] : [];
+  // Streaming-STT path: flush the pre-roll to the server up front so
+  // Sarvam has the leading consonants by the time the user's voice
+  // hits the mic threshold. Without this the first 60-100ms of audio
+  // never reaches the transcriber.
+  for (const chunk of voice.value.utteranceChunks) {
+    _streamPcmChunkToServer(chunk);
+  }
 };
 
 const finishUtteranceCaptureAndSend = () => {
@@ -3735,7 +4258,10 @@ const startVoiceCall = async (mode = 'inbound') => {
     ws.onopen = () => {
       // Tell the backend we're using browser VAD — it will treat each binary
       // frame as a complete utterance instead of streaming PCM.
-      ws.send(JSON.stringify({ type: 'config', language: voice.value.language, mode: 'vad_blob' }));
+      // Streaming STT: PCM frames flow continuously while the user
+      // speaks; Sarvam transcribes in parallel. Saves ~200-400ms per
+      // turn vs the legacy vad_blob (full-utterance REST POST).
+      ws.send(JSON.stringify({ type: 'config', language: voice.value.language, mode: 'stream', sample_rate: TARGET_STT_SAMPLE_RATE }));
     };
 
     ws.onmessage = (event) => {
@@ -3767,6 +4293,9 @@ const handleVoiceEvent = (msg) => {
     case 'voice_session_ready':
       voice.value.callId = msg.call_id;
       voice.value.status = 'listening';
+      // Anchor the cost meter when the call actually starts (mic up,
+      // STT live). Same anchor the backend uses for the ledger row.
+      _startCostMeter();
       break;
     case 'runtime_status':
       runtimeStatus.value = msg;
@@ -3834,12 +4363,62 @@ const handleVoiceEvent = (msg) => {
   }
 };
 
+// Cost meter helpers. Kept here next to cleanupVoiceCall because both
+// touch the same voice ref and need to stay in lockstep — a leaked
+// interval would keep ticking after the call ended, and forgetting to
+// reset elapsedSeconds would leave a stale total on the badge for the
+// next call.
+const _startCostMeter = () => {
+  if (voice.value.costTimer) {
+    try { clearInterval(voice.value.costTimer); } catch {}
+  }
+  voice.value.callStartedAt = Date.now();
+  voice.value.elapsedSeconds = 0;
+  voice.value.costTimer = setInterval(() => {
+    if (!voice.value.callStartedAt) return;
+    voice.value.elapsedSeconds = (Date.now() - voice.value.callStartedAt) / 1000;
+  }, 1000);
+};
+
+const _stopCostMeter = () => {
+  if (voice.value.costTimer) {
+    try { clearInterval(voice.value.costTimer); } catch {}
+    voice.value.costTimer = null;
+  }
+  voice.value.callStartedAt = null;
+};
+
+// Display values for the in-call meter. Two-decimal rupees (₹0.13/s
+// granularity is the tariff so a 1-decimal display would round
+// awkwardly) + an HH:MM:SS clock so long calls don't pile into a
+// single huge seconds count.
+const liveCostRupees = computed(() => {
+  const seconds = voice.value.elapsedSeconds || 0;
+  return (seconds * COST_RUPEES_PER_SECOND).toFixed(2);
+});
+
+const liveCostDuration = computed(() => {
+  const total = Math.max(0, Math.floor(voice.value.elapsedSeconds || 0));
+  const hh = Math.floor(total / 3600);
+  const mm = Math.floor((total % 3600) / 60);
+  const ss = total % 60;
+  const pad = (n) => String(n).padStart(2, '0');
+  return hh > 0 ? `${hh}:${pad(mm)}:${pad(ss)}` : `${pad(mm)}:${pad(ss)}`;
+});
+
 const cleanupVoiceCall = () => {
   // Stop VAD polling FIRST so it can't try to start a new capture mid-cleanup.
   if (voice.value.vadTimer) {
     try { clearInterval(voice.value.vadTimer); } catch {}
     voice.value.vadTimer = null;
   }
+  // Stop the cost meter and refresh the dashboard tile so the call
+  // that just ended shows up in the persisted totals. Refresh runs
+  // fire-and-forget — the backend may take a moment to commit the row,
+  // so we re-pull after a short delay too.
+  _stopCostMeter();
+  try { loadCostSummary(); } catch {}
+  setTimeout(() => { try { loadCostSummary(); } catch {} }, 1500);
   teardownPcmCapture();
   stopAmbienceBed();
   if (voice.value.micNode) try { voice.value.micNode.disconnect(); } catch {}
@@ -3881,6 +4460,10 @@ const handleLogout = async () => {
   try {
     await api.post('/logout', {}, { headers: authHeader() });
   } catch (_) {}
+  closeNotificationsSocket();
+  notifications.value = [];
+  unreadCount.value = 0;
+  isNotificationsOpen.value = false;
   localStorage.removeItem(ACCESS_TOKEN_KEY);
   localStorage.removeItem(REFRESH_TOKEN_KEY);
   currentUser.value = null;
@@ -3931,6 +4514,7 @@ watch(authConfig, async () => {
 
 onBeforeUnmount(() => {
   if (cursorTimer.value) clearTimeout(cursorTimer.value);
+  closeNotificationsSocket();
 });
 </script>
 
@@ -3954,15 +4538,57 @@ onBeforeUnmount(() => {
         <Moon v-else :size="14" />
         {{ themeToggleLabel }}
       </button>
-      <button
+      <div
         v-if="authState === 'ready' && !isMemberOnly"
-        type="button"
-        class="mode-link mode-link--icon"
-        aria-label="Notifications"
-        title="Notifications"
+        class="mode-link-wrap notif-wrap"
       >
-        <Bell :size="14" />
-      </button>
+        <button
+          type="button"
+          class="mode-link mode-link--icon notif-button"
+          :class="{ active: isNotificationsOpen, 'has-unread': unreadCount > 0 }"
+          aria-label="Notifications"
+          title="Notifications"
+          @click="openNotifications"
+        >
+          <Bell :size="14" />
+          <span v-if="unreadCount > 0" class="notif-badge" :aria-label="`${unreadCount} unread`">{{ unreadCount > 99 ? '99+' : unreadCount }}</span>
+        </button>
+        <div v-if="isNotificationsOpen" class="notif-panel">
+          <div class="notif-panel-head">
+            <strong>Notifications</strong>
+            <button
+              v-if="unreadCount > 0"
+              type="button"
+              class="notif-mark-all"
+              @click="markAllNotificationsRead"
+            >
+              Mark all read
+            </button>
+          </div>
+          <p v-if="!notifications.length && !isLoadingNotifications" class="notif-empty">
+            Nothing new. Hot leads, integration issues, and outbound batch results will show up here.
+          </p>
+          <p v-else-if="isLoadingNotifications && !notifications.length" class="notif-empty">
+            Loading…
+          </p>
+          <ul v-else class="notif-list">
+            <li
+              v-for="notif in notifications"
+              :key="notif.id"
+              class="notif-row"
+              :class="[`severity-${notif.severity}`, { unread: !notif.read_at }]"
+              @click="markNotificationRead(notif)"
+            >
+              <span class="notif-dot" :class="`severity-${notif.severity}`"></span>
+              <div class="notif-row-body">
+                <strong>{{ notif.title }}</strong>
+                <small v-if="notif.body">{{ notif.body }}</small>
+                <small class="notif-row-time">{{ notif.created_at ? new Date(notif.created_at).toLocaleString() : '' }}</small>
+              </div>
+            </li>
+          </ul>
+        </div>
+      </div>
       <div
         v-if="authState === 'ready' && !isMemberOnly && onboardingV2Enabled"
         class="mode-link-wrap"
@@ -3978,6 +4604,14 @@ onBeforeUnmount(() => {
           <Settings2 :size="14" />
         </button>
         <div v-if="settingsMenuOpen" class="nav-settings-menu mode-settings-menu">
+          <button
+            type="button"
+            class="nav-settings-item"
+            @click="settingsMenuOpen = false; switchPage('organization_health')"
+          >
+            <strong>Organization Health</strong>
+            <small>Workspace readiness — security, agent setup, knowledge, runtime, outbound, infra.</small>
+          </button>
           <button
             type="button"
             class="nav-settings-item"
@@ -4256,7 +4890,7 @@ onBeforeUnmount(() => {
               <input v-model="selectedBusinessType" type="radio" class="sr-only" :value="option.value" />
               <strong class="provider-name">{{ option.label }}</strong>
               <small>
-                {{ option.tabs.includes('appointments') ? 'Leads, Tickets, and Appointments' : 'Leads and Tickets' }}
+                {{ businessTypeTabsLabel(option) }}
               </small>
             </label>
           </div>
@@ -4582,7 +5216,7 @@ onBeforeUnmount(() => {
             </button>
             <button v-if="!isMemberOnly" type="button" class="nav-page-button" :class="{ active: currentPage === 'tickets' }" @click="switchPage('tickets')">
               <MessageSquare :size="17" />
-              <span>Tickets</span>
+              <span>{{ ticketsTabLabel }}</span>
             </button>
             <button v-if="!isMemberOnly" type="button" class="nav-page-button" :class="{ active: currentPage === 'leads' }" @click="switchPage('leads')">
               <UserPlus :size="17" />
@@ -4639,7 +5273,7 @@ onBeforeUnmount(() => {
               <span>Knowledge Base</span>
             </button>
             <button
-              v-if="!isMemberOnly"
+              v-if="!isMemberOnly && nokvoConnectEnabled"
               type="button"
               class="nav-page-button"
               :class="{ active: currentPage === 'nokvo_connect' }"
@@ -4736,7 +5370,147 @@ onBeforeUnmount(() => {
 
         <div v-if="isLoadingMyTimetable && !myTimetable" class="empty-state">Loading your timetable…</div>
 
-        <div v-else class="member-timetable-grid">
+        <div v-else class="my-calendar-shell">
+          <section class="timetable-calendar-card my-calendar-card">
+            <div class="timetable-calendar-head">
+              <button type="button" class="ghost-button compact icon-only" aria-label="Previous month" @click="shiftMyCalendarMonth(-1)">
+                <ChevronLeft :size="16" />
+              </button>
+              <strong>{{ myCalendarMonthLabel }}</strong>
+              <button type="button" class="ghost-button compact icon-only" aria-label="Next month" @click="shiftMyCalendarMonth(1)">
+                <ChevronRight :size="16" />
+              </button>
+            </div>
+            <div class="timetable-weekdays">
+              <span v-for="day in ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']" :key="day">{{ day }}</span>
+            </div>
+            <div class="timetable-month-grid">
+              <button
+                v-for="day in myCalendarDays"
+                :key="day.key"
+                type="button"
+                class="timetable-date-cell"
+                :class="{
+                  muted: !day.inMonth,
+                  today: day.isToday,
+                  active: day.isSelected,
+                  busy: day.itemCount,
+                  'has-visit': day.visitCount,
+                  'working-day': day.isWorkingDay && day.inMonth,
+                }"
+                @click="selectMyCalendarDate(day.key)"
+              >
+                <span>{{ day.dayNumber }}</span>
+                <small v-if="day.visitCount && day.blockCount">{{ day.visitCount }} visit{{ day.visitCount === 1 ? '' : 's' }} · {{ day.blockCount }} block</small>
+                <small v-else-if="day.visitCount">{{ day.visitCount }} visit{{ day.visitCount === 1 ? '' : 's' }}</small>
+                <small v-else-if="day.blockCount">{{ day.blockCount }} block{{ day.blockCount === 1 ? '' : 's' }}</small>
+                <small v-else-if="day.isWorkingDay && day.inMonth" class="my-calendar-working-hint">on duty</small>
+              </button>
+            </div>
+            <div class="my-calendar-legend">
+              <span><i class="legend-dot working"></i> Working day</span>
+              <span><i class="legend-dot visit"></i> Customer visit</span>
+              <span><i class="legend-dot blocked"></i> Blocked time</span>
+              <span><i class="legend-dot today"></i> Today</span>
+            </div>
+          </section>
+
+          <section class="timetable-selected-day my-calendar-selected">
+            <div class="timetable-queue-head">
+              <div>
+                <span class="section-kicker">Selected date</span>
+                <h4>{{ myCalendarSelectedLabel }}</h4>
+              </div>
+              <span class="status-chip" :class="{ active: myCalendarSelectedIsWorking }">
+                {{ myCalendarSelectedIsWorking ? 'Working day' : 'Off-day' }}
+              </span>
+            </div>
+
+            <dl v-if="myCalendarSelectedIsWorking && myTimetable?.assignment?.start_time && myTimetable?.assignment?.end_time" class="dashboard-detail-list my-calendar-hours">
+              <div>
+                <dt>Working hours</dt>
+                <dd>
+                  {{ myTimetable.assignment.start_time }} – {{ myTimetable.assignment.end_time }}
+                  <small>({{ myTimetable.assignment.timezone || 'Asia/Kolkata' }})</small>
+                </dd>
+              </div>
+              <div v-if="myTimetable?.assignment?.appointment_duration_minutes">
+                <dt>Slot duration</dt>
+                <dd>{{ myTimetable.assignment.appointment_duration_minutes }} min</dd>
+              </div>
+            </dl>
+
+            <div v-if="!myCalendarSelectedItems.length" class="kb-empty compact my-calendar-empty">
+              <div class="kb-empty-icon">
+                <CalendarDays :size="22" />
+              </div>
+              <strong>Nothing scheduled on this date.</strong>
+              <span>Customer visits and your own buffers will appear here.</span>
+            </div>
+
+            <div v-else class="timetable-day-list">
+              <article
+                v-for="item in myCalendarSelectedItems"
+                :key="`${item.recordType}-${item.id}`"
+                class="timetable-event"
+                :class="{ blocked: item.isBlocked }"
+              >
+                <div class="timetable-time">
+                  <strong>{{ formatCalendarTime(item.start) }}</strong>
+                  <span>{{ item.end ? formatCalendarTime(item.end) : '' }}</span>
+                </div>
+                <div class="timetable-event-main">
+                  <div>
+                    <strong>{{ item.title }}</strong>
+                    <span>{{ item.detail || item.typeLabel }}</span>
+                    <a v-if="!item.isBlocked && item.phoneHref" class="record-call-link timetable-call-link" :href="item.phoneHref">
+                      <PhoneCall :size="14" />
+                      Call {{ item.phone }}
+                    </a>
+                  </div>
+                  <button
+                    v-if="item.isBlocked"
+                    type="button"
+                    class="dashboard-inline-button"
+                    :disabled="isMutatingMyBlock"
+                    @click="removeMyBlock(item.id)"
+                  >
+                    <Trash2 :size="14" />
+                    Remove
+                  </button>
+                  <small v-else>{{ item.status }}</small>
+                </div>
+              </article>
+            </div>
+          </section>
+        </div>
+
+        <div v-if="myAssignedQueuedItems.length" class="my-calendar-queue">
+          <div class="dashboard-section-head">
+            <div>
+              <span class="section-kicker">Assigned queue</span>
+              <h4>Awaiting a scheduled time</h4>
+            </div>
+            <p>Customer work assigned to you that hasn't been booked into a slot yet.</p>
+          </div>
+          <ul class="timetable-day-list my-calendar-queue-list">
+            <li v-for="item in myAssignedQueuedItems" :key="`${item.recordType}-${item.id}`" class="timetable-event">
+              <div class="timetable-event-main">
+                <div>
+                  <strong>{{ item.title }}</strong>
+                  <span>{{ item.detail || item.typeLabel }}</span>
+                  <a v-if="item.phoneHref" class="record-call-link timetable-call-link" :href="item.phoneHref">
+                    <PhoneCall :size="14" />
+                    Call {{ item.phone }}
+                  </a>
+                </div>
+                <small>{{ item.status }}</small>
+              </div>
+            </li>
+          </ul>
+        </div>
+
+        <div v-if="myTimetable" class="member-timetable-grid">
           <article class="dashboard-card member-timetable-card">
             <div class="dashboard-card-glow"></div>
             <div class="member-timetable-card-head">
@@ -4909,17 +5683,17 @@ onBeforeUnmount(() => {
         </div>
       </section>
 
-      <!-- DASHBOARD -->
-      <section v-if="currentPage === 'dashboard'" class="dashboard-section">
+      <!-- ORGANIZATION HEALTH (dedicated page, opened from the settings menu) -->
+      <section v-if="currentPage === 'organization_health'" class="dashboard-section">
         <div class="dashboard-section-head">
           <div>
-            <span class="section-kicker">Overview</span>
-            <h3>Organization analytics</h3>
+            <span class="section-kicker">Settings</span>
+            <h3>Organization Health</h3>
           </div>
           <p>Live readiness across security, agent setup, knowledge, runtime, outbound, and infrastructure.</p>
         </div>
 
-        <div class="dashboard-grid overview-grid">
+        <div class="dashboard-grid overview-grid org-health-grid">
           <article class="dashboard-card organization-card">
             <div class="dashboard-card-glow"></div>
             <div class="organization-card-head">
@@ -4962,39 +5736,79 @@ onBeforeUnmount(() => {
               </div>
             </div>
           </article>
+        </div>
+      </section>
 
-          <article class="dashboard-card compact-card">
+      <!-- DASHBOARD -->
+      <section v-if="currentPage === 'dashboard'" class="dashboard-section">
+        <div class="dashboard-section-head">
+          <div>
+            <span class="section-kicker">Billing</span>
+            <h3>Conversation cost</h3>
+          </div>
+          <p>Billed at ₹8 per minute of conversation (₹0.13 per second). Totals reflect the persisted call-cost ledger.</p>
+        </div>
+
+        <div class="dashboard-grid overview-grid cost-grid">
+          <article class="dashboard-card cost-card">
+            <div class="dashboard-card-glow"></div>
             <div class="compact-card-head">
               <div class="compact-icon-shell">
-                <Bot :size="18" />
+                <Wallet :size="18" />
               </div>
               <div>
-                <h3>Agent Studio</h3>
-                <p>{{ agents.length ? 'Ready for testing' : 'No agent yet' }}</p>
+                <h3>Call cost ledger</h3>
+                <p v-if="costSummary?.rate?.rupees_per_minute">₹{{ costSummary.rate.rupees_per_minute }} / minute · ₹{{ costSummary.rate.rupees_per_second_display }} / second</p>
+                <p v-else>₹8 / minute · ₹0.13 / second</p>
+              </div>
+              <button
+                type="button"
+                class="dashboard-inline-button cost-refresh-button"
+                @click="loadCostSummary"
+                :disabled="isLoadingCostSummary"
+                :aria-label="isLoadingCostSummary ? 'Refreshing' : 'Refresh'"
+              >
+                <Activity :size="14" />
+                {{ isLoadingCostSummary ? 'Refreshing…' : 'Refresh' }}
+              </button>
+            </div>
+            <div class="cost-stats">
+              <div class="cost-stat">
+                <span class="cost-stat-label">Today</span>
+                <strong class="cost-stat-value">{{ costSummary?.today?.rupees_formatted || '—' }}</strong>
+                <small class="cost-stat-meta">{{ costSummary?.today?.call_count ?? 0 }} call{{ (costSummary?.today?.call_count ?? 0) === 1 ? '' : 's' }}</small>
+              </div>
+              <div class="cost-stat">
+                <span class="cost-stat-label">This month</span>
+                <strong class="cost-stat-value">{{ costSummary?.this_month?.rupees_formatted || '—' }}</strong>
+                <small class="cost-stat-meta">{{ costSummary?.this_month?.call_count ?? 0 }} call{{ (costSummary?.this_month?.call_count ?? 0) === 1 ? '' : 's' }}</small>
+              </div>
+              <div class="cost-stat cost-stat-minutes">
+                <span class="cost-stat-label">Minutes today</span>
+                <strong class="cost-stat-value">{{ formatMinutes(costSummary?.today?.seconds) }}</strong>
+                <small class="cost-stat-meta">conversation time</small>
+              </div>
+              <div class="cost-stat cost-stat-minutes">
+                <span class="cost-stat-label">Minutes this month</span>
+                <strong class="cost-stat-value">{{ formatMinutes(costSummary?.this_month?.seconds) }}</strong>
+                <small class="cost-stat-meta">conversation time</small>
               </div>
             </div>
-            <dl class="dashboard-detail-list">
-              <div>
-                <dt>Primary Agent</dt>
-                <dd>{{ activeAgent?.name || agents[0]?.name || 'Not created' }}</dd>
+            <div v-if="costSummary?.recent_calls?.length" class="cost-recent">
+              <div class="cost-recent-head">
+                <span class="micro-label">Recent calls</span>
               </div>
-              <div>
-                <dt>Calling</dt>
-                <dd>{{ currentOrganization?.calling_enabled ? 'Enabled' : 'Awaiting approval' }}</dd>
-              </div>
-              <div>
-                <dt>Chat Mode</dt>
-                <dd>Limited (no external sends)</dd>
-              </div>
-              <div>
-                <dt>Business Type</dt>
-                <dd>{{ businessTypeLabel }}</dd>
-              </div>
-            </dl>
-            <button type="button" class="dashboard-inline-button" @click="switchPage('agent')">
-              <Wrench :size="15" />
-              Open Agent Studio
-            </button>
+              <ul class="cost-recent-list">
+                <li v-for="call in costSummary.recent_calls" :key="call.id" class="cost-recent-row">
+                  <div>
+                    <strong>{{ call.rupees_formatted }}</strong>
+                    <small>{{ Math.round(Number(call.duration_seconds || 0)) }}s · {{ call.kind }}</small>
+                  </div>
+                  <small class="cost-recent-time">{{ call.started_at ? new Date(call.started_at).toLocaleString() : '' }}</small>
+                </li>
+              </ul>
+            </div>
+            <p v-else class="cost-empty">No calls billed yet. Costs appear here as soon as voice sessions complete.</p>
           </article>
         </div>
 
@@ -5217,55 +6031,50 @@ onBeforeUnmount(() => {
         <div class="dashboard-section-head">
           <div>
             <span class="section-kicker">{{ businessTypeLabel }}</span>
-            <h3>Tickets</h3>
+            <h3>{{ ticketsTabLabel }}</h3>
           </div>
-          <p>Choose the details your team tracks for support requests.</p>
+          <p>Choose the details your team tracks for {{ isRealEstateTemplate ? 'site visits' : 'support requests' }}.</p>
         </div>
 
         <div class="dashboard-grid control-grid">
-          <article class="dashboard-card wide-card members-card">
+          <article class="dashboard-card wide-card members-card field-schema-card">
             <div class="members-card-head">
               <div>
-                <h3>Ticket Fields</h3>
-                <p>These fields appear when your team captures or reviews a ticket.</p>
+                <h3>{{ ticketFieldTitle }}</h3>
+                <p>These fields appear when your team captures or reviews a {{ ticketSingularLabel }}.</p>
               </div>
               <div class="field-card-actions">
                 <span class="status-chip">{{ schemaFor('tickets').length }} fields</span>
-                <button type="button" class="ghost-button compact" @click="startFieldEdit('tickets', 'Ticket Fields')">Edit Fields</button>
+                <button type="button" class="ghost-button compact" @click="startFieldEdit('tickets', ticketFieldTitle)">Edit Fields</button>
               </div>
             </div>
-            <div class="schema-field-grid">
-              <div v-for="field in schemaFor('tickets')" :key="field.key" class="schema-field-row">
-                <strong>{{ field.label }}</strong>
-                <span>{{ field.type }}{{ field.required ? ' · required' : '' }}</span>
+            <div class="field-schema-grid">
+              <div
+                v-for="field in schemaFor('tickets')"
+                :key="field.key"
+                class="field-schema-tile"
+                :class="{ required: field.required }"
+              >
+                <div class="field-schema-icon">
+                  <component :is="fieldTypeIcon(field.type)" :size="14" />
+                </div>
+                <div class="field-schema-body">
+                  <strong>{{ field.label }}</strong>
+                  <span class="field-schema-meta">
+                    {{ fieldTypeLabel(field.type) }}<em v-if="field.required"> · required</em>
+                  </span>
+                </div>
               </div>
             </div>
           </article>
 
-          <article class="dashboard-card compact-card">
-            <div class="compact-card-head">
-              <div class="compact-icon-shell">
-                <MessageSquare :size="18" />
-              </div>
-              <div>
-                <h3>At A Glance</h3>
-                <p>{{ businessTypeLabel }} ticket setup</p>
-              </div>
-            </div>
-            <dl class="dashboard-detail-list">
-              <div v-for="field in schemaFor('tickets').slice(0, 5)" :key="field.key">
-                <dt>{{ field.label }}</dt>
-                <dd>{{ field.required ? 'Required' : 'Optional' }}</dd>
-              </div>
-            </dl>
-          </article>
         </div>
 
         <article class="dashboard-card wide-card members-card">
           <div class="members-card-head">
             <div>
-              <h3>Ticket Records</h3>
-              <p>Inbound calls handled by the voice or chat agent appear here as tickets.</p>
+              <h3>{{ ticketTitleLabel }} Records</h3>
+              <p>Inbound calls handled by the voice or chat agent appear here as {{ isRealEstateTemplate ? 'site visits' : 'tickets' }}.</p>
             </div>
             <div class="field-card-actions">
               <span class="status-chip">{{ (tabRecords.tickets || []).length }} records</span>
@@ -5280,9 +6089,9 @@ onBeforeUnmount(() => {
             </div>
           </div>
 
-          <div v-if="tabRecordsLoading.tickets" class="empty-state compact">Loading ticket records...</div>
+          <div v-if="tabRecordsLoading.tickets" class="empty-state compact">Loading {{ ticketSingularLabel }} records...</div>
           <div v-else-if="!(tabRecords.tickets || []).length" class="empty-state compact">
-            No ticket records yet.
+            No {{ ticketSingularLabel }} records yet.
           </div>
           <div v-else class="tab-record-list">
             <div v-for="record in tabRecords.tickets" :key="record.id" class="tab-record-row">
@@ -5328,7 +6137,7 @@ onBeforeUnmount(() => {
         </div>
 
         <div class="dashboard-grid control-grid">
-          <article class="dashboard-card wide-card members-card">
+          <article class="dashboard-card wide-card members-card field-schema-card">
             <div class="members-card-head">
               <div>
                 <h3>Lead Fields</h3>
@@ -5339,31 +6148,26 @@ onBeforeUnmount(() => {
                 <button type="button" class="ghost-button compact" @click="startFieldEdit('leads', 'Lead Fields')">Edit Fields</button>
               </div>
             </div>
-            <div class="schema-field-grid">
-              <div v-for="field in schemaFor('leads')" :key="field.key" class="schema-field-row">
-                <strong>{{ field.label }}</strong>
-                <span>{{ field.type }}{{ field.required ? ' · required' : '' }}</span>
+            <div class="field-schema-grid">
+              <div
+                v-for="field in schemaFor('leads')"
+                :key="field.key"
+                class="field-schema-tile"
+                :class="{ required: field.required }"
+              >
+                <div class="field-schema-icon">
+                  <component :is="fieldTypeIcon(field.type)" :size="14" />
+                </div>
+                <div class="field-schema-body">
+                  <strong>{{ field.label }}</strong>
+                  <span class="field-schema-meta">
+                    {{ fieldTypeLabel(field.type) }}<em v-if="field.required"> · required</em>
+                  </span>
+                </div>
               </div>
             </div>
           </article>
 
-          <article class="dashboard-card compact-card">
-            <div class="compact-card-head">
-              <div class="compact-icon-shell">
-                <UserPlus :size="18" />
-              </div>
-              <div>
-                <h3>At A Glance</h3>
-                <p>{{ businessTypeLabel }} lead setup</p>
-              </div>
-            </div>
-            <dl class="dashboard-detail-list">
-              <div v-for="field in schemaFor('leads').slice(0, 5)" :key="field.key">
-                <dt>{{ field.label }}</dt>
-                <dd>{{ field.required ? 'Required' : 'Optional' }}</dd>
-              </div>
-            </dl>
-          </article>
         </div>
 
         <article class="dashboard-card wide-card members-card">
@@ -5699,6 +6503,11 @@ onBeforeUnmount(() => {
             <div class="voice-status-badge" :class="`voice-status-${voice.status}`">
               <span class="voice-status-dot"></span>
               {{ voice.status }}
+            </div>
+            <div v-if="voice.callStartedAt" class="voice-cost-meter" title="Live call cost (₹8/min)">
+              <Wallet :size="13" />
+              <strong>₹{{ liveCostRupees }}</strong>
+              <span>{{ liveCostDuration }}</span>
             </div>
           </div>
 
@@ -6397,6 +7206,24 @@ onBeforeUnmount(() => {
                 <input v-model="outboundTester.tone" type="text" placeholder="warm, direct, and respectful" />
               </label>
             </div>
+            <div class="outbound-tester-save-row">
+              <button type="button" class="primary-button compact" @click="saveOutboundTesterPreset">
+                <CheckCircle2 :size="15" />
+                Save preset
+              </button>
+              <button
+                v-if="outboundTesterSaved.hasPreset"
+                type="button"
+                class="ghost-button compact danger"
+                @click="clearOutboundTesterPreset"
+              >
+                <Trash2 :size="14" />
+                Clear saved
+              </button>
+              <span v-if="outboundTesterSaved.savedAt" class="outbound-tester-save-meta">
+                Saved {{ new Date(outboundTesterSaved.savedAt).toLocaleString() }}
+              </span>
+            </div>
           </article>
 
           <article class="dashboard-card voice-tester-card outbound-tester-call">
@@ -6411,6 +7238,11 @@ onBeforeUnmount(() => {
               <div class="voice-status-badge" :class="`voice-status-${voice.status}`">
                 <span class="voice-status-dot"></span>
                 {{ voice.status }}
+              </div>
+              <div v-if="voice.callStartedAt" class="voice-cost-meter" title="Live call cost (₹8/min)">
+                <Wallet :size="13" />
+                <strong>₹{{ liveCostRupees }}</strong>
+                <span>{{ liveCostDuration }}</span>
               </div>
             </div>
 
@@ -6656,7 +7488,7 @@ onBeforeUnmount(() => {
         <div v-else-if="kbInfo" class="message info dashboard-message">{{ kbInfo }}</div>
 
         <div class="kb-grid">
-          <article v-if="isAdmin" class="dashboard-card kb-card kb-upload-card">
+          <article v-if="isAdmin && kbDocumentUploadEnabled" class="dashboard-card kb-card kb-upload-card">
             <div class="kb-card-head">
               <div class="kb-card-icon kb-card-icon-primary">
                 <Upload :size="18" />
@@ -10544,6 +11376,23 @@ onBeforeUnmount(() => {
   align-self: start;
 }
 
+.outbound-tester-save-row {
+  margin-top: 1rem;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+
+.outbound-tester-save-meta {
+  font-size: 0.78rem;
+  color: #5f5f53;
+}
+
+.org-shell.dark .outbound-tester-save-meta {
+  color: rgba(244, 240, 225, 0.7);
+}
+
 .outbound-tester-doc {
   display: flex;
   flex-direction: column;
@@ -14130,6 +14979,728 @@ onBeforeUnmount(() => {
     justify-content: flex-start;
   }
   .kb-form-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.cost-grid {
+  grid-template-columns: 1fr;
+}
+
+/* Notifications bell + dropdown panel. The panel anchors below the bell
+   inside the topbar; it's a fixed-width column with a scrollable list
+   so a busy inbox doesn't push the page layout around. */
+.notif-wrap {
+  position: relative;
+}
+.notif-button {
+  position: relative;
+}
+.notif-button.has-unread {
+  color: #ef4444;
+}
+.notif-badge {
+  position: absolute;
+  top: -4px;
+  right: -4px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: #ef4444;
+  color: #fff;
+  font-size: 10px;
+  line-height: 16px;
+  font-weight: 700;
+  text-align: center;
+  box-shadow: 0 0 0 2px var(--surface-page, #fff);
+}
+.notif-panel {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  width: 360px;
+  max-width: 92vw;
+  max-height: 480px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface-elevated, #fff);
+  border: 1px solid var(--surface-border, rgba(15, 23, 42, 0.08));
+  border-radius: 14px;
+  box-shadow: 0 18px 48px rgba(15, 23, 42, 0.18);
+  z-index: 50;
+}
+.notif-panel-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--surface-border, rgba(15, 23, 42, 0.06));
+}
+.notif-mark-all {
+  background: none;
+  border: none;
+  color: var(--accent, #4f46e5);
+  font-size: 12px;
+  cursor: pointer;
+  padding: 4px 6px;
+  border-radius: 6px;
+}
+.notif-mark-all:hover {
+  background: var(--surface-muted, rgba(99, 102, 241, 0.08));
+}
+.notif-empty {
+  padding: 24px 18px;
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-muted, #6b7280);
+}
+.notif-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  overflow-y: auto;
+  max-height: 420px;
+}
+.notif-row {
+  display: flex;
+  gap: 10px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--surface-border, rgba(15, 23, 42, 0.04));
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+.notif-row:hover {
+  background: var(--surface-muted, rgba(99, 102, 241, 0.04));
+}
+.notif-row.unread {
+  background: var(--surface-muted, rgba(99, 102, 241, 0.05));
+}
+.notif-row:last-child {
+  border-bottom: none;
+}
+.notif-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  flex-shrink: 0;
+  margin-top: 6px;
+  background: #9ca3af;
+}
+.notif-dot.severity-p1 {
+  background: #ef4444;
+  box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.15);
+}
+.notif-dot.severity-p2 {
+  background: #f59e0b;
+}
+.notif-dot.severity-p3 {
+  background: #9ca3af;
+}
+.notif-row-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+.notif-row-body strong {
+  font-size: 13px;
+  color: var(--text-primary, #111827);
+  word-wrap: break-word;
+}
+.notif-row-body small {
+  font-size: 11px;
+  color: var(--text-muted, #6b7280);
+  word-wrap: break-word;
+}
+.notif-row-time {
+  margin-top: 4px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* Member self-service calendar.
+   Mirrors the admin's timetable-calendar layout but anchored on the
+   member's own /me/timetable payload — working-day highlight on dates
+   that match assignment.working_days, block-count badges for one-off
+   buffers/unavailable slots, and a side panel showing the selected
+   date's blocks with inline remove. */
+.my-calendar-shell {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
+  gap: 1.5rem;
+  margin-bottom: 1.75rem;
+}
+.my-calendar-card .timetable-date-cell.working-day:not(.muted) {
+  background: rgba(99, 102, 241, 0.06);
+  border-color: rgba(99, 102, 241, 0.18);
+}
+.my-calendar-working-hint {
+  color: rgba(79, 70, 229, 0.8);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.my-calendar-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  padding: 12px 14px 0;
+  font-size: 11px;
+  color: var(--text-muted, #6b7280);
+}
+.my-calendar-legend .legend-dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  margin-right: 6px;
+  vertical-align: -1px;
+}
+.my-calendar-legend .legend-dot.working {
+  background: rgba(99, 102, 241, 0.6);
+}
+.my-calendar-legend .legend-dot.visit {
+  background: #f59e0b;
+}
+.my-calendar-legend .legend-dot.blocked {
+  background: #ef4444;
+}
+.my-calendar-legend .legend-dot.today {
+  background: #10b981;
+}
+/* Date cells with a customer visit get an amber border so they stand
+   out at a glance even before the user clicks them. */
+.my-calendar-card .timetable-date-cell.has-visit:not(.muted) {
+  border-color: rgba(245, 158, 11, 0.55);
+  box-shadow: inset 0 0 0 1px rgba(245, 158, 11, 0.18);
+}
+.my-calendar-queue {
+  margin-top: 1.25rem;
+}
+.my-calendar-queue-list {
+  margin-top: 12px;
+}
+
+/* Field schema cards (Site Visits / Leads tabs). Quiet beige tone
+   matching .provider-option — neutral border, no gradients, no badges.
+   A small leading icon hints at the type; required is shown as muted
+   italic text after the type label. */
+.field-schema-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 0.7rem;
+  margin-top: 0.85rem;
+}
+.field-schema-tile {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  padding: 0.75rem 0.9rem;
+  border-radius: 0.8rem;
+  background: rgba(255, 255, 255, 0.72);
+  border: 1px solid #e4e3d7;
+  transition: border-color 0.15s ease;
+}
+.field-schema-tile:hover {
+  border-color: #8a8f86;
+}
+.field-schema-icon {
+  flex-shrink: 0;
+  width: 26px;
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 0.55rem;
+  background: #efeee3;
+  color: #5f5f53;
+}
+.field-schema-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.18rem;
+  min-width: 0;
+  flex: 1;
+}
+.field-schema-body strong {
+  font-size: 0.92rem;
+  font-weight: 600;
+  color: #1b1c15;
+  word-break: break-word;
+}
+.field-schema-meta {
+  font-size: 0.78rem;
+  color: #5f5f53;
+}
+.field-schema-meta em {
+  font-style: normal;
+  color: #8a8f86;
+}
+
+/* Dark-mode parity. */
+.org-shell.dark .field-schema-tile {
+  background: rgba(255, 255, 255, 0.04);
+  border-color: rgba(255, 255, 255, 0.1);
+}
+.org-shell.dark .field-schema-tile:hover {
+  border-color: rgba(255, 255, 255, 0.22);
+}
+.org-shell.dark .field-schema-body strong {
+  color: #f3f4f6;
+}
+.org-shell.dark .field-schema-icon {
+  background: rgba(255, 255, 255, 0.08);
+  color: #d1d5db;
+}
+.org-shell.dark .field-schema-meta {
+  color: #9ca3af;
+}
+.org-shell.dark .field-schema-meta em {
+  color: #6b7280;
+}
+
+/* Live in-call cost meter, displayed next to the voice-status badge
+   on both the inbound and outbound testers. Ticks once per second
+   while the call is active; the ledger row on the server uses the
+   same Decimal math so the dashboard tile reconciles exactly when
+   the call ends. */
+.voice-cost-meter {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.35rem 0.75rem;
+  border-radius: 999px;
+  border: 1px solid #e4e3d7;
+  background: rgba(255, 255, 255, 0.72);
+  color: #1b1c15;
+  font-size: 0.82rem;
+  font-variant-numeric: tabular-nums;
+}
+.voice-cost-meter strong {
+  font-weight: 700;
+}
+.voice-cost-meter span {
+  color: #5f5f53;
+  font-size: 0.74rem;
+}
+.org-shell.dark .voice-cost-meter {
+  background: rgba(255, 255, 255, 0.05);
+  border-color: rgba(255, 255, 255, 0.12);
+  color: #f3f4f6;
+}
+.org-shell.dark .voice-cost-meter span {
+  color: #9ca3af;
+}
+
+/* ──────────────────────────────────────────────────────────────────
+   Comprehensive mobile pass. The earlier breakpoints handle isolated
+   pieces; this block makes sure every section that landed after the
+   initial responsive work also behaves on a phone.
+   ────────────────────────────────────────────────────────────────── */
+
+/* Tablet: one big content column, calendar splits collapse. */
+@media (max-width: 920px) {
+  .dashboard-layout {
+    width: 100%;
+    margin-left: 0;
+    padding-left: 5.7rem;
+  }
+  .timetable-calendar-shell,
+  .my-calendar-shell {
+    grid-template-columns: 1fr;
+  }
+  .org-health-grid {
+    grid-template-columns: 1fr;
+  }
+  .org-health-grid .organization-card {
+    grid-column: 1 / -1;
+  }
+  .timetable-summary-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+/* Phone breakpoint. Single column everywhere, larger tap targets,
+   bottom-sheet feel for modals, and a more compact top bar so the
+   notif + settings + logout buttons all fit. */
+@media (max-width: 720px) {
+  /* Use the full viewport width and trim padding so cards aren't
+     letterboxed inside narrow gutters. */
+  .login-layout,
+  .workspace-layout {
+    padding: 1rem 0.85rem 2rem;
+  }
+  .dashboard-layout {
+    padding-left: 5.4rem;
+    padding-right: 0.75rem;
+    padding-top: 0.85rem;
+    gap: 1.25rem;
+  }
+  .dashboard-section {
+    gap: 1rem;
+  }
+  .dashboard-card {
+    padding: 1rem;
+    border-radius: 1rem;
+  }
+
+  /* Top mode bar — wrap and shrink so notif + settings + logout fit
+     side-by-side on a narrow phone without overflowing. */
+  .mode-bar {
+    flex-wrap: wrap;
+    padding: 0.85rem 0.85rem 0;
+    gap: 0.4rem;
+  }
+  .mode-link {
+    padding: 0.55rem 0.75rem;
+    font-size: 0.78rem;
+  }
+  .mode-link--icon {
+    width: 2.1rem;
+    height: 2.1rem;
+    padding: 0.4rem;
+  }
+  .mode-settings-menu,
+  .nav-settings-menu {
+    width: min(320px, calc(100vw - 1.5rem));
+    right: 0;
+  }
+
+  /* Notifications dropdown — anchor to the screen edge so the panel
+     can't be clipped by the narrow viewport. */
+  .notif-panel {
+    width: min(360px, calc(100vw - 1.5rem));
+    right: -0.5rem;
+    max-height: 70vh;
+  }
+  .notif-list {
+    max-height: 60vh;
+  }
+
+  /* Section headers stack and de-emphasize on phone. */
+  .dashboard-section-head {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.45rem;
+  }
+  .dashboard-section-head h3 {
+    font-size: 1.1rem;
+  }
+
+  /* Every grid I added recently → 1 column. */
+  .dashboard-grid,
+  .overview-grid,
+  .control-grid,
+  .member-timetable-grid,
+  .cost-grid,
+  .cost-stats,
+  .org-health-grid {
+    grid-template-columns: 1fr !important;
+    gap: 0.8rem;
+  }
+  .field-schema-grid {
+    grid-template-columns: 1fr;
+  }
+
+  /* Stat tiles — comfy height + tabular font even when stacked. */
+  .cost-stat-value {
+    font-size: 20px;
+  }
+  .cost-stat {
+    padding: 14px 16px;
+  }
+
+  /* Member calendar — give the date cells a bigger tap area, and
+     stack the legend rows. */
+  .timetable-month-grid {
+    gap: 2px;
+  }
+  .timetable-date-cell {
+    min-height: 3.2rem;
+    padding: 0.4rem 0.35rem;
+    font-size: 0.85rem;
+  }
+  .timetable-date-cell small {
+    font-size: 9px;
+  }
+  .my-calendar-legend {
+    flex-direction: column;
+    gap: 6px;
+  }
+  .my-calendar-card .timetable-calendar-head {
+    padding: 0.55rem 0.75rem;
+  }
+
+  /* Dashboard header strip — title + context pill on their own rows. */
+  .dashboard-header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.6rem;
+  }
+  .dashboard-header-actions {
+    flex-wrap: wrap;
+  }
+
+  /* Modals — use the full screen as a bottom sheet so the long forms
+     remain reachable. */
+  .field-modal-shell {
+    padding: 0;
+    align-items: flex-end;
+  }
+  .field-modal,
+  .timetable-modal {
+    width: 100%;
+    max-height: 92vh;
+    border-radius: 1.2rem 1.2rem 0 0;
+    padding: 1.1rem 1rem 1.4rem;
+  }
+  .timetable-summary-row {
+    grid-template-columns: 1fr;
+  }
+  .field-modal-actions {
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+  .field-modal-actions > * {
+    width: 100%;
+  }
+
+  /* Record + member tables → card rows. The desktop layouts use a
+     grid template column scheme that turns into illegible slivers on
+     a phone; switching to a flex column gives each cell breathing
+     room and clear hierarchy. */
+  .member-table .member-head {
+    display: none;
+  }
+  .member-row {
+    grid-template-columns: 1fr !important;
+    gap: 0.5rem;
+    padding: 0.9rem 0.95rem;
+  }
+  .tab-record-row {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.6rem;
+  }
+  .tab-record-meta,
+  .blocked-slot-row,
+  .assignment-summary-cell {
+    grid-template-columns: 1fr !important;
+    align-items: flex-start !important;
+    gap: 0.5rem;
+  }
+
+  /* Form fields — minimum 44px height for comfortable tapping. */
+  input[type="text"],
+  input[type="email"],
+  input[type="password"],
+  input[type="tel"],
+  input[type="number"],
+  input[type="search"],
+  input[type="datetime-local"],
+  input[type="date"],
+  input[type="time"],
+  select,
+  textarea,
+  .member-field-input {
+    font-size: 16px; /* prevents iOS zoom-on-focus */
+    min-height: 2.75rem;
+  }
+  textarea {
+    min-height: 5rem;
+  }
+
+  /* Buttons — large enough to tap, full width on action rows. */
+  .ghost-button,
+  .primary-button,
+  .danger-button,
+  .dashboard-inline-button,
+  .member-action-submit {
+    min-height: 2.6rem;
+  }
+  .member-action-submit,
+  .field-card-actions .ghost-button {
+    width: 100%;
+  }
+
+  /* Cost-card refresh button moves to its own row when stacked. */
+  .cost-refresh-button {
+    width: 100%;
+    margin-left: 0;
+    margin-top: 0.6rem;
+    justify-content: center;
+  }
+  .cost-card .compact-card-head {
+    flex-wrap: wrap;
+  }
+
+  /* Members card head + similar headers — wrap action chips so the
+     count + refresh button don't overflow. */
+  .members-card-head,
+  .field-card-actions {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.55rem;
+  }
+  .field-card-actions {
+    width: 100%;
+  }
+
+  /* Field-schema tiles: tighter padding on phone. */
+  .field-schema-tile {
+    padding: 0.65rem 0.75rem;
+  }
+}
+
+/* Extra-narrow phones (≤380px) — drop a few padding rungs further and
+   shrink the always-visible sidebar so the page isn't a sliver. */
+@media (max-width: 380px) {
+  .dashboard-layout {
+    padding-left: 4.6rem;
+  }
+  .floating-top-nav {
+    width: 4.4rem;
+    padding: 0.5rem;
+  }
+  .nav-page-button,
+  .theme-toggle-button,
+  .dashboard-nav-actions .nav-icon-button,
+  .dashboard-nav-actions .org-avatar-button {
+    width: 2.4rem;
+    height: 2.4rem;
+  }
+  .dashboard-card {
+    padding: 0.85rem;
+  }
+}
+.my-calendar-selected {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.my-calendar-hours {
+  margin: 0;
+}
+.my-calendar-empty {
+  margin-top: 8px;
+}
+
+@media (max-width: 920px) {
+  .my-calendar-shell {
+    grid-template-columns: 1fr;
+  }
+}
+/* Org Health is now a standalone page; the org card should stretch to
+   fill the row rather than be stuck at the 2-of-3 overview-grid span. */
+.org-health-grid {
+  grid-template-columns: 1fr;
+}
+.org-health-grid .organization-card {
+  grid-column: 1 / -1;
+}
+.cost-card {
+  position: relative;
+}
+.cost-card .compact-card-head {
+  align-items: flex-start;
+}
+.cost-refresh-button {
+  margin-left: auto;
+  align-self: flex-start;
+}
+.cost-stats {
+  display: grid;
+  /* auto-fit wraps the five tiles (3 rupee totals + 2 minute totals)
+     onto two rows on narrower viewports while keeping them in one row
+     on a wide dashboard. */
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 16px;
+  margin: 18px 0 4px;
+}
+.cost-stat-minutes {
+  /* Slightly subdued styling so the minutes tiles read as a supporting
+     metric next to the rupee totals, not a competing headline. */
+  background: var(--surface-subtle, rgba(15, 23, 42, 0.04));
+}
+.cost-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 16px 18px;
+  border-radius: 14px;
+  background: var(--surface-muted, rgba(99, 102, 241, 0.06));
+  border: 1px solid var(--surface-border, rgba(99, 102, 241, 0.14));
+}
+.cost-stat-label {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-muted, #6b7280);
+}
+.cost-stat-value {
+  font-size: 24px;
+  font-weight: 700;
+  color: var(--text-primary, #111827);
+  font-variant-numeric: tabular-nums;
+}
+.cost-stat-meta {
+  font-size: 12px;
+  color: var(--text-muted, #6b7280);
+}
+.cost-recent {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px dashed var(--surface-border, rgba(99, 102, 241, 0.18));
+}
+.cost-recent-head {
+  margin-bottom: 8px;
+}
+.cost-recent-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 240px;
+  overflow-y: auto;
+}
+.cost-recent-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: var(--surface-subtle, rgba(15, 23, 42, 0.03));
+}
+.cost-recent-row strong {
+  font-variant-numeric: tabular-nums;
+  font-size: 14px;
+}
+.cost-recent-row small {
+  display: block;
+  font-size: 11px;
+  color: var(--text-muted, #6b7280);
+  text-transform: lowercase;
+}
+.cost-recent-time {
+  font-size: 11px;
+  color: var(--text-muted, #6b7280);
+  white-space: nowrap;
+}
+.cost-empty {
+  margin-top: 16px;
+  font-size: 13px;
+  color: var(--text-muted, #6b7280);
+}
+
+@media (max-width: 720px) {
+  .cost-stats {
     grid-template-columns: 1fr;
   }
 }

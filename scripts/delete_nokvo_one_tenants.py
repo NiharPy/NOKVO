@@ -104,10 +104,16 @@ async def main() -> int:
 
         log.info("tearing down %s nokvo_one tenant(s)", len(tenants))
         org_ids: list[str] = []
+        # ``tenant_str_ids`` collects the per-tenant string keys used by
+        # the lead / campaign chain (those tables FK on the string
+        # ``tenant_resources.tenant_id`` column, not the org UUID).
+        tenant_str_ids: list[str] = []
 
         for t in tenants:
             log.info("=== tenant %s (org %r) ===", t["tenant_id"], t["name"])
             org_ids.append(str(t["organization_id"]))
+            if t["tenant_id"]:
+                tenant_str_ids.append(str(t["tenant_id"]))
 
             rg = t["azure_resource_group_name"]
             if rg:
@@ -146,6 +152,47 @@ async def main() -> int:
         async with eng.begin() as conn:
             placeholders = ",".join(f":id{i}" for i in range(len(org_ids)))
             params = {f"id{i}": v for i, v in enumerate(org_ids)}
+            tenant_id_placeholders = ",".join(f":tid{i}" for i in range(len(tenant_str_ids)))
+            tenant_params = {f"tid{i}": v for i, v in enumerate(tenant_str_ids)}
+
+            # Outbound campaign chain (added after the original script
+            # shipped) — these FK to tenant_resources / organizations
+            # with ON DELETE NO ACTION, so we have to remove them
+            # before the tenant_resources / organizations cascade.
+            # Order matters: contacts → leads → forms → connections,
+            # then the campaigns themselves.
+            if tenant_str_ids:
+                pre_chain = [
+                    (
+                        "DELETE FROM outbound_campaign_contacts "
+                        "WHERE campaign_id IN (SELECT id FROM outbound_campaigns "
+                        f"WHERE tenant_id IN ({tenant_id_placeholders}))"
+                    ),
+                    f"DELETE FROM outgoing_leads WHERE tenant_id IN ({tenant_id_placeholders})",
+                    f"DELETE FROM lead_capture_forms WHERE tenant_id IN ({tenant_id_placeholders})",
+                    f"DELETE FROM lead_source_connections WHERE tenant_id IN ({tenant_id_placeholders})",
+                    f"DELETE FROM outbound_campaigns WHERE tenant_id IN ({tenant_id_placeholders})",
+                ]
+                for stmt in pre_chain:
+                    res = await conn.execute(text(stmt), tenant_params)
+                    log.info(
+                        "db: deleted %s rows via `%s ...`",
+                        res.rowcount,
+                        stmt.split(" WHERE", 1)[0],
+                    )
+
+            # Organization-level dependents (ON DELETE NO ACTION).
+            org_chain_extra = [
+                "DELETE FROM connect_sessions",
+                "DELETE FROM organization_api_keys",
+            ]
+            for stmt in org_chain_extra:
+                res = await conn.execute(
+                    text(f"{stmt} WHERE organization_id IN ({placeholders})"),
+                    params,
+                )
+                log.info("db: deleted %s rows via `%s ...`", res.rowcount, stmt)
+
             res = await conn.execute(
                 text(
                     f"DELETE FROM tenant_usage_events WHERE organization_id IN ({placeholders})"

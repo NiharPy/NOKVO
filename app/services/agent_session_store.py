@@ -58,11 +58,15 @@ class AgentSessionStore:
         language: str,
         *,
         campaign_id: str | None = None,
+        call_context: str | None = None,
     ) -> str:
         normalized = _clean(query)
         words = sorted({word for word in normalized.split() if len(word) > 2})
         signature = " ".join(words) if words else normalized
-        scope = f"campaign:{campaign_id}" if campaign_id else "tenant"
+        scope_parts = [f"campaign:{campaign_id}" if campaign_id else "tenant"]
+        if call_context:
+            scope_parts.append(f"call:{cls._hash(str(call_context))}")
+        scope = ":".join(scope_parts)
         return (
             f"{cls.namespace(tenant_res)}:agent:semantic_cache:v1:"
             f"{cls._policy_version(tenant_res)}:{scope}:{language}:{cls._hash(signature)}"
@@ -76,11 +80,20 @@ class AgentSessionStore:
         language: str,
         *,
         campaign_id: str | None = None,
+        call_context: str | None = None,
     ) -> dict[str, Any] | None:
         if not settings.AGENT_ANSWER_CACHE_ENABLED:
             return None
         try:
-            raw = await cls.client().get(cls.semantic_cache_key(tenant_res, query, language, campaign_id=campaign_id))
+            raw = await cls.client().get(
+                cls.semantic_cache_key(
+                    tenant_res,
+                    query,
+                    language,
+                    campaign_id=campaign_id,
+                    call_context=call_context,
+                )
+            )
             return json.loads(raw) if raw else None
         except Exception:
             return None
@@ -94,12 +107,19 @@ class AgentSessionStore:
         payload: dict[str, Any],
         *,
         campaign_id: str | None = None,
+        call_context: str | None = None,
     ) -> None:
         if not settings.AGENT_ANSWER_CACHE_ENABLED:
             return
         try:
             await cls.client().setex(
-                cls.semantic_cache_key(tenant_res, query, language, campaign_id=campaign_id),
+                cls.semantic_cache_key(
+                    tenant_res,
+                    query,
+                    language,
+                    campaign_id=campaign_id,
+                    call_context=call_context,
+                ),
                 int(settings.AGENT_ANSWER_CACHE_TTL_SECONDS),
                 json.dumps(payload, ensure_ascii=False),
             )

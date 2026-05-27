@@ -12,7 +12,7 @@ from __future__ import annotations
 from fastapi import WebSocket
 
 from app.core.config import settings
-from app.services.twilio_bridge_service import TwilioWebSocketAdapter
+from app.services.twilio_bridge_service import TwilioWebSocketAdapter, _extract_start_call_context
 
 
 import base64
@@ -119,6 +119,7 @@ class ExotelWebSocketAdapter(TwilioWebSocketAdapter):
                     payload.get("callSid") or payload.get("call_sid") or
                     self._stream_sid
                 )
+                self.call_context = _extract_start_call_context(payload)
                 _log.warning("[EXOTEL-WS] stream started sid=%s media_format=%s", self._stream_sid, start_data.get("media_format"))
                 _dump(f"START media_format={start_data.get('media_format')} full_start={json.dumps(start_data)}")
 

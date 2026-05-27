@@ -590,10 +590,16 @@ class ToolkitGeneratorService:
                 "dry_run_strategy": "Validate SQL statement type, allowed tables, parameters, and estimated affected rows before execution." if write_requested else "Run with LIMIT and no mutation.",
                 "limits": {
                     "max_entity_matches": 10,
-                    "max_rows_per_table": 50,
-                    "max_total_rows": 100,
-                    "timeout_seconds": 10,
+                    "max_rows_per_table": min(50, max(1, int(settings.MCP_SQL_MAX_ROWS or 100))),
+                    "max_total_rows": max(1, int(settings.MCP_SQL_MAX_ROWS or 100)),
+                    "timeout_seconds": max(1, int(settings.MCP_SQL_STATEMENT_TIMEOUT_MS or 10000) // 1000),
                     "max_response_size_bytes": 262144,
+                    "db_enforced": {
+                        "statement_timeout_ms": max(100, int(settings.MCP_SQL_STATEMENT_TIMEOUT_MS or 10000)),
+                        "max_rows": max(1, int(settings.MCP_SQL_MAX_ROWS or 100)),
+                        "limit_parameter": "limit",
+                        "enforcement": "SET LOCAL statement_timeout plus capped bound LIMIT before execution",
+                    },
                 },
             },
         }

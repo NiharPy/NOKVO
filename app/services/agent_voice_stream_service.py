@@ -28,6 +28,7 @@ import logging
 import re
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 from time import perf_counter
 from typing import Any, Callable
@@ -1376,6 +1377,10 @@ class AgentVoiceStreamService:
     @staticmethod
     async def run_session(websocket: WebSocket, tenant_res: TenantResources, *, db=None) -> None:
         await websocket.accept()
+        # Wall-clock anchors for the billing ledger row written in the
+        # outer finally block.
+        _cost_started_at = datetime.now(timezone.utc)
+        _cost_call_id = f"prime:{uuid.uuid4()}"
 
         provider_status = dict(tenant_res.provider_status or {})
         session_ctx = SessionContext()
@@ -1412,6 +1417,8 @@ class AgentVoiceStreamService:
         }
         final_transcript_parts: list[str] = []
 
+        prewarm_tasks: set[asyncio.Task] = set()
+
         async def _prewarm_tts_pair(language: str, *, timeout_s: float = 2.0) -> None:
             try:
                 await asyncio.wait_for(
@@ -1423,6 +1430,25 @@ class AgentVoiceStreamService:
                 )
             except asyncio.TimeoutError:
                 logger.warning("TTS warm timeout after %.1fs; continuing with lazy reconnect", timeout_s)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("TTS warm failed; continuing with lazy reconnect", exc_info=True)
+
+        def _start_prewarm_tts_pair(language: str) -> None:
+            task = asyncio.create_task(_prewarm_tts_pair(language))
+            prewarm_tasks.add(task)
+
+            def _cleanup(done: asyncio.Task) -> None:
+                prewarm_tasks.discard(done)
+                if done.cancelled():
+                    return
+                try:
+                    done.result()
+                except Exception:
+                    logger.debug("TTS warm task failed", exc_info=True)
+
+            task.add_done_callback(_cleanup)
 
         def _on_speaking() -> None:
             _s["state"] = TurnState.SPEAKING
@@ -1446,7 +1472,7 @@ class AgentVoiceStreamService:
                 await task
             except asyncio.CancelledError:
                 # Barge-in cancelled this turn — re-warm TTS for the next turn
-                asyncio.create_task(_prewarm_tts_pair(session_ctx.language))
+                _start_prewarm_tts_pair(session_ctx.language)
             except Exception as exc:
                 try:
                     await websocket.send_json({"type": "agent_error", "error": str(exc)[:200]})
@@ -1561,9 +1587,10 @@ class AgentVoiceStreamService:
             except Exception:
                 logger.debug("swallowed exception", exc_info=True)
 
-            # Warm both TTS connections at session start so the first answer
-            # does not pay the WebSocket/TLS handshake cost.
-            await _prewarm_tts_pair(session_ctx.language)
+            # Warm both TTS connections at session start without blocking the
+            # receive loop. The first turn can still await the warm connection
+            # if it reaches TTS before the background handshake completes.
+            _start_prewarm_tts_pair(session_ctx.language)
 
             while True:
                 try:
@@ -1597,7 +1624,7 @@ class AgentVoiceStreamService:
                 if event_type == "config":
                     lang = AgentRuntimeService.normalize_language(str(payload.get("language") or "en"))
                     session_ctx.language = lang
-                    asyncio.create_task(_prewarm_tts_pair(lang))
+                    _start_prewarm_tts_pair(lang)
                     await _ensure_stt()
 
                 elif event_type == "audio":
@@ -1647,6 +1674,9 @@ class AgentVoiceStreamService:
             reader = _s["stt_reader"]
             if reader:
                 reader.cancel()
+            for prewarm_task in list(prewarm_tasks):
+                if not prewarm_task.done():
+                    prewarm_task.cancel()
             stt_conn = _s["stt_ws"]
             if stt_conn is not None:
                 try:
@@ -1655,8 +1685,25 @@ class AgentVoiceStreamService:
                     logger.debug("swallowed exception", exc_info=True)
             await warm_tts.close()
             await warm_tts_filler.close()
+            if prewarm_tasks:
+                await asyncio.gather(*prewarm_tasks, return_exceptions=True)
             if _redis_client is not None:
                 try:
                     await _redis_client.aclose()
                 except Exception:
                     logger.debug("swallowed exception", exc_info=True)
+            # Billing ledger — one row per Prime voice call. Best-effort.
+            try:
+                from app.services.call_cost_recorder import record_call_cost
+
+                await record_call_cost(
+                    db,
+                    organization_id=getattr(tenant_res, "organization_id", None),
+                    tenant_id=getattr(tenant_res, "tenant_id", None),
+                    call_id=_cost_call_id,
+                    started_at=_cost_started_at,
+                    ended_at=datetime.now(timezone.utc),
+                    kind="inbound",
+                )
+            except Exception:
+                logger.exception("AGENT-VOICE: failed to record call cost")

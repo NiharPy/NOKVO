@@ -77,6 +77,7 @@ async def login(request: Request, login_data: LoginRequest, db: AsyncSession = D
             mfa_completed=False,
             expires_delta=timedelta(minutes=5),
             extra_claims={"principal_type": "superadmin", "role": user.role},
+            token_tier=security.JWT_TIER_SUPERADMIN,
         )
         return {"access_token": access_token, "refresh_token": "pending_mfa", "token_type": "bearer"}
     else:
@@ -95,6 +96,7 @@ async def login(request: Request, login_data: LoginRequest, db: AsyncSession = D
             mfa_completed=True,
             session_id=str(session.id),
             extra_claims={"principal_type": "superadmin", "role": user.role},
+            token_tier=security.JWT_TIER_SUPERADMIN,
         )
 
         db.add(session)
@@ -156,6 +158,7 @@ async def verify_totp(request: Request, data: TOTPVerifyRequest, current_user: S
         mfa_completed=True,
         session_id=str(session.id),
         extra_claims={"principal_type": "superadmin", "role": current_user.role},
+        token_tier=security.JWT_TIER_SUPERADMIN,
     )
 
     db.add(session)
@@ -172,7 +175,7 @@ async def verify_totp(request: Request, data: TOTPVerifyRequest, current_user: S
 @limiter.limit("30/minute")
 async def refresh_token(request: Request, data: RefreshRequest, db: AsyncSession = Depends(deps.get_db)):
     # Hash the provided token and find it in DB
-    provided_hash = security.hashlib.sha256(data.refresh_token.encode()).hexdigest()
+    provided_hash = security.hash_refresh_token(data.refresh_token)
     
     result = await db.execute(select(SuperAdminSession).where(
         SuperAdminSession.refresh_token_hash == provided_hash,
@@ -208,6 +211,7 @@ async def refresh_token(request: Request, data: RefreshRequest, db: AsyncSession
         mfa_completed=True,
         session_id=str(new_session.id),
         extra_claims={"principal_type": "superadmin", "role": user.role if user else None},
+        token_tier=security.JWT_TIER_SUPERADMIN,
     )
     
     db.add(new_session)

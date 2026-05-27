@@ -11,10 +11,13 @@ from __future__ import annotations
 
 import asyncio
 import io
+import logging
 import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from fastapi import UploadFile
 from sqlalchemy import select
@@ -578,12 +581,70 @@ class OutboundCampaignService:
 
         # Check if all calls are terminal
         terminal = {"answered", "no_answer", "failed"}
+        just_completed = False
         if all(c.get("status") in terminal for c in contacts):
+            if campaign.status != CampaignStatus.completed:
+                just_completed = True
             campaign.status = CampaignStatus.completed
             campaign.completed_at = datetime.now(timezone.utc)
 
         db.add(campaign)
         await db.commit()
+
+        # When the campaign just finished, post a P2 inbox summary so
+        # the operator sees the batch result without polling the page.
+        # Best-effort — a notification failure must not roll back the
+        # campaign status that we just committed.
+        if just_completed:
+            try:
+                await OutboundCampaignService._notify_batch_complete(
+                    db, campaign, contacts
+                )
+            except Exception:
+                logger.exception("NOKVO-NOTIF: failed to emit outbound_batch summary")
+
+    @staticmethod
+    async def _notify_batch_complete(
+        db: AsyncSession,
+        campaign: OutboundCampaign,
+        contacts: list[dict],
+    ) -> None:
+        from app.models.notification import (
+            NOTIFICATION_OUTBOUND_BATCH,
+            SEVERITY_P2,
+        )
+        from app.models.tenant_resources import TenantResources
+        from app.services.notification_service import NotificationService
+
+        tr_res = await db.execute(
+            select(TenantResources).where(TenantResources.tenant_id == campaign.tenant_id)
+        )
+        tr = tr_res.scalars().first()
+        if tr is None:
+            return
+        answered = sum(1 for c in contacts if c.get("status") == "answered")
+        no_answer = sum(1 for c in contacts if c.get("status") == "no_answer")
+        failed = sum(1 for c in contacts if c.get("status") == "failed")
+        total = len(contacts)
+        await NotificationService.emit(
+            db,
+            organization_id=tr.organization_id,
+            tenant_id=campaign.tenant_id,
+            type=NOTIFICATION_OUTBOUND_BATCH,
+            severity=SEVERITY_P2,
+            title=f"Campaign '{campaign.name}' finished — {answered}/{total} answered",
+            body=f"{answered} answered · {no_answer} no answer · {failed} failed",
+            payload={
+                "campaign_id": str(campaign.id),
+                "answered": answered,
+                "no_answer": no_answer,
+                "failed": failed,
+                "total": total,
+            },
+            # One summary per campaign completion. Re-fires on a re-launch
+            # are fine because the campaign_id changes per run.
+            dedup_key=f"outbound_batch:{campaign.id}",
+        )
 
     # ------------------------------------------------------------------
     # Lookup by call_link_id (used in webhook handlers)

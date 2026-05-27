@@ -547,6 +547,54 @@ def test_assignment_selects_lowest_load_member_and_audits_decision():
     assert db.audits[-1].selected_member_id == b.id
 
 
+def test_assignment_prefers_other_member_same_time_over_first_member_next_time():
+    """If Member A's 10am is booked and Member B's 10am is free, the
+    agent must propose Member B at 10am — never Member A at 11am.
+
+    Regression for the operator complaint that the agent was shifting
+    the FIRST member to the next slot rather than handing the same
+    time to another available member. The sort in ``assign_request``
+    orders by ``shift_minutes`` first, so a zero-shift candidate
+    always beats a shifted one regardless of which member came first
+    in the roster.
+    """
+    organization, _ = _org_and_user(industry="real_estate")
+    a = _member(organization.id, "AgentA")
+    b = _member(organization.id, "AgentB", created_offset=1)
+    settings_list = [
+        _settings(organization.id, a.id, request_types=["property_inquiry"]),
+        _settings(organization.id, b.id, request_types=["property_inquiry"]),
+    ]
+    # Booking the 10am slot for Member A only. The standard slot
+    # duration is 30 minutes; Member A's next free slot is therefore
+    # 10:30 (shift=30). Member B has nothing on the calendar so
+    # 10am itself (shift=0) is available.
+    existing_for_a = _assigned_record(
+        organization.id,
+        a.id,
+        created_at=datetime(2026, 5, 16, 10, 0, tzinfo=timezone.utc),
+    )
+    db = _FakeAssignmentDB(
+        organization,
+        [a, b],
+        settings_list,
+        records=[existing_for_a],
+    )
+    result = _run(
+        NokvoOneAssignmentService.assign_request(
+            db,
+            organization,
+            request_type="property_inquiry",
+            requested_time=datetime(2026, 5, 16, 10, 0, tzinfo=timezone.utc),
+        )
+    )
+    assert result["assignment_status"] == "assigned"
+    # Member B's 10am wins over Member A's 10:30.
+    assert result["selected_member_id"] == b.id
+    assert result["scheduled_time"] == datetime(2026, 5, 16, 10, 0, tzinfo=timezone.utc)
+    assert result["time_adjusted"] is False
+
+
 def test_assignment_returns_no_available_when_all_members_skipped():
     organization, _ = _org_and_user(industry="real_estate")
     member = _member(organization.id, "AgentA")

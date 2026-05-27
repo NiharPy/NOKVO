@@ -335,6 +335,23 @@ def evaluate_tool_flow_policy(
     expected = build_tool_flow_questions(business_type, schema_overrides, custom_tabs)
     bundle = persisted if persisted.get("schema_hash") == expected.get("schema_hash") else expected
 
+    # Anti-repeat: any slot we already know from the conversational
+    # memory (snapshot lives in ``state['memory']['facts']`` keyed by
+    # the canonical fact name) should pre-populate ``collected`` so
+    # the flow skips asking. The hydrator only fills gaps — explicit
+    # flow writes win.
+    try:
+        # Local import to avoid the import-time cycle with services
+        # that themselves consume tool_flow_policy.
+        from app.services.conversational_memory import (
+            ConversationalMemory as _CM,
+            hydrate_flow_collected as _hydrate,
+        )
+        memory_obj = _CM.from_state_blob((state or {}).get("memory") or {})
+    except Exception:
+        memory_obj = None
+        _hydrate = None  # type: ignore[assignment]
+
     flow_state = dict(state.get("tool_flow") or {})
     newly_started = False
     if not flow_state.get("active"):
@@ -355,6 +372,19 @@ def evaluate_tool_flow_policy(
             "tool_key": ((bundle.get("flows") or {}).get(flow_key) or {}).get("tool_key"),
             "collected": {},
         }
+
+    # Memory hydration — fill in any slot the caller has already told
+    # us about (this or a prior call) so ``_next_slot`` won't ask for
+    # things we know. Done once per evaluation pass; subsequent
+    # writes by the flow itself still take precedence.
+    if memory_obj is not None and _hydrate is not None:
+        try:
+            flow_state["collected"] = _hydrate(
+                flow_state.get("collected") or {},
+                memory_obj,
+            )
+        except Exception:
+            pass
 
     flow_key = str(flow_state.get("flow_key") or "")
 

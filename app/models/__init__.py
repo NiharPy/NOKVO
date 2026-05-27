@@ -1,7 +1,7 @@
 from app.db.session import Base
 from app.models.user import SuperAdminUser
 from app.models.session import SuperAdminSession
-from app.models.audit import SuperAdminAuditLog
+from app.models.audit import SuperAdminAuditLog, VoiceDataAccessAuditLog
 from app.models.approval import SuperAdminApprovalRequest
 from app.models.organization import Organization
 from app.models.organization_session import OrganizationSession
@@ -28,6 +28,8 @@ from app.models.member_assignment import (
 )
 from app.models.connect_api_key import OrganizationApiKey
 from app.models.connect_session import ConnectSession
+from app.models.call_cost import CallCost
+from app.models.notification import Notification
 
 # For Alembic to discover all models
 __all__ = [
@@ -35,6 +37,7 @@ __all__ = [
     "SuperAdminUser",
     "SuperAdminSession",
     "SuperAdminAuditLog",
+    "VoiceDataAccessAuditLog",
     "SuperAdminApprovalRequest",
     "Organization",
     "OrganizationUser",
@@ -57,4 +60,6 @@ __all__ = [
     "NokvoOneAssignmentAuditLog",
     "OrganizationApiKey",
     "ConnectSession",
+    "CallCost",
+    "Notification",
 ]

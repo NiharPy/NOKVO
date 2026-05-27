@@ -5,9 +5,11 @@ import logging
 logger = logging.getLogger(__name__)
 
 import asyncio
+import contextlib
 import json
 import struct
 import uuid
+from datetime import datetime, timezone
 from time import perf_counter
 from typing import Any
 
@@ -87,6 +89,7 @@ from app.services.agent_outbound_context import (
     generate_outbound_opener_text,
     infer_covered_objectives,
     load_outbound_context,
+    update_outbound_memory,
 )
 from app.services.agent_robustness import (
     AudioQualityProbe,
@@ -105,6 +108,13 @@ from app.services.agent_robustness import (
     CLARIFY_ESCALATE,
 )
 from app.services.agent_session_store import AgentSessionStore
+from app.services.conversational_memory import (
+    ConversationalMemory,
+    bootstrap_caller_memory,
+    load_memory,
+    promote_to_caller_memory,
+    save_memory,
+)
 from app.services.language_intent import detect_language_switch
 from app.services.nokvo_one_voice_pipeline import NokvoOneVoicePipeline
 from app.services.predefined_tools_service import PredefinedToolsService, get_tool
@@ -200,7 +210,7 @@ class _TtsPump:
         self._turn_id = turn_id
         self._purpose = purpose
         self._speaking_mark = speaking_mark
-        self._queue: asyncio.Queue[tuple[str, str] | None] = asyncio.Queue()
+        self._queue: asyncio.Queue[tuple[str, str, bool] | None] = asyncio.Queue()
         self._worker: asyncio.Task[None] | None = None
         self._first_audio_fired = False
 
@@ -208,10 +218,10 @@ class _TtsPump:
         if self._worker is None:
             self._worker = asyncio.create_task(self._run())
 
-    async def submit(self, sentence: str, tone: str) -> None:
+    async def submit(self, sentence: str, tone: str, *, cacheable_tts: bool = False) -> None:
         if not sentence:
             return
-        await self._queue.put((sentence, tone))
+        await self._queue.put((sentence, tone, cacheable_tts))
 
     async def close(self) -> None:
         """Send the end-of-stream sentinel and wait for the worker to flush
@@ -241,7 +251,7 @@ class _TtsPump:
             item = await self._queue.get()
             if item is None:
                 return
-            batch: list[tuple[str, str]] = [item]
+            batch: list[tuple[str, str, bool]] = [item]
             # First sentence: dispatch alone so first audio lands as fast
             # as possible. After that, opportunistically drain any extra
             # sentences that piled up while the previous TTS call was in
@@ -259,16 +269,16 @@ class _TtsPump:
             await self._flush(batch)
             self._first_audio_fired = True
 
-    async def _flush(self, batch: list[tuple[str, str]]) -> None:
+    async def _flush(self, batch: list[tuple[str, str, bool]]) -> None:
         if not batch:
             return
-        text = " ".join(s for s, _ in batch).strip()
+        text = " ".join(s for s, _, _ in batch).strip()
         if not text:
             return
         # Use the tone of the first sentence in the batch for prosody —
         # adjacent sentences from the same LLM completion almost always
         # carry the same emotional register.
-        prosody = prosody_for(batch[0][1] or DEFAULT_TONE)
+        prosody = None if not self._first_audio_fired else prosody_for(batch[0][1] or DEFAULT_TONE)
         if self._speaking_mark is not None:
             try:
                 self._speaking_mark()
@@ -281,9 +291,10 @@ class _TtsPump:
                 text,
                 language=self._language,
                 purpose=self._purpose,
-                pace=prosody.pace,
-                pitch=prosody.pitch,
-                loudness=prosody.loudness,
+                pace=prosody.pace if prosody else None,
+                pitch=prosody.pitch if prosody else None,
+                loudness=prosody.loudness if prosody else None,
+                enable_cached_responses=all(cacheable for _, _, cacheable in batch),
             )
         except Exception as exc:
             try:
@@ -325,6 +336,20 @@ def _quick_ack_text(language: str | None) -> str:
     }.get(language or "en", "Yes, I'm here.")
 
 
+def _latency_guard_text(language: str | None) -> str:
+    return {
+        "hi": "एक पल, मैं देख रहा हूँ।",
+        "ta": "ஒரு நிமிடம், பார்த்துக்கிறேன்.",
+        "te": "ఒక్క క్షణం, చూస్తున్నాను.",
+        "bn": "একটু সময় দিন, আমি দেখছি।",
+        "kn": "ಒಂದು ಕ್ಷಣ, ನೋಡುತ್ತಿದ್ದೇನೆ.",
+        "ml": "ഒരു നിമിഷം, ഞാൻ നോക്കുകയാണ്.",
+        "mr": "एक क्षण, मी पाहतोय.",
+        "gu": "એક ક્ષણ, હું જોઈ રહ્યો છું.",
+        "pa": "ਇੱਕ ਪਲ, ਮੈਂ ਵੇਖ ਰਿਹਾ ਹਾਂ।",
+    }.get(language or "en", "One moment, I'm checking that.")
+
+
 class NokvoOneVoiceStreamService:
     @staticmethod
     async def _company_name(db: AsyncSession | None, tenant_res: TenantResources) -> str:
@@ -340,6 +365,20 @@ class NokvoOneVoiceStreamService:
     @staticmethod
     async def _emit_runtime_status(websocket: WebSocket, tenant_res: TenantResources) -> None:
         await websocket.send_json({"type": "runtime_status", **NokvoOneVoicePipeline.runtime_status(tenant_res)})
+
+    @staticmethod
+    def _campaign_context_with_adapter_call_details(
+        campaign_context: dict[str, Any] | None,
+        websocket: WebSocket,
+    ) -> dict[str, Any] | None:
+        adapter_context = getattr(websocket, "call_context", None)
+        if not isinstance(adapter_context, dict) or not adapter_context:
+            return campaign_context
+        merged = dict(campaign_context or {})
+        for key in ("from_phone", "to_phone", "provider_call_id"):
+            if adapter_context.get(key) and not merged.get(key):
+                merged[key] = adapter_context[key]
+        return merged
 
     @staticmethod
     async def _dispatch_quality_recovery(
@@ -565,6 +604,19 @@ class NokvoOneVoiceStreamService:
                 session_id=f"{call_id}:call_log",
             )
             await db.commit()
+            from app.services.voice_data_audit_service import VoiceDataAuditService
+
+            await VoiceDataAuditService.log_tenant_access(
+                db,
+                tenant_res,
+                actor_type="system",
+                access_type="summarize",
+                resource_type="session_history",
+                resource_id=call_id,
+                call_id=call_id,
+                reason="voice_call_log_create",
+                metadata={"duration_seconds": max(0, duration_seconds), "turn_count": len(history)},
+            )
         except Exception:
             await db.rollback()
 
@@ -687,8 +739,16 @@ class NokvoOneVoiceStreamService:
             )
             return
 
-        await websocket.send_json({"type": "stt_finished", "text": cleaned, "turn_id": turn_id, "source": source})
-        await websocket.send_json({"type": "agent_thinking", "turn_id": turn_id, "query": cleaned})
+        # Proactive-silence turns synthesize a "(no caller response — ...)"
+        # prompt that the LLM consumes as guidance. It is internal scaffolding,
+        # NOT something the caller actually said — don't render it as a user
+        # transcript or thinking-query bubble in the UI. agent_sentence /
+        # agent_answer events still flow so the response is voiced normally.
+        if source == "proactive_silence":
+            await websocket.send_json({"type": "agent_thinking", "turn_id": turn_id, "query": "(proactive nudge)"})
+        else:
+            await websocket.send_json({"type": "stt_finished", "text": cleaned, "turn_id": turn_id, "source": source})
+            await websocket.send_json({"type": "agent_thinking", "turn_id": turn_id, "query": cleaned})
         answer_parts: list[str] = []
         final_payload: dict[str, Any] | None = None
         first_sentence_ms: int | None = None
@@ -716,57 +776,169 @@ class NokvoOneVoiceStreamService:
         # outstanding on this turn. The clarification / progress writer
         # lives below — for now we read what's already been recorded.
         covered_objectives: list[str] = []
+        stored_outbound_memory: dict[str, Any] = {}
+        prompt_outbound_memory: dict[str, str] | None = None
+        # ── Conversational memory ────────────────────────────────────
+        # Universal layer: applies to inbound AND outbound, drives the
+        # "don't re-ask" prompt block, and feeds tool_flow_policy so the
+        # structured booking flow skips slots whose values the caller
+        # already gave us mid-conversation.
+        conv_memory = await load_memory(tenant_res, call_id)
+        turn_index = len(await AgentSessionStore.get_history(tenant_res, call_id))
+        # First turn? Bootstrap from cross-call caller memory if we
+        # have a phone. Outbound campaigns carry it on
+        # ``campaign_context.contact.phone``; inbound webhooks stash
+        # ``from_phone``. Failures are silent — a cold call is the
+        # default and always works.
+        if turn_index == 0 and not conv_memory.facts:
+            caller_phone = None
+            try:
+                contact = (campaign_context or {}).get("contact")
+                if isinstance(contact, dict):
+                    caller_phone = contact.get("phone") or contact.get("phone_e164")
+                caller_phone = caller_phone or (campaign_context or {}).get("from_phone")
+            except Exception:
+                caller_phone = None
+            if caller_phone:
+                try:
+                    await bootstrap_caller_memory(
+                        tenant_res, phone=caller_phone, memory=conv_memory
+                    )
+                except Exception:
+                    logger.debug("NOKVO-MEMORY: bootstrap failed", exc_info=True)
+        if source != "proactive_silence":
+            conv_memory.merge_text(
+                cleaned,
+                turn_index=turn_index,
+                language=language,
+                role="user",
+            )
+        # Don't await the save yet — we'll fold in the agent's answer
+        # extraction later in the same turn and commit once. Persist
+        # immediately though as a safety net in case the LLM call hangs.
+        await save_memory(tenant_res, call_id, conv_memory)
+
         if outbound_context is not None:
             try:
                 session_state = await AgentSessionStore.get_state(tenant_res, call_id)
                 covered_objectives = list(
                     (session_state or {}).get("campaign_objectives_covered") or []
                 )
+                stored_outbound_memory = dict((session_state or {}).get("outbound_memory") or {})
+                prompt_outbound_memory = update_outbound_memory(
+                    stored_outbound_memory,
+                    caller_text=cleaned,
+                )
             except Exception:
                 covered_objectives = []
+                stored_outbound_memory = {}
+                prompt_outbound_memory = update_outbound_memory({}, caller_text=cleaned)
+        stream_done = object()
+        event_queue: asyncio.Queue[Any] = asyncio.Queue()
+
+        async def _produce_events() -> None:
+            try:
+                async for event in NokvoOneVoicePipeline.stream_answer_sentences(
+                    tenant_res,
+                    cleaned,
+                    db=db,
+                    top_k=settings.AGENT_RETRIEVAL_TOP_K,
+                    response_language=language,
+                    call_id=call_id,
+                    campaign_id=(campaign_context or {}).get("campaign_id"),
+                    campaign_goal=(campaign_context or {}).get("goal"),
+                    company_name=company_name,
+                    retrieval_text=retrieval_text,
+                    code_switching=is_code_switching,
+                    outbound_context=outbound_context,
+                    covered_objectives=covered_objectives,
+                    outbound_memory=prompt_outbound_memory,
+                    conversational_memory=conv_memory,
+                ):
+                    await event_queue.put(event)
+            except Exception as exc:
+                await event_queue.put(exc)
+            finally:
+                await event_queue.put(stream_done)
+
+        producer_task = asyncio.create_task(_produce_events())
+
+        async def _handle_stream_event(event: dict[str, Any]) -> None:
+            nonlocal first_sentence_ms, final_payload
+            if event.get("type") == "sentence":
+                sentence = str(event.get("text") or "").strip()
+                if not sentence:
+                    return
+                if first_sentence_ms is None:
+                    first_sentence_ms = int((perf_counter() - started) * 1000)
+                tone = str(event.get("tone") or DEFAULT_TONE)
+                answer_parts.append(sentence)
+                await websocket.send_json(
+                    {
+                        "type": "agent_sentence",
+                        "turn_id": turn_id,
+                        "sentence": sentence,
+                        "tone": tone,
+                        "first_sentence_ms": first_sentence_ms,
+                        "cache_hit": bool(event.get("cache_hit")),
+                    }
+                )
+                await tts_pump.submit(sentence, tone)
+            elif event.get("type") == "final":
+                final_payload = event
+
+        latency_guard_sent = False
+        # The spoken latency guard is useful for inbound support because it
+        # reassures the caller during retrieval. On outbound calls it sounds
+        # like an extra agent turn ("one moment...") and can stack in front of
+        # the actual sales reply, which prevents natural interruption.
+        latency_guard_enabled = outbound_context is None
         try:
-            async for event in NokvoOneVoicePipeline.stream_answer_sentences(
-                tenant_res,
-                cleaned,
-                db=db,
-                top_k=settings.AGENT_RETRIEVAL_TOP_K,
-                response_language=language,
-                call_id=call_id,
-                campaign_id=(campaign_context or {}).get("campaign_id"),
-                campaign_goal=(campaign_context or {}).get("goal"),
-                company_name=company_name,
-                retrieval_text=retrieval_text,
-                code_switching=is_code_switching,
-                outbound_context=outbound_context,
-                covered_objectives=covered_objectives,
-            ):
-                if event.get("type") == "sentence":
-                    sentence = str(event.get("text") or "").strip()
-                    if not sentence:
+            while True:
+                timeout_s = (
+                    max(0.05, settings.VOICE_FIRST_SENTENCE_TIMEOUT_MS / 1000)
+                    if first_sentence_ms is None and latency_guard_enabled
+                    else None
+                )
+                try:
+                    event = await asyncio.wait_for(event_queue.get(), timeout=timeout_s)
+                except asyncio.TimeoutError:
+                    if latency_guard_sent:
                         continue
-                    if first_sentence_ms is None:
-                        first_sentence_ms = int((perf_counter() - started) * 1000)
-                    tone = str(event.get("tone") or DEFAULT_TONE)
-                    answer_parts.append(sentence)
+                    latency_guard_sent = True
+                    first_sentence_ms = int((perf_counter() - started) * 1000)
+                    guard_sentence = _latency_guard_text(language)
                     await websocket.send_json(
                         {
                             "type": "agent_sentence",
                             "turn_id": turn_id,
-                            "sentence": sentence,
-                            "tone": tone,
+                            "sentence": guard_sentence,
+                            "tone": "warm",
                             "first_sentence_ms": first_sentence_ms,
-                            "cache_hit": bool(event.get("cache_hit")),
+                            "cache_hit": False,
+                            "source": "latency_guard",
                         }
                     )
-                    await tts_pump.submit(sentence, tone)
-                elif event.get("type") == "final":
-                    final_payload = event
+                    await tts_pump.submit(guard_sentence, "warm", cacheable_tts=True)
+                    continue
+                if event is stream_done:
+                    break
+                if isinstance(event, Exception):
+                    raise event
+                await _handle_stream_event(event)
+            await producer_task
             await tts_pump.close()
         except asyncio.CancelledError:
+            producer_task.cancel()
+            with contextlib.suppress(BaseException):
+                await producer_task
             await tts_pump.cancel()
             await websocket.send_json({"type": "turn_cancelled", "turn_id": turn_id})
             raise
         except Exception as exc:
+            producer_task.cancel()
+            with contextlib.suppress(BaseException):
+                await producer_task
             await tts_pump.cancel()
             fallback = NokvoOneVoicePipeline._refusal(language)
             answer_parts = [fallback]
@@ -774,7 +946,27 @@ class NokvoOneVoiceStreamService:
             await websocket.send_json({"type": "agent_error", "turn_id": turn_id, "error": str(exc)[:240]})
 
         answer = str((final_payload or {}).get("answer") or " ".join(answer_parts)).strip()
+        # Mine the agent's answer for fact confirmations the user
+        # implicitly accepted (the agent often echoes "Got it — 3BHK
+        # in Kompally"). Lower confidence than the user's own turn so
+        # a later user correction still wins.
+        if answer:
+            conv_memory.merge_text(
+                answer,
+                turn_index=turn_index + 1,
+                language=language,
+                role="assistant",
+            )
+        await save_memory(tenant_res, call_id, conv_memory)
+        outbound_state_patch: dict[str, Any] = {}
         if outbound_context is not None and call_id:
+            updated_memory = update_outbound_memory(
+                prompt_outbound_memory or stored_outbound_memory,
+                caller_text=cleaned,
+                agent_answer=answer,
+            )
+            if updated_memory != stored_outbound_memory:
+                outbound_state_patch["outbound_memory"] = updated_memory
             updated_objectives = infer_covered_objectives(
                 outbound_context,
                 caller_text=cleaned,
@@ -782,11 +974,10 @@ class NokvoOneVoiceStreamService:
                 already_covered=covered_objectives,
             )
             if updated_objectives != covered_objectives:
-                await AgentSessionStore.merge_state(
-                    tenant_res,
-                    call_id,
-                    {"campaign_objectives_covered": updated_objectives},
-                )
+                outbound_state_patch["campaign_objectives_covered"] = updated_objectives
+            if outbound_state_patch:
+                await AgentSessionStore.merge_state(tenant_res, call_id, outbound_state_patch)
+            if updated_objectives != covered_objectives:
                 try:
                     await websocket.send_json(
                         {
@@ -1196,6 +1387,11 @@ class NokvoOneVoiceStreamService:
     ) -> None:
         await websocket.accept()
         session_started = perf_counter()
+        # Wall-clock anchor for the billing ledger. ``perf_counter`` gives us
+        # an accurate elapsed-time delta for runtime metrics, but the cost
+        # row needs a real UTC timestamp the dashboard can render and an
+        # ``ended_at`` set from the same clock at teardown.
+        session_started_at = datetime.now(timezone.utc)
         language = SarvamVoiceService.normalize_language(language)
         call_id = call_id or str(uuid.uuid4())
         company_name = await NokvoOneVoiceStreamService._company_name(db, tenant_res)
@@ -1246,7 +1442,7 @@ class NokvoOneVoiceStreamService:
                 return
             state = await AgentSessionStore.get_state(tenant_res, call_id) or {}
             nudge_count = int(state.get("proactive_silence_nudges") or 0)
-            if nudge_count >= 2:
+            if nudge_count >= 1:
                 return
             await AgentSessionStore.merge_state(
                 tenant_res,
@@ -1302,8 +1498,8 @@ class NokvoOneVoiceStreamService:
         # speech_end is treated as a HINT (restart the debounce), not as
         # authority to fire. The turn only fires after the debounce elapses
         # with no new speech — i.e., the user actually finished their thought.
-        EOU_DEBOUNCE_MS = 2000
-        EOU_CONTINUATION_BONUS_MS = 1500  # added when the buffer ends in a function word
+        EOU_DEBOUNCE_MS = max(500, int(settings.VOICE_EOU_DEBOUNCE_MS))
+        EOU_CONTINUATION_BONUS_MS = max(0, int(settings.VOICE_EOU_CONTINUATION_BONUS_MS))
         # Trailing words that almost always precede more speech. Bumping the
         # debounce when the buffer ends in one of these saves us from cutting
         # off thoughts like "Basically he asked me to" / "you guys would be".
@@ -1498,10 +1694,19 @@ class NokvoOneVoiceStreamService:
             # English doc corpus, ~4× better cosine recall in practice).
             retrieval_text: str | None = None
             translate_audio: bytes | None = None
+            # Outbound mode does not consult Qdrant retrieval; English
+            # translation is therefore wasted work (and adds up to 1.5s of
+            # turn latency). Inbound keeps the translate path so cross-
+            # lingual recall against the tenant KB still works.
+            _outbound_skip_translate = bool(
+                outbound_context
+                and outbound_context.is_proactive
+            )
             if (
                 settings.AGENT_TRANSLATE_FOR_RETRIEVAL_ENABLED
                 and turn_language != "en"
                 and utterance_audio
+                and not _outbound_skip_translate
                 and not NokvoOneVoicePipeline.should_skip_translate_for_native_query(text)
             ):
                 translate_audio = bytes(utterance_audio)
@@ -1733,7 +1938,7 @@ class NokvoOneVoiceStreamService:
         elif _outbound_proactive:
             # Use the deterministic, template-filled opener — no LLM call,
             # ~150ms faster first audio. The LLM takes over from turn 2.
-            outbound_opening_text = generate_outbound_opener_text(outbound_context)
+            outbound_opening_text = generate_outbound_opener_text(outbound_context, language=language)
             await NokvoOneVoiceStreamService._play_opener(
                 websocket,
                 tenant_res,
@@ -1855,6 +2060,27 @@ class NokvoOneVoiceStreamService:
                     utterance_segments.clear()
                     utterance_audio.clear()
                     continue
+                if event_type == "end_of_utterance":
+                    # Client VAD signalled real end-of-speech. In streaming
+                    # mode we let Sarvam's STT WS race finalization while
+                    # the server-side EOU debounce is already running, but
+                    # the CLIENT VAD is more accurate than Sarvam's pause
+                    # detector (it sees the actual mic signal). Treat this
+                    # as authoritative: flush the Sarvam socket and fire
+                    # the turn immediately, skipping the rest of the
+                    # debounce. Saves 200-400ms per turn vs waiting for
+                    # the EOU_DEBOUNCE_MS window.
+                    if capture_mode[0] == "stream":
+                        if stt_ws is not None:
+                            try:
+                                await SarvamVoiceService.flush_stt(stt_ws)
+                            except Exception:
+                                pass
+                        if utterance_segments:
+                            _cancel_eou_timer()
+                            await _drain_turn(current_turn)
+                            await _fire_turn()
+                    continue
                 if event_type in {"text_query", "transcript"}:
                     await _drain_turn(current_turn)
                     turn_state = {"speaking": False}
@@ -1929,10 +2155,75 @@ class NokvoOneVoiceStreamService:
                     await stt_ws.close()
                 except Exception:
                     pass
+            final_campaign_context = NokvoOneVoiceStreamService._campaign_context_with_adapter_call_details(
+                campaign_context,
+                websocket,
+            )
+            try:
+                await NokvoOneVoicePipeline.maybe_create_real_estate_lead_from_call(
+                    tenant_res,
+                    db,
+                    call_id,
+                    campaign_context=final_campaign_context,
+                    outbound_context=outbound_context,
+                )
+            except Exception as exc:
+                logger.warning(f"NOKVO-VOICE: auto real-estate lead creation failed: {exc!r}")
             await NokvoOneVoiceStreamService._log_voice_call(
                 db,
                 tenant_res,
                 call_id,
                 duration_seconds=int(perf_counter() - session_started),
-                campaign_context=campaign_context,
+                campaign_context=final_campaign_context,
             )
+            # Billing ledger — one row per call. Tester sessions and
+            # campaign calls are tagged so the dashboard can split totals.
+            # Failures here are logged and swallowed; they must never block
+            # WS teardown.
+            try:
+                if str(call_id or "").startswith("tester:"):
+                    cost_kind = "tester"
+                elif outbound_context is not None:
+                    cost_kind = "outbound"
+                else:
+                    cost_kind = "inbound"
+                cost_campaign_id: Any = None
+                if outbound_context is not None:
+                    raw_cid = getattr(outbound_context, "campaign_id", None)
+                    # Synthetic tester contexts use ``tester-<uuid>`` strings;
+                    # only real UUIDs go into the ``campaign_id`` column.
+                    if raw_cid and not str(raw_cid).startswith("tester-"):
+                        cost_campaign_id = raw_cid
+                from app.services.call_cost_recorder import record_call_cost
+
+                await record_call_cost(
+                    db,
+                    organization_id=tenant_res.organization_id,
+                    tenant_id=tenant_res.tenant_id,
+                    call_id=str(call_id),
+                    started_at=session_started_at,
+                    ended_at=datetime.now(timezone.utc),
+                    kind=cost_kind,
+                    campaign_id=cost_campaign_id,
+                )
+            except Exception:
+                logger.exception("NOKVO-VOICE: failed to record call cost")
+            # Promote durable facts from this call's conversational
+            # memory into the per-phone caller-memory blob so a future
+            # call from the same number opens warm. Best-effort.
+            try:
+                final_memory = await load_memory(tenant_res, call_id)
+                contact = (final_campaign_context or {}).get("contact") if isinstance(final_campaign_context, dict) else None
+                promote_phone = None
+                if isinstance(contact, dict):
+                    promote_phone = contact.get("phone") or contact.get("phone_e164")
+                if not promote_phone and final_memory.has("phone"):
+                    promote_phone = final_memory.get("phone")
+                if not promote_phone and isinstance(final_campaign_context, dict):
+                    promote_phone = final_campaign_context.get("from_phone")
+                if promote_phone:
+                    await promote_to_caller_memory(
+                        tenant_res, phone=promote_phone, memory=final_memory
+                    )
+            except Exception:
+                logger.exception("NOKVO-MEMORY: promote_to_caller_memory failed at session end")

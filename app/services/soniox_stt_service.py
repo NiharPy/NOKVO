@@ -3,12 +3,24 @@ from app.services.azure_keyvault_service import AzureKeyVaultService
 
 
 class SonioxSTTService:
+    # Indian-language calls are almost always code-mixed: speakers slip
+    # English loanwords (order, refund, appointment, ₹500) into otherwise
+    # Telugu / Hindi utterances. Passing English as a secondary hint
+    # alongside the primary keeps Soniox's language ID from chopping those
+    # tokens or mis-transliterating them mid-sentence. Single-language
+    # English calls stay as ``["en"]`` (no double-hint penalty).
+    _INDIAN_LANG_CODES = {"hi", "te", "ta", "kn", "ml", "bn", "mr", "gu", "pa", "or", "ur"}
+
     @staticmethod
     def _language_hints(language: str | None) -> list[str]:
         if not language:
             return []
         primary = language.split("-", 1)[0].strip().lower()
-        return [primary] if primary else []
+        if not primary:
+            return []
+        if primary in SonioxSTTService._INDIAN_LANG_CODES:
+            return [primary, "en"]
+        return [primary]
 
     @staticmethod
     async def provision_stt(

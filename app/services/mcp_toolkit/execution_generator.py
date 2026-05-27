@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from app.core.config import settings
 from app.services.mcp_toolkit.capability_registry import ProviderCapability
 from app.services.mcp_toolkit.compilers import ExecutionCompilerRegistry
 from app.services.mcp_toolkit.context_retriever import ContextRetriever
@@ -703,7 +704,21 @@ class ExecutionGenerator:
 
     @staticmethod
     def limits() -> dict[str, Any]:
-        return {"max_entity_matches": 10, "max_rows_per_table": 50, "max_total_rows": 100, "timeout_seconds": 10, "max_response_size_bytes": 262144}
+        max_rows = max(1, int(settings.MCP_SQL_MAX_ROWS or 100))
+        timeout_ms = max(100, int(settings.MCP_SQL_STATEMENT_TIMEOUT_MS or 10000))
+        return {
+            "max_entity_matches": 10,
+            "max_rows_per_table": min(50, max_rows),
+            "max_total_rows": max_rows,
+            "timeout_seconds": max(1, timeout_ms // 1000),
+            "max_response_size_bytes": 262144,
+            "db_enforced": {
+                "statement_timeout_ms": timeout_ms,
+                "max_rows": max_rows,
+                "limit_parameter": "limit",
+                "enforcement": "SET LOCAL statement_timeout plus capped bound LIMIT before execution",
+            },
+        }
 
     @staticmethod
     def tenant_scope() -> dict[str, Any]:

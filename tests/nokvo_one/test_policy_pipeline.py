@@ -23,6 +23,8 @@ from app.services.fast_intent_router import (
     FastIntentRouter,
 )
 from app.services.language_intent import detect_language_switch
+from app.services.agent_outbound_context import OutboundCampaignContext
+from app.services.agent_runtime_bundle import RuntimeBundle
 from app.services.nokvo_one_voice_pipeline import NokvoOneVoicePipeline
 from app.services.policy_card_extractor import (
     OUTCOME_EIGHTY_PERCENT_REFUND,
@@ -842,6 +844,58 @@ def test_real_estate_visit_flow_uses_schema_questions():
     assert "name" in result["answer"]
 
 
+def test_real_estate_single_prompt_permission_reply_uses_llm_context():
+    """A bare "Sure" after the agent asks a contextual question must not become
+    the generic template "Sure, go ahead." In single-prompt mode the prompt and
+    transcript need to decide the next move."""
+    tenant_res = SimpleNamespace(
+        tenant_id="tenant-test",
+        organization_id=uuid.uuid4(),
+        provider_status={
+            "single_prompt_voice_agent": {
+                "enabled": True,
+                "prompt": "You are a concise real estate voice agent for Raghava Skyline.",
+            }
+        },
+    )
+    bundle = RuntimeBundle(
+        tenant_id="tenant-test",
+        organization=SimpleNamespace(industry="real_estate", name="Raghava Estates"),
+        organization_industry="real_estate",
+        organization_name="Raghava Estates",
+        overrides={},
+        custom_tabs=[],
+        policy_cards=[],
+        single_prompt_guidance="You are a concise real estate voice agent for Raghava Skyline.",
+        single_prompt_enabled=True,
+        version_key="test",
+    )
+
+    route = _run(
+        NokvoOneVoicePipeline._route_turn(
+            tenant_res,
+            "Sure",
+            language="en",
+            company_name="Raghava Estates",
+            call_id="call-real-estate-single-prompt",
+            db=SimpleNamespace(),
+            turn_cache={
+                "history": [
+                    {
+                        "role": "assistant",
+                        "content": "I can arrange a callback with the sales team. Would you like that?",
+                    }
+                ],
+                "state": {},
+                "bundle": bundle,
+            },
+        )
+    )
+
+    assert route["route"] == "smalltalk_llm"
+    assert route.get("answer") is None
+
+
 def test_tool_flow_yields_when_caller_asks_side_question_mid_flow():
     """Mid-flow KB question must NOT be consumed as a slot value."""
     provider_status, _ = ensure_tool_flow_questions({}, "real_estate")
@@ -979,6 +1033,19 @@ def test_voice_router_routes_bare_phone_before_short_filler(monkeypatch):
 
     monkeypatch.setattr("app.services.agent_session_store.AgentSessionStore.get_history", fake_history)
     monkeypatch.setattr("app.services.agent_session_store.AgentSessionStore.get_state", fake_state)
+
+    # Bare-phone confirmation is a clinic FSM heuristic. Tenants without a
+    # clinic industry no longer get the FSM (it leaked ophthalmology
+    # phrasing into real-estate accounts), so to exercise this code path
+    # we have to declare the tenant a clinic explicitly.
+    async def fake_business_context(db, tenant_res):
+        return SimpleNamespace(industry="clinics"), {}, []
+    monkeypatch.setattr(
+        NokvoOneVoicePipeline,
+        "_voice_business_context",
+        staticmethod(fake_business_context),
+    )
+
     tenant_res = SimpleNamespace(tenant_id="tenant-test", provider_status={})
     route = _run(
         NokvoOneVoicePipeline._route_turn(
@@ -1142,6 +1209,343 @@ def test_voice_real_estate_visit_flow_executes_macro(monkeypatch):
     assert route["tool_calls"][0]["result"]["assigned_member_name"] == "Rahul"
     assert "Site visit request create" in route["answer"]
     assert "Rahul" in route["answer"]
+
+
+def test_outbound_real_estate_visit_flow_executes_macro(monkeypatch):
+    org_id = uuid.uuid4()
+    calls: list[dict[str, Any]] = []
+
+    async def fake_context(db, tenant_res):
+        return SimpleNamespace(industry="real_estate"), {}, []
+
+    async def fake_execute(db, organization_id, user_id, tool, arguments, **kwargs):
+        calls.append({"tool": tool.key, "organization_id": organization_id, "arguments": arguments, "kwargs": kwargs})
+        return {
+            "ok": True,
+            "lead_id": str(uuid.uuid4()),
+            "callback_id": str(uuid.uuid4()),
+            "assignment_status": "assigned",
+            "assigned_member_name": "Rahul",
+        }
+
+    class FakeDB:
+        committed = False
+        rolled_back = False
+
+        async def commit(self):
+            self.committed = True
+
+        async def rollback(self):
+            self.rolled_back = True
+
+    outbound_context = OutboundCampaignContext(
+        campaign_id="campaign-real-estate",
+        name="Raghava outbound",
+        goal="Book site visits",
+        agent_prompt="",
+        objectives=["Book site visit"],
+        exit_conditions=["Not interested"],
+        tone="warm",
+        doc_text=None,
+        company_name="Raghava Constructions",
+        pitch_summary="Raghava Skyline",
+    )
+
+    monkeypatch.setattr(NokvoOneVoicePipeline, "_voice_business_context", staticmethod(fake_context))
+    monkeypatch.setattr("app.services.nokvo_one_voice_pipeline.PredefinedToolsService.execute", fake_execute)
+
+    db = FakeDB()
+    tenant_res = SimpleNamespace(tenant_id="tenant-test", organization_id=org_id, provider_status={})
+    state = {
+        "tool_flow": {
+            "active": True,
+            "flow_key": "real_estate_site_visit",
+            "pending_slot": "visit_time",
+            "collected": {
+                "name": "Nihar",
+                "phone": "7569672503",
+                "visit_date": "tomorrow",
+            },
+        },
+        "call_surface": "voice_outbound",
+    }
+
+    route = _run(
+        NokvoOneVoicePipeline._route_turn(
+            tenant_res,
+            "5 PM",
+            language="en",
+            company_name="Raghava Constructions",
+            call_id="call-outbound-real-estate",
+            db=db,
+            turn_cache={"history": [], "state": state, "bundle": None},
+            outbound_context=outbound_context,
+        )
+    )
+
+    assert route["route"] == "template"
+    assert db.committed is True
+    assert calls and calls[0]["tool"] == "qualify_lead_and_schedule_visit"
+    assert calls[0]["arguments"]["name"] == "Nihar"
+    assert calls[0]["arguments"]["phone"] == "7569672503"
+    assert route["tool_calls"][0]["result"]["assigned_member_name"] == "Rahul"
+
+
+def test_outbound_real_estate_visit_request_does_not_emit_inbound_question(monkeypatch):
+    """On outbound, the tool_flow's slot scraper still runs (so when the
+    caller later answers we persist what they said), but its inbound-style
+    canned question ("May I have your name?") MUST NOT be emitted as the
+    user-facing reply — the outbound sales-persona LLM owns the asking.
+    The route falls through to ``rag`` so the LLM composes the next reply
+    in its own voice.
+    """
+    async def fake_context(db, tenant_res):
+        return SimpleNamespace(industry="real_estate"), {}, []
+
+    outbound_context = OutboundCampaignContext(
+        campaign_id="campaign-real-estate",
+        name="Raghava outbound",
+        goal="Book site visits",
+        agent_prompt="",
+        objectives=["Book site visit"],
+        exit_conditions=["Not interested"],
+        tone="warm",
+        doc_text=None,
+        company_name="Raghava Constructions",
+        pitch_summary="Raghava Skyline",
+    )
+
+    monkeypatch.setattr(NokvoOneVoicePipeline, "_voice_business_context", staticmethod(fake_context))
+    # _apply_route_state writes to Redis — stub it so the test stays
+    # purely in-memory.
+    async def _noop(*args, **kwargs):
+        return None
+    monkeypatch.setattr(NokvoOneVoicePipeline, "_apply_route_state", staticmethod(_noop))
+
+    tenant_res = SimpleNamespace(tenant_id="tenant-test", organization_id=uuid.uuid4(), provider_status={})
+    route = _run(
+        NokvoOneVoicePipeline._route_turn(
+            tenant_res,
+            "I want to visit the property",
+            language="en",
+            company_name="Raghava Constructions",
+            call_id="call-outbound-start-visit",
+            db=SimpleNamespace(),
+            turn_cache={"history": [], "state": {"call_surface": "voice_outbound"}, "bundle": None},
+            outbound_context=outbound_context,
+        )
+    )
+
+    # Falls through to RAG; LLM will compose the next reply in persona.
+    assert route["route"] == "rag"
+    # No canned answer is emitted.
+    assert not route.get("answer")
+
+
+def test_auto_creates_real_estate_lead_from_outbound_details_on_hangup(monkeypatch):
+    org_id = uuid.uuid4()
+    calls: list[dict[str, Any]] = []
+    merged_state: list[dict[str, Any]] = []
+
+    async def fake_context(db, tenant_res):
+        return SimpleNamespace(industry="real_estate"), {}, []
+
+    async def fake_state(*args, **kwargs):
+        return {
+            "call_surface": "voice_outbound",
+            "outbound_memory": {
+                "name": "Nihar",
+                "phone": "7569672503",
+                "bhk": "4 BHK",
+                "budget": "1.2 crore",
+                "requested_info": "details, pricing",
+            },
+        }
+
+    async def fake_history(*args, **kwargs):
+        return [
+            {"role": "assistant", "content": "Is now a good time?"},
+            {"role": "user", "content": "Send me pricing details on WhatsApp."},
+        ]
+
+    async def fake_execute(db, organization_id, user_id, tool, arguments, **kwargs):
+        calls.append({"tool": tool.key, "organization_id": organization_id, "arguments": arguments, "kwargs": kwargs})
+        return {"ok": True, "id": str(uuid.uuid4()), "record_type": "lead", "status": "new"}
+
+    async def fake_patch(*args, **kwargs):
+        return None
+
+    async def fake_merge(_tenant_res, _call_id, patch, **kwargs):
+        merged_state.append(patch)
+        return patch
+
+    class FakeDB:
+        committed = False
+
+        async def commit(self):
+            self.committed = True
+
+        async def rollback(self):
+            return None
+
+    outbound_context = OutboundCampaignContext(
+        campaign_id="campaign-real-estate",
+        name="Raghava outbound",
+        goal="Share details and book site visits",
+        agent_prompt="",
+        objectives=["Send details", "Book site visit"],
+        exit_conditions=["Not interested"],
+        tone="warm",
+        doc_text=None,
+        company_name="Raghava Constructions",
+        pitch_summary="Raghava Skyline",
+    )
+
+    monkeypatch.setattr(NokvoOneVoicePipeline, "_voice_business_context", staticmethod(fake_context))
+    monkeypatch.setattr("app.services.agent_session_store.AgentSessionStore.get_state", fake_state)
+    monkeypatch.setattr("app.services.agent_session_store.AgentSessionStore.get_history", fake_history)
+    monkeypatch.setattr("app.services.agent_session_store.AgentSessionStore.merge_state", fake_merge)
+    monkeypatch.setattr("app.services.nokvo_one_voice_pipeline.PredefinedToolsService.execute", fake_execute)
+    monkeypatch.setattr(NokvoOneVoicePipeline, "_patch_record_metadata", staticmethod(fake_patch))
+
+    db = FakeDB()
+    tenant_res = SimpleNamespace(tenant_id="tenant-test", organization_id=org_id, provider_status={})
+    result = _run(
+        NokvoOneVoicePipeline.maybe_create_real_estate_lead_from_call(
+            tenant_res,
+            db,
+            "call-auto-lead",
+            campaign_context={"campaign_id": "campaign-real-estate"},
+            outbound_context=outbound_context,
+        )
+    )
+
+    assert result is not None
+    assert db.committed is True
+    assert calls and calls[0]["tool"] == "leads_create"
+    assert calls[0]["arguments"]["name"] == "Nihar"
+    assert calls[0]["arguments"]["phone"] == "7569672503"
+    assert calls[0]["arguments"]["property_type"] == "4 BHK"
+    assert calls[0]["arguments"]["budget"] == 1.2
+    assert merged_state and merged_state[0]["auto_lead_created"] is True
+
+
+def test_auto_creates_real_estate_lead_from_inbound_inquiry_on_hangup(monkeypatch):
+    org_id = uuid.uuid4()
+    calls: list[dict[str, Any]] = []
+    metadata_patches: list[dict[str, Any]] = []
+    merged_state: list[dict[str, Any]] = []
+
+    async def fake_context(db, tenant_res):
+        return SimpleNamespace(industry="real_estate"), {}, []
+
+    async def fake_state(*args, **kwargs):
+        return {"call_surface": "voice_inbound"}
+
+    async def fake_history(*args, **kwargs):
+        return [
+            {
+                "role": "user",
+                "content": "Can I know the RERA number for Raghava Skyline Kokapet?",
+            },
+            {
+                "role": "assistant",
+                "content": "I do not have that number in the current details.",
+            },
+        ]
+
+    async def fake_execute(db, organization_id, user_id, tool, arguments, **kwargs):
+        calls.append({"tool": tool.key, "organization_id": organization_id, "arguments": arguments, "kwargs": kwargs})
+        return {"ok": True, "id": str(uuid.uuid4()), "record_type": "lead", "status": "new"}
+
+    async def fake_patch(_db, _record_id, metadata):
+        metadata_patches.append(metadata)
+
+    async def fake_merge(_tenant_res, _call_id, patch, **kwargs):
+        merged_state.append(patch)
+        return patch
+
+    class FakeDB:
+        committed = False
+
+        async def commit(self):
+            self.committed = True
+
+        async def rollback(self):
+            return None
+
+    monkeypatch.setattr(NokvoOneVoicePipeline, "_voice_business_context", staticmethod(fake_context))
+    monkeypatch.setattr("app.services.agent_session_store.AgentSessionStore.get_state", fake_state)
+    monkeypatch.setattr("app.services.agent_session_store.AgentSessionStore.get_history", fake_history)
+    monkeypatch.setattr("app.services.agent_session_store.AgentSessionStore.merge_state", fake_merge)
+    monkeypatch.setattr("app.services.nokvo_one_voice_pipeline.PredefinedToolsService.execute", fake_execute)
+    monkeypatch.setattr(NokvoOneVoicePipeline, "_patch_record_metadata", staticmethod(fake_patch))
+
+    db = FakeDB()
+    tenant_res = SimpleNamespace(tenant_id="tenant-test", organization_id=org_id, provider_status={})
+    result = _run(
+        NokvoOneVoicePipeline.maybe_create_real_estate_lead_from_call(
+            tenant_res,
+            db,
+            "call-inbound-rera",
+            campaign_context={"from_phone": "+91 75696 72503"},
+        )
+    )
+
+    assert result is not None
+    assert db.committed is True
+    assert calls and calls[0]["tool"] == "leads_create"
+    assert calls[0]["arguments"]["name"] == "Property inquiry"
+    assert calls[0]["arguments"]["phone"] == "7569672503"
+    assert metadata_patches and metadata_patches[0]["requested_info"] == "RERA number"
+    assert merged_state and merged_state[0]["auto_lead_created"] is True
+
+
+def test_auto_lead_skips_outbound_not_interested_hangup(monkeypatch):
+    async def fake_context(db, tenant_res):
+        return SimpleNamespace(industry="real_estate"), {}, []
+
+    async def fake_state(*args, **kwargs):
+        return {
+            "call_surface": "voice_outbound",
+            "outbound_memory": {
+                "phone": "7569672503",
+                "objection": "Not interested, don't call again.",
+            },
+        }
+
+    async def fake_history(*args, **kwargs):
+        return [{"role": "user", "content": "Not interested, don't call again."}]
+
+    async def fail_execute(*args, **kwargs):
+        raise AssertionError("should not create lead for opt-out")
+
+    monkeypatch.setattr(NokvoOneVoicePipeline, "_voice_business_context", staticmethod(fake_context))
+    monkeypatch.setattr("app.services.agent_session_store.AgentSessionStore.get_state", fake_state)
+    monkeypatch.setattr("app.services.agent_session_store.AgentSessionStore.get_history", fake_history)
+    monkeypatch.setattr("app.services.nokvo_one_voice_pipeline.PredefinedToolsService.execute", fail_execute)
+
+    tenant_res = SimpleNamespace(tenant_id="tenant-test", organization_id=uuid.uuid4(), provider_status={})
+    result = _run(
+        NokvoOneVoicePipeline.maybe_create_real_estate_lead_from_call(
+            tenant_res,
+            SimpleNamespace(),
+            "call-auto-lead-optout",
+            campaign_context={"campaign_id": "campaign-real-estate"},
+            outbound_context=OutboundCampaignContext(
+                campaign_id="campaign-real-estate",
+                name="Raghava outbound",
+                goal="Share details",
+                agent_prompt="",
+                objectives=["Share details"],
+                exit_conditions=["Not interested"],
+                tone="warm",
+                doc_text=None,
+            ),
+        )
+    )
+
+    assert result is None
 
 
 # ── 10) (Bonus) Extractor produces structured conditions for the matrix ─────

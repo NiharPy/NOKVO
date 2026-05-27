@@ -137,37 +137,23 @@ def _organization_option(organization: Organization) -> dict:
 
 
 def _build_zoho_oauth_state(organization_id: str, user_id: str) -> str:
-    payload = {
-        "organization_id": organization_id,
-        "user_id": user_id,
-        "exp": int((datetime.now(timezone.utc) + timedelta(minutes=15)).timestamp()),
-    }
-    payload_bytes = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    signature = hmac.new(settings.SECRET_KEY.encode("utf-8"), payload_bytes, hashlib.sha256).hexdigest()
-    token = base64.urlsafe_b64encode(payload_bytes).decode("utf-8").rstrip("=")
-    return f"{token}.{signature}"
+    return security.create_oauth_state(
+        {
+            "organization_id": organization_id,
+            "user_id": user_id,
+        },
+        purpose="zoho_crm",
+        ttl=timedelta(minutes=15),
+    )
 
 
 def _parse_zoho_oauth_state(state: str) -> dict:
     try:
-        encoded_payload, signature = state.split(".", 1)
-    except ValueError as exc:
+        return security.decode_oauth_state(state, expected_purpose="zoho_crm")
+    except jwt.ExpiredSignatureError as exc:
+        raise HTTPException(status_code=400, detail="Zoho OAuth state expired") from exc
+    except jwt.PyJWTError as exc:
         raise HTTPException(status_code=400, detail="Invalid Zoho OAuth state") from exc
-
-    padded = encoded_payload + "=" * (-len(encoded_payload) % 4)
-    try:
-        payload_bytes = base64.urlsafe_b64decode(padded.encode("utf-8"))
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail="Invalid Zoho OAuth state") from exc
-
-    expected_signature = hmac.new(settings.SECRET_KEY.encode("utf-8"), payload_bytes, hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(signature, expected_signature):
-        raise HTTPException(status_code=400, detail="Invalid Zoho OAuth state")
-
-    payload = json.loads(payload_bytes.decode("utf-8"))
-    if int(payload.get("exp", 0)) < int(datetime.now(timezone.utc).timestamp()):
-        raise HTTPException(status_code=400, detail="Zoho OAuth state expired")
-    return payload
 
 
 def _crm_oauth_redirect_url(status_value: str, provider: str, message: str = "") -> str:
@@ -264,6 +250,7 @@ def _build_org_access_token(user: OrganizationUser, session_id: str) -> str:
         subject=user.id,
         mfa_completed=True,
         session_id=session_id,
+        token_tier=security.JWT_TIER_ORGANIZATION,
         extra_claims={
             "principal_type": "organization_user",
             "organization_id": str(user.organization_id),
@@ -277,6 +264,7 @@ def _build_org_temp_token(user: OrganizationUser) -> str:
         subject=user.id,
         mfa_completed=False,
         expires_delta=timedelta(minutes=5),
+        token_tier=security.JWT_TIER_ORGANIZATION,
         extra_claims={
             "principal_type": "organization_user",
             "organization_id": str(user.organization_id),
@@ -355,7 +343,7 @@ async def _get_websocket_organization_user(websocket: WebSocket, db: AsyncSessio
     if not token:
         return None
     try:
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        payload = security.decode_access_token(token, expected_tiers=[security.JWT_TIER_ORGANIZATION])
         if payload.get("principal_type") != "organization_user":
             return None
         user_id = payload.get("sub")
@@ -606,7 +594,7 @@ async def refresh_organization_token(
     data: RefreshRequest,
     db: AsyncSession = Depends(deps.get_db),
 ):
-    provided_hash = security.hashlib.sha256(data.refresh_token.encode()).hexdigest()
+    provided_hash = security.hash_refresh_token(data.refresh_token)
     result = await db.execute(
         select(OrganizationSession).where(
             OrganizationSession.refresh_token_hash == provided_hash,

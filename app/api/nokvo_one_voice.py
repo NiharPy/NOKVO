@@ -24,6 +24,7 @@ Tenant isolation is enforced via TenantResources lookups for every path:
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -33,7 +34,6 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-import jwt
 from fastapi import (
     APIRouter,
     Depends,
@@ -52,6 +52,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.api import deps
+from app.core import security
 from app.core.config import settings
 from app.models.organization import Organization
 from app.models.organization_user import OrganizationUser
@@ -165,8 +166,8 @@ async def _ws_user(websocket: WebSocket, db: AsyncSession) -> OrganizationUser |
     if not token:
         return None
     try:
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-    except jwt.PyJWTError:
+        payload = security.decode_access_token(token, expected_tiers=[security.JWT_TIER_ORGANIZATION])
+    except Exception:
         return None
     if payload.get("principal_type") != "organization_user":
         return None
@@ -267,18 +268,17 @@ async def voice_tester_websocket(websocket: WebSocket):
 # we scale, matching the rest of the platform.
 
 import time as _time
-from threading import Lock as _Lock
 
 _TESTER_STASH_TTL_SECONDS = 300
 _TESTER_STASH_MAX = 256
 _tester_stash: dict[str, dict[str, Any]] = {}
-_tester_stash_lock = _Lock()
+_tester_stash_lock = asyncio.Lock()
 
 
-def _tester_stash_put(payload: dict[str, Any]) -> str:
+async def _tester_stash_put(payload: dict[str, Any]) -> str:
     token = uuid.uuid4().hex
     expires_at = _time.monotonic() + _TESTER_STASH_TTL_SECONDS
-    with _tester_stash_lock:
+    async with _tester_stash_lock:
         # Drop expired entries opportunistically — cheap O(n) sweep.
         now = _time.monotonic()
         for stale in [k for k, v in _tester_stash.items() if v.get("_expires_at", 0) <= now]:
@@ -290,10 +290,10 @@ def _tester_stash_put(payload: dict[str, Any]) -> str:
     return token
 
 
-def _tester_stash_pop(token: str | None) -> dict[str, Any] | None:
+async def _tester_stash_pop(token: str | None) -> dict[str, Any] | None:
     if not token:
         return None
-    with _tester_stash_lock:
+    async with _tester_stash_lock:
         record = _tester_stash.pop(token, None)
     if record is None:
         return None
@@ -339,7 +339,7 @@ async def prepare_outbound_tester_session(
             status_code=400,
             detail="Provide a system prompt, a reference document, or both.",
         )
-    token = _tester_stash_put({"agent_prompt": prompt, "doc_text": doc_text[:8000]})
+    token = await _tester_stash_put({"agent_prompt": prompt, "doc_text": doc_text[:8000]})
     return {
         "tester_session_token": token,
         "expires_in_seconds": _TESTER_STASH_TTL_SECONDS,
@@ -392,7 +392,7 @@ async def outbound_voice_tester_websocket(websocket: WebSocket):
         # Pull doc text / system-prompt override from the one-shot stash if
         # the frontend called /prepare first. The stash pop validates the
         # token and clears it so it can't be reused.
-        stashed = _tester_stash_pop(params.get("tester_session_token")) or {}
+        stashed = await _tester_stash_pop(params.get("tester_session_token")) or {}
         prompt_override = stashed.get("agent_prompt") or params.get("agent_prompt")
 
         agent_config = build_agent_config(
@@ -405,6 +405,7 @@ async def outbound_voice_tester_websocket(websocket: WebSocket):
             company_name=params.get("company_name"),
             pitch_summary=params.get("pitch_summary"),
             objective=params.get("objective"),
+            language=params.get("language"),
         )
         synthetic_id = f"tester-{uuid.uuid4()}"
         outbound_context = OutboundCampaignContext(
@@ -966,11 +967,20 @@ async def exotel_outbound_media_websocket(websocket: WebSocket, call_link_id: st
         if not tr:
             await websocket.close(code=1008)
             return
-        adapter = ExotelWebSocketAdapter(websocket, language="en")
+        # Outbound campaigns can be authored in any supported language —
+        # pull it off the persisted agent_config (default "en" for legacy
+        # campaigns). Threading this through the adapter + session means
+        # the STT, TTS, opener, and system prompt all agree on the
+        # language for the entire call.
+        campaign_language = str(
+            ((campaign.agent_config or {}).get("language") or "en")
+        ).strip().lower() or "en"
+        adapter = ExotelWebSocketAdapter(websocket, language=campaign_language)
         campaign_context = {
             "campaign_id": str(campaign.id),
             "goal": campaign.name,
             "contact": contact,
+            "language": campaign_language,
             "opening_message": (
                 f"Start the outbound campaign call for {contact.get('name') or 'the recipient'}. "
                 "Use the campaign script context, introduce yourself briefly, and ask if this is a good time to talk."
@@ -980,7 +990,7 @@ async def exotel_outbound_media_websocket(websocket: WebSocket, call_link_id: st
             adapter,
             tr,
             db=db,
-            language="en",
+            language=campaign_language,
             call_id=call_link_id,
             campaign_context=campaign_context,
         )

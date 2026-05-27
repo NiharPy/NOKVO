@@ -14,6 +14,7 @@ import asyncpg
 import redis
 from sqlalchemy import text as sql_text
 
+from app.core.config import settings
 from app.models.tenant_resources import TenantResources
 from app.services.mcp_toolkit.sql_validator import SQLValidator
 from app.services.azure_keyvault_service import AzureKeyVaultService
@@ -162,10 +163,25 @@ class DatabaseIntegrationService:
         if provider not in POSTGRES_FAMILY:
             return {"status": "skipped", "message": f"EXPLAIN validation is not implemented for {provider}."}
         explain_sql, args, sample_bindings = SQLValidator.postgres_explain_query(sql, mapping)
+        limits = dict(mapping.get("limits") or {})
+        db_limits = dict(limits.get("db_enforced") or {})
+        statement_timeout_ms = max(
+            100,
+            min(
+                int(db_limits.get("statement_timeout_ms") or settings.MCP_SQL_STATEMENT_TIMEOUT_MS or 10000),
+                60000,
+            ),
+        )
+        client_timeout_seconds = max(1.0, (statement_timeout_ms / 1000) + 1.0)
         connect_kwargs = DatabaseIntegrationService._build_postgres_connect_kwargs(connection_string)
         conn = await asyncpg.connect(**connect_kwargs)
         try:
-            rows = await conn.fetch(explain_sql, *args)
+            async with conn.transaction(readonly=True):
+                await conn.execute(f"SET LOCAL statement_timeout = {statement_timeout_ms}")
+                rows = await asyncio.wait_for(
+                    conn.fetch(explain_sql, *args),
+                    timeout=client_timeout_seconds,
+                )
         finally:
             await conn.close()
         return {
@@ -173,6 +189,10 @@ class DatabaseIntegrationService:
             "statement": "EXPLAIN <generated parameterized SQL>",
             "sample_bindings": sample_bindings,
             "plan_rows": len(rows),
+            "db_enforced_limits": {
+                "statement_timeout_ms": statement_timeout_ms,
+                "max_rows": max(1, int(settings.MCP_SQL_MAX_ROWS or 100)),
+            },
         }
 
     @staticmethod

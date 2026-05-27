@@ -42,6 +42,7 @@ from app.schemas.connect import (
 from app.services.agent_runtime_service import AgentRuntimeService
 from app.services.connect_session_service import ConnectSessionService
 from app.services.nokvo_one_voice_stream_service import NokvoOneVoiceStreamService
+from app.services.voice_data_audit_service import VoiceDataAuditService
 
 
 logger = logging.getLogger(__name__)
@@ -142,10 +143,22 @@ async def get_session(
     auth: tuple[OrganizationApiKey, Organization, TenantResources] = Depends(deps.get_api_key_record),
     db: AsyncSession = Depends(deps.get_db),
 ):
-    api_key, organization, _tenant_res = auth
+    api_key, organization, tenant_res = auth
     record = await ConnectSessionService.get(db, session_id=session_id, organization_id=organization.id)
     if record is None or record.api_key_id != api_key.id:
         raise HTTPException(status_code=404, detail="Session not found")
+    await VoiceDataAuditService.log_tenant_access(
+        db,
+        tenant_res,
+        actor_type="api_key",
+        actor_id=str(api_key.id),
+        access_type="read",
+        resource_type="transcript",
+        resource_id=str(record.id),
+        call_id=f"connect:{record.id}",
+        reason="connect_session_get",
+        request=request,
+    )
     return _serialize_session(record)
 
 
@@ -210,6 +223,19 @@ async def post_text_message(
             "llm_input_tokens": float(user_tokens),
             "llm_output_tokens": float(assistant_tokens),
         },
+    )
+    await VoiceDataAuditService.log_tenant_access(
+        db,
+        tenant_res,
+        actor_type="api_key",
+        actor_id=str(api_key.id),
+        access_type="write",
+        resource_type="transcript",
+        resource_id=str(record.id),
+        call_id=f"connect:{record.id}",
+        reason="connect_text_message",
+        request=request,
+        metadata={"user_message_ts": user_entry.get("ts"), "assistant_message_ts": assistant_entry.get("ts")},
     )
 
     await db.refresh(record)
@@ -323,6 +349,18 @@ async def stream_session(websocket: WebSocket, session_id: uuid.UUID):
                 # concurrency slot regardless of how the WS ended.
                 await ConnectSessionService.end(
                     db, record, status="completed", reason="stream_closed"
+                )
+                await VoiceDataAuditService.log_tenant_access(
+                    db,
+                    tenant_res,
+                    actor_type="api_key",
+                    actor_id=str(api_key.id),
+                    access_type="write",
+                    resource_type="transcript",
+                    resource_id=str(record.id),
+                    call_id=f"connect:{record.id}",
+                    reason="connect_voice_stream",
+                    metadata={"status": "completed"},
                 )
             except Exception:
                 logger.exception("connect session cleanup on stream close failed")

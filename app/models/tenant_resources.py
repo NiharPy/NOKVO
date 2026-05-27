@@ -1,6 +1,7 @@
 from sqlalchemy import Column, String, DateTime, ForeignKey, Boolean, Integer, Numeric
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from app.db.session import Base
+from sqlalchemy.orm import validates
 from sqlalchemy.sql import func
 import uuid
 
@@ -39,3 +40,9 @@ class TenantResources(Base):
     
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    @validates("provider_status")
+    def _validate_provider_status(self, _key, value):
+        from app.services.provider_status_schema import sanitize_provider_status
+
+        return sanitize_provider_status(value)

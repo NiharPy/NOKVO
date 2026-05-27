@@ -1,6 +1,6 @@
 """Per-tenant runtime bundle cache.
 
-Every voice turn previously rebuilt several values that are tenant-stable
+Every voice turn previously rebuilt several values that are account-stable
 within a short window:
 
   * the :class:`Organization` row (industry, name)
@@ -12,8 +12,9 @@ within a short window:
 The hot path was paying a DB round trip + several dictionary copies per
 turn even when nothing about the tenant had changed for hours. The
 :class:`RuntimeBundle` keeps a process-local view of those values keyed by
-``tenant_id``, refreshed only when the tenant's ``agent_policy_version``,
-single-prompt updated_at, or overrides marker changes.
+``tenant_id`` + ``organization_id``, refreshed only when the tenant's
+``agent_policy_version``, single-prompt updated_at, or overrides marker
+changes.
 
 This is intentionally NOT a Redis cache — these values are derived
 synchronously from ``tenant_res.provider_status`` (which is already in
@@ -81,11 +82,17 @@ _cache: dict[str, tuple[float, RuntimeBundle]] = {}
 _locks: dict[str, asyncio.Lock] = {}
 
 
-def _lock_for(tenant_id: str) -> asyncio.Lock:
-    lock = _locks.get(tenant_id)
+def _cache_key(tenant_res: TenantResources) -> str:
+    tenant_id = str(tenant_res.tenant_id)
+    organization_id = str(getattr(tenant_res, "organization_id", None) or "none")
+    return f"{tenant_id}:org:{organization_id}"
+
+
+def _lock_for(cache_key: str) -> asyncio.Lock:
+    lock = _locks.get(cache_key)
     if lock is None:
         lock = asyncio.Lock()
-        _locks[tenant_id] = lock
+        _locks[cache_key] = lock
     return lock
 
 
@@ -109,11 +116,17 @@ def _version_key(tenant_res: TenantResources) -> str:
         overrides_marker = hashlib.sha256(
             repr(sorted(overrides.items())).encode("utf-8")
         ).hexdigest()[:12]
+    custom_tabs = provider_status.get("business_template_custom_tabs") or []
+    custom_tabs_marker = ""
+    if isinstance(custom_tabs, list) and custom_tabs:
+        custom_tabs_marker = hashlib.sha256(
+            repr(custom_tabs).encode("utf-8")
+        ).hexdigest()[:12]
     cards = provider_status.get(AGENT_POLICY_CARDS_KEY) or []
     cards_marker = ""
     if isinstance(cards, list) and cards:
         cards_marker = str(len(cards))
-    return f"{policy_version}:{sp_marker}:{overrides_marker}:{cards_marker}"
+    return f"{policy_version}:{sp_marker}:{overrides_marker}:{custom_tabs_marker}:{cards_marker}"
 
 
 def _active_policy_cards(provider_status: dict[str, Any]) -> list[dict[str, Any]]:
@@ -226,15 +239,16 @@ async def get_bundle(
     """Return the cached :class:`RuntimeBundle` for ``tenant_res``, rebuilding
     only when the version key changed or the TTL elapsed.
 
-    Safe to call concurrently — duplicate rebuilds for the same tenant are
-    coalesced behind a per-tenant lock so a burst of simultaneous calls
+    Safe to call concurrently — duplicate rebuilds for the same organization
+    are coalesced behind an org-scoped lock so a burst of simultaneous calls
     triggers exactly one DB read.
     """
     tenant_id = str(tenant_res.tenant_id)
+    cache_key = _cache_key(tenant_res)
     expected_version = _version_key(tenant_res)
     now = time.monotonic()
 
-    cached = _cache.get(tenant_id)
+    cached = _cache.get(cache_key)
     if cached is not None:
         expires_at, bundle = cached
         if expires_at > now and bundle.version_key == expected_version and _bundle_is_usable(bundle):
@@ -243,13 +257,13 @@ async def get_bundle(
         # no longer safe to read (its loading session was closed in a
         # way that prevents scalar access). Drop it and fall through to
         # the rebuild path.
-        _cache.pop(tenant_id, None)
+        _cache.pop(cache_key, None)
 
-    lock = _lock_for(tenant_id)
+    lock = _lock_for(cache_key)
     async with lock:
         # Re-check after acquiring the lock — another caller may have
         # already rebuilt while we were waiting.
-        cached = _cache.get(tenant_id)
+        cached = _cache.get(cache_key)
         now = time.monotonic()
         if cached is not None:
             expires_at, bundle = cached
@@ -291,7 +305,7 @@ async def get_bundle(
             single_prompt_enabled=bool(guidance),
             version_key=expected_version,
         )
-        _cache[tenant_id] = (now + _BUNDLE_TTL_SECONDS, bundle)
+        _cache[cache_key] = (now + _BUNDLE_TTL_SECONDS, bundle)
         _evict_stale(now)
         return bundle
 
@@ -300,8 +314,15 @@ def invalidate(tenant_id: str) -> None:
     """Force the next ``get_bundle`` call to rebuild. Used after a write
     path mutates ``provider_status`` so the new state is picked up
     immediately rather than waiting on the TTL."""
-    _cache.pop(str(tenant_id), None)
+    prefix = f"{tenant_id}:"
+    for key in list(_cache):
+        if key == str(tenant_id) or key.startswith(prefix):
+            _cache.pop(key, None)
+    for key in list(_locks):
+        if key == str(tenant_id) or key.startswith(prefix):
+            _locks.pop(key, None)
 
 
 def invalidate_all() -> None:
     _cache.clear()
+    _locks.clear()

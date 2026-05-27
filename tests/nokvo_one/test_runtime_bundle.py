@@ -146,6 +146,27 @@ def test_get_bundle_returns_same_instance_on_hit():
     assert first is second
 
 
+def test_get_bundle_cache_is_scoped_by_organization_id():
+    """One tenant can own multiple Nokvo One organizations. Cached industry
+    data must not bleed from a clinic account into a real-estate account."""
+    tenant_id = str(uuid.uuid4())
+    clinic = _fake_organization(industry="clinics", name="Eye Clinic")
+    estate = _fake_organization(industry="real_estate", name="Raghava Estates")
+    clinic_tenant = _fake_tenant()
+    clinic_tenant.tenant_id = tenant_id
+    clinic_tenant.organization_id = clinic.id
+    estate_tenant = _fake_tenant()
+    estate_tenant.tenant_id = tenant_id
+    estate_tenant.organization_id = estate.id
+
+    first = _run(get_bundle(_FakeSession(clinic), clinic_tenant))
+    second = _run(get_bundle(_FakeSession(estate), estate_tenant))
+
+    assert first is not second
+    assert first.organization_industry == "clinics"
+    assert second.organization_industry == "real_estate"
+
+
 def test_version_key_changes_invalidate_cache():
     organization = _fake_organization()
     session = _FakeSession(organization)
@@ -190,7 +211,8 @@ def test_get_bundle_rebuilds_when_cached_instance_unreadable(monkeypatch):
     # Sabotage the cached bundle's Organization so attribute access
     # raises. We swap the cache entry's organization with a magic mock
     # whose `id` access raises — mirroring the real ORM-detach failure.
-    cached = bundle_module._cache[tenant.tenant_id][1]
+    cache_key = bundle_module._cache_key(tenant)
+    cached = bundle_module._cache[cache_key][1]
     broken_org = MagicMock()
     type(broken_org).id = property(lambda self: (_ for _ in ()).throw(
         RuntimeError("greenlet_spawn has not been called; can't call await_only() here")
@@ -208,8 +230,8 @@ def test_get_bundle_rebuilds_when_cached_instance_unreadable(monkeypatch):
         single_prompt_enabled=cached.single_prompt_enabled,
         version_key=cached.version_key,
     )
-    expires_at, _ = bundle_module._cache[tenant.tenant_id]
-    bundle_module._cache[tenant.tenant_id] = (expires_at, new_bundle)
+    expires_at, _ = bundle_module._cache[cache_key]
+    bundle_module._cache[cache_key] = (expires_at, new_bundle)
     assert _bundle_is_usable(new_bundle) is False
 
     # The next get_bundle call should self-heal and return a fresh

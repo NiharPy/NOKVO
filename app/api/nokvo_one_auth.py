@@ -63,6 +63,7 @@ from app.services.nokvo_one_provisioning_service import (
     NokvoOneProvisioningError,
     NokvoOneProvisioningService,
 )
+from app.services.agent_runtime_bundle import invalidate as invalidate_runtime_bundle
 from app.services.nokvo_one_business_templates import (
     apply_schema_overrides,
     business_type_config,
@@ -98,19 +99,20 @@ def _hash_token(raw: str) -> str:
 
 def _issue_setup_token(user_id: uuid.UUID, organization_id: uuid.UUID, stage: str, ttl_minutes: int = 30) -> str:
     """Short-lived JWT used to gate signup-stage flows (email-verified → TOTP setup)."""
-    payload = {
-        "sub": str(user_id),
-        "organization_id": str(organization_id),
-        "stage": stage,
-        "principal_type": "nokvo_one_signup",
-        "exp": datetime.now(timezone.utc) + timedelta(minutes=ttl_minutes),
-    }
-    return jwt.encode(payload, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+    return security.create_setup_token(
+        {
+            "sub": str(user_id),
+            "organization_id": str(organization_id),
+            "stage": stage,
+            "principal_type": "nokvo_one_signup",
+        },
+        expires_delta=timedelta(minutes=ttl_minutes),
+    )
 
 
 def _decode_setup_token(token: str, expected_stage: str) -> dict:
     try:
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        payload = security.decode_setup_token(token)
     except jwt.PyJWTError as exc:
         raise HTTPException(status_code=401, detail="Invalid or expired setup token") from exc
     if payload.get("principal_type") != "nokvo_one_signup":
@@ -125,6 +127,7 @@ def _issue_login_temp_token(user: OrganizationUser, organization_id: uuid.UUID) 
         subject=user.id,
         mfa_completed=False,
         expires_delta=timedelta(minutes=5),
+        token_tier=security.JWT_TIER_ORGANIZATION,
         extra_claims={
             "principal_type": "organization_user",
             "organization_id": str(organization_id),
@@ -198,6 +201,7 @@ async def _issue_full_session(
         subject=user.id,
         mfa_completed=mfa_completed,
         session_id=str(session.id),
+        token_tier=security.JWT_TIER_ORGANIZATION,
         extra_claims={
             "principal_type": "organization_user",
             "organization_id": str(organization.id),
@@ -778,7 +782,7 @@ async def nokvo_one_login_totp_verify(
     token: str = Depends(deps.oauth2_scheme),
 ):
     try:
-        claims = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        claims = security.decode_access_token(token, expected_tiers=[security.JWT_TIER_ORGANIZATION])
     except jwt.PyJWTError as exc:
         raise HTTPException(status_code=401, detail="Invalid or expired login token") from exc
     if not claims.get("nokvo_one_login") or claims.get("principal_type") != "organization_user":
@@ -913,6 +917,8 @@ async def nokvo_one_config():
         "google_client_id": settings.GOOGLE_OAUTH_CLIENT_ID,
         "google_login_enabled": bool(settings.GOOGLE_OAUTH_CLIENT_ID),
         "onboarding_v2_enabled": bool(settings.NOKVO_ONBOARDING_V2),
+        "nokvo_connect_enabled": bool(settings.NOKVO_CONNECT_ENABLED),
+        "kb_document_upload_enabled": bool(settings.NOKVO_KB_DOCUMENT_UPLOAD_ENABLED),
         "call_center_ambience": {
             "enabled": bool(settings.NOKVO_CALL_CENTER_AMBIENCE_ENABLED) and bool(ambience_urls),
             "volume": float(settings.NOKVO_CALL_CENTER_AMBIENCE_VOLUME),
@@ -1089,7 +1095,7 @@ async def nokvo_one_google_login(
 async def nokvo_one_refresh(
     request: Request, payload: RefreshRequest, db: AsyncSession = Depends(deps.get_db)
 ):
-    token_hash = hashlib.sha256(payload.refresh_token.encode()).hexdigest()
+    token_hash = security.hash_refresh_token(payload.refresh_token)
     session_res = await db.execute(
         select(OrganizationSession).where(
             OrganizationSession.refresh_token_hash == token_hash,
@@ -1130,6 +1136,7 @@ async def nokvo_one_refresh(
         subject=user.id,
         mfa_completed=False,
         session_id=str(new_session.id),
+        token_tier=security.JWT_TIER_ORGANIZATION,
         extra_claims={
             "principal_type": "organization_user",
             "organization_id": str(organization.id),
@@ -1232,6 +1239,7 @@ async def nokvo_one_save_business_template(
         db.add(tenant_res)
         await db.commit()
         await db.refresh(tenant_res)
+    invalidate_runtime_bundle(tenant_res.tenant_id)
     return NokvoOneBusinessTemplateSaveResponse(
         organization=_organization_response(organization),
         business_template=_resolved_business_template(organization, tenant_res),
@@ -1272,6 +1280,7 @@ async def nokvo_one_update_business_template_schema(
     db.add(tenant_res)
     await db.commit()
     await db.refresh(tenant_res)
+    invalidate_runtime_bundle(tenant_res.tenant_id)
 
     return _resolved_business_template(organization, tenant_res)
 
@@ -1352,6 +1361,7 @@ async def nokvo_one_create_custom_tab(
     db.add(tenant_res)
     await db.commit()
     await db.refresh(tenant_res)
+    invalidate_runtime_bundle(tenant_res.tenant_id)
 
     return [NokvoOneCustomTabResponse(**spec) for spec in custom_tabs_from_overrides(tenant_res.provider_status)]
 
@@ -1388,6 +1398,7 @@ async def nokvo_one_delete_custom_tab(
     db.add(tenant_res)
     await db.commit()
     await db.refresh(tenant_res)
+    invalidate_runtime_bundle(tenant_res.tenant_id)
 
     return [NokvoOneCustomTabResponse(**spec) for spec in custom_tabs_from_overrides(tenant_res.provider_status)]
 

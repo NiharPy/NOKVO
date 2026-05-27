@@ -299,6 +299,15 @@ class NokvoOneAssignmentService:
             await NokvoOneAssignmentService._audit(db, result)
             return result
 
+        # Time-first selection: prefer the candidate whose slot is
+        # CLOSEST to what the caller asked for, regardless of which
+        # member it belongs to. So if Member A's 10am is booked and
+        # Member B's 10am is free, Member B (shift=0) wins over Member
+        # A (shift=60). active_load + hourly_count + daily_count are
+        # only used to break ties on equal shift_minutes — they never
+        # rescue a member with a worse time. created_at is the final
+        # deterministic tiebreaker so two equally-eligible members
+        # always resolve identically.
         selected = sorted(
             candidates,
             key=lambda item: (

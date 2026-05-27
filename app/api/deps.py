@@ -13,7 +13,7 @@ from app.models.organization_user import OrganizationUser
 from app.models.user import SuperAdminUser
 from app.models.session import SuperAdminSession
 from app.models.tenant_resources import TenantResources
-from app.core.config import settings
+from app.core import security
 import jwt
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
@@ -24,7 +24,7 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
 async def get_current_session_id(token: str = Depends(oauth2_scheme)) -> Optional[str]:
     try:
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        payload = security.decode_access_token(token, expected_tiers=[security.JWT_TIER_SUPERADMIN])
     except jwt.PyJWTError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -33,9 +33,9 @@ async def get_current_session_id(token: str = Depends(oauth2_scheme)) -> Optiona
         )
     return payload.get("sid")
 
-async def _decode_token(token: str) -> dict:
+async def _decode_token(token: str, *, expected_tiers: list[str] | None = None) -> dict:
     try:
-        return jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        return security.decode_access_token(token, expected_tiers=expected_tiers)
     except jwt.PyJWTError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -53,7 +53,7 @@ async def get_current_user(
         detail="Could not validate credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
-    payload = await _decode_token(token)
+    payload = await _decode_token(token, expected_tiers=[security.JWT_TIER_SUPERADMIN])
     user_id: str = payload.get("sub")
     session_id: str = payload.get("sid")
     principal_type: str | None = payload.get("principal_type")
@@ -103,7 +103,7 @@ async def get_current_user_require_mfa_setup(
 
 async def get_current_org_session_id(token: str = Depends(oauth2_scheme)) -> Optional[str]:
     try:
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        payload = security.decode_access_token(token, expected_tiers=[security.JWT_TIER_ORGANIZATION])
     except jwt.PyJWTError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -127,7 +127,7 @@ async def get_current_organization_user(
         detail="Could not validate organization credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
-    payload = await _decode_token(token)
+    payload = await _decode_token(token, expected_tiers=[security.JWT_TIER_ORGANIZATION])
     user_id: str = payload.get("sub")
     organization_id: str = payload.get("organization_id")
     session_id: str = payload.get("sid")

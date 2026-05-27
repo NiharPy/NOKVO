@@ -15,6 +15,11 @@ class Settings(BaseSettings):
 
     # JWT
     SECRET_KEY: str
+    SUPERADMIN_JWT_SECRET_KEY: str = ""
+    ORGANIZATION_JWT_SECRET_KEY: str = ""
+    NOKVO_ONE_SETUP_JWT_SECRET_KEY: str = ""
+    OAUTH_STATE_SECRET_KEY: str = ""
+    JWT_LEGACY_SECRET_FALLBACK: bool = True
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
     REFRESH_TOKEN_EXPIRE_HOURS: int = 4
@@ -42,6 +47,23 @@ class Settings(BaseSettings):
     # `python -m app.scripts.download_ambience_audio`).
     NOKVO_CALL_CENTER_AMBIENCE_ENABLED: bool = True
     NOKVO_CALL_CENTER_AMBIENCE_VOLUME: float = 0.28  # 0.0 (silent) to 1.0 (full)
+
+    # Nokvo Connect — public API key infrastructure that lets customers embed
+    # the voice agent into their own apps. Default OFF: the surface (admin
+    # key-management routes, public session/voice routes, and the frontend
+    # nav button + landing pages) is hidden until an operator explicitly
+    # turns it on. Flip to ``true`` in .env when the feature is ready for a
+    # given deployment.
+    NOKVO_CONNECT_ENABLED: bool = False
+
+    # Knowledge-base document uploads. The Upload Document card on the
+    # Knowledge Base page is admin-only, but in most deployments we don't
+    # want admins to be able to add raw documents (the answer surface is
+    # better served by the onboarding-time sample upload + sources we
+    # manage centrally). Default OFF: the card is hidden until an operator
+    # flips this flag in .env. The backend upload endpoint stays available
+    # regardless — gating is presentational only.
+    NOKVO_KB_DOCUMENT_UPLOAD_ENABLED: bool = False
 
     # SMTP (optional — when unset, emails are logged only)
     SMTP_HOST: str = ""
@@ -215,6 +237,11 @@ class Settings(BaseSettings):
     AGENT_LLM_STREAM_TOTAL_MS: int = 6000 # Max total LLM stream wait
     AGENT_TOPIC_CONTINUITY_OVERLAP: float = 0.35  # Word overlap to reuse last chunks
     AGENT_MAX_FIRST_SENTENCE_CHARS: int = 110     # Force TTS dispatch after this many chars
+    VOICE_EOU_DEBOUNCE_MS: int = 900      # Silence before firing a streaming-STT turn
+    VOICE_EOU_CONTINUATION_BONUS_MS: int = 1100  # Extra wait when speech likely continues
+    VOICE_FIRST_SENTENCE_TIMEOUT_MS: int = 900  # Speak a short hold if LLM has not yielded
+    VOICE_LLM_STREAM_RETRY_ATTEMPTS: int = 2
+    VOICE_LLM_STREAM_MAX_RETRY_WAIT_MS: int = 350
 
     # Billing and Usage Tracking
     ORGANIZATION_BASE_MONTHLY_COST_USD: float = 5.00
@@ -238,6 +265,16 @@ class Settings(BaseSettings):
     QDRANT_API_KEY: str = ""
     QDRANT_COLLECTION_PREFIX: str = "tenant"
     QDRANT_VECTOR_SIZE: int = 1536
+    QDRANT_MAX_POINTS_PER_TENANT: int = 100000
+    QDRANT_MAX_UPSERT_POINTS: int = 2000
+
+    # MCP / generated database tools
+    MCP_SQL_MAX_ROWS: int = 100
+    MCP_SQL_STATEMENT_TIMEOUT_MS: int = 10000
+
+    # Privacy audit logging for voice/transcript data. Kept fail-open by default
+    # so older databases without the audit table do not break live calls.
+    VOICE_DATA_AUDIT_ENFORCED: bool = False
     
     OPENAI_API_KEY: str = ""
     OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-small"

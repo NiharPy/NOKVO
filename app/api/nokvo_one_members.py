@@ -44,7 +44,6 @@ from app.services.email_service import EmailService
 from app.services.nokvo_one_assignment_service import NokvoOneAssignmentService
 from app.services.nokvo_one_business_templates import allowed_consultation_types, allowed_request_types
 
-import jwt
 import pyotp
 
 
@@ -64,14 +63,15 @@ def _hash_token(raw: str) -> str:
 
 
 def _issue_invite_setup_token(user_id: uuid.UUID, organization_id: uuid.UUID) -> str:
-    payload = {
-        "sub": str(user_id),
-        "organization_id": str(organization_id),
-        "stage": "totp_setup",
-        "principal_type": "nokvo_one_signup",
-        "exp": datetime.now(timezone.utc) + timedelta(minutes=30),
-    }
-    return jwt.encode(payload, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+    return security.create_setup_token(
+        {
+            "sub": str(user_id),
+            "organization_id": str(organization_id),
+            "stage": "totp_setup",
+            "principal_type": "nokvo_one_signup",
+        },
+        expires_delta=timedelta(minutes=30),
+    )
 
 
 async def _get_organization(db: AsyncSession, organization_id: uuid.UUID) -> Organization:
@@ -278,6 +278,71 @@ async def get_my_timetable(
         assignment=_assignment_response(settings, active_count),
         blocked_slots=blocked,
     )
+
+
+@router.get("/me/assigned-records")
+async def list_my_assigned_records(
+    record_type: str | None = None,
+    limit: int = 200,
+    user: OrganizationUser = Depends(
+        deps.RequireNokvoOneOrganization(allowed_statuses=["pending_approval", "active"])
+    ),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Records assigned to the calling member (site visits, leads, tickets).
+
+    Mirrors the shape the admin sees via ``/agents/records/tab/{slug}``
+    but scoped to ``data.assigned_member_id == user.id``. Members get
+    only their own work — there's no admin escape hatch and no way to
+    pass another member's id, which is why this lives under ``/me/``.
+
+    ``record_type`` filters to a single bucket (``appointment``,
+    ``lead``, ``ticket``). Omitted = all three.
+    """
+    from app.models.nokvo_one_tool_record import NokvoOneToolRecord
+
+    allowed_types = {"appointment", "lead", "ticket"}
+    requested_type = (record_type or "").strip().lower() or None
+    if requested_type is not None and requested_type not in allowed_types:
+        raise HTTPException(status_code=400, detail="Unsupported record_type")
+    max_limit = min(max(int(limit or 200), 1), 500)
+
+    stmt = (
+        select(NokvoOneToolRecord)
+        .where(NokvoOneToolRecord.organization_id == user.organization_id)
+        .order_by(NokvoOneToolRecord.created_at.desc())
+        .limit(max_limit)
+    )
+    if requested_type is not None:
+        stmt = stmt.where(NokvoOneToolRecord.record_type == requested_type)
+    res = await db.execute(stmt)
+    records = list(res.scalars().all())
+
+    member_key = str(user.id)
+    out: list[dict] = []
+    for r in records:
+        data = r.data or {}
+        # Two assignment-encoding shapes coexist: the modern engine writes
+        # ``assigned_member_id`` (string UUID); older free-text records
+        # carry name/email under ``assigned_to`` / ``owner``. We only
+        # match on the structured id to avoid leaking sibling work via
+        # name collisions.
+        assigned_id = str(data.get("assigned_member_id") or "")
+        if assigned_id != member_key:
+            continue
+        out.append(
+            {
+                "id": str(r.id),
+                "record_type": r.record_type,
+                "status": r.status,
+                "data": data,
+                "contact_phone": r.contact_phone,
+                "contact_email": r.contact_email,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+                "updated_at": r.updated_at.isoformat() if r.updated_at else None,
+            }
+        )
+    return out
 
 
 @router.post(
