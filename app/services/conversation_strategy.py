@@ -1,0 +1,429 @@
+"""Conversation strategy — turns structured memory into tactics.
+
+Why this module exists
+----------------------
+:mod:`conversational_memory` answers *"what do I already know about this
+caller?"* It is a deterministic state container: facts, objections,
+commitments, salient notes. What it deliberately does **not** do is decide
+*what the agent should do about that state*. So the inbound agent ended up
+purely reactive — it filled the next slot and answered the last thing said,
+with no lead prioritisation, no objection playbook, no sense of a buying-
+journey arc, and no recovery when a call went sideways.
+
+This module is that missing strategic layer. It is pure and synchronous —
+no I/O, no LLM call — operating only on a :class:`ConversationalMemory`
+snapshot, so it costs nothing per turn beyond a few regex scans. Its single
+public output, :func:`compose_strategy_block`, is an English directive block
+injected into the system prompt right after the "already known" memory block.
+The reply LLM (which runs every turn anyway) is the brain that executes these
+tactics; we just give it explicit marching orders derived from the state.
+
+What it produces (gated by signal, capped in size):
+  * recovery directives when the caller is frustrated or feels re-asked
+    (universal — fires for any business type);
+  * a per-code objection playbook (price, competitor, timing, …);
+  * a lead tier + posture + the current journey stage and the goal for this
+    turn;
+  * permission to estimate affordability from a stated income;
+  * a one-line continuity reference for a returning caller.
+
+The sales layer (everything but recovery) is gated on real-estate / outbound
+sales contexts. ``business_type`` may be ``None`` before an admin selects an
+industry — the function must never raise on that and emits only the universal
+recovery parts (or an empty string).
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+
+from app.services.conversational_memory import (
+    FACT_BHK,
+    FACT_BUDGET,
+    FACT_INCOME,
+    FACT_LOCATION,
+    FACT_PURPOSE,
+    FACT_TIMELINE,
+    FACT_VISIT_DATE,
+    ConversationalMemory,
+)
+
+
+# Hard ceiling on the rendered block so it can't balloon the ~3KB system
+# prompt and hurt time-to-first-token. ~300 tokens ≈ 1,800 characters.
+_MAX_CHARS = 1800
+
+
+def _is_sales(business_type: str | None, is_outbound: bool) -> bool:
+    return bool(is_outbound) or str(business_type or "").strip().lower() == "real_estate"
+
+
+def _current_codes(bucket: list[dict], *, key: str = "code") -> list[str]:
+    """Codes from a bucket raised on THIS call (skip restored prior-call
+    entries), de-duped, most-recent last."""
+    out: list[str] = []
+    for entry in bucket or []:
+        if not isinstance(entry, dict) or entry.get("from_prior_call"):
+            continue
+        code = str(entry.get(key) or "")
+        if code and code not in out:
+            out.append(code)
+    return out
+
+
+def _corpus(memory: ConversationalMemory) -> str:
+    """All free text the caller produced this call (fact raws + bucket /
+    salient texts), lower-cased, for cue scans like pre-approval."""
+    parts: list[str] = []
+    for fact in memory.facts.values():
+        if fact.raw and fact.source_turn != -1:
+            parts.append(str(fact.raw))
+    for bucket in (memory.objections, memory.commitments):
+        for entry in bucket:
+            if not entry.get("from_prior_call") and entry.get("text"):
+                parts.append(str(entry.get("text")))
+    for note in memory.salient_notes:
+        if not note.get("from_prior_call") and note.get("text"):
+            parts.append(str(note.get("text")))
+    return " ".join(parts).lower()
+
+
+_PREAPPROVAL_RE = re.compile(
+    r"\b(pre[\s-]?approv|loan (?:approv|sanction|ready)|sanction(?:ed|\s+letter)|"
+    r"home loan (?:approved|ready|sorted)|funds? ready|ready to pay|cash purchase)\b",
+    re.IGNORECASE,
+)
+_IMMEDIATE_TIMELINE_RE = re.compile(
+    r"\b(immediate|right away|asap|as soon|this week|this month|abhi|turant|"
+    r"ippud|ventane)\b",
+    re.IGNORECASE,
+)
+
+
+def _has_preapproval(memory: ConversationalMemory) -> bool:
+    return bool(_PREAPPROVAL_RE.search(_corpus(memory)))
+
+
+def _timeline_is_immediate(memory: ConversationalMemory) -> bool:
+    value = str(memory.get(FACT_TIMELINE) or "")
+    return bool(value and _IMMEDIATE_TIMELINE_RE.search(value))
+
+
+def _emotional_distress(memory: ConversationalMemory) -> bool:
+    for note in memory.salient_notes:
+        if not note.get("from_prior_call") and str(note.get("code") or "") == "emotional_flag":
+            return True
+    return False
+
+
+_SIGNAL_FACTS = (
+    FACT_BUDGET, FACT_BHK, FACT_LOCATION, FACT_INCOME, FACT_PURPOSE,
+    FACT_TIMELINE, FACT_VISIT_DATE,
+)
+
+
+def _has_sales_signal(memory: ConversationalMemory) -> bool:
+    """True when there's something for the sales layer to react to. A cold-open
+    turn with nothing known yields no strategy block (keeps TTFT cheap)."""
+    if _current_codes(memory.objections) or _current_codes(memory.commitments):
+        return True
+    if memory.prior_stage:
+        return True
+    return any(memory.has(k) for k in _SIGNAL_FACTS)
+
+
+# ── Objection playbook ───────────────────────────────────────────────────────
+#
+# One concrete handling instruction per objection code emitted by
+# ``_OBJECTION_PATTERNS`` in conversational_memory. Real-estate / sales framing.
+# These are the "what a trainer would tell a rep" lines the agent never had.
+
+OBJECTION_PLAYBOOK: dict[str, str] = {
+    "price_concern": (
+        "PRICE objection: do NOT just restate the number or get defensive. Acknowledge it, then "
+        "reframe on value and affordability — payment plans, EMI/month, what's included, "
+        "appreciation in the area. Ask what range they had in mind so you can match a unit, and "
+        "offer a site visit to anchor value against the price."
+    ),
+    "competitor": (
+        "COMPETITOR / already-looking: don't bad-mouth anyone. Ask what they liked about the "
+        "other option, then differentiate on a concrete edge in the inventory (location, "
+        "possession date, amenities, RERA/legal clarity). Offer a no-pressure comparison visit."
+    ),
+    "call_later": (
+        "TIMING brush-off ('busy', 'call later'): respect it. Don't pitch. Confirm one good time "
+        "to reconnect and one channel (call / WhatsApp), capture it, and close warmly in a sentence."
+    ),
+    "long_horizon": (
+        "LONG-HORIZON buyer (months away): switch from closing to nurturing. Don't push a visit. "
+        "Offer to send options / price trends and stay in touch; capture preferred channel and a "
+        "rough timeline so a follow-up lands at the right moment."
+    ),
+    "do_not_call": (
+        "DO-NOT-CALL / not interested: stop selling immediately. Acknowledge, confirm you'll note "
+        "the preference, and end the call politely. Do not ask further qualification questions."
+    ),
+}
+
+
+# ── Lead scoring ─────────────────────────────────────────────────────────────
+
+
+@dataclass
+class LeadAssessment:
+    """Qualitative lead read derived from current-call signals."""
+
+    tier: str  # hot | warm | cold | at_risk
+    reasons: list[str] = field(default_factory=list)
+    posture: str = ""
+
+
+_POSTURE = {
+    "hot": (
+        "HOT lead — high intent. Move to close: propose a specific site-visit slot or the booking "
+        "step now. Be confident and concrete; don't re-open discovery you've already covered."
+    ),
+    "warm": (
+        "WARM lead — real interest, not yet committed. Advance one step: fill the most important "
+        "missing qualifier (budget, BHK, or location), then offer a clear next action."
+    ),
+    "cold": (
+        "COLD / exploratory lead — low urgency. Keep it light and low-pressure. Be helpful, "
+        "capture how to follow up, and don't push for a visit."
+    ),
+    "at_risk": (
+        "AT-RISK — the call is going badly. Repair the relationship before anything else: "
+        "apologise once, slow down, and don't push the agenda this turn."
+    ),
+}
+
+
+def score_lead(
+    memory: ConversationalMemory,
+    *,
+    business_type: str | None = None,
+) -> LeadAssessment:
+    """Deterministic lead read from signals already in ``memory``. No I/O."""
+    objections = _current_codes(memory.objections)
+    commitments = _current_codes(memory.commitments)
+    has_triad = sum(memory.has(k) for k in (FACT_BUDGET, FACT_BHK, FACT_LOCATION))
+    visit = memory.has(FACT_VISIT_DATE)
+    preapproved = _has_preapproval(memory)
+    immediate = _timeline_is_immediate(memory)
+
+    # 1. Explicit opt-out wins outright.
+    if "do_not_call" in objections:
+        return LeadAssessment("cold", ["caller asked not to be pursued"], _POSTURE["cold"])
+
+    # 2. Relationship in danger.
+    if "repetition_complaint" in objections or _emotional_distress(memory):
+        reasons = []
+        if "repetition_complaint" in objections:
+            reasons.append("caller feels re-asked")
+        if _emotional_distress(memory):
+            reasons.append("caller is frustrated")
+        return LeadAssessment("at_risk", reasons, _POSTURE["at_risk"])
+
+    # 3. Hot signals.
+    hot_reasons: list[str] = []
+    if "ready_to_book" in commitments:
+        hot_reasons.append("ready to book")
+    if visit:
+        hot_reasons.append("visit date discussed")
+    if preapproved:
+        hot_reasons.append("financing ready / pre-approved")
+    if immediate and has_triad >= 2:
+        hot_reasons.append("immediate timeline with clear requirements")
+    if hot_reasons:
+        return LeadAssessment("hot", hot_reasons, _POSTURE["hot"])
+
+    # 4. Long-horizon explicitly cools an otherwise-warm lead.
+    if "long_horizon" in objections and has_triad < 2:
+        return LeadAssessment("cold", ["buying months out"], _POSTURE["cold"])
+
+    # 5. Warm: any qualification or soft commitment.
+    warm_reasons: list[str] = []
+    if has_triad:
+        warm_reasons.append("shared requirements")
+    if memory.has(FACT_INCOME):
+        warm_reasons.append("shared income")
+    if any(c in commitments for c in ("interested", "info_requested", "callback_requested")):
+        warm_reasons.append("expressed interest")
+    if warm_reasons:
+        return LeadAssessment("warm", warm_reasons, _POSTURE["warm"])
+
+    # 6. Nothing actionable yet.
+    return LeadAssessment("cold", ["not yet qualified"], _POSTURE["cold"])
+
+
+# ── Buying-journey stage ─────────────────────────────────────────────────────
+
+_STAGE_GOAL = {
+    "booked": "Confirm the booking/visit details and what happens next.",
+    "closing": "Lock the next concrete step — a specific visit slot or the booking.",
+    "objection_handling": "Resolve the live concern before advancing.",
+    "qualification": "Fill the most important missing qualifier, then advance.",
+    "discovery": "Understand what they're looking for — purpose, BHK, location, budget.",
+}
+
+
+def journey_stage(
+    memory: ConversationalMemory,
+    *,
+    business_type: str | None = None,
+) -> str:
+    """Where the caller is in the buying journey, from facts + commitments +
+    objections. Independent of :func:`score_lead`. Public — also used by
+    cross-call persistence to remember where a caller left off."""
+    objections = _current_codes(memory.objections)
+    commitments = _current_codes(memory.commitments)
+    has_triad = sum(memory.has(k) for k in (FACT_BUDGET, FACT_BHK, FACT_LOCATION))
+
+    if memory.has(FACT_VISIT_DATE) and "ready_to_book" in commitments:
+        return "booked"
+    if "ready_to_book" in commitments or memory.has(FACT_VISIT_DATE):
+        return "closing"
+    if any(o in objections for o in ("price_concern", "competitor", "long_horizon")):
+        return "objection_handling"
+    if has_triad or memory.has(FACT_INCOME) or memory.has(FACT_PURPOSE):
+        return "qualification"
+    return "discovery"
+
+
+# ── Block assembly ───────────────────────────────────────────────────────────
+
+
+def _recovery_section(memory: ConversationalMemory) -> str | None:
+    """Universal — fires for any business type when the caller signals the
+    call is going wrong. Addresses 'you keep asking me the same thing'."""
+    objections = _current_codes(memory.objections)
+    repetition = "repetition_complaint" in objections
+    distressed = _emotional_distress(memory)
+    if not (repetition or distressed):
+        return None
+    bits = ["# RECOVER THE CALL — do this before anything else"]
+    if repetition:
+        bits.append(
+            "- The caller feels you're repeating yourself or re-asking what they already told you. "
+            "Apologise ONCE, do NOT ask again for anything listed in CONVERSATIONAL MEMORY, briefly "
+            "summarise what you already know, then ask only the single most important missing item — "
+            "or just move to the next step."
+        )
+    if distressed:
+        bits.append(
+            "- The caller is upset. Acknowledge the feeling in one short phrase, slow down, and "
+            "don't push your agenda this turn."
+        )
+    return "\n".join(bits)
+
+
+def _objection_section(memory: ConversationalMemory) -> str | None:
+    codes = [c for c in _current_codes(memory.objections) if c in OBJECTION_PLAYBOOK]
+    if not codes:
+        return None
+    # Most-recent objections first, cap at two so the block stays tight.
+    lines = ["# HANDLE THE ACTIVE OBJECTION(S)"]
+    for code in list(reversed(codes))[:2]:
+        lines.append("- " + OBJECTION_PLAYBOOK[code])
+    return "\n".join(lines)
+
+
+def _lead_section(lead: LeadAssessment, stage: str) -> str:
+    reason = "; ".join(lead.reasons) if lead.reasons else "—"
+    return (
+        "# LEAD STRATEGY\n"
+        f"- Lead read: {lead.tier.upper()} ({reason}).\n"
+        f"- {lead.posture}\n"
+        f"- Journey stage: {stage}. Goal this turn: {_STAGE_GOAL.get(stage, '')}"
+    )
+
+
+def _affordability_section(memory: ConversationalMemory) -> str | None:
+    """Issue #5: synthesise across turns. If income is known but budget isn't,
+    let the LLM give a ballpark of what they can afford — as an estimate,
+    deferring exact eligibility to the team (keeps the no-hallucination rule)."""
+    if not memory.has(FACT_INCOME) or memory.has(FACT_BUDGET):
+        return None
+    income = memory.get(FACT_INCOME)
+    return (
+        "# AFFORDABILITY\n"
+        f"- The caller's monthly income is ~{income}. If they ask what they can afford (or you "
+        "need a budget to suggest units), reason it out loud as a ROUGH ballpark — a common rule of "
+        "thumb is an EMI around 40% of monthly income, and total loan eligibility roughly 5-6× "
+        "annual income. Present it as an estimate, suggest a matching range, and offer to connect "
+        "them with a loan specialist for exact eligibility. Never state a precise sanction figure as fact."
+    )
+
+
+def _continuity_section(memory: ConversationalMemory) -> str | None:
+    """Issue #7: a returning caller. The narrative continuity note already
+    renders inside the memory block; here we give one tactical instruction."""
+    if not memory.prior_stage:
+        return None
+    return (
+        "# RETURNING CALLER\n"
+        f"- This caller spoke to us before and had reached the {memory.prior_stage.replace('_', ' ')} "
+        "stage. Reference that continuity naturally and pick up from there rather than restarting "
+        "discovery; confirm rather than assume any prior detail before acting on it."
+    )
+
+
+def compose_strategy_block(
+    memory: ConversationalMemory,
+    *,
+    business_type: str | None = None,
+    is_outbound: bool = False,
+    language: str | None = None,
+) -> str:
+    """Render the strategy directive block for this turn, or ``""`` when there
+    is no actionable signal. Safe for ``business_type=None`` (emits only the
+    universal recovery part, if any). Output is capped at :data:`_MAX_CHARS`."""
+    if memory is None:
+        return ""
+
+    # Priority order: a call in trouble is salvaged before we chase the sale.
+    sections: list[str] = []
+    recovery = _recovery_section(memory)
+    if recovery:
+        sections.append(recovery)
+
+    if _is_sales(business_type, is_outbound) and _has_sales_signal(memory):
+        objection = _objection_section(memory)
+        if objection:
+            sections.append(objection)
+        lead = score_lead(memory, business_type=business_type)
+        stage = journey_stage(memory, business_type=business_type)
+        sections.append(_lead_section(lead, stage))
+        affordability = _affordability_section(memory)
+        if affordability:
+            sections.append(affordability)
+        continuity = _continuity_section(memory)
+        if continuity:
+            sections.append(continuity)
+
+    if not sections:
+        return ""
+
+    header = (
+        "# CONVERSATION STRATEGY — how to play this turn\n"
+        "Use this together with what's already known above. It is tactical guidance, not a script; "
+        "it overrides lower-priority slot-filling when they conflict.\n"
+    )
+    out = header
+    for section in sections:
+        candidate = out + "\n" + section + "\n"
+        if len(candidate) > _MAX_CHARS:
+            break
+        out = candidate
+    # Header-only means no section fit — treat as nothing to say.
+    return out.rstrip() if out.strip() != header.strip() else ""
+
+
+__all__ = [
+    "LeadAssessment",
+    "OBJECTION_PLAYBOOK",
+    "compose_strategy_block",
+    "journey_stage",
+    "score_lead",
+]
