@@ -159,6 +159,23 @@ _CHECK_IN_CONTAINS = (
 _TTS_BATCH_MAX = 2
 
 
+async def _resolve_business_type(
+    db: AsyncSession | None,
+    tenant_res: TenantResources,
+) -> str | None:
+    """Return the org's business type (``organization.industry``) via the
+    cached runtime bundle. Best-effort — a failure returns ``None`` so the
+    memory layer falls back to its broad superset extractor."""
+    try:
+        from app.services.agent_runtime_bundle import get_bundle
+
+        bundle = await get_bundle(db, tenant_res)
+        return (bundle.organization_industry or "").strip().lower() or None
+    except Exception:
+        logger.debug("NOKVO-MEMORY: business_type resolve failed", exc_info=True)
+        return None
+
+
 async def _drain_turn(task: asyncio.Task | None) -> None:
     """Cancel ``task`` and wait for it to fully exit.
 
@@ -785,6 +802,11 @@ class NokvoOneVoiceStreamService:
         # already gave us mid-conversation.
         conv_memory = await load_memory(tenant_res, call_id)
         turn_index = len(await AgentSessionStore.get_history(tenant_res, call_id))
+        # Business type drives which domain slots the extractor mines and
+        # which the prompt block renders. Resolved from the cached runtime
+        # bundle so this is a near-free lookup; ``None`` falls back to the
+        # broad superset extractor.
+        business_type = await _resolve_business_type(db, tenant_res)
         # First turn? Bootstrap from cross-call caller memory if we
         # have a phone. Outbound campaigns carry it on
         # ``campaign_context.contact.phone``; inbound webhooks stash
@@ -802,7 +824,10 @@ class NokvoOneVoiceStreamService:
             if caller_phone:
                 try:
                     await bootstrap_caller_memory(
-                        tenant_res, phone=caller_phone, memory=conv_memory
+                        tenant_res,
+                        phone=caller_phone,
+                        memory=conv_memory,
+                        business_type=business_type,
                     )
                 except Exception:
                     logger.debug("NOKVO-MEMORY: bootstrap failed", exc_info=True)
@@ -812,6 +837,7 @@ class NokvoOneVoiceStreamService:
                 turn_index=turn_index,
                 language=language,
                 role="user",
+                business_type=business_type,
             )
         # Don't await the save yet — we'll fold in the agent's answer
         # extraction later in the same turn and commit once. Persist
@@ -956,6 +982,7 @@ class NokvoOneVoiceStreamService:
                 turn_index=turn_index + 1,
                 language=language,
                 role="assistant",
+                business_type=business_type,
             )
         await save_memory(tenant_res, call_id, conv_memory)
         outbound_state_patch: dict[str, Any] = {}
@@ -2222,8 +2249,12 @@ class NokvoOneVoiceStreamService:
                 if not promote_phone and isinstance(final_campaign_context, dict):
                     promote_phone = final_campaign_context.get("from_phone")
                 if promote_phone:
+                    promote_business_type = await _resolve_business_type(db, tenant_res)
                     await promote_to_caller_memory(
-                        tenant_res, phone=promote_phone, memory=final_memory
+                        tenant_res,
+                        phone=promote_phone,
+                        memory=final_memory,
+                        business_type=promote_business_type,
                     )
             except Exception:
                 logger.exception("NOKVO-MEMORY: promote_to_caller_memory failed at session end")

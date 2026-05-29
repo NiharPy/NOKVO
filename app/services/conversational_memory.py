@@ -33,23 +33,37 @@ Design contract
 - ``MemoryExtractor`` is the heuristic ladder. It is deliberately
   deterministic and conservative — no LLM call per turn. It handles
   English + Indian-language code-switched patterns (Hindi, Telugu,
-  Tamil) for the slots that matter most: name, phone, email,
-  bhk, budget, timeline, location, visit date/time, decisions,
-  objections, preferences.
+  Tamil). Extraction is **business-type aware**: a universal set
+  (name, phone, email, language, appointment date/time, timeline) runs
+  for everyone, and a per-domain set runs on top —
+
+    * real_estate → bhk, budget, location, purpose
+    * clinics     → symptoms, appointment type, doctor, age, gender,
+                    insurance, prior visit
+    * ecommerce   → order id, tracking, issue type, item, address,
+                    payment method
+    * hospitality → party size, check-in/out, room/table, occasion,
+                    dietary
+    * other / unknown → the full superset (we can't predict the domain)
+
+  Alongside slots it captures *salient notes* — free-form must-remember
+  statements (allergies, named family, deadlines, "please remember…")
+  that aren't single-valued slots, giving the agent strong recall of
+  the specifics of *this* conversation.
 - ``ConversationalMemory`` is the container. It exposes ``has``,
   ``get``, ``snapshot``, ``merge_text``, ``compose_prompt_block``,
-  ``known_slot_keys``, ``add_objection``, ``add_commitment``, and
-  serialisation helpers.
+  ``known_slot_keys``, ``mark_asked``, and serialisation helpers.
 
 Cross-call layer
 ----------------
-At call-start, :func:`bootstrap_caller_memory` reads the latest
-``outgoing_leads`` row (and any callable history) for the caller's
-phone and seeds the memory with high-confidence facts. At call-end,
-:func:`promote_to_caller_memory` writes the consolidated bag to a
-phone-keyed Redis blob so the next call for the same number opens
-warm. This is gated by phone availability — anonymous callers don't
-participate.
+At call-start, :func:`bootstrap_caller_memory` reads the per-(tenant,
+phone) Redis blob written by a prior call and seeds the memory with the
+durable facts + salient notes relevant to the current business type. At
+call-end, :func:`promote_to_caller_memory` writes the consolidated bag
+back so the next call for the same number opens warm. Both are gated by
+phone availability — anonymous callers don't participate — and the
+Redis key is namespaced per tenant so memory never leaks across
+tenants.
 
 Non-goals
 ---------
@@ -107,6 +121,32 @@ FACT_LANGUAGE_PREF = "language_preference"
 FACT_FAMILY_SIZE = "family_size"
 FACT_REQUESTED_INFO = "requested_info"
 
+# Clinics / healthcare
+FACT_SYMPTOMS = "symptoms"
+FACT_APPOINTMENT_TYPE = "appointment_type"  # consultation, follow-up, lab test
+FACT_DOCTOR_PREFERENCE = "doctor_preference"
+FACT_PATIENT_AGE = "patient_age"
+FACT_PATIENT_GENDER = "patient_gender"
+FACT_INSURANCE = "insurance"
+FACT_PRIOR_VISIT = "prior_visit"
+
+# E-commerce / support
+FACT_ORDER_ID = "order_id"
+FACT_ITEM = "item"
+FACT_ISSUE_TYPE = "issue_type"  # refund, exchange, delivery, defect, query
+FACT_SHIPPING_ADDRESS = "shipping_address"
+FACT_TRACKING_NUMBER = "tracking_number"
+FACT_PAYMENT_METHOD = "payment_method"
+
+# Hospitality (hotels / restaurants / events)
+FACT_PARTY_SIZE = "party_size"
+FACT_CHECK_IN = "check_in"
+FACT_CHECK_OUT = "check_out"
+FACT_ROOM_TYPE = "room_type"
+FACT_OCCASION = "occasion"
+FACT_DIETARY = "dietary"
+FACT_SEATING_PREFERENCE = "seating_preference"
+
 # Tracker-only buckets (lists, not single-valued slots)
 BUCKET_OBJECTIONS = "objections"
 BUCKET_COMMITMENTS = "commitments"
@@ -114,24 +154,51 @@ BUCKET_PREFERENCES = "preferences"
 BUCKET_ASKED = "asked_questions"  # which question keys the agent has already asked
 
 
-# Slot-key → human label used in the prompt preamble.
+# Slot-key → human label used in the prompt preamble. ``compose_prompt_block``
+# filters this map by business type so a clinic call doesn't see BHK lines and a
+# real-estate call doesn't see check-in date lines.
 SLOT_LABELS: dict[str, str] = {
+    # Universal
     FACT_NAME: "Name",
     FACT_PHONE: "Phone",
     FACT_EMAIL: "Email",
-    FACT_BHK: "BHK preference",
-    FACT_BUDGET: "Budget",
-    FACT_LOCATION: "Location",
-    FACT_PURPOSE: "Purpose",
-    FACT_TIMELINE: "Timeline",
-    FACT_PROPERTY: "Property",
-    FACT_VISIT_DATE: "Visit date",
-    FACT_VISIT_TIME: "Visit time",
-    FACT_URGENCY: "Urgency",
     FACT_COMPANY: "Company",
     FACT_LANGUAGE_PREF: "Language preference",
     FACT_FAMILY_SIZE: "Family size",
     FACT_REQUESTED_INFO: "Requested info",
+    FACT_URGENCY: "Urgency",
+    FACT_TIMELINE: "Timeline",
+    FACT_VISIT_DATE: "Visit / appointment date",
+    FACT_VISIT_TIME: "Visit / appointment time",
+    # Real estate
+    FACT_BHK: "BHK preference",
+    FACT_BUDGET: "Budget",
+    FACT_LOCATION: "Location",
+    FACT_PURPOSE: "Purpose",
+    FACT_PROPERTY: "Property",
+    # Clinics
+    FACT_SYMPTOMS: "Symptoms / reason",
+    FACT_APPOINTMENT_TYPE: "Appointment type",
+    FACT_DOCTOR_PREFERENCE: "Doctor preference",
+    FACT_PATIENT_AGE: "Patient age",
+    FACT_PATIENT_GENDER: "Patient gender",
+    FACT_INSURANCE: "Insurance",
+    FACT_PRIOR_VISIT: "Prior visit",
+    # E-commerce
+    FACT_ORDER_ID: "Order ID",
+    FACT_ITEM: "Item",
+    FACT_ISSUE_TYPE: "Issue type",
+    FACT_SHIPPING_ADDRESS: "Shipping address",
+    FACT_TRACKING_NUMBER: "Tracking number",
+    FACT_PAYMENT_METHOD: "Payment method",
+    # Hospitality
+    FACT_PARTY_SIZE: "Party size",
+    FACT_CHECK_IN: "Check-in date",
+    FACT_CHECK_OUT: "Check-out date",
+    FACT_ROOM_TYPE: "Room / table type",
+    FACT_OCCASION: "Occasion",
+    FACT_DIETARY: "Dietary",
+    FACT_SEATING_PREFERENCE: "Seating preference",
 }
 
 
@@ -141,13 +208,20 @@ SLOT_LABELS: dict[str, str] = {
 # slot of the same meaning. (Direction is fact→flow_slot; the reverse
 # is built from this at import time.)
 FLOW_SLOT_TO_FACT: dict[str, str] = {
+    # Universal identity
     "name": FACT_NAME,
     "customer_name": FACT_NAME,
+    "patient_name": FACT_NAME,
+    "guest_name": FACT_NAME,
     "full_name": FACT_NAME,
     "phone": FACT_PHONE,
     "mobile": FACT_PHONE,
     "contact_phone": FACT_PHONE,
+    "patient_phone": FACT_PHONE,
     "email": FACT_EMAIL,
+    "company": FACT_COMPANY,
+    "family_size": FACT_FAMILY_SIZE,
+    # Real estate
     "bhk": FACT_BHK,
     "budget": FACT_BUDGET,
     "location": FACT_LOCATION,
@@ -155,14 +229,67 @@ FLOW_SLOT_TO_FACT: dict[str, str] = {
     "area": FACT_LOCATION,
     "purpose": FACT_PURPOSE,
     "timeline": FACT_TIMELINE,
+    "property": FACT_PROPERTY,
+    "property_name": FACT_PROPERTY,
+    "project": FACT_PROPERTY,
+    "project_name": FACT_PROPERTY,
+    "urgency": FACT_URGENCY,
+    # Universal appointment date/time aliases (also used by clinics)
     "visit_date": FACT_VISIT_DATE,
     "preferred_date": FACT_VISIT_DATE,
+    "appointment_date": FACT_VISIT_DATE,
     "visit_time": FACT_VISIT_TIME,
     "preferred_time": FACT_VISIT_TIME,
-    "property": FACT_PROPERTY,
-    "urgency": FACT_URGENCY,
-    "company": FACT_COMPANY,
-    "family_size": FACT_FAMILY_SIZE,
+    "appointment_time": FACT_VISIT_TIME,
+    # Clinics
+    "symptoms": FACT_SYMPTOMS,
+    "reason_for_visit": FACT_SYMPTOMS,
+    "complaint": FACT_SYMPTOMS,
+    "appointment_type": FACT_APPOINTMENT_TYPE,
+    "consultation_type": FACT_APPOINTMENT_TYPE,
+    "doctor": FACT_DOCTOR_PREFERENCE,
+    "doctor_preference": FACT_DOCTOR_PREFERENCE,
+    "preferred_doctor": FACT_DOCTOR_PREFERENCE,
+    "patient_age": FACT_PATIENT_AGE,
+    "age": FACT_PATIENT_AGE,
+    "patient_gender": FACT_PATIENT_GENDER,
+    "gender": FACT_PATIENT_GENDER,
+    "insurance": FACT_INSURANCE,
+    "insurance_provider": FACT_INSURANCE,
+    "prior_visit": FACT_PRIOR_VISIT,
+    # E-commerce
+    "order_id": FACT_ORDER_ID,
+    "order_number": FACT_ORDER_ID,
+    "order": FACT_ORDER_ID,
+    "item": FACT_ITEM,
+    "product": FACT_ITEM,
+    "issue_type": FACT_ISSUE_TYPE,
+    "issue": FACT_ISSUE_TYPE,
+    "shipping_address": FACT_SHIPPING_ADDRESS,
+    "delivery_address": FACT_SHIPPING_ADDRESS,
+    "address": FACT_SHIPPING_ADDRESS,
+    "tracking_number": FACT_TRACKING_NUMBER,
+    "awb": FACT_TRACKING_NUMBER,
+    "payment_method": FACT_PAYMENT_METHOD,
+    # Hospitality
+    "party_size": FACT_PARTY_SIZE,
+    "guest_count": FACT_PARTY_SIZE,
+    "pax": FACT_PARTY_SIZE,
+    "check_in": FACT_CHECK_IN,
+    "checkin": FACT_CHECK_IN,
+    "check_in_date": FACT_CHECK_IN,
+    "arrival_date": FACT_CHECK_IN,
+    "check_out": FACT_CHECK_OUT,
+    "checkout": FACT_CHECK_OUT,
+    "check_out_date": FACT_CHECK_OUT,
+    "departure_date": FACT_CHECK_OUT,
+    "room_type": FACT_ROOM_TYPE,
+    "table_type": FACT_ROOM_TYPE,
+    "occasion": FACT_OCCASION,
+    "dietary": FACT_DIETARY,
+    "dietary_preference": FACT_DIETARY,
+    "seating": FACT_SEATING_PREFERENCE,
+    "seating_preference": FACT_SEATING_PREFERENCE,
 }
 
 
@@ -293,6 +420,12 @@ _NAME_REJECT_WORDS = {
     "looking", "interested", "busy", "not", "calling", "thinking", "going",
     "planning", "buying", "searching", "available", "ok", "okay", "yes", "no",
     "sure", "fine", "good", "great", "right",
+    # Verbs/adjectives that commonly follow "I am" / "I'm" in
+    # non-introduction sentences, so a clinic caller's "I'm allergic to
+    # penicillin" or "I am feeling feverish" doesn't become a name.
+    "feeling", "suffering", "having", "experiencing", "here", "trying",
+    "waiting", "wondering", "hoping", "from", "allergic", "unable",
+    "worried", "upset", "happy", "unhappy",
     # Indic copulas / honorifics that often trail a self-introduction.
     "hai", "hain", "hu", "hoon", "ji",   # Hindi
     "ga", "garu", "andi", "ki", "ledu",  # Telugu
@@ -316,18 +449,28 @@ _BUDGET_RE = re.compile(
 )
 
 _PURPOSE_SELF_RE = re.compile(
-    r"\b(self[-\s]?use|own use|end use|family|to live|for living|own house|investment\s+nahi)\b",
+    r"\b(self[-\s]?use|own use|end use|family|to live|for living|own house|investment\s+nahi|"
+    # Transliterated Telugu / Hindi self-use cues.
+    r"sontham|sontha|nivasam|undatani(?:ki)?|"
+    r"khud\s+ke\s+liye|rehne\s+ke\s+liye|ghar\s+ke\s+liye)\b|"
+    r"(సొంత|సొంతం|నివాసం|ఉండటానికి|खुद\s*के\s*लिए|रहने\s*के\s*लिए|घर\s*के\s*लिए)",
     re.IGNORECASE,
 )
 _PURPOSE_INVEST_RE = re.compile(
-    r"\b(invest|investment|investor|rental|rent out|roi|second home)\b",
+    r"\b(invest|investment|investor|rental|rent out|roi|second home|"
+    # Transliterated Telugu / Hindi investment cues.
+    r"pettubadi|adde|addhe|nivesh|kiray[ae])\b|"
+    r"(పెట్టుబడి|అద్దె|अद्दे|निवेश|किराया|किराये|किराए)",
     re.IGNORECASE,
 )
 
 _TIMELINE_RE = re.compile(
     r"\b(immediately|right away|asap|as soon as possible|this week|this month|"
     r"next month|this year|next year|"
-    r"within\s+[0-9]+\s+(?:days?|weeks?|months?)|in\s+[0-9]+\s+(?:days?|weeks?|months?))\b",
+    r"within\s+[0-9]+\s+(?:days?|weeks?|months?)|in\s+[0-9]+\s+(?:days?|weeks?|months?)|"
+    # Transliterated Telugu / Hindi timeline cues.
+    r"abhi|turant|ippud[ue]|ventane|ee\s+nela|vacche\s+nela|is\s+mahine|agle\s+mahine)\b|"
+    r"(అభీ|ఇప్పుడే|వెంటనే|ఈ\s*నెల|వచ్చే\s*నెల|अभी|तुरंत|इस\s*महीने|अगले\s*महीने)",
     re.IGNORECASE,
 )
 
@@ -338,14 +481,67 @@ _VISIT_DATE_RE = re.compile(
     r"\b(today|tomorrow|day after tomorrow|"
     r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
     r"this\s+(?:weekend|saturday|sunday)|next\s+(?:weekend|monday|tuesday|wednesday|thursday|friday|saturday|sunday)|"
-    r"[0-3]?\d(?:st|nd|rd|th)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*"
-    r")\b",
+    r"[0-3]?\d(?:st|nd|rd|th)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*|"
+    # Transliterated Telugu / Hindi relative dates.
+    r"aaj|kal|parso|parson|repu|rapu|eeroju|ellundi"
+    r")\b|"
+    r"(ఈరోజు|రేపు|రెపు|ఎల్లుండి|आज|कल|परसों|परसो)",
     re.IGNORECASE,
 )
 
 _LOCATION_RE = re.compile(
     r"\b(?:near|around|in|at)\s+([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,3})\b"
 )
+# Telugu / Hindi put the postposition after the (Latin-script) place:
+# "Kokapet లో", "Kondapur mein", "Gachibowli ke paas".
+_LOCATION_POST_RE = re.compile(
+    r"([A-Za-z][A-Za-z]+(?:\s+[A-Za-z]+){0,2})\s*"
+    r"(?:(?:లో|లోని|దగ్గర|వద్ద|में|मे|के\s*पास)|(?:ke\s+paas|ke\s+pass|mein)\b)",
+    re.IGNORECASE,
+)
+_LOCATION_REJECT_WORDS = {"this", "that", "here", "there", "interested", "looking", "budget"}
+
+# Project / development the caller names. Two cues: an explicit "<Name>
+# project" (case-insensitive, the strongest signal) and a Title-cased proper
+# noun after an interest verb. Kept conservative — the booking macro's fuzzy
+# ``find_project_match`` is the authority, so we only need a usable hint here.
+_PROPERTY_PROJECT_RE = re.compile(
+    r"\b([A-Za-z][\w&'.-]*(?:\s+[A-Za-z][\w&'.-]*){0,4})\s+project\b",
+    re.IGNORECASE,
+)
+_PROPERTY_INTEREST_RE = re.compile(
+    r"\b(?:interested\s+in|looking\s+(?:at|into)|enquir(?:e|ing)\s+about|"
+    r"asking\s+about|about|regarding|visit|see)\s+"
+    r"([A-Z][\w&'.-]*(?:\s+[A-Z][\w&'.-]*){0,4})\b"
+)
+# Telugu / Hindi place the project name BEFORE the cue: "Skyline gurinchi"
+# (about Skyline), "Green Meadows ke baare mein". The name is Latin-script even
+# in code-switched te/hi STT.
+_PROPERTY_POST_RE = re.compile(
+    r"([A-Za-z][\w&'.-]*(?:\s+[A-Za-z][\w&'.-]*){0,4})\s+"
+    r"(?:gurinchi|gurinci|gurinchii|ke\s+baare\s+mein|ke\s+bare\s+me|"
+    r"గురించి|के\s*बारे\s*में)\b",
+    re.IGNORECASE,
+)
+# Filler/lead-in tokens peeled off the edges of a captured project phrase so
+# "tell me about the green meadows" reduces to "green meadows".
+_PROPERTY_LEAD_FILLER = {
+    "tell", "me", "us", "about", "the", "a", "an", "i", "we", "you", "is",
+    "are", "am", "im", "want", "wanted", "know", "more", "please", "can",
+    "could", "would", "should", "share", "send", "give", "get", "interested",
+    "in", "at", "looking", "into", "regarding", "enquire", "enquiring",
+    "asking", "like", "to", "visit", "see", "details", "detail", "info",
+    "information", "your", "and",
+}
+# Words that are never a project name even when they follow an interest cue.
+_PROPERTY_REJECT_WORDS = {
+    "this", "that", "it", "the", "a", "an", "you", "your", "them", "us", "me",
+    "details", "detail", "price", "pricing", "cost", "brochure", "more", "info",
+    "information", "something", "anything", "property", "properties", "flat",
+    "flats", "apartment", "apartments", "home", "homes", "house", "villa",
+    "villas", "plot", "plots", "options", "option", "area", "areas", "budget",
+    "loan", "emi", "possession", "site", "visit", "booking",
+}
 
 # Correction-cue prefixes — when present, the value extracted from the
 # same utterance should override existing memory at high confidence.
@@ -397,6 +593,198 @@ _LANG_PREF_PATTERNS = (
 )
 
 
+# ── Clinics / healthcare patterns ────────────────────────────────────────────
+
+_SYMPTOM_LEADIN_RE = re.compile(
+    r"\b(?:having|feeling|suffering from|been having|i have|i've got|i've had|"
+    r"complaining of|down with|got|with)\s+"
+    r"((?:[a-z][a-z'-]+\s*){1,6})"
+    r"(?=[\s,.;!?]|$)",
+    re.IGNORECASE,
+)
+_SYMPTOM_KEYWORDS = (
+    "fever", "cough", "cold", "headache", "migraine", "back pain", "chest pain",
+    "stomach pain", "nausea", "vomiting", "diarrhea", "rash", "allergy",
+    "sore throat", "body ache", "fatigue", "tired", "dizzy", "dizziness",
+    "shortness of breath", "breathlessness", "blood pressure", "bp", "sugar",
+    "diabetes", "asthma", "anxiety", "depression", "insomnia", "swelling",
+    "infection", "burning", "itching", "tooth pain", "ear pain", "eye pain",
+    "knee pain", "joint pain", "period pain", "cramps", "constipation",
+)
+_APPOINTMENT_TYPE_RE = re.compile(
+    r"\b(consultation|follow[\s-]?up|follow up|first visit|new patient|"
+    r"second opinion|lab test|blood test|scan|x[\s-]?ray|mri|ct scan|"
+    r"checkup|check[\s-]?up|review|vaccination|teleconsult|tele consult|video consult)\b",
+    re.IGNORECASE,
+)
+# "see Dr. Sharma", "doctor Mehta", "with Dr Rao". The "with" lead-in only
+# fires when followed by dr/doctor so it doesn't grab "with fever".
+_DOCTOR_RE = re.compile(
+    r"\b(?:(?:doctor|dr\.?|see)\s+(?:dr\.?\s+|doctor\s+)?|with\s+(?:dr\.?|doctor)\s+)"
+    r"([A-Za-z][A-Za-z'-]+(?:\s+[A-Za-z][A-Za-z'-]+){0,2})",
+    re.IGNORECASE,
+)
+# Trailing tokens that aren't part of a doctor's name ("Dr Mehta tomorrow").
+_DOCTOR_STOP_WORDS = {
+    "tomorrow", "today", "yesterday", "next", "last", "this", "on", "at",
+    "in", "for", "please", "morning", "afternoon", "evening", "tonight",
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday",
+    "sunday", "and", "or", "about", "regarding",
+}
+_AGE_RE = re.compile(
+    r"\b(?:age(?:d)?(?:\s+is)?|i am|i'm|my age is|patient is|(?:she|he) is)\s+"
+    r"(\d{1,3})\s*(?:years?(?:\s*old)?|yrs?(?:\s*old)?|yo)?\b",
+    re.IGNORECASE,
+)
+_AGE_SIMPLE_RE = re.compile(r"\b(\d{1,3})\s*(?:years?\s*old|yrs?\s*old|yo)\b", re.IGNORECASE)
+_GENDER_RE = re.compile(
+    r"\b(?:patient\s+is\s+a?|for\s+a?|my\s+(?:son|daughter|wife|husband|"
+    r"mother|father|brother|sister))\s+(male|female|man|woman|boy|girl)\b",
+    re.IGNORECASE,
+)
+_INSURANCE_RE = re.compile(
+    r"\b(?:insurance|cover(?:ed)?\s+by|tpa|health\s+plan)\s+(?:is\s+|with\s+|by\s+)?"
+    r"([A-Z][A-Za-z&\- ]{2,40}?)(?=[,.;!?]|$)",
+    re.IGNORECASE,
+)
+_PRIOR_VISIT_RE = re.compile(
+    r"\b(visited (?:before|last|earlier)|been here (?:before|earlier)|"
+    r"existing patient|regular patient|came (?:last|earlier|previously)|"
+    r"my last visit (?:was )?(?:in )?[a-z]+)\b",
+    re.IGNORECASE,
+)
+
+
+# ── E-commerce / support patterns ────────────────────────────────────────────
+
+_ORDER_ID_RE = re.compile(
+    r"\b(?:order\s*(?:no\.?|number|id|#)?\s*(?:is\s+|was\s+|=\s*)?[:#]?\s*|#)"
+    r"([A-Z0-9][A-Z0-9-]{4,24})\b",
+    re.IGNORECASE,
+)
+_TRACKING_RE = re.compile(
+    r"\b(?:tracking|awb|waybill|consignment)\s*(?:no\.?|number|id|#)?\s*"
+    r"(?:is\s+|was\s+|=\s*)?[:#]?\s*"
+    r"([A-Z0-9][A-Z0-9-]{5,24})\b",
+    re.IGNORECASE,
+)
+_ISSUE_TYPE_PATTERNS = (
+    (re.compile(r"\b(refund|money back|reimburse|return the money)\b", re.IGNORECASE), "refund"),
+    (re.compile(r"\b(return|send (?:it )?back|pick(?:\s*up)? return)\b", re.IGNORECASE), "return"),
+    (re.compile(r"\b(exchange|replace(?:ment)?|swap)\b", re.IGNORECASE), "exchange"),
+    (re.compile(r"\b(damaged|broken|defect(?:ive)?|not working|faulty|spoilt)\b", re.IGNORECASE), "damaged"),
+    (re.compile(r"\b(wrong (?:item|product|size|colou?r)|missing item|not (?:as|what) (?:described|ordered))\b", re.IGNORECASE), "wrong_item"),
+    (re.compile(r"\b(delivery|shipping|courier|tracking|where is my order|not delivered|late)\b", re.IGNORECASE), "delivery"),
+    (re.compile(r"\b(cancel(?:lation)?|cancel my order)\b", re.IGNORECASE), "cancel"),
+    (re.compile(r"\b(invoice|gst bill|receipt)\b", re.IGNORECASE), "invoice"),
+)
+_PAYMENT_METHOD_RE = re.compile(
+    r"\b(cod|cash on delivery|upi|gpay|google pay|phonepe|paytm|credit card|debit card|"
+    r"net\s*banking|bank transfer|wallet)\b",
+    re.IGNORECASE,
+)
+_ADDRESS_LEADIN_RE = re.compile(
+    r"\b(?:ship(?:ping)? (?:address|to)|deliver(?:y)? (?:address|to)|address is)\s+"
+    r"(.+?)(?=[.;!?]|$)",
+    re.IGNORECASE,
+)
+# "ordered a blue kettle", "bought the running shoes" — deliberately NOT
+# "item is …" / "product is …" because those usually precede a *state*
+# ("the item is damaged"), not the item itself.
+_ITEM_LEADIN_RE = re.compile(
+    r"\b(?:ordered|bought|purchased|received)\s+(?:a|an|the|some|my)?\s*"
+    r"((?:[A-Za-z0-9][A-Za-z0-9'-]*\s*){1,5})"
+    r"(?=[\s,.;!?]|$)",
+    re.IGNORECASE,
+)
+# Words that describe an issue/state, not a product — reject as item values.
+_ITEM_REJECT_WORDS = {
+    "damaged", "broken", "defective", "faulty", "wrong", "missing", "late",
+    "refund", "return", "exchange", "it", "this", "that", "them", "back",
+}
+# Tokens that end the item phrase — "ordered a blue kettle but received…"
+# should yield "blue kettle", not the whole tail.
+_ITEM_STOP_WORDS = {
+    "but", "and", "however", "though", "received", "is", "was", "that",
+    "which", "from", "with", "because", "since", "yesterday", "today",
+    "on", "in", "to", "however,", "last", "next", "this", "ago",
+    "week", "month", "weeks", "months", "days", "day",
+}
+
+
+# ── Hospitality patterns ─────────────────────────────────────────────────────
+
+_PARTY_SIZE_RE = re.compile(
+    r"\b(?:for|table for|booking for|reservation for|party of|group of|we are|"
+    r"there are|there'll be)\s+"
+    r"(\d{1,3}|two|three|four|five|six|seven|eight|nine|ten|"
+    r"do|teen|char|paanch|rendu|moodu|nalugu|aidu)"
+    r"(?:\s+(?:people|adults?|guests?|pax|persons?|of us))?\b",
+    re.IGNORECASE,
+)
+_PARTY_NUMBER_WORDS = {
+    "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
+    "eight": 8, "nine": 9, "ten": 10,
+    "do": 2, "teen": 3, "char": 4, "paanch": 5,
+    "rendu": 2, "moodu": 3, "nalugu": 4, "aidu": 5,
+}
+_CHECKIN_RE = re.compile(
+    r"\b(?:check[\s-]?in|arriv(?:e|al)|coming on)\s+"
+    r"(?:on\s+)?([A-Za-z0-9 ,/-]{3,30}?)(?=[.;!?]|$|\s+(?:and|for|with|to))",
+    re.IGNORECASE,
+)
+_CHECKOUT_RE = re.compile(
+    r"\b(?:check[\s-]?out|leav(?:e|ing)|depart(?:ing|ure)|until)\s+"
+    r"(?:on\s+)?([A-Za-z0-9 ,/-]{3,30}?)(?=[.;!?]|$|\s+(?:and|for|with))",
+    re.IGNORECASE,
+)
+_ROOM_TYPE_RE = re.compile(
+    r"\b(single|double|twin|triple|suite|deluxe|standard|family|king|queen|"
+    r"superior|executive|presidential|villa|cottage)\s*(?:room|suite)?\b",
+    re.IGNORECASE,
+)
+_TABLE_TYPE_RE = re.compile(
+    r"\b(booth|window (?:seat|table)|outdoor|patio|private dining|bar (?:seat|table))\b",
+    re.IGNORECASE,
+)
+_OCCASION_RE = re.compile(
+    r"\b(birthday|anniversary|wedding|honeymoon|business meeting|"
+    r"corporate|family (?:gathering|reunion)|date night|engagement|"
+    r"baby shower|farewell)\b",
+    re.IGNORECASE,
+)
+_DIETARY_RE = re.compile(
+    r"\b(vegetarian|vegan|jain|non[\s-]?veg|halal|kosher|gluten[\s-]?free|"
+    r"lactose[\s-]?free|nut[\s-]?free|diabetic[\s-]?friendly|low[\s-]?sodium|"
+    r"no onion(?:\s+no garlic)?)\b",
+    re.IGNORECASE,
+)
+
+
+# ── Salient-detail capture ───────────────────────────────────────────────────
+#
+# Things a caller says that aren't a single-valued slot but the agent must
+# remember for the rest of the call (and ideally future calls): allergies,
+# named family members, callback-time promises, "important" / "please remember"
+# statements, specific numbers + units, emotional flags ("very upset"). The
+# heuristic deliberately captures *short* utterance fragments — not the whole
+# turn — so the prompt block stays compact.
+
+_SALIENT_CUE_PATTERNS = (
+    (re.compile(r"\b(?:allergic to|allergy to|cannot (?:eat|have|take)|can'?t (?:eat|have|take))\s+[a-z][a-z\s]{1,40}", re.IGNORECASE), "allergy"),
+    (re.compile(r"\b(?:please remember|don'?t forget|make sure (?:that|to)|by the way|fyi|important|note that|keep in mind|remember that)\s+[^.;!?]{3,140}", re.IGNORECASE), "note"),
+    (re.compile(r"\b(?:my (?:son|daughter|wife|husband|mother|father|brother|sister|partner|kid|child))\s+[a-z][^.;!?]{2,80}", re.IGNORECASE), "family"),
+    (re.compile(r"\b(?:call me|call back|contact me)\s+(?:at|on|around|after|before)\s+[^.;!?]{2,40}", re.IGNORECASE), "callback_time"),
+    (re.compile(r"\b(?:very|really|extremely|completely)\s+(?:upset|angry|frustrated|disappointed|unhappy|worried|anxious|stressed)\b", re.IGNORECASE), "emotional_flag"),
+    (re.compile(r"\b(?:waiting (?:for|since)|haven'?t (?:received|got))\s+[^.;!?]{3,80}", re.IGNORECASE), "complaint"),
+    (re.compile(r"\b(?:my (?:case|complaint|ticket|reference)\s*(?:number|no|id)?\s*(?:is)?)\s*[:#]?\s*[A-Z0-9-]{3,24}", re.IGNORECASE), "reference"),
+    (re.compile(r"\b(?:by|before|after|within|in)\s+(?:next\s+)?(?:\d+\s+(?:days?|weeks?|months?|hours?)|(?:january|february|march|april|may|june|july|august|september|october|november|december))\b", re.IGNORECASE), "deadline"),
+    (re.compile(r"\b(?:must|need to|have to)\s+(?:be|have|get|finish|complete|deliver(?:ed)?|arrive)\s+[^.;!?]{3,80}", re.IGNORECASE), "requirement"),
+)
+
+_SALIENT_MAX_LEN = 160
+
+
 def _clean_value(text: str) -> str:
     return re.sub(r"\s+", " ", str(text or "")).strip(" .,:;-")
 
@@ -412,25 +800,27 @@ class MemoryExtractor:
 
     @staticmethod
     def _extract_name(text: str) -> str | None:
+        # Scan *all* matches of each pattern, not just the first. "I'm
+        # allergic to penicillin, my name is Ravi" trips the "i'm" lead-in
+        # first (rejected on "allergic"); we must keep scanning so the real
+        # "my name is Ravi" later in the turn still wins.
         for pat in _NAME_PATTERNS:
-            match = pat.search(text)
-            if not match:
-                continue
-            tokens = [t for t in match.group(1).split() if t]
-            if not tokens:
-                continue
-            # Walk left-to-right, take tokens until we hit a reject word.
-            # "name is Asha looking for 3BHK" → ["Asha"].
-            kept: list[str] = []
-            for tok in tokens:
-                if tok.lower() in _NAME_REJECT_WORDS:
-                    break
-                kept.append(tok)
-            if not kept:
-                continue
-            cleaned = _clean_value(" ".join(kept))
-            if cleaned and len(cleaned) >= 2:
-                return cleaned.title()
+            for match in pat.finditer(text):
+                tokens = [t for t in match.group(1).split() if t]
+                if not tokens:
+                    continue
+                # Walk left-to-right, take tokens until we hit a reject
+                # word. "name is Asha looking for 3BHK" → ["Asha"].
+                kept: list[str] = []
+                for tok in tokens:
+                    if tok.lower() in _NAME_REJECT_WORDS:
+                        break
+                    kept.append(tok)
+                if not kept:
+                    continue
+                cleaned = _clean_value(" ".join(kept))
+                if cleaned and len(cleaned) >= 2:
+                    return cleaned.title()
         return None
 
     @staticmethod
@@ -487,14 +877,50 @@ class MemoryExtractor:
 
     @staticmethod
     def _extract_location(text: str) -> str | None:
-        match = _LOCATION_RE.search(text)
+        # English "in/near <Place>" first; then the hi/te "<Place> లో/mein/ke paas"
+        # postposition order so a Telugu / Hindi turn captures the area too.
+        match = _LOCATION_RE.search(text) or _LOCATION_POST_RE.search(text)
         if not match:
             return None
         value = _clean_value(match.group(1))
-        # Filter out demonstratives that aren't actual locations.
-        if value.lower() in {"this", "that", "here", "there"}:
+        tokens = [t for t in value.split() if t.lower() not in _LOCATION_REJECT_WORDS]
+        if not tokens:
             return None
-        return value
+        return " ".join(tokens)
+
+    @staticmethod
+    def _extract_property(text: str) -> str | None:
+        def _usable(value: str) -> str | None:
+            tokens = _clean_value(value).strip(" .,-").split()
+            # Peel leading/trailing filler so "me about the green meadows"
+            # reduces to "green meadows".
+            while tokens and tokens[0].lower() in _PROPERTY_LEAD_FILLER:
+                tokens.pop(0)
+            while tokens and tokens[-1].lower() in _PROPERTY_LEAD_FILLER:
+                tokens.pop()
+            if not tokens:
+                return None
+            if all(t.lower() in _PROPERTY_REJECT_WORDS for t in tokens):
+                return None
+            candidate = " ".join(tokens)
+            return candidate if len(candidate) >= 3 else None
+
+        match = _PROPERTY_PROJECT_RE.search(text)
+        if match:
+            usable = _usable(match.group(1))
+            if usable:
+                return usable.title()
+        match = _PROPERTY_INTEREST_RE.search(text)
+        if match:
+            usable = _usable(match.group(1))
+            if usable:
+                return usable
+        match = _PROPERTY_POST_RE.search(text)
+        if match:
+            usable = _usable(match.group(1))
+            if usable:
+                return usable.title()
+        return None
 
     @staticmethod
     def _extract_language_pref(text: str) -> str | None:
@@ -510,6 +936,246 @@ class MemoryExtractor:
                     return code
         return None
 
+    # ── Clinics ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _extract_symptoms(text: str) -> str | None:
+        lowered = text.lower()
+        hits = [kw for kw in _SYMPTOM_KEYWORDS if kw in lowered]
+        if hits:
+            # Drop substrings of a longer hit ("pain" when "chest pain"
+            # is present), keep declaration order, cap at three.
+            hits.sort(key=len, reverse=True)
+            kept: list[str] = []
+            for kw in hits:
+                if any(kw != other and kw in other for other in kept):
+                    continue
+                kept.append(kw)
+            return ", ".join(kept[:3]) if kept else None
+        match = _SYMPTOM_LEADIN_RE.search(text)
+        if match:
+            value = _clean_value(match.group(1))
+            if value and len(value) >= 3 and value.lower() not in _NAME_REJECT_WORDS:
+                return value.lower()
+        return None
+
+    @staticmethod
+    def _extract_appointment_type(text: str) -> str | None:
+        match = _APPOINTMENT_TYPE_RE.search(text)
+        return _clean_value(match.group(1)).lower() if match else None
+
+    @staticmethod
+    def _extract_doctor(text: str) -> str | None:
+        match = _DOCTOR_RE.search(text)
+        if not match:
+            return None
+        tokens = _clean_value(match.group(1)).split()
+        kept: list[str] = []
+        for tok in tokens:
+            if tok.lower() in _DOCTOR_STOP_WORDS:
+                break
+            kept.append(tok)
+        value = " ".join(kept).strip()
+        first = value.split()[0].lower() if value else ""
+        if not value or first in {"dr", "doctor"} or first in _NAME_REJECT_WORDS:
+            return None
+        if len(value) >= 2:
+            return f"Dr. {value.title()}"
+        return None
+
+    @staticmethod
+    def _extract_age(text: str) -> str | None:
+        match = _AGE_SIMPLE_RE.search(text) or _AGE_RE.search(text)
+        if not match:
+            return None
+        try:
+            age = int(match.group(1))
+        except (TypeError, ValueError):
+            return None
+        if 0 < age <= 120:
+            return str(age)
+        return None
+
+    @staticmethod
+    def _extract_gender(text: str) -> str | None:
+        match = _GENDER_RE.search(text)
+        if not match:
+            return None
+        raw = match.group(1).lower()
+        if raw in {"male", "man", "boy"}:
+            return "male"
+        if raw in {"female", "woman", "girl"}:
+            return "female"
+        return None
+
+    @staticmethod
+    def _extract_insurance(text: str) -> str | None:
+        match = _INSURANCE_RE.search(text)
+        if not match:
+            return None
+        value = _clean_value(match.group(1))
+        return value if value and len(value) >= 3 else None
+
+    @staticmethod
+    def _extract_prior_visit(text: str) -> str | None:
+        return "yes" if _PRIOR_VISIT_RE.search(text) else None
+
+    # ── E-commerce ───────────────────────────────────────────────────
+
+    @staticmethod
+    def _extract_order_id(text: str) -> str | None:
+        match = _ORDER_ID_RE.search(text)
+        if not match:
+            return None
+        value = _clean_value(match.group(1)).upper()
+        # Reject pure-word captures ("ORDER", "NUMBER") — require a digit.
+        if value and any(c.isdigit() for c in value):
+            return value
+        return None
+
+    @staticmethod
+    def _extract_tracking(text: str) -> str | None:
+        match = _TRACKING_RE.search(text)
+        if not match:
+            return None
+        value = _clean_value(match.group(1)).upper()
+        return value if value and any(c.isdigit() for c in value) else None
+
+    @staticmethod
+    def _extract_issue_type(text: str) -> str | None:
+        for pat, code in _ISSUE_TYPE_PATTERNS:
+            if pat.search(text):
+                return code
+        return None
+
+    @staticmethod
+    def _extract_payment_method(text: str) -> str | None:
+        match = _PAYMENT_METHOD_RE.search(text)
+        return _clean_value(match.group(1)).lower() if match else None
+
+    @staticmethod
+    def _extract_shipping_address(text: str) -> str | None:
+        match = _ADDRESS_LEADIN_RE.search(text)
+        if not match:
+            return None
+        value = _clean_value(match.group(1))
+        return value if value and len(value) >= 6 else None
+
+    @staticmethod
+    def _extract_item(text: str) -> str | None:
+        match = _ITEM_LEADIN_RE.search(text)
+        if not match:
+            return None
+        tokens = _clean_value(match.group(1)).split()
+        kept: list[str] = []
+        for tok in tokens:
+            if tok.lower() in _ITEM_STOP_WORDS:
+                break
+            kept.append(tok)
+        value = " ".join(kept).strip()
+        if not value or len(value) < 3:
+            return None
+        first = value.split()[0].lower()
+        if first in _NAME_REJECT_WORDS or first in _ITEM_REJECT_WORDS:
+            return None
+        return value
+
+    # ── Hospitality ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _extract_party_size(text: str) -> str | None:
+        match = _PARTY_SIZE_RE.search(text)
+        if not match:
+            return None
+        token = match.group(1).lower()
+        if token.isdigit():
+            n = int(token)
+        else:
+            n = _PARTY_NUMBER_WORDS.get(token)
+        if n and 0 < n <= 100:
+            return str(n)
+        return None
+
+    @staticmethod
+    def _extract_check_in(text: str) -> str | None:
+        match = _CHECKIN_RE.search(text)
+        if match:
+            value = _clean_value(match.group(1))
+            if value and len(value) >= 3:
+                return value
+        # Fall back to a bare date phrase ("arriving tomorrow").
+        date_match = _VISIT_DATE_RE.search(text)
+        if date_match and re.search(r"\b(check[\s-]?in|arriv|coming)\b", text, re.IGNORECASE):
+            return _clean_value(date_match.group(0))
+        return None
+
+    @staticmethod
+    def _extract_check_out(text: str) -> str | None:
+        match = _CHECKOUT_RE.search(text)
+        if match:
+            value = _clean_value(match.group(1))
+            if value and len(value) >= 3:
+                return value
+        return None
+
+    @staticmethod
+    def _extract_room_type(text: str) -> str | None:
+        match = _ROOM_TYPE_RE.search(text)
+        if match:
+            return _clean_value(match.group(0)).lower()
+        table_match = _TABLE_TYPE_RE.search(text)
+        if table_match:
+            return _clean_value(table_match.group(0)).lower()
+        return None
+
+    @staticmethod
+    def _extract_occasion(text: str) -> str | None:
+        match = _OCCASION_RE.search(text)
+        return _clean_value(match.group(1)).lower() if match else None
+
+    @staticmethod
+    def _extract_dietary(text: str) -> str | None:
+        match = _DIETARY_RE.search(text)
+        return _clean_value(match.group(1)).lower() if match else None
+
+    # ── Salient details ──────────────────────────────────────────────
+
+    @staticmethod
+    def _extract_salient(text: str) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        seen_codes: set[str] = set()
+        for pat, code in _SALIENT_CUE_PATTERNS:
+            match = pat.search(text)
+            if not match:
+                continue
+            # One note per code per turn keeps the bucket from flooding
+            # when a long utterance trips several sub-patterns.
+            if code in seen_codes:
+                continue
+            seen_codes.add(code)
+            snippet = _clean_value(match.group(0))
+            if snippet:
+                out.append({"code": code, "text": snippet[:_SALIENT_MAX_LEN]})
+        return out
+
+    @classmethod
+    def _extractors_for(cls, business_type: str | None) -> tuple[tuple[str, str], ...]:
+        """Return the ``(fact_key, method_name)`` extractor list to run.
+
+        Known business type → universal slots + that domain's slots.
+        ``None`` / ``"other"`` / unknown → universal + the superset of
+        every domain (we don't know which facts matter, so capture
+        broadly). The superset is also what keeps legacy callers that
+        pass no business type extracting real-estate slots as before.
+        """
+        bt = str(business_type or "").strip().lower()
+        if bt and bt != "other" and bt in _BUSINESS_EXTRACTORS:
+            return _UNIVERSAL_EXTRACTORS + _BUSINESS_EXTRACTORS[bt]
+        superset: tuple[tuple[str, str], ...] = _UNIVERSAL_EXTRACTORS
+        for key in ("real_estate", "clinics", "ecommerce", "hospitality"):
+            superset = superset + _BUSINESS_EXTRACTORS[key]
+        return superset
+
     @classmethod
     def extract(
         cls,
@@ -518,19 +1184,25 @@ class MemoryExtractor:
         turn_index: int,
         language: str | None = None,
         role: str = "user",
+        business_type: str | None = None,
     ) -> dict[str, Any]:
         """Return ``{"facts": [...], "objections": [...],
-        "commitments": [...], "preferences": [...]}``.
+        "commitments": [...], "preferences": [...], "salient": [...]}``.
 
         ``role`` controls how aggressively we trust the text.
         ``"user"`` is the primary source (names, phones, decisions).
         ``"assistant"`` text is mined too — the agent often confirms a
         slot ("Got it, 3BHK in Kompally") and we want that confirmation
         to lock the fact even if the user's earlier utterance was noisy.
+
+        ``business_type`` selects which domain extractors run. When it is
+        a known type only that domain's slots are mined (a clinic call
+        never extracts BHK); otherwise the full superset runs.
         """
+        empty = {"facts": [], "objections": [], "commitments": [], "preferences": [], "salient": []}
         clean_text = re.sub(r"\s+", " ", str(text or "")).strip()
         if not clean_text:
-            return {"facts": [], "objections": [], "commitments": [], "preferences": []}
+            return empty
 
         ts = time.time()
         is_correction = bool(role == "user" and _CORRECTION_RE.search(clean_text))
@@ -554,18 +1226,15 @@ class MemoryExtractor:
                 )
             )
 
-        _add(FACT_NAME, cls._extract_name(clean_text))
-        _add(FACT_PHONE, cls._extract_phone(clean_text))
+        # Email is universal and cheap — handle inline.
         email_match = _EMAIL_RE.search(clean_text)
         _add(FACT_EMAIL, email_match.group(0) if email_match else None)
-        _add(FACT_BHK, cls._extract_bhk(clean_text))
-        _add(FACT_BUDGET, cls._extract_budget(clean_text))
-        _add(FACT_PURPOSE, cls._extract_purpose(clean_text))
-        _add(FACT_TIMELINE, cls._extract_timeline(clean_text))
-        _add(FACT_VISIT_DATE, cls._extract_visit_date(clean_text))
-        _add(FACT_VISIT_TIME, cls._extract_visit_time(clean_text))
-        _add(FACT_LOCATION, cls._extract_location(clean_text))
-        _add(FACT_LANGUAGE_PREF, cls._extract_language_pref(clean_text))
+
+        for fact_key, method_name in cls._extractors_for(business_type):
+            extractor = getattr(cls, method_name, None)
+            if extractor is None:
+                continue
+            _add(fact_key, extractor(clean_text))
 
         objections: list[dict[str, Any]] = []
         if role == "user":
@@ -591,12 +1260,129 @@ class MemoryExtractor:
         if time_pref:
             preferences.append({"key": "contact_time", "value": time_pref.group(0).lower(), "turn": turn_index})
 
+        # Salient details — only mined from caller turns. The agent's own
+        # phrasing ("please remember to bring your ID") would otherwise be
+        # captured as if the caller said it.
+        salient: list[dict[str, Any]] = []
+        if role == "user":
+            for note in cls._extract_salient(clean_text):
+                salient.append({**note, "turn": turn_index, "ts": ts})
+
         return {
             "facts": facts,
             "objections": objections,
             "commitments": commitments,
             "preferences": preferences,
+            "salient": salient,
         }
+
+
+# Extractor registries. ``_UNIVERSAL_EXTRACTORS`` run for every business
+# type; the per-type tuples add domain slots. Keep these *after* the class
+# so the method references resolve, and reference them by name (string) so
+# the registry stays a plain data structure.
+_UNIVERSAL_EXTRACTORS: tuple[tuple[str, str], ...] = (
+    (FACT_NAME, "_extract_name"),
+    (FACT_PHONE, "_extract_phone"),
+    (FACT_LANGUAGE_PREF, "_extract_language_pref"),
+    (FACT_VISIT_DATE, "_extract_visit_date"),
+    (FACT_VISIT_TIME, "_extract_visit_time"),
+    (FACT_TIMELINE, "_extract_timeline"),
+)
+
+_BUSINESS_EXTRACTORS: dict[str, tuple[tuple[str, str], ...]] = {
+    "real_estate": (
+        (FACT_BHK, "_extract_bhk"),
+        (FACT_BUDGET, "_extract_budget"),
+        (FACT_PURPOSE, "_extract_purpose"),
+        (FACT_LOCATION, "_extract_location"),
+        (FACT_PROPERTY, "_extract_property"),
+    ),
+    "clinics": (
+        (FACT_SYMPTOMS, "_extract_symptoms"),
+        (FACT_APPOINTMENT_TYPE, "_extract_appointment_type"),
+        (FACT_DOCTOR_PREFERENCE, "_extract_doctor"),
+        (FACT_PATIENT_AGE, "_extract_age"),
+        (FACT_PATIENT_GENDER, "_extract_gender"),
+        (FACT_INSURANCE, "_extract_insurance"),
+        (FACT_PRIOR_VISIT, "_extract_prior_visit"),
+    ),
+    "ecommerce": (
+        (FACT_ORDER_ID, "_extract_order_id"),
+        (FACT_TRACKING_NUMBER, "_extract_tracking"),
+        (FACT_ISSUE_TYPE, "_extract_issue_type"),
+        (FACT_ITEM, "_extract_item"),
+        (FACT_SHIPPING_ADDRESS, "_extract_shipping_address"),
+        (FACT_PAYMENT_METHOD, "_extract_payment_method"),
+    ),
+    "hospitality": (
+        (FACT_PARTY_SIZE, "_extract_party_size"),
+        (FACT_CHECK_IN, "_extract_check_in"),
+        (FACT_CHECK_OUT, "_extract_check_out"),
+        (FACT_ROOM_TYPE, "_extract_room_type"),
+        (FACT_OCCASION, "_extract_occasion"),
+        (FACT_DIETARY, "_extract_dietary"),
+    ),
+    "other": (),
+}
+
+
+# Which slot labels to surface in the prompt block per business type. The
+# universal keys appear for everyone; domain keys only for their domain.
+# ``None`` / "other" shows the universal set plus anything that was actually
+# captured (handled in ``compose_prompt_block``).
+_UNIVERSAL_PROMPT_KEYS: tuple[str, ...] = (
+    FACT_NAME, FACT_PHONE, FACT_EMAIL, FACT_COMPANY, FACT_LANGUAGE_PREF,
+    FACT_FAMILY_SIZE, FACT_REQUESTED_INFO, FACT_URGENCY, FACT_TIMELINE,
+    FACT_VISIT_DATE, FACT_VISIT_TIME,
+)
+_BUSINESS_PROMPT_KEYS: dict[str, tuple[str, ...]] = {
+    "real_estate": (FACT_BHK, FACT_BUDGET, FACT_LOCATION, FACT_PURPOSE, FACT_PROPERTY),
+    "clinics": (
+        FACT_SYMPTOMS, FACT_APPOINTMENT_TYPE, FACT_DOCTOR_PREFERENCE,
+        FACT_PATIENT_AGE, FACT_PATIENT_GENDER, FACT_INSURANCE, FACT_PRIOR_VISIT,
+    ),
+    "ecommerce": (
+        FACT_ORDER_ID, FACT_ITEM, FACT_ISSUE_TYPE, FACT_SHIPPING_ADDRESS,
+        FACT_TRACKING_NUMBER, FACT_PAYMENT_METHOD,
+    ),
+    "hospitality": (
+        FACT_PARTY_SIZE, FACT_CHECK_IN, FACT_CHECK_OUT, FACT_ROOM_TYPE,
+        FACT_OCCASION, FACT_DIETARY, FACT_SEATING_PREFERENCE,
+    ),
+    "other": (),
+}
+
+
+def _prompt_keys_for(business_type: str | None) -> tuple[str, ...] | None:
+    """Ordered slot keys to render in the prompt block for this business
+    type. ``None`` return means "render every known fact" (used for the
+    ``other`` / unknown case where we can't predict the relevant slots)."""
+    bt = str(business_type or "").strip().lower()
+    if bt and bt != "other" and bt in _BUSINESS_PROMPT_KEYS:
+        return _UNIVERSAL_PROMPT_KEYS + _BUSINESS_PROMPT_KEYS[bt]
+    return None
+
+
+def _durable_fact_keys_for(business_type: str | None) -> tuple[str, ...]:
+    """Subset of facts worth persisting across calls for this business
+    type. Identity + stable preferences always; domain facts that stay
+    true between calls (budget, insurance, dietary) when known."""
+    base = (FACT_NAME, FACT_EMAIL, FACT_COMPANY, FACT_LANGUAGE_PREF, FACT_FAMILY_SIZE)
+    bt = str(business_type or "").strip().lower()
+    domain: dict[str, tuple[str, ...]] = {
+        "real_estate": (FACT_BHK, FACT_BUDGET, FACT_LOCATION, FACT_PURPOSE, FACT_TIMELINE),
+        "clinics": (FACT_DOCTOR_PREFERENCE, FACT_PATIENT_AGE, FACT_PATIENT_GENDER, FACT_INSURANCE, FACT_PRIOR_VISIT),
+        "ecommerce": (FACT_SHIPPING_ADDRESS, FACT_PAYMENT_METHOD),
+        "hospitality": (FACT_ROOM_TYPE, FACT_DIETARY, FACT_SEATING_PREFERENCE, FACT_PARTY_SIZE),
+    }
+    if bt and bt != "other" and bt in domain:
+        return base + domain[bt]
+    # Unknown / other → persist identity plus every domain's durable keys.
+    combined = base
+    for keys in domain.values():
+        combined = combined + keys
+    return combined
 
 
 # ── ConversationalMemory ────────────────────────────────────────────────────
@@ -616,6 +1402,10 @@ class ConversationalMemory:
     objections: list[dict[str, Any]] = field(default_factory=list)
     commitments: list[dict[str, Any]] = field(default_factory=list)
     preferences: list[dict[str, Any]] = field(default_factory=list)
+    # Free-form important caller statements (allergies, deadlines, named
+    # family, "please remember…") that aren't single-valued slots but the
+    # agent must keep front-of-mind for the rest of the call.
+    salient_notes: list[dict[str, Any]] = field(default_factory=list)
     asked_questions: list[dict[str, Any]] = field(default_factory=list)
     # Caller-memory bootstrap snapshot — facts loaded from prior calls
     # for the same phone. Kept separate so the in-call merge can prefer
@@ -630,6 +1420,7 @@ class ConversationalMemory:
             "objections": list(self.objections),
             "commitments": list(self.commitments),
             "preferences": list(self.preferences),
+            "salient_notes": list(self.salient_notes),
             "asked_questions": list(self.asked_questions),
             "bootstrap_keys": sorted(self.bootstrap_keys),
         }
@@ -648,6 +1439,7 @@ class ConversationalMemory:
             objections=list(data.get("objections") or []),
             commitments=list(data.get("commitments") or []),
             preferences=list(data.get("preferences") or []),
+            salient_notes=list(data.get("salient_notes") or []),
             asked_questions=list(data.get("asked_questions") or []),
             bootstrap_keys=set(data.get("bootstrap_keys") or []),
         )
@@ -699,11 +1491,25 @@ class ConversationalMemory:
             self.commitments.append(dict(c))
         for p in extracted.get("preferences") or []:
             self.preferences.append(dict(p))
+        for note in extracted.get("salient") or []:
+            self._accept_salient(dict(note))
         # Keep the buckets bounded so a 50-turn call doesn't accumulate
         # 50 "interested" entries. Latest 16 of each is plenty.
         self.objections = self.objections[-16:]
         self.commitments = self.commitments[-16:]
         self.preferences = self.preferences[-16:]
+        self.salient_notes = self.salient_notes[-16:]
+
+    def _accept_salient(self, note: dict[str, Any]) -> None:
+        """Append a salient note, de-duping on the captured text so the
+        same allergy mentioned three times doesn't appear three times."""
+        text = str(note.get("text") or "").strip().lower()
+        if not text:
+            return
+        for existing in self.salient_notes:
+            if str(existing.get("text") or "").strip().lower() == text:
+                return
+        self.salient_notes.append(note)
 
     def merge_text(
         self,
@@ -712,9 +1518,14 @@ class ConversationalMemory:
         turn_index: int,
         language: str | None = None,
         role: str = "user",
+        business_type: str | None = None,
     ) -> dict[str, Any]:
         extracted = MemoryExtractor.extract(
-            text, turn_index=turn_index, language=language, role=role
+            text,
+            turn_index=turn_index,
+            language=language,
+            role=role,
+            business_type=business_type,
         )
         self.merge_extracted(extracted)
         return extracted
@@ -743,15 +1554,34 @@ class ConversationalMemory:
 
     # ── Prompt block ─────────────────────────────────────────────────
 
-    def compose_prompt_block(self, language: str | None = None) -> str:
+    def compose_prompt_block(
+        self,
+        language: str | None = None,
+        *,
+        business_type: str | None = None,
+    ) -> str:
         """Render the memory as a system-prompt fragment the LLM is
         told to honour. Empty string when nothing is known yet (the
-        caller should drop the section entirely)."""
+        caller should drop the section entirely).
+
+        ``business_type`` restricts which slots are rendered so a clinic
+        call doesn't show BHK lines. When it is ``None`` / ``"other"`` /
+        unknown, every known fact is rendered (we can't predict which
+        slots matter for an unclassified business)."""
+        prompt_keys = _prompt_keys_for(business_type)
+        if prompt_keys is None:
+            # Unknown business: render whatever was captured, in the
+            # canonical label order.
+            ordered_keys = [k for k in SLOT_LABELS if self.has(k)]
+        else:
+            ordered_keys = [k for k in prompt_keys if k in SLOT_LABELS]
+
         lines: list[str] = []
-        for key, label in SLOT_LABELS.items():
+        for key in ordered_keys:
             fact = self.facts.get(key)
             if not fact or fact.value in (None, "", []):
                 continue
+            label = SLOT_LABELS.get(key, key)
             origin = "from a prior call" if key in self.bootstrap_keys else None
             value_text = str(fact.value)
             if origin:
@@ -778,18 +1608,33 @@ class ConversationalMemory:
             for k, v in seen.items():
                 lines.append(f"  - Preference {k}: {v}")
 
-        if not lines:
+        # Salient details get their own labelled sub-block so the LLM
+        # treats them as must-remember context, not just slots.
+        salient_lines: list[str] = []
+        for note in self.salient_notes[-8:]:
+            text = str(note.get("text") or "").strip()
+            if text:
+                salient_lines.append(f"  - {text}")
+
+        if not lines and not salient_lines:
             return ""
 
-        # Bilingual header — the LLM is more likely to honour the
-        # directive when it's in the reply language.
         header = (
-            "# CONVERSATIONAL MEMORY — already known from this call\n"
+            "# CONVERSATIONAL MEMORY — already known about this caller\n"
             "Treat the following as established facts. Do NOT ask the caller for them again. "
             "Build your next reply around what is known; if a fact contradicts what they just said, "
-            "briefly acknowledge the correction ('Ah, my mistake') and update accordingly.\n"
+            "briefly acknowledge the correction ('Ah, my mistake') and update accordingly. "
+            "Facts marked '(from a prior call)' come from an earlier conversation — reference them "
+            "naturally to show continuity, but confirm rather than assume if acting on them.\n"
         )
-        return header + "\n".join(lines)
+        block = header
+        if lines:
+            block += "\n".join(lines)
+        if salient_lines:
+            if lines:
+                block += "\n"
+            block += "Key details to remember:\n" + "\n".join(salient_lines)
+        return block
 
 
 # ── Session-store load / save ───────────────────────────────────────────────
@@ -833,16 +1678,13 @@ async def save_memory(
 
 
 _CALLER_TTL_SECONDS = 60 * 60 * 24 * 30  # 30 days
-_CALLER_FACT_KEYS = (
-    FACT_NAME,
-    FACT_EMAIL,
-    FACT_BHK,
-    FACT_BUDGET,
-    FACT_LOCATION,
-    FACT_PURPOSE,
-    FACT_TIMELINE,
-    FACT_LANGUAGE_PREF,
-)
+
+# Salient-note codes that stay true between calls (an allergy doesn't expire
+# at hang-up). Call-specific codes — emotional_flag, complaint, callback_time,
+# deadline — are deliberately excluded so the next call doesn't re-surface a
+# stale "very upset" or a deadline that has since passed.
+_DURABLE_SALIENT_CODES = frozenset({"allergy", "family", "note", "requirement", "reference"})
+_CALLER_SALIENT_MAX = 6
 
 
 def _normalise_phone(value: Any) -> str | None:
@@ -866,10 +1708,11 @@ async def bootstrap_caller_memory(
     *,
     phone: Any,
     memory: ConversationalMemory,
+    business_type: str | None = None,
 ) -> ConversationalMemory:
     """Seed ``memory`` with facts persisted from prior calls for the
-    same caller phone. Idempotent and best-effort — failures are
-    swallowed so the live call always proceeds."""
+    same (tenant, caller phone) pair. Idempotent and best-effort —
+    failures are swallowed so the live call always proceeds."""
     norm = _normalise_phone(phone)
     if not norm:
         return memory
@@ -884,26 +1727,41 @@ async def bootstrap_caller_memory(
         return memory
     if not isinstance(payload, dict):
         return memory
+    allowed = set(_durable_fact_keys_for(business_type))
+    # Always allow language preference and core identity even if the
+    # stored business type differs from the current one.
+    allowed.update({FACT_NAME, FACT_EMAIL, FACT_LANGUAGE_PREF, FACT_COMPANY})
     facts_raw = payload.get("facts") or {}
-    if not isinstance(facts_raw, dict):
-        return memory
-    for key, fact_payload in facts_raw.items():
-        if key not in _CALLER_FACT_KEYS or not isinstance(fact_payload, dict):
-            continue
-        if memory.has(key):
-            # Live-call fact already wins; bootstrap stays out of the
-            # way. We still tag the key so the prompt knows it was
-            # known historically (not silently corrected).
+    if isinstance(facts_raw, dict):
+        for key, fact_payload in facts_raw.items():
+            if key not in allowed or not isinstance(fact_payload, dict):
+                continue
+            if memory.has(key):
+                # Live-call fact already wins; bootstrap stays out of the
+                # way. We still tag the key so the prompt knows it was
+                # known historically (not silently corrected).
+                memory.bootstrap_keys.add(key)
+                continue
+            # Bootstrap facts come in at slightly reduced confidence so an
+            # in-call correction can override them without needing the
+            # explicit "no actually" prefix.
+            fact = MemoryFact.from_dict(fact_payload)
+            fact.confidence = min(fact.confidence, 0.7)
+            fact.source_turn = -1  # signal "from before this call"
+            memory.facts[key] = fact
             memory.bootstrap_keys.add(key)
-            continue
-        # Bootstrap facts come in at slightly reduced confidence so an
-        # in-call correction can override them without needing the
-        # explicit "no actually" prefix.
-        fact = MemoryFact.from_dict(fact_payload)
-        fact.confidence = min(fact.confidence, 0.7)
-        fact.source_turn = -1  # signal "from before this call"
-        memory.facts[key] = fact
-        memory.bootstrap_keys.add(key)
+
+    # Restore durable salient notes (allergies, named family, standing
+    # requirements) tagged so the prompt block flags them as prior-call.
+    notes_raw = payload.get("salient_notes") or []
+    if isinstance(notes_raw, list):
+        for note in notes_raw:
+            if not isinstance(note, dict):
+                continue
+            restored = dict(note)
+            restored["from_prior_call"] = True
+            memory._accept_salient(restored)
+        memory.salient_notes = memory.salient_notes[-16:]
     return memory
 
 
@@ -912,24 +1770,37 @@ async def promote_to_caller_memory(
     *,
     phone: Any,
     memory: ConversationalMemory,
+    business_type: str | None = None,
 ) -> None:
     """Persist the durable subset of ``memory`` to the per-caller
-    Redis blob so the next call for the same phone opens warm."""
+    Redis blob so the next call for the same phone opens warm. Keyed by
+    the per-tenant namespace + normalised phone, so memory never leaks
+    across tenants."""
     norm = _normalise_phone(phone)
     if not norm:
         return
-    if not memory or not memory.facts:
+    if not memory:
         return
     payload_facts: dict[str, Any] = {}
-    for key in _CALLER_FACT_KEYS:
+    for key in _durable_fact_keys_for(business_type):
         fact = memory.facts.get(key)
         if fact is None or fact.value in (None, "", []):
             continue
         payload_facts[key] = fact.to_dict()
-    if not payload_facts:
+
+    payload_notes: list[dict[str, Any]] = []
+    for note in memory.salient_notes:
+        if str(note.get("code") or "") in _DURABLE_SALIENT_CODES:
+            payload_notes.append({k: note[k] for k in ("code", "text") if k in note})
+        if len(payload_notes) >= _CALLER_SALIENT_MAX:
+            break
+
+    if not payload_facts and not payload_notes:
         return
     payload = {
         "facts": payload_facts,
+        "salient_notes": payload_notes,
+        "business_type": str(business_type or "").strip().lower() or None,
         "updated_at": time.time(),
     }
     try:
@@ -974,22 +1845,47 @@ __all__ = [
     "BUCKET_OBJECTIONS",
     "BUCKET_PREFERENCES",
     "ConversationalMemory",
-    "FACT_BHK",
-    "FACT_BUDGET",
+    # Universal
     "FACT_COMPANY",
     "FACT_EMAIL",
     "FACT_FAMILY_SIZE",
     "FACT_LANGUAGE_PREF",
-    "FACT_LOCATION",
     "FACT_NAME",
     "FACT_PHONE",
-    "FACT_PROPERTY",
-    "FACT_PURPOSE",
     "FACT_REQUESTED_INFO",
     "FACT_TIMELINE",
     "FACT_URGENCY",
     "FACT_VISIT_DATE",
     "FACT_VISIT_TIME",
+    # Real estate
+    "FACT_BHK",
+    "FACT_BUDGET",
+    "FACT_LOCATION",
+    "FACT_PROPERTY",
+    "FACT_PURPOSE",
+    # Clinics
+    "FACT_APPOINTMENT_TYPE",
+    "FACT_DOCTOR_PREFERENCE",
+    "FACT_INSURANCE",
+    "FACT_PATIENT_AGE",
+    "FACT_PATIENT_GENDER",
+    "FACT_PRIOR_VISIT",
+    "FACT_SYMPTOMS",
+    # E-commerce
+    "FACT_ISSUE_TYPE",
+    "FACT_ITEM",
+    "FACT_ORDER_ID",
+    "FACT_PAYMENT_METHOD",
+    "FACT_SHIPPING_ADDRESS",
+    "FACT_TRACKING_NUMBER",
+    # Hospitality
+    "FACT_CHECK_IN",
+    "FACT_CHECK_OUT",
+    "FACT_DIETARY",
+    "FACT_OCCASION",
+    "FACT_PARTY_SIZE",
+    "FACT_ROOM_TYPE",
+    "FACT_SEATING_PREFERENCE",
     "FLOW_SLOT_TO_FACT",
     "MemoryExtractor",
     "MemoryFact",

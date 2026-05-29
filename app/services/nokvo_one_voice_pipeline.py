@@ -97,7 +97,10 @@ from app.services.sarvam_voice_service import SARVAM_LANGUAGE_OPTIONS, SarvamVoi
 from app.services.text_embedding_service import TextEmbeddingService
 from app.services.tool_flow_policy import evaluate_tool_flow_policy
 from app.services.tool_flow_questions import build_tool_flow_questions, format_field_questions_prompt
-from app.services.voice_turn_policy import evaluate_voice_turn_policy
+from app.services.voice_turn_policy import (
+    evaluate_voice_turn_policy,
+    normalize_relative_datetime_text,
+)
 
 
 _SENTENCE_RE = re.compile(r"(?<=[.!?।])\s+")
@@ -792,8 +795,17 @@ class NokvoOneVoicePipeline:
         english_text: str | None = None,
         dual_retrieval: bool = False,
     ) -> dict[str, Any]:
+        # Qdrant has been retired from the runtime pipeline. The agent now
+        # answers from: (a) the admin's single-prompt guidance, (b) the
+        # live real-estate project inventory, (c) conversational memory,
+        # and (d) the slot FSM's deterministic flow. Returning an empty
+        # chunks list short-circuits every downstream "no chunks → refuse"
+        # gate AND keeps the LLM path active because every call site also
+        # checks ``single_prompt_guidance`` / ``outbound_mode`` before
+        # refusing.
         if not query.strip():
             return {"query": query, "chunks": [], "refusal": "Empty query."}
+        return {"query": query, "chunks": [], "refusal": None}
         # Dual retrieval (code-switching path): when the call is actively
         # code-switching between two languages, embedding only the
         # "best" form of the query misses chunks indexed under the other
@@ -1132,6 +1144,34 @@ class NokvoOneVoicePipeline:
         return bool(NokvoOneVoicePipeline._single_prompt_guidance(tenant_res))
 
     @staticmethod
+    async def _projects_block_for_bundle(
+        db: AsyncSession | None,
+        bundle: "RuntimeBundle",
+    ) -> str:
+        """Return the authoritative real-estate project inventory block, or
+        an empty string for non-real-estate orgs.
+
+        The block is injected as its own top-level system section by the
+        voice prompt builder so the live agent treats it as the source of
+        truth for inventory questions (overriding any project names the
+        admin may have hardcoded into their single-prompt text)."""
+        if (bundle.organization_industry or "").lower() != "real_estate":
+            return ""
+        organization_id = getattr(bundle.organization, "id", None)
+        if organization_id is None:
+            return ""
+        try:
+            from app.services.real_estate_project_service import (
+                load_active_projects,
+                projects_prompt_section,
+            )
+
+            projects = await load_active_projects(db, organization_id)
+        except Exception:
+            return ""
+        return projects_prompt_section(projects)
+
+    @staticmethod
     async def _voice_business_context(
         db: AsyncSession | None,
         tenant_res: TenantResources,
@@ -1144,7 +1184,7 @@ class NokvoOneVoicePipeline:
 
     @staticmethod
     def _parse_appointment_date(value: Any, *, now: datetime | None = None) -> datetime.date:
-        raw = re.sub(r"\s+", " ", str(value or "").strip().lower())
+        raw = re.sub(r"\s+", " ", normalize_relative_datetime_text(str(value or "")).strip().lower())
         local_now = (now or datetime.now(timezone.utc)).astimezone(_APPOINTMENT_LOCAL_TZ)
         today = local_now.date()
         if not raw:
@@ -1223,7 +1263,7 @@ class NokvoOneVoicePipeline:
 
     @staticmethod
     def _parse_appointment_time(value: Any) -> time:
-        raw = re.sub(r"\s+", " ", str(value or "").strip().lower())
+        raw = re.sub(r"\s+", " ", normalize_relative_datetime_text(str(value or "")).strip().lower())
         if not raw:
             raise _AppointmentToolInputError("preferred_time", "What time should I note for the appointment?")
         named_times = {
@@ -1839,8 +1879,12 @@ class NokvoOneVoicePipeline:
         merged.setdefault("priority", "normal")
         if ind == "real_estate":
             merged.setdefault("issue_type", "site_visit")
-            if merged.get("location") and not merged.get("property_id"):
-                merged["property_id"] = merged["location"]
+            # "Property" column → prefer the matched project name (what the
+            # caller is actually visiting); fall back to the free-text area.
+            if not merged.get("property_id"):
+                property_value = merged.get("project_name") or merged.get("location")
+                if property_value:
+                    merged["property_id"] = property_value
         elif ind == "clinics":
             merged.setdefault("subject", merged.get("care_need") or merged.get("reason") or "Patient request")
             merged.setdefault("priority", "normal")
@@ -1859,26 +1903,36 @@ class NokvoOneVoicePipeline:
         *,
         call_surface: str | None,
         industry: str | None = None,
+        force_ticket: bool = False,
     ) -> None:
-        """Inbound calls = caller reached out for help → tickets tab.
-        Outbound calls = we reached out → leads tab.
+        """Decide which tab a macro-created record belongs in.
 
-        We rewrite ``record_type`` post-creation on records the macro created
-        as ``lead`` so they land in the right tab, AND project the data dict
-        onto the ticket schema's expected field keys so the UI renders
-        populated cells (otherwise the row looks blank and the operator
-        thinks no ticket was created)."""
-        if call_surface not in {"voice_inbound", "voice_outbound"} or not record_ids:
+        Two rules, in priority order:
+
+        * ``force_ticket`` — the *action* is tab-defining. A booked site
+          visit always belongs in the Site Visits (tickets) tab no matter
+          who placed the call, so callers set this for action-routed flows
+          (e.g. ``real_estate_site_visit``). This is what the operator means
+          by "site visits go to the Site Visits tab" — it's about what the
+          caller booked, not the call direction.
+        * Otherwise fall back to the call-direction heuristic: inbound
+          callers reached out for help → tickets tab; outbound calls we
+          initiated → leads tab (the macro already creates leads there, so
+          outbound needs no rewrite).
+
+        When we do rewrite, we flip ``record_type`` from ``lead`` to
+        ``ticket`` AND project the data dict onto the ticket schema's
+        expected field keys so the UI renders populated cells (otherwise the
+        row looks blank and the operator thinks no record was created)."""
+        if not record_ids:
+            return
+        rewrite_to_ticket = force_ticket or call_surface == "voice_inbound"
+        if not rewrite_to_ticket:
             return
         from app.models.nokvo_one_tool_record import NokvoOneToolRecord
         from app.services.nokvo_one_business_templates import STATUS_VOCABULARIES
         from sqlalchemy import select
         import uuid as _uuid
-
-        # Only inbound triggers a rewrite (lead → ticket). Outbound already
-        # creates leads and that's correct.
-        if call_surface != "voice_inbound":
-            return
 
         ticket_status = (
             (STATUS_VOCABULARIES.get((industry or "").lower(), {}).get("tickets") or {}).get("initial")
@@ -1900,7 +1954,8 @@ class NokvoOneVoicePipeline:
                 rec.status = ticket_status
                 projected = NokvoOneVoicePipeline._map_lead_data_to_ticket_shape(rec.data or {}, industry)
                 projected["routed_from"] = "lead"
-                projected["call_surface"] = call_surface
+                if call_surface:
+                    projected["call_surface"] = call_surface
                 rec.data = projected
                 db.add(rec)
                 await db.commit()
@@ -2094,6 +2149,37 @@ class NokvoOneVoicePipeline:
         )
         await db.commit()
         lead_id = result.get("id") or result.get("lead_id")
+
+        # An abandoned site-visit booking leaves partial slots in tool_flow.
+        # Carry the project + any partial date/time into the lead so a warm
+        # prospect (who started booking) isn't indistinguishable from a cold
+        # enquiry. Project also falls back to conversational memory.
+        collected = dict(tool_flow.get("collected") or {})
+
+        def _first_collected(predicate) -> Any:
+            for key, value in collected.items():
+                if value in (None, "") or not predicate(key):
+                    continue
+                return value
+            return None
+
+        project_hint = _first_collected(lambda k: "project" in k.lower()) or collected.get("property_id")
+        if not project_hint:
+            try:
+                from app.services.conversational_memory import (
+                    ConversationalMemory as _CM,
+                    FACT_PROPERTY as _FACT_PROPERTY,
+                )
+
+                _mem = _CM.from_state_blob((state or {}).get("memory") or {})
+                _fact = _mem.facts.get(_FACT_PROPERTY)
+                project_hint = _fact.value if _fact else None
+            except Exception:
+                project_hint = None
+        partial_visit_date = _first_collected(lambda k: "date" in k.lower())
+        partial_visit_time = _first_collected(lambda k: "time" in k.lower())
+        booking_abandoned = bool(project_hint or partial_visit_date or partial_visit_time)
+
         metadata = {
             "source": call_surface or "voice_call",
             "auto_created_from_call": True,
@@ -2104,6 +2190,10 @@ class NokvoOneVoicePipeline:
             "objection": memory.get("objection"),
             "budget_label": memory.get("budget"),
             "campaign_id": (campaign_context or {}).get("campaign_id"),
+            "project_name": project_hint,
+            "partial_visit_date": partial_visit_date,
+            "partial_visit_time": partial_visit_time,
+            "booking_abandoned": True if booking_abandoned else None,
         }
         if lead_id:
             await NokvoOneVoicePipeline._patch_record_metadata(
@@ -2224,14 +2314,37 @@ class NokvoOneVoicePipeline:
         flow_key = str(action.get("flow_key") or tool_flow.get("flow_key") or "")
         args: dict[str, Any] = {}
         if flow_key == "real_estate_site_visit":
+            # Resolve the flow's slots so we can (a) find date/time/name/phone/
+            # project slots by KIND (slot keys equal the admin's Site Visit
+            # Field keys, which are arbitrary), and (b) store each captured
+            # value back under its configured field key (``source_field``) so
+            # the Site Visits tab renders the admin's Site Visit Fields.
+            from app.services.tool_flow_questions import build_tool_flow_questions
+
+            sv_bundle = build_tool_flow_questions(
+                getattr(organization, "industry", None), overrides, custom_tabs
+            )
+            flow_slots = (
+                ((sv_bundle.get("flows") or {}).get("real_estate_site_visit") or {}).get("slots") or []
+            )
+
+            def _slot_keys(kind: str) -> list[str]:
+                return [str(s.get("key")) for s in flow_slots if s.get("kind") == kind]
+
+            date_keys = _slot_keys("date") or ["visit_date"]
+            time_keys = _slot_keys("time") or ["visit_time"]
+            date_raw = next((raw_args.get(k) for k in date_keys if raw_args.get(k)), None)
+            time_raw = next((raw_args.get(k) for k in time_keys if raw_args.get(k)), None)
             try:
-                visit_date = NokvoOneVoicePipeline._parse_appointment_date(raw_args.get("visit_date"))
-                visit_time = NokvoOneVoicePipeline._parse_appointment_time(raw_args.get("visit_time"))
+                visit_date = NokvoOneVoicePipeline._parse_appointment_date(date_raw)
+                visit_time = NokvoOneVoicePipeline._parse_appointment_time(time_raw)
             except _AppointmentToolInputError as exc:
                 flow_state = dict(((tool_flow.get("state_patch") or {}).get("tool_flow") or {}))
                 flow_state["active"] = True
                 flow_state["completed"] = False
-                flow_state["pending_slot"] = "visit_date" if exc.slot == "preferred_date" else "visit_time"
+                flow_state["pending_slot"] = (
+                    date_keys[0] if exc.slot == "preferred_date" else time_keys[0]
+                )
                 return {
                     "answer": exc.answer,
                     "state_patch": {"tool_flow": flow_state},
@@ -2240,17 +2353,37 @@ class NokvoOneVoicePipeline:
                     "tool_calls": [],
                 }
             visit_at = datetime.combine(visit_date, visit_time, tzinfo=_APPOINTMENT_LOCAL_TZ).astimezone(timezone.utc).isoformat()
+
+            # Field-keyed site-visit data for the Site Visits tab.
+            record_data: dict[str, Any] = {}
+            for slot in flow_slots:
+                skey = str(slot.get("key") or "")
+                fkey = str(slot.get("source_field") or skey)
+                value = raw_args.get(skey)
+                if value in (None, ""):
+                    continue
+                kind = slot.get("kind")
+                if kind == "date":
+                    record_data[fkey] = visit_date.isoformat()
+                elif kind == "time":
+                    record_data[fkey] = visit_time.strftime("%I:%M %p").lstrip("0")
+                else:
+                    record_data[fkey] = value
+
+            name_val = next((raw_args.get(k) for k in _slot_keys("name") if raw_args.get(k)), None) or raw_args.get("name")
+            phone_val = next((raw_args.get(k) for k in _slot_keys("phone") if raw_args.get(k)), None) or raw_args.get("phone")
+            project_val = next((raw_args.get(k) for k in _slot_keys("project") if raw_args.get(k)), None) or raw_args.get("project_name")
+
             args = {
-                "name": raw_args.get("name"),
-                "phone": raw_args.get("phone"),
+                "name": name_val,
+                "phone": phone_val,
                 "visit_at": visit_at,
+                "record_data": record_data,
             }
-            for key in ("email", "property_type", "budget", "location", "notes"):
-                if raw_args.get(key) not in (None, ""):
-                    args[key] = raw_args[key]
-            extra = {k: v for k, v in raw_args.items() if k not in {*args.keys(), "visit_date", "visit_time"} and v not in (None, "")}
-            if extra:
-                args["notes"] = "Additional details: " + json.dumps(extra, ensure_ascii=False, default=str)
+            if project_val not in (None, ""):
+                args["project_name"] = project_val
+            if raw_args.get("project_id") not in (None, ""):
+                args["project_id"] = raw_args["project_id"]
         else:
             args = {k: v for k, v in raw_args.items() if v not in (None, "")}
         # Same retry shape as the clinic appointment path — reads from spec.
@@ -2353,9 +2486,12 @@ class NokvoOneVoicePipeline:
         if record_metadata and created_id and db is not None:
             await NokvoOneVoicePipeline._patch_record_metadata(db, created_id, record_metadata)
 
-        # Surface-based routing: inbound calls land in tickets, outbound in
-        # leads. The macro defaults to creating leads, so we rewrite to
-        # tickets when the session is voice_inbound.
+        # Record routing. A completed site-visit booking is tab-defining: it
+        # always belongs in the Site Visits (tickets) tab regardless of who
+        # placed the call (force_ticket below). Other macros fall back to the
+        # call-direction heuristic — inbound → tickets, outbound → leads. The
+        # macro defaults to creating leads, so a rewrite only happens when the
+        # destination is the tickets tab.
         if db is not None and call_id is not None:
             try:
                 session_state = await AgentSessionStore.get_state(tenant_res, call_id) or {}
@@ -2373,7 +2509,8 @@ class NokvoOneVoicePipeline:
                         db,
                         ids_to_route,
                         call_surface=surface,
-                        industry=(business_context[0].industry if business_context else None),
+                        industry=organization.industry,
+                        force_ticket=(flow_key == "real_estate_site_visit"),
                     )
             except Exception:
                 pass
@@ -2417,6 +2554,7 @@ class NokvoOneVoicePipeline:
         outbound_memory: dict[str, Any] | None = None,
         conversational_memory_block: str | None = None,
         field_questions_prompt: str | None = None,
+        projects_block: str | None = None,
     ) -> list[dict[str, str]]:
         language_label = SarvamVoiceService.language_label(language)
         context_parts: list[str] = []
@@ -2463,6 +2601,43 @@ class NokvoOneVoicePipeline:
             if custom_guidance
             else ""
         )
+        # Real-estate project inventory — separate, high-priority section.
+        # Sits AFTER the admin guidance so any project facts it asserts
+        # override project facts the admin may have hardcoded into their
+        # single-prompt text. Empty for non-real-estate orgs.
+        _projects_inner = (projects_block or "").strip()
+        projects_block_section = (
+            "# CURRENT PROJECT INVENTORY (authoritative — overrides admin prompt)\n"
+            f"{_projects_inner}\n\n"
+            if _projects_inner
+            else ""
+        )
+        # Also pin a high-priority OVERRIDE directive at the very top of the
+        # prompt when DB projects exist. LLMs weight start-of-prompt rules
+        # heavily, and the admin's free-text "answer only from this prompt"
+        # rule fights us if we rely on positional ordering alone.
+        projects_override_directive = (
+            "# PROJECT INVENTORY OVERRIDE — NON-NEGOTIABLE\n"
+            "For this organization, the live PROJECT INVENTORY section below is "
+            "the SOLE source of truth for project / property facts (names, "
+            "locations, prices, RERA numbers, configurations, possession dates, "
+            "amenities). The admin's single-prompt may contain example or "
+            "outdated project text — IGNORE every project name, price, or "
+            "RERA number you find in that prompt. Quote only from the "
+            "PROJECT INVENTORY block. If the inventory has fewer projects "
+            "than the admin prompt suggests, that is intentional: the "
+            "inventory is the current portfolio.\n\n"
+            if _projects_inner
+            else ""
+        )
+        # Final reminder block tail — repeats the override one more time
+        # close to the user's turn so the LLM's recency bias works in our
+        # favour. Empty for non-real-estate orgs.
+        projects_final_reminder = (
+            "\nWhen the caller asks about properties, projects, what's available, or what you offer, base every fact ONLY on the PROJECT INVENTORY section. Do NOT reuse project names from the admin prompt."
+            if _projects_inner
+            else ""
+        )
 
         # Order matters: language directive sits at the very top AND is
         # repeated at the bottom — LLMs weight start and end of long prompts
@@ -2500,6 +2675,7 @@ class NokvoOneVoicePipeline:
         if _outbound_proactive:
             system_content = (
                 language_directive_top
+                + projects_override_directive
                 + "# PROSODY — make it sound human\n"
                 "Wrap EACH sentence in exactly one tone tag: [empathy]…[/empathy] (apologies, bad news), "
                 "[warm]…[/warm] (greetings, acknowledgments), [neutral]…[/neutral] (facts, default), "
@@ -2507,8 +2683,10 @@ class NokvoOneVoicePipeline:
                 "Tags are stripped before speaking — they only set the voice's tone.\n\n"
                 + campaign_rule
                 + memory_section
+                + (f"\n\n{projects_block_section}" if projects_block_section else "")
                 + (f"\n\n{outbound_fewshot_block}" if outbound_fewshot_block else "")
                 + f"\n\n# REMINDER\nReply in {language_label} with natural English code-switching for loanwords, numbers, and ₹ amounts. Keep it to 1-2 sentences."
+                + projects_final_reminder
             )
             messages: list[dict[str, str]] = [{"role": "system", "content": system_content}]
             # Outbound conversations are short by design — keep the last 6
@@ -2526,6 +2704,7 @@ class NokvoOneVoicePipeline:
 
         system_content = (
             language_directive_top
+            + projects_override_directive
             + f"You are Nokvo One's live voice agent for {brand}. Talk like a real person on a phone call — "
             "not a help-center bot.\n\n"
             "# PROSODY — make it sound human\n"
@@ -2541,6 +2720,7 @@ class NokvoOneVoicePipeline:
             "Tags are stripped before being spoken; they only control the voice's tone. Most replies are mostly [neutral] with one warm or empathic opener.\n\n"
             "# VOICE & PERSONALITY\n"
             f"{custom_guidance_section}"
+            f"{projects_block_section}"
             "- Use contractions: 'I'll', 'you're', 'let's' — same in every language (equivalent informal forms).\n"
             "- Open with quick acknowledgments — 'Sure', 'Got it', 'Of course', 'Okay', 'Right' — not 'I understand your concern' or 'Thank you for reaching out'.\n"
             "- When the caller is frustrated, hurt, or angry: ACKNOWLEDGE the feeling first in one short phrase ('Oh that's frustrating', 'Sorry to hear that'), THEN help. Don't skip to 'please provide your order number'.\n"
@@ -2598,6 +2778,7 @@ class NokvoOneVoicePipeline:
                 else ""
             )
             + f"# REMINDER\nReply in {language_label} with natural English code-switching for loanwords, numbers, and ₹ amounts."
+            + projects_final_reminder
         )
 
         messages: list[dict[str, str]] = [
@@ -3562,12 +3743,24 @@ class NokvoOneVoicePipeline:
                 # are still scraped into Redis below and the completion
                 # path still fires the tool — only the mid-flow canned
                 # question is suppressed.
-                _suppress_tool_flow_template = (_outbound_active or single_prompt_active) and not _is_completion
+                # Confirmation prompts ("Just to confirm — the name is Nihar.
+                # Is that right?") are verbatim read-back challenges the FSM
+                # needs back as a yes/no. If we let the LLM paraphrase them
+                # in single-prompt mode, the slot extractor can't reliably
+                # tell whether the next user turn confirmed or corrected.
+                # So: confirmation prompts ALWAYS play deterministically.
+                _is_confirmation_prompt = str(tool_flow.get("state_slot") or "").endswith("_confirm")
+                _suppress_tool_flow_template = (
+                    (_outbound_active or single_prompt_active)
+                    and not _is_completion
+                    and not _is_confirmation_prompt
+                )
                 if _suppress_tool_flow_template:
                     # Persist the scraped slots into the state-patch
                     # path used by the rag branch so the LLM's next
-                    # turn sees up-to-date slot data, then fall
-                    # through to LLM-driven reply.
+                    # turn sees up-to-date slot data, then route
+                    # straight to RAG/LLM so the LLM can ask the next
+                    # slot question in the admin's persona.
                     state_patch_holder: dict[str, Any] = tool_flow.get("state_patch") or {}
                     if state_patch_holder:
                         await NokvoOneVoicePipeline._apply_route_state(
@@ -3578,6 +3771,39 @@ class NokvoOneVoicePipeline:
                                 "state_slot": tool_flow.get("state_slot"),
                             },
                         )
+                    # CRITICAL: short slot-answer like "9704628375" or
+                    # "Nihar" would otherwise hit the downstream
+                    # "word-count gate" (line ~3840) and get nudged with
+                    # "Mm-hm, go on". Force the RAG/LLM route now so the
+                    # LLM uses the freshly-scraped state to compose the
+                    # next reply (acknowledge + ask next slot or
+                    # complete) instead of treating the utterance as a
+                    # vague filler.
+                    return {
+                        "route": "rag",
+                        "answer": None,
+                        "intent_result": IntentResult(
+                            intent=intent_result.intent,
+                            topic=intent_result.topic,
+                            confidence=max(intent_result.confidence, 0.9),
+                            sensitive=intent_result.sensitive,
+                            requires_live_status=intent_result.requires_live_status,
+                            reason="slot scraped in single-prompt mode; defer reply to LLM",
+                            metadata={
+                                **(intent_result.metadata or {}),
+                                "tool_flow_slot_scraped": True,
+                                "tool_flow_state_slot": tool_flow.get("state_slot"),
+                                "flow_key": tool_flow.get("flow_key"),
+                            },
+                        ),
+                        "safe_to_cache": False,
+                        "sensitive": intent_result.sensitive,
+                        "state_patch": state_patch_holder,
+                        "state_slot": tool_flow.get("state_slot"),
+                        "route_reason": tool_flow.get("reason") or "tool_flow_slot_captured",
+                        "tool_calls": (action or {}).get("tool_calls") or [],
+                        "prefetched_retrieval": None,
+                    }
                 else:
                     return {
                         "route": "template",
@@ -3765,10 +3991,16 @@ class NokvoOneVoicePipeline:
             or "।" in user_text
             or (english_text and "?" in english_text)
         )
+        # Pure-digit answers (phone numbers, OTPs, order ids, amounts) carry
+        # real information even though they only count as one "word". Spaces
+        # between groups of digits are common in dictation ("970 462 8375")
+        # so we strip whitespace before checking.
+        _digit_only = re.sub(r"\s+", "", user_text).isdigit() and len(re.sub(r"\D+", "", user_text)) >= 4
         if (
             intent_result.intent == INTENT_UNKNOWN_GENERAL
             and len(user_text.split()) < settings.AGENT_RAG_MIN_QUERY_WORDS
             and not clear_question
+            and not _digit_only
         ):
             nudge = {
                 "hi": "हाँ, बताइए।",
@@ -4051,6 +4283,7 @@ class NokvoOneVoicePipeline:
         intent_result: IntentResult = route["intent_result"]
         bundle: RuntimeBundle = turn_cache["bundle"]
         single_prompt_guidance = bundle.single_prompt_guidance
+        projects_block = await NokvoOneVoicePipeline._projects_block_for_bundle(db, bundle)
         if route["route"] in {"template", "answer_card", "policy_card"}:
             answer = route["answer"]
             await NokvoOneVoicePipeline._apply_route_state(tenant_res, call_id, route)
@@ -4199,13 +4432,25 @@ class NokvoOneVoicePipeline:
                 "intent": {"type": "RAG_ALWAYS_ON", "should_retrieve": True, "reason": "pre-indexed tenant retrieval"},
             }
 
+        project_names_for_prompt: list[str] = []
+        if (bundle.organization_industry or "").lower() == "real_estate":
+            try:
+                from app.services.real_estate_project_service import load_active_projects
+
+                _projects = await load_active_projects(db, getattr(bundle.organization, "id", None))
+                project_names_for_prompt = [p.name for p in _projects if p.name]
+            except Exception:
+                project_names_for_prompt = []
         field_questions_prompt = NokvoOneVoicePipeline._field_questions_prompt_for_bundle(
-            bundle, language=language
+            bundle, language=language, project_names=project_names_for_prompt
         )
         memory_block_v2 = ""
         if conversational_memory is not None:
             try:
-                memory_block_v2 = conversational_memory.compose_prompt_block(language=language)
+                memory_block_v2 = conversational_memory.compose_prompt_block(
+                    language=language,
+                    business_type=bundle.organization_industry,
+                )
             except Exception:
                 memory_block_v2 = ""
         messages = NokvoOneVoicePipeline._messages(
@@ -4223,6 +4468,7 @@ class NokvoOneVoicePipeline:
             ) if outbound_context is not None else None,
             conversational_memory_block=memory_block_v2,
             field_questions_prompt=field_questions_prompt,
+            projects_block=projects_block,
         )
         timeout = max(0.8, (latency_budget_ms or settings.AGENT_LLM_TIMEOUT_MS) / 1000)
         llm_error = None
@@ -4296,11 +4542,17 @@ class NokvoOneVoicePipeline:
         bundle: "RuntimeBundle",
         *,
         language: str,
+        project_names: list[str] | None = None,
     ) -> str:
         """Build the "use these exact phrasings" prompt block from the
         per-tenant runtime bundle. Empty string when no record-creation
         fields are configured — keeps the prompt lean for inbound calls
-        that aren't collecting structured records."""
+        that aren't collecting structured records.
+
+        ``project_names`` (real-estate only) is the live DB list and is
+        substituted into the Project slot's question so the LLM can't fall
+        back to a project list baked into the admin's single prompt.
+        """
         try:
             catalog = build_tool_flow_questions(
                 bundle.organization_industry,
@@ -4309,7 +4561,9 @@ class NokvoOneVoicePipeline:
             )
         except Exception:
             return ""
-        return format_field_questions_prompt(catalog, language=language)
+        return format_field_questions_prompt(
+            catalog, language=language, project_names=project_names
+        )
 
     @staticmethod
     async def stream_answer_sentences(
@@ -4357,6 +4611,7 @@ class NokvoOneVoicePipeline:
         intent_result: IntentResult = route["intent_result"]
         bundle: RuntimeBundle = turn_cache["bundle"]
         single_prompt_guidance = bundle.single_prompt_guidance
+        projects_block = await NokvoOneVoicePipeline._projects_block_for_bundle(db, bundle)
         # Outbound is a different agent — *no* inbound short-circuits apply.
         # Template smalltalk ("Sure, go ahead." for a "Yes") is the worst
         # offender: it derails the outbound flow because the agent should be
@@ -4663,13 +4918,25 @@ class NokvoOneVoicePipeline:
             }
             return
 
+        project_names_for_prompt: list[str] = []
+        if (bundle.organization_industry or "").lower() == "real_estate":
+            try:
+                from app.services.real_estate_project_service import load_active_projects
+
+                _projects = await load_active_projects(db, getattr(bundle.organization, "id", None))
+                project_names_for_prompt = [p.name for p in _projects if p.name]
+            except Exception:
+                project_names_for_prompt = []
         field_questions_prompt = NokvoOneVoicePipeline._field_questions_prompt_for_bundle(
-            bundle, language=language
+            bundle, language=language, project_names=project_names_for_prompt
         )
         memory_block = ""
         if conversational_memory is not None:
             try:
-                memory_block = conversational_memory.compose_prompt_block(language=language)
+                memory_block = conversational_memory.compose_prompt_block(
+                    language=language,
+                    business_type=bundle.organization_industry,
+                )
             except Exception:
                 memory_block = ""
         messages = NokvoOneVoicePipeline._messages(
@@ -4685,6 +4952,7 @@ class NokvoOneVoicePipeline:
             outbound_memory=prompt_outbound_memory,
             conversational_memory_block=memory_block,
             field_questions_prompt=field_questions_prompt,
+            projects_block=projects_block,
         )
         # Prosody-aware streaming: the LLM is asked to wrap each sentence in a
         # [tone]…[/tone] tag. The parser strips the tags and emits one chunk

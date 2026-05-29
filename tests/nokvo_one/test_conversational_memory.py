@@ -21,13 +21,29 @@ import pytest
 from app.services.conversational_memory import (
     BUCKET_OBJECTIONS,
     ConversationalMemory,
+    FACT_APPOINTMENT_TYPE,
     FACT_BHK,
     FACT_BUDGET,
+    FACT_CHECK_IN,
+    FACT_CHECK_OUT,
+    FACT_DIETARY,
+    FACT_DOCTOR_PREFERENCE,
     FACT_EMAIL,
+    FACT_ISSUE_TYPE,
+    FACT_ITEM,
     FACT_LOCATION,
     FACT_NAME,
+    FACT_OCCASION,
+    FACT_ORDER_ID,
+    FACT_PARTY_SIZE,
+    FACT_PATIENT_AGE,
     FACT_PHONE,
+    FACT_PROPERTY,
+    FACT_ROOM_TYPE,
+    FACT_SYMPTOMS,
+    FACT_TRACKING_NUMBER,
     FACT_VISIT_DATE,
+    FLOW_SLOT_TO_FACT,
     MemoryExtractor,
     MemoryFact,
     hydrate_flow_collected,
@@ -199,3 +215,209 @@ def test_memory_fact_dict_roundtrip_preserves_confidence() -> None:
     assert restored.confidence == 0.85
     assert restored.source_turn == 2
     assert restored.language == "en"
+
+
+# ── Per-business-type extraction ─────────────────────────────────────────────
+
+
+def test_clinics_extracts_symptoms_doctor_age() -> None:
+    m = ConversationalMemory()
+    m.merge_text(
+        "I have fever and a cough, want a follow-up with Dr. Sharma, my son is 7 years old",
+        turn_index=1,
+        business_type="clinics",
+    )
+    snap = m.snapshot()
+    assert "fever" in snap[FACT_SYMPTOMS]
+    assert snap[FACT_APPOINTMENT_TYPE] == "follow-up"
+    assert snap[FACT_DOCTOR_PREFERENCE] == "Dr. Sharma"
+    assert snap[FACT_PATIENT_AGE] == "7"
+
+
+def test_clinics_does_not_extract_real_estate_slots() -> None:
+    """A clinic call must not mine BHK/budget even if the words appear."""
+    m = ConversationalMemory()
+    m.merge_text(
+        "I want 3 BHK worth of medicine around 80 lakhs of patients",
+        turn_index=1,
+        business_type="clinics",
+    )
+    assert FACT_BHK not in m.snapshot()
+    assert FACT_BUDGET not in m.snapshot()
+
+
+def test_ecommerce_extracts_order_issue_item() -> None:
+    m = ConversationalMemory()
+    m.merge_text(
+        "My order number is ORD-12345, I ordered a blue kettle but it is damaged",
+        turn_index=1,
+        business_type="ecommerce",
+    )
+    snap = m.snapshot()
+    assert snap[FACT_ORDER_ID] == "ORD-12345"
+    assert snap[FACT_ISSUE_TYPE] == "damaged"
+    assert snap[FACT_ITEM] == "blue kettle"
+
+
+def test_ecommerce_tracking_number() -> None:
+    m = ConversationalMemory()
+    m.merge_text(
+        "tracking number AWB9988776 hasn't moved in days",
+        turn_index=1,
+        business_type="ecommerce",
+    )
+    assert m.snapshot()[FACT_TRACKING_NUMBER] == "AWB9988776"
+
+
+def test_hospitality_extracts_party_dates_occasion() -> None:
+    m = ConversationalMemory()
+    m.merge_text(
+        "Table for four, it's our anniversary and we are vegetarian",
+        turn_index=1,
+        business_type="hospitality",
+    )
+    snap = m.snapshot()
+    assert snap[FACT_PARTY_SIZE] == "4"
+    assert snap[FACT_OCCASION] == "anniversary"
+    assert snap[FACT_DIETARY] == "vegetarian"
+
+
+def test_hospitality_check_in_check_out() -> None:
+    m = ConversationalMemory()
+    m.merge_text(
+        "I'd like a deluxe room, check in on Friday and check out Sunday",
+        turn_index=1,
+        business_type="hospitality",
+    )
+    snap = m.snapshot()
+    assert snap[FACT_ROOM_TYPE] == "deluxe room"
+    assert "Friday" in snap[FACT_CHECK_IN]
+    assert "Sunday" in snap[FACT_CHECK_OUT]
+
+
+def test_unknown_business_type_runs_superset() -> None:
+    """``other`` / unknown business types capture across every domain so
+    nothing is silently dropped for an unclassified business."""
+    m = ConversationalMemory()
+    m.merge_text(
+        "My name is Ravi, order #A1B2C3 is broken",
+        turn_index=1,
+        business_type="other",
+    )
+    snap = m.snapshot()
+    assert snap[FACT_NAME] == "Ravi"
+    assert snap[FACT_ORDER_ID] == "A1B2C3"
+    assert snap[FACT_ISSUE_TYPE] == "damaged"
+
+
+def test_prompt_block_filters_by_business_type() -> None:
+    """Clinic prompt block omits real-estate slot lines and vice-versa."""
+    m = ConversationalMemory()
+    m.merge_text("my name is Asha, 3 BHK in Kompally", turn_index=1, business_type="real_estate")
+    # Cross-render the same memory under a clinic lens — BHK/location must
+    # not appear because they aren't clinic prompt keys.
+    clinic_block = m.compose_prompt_block(business_type="clinics")
+    assert "BHK preference" not in clinic_block
+    assert "Location" not in clinic_block
+    # Real-estate lens shows them.
+    re_block = m.compose_prompt_block(business_type="real_estate")
+    assert "3 BHK" in re_block
+    assert "Kompally" in re_block
+
+
+# ── In-conversation salient recall ───────────────────────────────────────────
+
+
+def test_salient_note_captures_allergy() -> None:
+    m = ConversationalMemory()
+    m.merge_text("By the way I'm allergic to penicillin", turn_index=1, business_type="clinics")
+    texts = [n.get("text") for n in m.salient_notes]
+    assert any("allergic to penicillin" in t for t in texts)
+
+
+def test_salient_notes_dedupe_repeated_statement() -> None:
+    m = ConversationalMemory()
+    m.merge_text("I'm allergic to peanuts", turn_index=1)
+    m.merge_text("Remember, I'm allergic to peanuts", turn_index=3)
+    allergy_notes = [n for n in m.salient_notes if "peanut" in str(n.get("text"))]
+    assert len(allergy_notes) == 1
+
+
+def test_salient_only_from_caller_not_agent() -> None:
+    m = ConversationalMemory()
+    m.merge_text("Please remember to bring your ID card", turn_index=1, role="assistant")
+    assert m.salient_notes == []
+
+
+def test_salient_renders_in_prompt_block() -> None:
+    m = ConversationalMemory()
+    m.merge_text("I'm allergic to shellfish", turn_index=1, business_type="hospitality")
+    block = m.compose_prompt_block(business_type="hospitality")
+    assert "Key details to remember" in block
+    assert "shellfish" in block
+
+
+def test_salient_notes_survive_state_blob_roundtrip() -> None:
+    m = ConversationalMemory()
+    m.merge_text("I'm allergic to dust", turn_index=1)
+    restored = ConversationalMemory.from_state_blob(m.to_state_blob())
+    assert any("dust" in str(n.get("text")) for n in restored.salient_notes)
+
+
+# ── Cross-call durable subset selection ──────────────────────────────────────
+
+
+def test_durable_fact_keys_are_business_specific() -> None:
+    from app.services.conversational_memory import _durable_fact_keys_for
+
+    clinic_keys = _durable_fact_keys_for("clinics")
+    assert FACT_DOCTOR_PREFERENCE in clinic_keys
+    assert FACT_BHK not in clinic_keys
+    re_keys = _durable_fact_keys_for("real_estate")
+    assert FACT_BHK in re_keys
+    assert FACT_DOCTOR_PREFERENCE not in re_keys
+    # Unknown → superset includes both.
+    other_keys = _durable_fact_keys_for("other")
+    assert FACT_BHK in other_keys
+    assert FACT_DOCTOR_PREFERENCE in other_keys
+
+
+def test_flow_slot_aliases_cover_all_domains() -> None:
+    from app.services.conversational_memory import fact_for_flow_slot
+
+    assert fact_for_flow_slot("appointment_date") == FACT_VISIT_DATE
+    assert fact_for_flow_slot("order_number") == FACT_ORDER_ID
+    assert fact_for_flow_slot("check_in_date") == FACT_CHECK_IN
+    assert fact_for_flow_slot("party_size") == FACT_PARTY_SIZE
+
+
+def test_extractor_captures_project_from_interest_cue() -> None:
+    """The caller naming a project early must be remembered so the booking
+    flow doesn't re-ask 'which project?'."""
+    m = ConversationalMemory()
+    m.merge_text("I'm interested in Raghava Skyline Residences", turn_index=1)
+    assert m.snapshot()[FACT_PROPERTY] == "Raghava Skyline Residences"
+
+
+def test_extractor_captures_project_from_project_keyword() -> None:
+    m = ConversationalMemory()
+    m.merge_text("tell me about the green meadows project", turn_index=1)
+    assert m.snapshot()[FACT_PROPERTY] == "Green Meadows"
+
+
+def test_extractor_property_ignores_generic_phrases() -> None:
+    m = ConversationalMemory()
+    m.merge_text("interested in the details and pricing", turn_index=1)
+    assert FACT_PROPERTY not in m.snapshot()
+
+
+def test_project_slot_hydrates_from_property_fact() -> None:
+    """project_name/project must map to FACT_PROPERTY so the booking flow's
+    project slot pre-fills from memory."""
+    assert FLOW_SLOT_TO_FACT["project_name"] == FACT_PROPERTY
+    assert FLOW_SLOT_TO_FACT["project"] == FACT_PROPERTY
+
+    m = ConversationalMemory()
+    m.merge_text("interested in Raghava Urban Nest", turn_index=1)
+    merged = hydrate_flow_collected({}, m)
+    assert merged["project_name"] == "Raghava Urban Nest"

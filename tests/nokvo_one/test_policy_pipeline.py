@@ -1154,6 +1154,7 @@ def test_voice_real_estate_visit_flow_executes_macro(monkeypatch):
                 "collected": {
                     "name": "Nihar",
                     "phone": "7569672503",
+                    "project_name": "Skyline Heights",
                     "visit_date": "tomorrow",
                 },
             }
@@ -1206,6 +1207,12 @@ def test_voice_real_estate_visit_flow_executes_macro(monkeypatch):
     assert calls[0]["arguments"]["name"] == "Nihar"
     assert calls[0]["arguments"]["phone"] == "7569672503"
     assert calls[0]["arguments"]["visit_at"].endswith("+00:00")
+    # The booking carries field-keyed record_data (the Site Visit Fields) so
+    # the Site Visits tab renders the captured values.
+    record_data = calls[0]["arguments"]["record_data"]
+    assert record_data["name"] == "Nihar"
+    assert record_data["project_name"] == "Skyline Heights"
+    assert record_data.get("visit_date")
     assert route["tool_calls"][0]["result"]["assigned_member_name"] == "Rahul"
     assert "Site visit request create" in route["answer"]
     assert "Rahul" in route["answer"]
@@ -1264,6 +1271,7 @@ def test_outbound_real_estate_visit_flow_executes_macro(monkeypatch):
             "collected": {
                 "name": "Nihar",
                 "phone": "7569672503",
+                "project_name": "Skyline Heights",
                 "visit_date": "tomorrow",
             },
         },
@@ -1548,6 +1556,122 @@ def test_auto_lead_skips_outbound_not_interested_hangup(monkeypatch):
     assert result is None
 
 
+# ── 9b) Site-visit records always land in the Site Visits (tickets) tab ─────
+
+
+class _FakeRoutingRecord:
+    def __init__(self, rid, record_type="lead", data=None):
+        self.id = rid
+        self.record_type = record_type
+        self.status = "qualified"
+        self.data = dict(data or {})
+
+
+class _FakeRoutingResult:
+    def __init__(self, record):
+        self._record = record
+
+    def scalars(self):
+        return self
+
+    def first(self):
+        return self._record
+
+
+class _FakeRoutingDB:
+    def __init__(self, record):
+        self._record = record
+        self.added: list[Any] = []
+        self.committed = False
+
+    async def execute(self, *args, **kwargs):
+        return _FakeRoutingResult(self._record)
+
+    def add(self, record):
+        self.added.append(record)
+
+    async def commit(self):
+        self.committed = True
+
+    async def rollback(self):
+        return None
+
+
+def test_site_visit_routes_to_ticket_tab_even_on_outbound():
+    """A booked site visit is tab-defining: it must land in the Site Visits
+    (tickets) tab regardless of call direction. force_ticket overrides the
+    outbound heuristic that would otherwise keep it a lead."""
+    rid = uuid.uuid4()
+    rec = _FakeRoutingRecord(
+        rid,
+        record_type="lead",
+        data={
+            "name": "Nihar",
+            "phone": "7569672503",
+            "project_name": "Skyline Heights",
+            "location": "Kokapet",
+            "visit_date": "2026-06-01T05:30:00+00:00",
+        },
+    )
+    db = _FakeRoutingDB(rec)
+    _run(
+        NokvoOneVoicePipeline._route_record_by_surface(
+            db,
+            [rid],
+            call_surface="voice_outbound",
+            industry="real_estate",
+            force_ticket=True,
+        )
+    )
+    assert rec.record_type == "ticket"
+    assert rec.status == "open"
+    assert rec.data["issue_type"] == "site_visit"
+    # "Property" column prefers the matched project over the free-text area.
+    assert rec.data["property_id"] == "Skyline Heights"
+    assert rec.data["customer"] == "Nihar"
+    assert rec.data["routed_from"] == "lead"
+    assert db.committed is True
+
+
+def test_outbound_lead_not_rewritten_without_force():
+    """A plain outbound macro lead (no force) stays in the Leads tab."""
+    rid = uuid.uuid4()
+    rec = _FakeRoutingRecord(rid, record_type="lead", data={"name": "Nihar"})
+    db = _FakeRoutingDB(rec)
+    _run(
+        NokvoOneVoicePipeline._route_record_by_surface(
+            db,
+            [rid],
+            call_surface="voice_outbound",
+            industry="real_estate",
+            force_ticket=False,
+        )
+    )
+    assert rec.record_type == "lead"
+    assert db.committed is False
+
+
+def test_inbound_lead_rewritten_to_ticket_falls_back_to_location():
+    """Inbound heuristic still rewrites lead → ticket; with no project_name
+    the Property column falls back to the free-text area the caller gave."""
+    rid = uuid.uuid4()
+    rec = _FakeRoutingRecord(
+        rid, record_type="lead", data={"name": "Asha", "location": "Gachibowli"}
+    )
+    db = _FakeRoutingDB(rec)
+    _run(
+        NokvoOneVoicePipeline._route_record_by_surface(
+            db,
+            [rid],
+            call_surface="voice_inbound",
+            industry="real_estate",
+        )
+    )
+    assert rec.record_type == "ticket"
+    assert rec.data["property_id"] == "Gachibowli"
+    assert rec.data["issue_type"] == "site_visit"
+
+
 # ── 10) (Bonus) Extractor produces structured conditions for the matrix ─────
 
 def test_history_extractor_picks_up_order_age():
@@ -1812,6 +1936,105 @@ def test_tool_flow_name_extraction_strips_indic_danda():
     assert flow["collected"]["name"] == "निहार"
 
 
+def test_tool_flow_name_slot_rejects_booking_intent_sentence():
+    """Regression: a caller's booking-intent sentence must NOT be confirmed
+    as their name. 'Yeah, I'd like to book a site visit' should be rejected
+    so the FSM re-asks instead of recording garbage as the name."""
+    provider_status, _ = ensure_tool_flow_questions({}, "real_estate")
+    state = {
+        "tool_flow": {
+            "active": True,
+            "flow_key": "real_estate_site_visit",
+            "tool_key": "qualify_lead_and_schedule_visit",
+            "collected": {},
+            "pending_slot": "name",
+        }
+    }
+    result = evaluate_tool_flow_policy(
+        "Yeah, I'd like to book a site visit.",
+        business_type="real_estate",
+        provider_status=provider_status,
+        history=[],
+        state=state,
+        language="en",
+    )
+    # Either yields to RAG (None) or re-asks the name — but must never
+    # capture the sentence as the name or move to confirmation.
+    if result is not None:
+        flow = result["state_patch"]["tool_flow"]
+        assert not flow.get("collected", {}).get("name")
+        assert not flow.get("awaiting_name_confirmation")
+
+
+def test_tool_flow_name_slot_strips_the_name_is_prefix():
+    """'the name is Nihar' must extract 'Nihar', not echo the prefix."""
+    provider_status, _ = ensure_tool_flow_questions({}, "real_estate")
+    state = {
+        "tool_flow": {
+            "active": True,
+            "flow_key": "real_estate_site_visit",
+            "tool_key": "qualify_lead_and_schedule_visit",
+            "collected": {},
+            "pending_slot": "name",
+        }
+    }
+    result = evaluate_tool_flow_policy(
+        "the name is Nihar",
+        business_type="real_estate",
+        provider_status=provider_status,
+        history=[],
+        state=state,
+        language="en",
+    )
+    assert result is not None
+    flow = result["state_patch"]["tool_flow"]
+    assert flow["collected"]["name"] == "Nihar"
+    assert flow.get("awaiting_name_confirmation") is True
+
+
+def test_tool_flow_name_confirm_strips_you_know_discourse():
+    """During name confirmation, 'You know Nihar' extracts 'Nihar'."""
+    provider_status, _ = ensure_tool_flow_questions({}, "real_estate")
+    state = {
+        "tool_flow": {
+            "active": True,
+            "flow_key": "real_estate_site_visit",
+            "tool_key": "qualify_lead_and_schedule_visit",
+            "collected": {"name": "Yeah I'd Like To Book"},
+            "pending_slot": "name_confirm",
+            "awaiting_name_confirmation": True,
+            "name_confirmation_slot": "name",
+        }
+    }
+    result = evaluate_tool_flow_policy(
+        "You know Nihar",
+        business_type="real_estate",
+        provider_status=provider_status,
+        history=[],
+        state=state,
+        language="en",
+    )
+    assert result is not None
+    flow = result["state_patch"]["tool_flow"]
+    assert flow["collected"]["name"] == "Nihar"
+
+
+def test_extract_person_name_unit_cases():
+    """Direct unit coverage of the name extractor's accept/reject set."""
+    from app.services.tool_flow_policy import _extract_person_name as N
+
+    assert N("Nihar") == "Nihar"
+    assert N("the name is Nihar") == "Nihar"
+    assert N("You know Nihar") == "Nihar"
+    assert N("It's Nihar") == "Nihar"
+    assert N("I am Nihar Reddy") == "Nihar Reddy"
+    assert N("నా పేరు Asha") == "Asha"
+    assert N("Yeah, I'd like to book a site visit.") is None
+    assert N("Do you guys have 4 BHK?") is None
+    assert N("I'm looking for a 3 BHK") is None
+    assert N("yes please") is None
+
+
 def test_tool_flow_slot_confirm_accepts_ya():
     """After the agent proposes a slot, 'Ya' must accept it."""
     from datetime import datetime as _dt, timezone as _tz
@@ -1842,3 +2065,152 @@ def test_tool_flow_slot_confirm_accepts_ya():
     flow = result["state_patch"]["tool_flow"]
     assert flow.get("awaiting_slot_confirm") is False
     assert "proposed_slot_utc" not in flow
+
+
+# ── Regression: past-time "same slot tomorrow?" offer must not loop ─────────
+#
+# Live bug: a caller booking a site visit named a time that had already
+# passed today; the agent offered "same time tomorrow", then ignored every
+# follow-up — new time proposals AND a clear "yeah" — re-emitting the exact
+# same offer forever. Root cause: the offer set awaiting_past_time_shift but
+# left the earlier availability awaiting_slot_confirm alive, and the shift
+# reply was handled only AFTER slot extraction (so it was re-scraped as a
+# fresh time that re-triggered the offer).
+
+
+def _site_visit_collected(**overrides):
+    base = {
+        "name": "Nihar",
+        "phone": "7569672503",
+        "project_name": "Skyline Heights",
+        "visit_date": "today",
+        "visit_time": "10 AM",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_past_time_first_offer_clears_competing_slot_confirm(monkeypatch):
+    """The first past time offers a next-day shift AND clears any live
+    availability slot-confirm so the two confirmation states never coexist."""
+    import app.services.tool_flow_policy as tfp
+
+    monkeypatch.setattr(tfp, "_appointment_is_past", lambda d, t: str(d).strip().lower() == "today")
+    provider_status, _ = ensure_tool_flow_questions({}, "real_estate")
+    state = {
+        "tool_flow": {
+            "active": True,
+            "flow_key": "real_estate_site_visit",
+            "tool_key": "qualify_lead_and_schedule_visit",
+            "collected": _site_visit_collected(visit_time=None),
+            "pending_slot": "visit_time",
+            # Stale availability confirmation from an earlier disambiguation.
+            "awaiting_slot_confirm": True,
+            "proposed_slot_utc": "2026-05-28T09:30:00+00:00",
+            "proposed_slot_label": "28 May at 3:00 PM",
+        }
+    }
+    result = evaluate_tool_flow_policy(
+        "10 AM", business_type="real_estate", provider_status=provider_status,
+        history=[], state=state, language="en",
+    )
+    assert result is not None
+    assert result["state_slot"] == "date_shift_confirm"
+    flow = result["state_patch"]["tool_flow"]
+    assert flow["awaiting_past_time_shift"] is True
+    assert flow["past_shift_count"] == 1
+    # The competing availability confirm is gone.
+    assert flow.get("awaiting_slot_confirm") is False
+    assert "proposed_slot_utc" not in flow
+
+
+def test_past_time_shift_yes_books(monkeypatch):
+    """A clear 'yeah' to the offer books the proposed next-day slot."""
+    import app.services.tool_flow_policy as tfp
+
+    monkeypatch.setattr(tfp, "_appointment_is_past", lambda d, t: str(d).strip().lower() == "today")
+    provider_status, _ = ensure_tool_flow_questions({}, "real_estate")
+    state = {
+        "tool_flow": {
+            "active": True,
+            "flow_key": "real_estate_site_visit",
+            "tool_key": "qualify_lead_and_schedule_visit",
+            "collected": _site_visit_collected(),
+            "pending_slot": "visit_time",
+            "awaiting_past_time_shift": True,
+            "past_shift_count": 1,
+            "proposed_date": "2026-05-29",
+            "original_time": "10 AM",
+        }
+    }
+    result = evaluate_tool_flow_policy(
+        "Okay fine yeah", business_type="real_estate", provider_status=provider_status,
+        history=[], state=state, language="en",
+    )
+    assert result is not None
+    assert result["state_slot"] == "complete"
+    flow = result["state_patch"]["tool_flow"]
+    assert flow.get("completed") is True
+    assert flow.get("awaiting_past_time_shift") is False
+    assert flow["collected"]["visit_date"] == "2026-05-29"
+
+
+def test_past_time_repeated_proposal_hands_to_availability(monkeypatch):
+    """After one rigid shift offer, naming another past time hands off to the
+    scheduler (availability_check) instead of re-offering tomorrow forever."""
+    import app.services.tool_flow_policy as tfp
+
+    monkeypatch.setattr(tfp, "_appointment_is_past", lambda d, t: str(d).strip().lower() == "today")
+    provider_status, _ = ensure_tool_flow_questions({}, "real_estate")
+    state = {
+        "tool_flow": {
+            "active": True,
+            "flow_key": "real_estate_site_visit",
+            "tool_key": "qualify_lead_and_schedule_visit",
+            "collected": _site_visit_collected(),
+            "pending_slot": "visit_time",
+            "awaiting_past_time_shift": True,
+            "past_shift_count": 1,
+            "proposed_date": "2026-05-29",
+            "original_time": "10 AM",
+        }
+    }
+    result = evaluate_tool_flow_policy(
+        "Is 11 AM possible today?", business_type="real_estate",
+        provider_status=provider_status, history=[], state=state, language="en",
+    )
+    assert result is not None
+    assert result["intent"] == "availability_check"
+    assert result["state_slot"] == "availability_after_past"
+
+
+def test_past_time_shift_no_reasks(monkeypatch):
+    """A 'no' to the offer drops the past slot and re-asks (no loop, no
+    completion with a past time)."""
+    import app.services.tool_flow_policy as tfp
+
+    monkeypatch.setattr(tfp, "_appointment_is_past", lambda d, t: str(d).strip().lower() == "today")
+    provider_status, _ = ensure_tool_flow_questions({}, "real_estate")
+    state = {
+        "tool_flow": {
+            "active": True,
+            "flow_key": "real_estate_site_visit",
+            "tool_key": "qualify_lead_and_schedule_visit",
+            "collected": _site_visit_collected(),
+            "pending_slot": "visit_time",
+            "awaiting_past_time_shift": True,
+            "past_shift_count": 1,
+            "proposed_date": "2026-05-29",
+            "original_time": "10 AM",
+        }
+    }
+    result = evaluate_tool_flow_policy(
+        "No", business_type="real_estate", provider_status=provider_status,
+        history=[], state=state, language="en",
+    )
+    assert result is not None
+    flow = result["state_patch"]["tool_flow"]
+    assert flow.get("completed") is not True
+    assert flow.get("awaiting_past_time_shift") is False
+    # The past time was dropped so we don't book it.
+    assert not flow["collected"].get("visit_time")

@@ -39,7 +39,9 @@ def test_macros_gated_to_specific_business_types():
         "book_appointment_with_lead_capture"
     }
     assert {t.key for t in macros_for_business_type("real_estate")} == {
-        "qualify_lead_and_schedule_visit"
+        "qualify_lead_and_schedule_visit",
+        "project_search",
+        "request_brochure",
     }
     assert {t.key for t in macros_for_business_type("ecommerce")} == {
         "open_return_ticket_with_order_lookup"
@@ -245,15 +247,23 @@ def test_clinics_macro_writes_lead_and_appointment():
     assert "lead" in record_types and "appointment" in record_types
 
 
-def test_real_estate_macro_writes_lead_and_callback():
+def test_real_estate_macro_writes_site_visit_ticket_and_callback():
+    """Booking a site visit writes a TICKET (Site Visits tab) keyed by the
+    Site Visit Fields, plus a scheduling callback — not a lead."""
     db = _FakeDB()
     tool = MACRO_CATALOG["real_estate"][0]
     args = {
         "name": "John Buyer",
         "phone": "+919999999999",
         "visit_at": "2026-05-25T14:00:00Z",
-        "budget": 5000000,
-        "location": "Whitefield",
+        "project_name": "Skyline Heights",
+        "record_data": {
+            "name": "John Buyer",
+            "phone": "+919999999999",
+            "project_name": "Skyline Heights",
+            "visit_date": "2026-05-25",
+            "visit_time": "2:00 PM",
+        },
     }
     result = _run(
         PredefinedToolsService.execute(
@@ -261,9 +271,17 @@ def test_real_estate_macro_writes_lead_and_callback():
         )
     )
     assert result["ok"] is True
-    assert result["lead_status"] == "qualified"
+    assert result["record_type"] == "ticket"
+    assert result["ticket_id"]
     record_types = {getattr(o, "record_type", None) for o in db.added}
-    assert {"lead", "callback"}.issubset(record_types)
+    assert {"ticket", "callback"}.issubset(record_types)
+    assert "lead" not in record_types
+    ticket = next(o for o in db.added if getattr(o, "record_type", None) == "ticket")
+    # Data is keyed by the configured Site Visit Fields.
+    assert ticket.data["name"] == "John Buyer"
+    assert ticket.data["project_name"] == "Skyline Heights"
+    assert ticket.data["visit_date"] == "2026-05-25"
+    assert ticket.data["issue_type"] == "site_visit"
 
 
 def test_ecommerce_macro_writes_ticket_and_call_log():

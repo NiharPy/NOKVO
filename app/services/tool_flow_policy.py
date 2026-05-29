@@ -41,9 +41,31 @@ _PROPERTY_TYPE_INFER_RE = re.compile(
     r"independent\s+house|row\s+house|commercial|office\s+space|shop)\b",
     re.IGNORECASE,
 )
+# Case-insensitive: voice STT emits lowercase ("in kokapet"), so the old
+# capitalized-only pattern silently dropped every spoken location.
 _LOCATION_INFER_RE = re.compile(
-    r"\b(?:in|at|near|around)\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+){0,2})\b"
+    r"\b(?:in|at|near|around)\s+([a-zA-Z][a-zA-Z]*(?:\s+[a-zA-Z]+){0,2})\b",
+    re.IGNORECASE,
 )
+# Telugu / Hindi put the postposition AFTER the place ("Kokapet లో",
+# "Kondapur mein", "Gachibowli ke paas"). The place name itself is almost
+# always Latin even in code-switched te/hi STT, so we capture the Latin run
+# immediately before a postposition. Bare "me"/"lo" are excluded — too
+# collision-prone with English "me" / "lo".
+_LOCATION_INFER_POST_RE = re.compile(
+    r"([a-zA-Z][a-zA-Z]+(?:\s+[a-zA-Z]+){0,1})\s*"
+    # Script postpositions need no trailing \b (combining marks aren't word-
+    # boundaried); Latin ones keep \b so "mein" doesn't fire mid-word.
+    r"(?:(?:లో|లోని|దగ్గర|వద్ద|में|मे|के\s*पास)|(?:ke\s+paas|ke\s+pass|mein)\b)",
+    re.IGNORECASE,
+)
+# Tokens that follow "in/at/near" but aren't a place — keeps the inference
+# from filling the location slot with filler like "in the area".
+_LOCATION_INFER_STOPWORDS = {
+    "the", "a", "an", "this", "that", "it", "your", "our", "any", "some",
+    "area", "areas", "budget", "person", "future", "fact", "general", "mind",
+    "touch", "case", "order",
+}
 _PARTY_SIZE_INFER_RE = re.compile(
     r"\b(?:for|of|table\s+for|party\s+of|group\s+of)\s+(\d{1,2})\s*"
     r"(?:people|persons|guests|adults|pax)?\b",
@@ -117,9 +139,14 @@ def _infer_domain_slots(
         if m:
             _try_fill("property_type", m.group(1).strip())
     if "location" in kinds:
-        m = _LOCATION_INFER_RE.search(text)
+        m = _LOCATION_INFER_RE.search(text) or _LOCATION_INFER_POST_RE.search(text)
         if m:
-            _try_fill("location", m.group(1).strip())
+            place = m.group(1).strip()
+            # Drop leading filler ("the area" -> "area" -> rejected) and skip
+            # when nothing place-like remains.
+            place_tokens = [t for t in place.split() if t.lower() not in _LOCATION_INFER_STOPWORDS]
+            if place_tokens:
+                _try_fill("location", " ".join(place_tokens))
     if "party_size" in kinds:
         m = _PARTY_SIZE_INFER_RE.search(text)
         if m:
@@ -143,6 +170,13 @@ def _infer_domain_slots(
 # where STT errors are common and silent corruption is bad (wrong phone,
 # wrong order ID).
 _CONFIRMATION_KINDS = {"phone", "email", "reference_number"}
+
+# How many times we'll rigidly offer "same time on the next day" before giving
+# up on the shift and surfacing the next actually-available slot via the
+# scheduler. Caps the past-time loop: a caller who keeps naming times that have
+# already passed today gets a concrete bookable option instead of the agent
+# re-offering tomorrow forever.
+_MAX_PAST_SHIFT_OFFERS = 1
 
 
 _YES_RE = re.compile(r"\b(yes|yeah|yep|sure|ok|okay|please|book|schedule)\b|(అవును|సరే|చేయండి|బుక్|हाँ|हा|ठीक)", re.IGNORECASE)
@@ -173,13 +207,44 @@ def _time_kind_keys(bundle: dict[str, Any], flow_key: str) -> list[str]:
     ]
 
 _VISIT_INTENT_RE = re.compile(
-    r"\b(site\s+visit|visit|see\s+(?:it|property|flat|house)|view(?:ing)?|schedule\s+a\s+visit)\b|"
-    r"(విజిట్|చూడాలి|చూడాలని|సైట్\s*విజిట్|ప్రాపర్టీ\s*చూడ|देखना|विजिट|साइट\s*विजिट)",
+    r"\b(site\s+visit|visit|"
+    r"see\s+(?:it|the\s+)?(?:property|flat|house|place|project|apartment|villa|model|sample)|"
+    r"view(?:ing)?|schedule\s+a\s+visit|book\s+a\s+(?:visit|tour|viewing)|"
+    r"come\s+(?:by|over|in|down|and\s+(?:see|look|visit)|to\s+(?:see|visit|view))|"
+    r"drop\s+(?:by|in)|stop\s+by|walk[\s-]?in|"
+    r"take\s+a\s+(?:tour|look)|tour|"
+    r"show\s+me\s+(?:around|the)|look\s+at\s+(?:it|the|your)|"
+    r"check\s+(?:it|the\s+\w+)\s+out|in\s+person|"
+    # Transliterated Telugu / Hindi visit cues (Latin, so \b + IGNORECASE work).
+    r"chuda(?:li|lani|dam|ne)|choodal(?:i|ani)|chupinch(?:andi|u)|chupistara|"
+    r"raav?ali|raav?aalani|vasta(?:nu|m|ru)|vacchi\s+chuda|"
+    r"dekhna|dekhne(?:\s+(?:aana|aaunga|aaun))?|aana\s+(?:hai|chahta|chahti|chahte)|"
+    r"dikh(?:ao|aao|aiye|ayein|wado)|ghoom(?:na|ne)?)\b|"
+    # Devanagari / Telugu script visit cues.
+    r"(విజిట్|చూడాలి|చూడాలని|చూడటానికి|చూడొచ్చా|చూపించండి|రావాలి|రావాలని|టూర్|"
+    r"సైట్\s*విజిట్|ప్రాపర్టీ\s*చూడ|"
+    r"देखना|देखने|देखने\s*आना|आना\s*(?:है|चाहता|चाहती)|दिखाइए|दिखाओ|घूम|"
+    r"विजिट|साइट\s*विजिट|आकर\s*देख)",
     re.IGNORECASE,
 )
 _LEAD_INTENT_RE = re.compile(
-    r"\b(interested|looking\s+for|need\s+details|contact\s+me|call\s+me|enquiry|inquiry)\b|"
-    r"(ఆసక్తి|డీటెయిల్స్|వివరాలు|కాంటాక్ట్|संपर्क|जानकारी|दिलचस्पी)",
+    r"\b(interested|looking\s+for|"
+    r"need\s+(?:details|info(?:rmation)?|a\s+quote)|"
+    r"more\s+(?:details|info(?:rmation)?)|"
+    r"send\s+(?:me\s+)?(?:details|brochure|info(?:rmation)?|the\s+\w+)|"
+    r"contact\s+me|call\s+me\s+back|call\s+me|reach\s+(?:out\s+to\s+)?me|get\s+back\s+to\s+me|"
+    r"enquir(?:y|e|ing)|inquir(?:y|e|ing)|"
+    r"want\s+to\s+know|tell\s+me\s+(?:more|about)|"
+    r"price\s+list|quote|details?\s+about|"
+    # Transliterated Telugu / Hindi enquiry cues.
+    r"vivar(?:alu|aalu|am)|ja+n?kari|"
+    r"details?\s+kavali|brochure\s+kavali|"
+    r"call\s+chey(?:andi|u)|call\s+kar(?:ein|o|na|iye)|phone\s+chey(?:andi|u)|"
+    r"sampradinch(?:andi|u)|aasakti)\b|"
+    # Devanagari / Telugu script enquiry cues.
+    r"(ఆసక్తి|డీటెయిల్స్|వివరాలు|వివరం|ధర|రేటు|బ్రోషర్|కావాలి|"
+    r"కాల్\s*చేయండి|సంప్రదించండి|కాంటాక్ట్|"
+    r"संपर्क|जानकारी|डिटेल्स|दिलचस्पी|कीमत|रेट|ब्रोशर|कॉल\s*कर|फ़ोन\s*कर|चाहिए)",
     re.IGNORECASE,
 )
 _EMAIL_RE = re.compile(r"\b[^@\s]+@[^@\s]+\.[^@\s]+\b")
@@ -201,6 +266,126 @@ _QUESTION_SHAPED_RE = re.compile(
 
 def _clean(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip())
+
+
+# ── Name extraction ────────────────────────────────────────────────────────
+# The name slot is the most abused: callers answer it with whole sentences
+# ("Yeah, I'd like to book a site visit"), prepend discourse markers
+# ("You know Nihar"), or restate the question ("the name is Nihar"). A naive
+# "take the whole utterance" approach then confirms garbage as the name. The
+# extractor below peels discourse fillers + lead-in phrases, drops honorifics,
+# and walks tokens until a non-name word — rejecting request/filler utterances
+# outright so the FSM re-asks instead of booking under a bogus name.
+
+# Discourse fillers / titles that can precede a real name answer; stripped
+# repeatedly so "well, you know, it's Nihar" peels down to "Nihar".
+_NAME_DISCOURSE_PREFIX_RE = re.compile(
+    r"^(?:\s*(?:yeah|yes|yep|yup|no|nope|nah|ok|okay|well|so|umm?|uhh?|hmm+|"
+    r"oh|hi+|hello|hey|sure|right|alright|actually|see|look|listen|please|"
+    r"you\s+know|i\s+mean|it'?s|its|that'?s|"
+    r"mr\.?|mrs\.?|ms\.?|dr\.?)\b[\s,\.]*)+",
+    re.IGNORECASE,
+)
+
+# Lead-in phrases that explicitly introduce the speaker's name.
+_NAME_LEADIN_RE = re.compile(
+    r"^(?:"
+    r"(?:the\s+)?(?:my\s+)?name'?s|"
+    r"(?:the\s+)?(?:my\s+)?name\s+(?:is|would\s+be)|"
+    r"i\s+am|i'?m|this\s+is|myself|call\s+me|you\s+can\s+call\s+me|"
+    r"నా\s+పేరు|పేరు|మీ\s+పేరు|मेरा\s+नाम|नाम"
+    # An explicit separator (not \b): Indic combining vowel marks aren't
+    # treated as word chars, so \b fails after e.g. "పేరు".
+    r")[\s,:]+",
+    re.IGNORECASE,
+)
+
+# Honorifics / trailing discourse to drop from the tail of a name answer.
+_NAME_HONORIFIC_SUFFIX_RE = re.compile(
+    r"\s*(?:గారు|అండి|ండి|garu|sir|madam|ma'?am|ji|जी|here|speaking|calling|"
+    r"this\s+side)\.?\s*$",
+    re.IGNORECASE,
+)
+
+# Tokens that are never part of a personal name. Used to trim trailing words
+# ("Nihar speaking") and, when they appear first, to reject the whole
+# utterance as a request/filler rather than a name.
+_NAME_STOP_WORDS = {
+    "yeah", "yes", "yep", "yup", "no", "nope", "nah", "ok", "okay", "well",
+    "so", "um", "uh", "hmm", "oh", "hi", "hello", "hey", "sure", "right",
+    "alright", "actually", "please", "thanks", "thank", "you", "your",
+    "yours", "my", "me", "mine", "i", "im", "i'm", "i'd", "id", "we", "they",
+    "it", "its", "it's", "the", "a", "an", "this", "that", "these", "those",
+    "there", "here", "like", "liked", "want", "wanna", "would", "could",
+    "can", "cannot", "need", "needed", "looking", "look", "book", "booking",
+    "schedule", "scheduling", "visit", "reserve", "reservation", "check",
+    "checking", "interested", "have", "has", "had", "do", "does", "did",
+    "know", "tell", "give", "get", "got", "see", "speak", "speaking", "talk",
+    "talking", "calling", "site", "appointment", "slot", "details", "detail",
+    "info", "information", "bhk", "flat", "apartment", "villa", "project",
+    "property", "price", "budget", "name", "names", "and", "or", "but", "to",
+    "for", "of", "with", "in", "at", "on", "about", "is", "are", "was",
+    "were", "be", "guys", "help", "trying",
+}
+
+
+def _extract_person_name(raw: str) -> str | None:
+    value = _clean(raw)
+    if not value:
+        return None
+    # Peel discourse fillers and a name lead-in, alternating until stable so
+    # "well, you know, the name is Nihar" reduces to "Nihar".
+    prev: str | None = None
+    while prev != value and value:
+        prev = value
+        value = _NAME_DISCOURSE_PREFIX_RE.sub("", value)
+        value = _NAME_LEADIN_RE.sub("", value)
+    value = _NAME_HONORIFIC_SUFFIX_RE.sub("", value)
+    value = value.strip(" ,.-।॥…・「」（）'\"")
+    cleaned = _clean(value)
+    if not cleaned:
+        return None
+    lowered = cleaned.lower()
+    # Pure digits / punctuation can't be names.
+    if re.fullmatch(r"[\d\s\W]+", cleaned):
+        return None
+    # Day-of-week / relative-day answers belong to a date slot, not a name.
+    if re.search(
+        r"\b(mon|tue|wed|thu|fri|sat|sun|monday|tuesday|wednesday|thursday|"
+        r"friday|saturday|sunday|today|tomorrow|tonight|yesterday|next\s+\w+)\b",
+        lowered,
+    ):
+        return None
+    # Time-of-day phrases belong to a time slot.
+    if re.search(
+        r"\b(\d{1,2}\s*(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.))\b|"
+        r"\b(noon|midnight|morning|afternoon|evening|night)\b",
+        lowered,
+    ):
+        return None
+    # Walk tokens, stopping at the first non-name word. A stop word in first
+    # position means the utterance is a request/filler ("I'd like to book…"),
+    # so reject it entirely.
+    kept: list[str] = []
+    for tok in re.split(r"\s+", cleaned):
+        bare = re.sub(r"[^A-Za-zऀ-෿']", "", tok)
+        if not bare:
+            break
+        if bare.lower() in _NAME_STOP_WORDS:
+            break
+        kept.append(bare)
+        if len(kept) >= 3:
+            break
+    if not kept:
+        return None
+    name = " ".join(kept).strip(" '")
+    # Need at least two alphabetic characters total (rejects stray "K", "Hi").
+    if len(re.sub(r"[^A-Za-zऀ-෿]", "", name)) < 2:
+        return None
+    # Title-case pure-ASCII names; leave Indic-script names untouched.
+    if re.fullmatch(r"[A-Za-z' ]+", name):
+        name = name.title()
+    return name
 
 
 def _language(language: str | None) -> str:
@@ -277,13 +462,19 @@ def _extract_value(text: str, slot_key: str, kind: str) -> Any:
         # slot on the next turn.
         return None
     if kind == "name" or slot_key in {"name", "customer_name", "full_name"}:
-        value = re.sub(r"^(?:my\s+name\s+is|name\s+is|i\s+am|this\s+is|నా\s+పేరు|పేరు|मेरा\s+नाम)\s+", "", value, flags=re.IGNORECASE)
-        value = re.sub(r"(?:గారు|అండి|ండి|sir|madam|ji|जी)\.?\s*$", "", value, flags=re.IGNORECASE)
-        # Strip Indic sentence terminators (Devanagari ।, double-danda ॥)
-        # plus ASCII punctuation so the captured name doesn't carry STT
-        # noise like "निहार।" through to the booking record.
-        value = value.strip(" ,.-।॥…・「」（）")
-        return _clean(value)
+        # Strip Indic sentence terminators / STT noise up front, then hand to
+        # the dedicated name extractor which peels discourse + lead-in phrases
+        # and rejects request/filler utterances ("I'd like to book a visit").
+        return _extract_person_name(value.strip(" ,.-।॥…・「」（）"))
+    if kind == "project" or slot_key in {"project", "project_name"}:
+        # Strip lead-in phrasing like "interested in", "I'd like", "the".
+        cleaned = re.sub(
+            r"^(?:i(?:'m| am)?\s+(?:interested in|looking at|considering)|interested in|the|in)\s+",
+            "",
+            value,
+            flags=re.IGNORECASE,
+        ).strip(" ,.-।॥")
+        return _clean(cleaned) or None
     return value
 
 
@@ -448,6 +639,74 @@ def evaluate_tool_flow_policy(
                 collected.pop(key, None)
             flow_state["collected"] = collected
 
+    # ── 2b) Caller responding to a past-time "same slot tomorrow?" offer ──
+    # Handled here, BEFORE slot extraction, so the reply is read as an answer
+    # to the offer — not re-scraped as a fresh time that re-triggers the very
+    # same offer (the bug where the agent looped "10 AM has passed…" while the
+    # caller kept proposing new times and even said "yeah"). Three outcomes:
+    #   • a different time/date in the reply → adopt it; the past-time guard
+    #     below re-evaluates and either books it or re-offers a shift,
+    #   • yes  → book the proposed next-day slot,
+    #   • no   → drop the slot and re-ask.
+    # An unparseable reply re-states the offer once. The competing
+    # availability ``awaiting_slot_confirm`` is cleared when the offer is made,
+    # so the two confirmation states never coexist and fight over the answer.
+    if flow_state.get("awaiting_past_time_shift"):
+        proposed = flow_state.get("proposed_date")
+        original_time = flow_state.get("original_time")
+        shift_entities = extract_turn_entities(value, expected_slot=None)
+        new_date = shift_entities.get("date_text")
+        new_time = shift_entities.get("time_text")
+        collected = dict(flow_state.get("collected") or {})
+        if new_date or new_time:
+            flow_state["awaiting_past_time_shift"] = False
+            flow_state.pop("proposed_date", None)
+            flow_state.pop("original_time", None)
+            if new_date:
+                for key in _date_kind_keys(bundle, flow_key):
+                    collected[key] = new_date
+            if new_time:
+                for key in _time_kind_keys(bundle, flow_key):
+                    collected[key] = new_time
+            flow_state["collected"] = collected
+            # Fall through: the past-time guard re-checks the new value.
+        elif _looks_affirmative(value) and proposed:
+            flow_state["awaiting_past_time_shift"] = False
+            flow_state.pop("proposed_date", None)
+            flow_state.pop("original_time", None)
+            for key in _date_kind_keys(bundle, flow_key):
+                collected[key] = proposed
+            if original_time:
+                for key in _time_kind_keys(bundle, flow_key):
+                    collected[key] = original_time
+            flow_state["collected"] = collected
+        elif _looks_negative(value):
+            flow_state["awaiting_past_time_shift"] = False
+            flow_state.pop("proposed_date", None)
+            flow_state.pop("original_time", None)
+            for key in _date_kind_keys(bundle, flow_key) + _time_kind_keys(bundle, flow_key):
+                collected.pop(key, None)
+            flow_state["collected"] = collected
+        else:
+            # Unparseable ("hmm"): keep the offer open and re-state it once.
+            # Returning here (rather than falling through) prevents the flow
+            # from completing with a slot we already flagged as in the past.
+            reask = _shift_to_next_day_prompt(
+                next((collected.get(k) for k in _date_kind_keys(bundle, flow_key) if collected.get(k)), None),
+                original_time,
+                language,
+            )
+            if reask is not None:
+                _next_iso, _nice, reask_prompt = reask
+                return {
+                    "answer": reask_prompt,
+                    "intent": "tool_flow",
+                    "flow_key": flow_key,
+                    "state_patch": {"tool_flow": flow_state},
+                    "state_slot": "date_shift_confirm",
+                    "reason": "past-time offer awaiting a clear yes/no/time",
+                }
+
     # ── 3a) Caller answering phone/email/id confirmation ───────────────
     if flow_state.get("awaiting_id_confirmation"):
         confirmation_key = str(flow_state.get("id_confirmation_slot") or "")
@@ -585,6 +844,27 @@ def evaluate_tool_flow_policy(
         if extracted:
             collected[pending] = extracted
             flow_state["collected"] = collected
+        elif kind == "name":
+            # The caller's reply didn't pass the name extractor (likely
+            # they answered a later slot like "Tuesday" or "10 AM" while
+            # the FSM was still on name). Try to opportunistically capture
+            # it into the appropriate date/time slot so the agent isn't
+            # forced to re-ask the same question that triggered the bad
+            # reply in the first place. The name slot stays pending.
+            stray_entities = extract_turn_entities(value, expected_slot="preferred_date")
+            if stray_entities.get("date_text"):
+                for key in _date_kind_keys(bundle, flow_key):
+                    if not collected.get(key):
+                        collected[key] = stray_entities["date_text"]
+                        flow_state["collected"] = collected
+                        break
+            stray_time = extract_turn_entities(value, expected_slot="preferred_time")
+            if stray_time.get("time_text"):
+                for key in _time_kind_keys(bundle, flow_key):
+                    if not collected.get(key):
+                        collected[key] = stray_time["time_text"]
+                        flow_state["collected"] = collected
+                        break
 
         # Domain inference: even when this slot didn't capture, the caller
         # may have volunteered budget/property_type/party_size/order_id etc.
@@ -616,15 +896,13 @@ def evaluate_tool_flow_policy(
 
             # ── 4b) Other high-stakes kinds → confirm too ─────────────────
             if kind in _CONFIRMATION_KINDS:
-                # Spec-gated skip: phone confirmation can be waived for a
-                # canonical 10-digit Indian mobile when the policy allows.
-                from app.services.agent_spec import CONFIRMATION_POLICY
-
-                skip = (
-                    kind == "phone"
-                    and CONFIRMATION_POLICY.confirm_phone_unless_high_confidence
-                    and _is_high_confidence_phone(str(extracted))
-                )
+                # We always read back phone / email / reference numbers. The
+                # previous "skip if 10-digit Indian mobile" shortcut was
+                # tempting but masked a real failure mode: a single STT digit
+                # swap (7 vs 8 vs 9) still produces a "high-confidence" 10-
+                # digit number — and the wrong record then gets the callback.
+                # A 2-second read-back is worth that guarantee.
+                skip = False
                 if not skip:
                     if kind == "phone":
                         prompt = _phone_confirmation_prompt(str(extracted), language)
@@ -652,12 +930,44 @@ def evaluate_tool_flow_policy(
             date_value = next((collected.get(k) for k in date_slots if collected.get(k)), None)
             time_value = next((collected.get(k) for k in time_slots if collected.get(k)), None)
             if date_value and time_value and _appointment_is_past(date_value, time_value):
+                shift_count = int(flow_state.get("past_shift_count") or 0)
+                if shift_count >= _MAX_PAST_SHIFT_OFFERS:
+                    # The caller keeps naming times that have already passed
+                    # today. Stop re-offering "same time tomorrow" and let the
+                    # scheduler surface the next actually-available slot. Drop
+                    # the past date/time so the availability lookup anchors on
+                    # "now" (proposing today's next free slot if any remains,
+                    # else the soonest upcoming one).
+                    for key in date_slots + time_slots:
+                        collected.pop(key, None)
+                    flow_state["collected"] = collected
+                    flow_state["awaiting_past_time_shift"] = False
+                    flow_state.pop("proposed_date", None)
+                    flow_state.pop("original_time", None)
+                    flow_state["offered_disambiguation"] = True
+                    return {
+                        "answer": None,
+                        "intent": "availability_check",
+                        "entities": {},
+                        "language": _language_code(language),
+                        "state_patch": {"tool_flow": flow_state},
+                        "state_slot": "availability_after_past",
+                        "reason": "repeated past times — offering next available slot",
+                        "flow_key": flow_key,
+                    }
                 shift = _shift_to_next_day_prompt(date_value, time_value, language)
                 if shift is not None:
                     next_iso, _nice_date, prompt = shift
                     flow_state["proposed_date"] = next_iso
                     flow_state["original_time"] = time_value
                     flow_state["awaiting_past_time_shift"] = True
+                    flow_state["past_shift_count"] = shift_count + 1
+                    # A past-time offer is the sole live confirmation now —
+                    # clear any availability slot-confirm so the next reply
+                    # routes unambiguously to the past-time handler above.
+                    flow_state["awaiting_slot_confirm"] = False
+                    flow_state.pop("proposed_slot_utc", None)
+                    flow_state.pop("proposed_slot_label", None)
                     return {
                         "answer": prompt,
                         "intent": "tool_flow",
@@ -666,25 +976,6 @@ def evaluate_tool_flow_policy(
                         "state_slot": "date_shift_confirm",
                         "reason": "tool_flow time in the past — offered same time next day",
                     }
-
-    # ── 6) Answer to "same time tomorrow?" prompt ──────────────────────
-    if flow_state.get("awaiting_past_time_shift"):
-        flow_state["awaiting_past_time_shift"] = False
-        proposed = flow_state.pop("proposed_date", None)
-        original_time = flow_state.pop("original_time", None)
-        if _looks_affirmative(value) and proposed:
-            collected = dict(flow_state.get("collected") or {})
-            for key in _date_kind_keys(bundle, flow_key):
-                collected[key] = proposed
-            if original_time:
-                for key in _time_kind_keys(bundle, flow_key):
-                    collected[key] = original_time
-            flow_state["collected"] = collected
-        else:
-            collected = dict(flow_state.get("collected") or {})
-            for key in _date_kind_keys(bundle, flow_key) + _time_kind_keys(bundle, flow_key):
-                collected.pop(key, None)
-            flow_state["collected"] = collected
 
     next_slot = _next_slot(flow_state, bundle)
     flow_state["pending_slot"] = next_slot

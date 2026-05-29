@@ -14,10 +14,12 @@ idempotency-guards each successful invocation.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 import urllib.parse as urllib_parse
 import uuid
+from copy import deepcopy
 from typing import Any
 
 import httpx
@@ -50,6 +52,7 @@ def _build_system_prompt(
     business_type: str | None,
     *,
     native_tool_calling: bool = False,
+    projects_section: str | None = None,
 ) -> str:
     sections: list[str] = [
         _section(
@@ -69,6 +72,9 @@ def _build_system_prompt(
             base_prompt if base_prompt else "No agent-specific custom prompt was provided.",
         )
     )
+
+    if projects_section:
+        sections.append(_section("Real-estate projects:", projects_section))
 
     sections.append(
         _section(
@@ -175,6 +181,39 @@ def _tool_error_reply(error: str) -> str:
     if error.startswith("Unsupported fields"):
         return "I tried to use a tool with details it does not accept. Let me ask for the needed fields clearly."
     return f"I could not complete that action: {error}"
+
+
+def _with_project_choices(
+    tools: list[PredefinedTool],
+    projects: list[Any],
+) -> list[PredefinedTool]:
+    """Return ``tools`` with any project_id/project_name field constrained to
+    the org's live project list.
+
+    Only the MODEL-FACING tool list is enriched — execution validates against
+    the freshly-resolved (lenient) catalog, so a near-miss from the model or
+    the deterministic voice FSM still resolves via fuzzy ``find_project_match``
+    instead of being hard-rejected. Tools without project fields (e.g.
+    ``leads_create``) are returned untouched.
+    """
+    if not projects:
+        return tools
+    from app.services.real_estate_project_service import project_choices_for_tool_schema
+
+    choices = project_choices_for_tool_schema(projects)
+    enriched: list[PredefinedTool] = []
+    for tool in tools:
+        props = (tool.input_schema or {}).get("properties") or {}
+        if "project_name" not in props and "project_id" not in props:
+            enriched.append(tool)
+            continue
+        new_schema = deepcopy(tool.input_schema)
+        new_props = new_schema.setdefault("properties", {})
+        for key, fragment in choices.items():
+            if key in new_props:
+                new_props[key] = {**new_props[key], **fragment}
+        enriched.append(dataclasses.replace(tool, input_schema=new_schema))
+    return enriched
 
 
 def _openai_tool_definitions(enabled_tools: list[PredefinedTool]) -> list[dict[str, Any]]:
@@ -464,12 +503,26 @@ class NokvoOneAgentRuntime:
                 enabled.append(tool)
                 enabled_keys.add(tool.key)
 
+        projects_section = ""
+        if (business_type or "").lower() == "real_estate":
+            from app.services.real_estate_project_service import (
+                load_active_projects,
+                projects_prompt_section,
+            )
+
+            projects = await load_active_projects(db, organization_id)
+            projects_section = projects_prompt_section(projects)
+            # Constrain project fields the model sees to real project names.
+            # Execution still uses the lenient ``catalog_index`` below.
+            enabled = _with_project_choices(enabled, projects)
+
         native_tool_calling = bool(enabled) and bool(settings.NOKVO_ONE_NATIVE_TOOL_CALLING)
         system_prompt = _build_system_prompt(
             agent_system_prompt,
             enabled,
             business_type,
             native_tool_calling=native_tool_calling,
+            projects_section=projects_section,
         )
         messages = [
             {"role": "system", "content": system_prompt},
@@ -502,6 +555,7 @@ class NokvoOneAgentRuntime:
                 enabled,
                 business_type,
                 native_tool_calling=False,
+                projects_section=projects_section,
             )
             messages = [
                 {"role": "system", "content": system_prompt},

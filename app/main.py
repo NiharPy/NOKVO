@@ -47,6 +47,7 @@ from app.api import (
     nokvo_one_billing,
     nokvo_one_knowledge_base,
     nokvo_one_outcomes,
+    nokvo_one_projects,
     nokvo_one_requests,
     nokvo_one_voice,
     connect_admin,
@@ -61,6 +62,7 @@ app.include_router(nokvo_one_requests.router, prefix="/api/nokvo-one", tags=["no
 app.include_router(nokvo_one_outcomes.router, prefix="/api/nokvo-one", tags=["nokvo-one-outcomes"])
 app.include_router(nokvo_one_members.router, prefix="/api/nokvo-one/members", tags=["nokvo-one-members"])
 app.include_router(nokvo_one_agents.router, prefix="/api/nokvo-one/agents", tags=["nokvo-one-agents"])
+app.include_router(nokvo_one_projects.router, prefix="/api/nokvo-one/projects", tags=["nokvo-one-projects"])
 app.include_router(
     nokvo_one_voice.router,
     prefix="/api/nokvo-one/agents",

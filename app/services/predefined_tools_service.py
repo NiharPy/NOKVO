@@ -227,8 +227,11 @@ MACRO_CATALOG: dict[str, tuple[PredefinedTool, ...]] = {
             key="qualify_lead_and_schedule_visit",
             display_name="Qualify lead + schedule site visit",
             description=(
-                "Real-estate workflow: creates a qualified lead with budget/location, "
-                "then schedules a site-visit callback. Returns lead_id + callback_id."
+                "Real-estate workflow: books a SITE VISIT — creates a site-visit "
+                "record in the Site Visits tab (captured per the org's Site Visit "
+                "Fields) and schedules a callback, assigning an available agent. "
+                "Set project_name to the project the caller asked about (matches the "
+                "projects list in the system prompt)."
             ),
             record_type=None,
             handler_name="macro_qualify_lead_and_schedule_visit",
@@ -244,6 +247,84 @@ MACRO_CATALOG: dict[str, tuple[PredefinedTool, ...]] = {
                     "location": {"type": "string", "maxLength": 200},
                     "visit_at": {"type": "string", "format": "date-time"},
                     "notes": {"type": "string", "maxLength": 2000},
+                    "project_id": {"type": "string", "maxLength": 80},
+                    "project_name": {"type": "string", "maxLength": 200},
+                    # Field-keyed site-visit data, built by the caller from the
+                    # org's Site Visit Fields so the Site Visits tab renders
+                    # populated cells. Free-form because field keys are
+                    # admin-configurable.
+                    "record_data": {"type": "object"},
+                },
+                "additionalProperties": False,
+            },
+        ),
+        PredefinedTool(
+            key="project_search",
+            display_name="Search projects",
+            description=(
+                "Real-estate inventory lookup: returns the org's ACTIVE projects "
+                "matching optional filters — max/min budget in rupees, a "
+                "configuration like '2 BHK' or 'villa', and/or an area. Use it to "
+                "answer questions like 'what do you have under 1 crore' or 'any "
+                "3 BHK in Kokapet' precisely instead of guessing from memory. "
+                "Returns name, location, configurations, price and possession for "
+                "each match."
+            ),
+            record_type=None,
+            handler_name="macro_project_search",
+            input_schema={
+                "type": "object",
+                "required": [],
+                "properties": {
+                    "budget_max": {
+                        "type": "number",
+                        "description": "Maximum budget in rupees (e.g. 10000000 for ₹1 crore).",
+                    },
+                    "budget_min": {
+                        "type": "number",
+                        "description": "Minimum budget in rupees.",
+                    },
+                    "configuration": {
+                        "type": "string",
+                        "maxLength": 40,
+                        "description": "Desired configuration, e.g. '2 BHK' or 'villa'.",
+                    },
+                    "location": {
+                        "type": "string",
+                        "maxLength": 120,
+                        "description": "Preferred area / locality.",
+                    },
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 10},
+                },
+                "additionalProperties": False,
+            },
+        ),
+        PredefinedTool(
+            key="request_brochure",
+            display_name="Log brochure request",
+            description=(
+                "Real-estate: log that the caller asked for a project's brochure "
+                "or details to be sent to them. Creates a follow-up task for the "
+                "team with the caller's phone and the matched project, and reports "
+                "whether a brochure link is on file. Use when the caller says "
+                "'send me the brochure/details'. This does NOT itself send an SMS "
+                "— a teammate dispatches it from the task."
+            ),
+            record_type=None,
+            handler_name="macro_request_brochure",
+            input_schema={
+                "type": "object",
+                "required": ["phone"],
+                "properties": {
+                    "name": {"type": "string", "maxLength": 200},
+                    "phone": {"type": "string", "minLength": 4, "maxLength": 32},
+                    "project_id": {"type": "string", "maxLength": 80},
+                    "project_name": {"type": "string", "maxLength": 200},
+                    "channel": {
+                        "type": "string",
+                        "enum": ["sms", "whatsapp", "email"],
+                        "default": "whatsapp",
+                    },
                 },
                 "additionalProperties": False,
             },
@@ -951,40 +1032,86 @@ class PredefinedToolsService:
 
     @staticmethod
     async def _handle_macro_qualify_lead_and_schedule_visit(db, org_id, user_id, tool, args):
-        lead = NokvoOneToolRecord(
+        from app.services.real_estate_project_service import (
+            find_project_match,
+            load_active_projects,
+        )
+        from app.services.nokvo_one_business_templates import STATUS_VOCABULARIES
+
+        projects = await load_active_projects(db, org_id)
+        matched = find_project_match(
+            projects,
+            project_id=args.get("project_id"),
+            project_name=args.get("project_name"),
+        )
+        project_id_str = str(matched.id) if matched else (args.get("project_id") or None)
+        project_name_str = (
+            matched.name if matched else (args.get("project_name") or None)
+        )
+
+        # The site-visit record is stored as a TICKET (the Site Visits tab),
+        # keyed by the org's configured Site Visit Fields. The caller builds
+        # ``record_data`` from those fields; fall back to a minimal shape so
+        # the macro still works if invoked without it.
+        record_data = dict(args.get("record_data") or {})
+        if not record_data:
+            record_data = {
+                "name": args["name"],
+                "phone": args["phone"],
+                "visit_date": args["visit_at"],
+            }
+            for key in ("email", "property_type", "budget", "location"):
+                if args.get(key) not in (None, ""):
+                    record_data[key] = args[key]
+        record_data.setdefault("issue_type", "site_visit")
+        record_data.setdefault("priority", "normal")
+        if project_id_str:
+            record_data["project_id"] = project_id_str
+        if matched is not None:
+            # A real project resolved — its canonical name wins over the raw
+            # spoken/STT text the flow captured, so the Site Visits tab shows
+            # the registered project name.
+            record_data["project_name"] = matched.name
+        elif project_name_str:
+            record_data.setdefault("project_name", project_name_str)
+
+        ticket_status = (
+            (STATUS_VOCABULARIES.get("real_estate", {}).get("tickets") or {}).get("initial")
+            or "open"
+        )
+        contact_phone, contact_email = _extract_contact(record_data)
+        site_visit = NokvoOneToolRecord(
             id=uuid.uuid4(),
             organization_id=org_id,
             created_by_user_id=user_id,
-            record_type="lead",
-            status="qualified",
-            data={
-                "name": args["name"],
-                "phone": args["phone"],
-                "email": args.get("email"),
-                "property_type": args.get("property_type"),
-                "budget": args.get("budget"),
-                "location": args.get("location"),
-                "visit_date": args["visit_at"],
-            },
-            contact_phone=args["phone"],
-            contact_email=args.get("email"),
+            record_type="ticket",
+            status=ticket_status,
+            data=record_data,
+            contact_phone=contact_phone or args["phone"],
+            contact_email=contact_email or args.get("email"),
         )
+        callback_data = {
+            "contact_name": args["name"],
+            "contact_phone": args["phone"],
+            "callback_at": args["visit_at"],
+            "notes": args.get("notes") or "Site visit scheduled.",
+            "related_ticket_id": str(site_visit.id),
+        }
+        if project_id_str:
+            callback_data["project_id"] = project_id_str
+        if project_name_str:
+            callback_data["project_name"] = project_name_str
+
         callback = NokvoOneToolRecord(
             id=uuid.uuid4(),
             organization_id=org_id,
             created_by_user_id=user_id,
             record_type="callback",
             status="scheduled",
-            data={
-                "contact_name": args["name"],
-                "contact_phone": args["phone"],
-                "callback_at": args["visit_at"],
-                "notes": args.get("notes") or "Site visit scheduled.",
-                "related_lead_id": str(lead.id),
-            },
+            data=callback_data,
             contact_phone=args["phone"],
         )
-        db.add(lead)
+        db.add(site_visit)
         db.add(callback)
         await db.flush()
         visit_at = _parse_tool_datetime(args["visit_at"], field_name="visit_at")
@@ -994,24 +1121,25 @@ class PredefinedToolsService:
             callback,
             request_type="site_visit",
             requested_time=visit_at,
-            summary=_assignment_summary_for(args, fallback="Real-estate site visit"),
+            summary=_assignment_summary_for(record_data, fallback="Real-estate site visit"),
             metadata={
                 "contact_name": args["name"],
                 "contact_phone": args["phone"],
                 "visit_at": args["visit_at"],
                 "callback_at": args["visit_at"],
-                "property_type": args.get("property_type"),
-                "budget": args.get("budget"),
-                "location": args.get("location"),
-                "related_lead_id": str(lead.id),
+                "related_ticket_id": str(site_visit.id),
                 "assignment_source": tool.key,
+                "project_id": project_id_str,
+                "project_name": project_name_str,
             },
         )
         scheduled_visit = (assignment or {}).get("scheduled_time") or args["visit_at"]
         return {
             "ok": True,
-            "lead_id": str(lead.id),
-            "lead_status": lead.status,
+            "id": str(site_visit.id),
+            "ticket_id": str(site_visit.id),
+            "ticket_status": site_visit.status,
+            "record_type": "ticket",
             "callback_id": str(callback.id),
             "callback_status": callback.status,
             "scheduled_for": scheduled_visit,
@@ -1020,6 +1148,101 @@ class PredefinedToolsService:
             "assignment": assignment,
             "assigned_member_name": assignment.get("selected_member_name") if assignment else None,
             "assignment_status": assignment.get("assignment_status") if assignment else None,
+            "project_id": project_id_str,
+            "project_name": project_name_str,
+        }
+
+    @staticmethod
+    async def _handle_macro_project_search(db, org_id, user_id, tool, args):
+        from app.services.real_estate_project_service import (
+            _format_price,
+            filter_projects,
+            load_active_projects,
+        )
+
+        projects = await load_active_projects(db, org_id)
+        matches = filter_projects(
+            projects,
+            budget_max=args.get("budget_max"),
+            budget_min=args.get("budget_min"),
+            configuration=args.get("configuration"),
+            location=args.get("location"),
+        )
+        limit = max(1, min(int(args.get("limit") or 10), 20))
+        limited = matches[:limit]
+        return {
+            "ok": True,
+            "count": len(matches),
+            "returned": len(limited),
+            "projects": [
+                {
+                    "id": str(p.id),
+                    "name": p.name,
+                    "location": p.location,
+                    "property_type": p.property_type,
+                    "configurations": list(p.configurations or []),
+                    "price": _format_price(p),
+                    "possession_date": p.possession_date,
+                    "rera_number": p.rera_number,
+                }
+                for p in limited
+            ],
+        }
+
+    @staticmethod
+    async def _handle_macro_request_brochure(db, org_id, user_id, tool, args):
+        from app.services.real_estate_project_service import (
+            find_project_match,
+            load_active_projects,
+        )
+
+        projects = await load_active_projects(db, org_id)
+        matched = find_project_match(
+            projects,
+            project_id=args.get("project_id"),
+            project_name=args.get("project_name"),
+        )
+        project_name_str = matched.name if matched else (args.get("project_name") or None)
+        brochure_url = matched.brochure_url if matched else None
+        channel = args.get("channel") or "whatsapp"
+
+        data: dict[str, Any] = {
+            "contact_name": args.get("name") or "Property inquiry",
+            "contact_phone": args["phone"],
+            "purpose": "brochure_dispatch",
+            "channel": channel,
+            "notes": (
+                f"Send brochure/details for {project_name_str or 'the requested project'} "
+                f"to the caller via {channel}."
+            ),
+        }
+        if matched is not None:
+            data["project_id"] = str(matched.id)
+            data["project_name"] = matched.name
+        elif project_name_str:
+            data["project_name"] = project_name_str
+        if brochure_url:
+            data["brochure_url"] = brochure_url
+
+        record = NokvoOneToolRecord(
+            id=uuid.uuid4(),
+            organization_id=org_id,
+            created_by_user_id=user_id,
+            record_type="callback",
+            status="scheduled",
+            data=data,
+            contact_phone=args["phone"],
+        )
+        db.add(record)
+        await db.flush()
+        return {
+            "ok": True,
+            "id": str(record.id),
+            "record_type": "callback",
+            "project_name": project_name_str,
+            "brochure_on_file": bool(brochure_url),
+            "channel": channel,
+            "dispatch": "queued_for_team",
         }
 
     @staticmethod

@@ -14,6 +14,76 @@ _MONTH_LOOKUP = {
 }
 
 
+# ── Telugu / Hindi relative date + time-of-day parity ────────────────────────
+# Code-switched callers say the relative date / part-of-day in their language
+# even when the rest of the utterance carries English loanwords. We map those
+# (Devanagari + Telugu script AND common Latin transliterations) onto the
+# canonical English tokens every downstream parser already understands, so a
+# Telugu / Hindi booking turn parses exactly like the English one.
+#
+# NOTE: ``kal`` (Hindi) is yesterday *or* tomorrow by context; for a forward
+# booking the only sensible reading is tomorrow, which is what we use.
+_RELATIVE_DATE_ALIASES: dict[str, str] = {
+    # today
+    "aaj": "today", "आज": "today",
+    "eeroju": "today", "iroju": "today", "ఈరోజు": "today", "ఈ రోజు": "today",
+    # tomorrow
+    "kal": "tomorrow", "कल": "tomorrow",
+    "repu": "tomorrow", "rapu": "tomorrow", "రేపు": "tomorrow", "రెపు": "tomorrow",
+    # day after tomorrow
+    "parso": "day after tomorrow", "parson": "day after tomorrow",
+    "परसों": "day after tomorrow", "परसो": "day after tomorrow",
+    "ellundi": "day after tomorrow", "ఎల్లుండి": "day after tomorrow",
+    "एल्लुंडी": "day after tomorrow",
+}
+_TIME_OF_DAY_ALIASES: dict[str, str] = {
+    # morning
+    "subah": "morning", "savere": "morning", "sawere": "morning",
+    "सुबह": "morning", "सवेरे": "morning",
+    "udayam": "morning", "poddunna": "morning", "poddunne": "morning",
+    "ఉదయం": "morning", "పొద్దున": "morning", "పొద్దున్న": "morning",
+    # afternoon
+    "dopahar": "afternoon", "dopaher": "afternoon", "दोपहर": "afternoon",
+    "madhyahnam": "afternoon", "madhyanam": "afternoon", "మధ్యాహ్నం": "afternoon",
+    # evening
+    "shaam": "evening", "शाम": "evening",
+    "sayantram": "evening", "saayantram": "evening", "సాయంత్రం": "evening",
+    # night
+    "raat": "night", "रात": "night", "ratri": "night", "రాత్రి": "night",
+}
+# Built for regex alternation: longest first so "kal subah" beats "kal".
+_RELATIVE_DATETIME_ALIAS_KEYS: list[str] = sorted(
+    [*_RELATIVE_DATE_ALIASES, *_TIME_OF_DAY_ALIASES], key=len, reverse=True
+)
+_RELATIVE_DATETIME_ALIAS_RE = re.compile(
+    "(?<!\\w)(" + "|".join(re.escape(k) for k in _RELATIVE_DATETIME_ALIAS_KEYS) + ")(?!\\w)",
+    re.IGNORECASE,
+)
+
+
+def normalize_relative_datetime_text(text: str | None) -> str:
+    """Replace hi/te relative-date and time-of-day tokens with their canonical
+    English equivalents (``kal``→``tomorrow``, ``సాయంత్రం``→``evening``) so the
+    English-native date/time parsers handle Telugu / Hindi turns unchanged.
+
+    Latin transliterations are matched case-insensitively on word boundaries;
+    Devanagari / Telugu script (which ``\\b`` doesn't bound reliably) is matched
+    with explicit non-word-character lookarounds.
+    """
+    if not text:
+        return text or ""
+
+    def _sub(match: "re.Match[str]") -> str:
+        key = match.group(0).lower()
+        return (
+            _RELATIVE_DATE_ALIASES.get(key)
+            or _TIME_OF_DAY_ALIASES.get(key)
+            or match.group(0)
+        )
+
+    return _RELATIVE_DATETIME_ALIAS_RE.sub(_sub, text)
+
+
 _PHONE_HINT_RE = re.compile(
     r"\b(phone|mobile|contact|callback|call\s+back|reach\s+(?:me|you)|number|whatsapp)\b|"
     r"(ఫోన్|మొబైల్|నంబర్|నెంబర్|సంప్రదించ|फोन|मोबाइल|नंबर|नम्बर)",
@@ -339,9 +409,13 @@ def extract_turn_entities(text: str, *, expected_slot: str | None = None) -> dic
     entities: dict[str, Any] = {}
     if phone:
         entities["phone"] = phone
-    if _DATE_RE.search(value):
-        entities["date_text"] = _DATE_RE.search(value).group(0)
-    time_match = _TIME_RE.search(value)
+    # Telugu / Hindi relative date + part-of-day get folded to canonical English
+    # so the English-native _DATE_RE / _TIME_RE match a hi/te booking turn too.
+    dt_value = normalize_relative_datetime_text(value)
+    date_match = _DATE_RE.search(dt_value)
+    if date_match:
+        entities["date_text"] = date_match.group(0)
+    time_match = _TIME_RE.search(dt_value)
     if time_match:
         entities["time_text"] = time_match.group(0)
     elif expected_slot == "preferred_time" and _BARE_TIME_RE.fullmatch(value):
@@ -376,8 +450,19 @@ def _unicode_lettersish(value: str) -> bool:
 _INDIC_TRAILING_PUNCT = "।॥।।…・「」（）"
 
 
+# Discourse fillers that can precede a bare name answer ("you know Nihar",
+# "well, Nihar"). Stripped repeatedly from the front before validation.
+_NAME_DISCOURSE_PREFIX_RE = re.compile(
+    r"^(?:\s*(?:well|so|um+|uh+|hmm+|oh|see|look|listen|actually|basically|"
+    r"you\s+know|i\s+mean|it'?s|its)\b[\s,\.]*)+",
+    re.IGNORECASE,
+)
+
+
 def _strip_name_suffix(value: str) -> str:
     value = _clean(value)
+    # Peel leading discourse fillers so "You know Nihar" → "Nihar".
+    value = _NAME_DISCOURSE_PREFIX_RE.sub("", value)
     value = re.sub(r"(?:గారు|అండి|ండి|sir|madam|ji|जी)\.?\s*$", "", value, flags=re.IGNORECASE)
     # Strip Indic sentence terminators (Devanagari ।, double-danda ॥) plus
     # ASCII punctuation. STT often appends a danda or full stop to the
@@ -483,7 +568,7 @@ def _parse_slot_date(raw: str | None) -> date | None:
     """
     if not raw:
         return None
-    text = re.sub(r"\s+", " ", str(raw).strip().lower())
+    text = re.sub(r"\s+", " ", normalize_relative_datetime_text(str(raw)).strip().lower())
     if not text:
         return None
     today = datetime.now(_APPOINTMENT_LOCAL_TZ).date()
@@ -545,7 +630,7 @@ def _parse_slot_date(raw: str | None) -> date | None:
 def _parse_slot_time(raw: str | None) -> time | None:
     if not raw:
         return None
-    text = re.sub(r"\s+", " ", str(raw).strip().lower())
+    text = re.sub(r"\s+", " ", normalize_relative_datetime_text(str(raw)).strip().lower())
     if not text:
         return None
     named = {

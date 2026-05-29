@@ -539,6 +539,96 @@ class NokvoOneAgentChatResponse(BaseModel):
     tool_calls: list[dict[str, Any]] = Field(default_factory=list)
 
 
+# ─────────── Real-estate projects ───────────
+
+
+class RealEstateProjectBase(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    location: Optional[str] = Field(default=None, max_length=500)
+    rera_number: Optional[str] = Field(default=None, max_length=120)
+    property_type: Optional[str] = Field(default=None, max_length=80)
+    price_min: Optional[float] = Field(default=None, ge=0)
+    price_max: Optional[float] = Field(default=None, ge=0)
+    price_display: Optional[str] = Field(default=None, max_length=200)
+    configurations: list[str] = Field(default_factory=list, max_length=40)
+    amenities: list[str] = Field(default_factory=list, max_length=80)
+    description: Optional[str] = Field(default=None, max_length=8000)
+    possession_date: Optional[str] = Field(default=None, max_length=80)
+    builder_name: Optional[str] = Field(default=None, max_length=200)
+    brochure_url: Optional[str] = Field(default=None, max_length=1000)
+    contact_phone: Optional[str] = Field(default=None, max_length=40)
+    extra: dict[str, Any] = Field(default_factory=dict)
+    status: Optional[str] = Field(default="active", max_length=40)
+
+    @field_validator("name", "location", "rera_number", "property_type", "price_display", "description", "possession_date", "builder_name", "brochure_url", "contact_phone")
+    @classmethod
+    def _trim_text(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        return cleaned or None
+
+    @field_validator("configurations", "amenities")
+    @classmethod
+    def _trim_list(cls, values: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        for item in values or []:
+            if item is None:
+                continue
+            text = str(item).strip()
+            if text:
+                cleaned.append(text[:120])
+        return cleaned
+
+
+class RealEstateProjectCreateRequest(RealEstateProjectBase):
+    pass
+
+
+class RealEstateProjectUpdateRequest(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=200)
+    location: Optional[str] = Field(default=None, max_length=500)
+    rera_number: Optional[str] = Field(default=None, max_length=120)
+    property_type: Optional[str] = Field(default=None, max_length=80)
+    price_min: Optional[float] = Field(default=None, ge=0)
+    price_max: Optional[float] = Field(default=None, ge=0)
+    price_display: Optional[str] = Field(default=None, max_length=200)
+    configurations: Optional[list[str]] = Field(default=None, max_length=40)
+    amenities: Optional[list[str]] = Field(default=None, max_length=80)
+    description: Optional[str] = Field(default=None, max_length=8000)
+    possession_date: Optional[str] = Field(default=None, max_length=80)
+    builder_name: Optional[str] = Field(default=None, max_length=200)
+    brochure_url: Optional[str] = Field(default=None, max_length=1000)
+    contact_phone: Optional[str] = Field(default=None, max_length=40)
+    extra: Optional[dict[str, Any]] = None
+    status: Optional[str] = Field(default=None, max_length=40)
+
+
+class RealEstateProjectResponse(BaseModel):
+    id: UUID
+    organization_id: UUID
+    name: str
+    location: Optional[str]
+    rera_number: Optional[str]
+    property_type: Optional[str]
+    price_min: Optional[float]
+    price_max: Optional[float]
+    price_display: Optional[str]
+    configurations: list[str] = Field(default_factory=list)
+    amenities: list[str] = Field(default_factory=list)
+    description: Optional[str]
+    possession_date: Optional[str]
+    builder_name: Optional[str]
+    brochure_url: Optional[str]
+    contact_phone: Optional[str]
+    extra: dict[str, Any] = Field(default_factory=dict)
+    status: str
+    created_at: datetime
+    updated_at: Optional[datetime]
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 # ─────────── Superadmin approval ───────────
 
 

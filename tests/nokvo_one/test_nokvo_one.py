@@ -1582,7 +1582,10 @@ def test_clinic_flow_triggers_availability_when_date_only(monkeypatch):
 
 
 def test_real_estate_inference_pulls_budget_and_property_type(monkeypatch):
-    """Caller volunteers details in the opener; the agent shouldn't re-ask them."""
+    """Enquiry (lead) flow: caller volunteers buyer-qualification details in
+    one sentence; the agent infers them instead of re-asking. Budget /
+    property_type / area are Lead Fields, captured for an enquiry — a site
+    visit captures only the Site Visit Fields."""
     from app.services.tool_flow_policy import evaluate_tool_flow_policy
     from datetime import datetime as _dt
     from app.services import voice_turn_policy as vtp
@@ -1592,8 +1595,8 @@ def test_real_estate_inference_pulls_budget_and_property_type(monkeypatch):
     state = {
         "tool_flow": {
             "active": True,
-            "flow_key": "real_estate_site_visit",
-            "tool_key": "qualify_lead_and_schedule_visit",
+            "flow_key": "leads_create",
+            "tool_key": "leads_create",
             "collected": {"name": "Ravi", "phone": "9177627064"},
             "pending_slot": "property_type",
         }
@@ -1843,10 +1846,16 @@ def test_pipeline_retry_loop_reads_max_attempts_from_spec():
 
 
 def test_pipeline_phone_confirm_gate_reads_policy():
+    # voice_turn_policy.py still honours the spec flag for the inbound
+    # voice path (canonical 10-digit Indian mobiles may be auto-accepted
+    # there). The slot-FSM (tool_flow_policy.py) no longer uses the skip
+    # gate — phones are always read back when captured via slot flow,
+    # because a single STT digit swap still produces a "high-confidence"
+    # number and the wrong record then receives the callback.
     voice_source = open("app/services/voice_turn_policy.py").read()
     flow_source = open("app/services/tool_flow_policy.py").read()
     assert "CONFIRMATION_POLICY.confirm_phone_unless_high_confidence" in voice_source
-    assert "CONFIRMATION_POLICY.confirm_phone_unless_high_confidence" in flow_source
+    assert "phones are always read back" in flow_source.lower() or "always read back" in flow_source.lower()
 
 
 # ─────────── Outcome closed loop ───────────
@@ -2069,14 +2078,15 @@ def test_call_surface_set_inbound_when_no_campaign(monkeypatch):
 
 
 def test_route_record_by_surface_rewrites_lead_to_ticket_for_inbound():
-    """Inbound voice surface must rewrite a `lead` record to `ticket` so it
-    lands in the tickets tab. Outbound leaves it as a lead."""
+    """A lead record is rewritten to `ticket` (so it lands in the tickets /
+    Site Visits tab) when the call is inbound OR when the action is
+    tab-defining (force_ticket, e.g. a booked site visit). A plain outbound
+    macro lead is left in the leads tab."""
     pipeline_source = open("app/services/nokvo_one_voice_pipeline.py").read()
     assert "_route_record_by_surface" in pipeline_source
-    # The helper must guard on call_surface == voice_inbound for the rewrite
-    helper_block = pipeline_source.split("_route_record_by_surface(", 1)[1]
-    # Definition of the method should clearly check the surface.
-    assert 'call_surface != "voice_inbound"' in pipeline_source
+    # The rewrite fires on the inbound surface OR an explicit force_ticket.
+    assert 'force_ticket or call_surface == "voice_inbound"' in pipeline_source
+    assert "force_ticket: bool = False" in pipeline_source
     # Only lead-type records get rewritten (appointments/callbacks/tickets stay).
     assert 'rec.record_type != "lead"' in pipeline_source
 
@@ -2084,11 +2094,13 @@ def test_route_record_by_surface_rewrites_lead_to_ticket_for_inbound():
 def test_pipeline_calls_route_after_tool_flow_execution():
     pipeline_source = open("app/services/nokvo_one_voice_pipeline.py").read()
     # The success path of _maybe_execute_tool_flow_action must invoke the
-    # routing helper with both result['lead_id'] and result['id'].
-    success_region = pipeline_source.split("Surface-based routing:", 1)[1].split("return {", 1)[0]
+    # routing helper with both result['lead_id'] and result['id'], and force
+    # the Site Visits tab for a completed site-visit booking.
+    success_region = pipeline_source.split("Record routing.", 1)[1].split("return {", 1)[0]
     assert "_route_record_by_surface" in success_region
     assert "lead_id" in success_region
     assert "call_surface" in success_region
+    assert 'force_ticket=(flow_key == "real_estate_site_visit")' in success_region
 
 
 # ─────────── Lead → Ticket projection (so the Tickets tab renders) ───────────
@@ -2116,6 +2128,23 @@ def test_lead_data_projects_onto_real_estate_ticket_schema():
     # Original keys preserved
     assert projected["name"] == "Nihar"
     assert projected["phone"] == "7569672503"
+
+
+def test_lead_data_prefers_project_name_for_property_column():
+    """When the caller named a project, the Site Visits "Property" column
+    (`property_id`) should show the project, not the free-text area."""
+    from app.services.nokvo_one_voice_pipeline import NokvoOneVoicePipeline
+
+    projected = NokvoOneVoicePipeline._map_lead_data_to_ticket_shape(
+        {
+            "name": "Nihar",
+            "project_name": "Skyline Heights",
+            "location": "Kokapet",
+        },
+        "real_estate",
+    )
+    assert projected["property_id"] == "Skyline Heights"
+    assert projected["issue_type"] == "site_visit"
 
 
 def test_lead_data_projection_industry_aware():

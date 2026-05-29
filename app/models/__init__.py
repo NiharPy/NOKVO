@@ -30,6 +30,7 @@ from app.models.connect_api_key import OrganizationApiKey
 from app.models.connect_session import ConnectSession
 from app.models.call_cost import CallCost
 from app.models.notification import Notification
+from app.models.real_estate_project import RealEstateProject
 
 # For Alembic to discover all models
 __all__ = [
@@ -62,4 +63,5 @@ __all__ = [
     "ConnectSession",
     "CallCost",
     "Notification",
+    "RealEstateProject",
 ]

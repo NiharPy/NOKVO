@@ -217,27 +217,34 @@ BUSINESS_TYPE_CONFIGS: dict[str, dict[str, Any]] = {
             {"value": "general_query", "label": "General Query"},
         ],
         "schemas": {
+            # Lead Fields — captured for an ENQUIRY (no site visit). Buyer
+            # qualification: who they are and what they're looking for.
             "leads": [
                 {"key": "name", "label": "Customer Name", "type": "text", "required": True},
                 {"key": "phone", "label": "Phone", "type": "phone", "required": True},
                 {"key": "property_type", "label": "Looking For", "type": "select", "required": False},
                 {"key": "budget", "label": "Budget", "type": "currency", "required": False},
                 {"key": "location", "label": "Area", "type": "text", "required": False},
-                {"key": "visit_date", "label": "Visit Date", "type": "date", "required": False},
                 {"key": "status", "label": "Status", "type": "select", "required": True},
             ],
+            # Site Visit Fields — captured when BOOKING a site visit. The
+            # booking tool stores values under these keys so the Site Visits
+            # tab renders them.
             "tickets": [
-                {"key": "customer", "label": "Customer Name", "type": "text", "required": True},
-                {"key": "property_id", "label": "Property", "type": "text", "required": False},
-                {"key": "issue_type", "label": "Request Type", "type": "select", "required": True},
-                {"key": "priority", "label": "Urgency", "type": "select", "required": True},
-                {"key": "assigned_to", "label": "Owner", "type": "text", "required": False},
+                {"key": "name", "label": "Customer Name", "type": "text", "required": True},
+                {"key": "phone", "label": "Phone", "type": "phone", "required": True},
+                {"key": "project_name", "label": "Project", "type": "text", "required": True},
+                {"key": "visit_date", "label": "Visit Date", "type": "date", "required": True},
+                {"key": "visit_time", "label": "Visit Time", "type": "time", "required": True},
+                {"key": "status", "label": "Status", "type": "select", "required": True},
             ],
         },
         "prompt": (
-            "Business Type: Real Estate. Prioritize property inquiries, buyer/renter qualification, "
-            "budget and location capture, site-visit scheduling, follow-ups, and ticket handling for "
-            "property or documentation issues."
+            "Business Type: Real Estate. Two outcomes only: (1) book a SITE VISIT (capture name, phone, "
+            "project, and a date/time) which goes to the Site Visits tab; or (2) if the caller only "
+            "enquires about details and does not book a visit, capture a LEAD (name, phone, what they're "
+            "looking for, budget, area) which goes to the Leads tab. Answer property questions from the "
+            "project inventory."
         ),
     },
     "clinics": {

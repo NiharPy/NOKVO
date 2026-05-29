@@ -89,6 +89,51 @@ const outcomeWizard = ref({
   agentName: '',
   isSaving: false,
 });
+
+// ── Real-estate setup wizard ────────────────────────────────────────────
+// Real-estate orgs follow a custom onboarding path after the
+// business-type screen:
+//   projects → fields (site visits + leads) → single prompt →
+//   tool selection → agent naming → ready
+// This state machine drives every step and gets reset when the wizard
+// completes or the user logs out.
+const realEstateWizardSteps = ['projects', 'fields', 'prompt', 'tools', 'naming'];
+const realEstateOnboardingStep = ref('projects');
+const realEstateAgentDraft = ref({
+  prompt: '',
+  toolKeys: [],
+  agentName: '',
+  isSaving: false,
+});
+
+const _emptyProjectDraft = () => ({
+  id: null,
+  name: '',
+  location: '',
+  rera_number: '',
+  property_type: '',
+  price_min: '',
+  price_max: '',
+  price_display: '',
+  configurations: '',
+  amenities: '',
+  description: '',
+  possession_date: '',
+  builder_name: '',
+  brochure_url: '',
+  contact_phone: '',
+});
+
+const projects = ref([]);
+const isLoadingProjects = ref(false);
+const projectDraft = ref(_emptyProjectDraft());
+const isSavingProject = ref(false);
+const isDeletingProjectId = ref(null);
+const realEstateFieldsEditor = ref({
+  leads: [],
+  tickets: [],
+  isSaving: false,
+});
 const sampleUpload = ref({
   mode: 'document',          // 'document' | 'prompt'
   file: null,
@@ -769,6 +814,10 @@ const switchPage = (page) => {
   if (page === 'nokvo_connect_step2') {
     loadConnectKeys();
   }
+  if (page === 'projects') {
+    loadProjects();
+    projectDraft.value = _emptyProjectDraft();
+  }
 };
 
 const scrollToDashboardMembers = async () => {
@@ -1271,6 +1320,14 @@ const saveBusinessType = async () => {
       else businessTypeOptions.value.push(data.business_template);
     }
     infoMsg.value = `Business Type set to ${data.business_template?.label || businessTypeLabel.value}.`;
+    // Real-estate orgs go through a custom project → fields → prompt → tools →
+    // naming wizard regardless of the v2 flag. Other industries fall back to
+    // the outcome wizard (v2) or the dashboard (v1).
+    if (data.business_template?.value === 'real_estate' || data.organization?.industry === 'real_estate') {
+      await loadWorkspace();
+      await beginRealEstateWizard();
+      return;
+    }
     if (onboardingV2Enabled.value) {
       await loadWorkspace();
       await beginOutcomeWizard();
@@ -1342,6 +1399,271 @@ const submitOutcomeWizard = async () => {
 const skipSampleUpload = () => {
   sampleUpload.value = { mode: 'document', file: null, prompt: '', isUploading: false };
   authState.value = 'ready';
+};
+
+// ── Real-estate setup wizard helpers ───────────────────────────────────
+const _projectDraftFromRecord = (project) => ({
+  id: project.id,
+  name: project.name || '',
+  location: project.location || '',
+  rera_number: project.rera_number || '',
+  property_type: project.property_type || '',
+  price_min: project.price_min == null ? '' : String(project.price_min),
+  price_max: project.price_max == null ? '' : String(project.price_max),
+  price_display: project.price_display || '',
+  configurations: Array.isArray(project.configurations) ? project.configurations.join(', ') : '',
+  amenities: Array.isArray(project.amenities) ? project.amenities.join(', ') : '',
+  description: project.description || '',
+  possession_date: project.possession_date || '',
+  builder_name: project.builder_name || '',
+  brochure_url: project.brochure_url || '',
+  contact_phone: project.contact_phone || '',
+});
+
+const _projectPayloadFromDraft = (draft) => {
+  const splitList = (value) => String(value || '')
+    .split(/[\n,]/)
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+  const numericOrNull = (value) => {
+    if (value === null || value === undefined || value === '') return null;
+    const num = Number(value);
+    return Number.isFinite(num) ? num : null;
+  };
+  const trimmed = (value) => {
+    if (value === null || value === undefined) return null;
+    const text = String(value).trim();
+    return text.length ? text : null;
+  };
+  return {
+    name: (draft.name || '').trim(),
+    location: trimmed(draft.location),
+    rera_number: trimmed(draft.rera_number),
+    property_type: trimmed(draft.property_type),
+    price_min: numericOrNull(draft.price_min),
+    price_max: numericOrNull(draft.price_max),
+    price_display: trimmed(draft.price_display),
+    configurations: splitList(draft.configurations),
+    amenities: splitList(draft.amenities),
+    description: trimmed(draft.description),
+    possession_date: trimmed(draft.possession_date),
+    builder_name: trimmed(draft.builder_name),
+    brochure_url: trimmed(draft.brochure_url),
+    contact_phone: trimmed(draft.contact_phone),
+  };
+};
+
+const loadProjects = async () => {
+  if (!isRealEstateTemplate.value) return;
+  isLoadingProjects.value = true;
+  try {
+    const { data } = await api.get('/projects/', { headers: authHeader() });
+    projects.value = Array.isArray(data) ? data : [];
+  } catch (err) {
+    errorMsg.value = extractErrorMessage(err, 'Failed to load projects.');
+  } finally {
+    isLoadingProjects.value = false;
+  }
+};
+
+const startEditProject = (project) => {
+  projectDraft.value = _projectDraftFromRecord(project);
+};
+
+const startNewProject = () => {
+  projectDraft.value = _emptyProjectDraft();
+};
+
+const saveProject = async () => {
+  const draft = projectDraft.value;
+  if (!draft.name || !draft.name.trim()) {
+    errorMsg.value = 'Project name is required.';
+    return;
+  }
+  isSavingProject.value = true;
+  errorMsg.value = '';
+  try {
+    const payload = _projectPayloadFromDraft(draft);
+    let saved;
+    if (draft.id) {
+      const { data } = await api.patch(`/projects/${draft.id}`, payload, { headers: authHeader() });
+      saved = data;
+      const idx = projects.value.findIndex((p) => p.id === saved.id);
+      if (idx >= 0) projects.value.splice(idx, 1, saved);
+    } else {
+      const { data } = await api.post('/projects/', payload, { headers: authHeader() });
+      saved = data;
+      projects.value = [saved, ...projects.value];
+    }
+    infoMsg.value = `Project "${saved.name}" saved.`;
+    projectDraft.value = _emptyProjectDraft();
+  } catch (err) {
+    errorMsg.value = extractErrorMessage(err, 'Project could not be saved.');
+  } finally {
+    isSavingProject.value = false;
+  }
+};
+
+const deleteProject = async (project) => {
+  if (!project?.id) return;
+  if (!window.confirm(`Remove project "${project.name}"? This cannot be undone.`)) return;
+  isDeletingProjectId.value = project.id;
+  try {
+    await api.delete(`/projects/${project.id}`, { headers: authHeader() });
+    projects.value = projects.value.filter((p) => p.id !== project.id);
+    if (projectDraft.value.id === project.id) {
+      projectDraft.value = _emptyProjectDraft();
+    }
+    infoMsg.value = `Project "${project.name}" removed.`;
+  } catch (err) {
+    errorMsg.value = extractErrorMessage(err, 'Project could not be deleted.');
+  } finally {
+    isDeletingProjectId.value = null;
+  }
+};
+
+const beginRealEstateWizard = async () => {
+  realEstateOnboardingStep.value = 'projects';
+  realEstateAgentDraft.value = {
+    prompt: '',
+    toolKeys: [...(toolCatalogDefaults.value || [])],
+    agentName: 'Property Assistant',
+    isSaving: false,
+  };
+  await loadProjects();
+  authState.value = 'real_estate_setup';
+};
+
+const refreshRealEstateFieldsEditor = () => {
+  const cloneSchema = (key) => schemaFor(key).map((field) => ({ ...field }));
+  realEstateFieldsEditor.value = {
+    leads: cloneSchema('leads'),
+    tickets: cloneSchema('tickets'),
+    isSaving: false,
+  };
+};
+
+const advanceRealEstateStep = async () => {
+  const current = realEstateOnboardingStep.value;
+  if (current === 'projects') {
+    if (!projects.value.length) {
+      errorMsg.value = 'Add at least one project before continuing.';
+      return;
+    }
+    refreshRealEstateFieldsEditor();
+    realEstateOnboardingStep.value = 'fields';
+    return;
+  }
+  if (current === 'fields') {
+    realEstateFieldsEditor.value.isSaving = true;
+    errorMsg.value = '';
+    try {
+      const sanitize = (fields) =>
+        (fields || []).map((field) => ({
+          key: _slugify(field.key || field.label || 'field'),
+          label: (field.label || field.key || '').trim() || 'Field',
+          type: field.type || 'text',
+          required: !!field.required,
+        }));
+      const leads = sanitize(realEstateFieldsEditor.value.leads);
+      const tickets = sanitize(realEstateFieldsEditor.value.tickets);
+      const [leadsRes] = await Promise.all([
+        api.patch('/business-template/schemas/leads', { fields: leads }, { headers: authHeader() }),
+        api.patch('/business-template/schemas/tickets', { fields: tickets }, { headers: authHeader() }),
+      ]);
+      organizationBusinessTemplate.value = leadsRes.data;
+    } catch (err) {
+      errorMsg.value = extractErrorMessage(err, 'Could not save field schemas.');
+      realEstateFieldsEditor.value.isSaving = false;
+      return;
+    } finally {
+      realEstateFieldsEditor.value.isSaving = false;
+    }
+    realEstateOnboardingStep.value = 'prompt';
+    return;
+  }
+  if (current === 'prompt') {
+    const prompt = (realEstateAgentDraft.value.prompt || '').trim();
+    if (prompt.length < 20) {
+      errorMsg.value = 'Prompt must be at least 20 characters.';
+      return;
+    }
+    realEstateOnboardingStep.value = 'tools';
+    return;
+  }
+  if (current === 'tools') {
+    realEstateOnboardingStep.value = 'naming';
+    return;
+  }
+  if (current === 'naming') {
+    await finishRealEstateWizard();
+  }
+};
+
+const goBackRealEstateStep = () => {
+  const idx = realEstateWizardSteps.indexOf(realEstateOnboardingStep.value);
+  if (idx > 0) {
+    realEstateOnboardingStep.value = realEstateWizardSteps[idx - 1];
+  }
+};
+
+const toggleRealEstateTool = (key) => {
+  const list = realEstateAgentDraft.value.toolKeys;
+  const idx = list.indexOf(key);
+  if (idx >= 0) list.splice(idx, 1);
+  else list.push(key);
+};
+
+const addRealEstateField = (tab) => {
+  realEstateFieldsEditor.value[tab].push({
+    key: `field_${realEstateFieldsEditor.value[tab].length + 1}`,
+    label: 'New field',
+    type: 'text',
+    required: false,
+  });
+};
+
+const removeRealEstateField = (tab, index) => {
+  if (realEstateFieldsEditor.value[tab].length <= 1) return;
+  realEstateFieldsEditor.value[tab].splice(index, 1);
+};
+
+const finishRealEstateWizard = async () => {
+  const prompt = (realEstateAgentDraft.value.prompt || '').trim();
+  const agentName = (realEstateAgentDraft.value.agentName || '').trim() || 'Property Assistant';
+  const toolKeys = [...new Set(realEstateAgentDraft.value.toolKeys || [])];
+  realEstateAgentDraft.value.isSaving = true;
+  errorMsg.value = '';
+  try {
+    const { data: agent } = await api.post(
+      '/agents/',
+      {
+        name: agentName,
+        description: 'Configured during real-estate onboarding.',
+        system_prompt: prompt,
+        tool_keys: toolKeys,
+      },
+      { headers: authHeader() },
+    );
+    agents.value.unshift(agent);
+    activeAgent.value = agent;
+    try {
+      await kbApi.post(
+        '/single-prompt-agent',
+        { prompt },
+        { headers: authHeader() },
+      );
+    } catch {
+      // Single-prompt write is best-effort; the agent has the prompt either way.
+    }
+    infoMsg.value = `Your agent "${agent.name}" is ready.`;
+    authState.value = 'ready';
+    await loadWorkspace();
+  } catch (err) {
+    errorMsg.value = extractErrorMessage(err, 'Could not finish setup.');
+  } finally {
+    realEstateAgentDraft.value.isSaving = false;
+  }
 };
 
 const handleSampleFileChange = (event) => {
@@ -4961,6 +5283,263 @@ onBeforeUnmount(() => {
           </div>
         </div>
 
+        <!-- REAL-ESTATE WIZARD -->
+        <div v-else-if="authState === 'real_estate_setup'" class="mfa-panel real-estate-wizard">
+          <div class="mfa-head">
+            <strong>
+              <template v-if="realEstateOnboardingStep === 'projects'">Add your projects</template>
+              <template v-else-if="realEstateOnboardingStep === 'fields'">Tune site-visit + lead fields</template>
+              <template v-else-if="realEstateOnboardingStep === 'prompt'">Write your agent prompt</template>
+              <template v-else-if="realEstateOnboardingStep === 'tools'">Pick the tools your agent can use</template>
+              <template v-else>Name your agent</template>
+            </strong>
+            <span>
+              <template v-if="realEstateOnboardingStep === 'projects'">
+                The inbound agent uses these projects to answer questions and to attach site visits + leads.
+              </template>
+              <template v-else-if="realEstateOnboardingStep === 'fields'">
+                Site visits live under the "Tickets" record type. Add the fields your team tracks.
+              </template>
+              <template v-else-if="realEstateOnboardingStep === 'prompt'">
+                One prompt is enough — describe how the agent should greet, qualify, and follow up.
+              </template>
+              <template v-else-if="realEstateOnboardingStep === 'tools'">
+                Toggle the tools the agent can call during live conversations.
+              </template>
+              <template v-else>
+                Pick a name your team will see in the workspace.
+              </template>
+            </span>
+          </div>
+
+          <ol class="real-estate-stepper">
+            <li v-for="(step, idx) in realEstateWizardSteps" :key="step" :class="{ active: realEstateOnboardingStep === step, done: realEstateWizardSteps.indexOf(realEstateOnboardingStep) > idx }">
+              <span class="re-step-number">{{ idx + 1 }}</span>
+              <span class="re-step-label">{{ step === 'projects' ? 'Projects' : step === 'fields' ? 'Fields' : step === 'prompt' ? 'Prompt' : step === 'tools' ? 'Tools' : 'Name' }}</span>
+            </li>
+          </ol>
+
+          <!-- STEP 1: Projects -->
+          <div v-if="realEstateOnboardingStep === 'projects'" class="re-wizard-step">
+            <div v-if="projects.length" class="re-project-list">
+              <article v-for="project in projects" :key="project.id" class="re-project-card">
+                <div class="re-project-card-head">
+                  <strong>{{ project.name }}</strong>
+                  <div class="re-project-card-actions">
+                    <button type="button" class="ghost-button compact" @click="startEditProject(project)">Edit</button>
+                    <button type="button" class="ghost-button compact danger" :disabled="isDeletingProjectId === project.id" @click="deleteProject(project)">Remove</button>
+                  </div>
+                </div>
+                <small v-if="project.location">📍 {{ project.location }}</small>
+                <small v-if="project.property_type">🏢 {{ project.property_type }}</small>
+                <small v-if="project.price_display">💰 {{ project.price_display }}</small>
+                <small v-if="project.rera_number">RERA: {{ project.rera_number }}</small>
+              </article>
+            </div>
+            <p v-else class="login-help compact">No projects yet. Add your first one below.</p>
+
+            <form class="re-project-form" @submit.prevent="saveProject">
+              <h4>{{ projectDraft.id ? 'Edit project' : 'Add a project' }}</h4>
+              <div class="re-form-row">
+                <label>
+                  <span>Name *</span>
+                  <input v-model="projectDraft.name" type="text" placeholder="Skyline Heights" required />
+                </label>
+                <label>
+                  <span>Location</span>
+                  <input v-model="projectDraft.location" type="text" placeholder="HSR Layout, Bangalore" />
+                </label>
+              </div>
+              <div class="re-form-row">
+                <label>
+                  <span>Property type</span>
+                  <input v-model="projectDraft.property_type" type="text" placeholder="Apartments / Villas / Plots" />
+                </label>
+                <label>
+                  <span>RERA number</span>
+                  <input v-model="projectDraft.rera_number" type="text" placeholder="PRM/KA/RERA/1251/..." />
+                </label>
+              </div>
+              <div class="re-form-row">
+                <label>
+                  <span>Price (min)</span>
+                  <input v-model="projectDraft.price_min" type="number" min="0" step="1" placeholder="9500000" />
+                </label>
+                <label>
+                  <span>Price (max)</span>
+                  <input v-model="projectDraft.price_max" type="number" min="0" step="1" placeholder="14500000" />
+                </label>
+                <label>
+                  <span>Price label</span>
+                  <input v-model="projectDraft.price_display" type="text" placeholder="₹95L – ₹1.45Cr" />
+                </label>
+              </div>
+              <div class="re-form-row">
+                <label>
+                  <span>Configurations</span>
+                  <input v-model="projectDraft.configurations" type="text" placeholder="2 BHK, 3 BHK, 4 BHK Duplex" />
+                </label>
+                <label>
+                  <span>Possession date</span>
+                  <input v-model="projectDraft.possession_date" type="text" placeholder="Dec 2027" />
+                </label>
+              </div>
+              <label class="re-form-fullwidth">
+                <span>Amenities (comma or newline separated)</span>
+                <textarea v-model="projectDraft.amenities" rows="2" placeholder="Pool, Clubhouse, EV charging, 24x7 security"></textarea>
+              </label>
+              <label class="re-form-fullwidth">
+                <span>Description / pitch</span>
+                <textarea v-model="projectDraft.description" rows="4" placeholder="Premium gated community with rooftop pool, 80% open spaces, and IGBC Gold certification. RERA-approved, OC expected Dec 2027."></textarea>
+              </label>
+              <div class="re-form-row">
+                <label>
+                  <span>Builder</span>
+                  <input v-model="projectDraft.builder_name" type="text" placeholder="Acme Developers" />
+                </label>
+                <label>
+                  <span>Brochure URL</span>
+                  <input v-model="projectDraft.brochure_url" type="url" placeholder="https://..." />
+                </label>
+                <label>
+                  <span>Site contact</span>
+                  <input v-model="projectDraft.contact_phone" type="tel" placeholder="+91 …" />
+                </label>
+              </div>
+              <div class="mfa-actions">
+                <button v-if="projectDraft.id" type="button" class="ghost-button" :disabled="isSavingProject" @click="startNewProject">Cancel edit</button>
+                <button type="submit" class="primary-button" :disabled="isSavingProject">
+                  {{ isSavingProject ? 'Saving…' : (projectDraft.id ? 'Update project' : 'Add project') }}
+                </button>
+              </div>
+            </form>
+
+            <div class="mfa-actions">
+              <button type="button" class="primary-button" :disabled="!projects.length" @click="advanceRealEstateStep">Continue →</button>
+            </div>
+          </div>
+
+          <!-- STEP 2: Fields -->
+          <div v-else-if="realEstateOnboardingStep === 'fields'" class="re-wizard-step">
+            <div class="re-fields-block">
+              <h4>Site visit fields</h4>
+              <p class="login-help compact">
+                These show up on the Site Visits tab when the agent or your team creates a record.
+              </p>
+              <div v-for="(field, index) in realEstateFieldsEditor.tickets" :key="`ticket-${index}`" class="re-field-row">
+                <input v-model="field.label" type="text" placeholder="Field label" />
+                <input v-model="field.key" type="text" placeholder="snake_case_key" />
+                <select v-model="field.type">
+                  <option v-for="type in fieldTypes" :key="type" :value="type">{{ type }}</option>
+                </select>
+                <label class="re-field-required">
+                  <input v-model="field.required" type="checkbox" /> required
+                </label>
+                <button type="button" class="ghost-button compact danger" @click="removeRealEstateField('tickets', index)">×</button>
+              </div>
+              <button type="button" class="ghost-button" @click="addRealEstateField('tickets')">+ Add site-visit field</button>
+            </div>
+
+            <div class="re-fields-block">
+              <h4>Lead fields</h4>
+              <p class="login-help compact">
+                Captured when the inbound agent qualifies a property inquiry.
+              </p>
+              <div v-for="(field, index) in realEstateFieldsEditor.leads" :key="`lead-${index}`" class="re-field-row">
+                <input v-model="field.label" type="text" placeholder="Field label" />
+                <input v-model="field.key" type="text" placeholder="snake_case_key" />
+                <select v-model="field.type">
+                  <option v-for="type in fieldTypes" :key="type" :value="type">{{ type }}</option>
+                </select>
+                <label class="re-field-required">
+                  <input v-model="field.required" type="checkbox" /> required
+                </label>
+                <button type="button" class="ghost-button compact danger" @click="removeRealEstateField('leads', index)">×</button>
+              </div>
+              <button type="button" class="ghost-button" @click="addRealEstateField('leads')">+ Add lead field</button>
+            </div>
+
+            <div class="mfa-actions">
+              <button type="button" class="ghost-button" :disabled="realEstateFieldsEditor.isSaving" @click="goBackRealEstateStep">← Back</button>
+              <button type="button" class="primary-button" :disabled="realEstateFieldsEditor.isSaving" @click="advanceRealEstateStep">
+                {{ realEstateFieldsEditor.isSaving ? 'Saving…' : 'Continue →' }}
+              </button>
+            </div>
+          </div>
+
+          <!-- STEP 3: Single prompt -->
+          <div v-else-if="realEstateOnboardingStep === 'prompt'" class="re-wizard-step">
+            <p class="login-help compact">
+              Write the instructions for your inbound agent. It will already know about your projects and field schemas — focus on tone, qualification questions, and follow-up rules.
+            </p>
+            <textarea
+              v-model="realEstateAgentDraft.prompt"
+              class="db-input sample-prompt-textarea"
+              rows="10"
+              placeholder="Example: You are Riya, the property assistant for Skyline Realty. Greet the caller warmly, capture their name and budget, suggest matching projects from the list, and offer to schedule a site visit. Never quote unverified prices."
+              :maxlength="8000"
+            ></textarea>
+            <div class="sample-prompt-meta">
+              <small>{{ (realEstateAgentDraft.prompt || '').length }} / 8000 characters</small>
+            </div>
+            <div class="mfa-actions">
+              <button type="button" class="ghost-button" @click="goBackRealEstateStep">← Back</button>
+              <button type="button" class="primary-button" :disabled="(realEstateAgentDraft.prompt || '').trim().length < 20" @click="advanceRealEstateStep">Continue →</button>
+            </div>
+          </div>
+
+          <!-- STEP 4: Tools -->
+          <div v-else-if="realEstateOnboardingStep === 'tools'" class="re-wizard-step">
+            <p class="login-help compact">
+              Pre-selected defaults work for most real-estate teams. Toggle anything you don't need.
+            </p>
+            <div class="re-tool-groups">
+              <article v-for="group in toolCatalogGroups" :key="group.label" class="re-tool-group">
+                <h4>{{ group.label }}</h4>
+                <label v-for="tool in group.tools" :key="tool.key" class="re-tool-row" :class="{ active: realEstateAgentDraft.toolKeys.includes(tool.key) }">
+                  <input
+                    type="checkbox"
+                    :checked="realEstateAgentDraft.toolKeys.includes(tool.key)"
+                    @change="toggleRealEstateTool(tool.key)"
+                  />
+                  <div>
+                    <strong>{{ tool.display_name }}</strong>
+                    <small>{{ tool.description }}</small>
+                  </div>
+                </label>
+              </article>
+            </div>
+            <div class="mfa-actions">
+              <button type="button" class="ghost-button" @click="goBackRealEstateStep">← Back</button>
+              <button type="button" class="primary-button" @click="advanceRealEstateStep">Continue →</button>
+            </div>
+          </div>
+
+          <!-- STEP 5: Agent naming -->
+          <div v-else class="re-wizard-step">
+            <div class="db-form-block outcome-name-row">
+              <label class="db-label" for="re-agent-name">Agent name</label>
+              <input
+                id="re-agent-name"
+                v-model="realEstateAgentDraft.agentName"
+                class="db-input"
+                type="text"
+                maxlength="120"
+                placeholder="Property Assistant"
+              />
+            </div>
+            <p class="login-help compact">
+              Almost done — we'll create your agent with the projects, fields, prompt, and tools you've picked.
+            </p>
+            <div class="mfa-actions">
+              <button type="button" class="ghost-button" :disabled="realEstateAgentDraft.isSaving" @click="goBackRealEstateStep">← Back</button>
+              <button type="button" class="primary-button" :disabled="realEstateAgentDraft.isSaving" @click="advanceRealEstateStep">
+                {{ realEstateAgentDraft.isSaving ? 'Creating agent…' : 'Create my agent →' }}
+              </button>
+            </div>
+          </div>
+        </div>
+
         <!-- ONBOARDING V2: SAMPLE KNOWLEDGE-BASE UPLOAD -->
         <div v-else-if="authState === 'sample_upload'" class="mfa-panel">
           <div class="mfa-head">
@@ -5221,6 +5800,16 @@ onBeforeUnmount(() => {
             <button v-if="!isMemberOnly" type="button" class="nav-page-button" :class="{ active: currentPage === 'leads' }" @click="switchPage('leads')">
               <UserPlus :size="17" />
               <span>Leads</span>
+            </button>
+            <button
+              v-if="!isMemberOnly && isRealEstateTemplate"
+              type="button"
+              class="nav-page-button"
+              :class="{ active: currentPage === 'projects' }"
+              @click="switchPage('projects')"
+            >
+              <Layers :size="17" />
+              <span>Projects</span>
             </button>
             <button
               v-if="!isMemberOnly && showAppointmentsTab"
@@ -6415,6 +7004,142 @@ onBeforeUnmount(() => {
             </div>
           </div>
         </article>
+      </section>
+
+      <!-- PROJECTS (real-estate only) -->
+      <section v-if="currentPage === 'projects'" class="dashboard-section projects-section">
+        <div class="dashboard-section-head">
+          <div>
+            <span class="section-kicker">Real-estate inventory</span>
+            <h3>Projects</h3>
+          </div>
+          <p>The inbound agent uses these projects when answering callers and when creating leads or site visits.</p>
+        </div>
+
+        <div class="projects-layout">
+          <article class="dashboard-card projects-form-card">
+            <div class="dashboard-card-glow"></div>
+            <div class="compact-card-head">
+              <div class="compact-icon-shell">
+                <Layers :size="18" />
+              </div>
+              <div>
+                <h3>{{ projectDraft.id ? 'Edit project' : 'Add a project' }}</h3>
+                <p>Capture name, RERA, price, configurations, and amenities so the agent can pitch confidently.</p>
+              </div>
+            </div>
+
+            <form class="projects-form" @submit.prevent="saveProject">
+              <div class="re-form-row">
+                <label>
+                  <span>Name *</span>
+                  <input v-model="projectDraft.name" type="text" placeholder="Skyline Heights" required />
+                </label>
+                <label>
+                  <span>Location</span>
+                  <input v-model="projectDraft.location" type="text" placeholder="HSR Layout, Bangalore" />
+                </label>
+              </div>
+              <div class="re-form-row">
+                <label>
+                  <span>Property type</span>
+                  <input v-model="projectDraft.property_type" type="text" placeholder="Apartments / Villas / Plots" />
+                </label>
+                <label>
+                  <span>RERA number</span>
+                  <input v-model="projectDraft.rera_number" type="text" placeholder="PRM/KA/RERA/1251/..." />
+                </label>
+              </div>
+              <div class="re-form-row">
+                <label>
+                  <span>Price (min)</span>
+                  <input v-model="projectDraft.price_min" type="number" min="0" step="1" />
+                </label>
+                <label>
+                  <span>Price (max)</span>
+                  <input v-model="projectDraft.price_max" type="number" min="0" step="1" />
+                </label>
+                <label>
+                  <span>Price label</span>
+                  <input v-model="projectDraft.price_display" type="text" placeholder="₹95L – ₹1.45Cr" />
+                </label>
+              </div>
+              <div class="re-form-row">
+                <label>
+                  <span>Configurations</span>
+                  <input v-model="projectDraft.configurations" type="text" placeholder="2 BHK, 3 BHK" />
+                </label>
+                <label>
+                  <span>Possession</span>
+                  <input v-model="projectDraft.possession_date" type="text" placeholder="Dec 2027" />
+                </label>
+              </div>
+              <label class="re-form-fullwidth">
+                <span>Amenities</span>
+                <textarea v-model="projectDraft.amenities" rows="2" placeholder="Pool, Clubhouse, EV charging"></textarea>
+              </label>
+              <label class="re-form-fullwidth">
+                <span>Description</span>
+                <textarea v-model="projectDraft.description" rows="4" placeholder="Premium gated community..."></textarea>
+              </label>
+              <div class="re-form-row">
+                <label>
+                  <span>Builder</span>
+                  <input v-model="projectDraft.builder_name" type="text" />
+                </label>
+                <label>
+                  <span>Brochure URL</span>
+                  <input v-model="projectDraft.brochure_url" type="url" placeholder="https://..." />
+                </label>
+                <label>
+                  <span>Site contact</span>
+                  <input v-model="projectDraft.contact_phone" type="tel" />
+                </label>
+              </div>
+
+              <div class="mfa-actions">
+                <button v-if="projectDraft.id" type="button" class="ghost-button" :disabled="isSavingProject" @click="startNewProject">Cancel edit</button>
+                <button type="submit" class="primary-button" :disabled="isSavingProject">
+                  {{ isSavingProject ? 'Saving…' : (projectDraft.id ? 'Update project' : 'Add project') }}
+                </button>
+              </div>
+            </form>
+          </article>
+
+          <article class="dashboard-card projects-list-card">
+            <div class="dashboard-card-glow"></div>
+            <div class="compact-card-head">
+              <div class="compact-icon-shell">
+                <Database :size="18" />
+              </div>
+              <div>
+                <h3>Current projects ({{ projects.length }})</h3>
+                <p>Click "Edit" to load a project into the form. Removal is permanent.</p>
+              </div>
+            </div>
+
+            <p v-if="isLoadingProjects" class="login-help compact">Loading…</p>
+            <p v-else-if="!projects.length" class="login-help compact">No projects yet — add your first one to teach the agent your inventory.</p>
+            <ul v-else class="projects-list">
+              <li v-for="project in projects" :key="project.id" class="projects-list-item">
+                <div class="projects-list-body">
+                  <strong>{{ project.name }}</strong>
+                  <small v-if="project.location">📍 {{ project.location }}</small>
+                  <small v-if="project.price_display">💰 {{ project.price_display }}</small>
+                  <small v-if="project.rera_number">RERA: {{ project.rera_number }}</small>
+                  <small v-if="project.property_type">🏢 {{ project.property_type }}</small>
+                  <small v-if="(project.configurations || []).length">{{ project.configurations.join(', ') }}</small>
+                </div>
+                <div class="projects-list-actions">
+                  <button type="button" class="ghost-button compact" @click="startEditProject(project)">Edit</button>
+                  <button type="button" class="ghost-button compact danger" :disabled="isDeletingProjectId === project.id" @click="deleteProject(project)">
+                    {{ isDeletingProjectId === project.id ? 'Removing…' : 'Remove' }}
+                  </button>
+                </div>
+              </li>
+            </ul>
+          </article>
+        </div>
       </section>
 
       <!-- AGENT STUDIO -->
@@ -11168,6 +11893,277 @@ onBeforeUnmount(() => {
 
 .outcome-wizard .mfa-head {
   margin-bottom: 1rem;
+}
+
+/* ── Real-estate onboarding wizard ─────────────────────────────────── */
+.real-estate-wizard {
+  max-width: 720px;
+  width: 100%;
+}
+
+.real-estate-stepper {
+  list-style: none;
+  display: flex;
+  gap: 0.55rem;
+  padding: 0;
+  margin: 0.4rem 0 1rem;
+  flex-wrap: wrap;
+}
+
+.real-estate-stepper li {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.35rem 0.7rem;
+  border: 1px solid rgba(95, 95, 83, 0.2);
+  border-radius: 999px;
+  font-size: 0.8rem;
+  color: #6f6f60;
+  background: rgba(255, 255, 255, 0.55);
+}
+
+.real-estate-stepper li.active {
+  border-color: rgba(47, 122, 74, 0.7);
+  background: rgba(47, 122, 74, 0.08);
+  color: #2f6d3a;
+}
+
+.real-estate-stepper li.done {
+  opacity: 0.7;
+}
+
+.re-step-number {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: rgba(47, 122, 74, 0.15);
+  color: #2f6d3a;
+  font-size: 0.7rem;
+  font-weight: 700;
+}
+
+.re-wizard-step {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+}
+
+.re-project-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 0.55rem;
+}
+
+.re-project-card {
+  border: 1px solid rgba(95, 95, 83, 0.2);
+  border-radius: 10px;
+  padding: 0.6rem 0.75rem;
+  background: rgba(255, 255, 255, 0.6);
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.re-project-card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.re-project-card-actions {
+  display: flex;
+  gap: 0.3rem;
+}
+
+.re-project-form {
+  border: 1px dashed rgba(95, 95, 83, 0.25);
+  border-radius: 10px;
+  padding: 0.85rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+  background: rgba(255, 255, 255, 0.4);
+}
+
+.re-project-form h4 {
+  margin: 0 0 0.25rem;
+  font-size: 0.95rem;
+}
+
+.re-form-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 0.55rem;
+}
+
+.re-form-row label,
+.re-form-fullwidth {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.8rem;
+  color: #5f5f53;
+}
+
+.re-form-row input,
+.re-form-row select,
+.re-form-fullwidth textarea,
+.re-form-fullwidth input {
+  border: 1px solid rgba(95, 95, 83, 0.25);
+  border-radius: 8px;
+  padding: 0.45rem 0.6rem;
+  background: #fff;
+  font: inherit;
+  color: inherit;
+}
+
+.re-fields-block {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.75rem;
+  border: 1px solid rgba(95, 95, 83, 0.2);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.45);
+}
+
+.re-fields-block h4 {
+  margin: 0;
+}
+
+.re-field-row {
+  display: grid;
+  grid-template-columns: 2fr 1fr 1fr auto auto;
+  gap: 0.35rem;
+  align-items: center;
+}
+
+.re-field-row input,
+.re-field-row select {
+  border: 1px solid rgba(95, 95, 83, 0.25);
+  border-radius: 8px;
+  padding: 0.4rem 0.55rem;
+  background: #fff;
+  font: inherit;
+}
+
+.re-field-required {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.8rem;
+}
+
+.re-tool-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+  max-height: 360px;
+  overflow-y: auto;
+  padding-right: 0.25rem;
+}
+
+.re-tool-group h4 {
+  margin: 0 0 0.4rem;
+  font-size: 0.95rem;
+}
+
+.re-tool-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.55rem;
+  padding: 0.55rem 0.7rem;
+  border: 1px solid rgba(95, 95, 83, 0.2);
+  border-radius: 8px;
+  margin-bottom: 0.35rem;
+  background: rgba(255, 255, 255, 0.55);
+  cursor: pointer;
+}
+
+.re-tool-row.active {
+  border-color: rgba(47, 122, 74, 0.6);
+  background: rgba(47, 122, 74, 0.08);
+}
+
+.re-tool-row input {
+  margin-top: 0.3rem;
+}
+
+.re-tool-row small {
+  display: block;
+  color: #6f6f60;
+  font-size: 0.78rem;
+}
+
+.ghost-button.danger {
+  border-color: rgba(161, 59, 44, 0.5);
+  color: #a13b2c;
+}
+
+/* ── Projects sidebar page ─────────────────────────────────────────── */
+.projects-section {
+  margin-top: 0.75rem;
+}
+
+.projects-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr);
+  gap: 1rem;
+}
+
+@media (max-width: 960px) {
+  .projects-layout {
+    grid-template-columns: 1fr;
+  }
+}
+
+.projects-form,
+.projects-form .re-form-row {
+  display: grid;
+  gap: 0.55rem;
+}
+
+.projects-form {
+  display: flex;
+  flex-direction: column;
+}
+
+.projects-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  max-height: 520px;
+  overflow-y: auto;
+}
+
+.projects-list-item {
+  border: 1px solid rgba(95, 95, 83, 0.2);
+  border-radius: 10px;
+  padding: 0.6rem 0.75rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 0.6rem;
+  background: rgba(255, 255, 255, 0.6);
+}
+
+.projects-list-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.projects-list-actions {
+  display: flex;
+  gap: 0.3rem;
+  flex-shrink: 0;
 }
 
 .outcome-list {

@@ -15,7 +15,9 @@ from app.services.nokvo_one_business_templates import (
 
 
 TOOL_FLOW_QUESTIONS_KEY = "tool_flow_questions"
-TOOL_FLOW_QUESTIONS_VERSION = "v1"
+# v2: real-estate site-visit FSM now pulls slots from BOTH lead and tickets
+# (site-visit) schemas, adds a Project slot, and is project-aware.
+TOOL_FLOW_QUESTIONS_VERSION = "v2"
 FLOW_LANGUAGES = ("en", "hi", "te")
 _SKIP_FIELD_KEYS = {"id", "status", "created_at", "updated_at"}
 
@@ -59,12 +61,14 @@ def _kind_for_field(field: dict[str, Any]) -> str:
         return "phone"
     if "email" in text or ftype == "email":
         return "email"
-    if "name" in text:
+    if "name" in text and "project" not in text:
         return "name"
     if "budget" in text or "price" in text or ftype == "currency":
         return "budget"
     if "location" in text or "area" in text:
         return "location"
+    if "project" in text:
+        return "project"
     if "property" in text and ("type" in text or "looking" in text):
         return "property_type"
     if "date" in text and ftype in {"date", "datetime", "text"}:
@@ -85,6 +89,7 @@ def _question_for_kind(kind: str, label: str, language: str) -> str:
             "budget": "आपका approximate budget क्या है?",
             "location": "आप किस location या area में देख रहे हैं?",
             "property_type": "आप किस type की property देख रहे हैं?",
+            "project": "आप किस project में interested हैं?",
             "date": "Preferred date क्या है?",
             "time": "Preferred time क्या है?",
             "reason": f"{label} के बारे में थोड़ा बताइए.",
@@ -98,6 +103,7 @@ def _question_for_kind(kind: str, label: str, language: str) -> str:
             "budget": "Approx budget ఎంత?",
             "location": "ఏ location లేదా area లో చూస్తున్నారు?",
             "property_type": "ఏ type property చూస్తున్నారు?",
+            "project": "ఏ project గురించి interested గా ఉన్నారు?",
             "date": "Preferred date ఏది?",
             "time": "Preferred time ఏది?",
             "reason": f"{label} గురించి short గా చెప్పండి.",
@@ -110,6 +116,7 @@ def _question_for_kind(kind: str, label: str, language: str) -> str:
         "budget": "What approximate budget should I note?",
         "location": "Which location or area are you interested in?",
         "property_type": "What type of property are you looking for?",
+        "project": "Which project are you interested in?",
         "date": "What date would you prefer?",
         "time": "What time would you prefer?",
         "reason": f"Please share {label}.",
@@ -146,32 +153,93 @@ def _lead_schema_fields(config: dict[str, Any] | None) -> list[dict[str, Any]]:
     return _writable_fields(((config or {}).get("schemas") or {}).get("leads") or [])
 
 
-def _real_estate_visit_slots(fields: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    slots: list[dict[str, Any]] = [
-        _slot_entry("name", "Name", "name"),
-        _slot_entry("phone", "Phone", "phone"),
-    ]
-    seen = {"name", "phone"}
+def _real_estate_visit_slots(
+    site_visit_fields: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Build the slot list for the real-estate site-visit FSM, driven by the
+    admin's **Site Visit Fields** (the tickets schema) — NOT the lead schema.
+
+    A booking captures exactly what the admin configured on the site-visit
+    form. Name + phone come first, the configured conversational fields fill
+    the middle, project + date + time come last. Categorical/admin-only
+    fields (status, owner, priority, issue_type) are never asked; they get
+    server-side defaults. Each slot records ``source_field`` — the configured
+    field key — so the booking tool can store the captured value back under
+    that key and the Site Visits tab renders a populated cell.
+    """
+    fields = _writable_fields(site_visit_fields or [])
+
+    def _field_of_kind(kind: str) -> dict[str, Any] | None:
+        for field in fields:
+            if _kind_for_field(field) == kind:
+                return field
+        return None
+
+    slots: list[dict[str, Any]] = []
+    used_keys: set[str] = set()
+
+    # Name + phone first. Bind to the matching configured field when present
+    # (so the value lands under e.g. ``customer``), else canonical keys.
+    name_field = _field_of_kind("name")
+    name_key = str((name_field or {}).get("key") or "name")
+    slots.append(_slot_entry(name_key, _field_label(name_field) if name_field else "Name", "name", source_field=(name_field or {}).get("key")))
+    used_keys.add(name_key)
+
+    phone_field = _field_of_kind("phone")
+    phone_key = str((phone_field or {}).get("key") or "phone")
+    slots.append(_slot_entry(phone_key, _field_label(phone_field) if phone_field else "Phone", "phone", source_field=(phone_field or {}).get("key")))
+    used_keys.add(phone_key)
+
+    # Middle: the configured conversational Site Visit Fields. Skip
+    # categorical/admin-only fields and the name/phone/project/date/time
+    # kinds (those are scaffolded separately).
+    _categorical_keys = {"status", "assigned_to", "owner", "issue_type", "priority"}
+    _conversational_kinds = {"location", "property_type", "budget", "email", "reason"}
     for field in fields:
-        entry = _question_entry(field)
-        kind = entry["kind"]
-        key = entry["key"]
-        if kind == "name" or key in {"name", "customer_name", "full_name"}:
+        key = str(field.get("key") or "")
+        if not key or key in used_keys or key in _categorical_keys:
             continue
-        if kind == "phone" or key in {"phone", "mobile", "contact_phone"}:
+        kind = _kind_for_field(field)
+        if kind in {"name", "phone", "date", "time", "project"}:
             continue
-        if kind in {"location", "property_type", "budget"} and kind not in seen:
-            slots.append(_slot_entry(kind, entry["label"], kind, required=bool(field.get("required")), source_field=key))
-            seen.add(kind)
-        elif field.get("required") and key not in seen:
-            slots.append(_slot_entry(key, entry["label"], kind, required=True, source_field=key))
-            seen.add(key)
-    slots.extend(
-        [
-            _slot_entry("visit_date", "Visit Date", "date"),
-            _slot_entry("visit_time", "Visit Time", "time"),
-        ]
-    )
+        ftype = str(field.get("type") or "").lower()
+        if ftype in {"select", "multiselect", "multi_select"} and kind == "generic":
+            continue
+        required = bool(field.get("required"))
+        if kind in _conversational_kinds or (required and ftype in {"text", "textarea", "longtext", ""}):
+            slots.append(_slot_entry(key, _field_label(field), kind, required=required, source_field=key))
+            used_keys.add(key)
+
+    # Project — always asked. Bind to a configured project/"Property" field
+    # when present so the value renders in that column, else canonical.
+    project_field = _field_of_kind("project")
+    if project_field is None:
+        project_field = next(
+            (
+                f for f in fields
+                if str(f.get("key")) not in used_keys
+                and "property" in f"{f.get('key')} {_field_label(f)}".lower()
+            ),
+            None,
+        )
+    project_key = str((project_field or {}).get("key") or "project_name")
+    if project_key not in used_keys:
+        slots.append(_slot_entry(project_key, _field_label(project_field) if project_field else "Project", "project", required=True, source_field=(project_field or {}).get("key")))
+        used_keys.add(project_key)
+
+    # Date + time last. Bind to configured date/time fields when present.
+    date_field = _field_of_kind("date")
+    date_key = str((date_field or {}).get("key") or "visit_date")
+    if date_key not in used_keys:
+        slots.append(_slot_entry(date_key, _field_label(date_field) if date_field else "Visit Date", "date", source_field=(date_field or {}).get("key")))
+        used_keys.add(date_key)
+
+    time_field = _field_of_kind("time")
+    time_key = str((time_field or {}).get("key") or "visit_time")
+    if time_key not in used_keys:
+        slots.append(_slot_entry(time_key, _field_label(time_field) if time_field else "Visit Time", "time", source_field=(time_field or {}).get("key")))
+        used_keys.add(time_key)
+
     return slots
 
 
@@ -207,18 +275,28 @@ def build_tool_flow_questions(
     lead_fields = _lead_schema_fields(resolved)
     flows: dict[str, Any] = {}
     if lead_fields:
+        # All writable Lead Fields become slots so an enquiry captures per the
+        # admin's Lead Fields. The FSM only *asks* the required ones; optional
+        # fields (looking-for, budget, area) are filled opportunistically when
+        # the caller volunteers them (see _infer_domain_slots) — we never
+        # interrogate a caller for optional details.
         flows["leads_create"] = {
             "flow": "leads_create",
             "tool_key": "leads_create",
             "tab": "leads",
-            "slots": [entry for entry in (_question_entry(field) for field in lead_fields) if entry["required"]],
+            "slots": [_question_entry(field) for field in lead_fields],
         }
     if normalized_business_type == "real_estate":
+        site_visit_fields = _writable_fields(
+            ((resolved or {}).get("schemas") or {}).get("tickets") or []
+        )
         flows["real_estate_site_visit"] = {
             "flow": "real_estate_site_visit",
             "tool_key": "qualify_lead_and_schedule_visit",
-            "tab": "leads",
-            "slots": _real_estate_visit_slots(lead_fields),
+            # A booking lands in the Site Visits (tickets) tab, captured per
+            # the admin's Site Visit Fields.
+            "tab": "tickets",
+            "slots": _real_estate_visit_slots(site_visit_fields),
         }
     return {
         "version": TOOL_FLOW_QUESTIONS_VERSION,
@@ -265,6 +343,7 @@ def format_field_questions_prompt(
     catalog: dict[str, Any] | None,
     *,
     language: str = "en",
+    project_names: list[str] | None = None,
 ) -> str:
     """Format a ``build_tool_flow_questions`` catalog into a prompt block.
 
@@ -298,6 +377,31 @@ def format_field_questions_prompt(
                     return value.strip()
         return f"Please share {label}."
 
+    def _project_question(default: str) -> str:
+        """When DB projects are available, build a question that enumerates
+        them so the LLM can't paraphrase in the admin's hardcoded project
+        names. Localised for hi / te so the enumeration isn't English-only.
+        Falls back to the generic prompt if the list is empty."""
+        if not project_names:
+            return default
+        names = [n.strip() for n in project_names if n and n.strip()]
+        if not names:
+            return default
+        # Per-language sentence frame + "or" connector for the final item.
+        if language == "hi":
+            stem, connector = "आप कौन सा project visit करना चाहेंगे — ", " या "
+        elif language == "te":
+            stem, connector = "మీరు ఏ project visit చేయాలనుకుంటున్నారు — ", " లేదా "
+        else:
+            stem, connector = "Which project would you like to visit — ", " or "
+        if len(names) == 1:
+            listing = names[0]
+        elif len(names) == 2:
+            listing = f"{names[0]}{connector}{names[1]}"
+        else:
+            listing = ", ".join(names[:-1]) + "," + connector + names[-1]
+        return f"{stem}{listing}?"
+
     sections: list[str] = []
 
     # Flows first — these are the booking / lead / appointment FSMs,
@@ -316,6 +420,8 @@ def format_field_questions_prompt(
             key = str(slot.get("key") or "").strip()
             label = str(slot.get("label") or key or "field").strip()
             question = _pick_question(slot.get("questions") or {}, label)
+            if str(slot.get("kind") or "") == "project":
+                question = _project_question(question)
             required = "required" if slot.get("required") else "optional"
             lines.append(f'  - {key} ({label}, {required}): "{question}"')
         sections.append("\n".join(lines))
