@@ -1869,11 +1869,28 @@ async def bootstrap_caller_memory(
     # what they committed to, and the stage they reached. Tagged
     # ``from_prior_call`` so the strategy layer treats them as history (not a
     # fresh signal) and the lead score is driven by the current call.
-    prior_objections = [
-        str(c) for c in (payload.get("objections") or []) if isinstance(c, str)
-    ]
-    for code in prior_objections:
-        memory.objections.append({"code": code, "from_prior_call": True})
+    # Objections persist as ``{code, text}`` now, but blobs written before that
+    # change stored bare code strings — accept both shapes.
+    prior_objections: list[dict[str, str]] = []
+    for raw in (payload.get("objections") or []):
+        if isinstance(raw, str):
+            code, text = raw, ""
+        elif isinstance(raw, dict):
+            code = str(raw.get("code") or "")
+            text = str(raw.get("text") or "").strip()
+        else:
+            continue
+        if not code:
+            continue
+        entry: dict[str, str] = {"code": code}
+        if text:
+            entry["text"] = text
+        prior_objections.append(entry)
+    for entry in prior_objections:
+        restored: dict[str, Any] = {"code": entry["code"], "from_prior_call": True}
+        if entry.get("text"):
+            restored["text"] = entry["text"]
+        memory.objections.append(restored)
     memory.objections = memory.objections[-16:]
 
     prior_commitments = [
@@ -1892,7 +1909,12 @@ async def bootstrap_caller_memory(
     if memory.prior_stage:
         continuity_bits.append(f"reached the {memory.prior_stage.replace('_', ' ')} stage")
     if prior_objections:
-        continuity_bits.append("raised " + ", ".join(c.replace("_", " ") for c in prior_objections[:2]))
+        obj_bits: list[str] = []
+        for entry in prior_objections[:2]:
+            label = entry["code"].replace("_", " ")
+            text = entry.get("text")
+            obj_bits.append(f'{label} ("{text}")' if text else label)
+        continuity_bits.append("raised " + ", ".join(obj_bits))
     if prior_commitments:
         continuity_bits.append("committed: " + ", ".join(c.replace("_", " ") for c in prior_commitments[:2]))
     if continuity_bits:
@@ -1952,7 +1974,27 @@ async def promote_to_caller_memory(
                 out.append(code)
         return out[-_CALLER_BUCKET_MAX:]
 
-    payload_objections = _durable_codes(memory.objections, _DURABLE_OBJECTION_CODES)
+    # Objections carry the caller's actual wording so a returning caller can be
+    # met addressing the concern by name. Keep the LATEST text per code.
+    def _durable_objections(bucket: list[dict[str, Any]]) -> list[dict[str, str]]:
+        out: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for entry in reversed(bucket):  # latest first
+            if entry.get("from_prior_call"):
+                continue
+            code = str(entry.get("code") or "")
+            if code not in _DURABLE_OBJECTION_CODES or code in seen:
+                continue
+            seen.add(code)
+            item: dict[str, str] = {"code": code}
+            text = str(entry.get("text") or "").strip()
+            if text:
+                item["text"] = text[:120]
+            out.append(item)
+        out.reverse()  # restore chronological order
+        return out[-_CALLER_BUCKET_MAX:]
+
+    payload_objections = _durable_objections(memory.objections)
     payload_commitments = _durable_codes(memory.commitments, _DURABLE_COMMITMENT_CODES)
 
     stage: str | None = None

@@ -573,3 +573,74 @@ def test_transient_objection_not_persisted(monkeypatch) -> None:
         )
     )
     assert all(o.get("code") != "call_later" for o in second.objections)
+
+
+# ── Cross-call objection text (#3) ───────────────────────────────────────────
+
+
+def test_cross_call_persists_objection_text(monkeypatch) -> None:
+    """The caller's actual price objection wording must survive across calls so
+    the return call can address the concern by name."""
+    fake = _FakeRedis()
+    monkeypatch.setattr(AgentSessionStore, "client", staticmethod(lambda: fake))
+    monkeypatch.setattr(AgentSessionStore, "namespace", staticmethod(lambda tr: "t1"))
+
+    first = ConversationalMemory()
+    first.merge_text(
+        "honestly 60 lakhs is too expensive, i want something under 50",
+        turn_index=1,
+        business_type="real_estate",
+    )
+    asyncio.run(
+        promote_to_caller_memory(
+            None, phone="9876500000", memory=first, business_type="real_estate"
+        )
+    )
+
+    second = ConversationalMemory()
+    asyncio.run(
+        bootstrap_caller_memory(
+            None, phone="9876500000", memory=second, business_type="real_estate"
+        )
+    )
+
+    price_objs = [o for o in second.objections if o.get("code") == "price_concern"]
+    assert price_objs
+    assert any("too expensive" in str(o.get("text", "")) for o in price_objs)
+    # The continuity note surfaces the wording so the agent opens addressing it.
+    note_texts = " ".join(str(n.get("text") or "") for n in second.salient_notes)
+    assert "too expensive" in note_texts
+
+
+def test_bootstrap_accepts_legacy_objection_code_list(monkeypatch) -> None:
+    """Blobs written before objections carried text stored bare code strings;
+    bootstrap must still restore them (no key/version bump)."""
+    import json
+
+    from app.services.conversational_memory import _caller_memory_key
+
+    fake = _FakeRedis()
+    monkeypatch.setattr(AgentSessionStore, "client", staticmethod(lambda: fake))
+    monkeypatch.setattr(AgentSessionStore, "namespace", staticmethod(lambda tr: "t1"))
+
+    key = _caller_memory_key(None, "9876511111")
+    fake.store[key] = json.dumps(
+        {
+            "facts": {},
+            "salient_notes": [],
+            "objections": ["price_concern"],  # legacy shape: list of code strings
+            "commitments": [],
+            "stage": "objection_handling",
+            "business_type": "real_estate",
+        }
+    )
+
+    mem = ConversationalMemory()
+    asyncio.run(
+        bootstrap_caller_memory(
+            None, phone="9876511111", memory=mem, business_type="real_estate"
+        )
+    )
+    codes = {o.get("code") for o in mem.objections}
+    assert "price_concern" in codes
+    assert all(o.get("from_prior_call") for o in mem.objections)

@@ -164,3 +164,40 @@ def test_operator_override_of_field_label_propagates_to_prompt():
     # The default "patient_name" / "customer_name" should be gone for
     # this tenant.
     assert "patient_name" not in prompt
+
+
+def test_site_visit_flow_asks_every_configured_ticket_field():
+    """The site-visit flow must surface EVERY writable Site Visit (tickets)
+    field — including custom number / select fields that the old hardcoded
+    subset dropped — so the agent collects the full ticket schema. Only
+    system/admin fields (status, owner, …) are withheld."""
+    overrides = {
+        "tickets": [
+            {"key": "name", "label": "Customer Name", "type": "text", "required": True, "writable": True},
+            {"key": "phone", "label": "Phone", "type": "phone", "required": True, "writable": True},
+            {"key": "project_name", "label": "Project", "type": "text", "required": True, "writable": True},
+            {"key": "visit_date", "label": "Visit Date", "type": "date", "required": True, "writable": True},
+            {"key": "visit_time", "label": "Visit Time", "type": "time", "required": True, "writable": True},
+            # Custom fields the old subset skipped (non-text required + select).
+            {"key": "num_visitors", "label": "Number of Visitors", "type": "number", "required": True, "writable": True},
+            {"key": "preferred_floor", "label": "Preferred Floor", "type": "select", "required": False, "writable": True, "options": ["low", "mid", "high"]},
+            # System field — must NOT be asked.
+            {"key": "status", "label": "Status", "type": "select", "required": True, "writable": True},
+        ]
+    }
+    catalog = build_tool_flow_questions("real_estate", overrides)
+    slots = catalog["flows"]["real_estate_site_visit"]["slots"]
+    slot_keys = {s["key"] for s in slots}
+    assert {
+        "name",
+        "phone",
+        "project_name",
+        "visit_date",
+        "visit_time",
+        "num_visitors",
+        "preferred_floor",
+    } <= slot_keys
+    assert "status" not in slot_keys  # system field withheld
+    prompt = format_field_questions_prompt(catalog, language="en")
+    assert "Number of Visitors" in prompt
+    assert "Preferred Floor" in prompt

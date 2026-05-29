@@ -190,11 +190,14 @@ def _real_estate_visit_slots(
     slots.append(_slot_entry(phone_key, _field_label(phone_field) if phone_field else "Phone", "phone", source_field=(phone_field or {}).get("key")))
     used_keys.add(phone_key)
 
-    # Middle: the configured conversational Site Visit Fields. Skip
-    # categorical/admin-only fields and the name/phone/project/date/time
-    # kinds (those are scaffolded separately).
+    # Middle: EVERY other configured Site Visit Field, in schema order, so the
+    # agent asks the full ticket schema — not just a hardcoded subset. Only the
+    # system/admin-only fields (status, owner, …) are withheld; those get
+    # server-side defaults. name/phone/project/date/time are scaffolded
+    # separately (above and below) for a natural ask order. Each field keeps its
+    # admin-configured required flag — the FSM asks the required ones and the
+    # field-questions prompt surfaces the rest for the agent to ask too.
     _categorical_keys = {"status", "assigned_to", "owner", "issue_type", "priority"}
-    _conversational_kinds = {"location", "property_type", "budget", "email", "reason"}
     for field in fields:
         key = str(field.get("key") or "")
         if not key or key in used_keys or key in _categorical_keys:
@@ -202,13 +205,16 @@ def _real_estate_visit_slots(
         kind = _kind_for_field(field)
         if kind in {"name", "phone", "date", "time", "project"}:
             continue
-        ftype = str(field.get("type") or "").lower()
-        if ftype in {"select", "multiselect", "multi_select"} and kind == "generic":
-            continue
-        required = bool(field.get("required"))
-        if kind in _conversational_kinds or (required and ftype in {"text", "textarea", "longtext", ""}):
-            slots.append(_slot_entry(key, _field_label(field), kind, required=required, source_field=key))
-            used_keys.add(key)
+        slots.append(
+            _slot_entry(
+                key,
+                _field_label(field),
+                kind,
+                required=bool(field.get("required")),
+                source_field=key,
+            )
+        )
+        used_keys.add(key)
 
     # Project — always asked. Bind to a configured project/"Property" field
     # when present so the value renders in that column, else canonical.

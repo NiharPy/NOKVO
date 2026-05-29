@@ -161,3 +161,71 @@ def test_block_respects_char_cap_with_all_signals() -> None:
     m.prior_stage = "closing"
     block = compose_strategy_block(m, business_type="real_estate")
     assert 0 < len(block) <= 1800
+
+
+# ── Project-aware objection handling (#1) ────────────────────────────────────
+
+
+def test_price_and_competitor_playbook_reference_inventory() -> None:
+    """The playbook must point the agent at the concrete inventory rather than
+    handle price/competition in generic terms."""
+    assert "PROJECT INVENTORY" in OBJECTION_PLAYBOOK["price_concern"]
+    assert "PROJECT INVENTORY" in OBJECTION_PLAYBOOK["competitor"]
+
+
+def test_block_objection_focus_project_when_present() -> None:
+    m = _re("honestly that's too expensive")
+    focus = "Skylark Horizon — by Acme — price: ₹55L — possession 18 months"
+    block = compose_strategy_block(m, business_type="real_estate", focus_project=focus)
+    assert "Skylark Horizon" in block
+    assert "Defend THIS project" in block
+
+
+def test_block_no_focus_line_without_project() -> None:
+    m = _re("that's too expensive")
+    block = compose_strategy_block(m, business_type="real_estate", focus_project=None)
+    assert OBJECTION_PLAYBOOK["price_concern"] in block
+    assert "Defend THIS project" not in block
+
+
+def test_block_focus_line_only_for_price_or_competitor() -> None:
+    """A non-price/competitor objection must not pull in the project focus line."""
+    m = _re("I'm busy, call later")
+    block = compose_strategy_block(
+        m, business_type="real_estate", focus_project="Skylark Horizon — price: ₹55L"
+    )
+    assert "Defend THIS project" not in block
+
+
+# ── Mid-call escalation (#2) ─────────────────────────────────────────────────
+
+
+def test_block_escalation_on_fresh_ready_to_book() -> None:
+    m = _re("let's go ahead and book it", turn=2)
+    block = compose_strategy_block(m, business_type="real_estate")
+    assert "ESCALATION" in block
+
+
+def test_block_escalation_on_fresh_visit_date() -> None:
+    m = _re("actually I want to visit tomorrow", turn=3)
+    block = compose_strategy_block(m, business_type="real_estate")
+    assert "ESCALATION" in block
+
+
+def test_block_no_escalation_when_hot_signal_is_stale() -> None:
+    """The hot signal lands on turn 1; a later turn supplies a different captured
+    signal, so the escalation must not keep re-firing every subsequent turn."""
+    m = ConversationalMemory()
+    m.merge_text("let's go ahead and book it", turn_index=1, business_type="real_estate")
+    m.merge_text("my budget is 80 lakhs", turn_index=2, business_type="real_estate")
+    block = compose_strategy_block(m, business_type="real_estate")
+    assert "ESCALATION" not in block
+
+
+def test_recovery_outranks_escalation() -> None:
+    """A frustrated caller who also drops a hot signal still gets recovery, not a
+    hard close."""
+    m = _re("you keep asking, but fine let's book it")
+    block = compose_strategy_block(m, business_type="real_estate")
+    assert "RECOVER THE CALL" in block
+    assert "ESCALATION" not in block

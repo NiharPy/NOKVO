@@ -1147,19 +1147,22 @@ class NokvoOneVoicePipeline:
     async def _projects_block_for_bundle(
         db: AsyncSession | None,
         bundle: "RuntimeBundle",
-    ) -> str:
-        """Return the authoritative real-estate project inventory block, or
-        an empty string for non-real-estate orgs.
+    ) -> tuple[str, list]:
+        """Return ``(inventory_block, active_projects)`` for a real-estate org,
+        or ``("", [])`` otherwise.
 
         The block is injected as its own top-level system section by the
         voice prompt builder so the live agent treats it as the source of
         truth for inventory questions (overriding any project names the
-        admin may have hardcoded into their single-prompt text)."""
+        admin may have hardcoded into their single-prompt text). The project
+        list is handed back so callers can reuse it (project-name hints,
+        objection focus) without a second round-trip — the underlying
+        ``load_active_projects`` is uncached."""
         if (bundle.organization_industry or "").lower() != "real_estate":
-            return ""
+            return "", []
         organization_id = getattr(bundle.organization, "id", None)
         if organization_id is None:
-            return ""
+            return "", []
         try:
             from app.services.real_estate_project_service import (
                 load_active_projects,
@@ -1168,8 +1171,36 @@ class NokvoOneVoicePipeline:
 
             projects = await load_active_projects(db, organization_id)
         except Exception:
-            return ""
-        return projects_prompt_section(projects)
+            return "", []
+        return projects_prompt_section(projects), projects
+
+    @staticmethod
+    def _focus_project_summary(
+        projects: list,
+        conversational_memory: Any,
+    ) -> str | None:
+        """One-line summary of the project the caller named (matched from
+        FACT_PROPERTY), for the strategy layer's price/competitor objection
+        focus. ``None`` when no property is known or no confident match exists."""
+        if conversational_memory is None or not projects:
+            return None
+        try:
+            from app.services.conversational_memory import FACT_PROPERTY
+            from app.services.real_estate_project_service import (
+                find_project_match,
+                project_summary_lines,
+            )
+
+            spoken = conversational_memory.get(FACT_PROPERTY)
+            if not spoken:
+                return None
+            project = find_project_match(projects, project_name=str(spoken))
+            if project is None:
+                return None
+            lines = project_summary_lines([project])
+            return lines[0] if lines else None
+        except Exception:
+            return None
 
     @staticmethod
     async def _voice_business_context(
@@ -2086,6 +2117,126 @@ class NokvoOneVoicePipeline:
         return {key: value for key, value in args.items() if value not in (None, "")}
 
     @staticmethod
+    def _site_visit_args_from_call_state(
+        *,
+        state: dict[str, Any],
+        organization: Any,
+        overrides: dict[str, Any],
+        custom_tabs: list[dict[str, Any]],
+        memory: dict[str, Any],
+        campaign_context: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Build ``qualify_lead_and_schedule_visit`` args when the call holds a
+        FIRM site-visit booking — name + phone + a parseable visit date AND
+        time. Returns ``None`` for enquiry / vague calls (no firm date/time) so
+        those stay leads. Used by the end-of-call safety net so a booking the
+        deterministic flow didn't capture is filed as a Site Visit, not a Lead."""
+        try:
+            from app.services.conversational_memory import (
+                ConversationalMemory as _CM,
+                FACT_NAME as _FACT_NAME,
+                FACT_PHONE as _FACT_PHONE,
+                FACT_PROPERTY as _FACT_PROPERTY,
+                FACT_VISIT_DATE as _FACT_VISIT_DATE,
+                FACT_VISIT_TIME as _FACT_VISIT_TIME,
+            )
+
+            cm = _CM.from_state_blob((state or {}).get("memory") or {})
+        except Exception:
+            return None
+
+        collected = dict((state.get("tool_flow") or {}).get("collected") or {})
+
+        def _collected_by(predicate) -> Any:
+            for key, value in collected.items():
+                if value not in (None, "") and predicate(key):
+                    return value
+            return None
+
+        date_raw = cm.get(_FACT_VISIT_DATE) or _collected_by(lambda k: "date" in k.lower())
+        time_raw = cm.get(_FACT_VISIT_TIME) or _collected_by(lambda k: "time" in k.lower())
+        if not (date_raw and time_raw):
+            return None
+        # A firm booking needs a concrete date AND time. Vague input ("morning",
+        # "sometime next week") raises here, which correctly keeps it a lead.
+        try:
+            visit_date = NokvoOneVoicePipeline._parse_appointment_date(date_raw)
+            visit_time = NokvoOneVoicePipeline._parse_appointment_time(time_raw)
+        except Exception:
+            return None
+
+        name_val = (
+            cm.get(_FACT_NAME)
+            or memory.get("name")
+            or _collected_by(lambda k: "name" in k.lower())
+        )
+        phone_val = (
+            cm.get(_FACT_PHONE)
+            or NokvoOneVoicePipeline._phone_from_call_context(memory, campaign_context)
+        )
+        if not (name_val and phone_val):
+            return None
+
+        project_val = (
+            cm.get(_FACT_PROPERTY)
+            or _collected_by(lambda k: "project" in k.lower())
+            or collected.get("property_id")
+        )
+
+        visit_at = datetime.combine(
+            visit_date, visit_time, tzinfo=_APPOINTMENT_LOCAL_TZ
+        ).astimezone(timezone.utc).isoformat()
+
+        # Project record_data onto the org's configured Site Visit Fields so the
+        # Site Visits tab renders populated cells, mirroring the deterministic
+        # flow's construction.
+        canonical = {
+            "date": visit_date.isoformat(),
+            "time": visit_time.strftime("%I:%M %p").lstrip("0"),
+            "name": str(name_val),
+            "phone": str(phone_val),
+            "project": str(project_val) if project_val else None,
+        }
+        record_data: dict[str, Any] = {}
+        try:
+            from app.services.tool_flow_questions import build_tool_flow_questions
+
+            sv_bundle = build_tool_flow_questions(
+                getattr(organization, "industry", None), overrides, custom_tabs
+            )
+            flow_slots = (
+                ((sv_bundle.get("flows") or {}).get("real_estate_site_visit") or {}).get("slots") or []
+            )
+            for slot in flow_slots:
+                kind = str(slot.get("kind") or "")
+                fkey = str(slot.get("source_field") or slot.get("key") or "")
+                value = canonical.get(kind)
+                if fkey and value not in (None, ""):
+                    record_data[fkey] = value
+        except Exception:
+            record_data = {}
+        if not record_data:
+            # Default real_estate Site Visit Fields.
+            record_data = {
+                "name": str(name_val),
+                "phone": str(phone_val),
+                "visit_date": canonical["date"],
+                "visit_time": canonical["time"],
+            }
+            if project_val:
+                record_data["project_name"] = str(project_val)
+
+        args: dict[str, Any] = {
+            "name": str(name_val),
+            "phone": str(phone_val),
+            "visit_at": visit_at,
+            "record_data": record_data,
+        }
+        if project_val not in (None, ""):
+            args["project_name"] = str(project_val)
+        return args
+
+    @staticmethod
     async def maybe_create_real_estate_lead_from_call(
         tenant_res: TenantResources,
         db: AsyncSession | None,
@@ -2128,6 +2279,60 @@ class NokvoOneVoicePipeline:
             outbound_context=outbound_context,
         ):
             return None
+
+        catalog = resolve_index(organization.industry, overrides, custom_tabs)
+
+        # A clear site-visit booking (firm date + time + name + phone) must
+        # create a SITE VISIT, not a lead — leads are for ENQUIRY / vague calls
+        # only. The deterministic flow normally creates the visit; this catches
+        # calls where it didn't fire (e.g. the LLM conducted the booking) and
+        # would otherwise mis-file the booking as a lead.
+        site_visit_args = NokvoOneVoicePipeline._site_visit_args_from_call_state(
+            state=state,
+            organization=organization,
+            overrides=overrides,
+            custom_tabs=custom_tabs,
+            memory=memory,
+            campaign_context=campaign_context,
+        )
+        sv_tool = catalog.get("qualify_lead_and_schedule_visit") if site_visit_args else None
+        if site_visit_args and sv_tool is not None:
+            sv_result = None
+            try:
+                sv_result = await PredefinedToolsService.execute(
+                    db,
+                    tenant_res.organization_id,
+                    None,
+                    sv_tool,
+                    site_visit_args,
+                    session_id=f"{call_id}:auto_real_estate_site_visit",
+                )
+                await db.commit()
+            except Exception:
+                if db is not None:
+                    try:
+                        await db.rollback()
+                    except Exception:
+                        pass
+                sv_result = None
+            if sv_result and sv_result.get("ok"):
+                await AgentSessionStore.merge_state(
+                    tenant_res,
+                    call_id,
+                    {
+                        "auto_lead_created": True,
+                        "auto_site_visit_created": True,
+                        "auto_site_visit_id": sv_result.get("ticket_id") or sv_result.get("id"),
+                    },
+                )
+                return {
+                    "tool": "qualify_lead_and_schedule_visit",
+                    "arguments": site_visit_args,
+                    "result": sv_result,
+                }
+            # Site-visit creation unavailable or failed — fall through to lead
+            # so the prospect is still captured.
+
         args = NokvoOneVoicePipeline._lead_args_from_call_memory(
             memory=memory,
             campaign_context=campaign_context,
@@ -2135,7 +2340,6 @@ class NokvoOneVoicePipeline:
         )
         if not args.get("phone"):
             return None
-        catalog = resolve_index(organization.industry, overrides, custom_tabs)
         tool = catalog.get("leads_create")
         if tool is None:
             return None
@@ -4295,7 +4499,7 @@ class NokvoOneVoicePipeline:
         intent_result: IntentResult = route["intent_result"]
         bundle: RuntimeBundle = turn_cache["bundle"]
         single_prompt_guidance = bundle.single_prompt_guidance
-        projects_block = await NokvoOneVoicePipeline._projects_block_for_bundle(db, bundle)
+        projects_block, active_projects = await NokvoOneVoicePipeline._projects_block_for_bundle(db, bundle)
         if route["route"] in {"template", "answer_card", "policy_card"}:
             answer = route["answer"]
             await NokvoOneVoicePipeline._apply_route_state(tenant_res, call_id, route)
@@ -4444,15 +4648,7 @@ class NokvoOneVoicePipeline:
                 "intent": {"type": "RAG_ALWAYS_ON", "should_retrieve": True, "reason": "pre-indexed tenant retrieval"},
             }
 
-        project_names_for_prompt: list[str] = []
-        if (bundle.organization_industry or "").lower() == "real_estate":
-            try:
-                from app.services.real_estate_project_service import load_active_projects
-
-                _projects = await load_active_projects(db, getattr(bundle.organization, "id", None))
-                project_names_for_prompt = [p.name for p in _projects if p.name]
-            except Exception:
-                project_names_for_prompt = []
+        project_names_for_prompt = [p.name for p in active_projects if p.name]
         field_questions_prompt = NokvoOneVoicePipeline._field_questions_prompt_for_bundle(
             bundle, language=language, project_names=project_names_for_prompt
         )
@@ -4474,6 +4670,9 @@ class NokvoOneVoicePipeline:
                     business_type=bundle.organization_industry,
                     is_outbound=outbound_context is not None,
                     language=language,
+                    focus_project=NokvoOneVoicePipeline._focus_project_summary(
+                        active_projects, conversational_memory
+                    ),
                 )
             except Exception:
                 strategy_block_v2 = ""
@@ -4636,7 +4835,7 @@ class NokvoOneVoicePipeline:
         intent_result: IntentResult = route["intent_result"]
         bundle: RuntimeBundle = turn_cache["bundle"]
         single_prompt_guidance = bundle.single_prompt_guidance
-        projects_block = await NokvoOneVoicePipeline._projects_block_for_bundle(db, bundle)
+        projects_block, active_projects = await NokvoOneVoicePipeline._projects_block_for_bundle(db, bundle)
         # Outbound is a different agent — *no* inbound short-circuits apply.
         # Template smalltalk ("Sure, go ahead." for a "Yes") is the worst
         # offender: it derails the outbound flow because the agent should be
@@ -4943,15 +5142,7 @@ class NokvoOneVoicePipeline:
             }
             return
 
-        project_names_for_prompt: list[str] = []
-        if (bundle.organization_industry or "").lower() == "real_estate":
-            try:
-                from app.services.real_estate_project_service import load_active_projects
-
-                _projects = await load_active_projects(db, getattr(bundle.organization, "id", None))
-                project_names_for_prompt = [p.name for p in _projects if p.name]
-            except Exception:
-                project_names_for_prompt = []
+        project_names_for_prompt = [p.name for p in active_projects if p.name]
         field_questions_prompt = NokvoOneVoicePipeline._field_questions_prompt_for_bundle(
             bundle, language=language, project_names=project_names_for_prompt
         )
@@ -4973,6 +5164,9 @@ class NokvoOneVoicePipeline:
                     business_type=bundle.organization_industry,
                     is_outbound=outbound_context is not None,
                     language=language,
+                    focus_project=NokvoOneVoicePipeline._focus_project_summary(
+                        active_projects, conversational_memory
+                    ),
                 )
             except Exception:
                 strategy_block = ""

@@ -143,13 +143,16 @@ OBJECTION_PLAYBOOK: dict[str, str] = {
     "price_concern": (
         "PRICE objection: do NOT just restate the number or get defensive. Acknowledge it, then "
         "reframe on value and affordability — payment plans, EMI/month, what's included, "
-        "appreciation in the area. Ask what range they had in mind so you can match a unit, and "
-        "offer a site visit to anchor value against the price."
+        "appreciation in the area. Cite the SPECIFIC project's price, configuration, and "
+        "possession date from the PROJECT INVENTORY section above — concrete facts, not generic "
+        "lines. Ask what range they had in mind so you can match a unit, and offer a site visit "
+        "to anchor value against the price."
     ),
     "competitor": (
         "COMPETITOR / already-looking: don't bad-mouth anyone. Ask what they liked about the "
-        "other option, then differentiate on a concrete edge in the inventory (location, "
-        "possession date, amenities, RERA/legal clarity). Offer a no-pressure comparison visit."
+        "other option, then differentiate on a concrete edge from the PROJECT INVENTORY above — "
+        "name the actual location, possession date, amenities, or RERA/legal clarity of the "
+        "specific project rather than speaking in generalities. Offer a no-pressure comparison visit."
     ),
     "call_later": (
         "TIMING brush-off ('busy', 'call later'): respect it. Don't pitch. Confirm one good time "
@@ -291,6 +294,89 @@ def journey_stage(
     return "discovery"
 
 
+# ── Mid-call escalation ──────────────────────────────────────────────────────
+#
+# The current-turn utterance is merged into ``memory`` before this module runs,
+# so a cold→hot pivot already reaches ``score_lead`` this turn. What was missing
+# was *prominence*: when a hot driver first appears on the current turn, lead with
+# an explicit "close now" directive instead of relying on the lead tier quietly
+# ticking up. "Current turn" is derived from the memory itself (no turn index is
+# threaded in), keeping this module pure.
+
+
+def _latest_turn(memory: ConversationalMemory) -> int:
+    """Highest turn index any current-call signal was captured on. ``-1`` when
+    nothing has been captured yet (cold open). Bootstrap facts (source_turn
+    ``-1``) and restored prior-call bucket entries are ignored."""
+    turns: list[int] = []
+    for fact in memory.facts.values():
+        if isinstance(fact.source_turn, int) and fact.source_turn >= 0:
+            turns.append(fact.source_turn)
+    for bucket in (memory.objections, memory.commitments):
+        for entry in bucket:
+            if entry.get("from_prior_call"):
+                continue
+            t = entry.get("turn")
+            if isinstance(t, int):
+                turns.append(t)
+    return max(turns) if turns else -1
+
+
+def _text_at_turn(memory: ConversationalMemory, turn: int) -> str:
+    """All free text the caller produced on a specific turn, lower-cased — used
+    to spot a fresh pre-approval / immediacy cue introduced this turn."""
+    parts: list[str] = []
+    for fact in memory.facts.values():
+        if fact.source_turn == turn and fact.raw:
+            parts.append(str(fact.raw))
+    for bucket in (memory.objections, memory.commitments):
+        for entry in bucket:
+            if not entry.get("from_prior_call") and entry.get("turn") == turn and entry.get("text"):
+                parts.append(str(entry.get("text")))
+    for note in memory.salient_notes:
+        if not note.get("from_prior_call") and note.get("turn") == turn and note.get("text"):
+            parts.append(str(note.get("text")))
+    return " ".join(parts).lower()
+
+
+def _fresh_hot_signal(memory: ConversationalMemory) -> str | None:
+    """Short reason when a HOT-tier driver was first introduced on the current
+    (latest) turn — i.e. the caller just escalated. ``None`` otherwise."""
+    latest = _latest_turn(memory)
+    if latest < 0:
+        return None
+
+    for entry in memory.commitments:
+        if entry.get("from_prior_call"):
+            continue
+        if str(entry.get("code") or "") == "ready_to_book" and entry.get("turn") == latest:
+            return "ready to book"
+
+    visit = memory.get_fact(FACT_VISIT_DATE)
+    if visit and visit.value not in (None, "", []) and visit.source_turn == latest:
+        return "wants to schedule a visit"
+
+    if _PREAPPROVAL_RE.search(_text_at_turn(memory, latest)):
+        return "financing ready / pre-approved"
+
+    timeline = memory.get_fact(FACT_TIMELINE)
+    if timeline and timeline.source_turn == latest and _timeline_is_immediate(memory):
+        return "immediate timeline"
+    return None
+
+
+def _escalation_section(memory: ConversationalMemory) -> str | None:
+    reason = _fresh_hot_signal(memory)
+    if not reason:
+        return None
+    return (
+        f"# ESCALATION — the caller just signalled strong intent ({reason})\n"
+        "- Pivot to closing NOW: propose a specific site-visit slot or the booking step this "
+        "turn. Don't re-open discovery you've already covered, and don't bury this under smaller "
+        "questions — match their momentum."
+    )
+
+
 # ── Block assembly ───────────────────────────────────────────────────────────
 
 
@@ -318,14 +404,27 @@ def _recovery_section(memory: ConversationalMemory) -> str | None:
     return "\n".join(bits)
 
 
-def _objection_section(memory: ConversationalMemory) -> str | None:
+def _objection_section(
+    memory: ConversationalMemory,
+    *,
+    focus_project: str | None = None,
+) -> str | None:
     codes = [c for c in _current_codes(memory.objections) if c in OBJECTION_PLAYBOOK]
     if not codes:
         return None
     # Most-recent objections first, cap at two so the block stays tight.
+    shown = list(reversed(codes))[:2]
     lines = ["# HANDLE THE ACTIVE OBJECTION(S)"]
-    for code in list(reversed(codes))[:2]:
+    for code in shown:
         lines.append("- " + OBJECTION_PLAYBOOK[code])
+    # When the caller has named a specific project and the live objection is
+    # about price or the competition, point the agent at THAT project's facts
+    # so it defends the right unit instead of generalising.
+    if focus_project and any(c in ("price_concern", "competitor") for c in shown):
+        lines.append(
+            f"- The caller is focused on: {focus_project}. Defend THIS project specifically "
+            "with its concrete price / configuration / possession; don't generalise."
+        )
     return "\n".join(lines)
 
 
@@ -375,10 +474,14 @@ def compose_strategy_block(
     business_type: str | None = None,
     is_outbound: bool = False,
     language: str | None = None,
+    focus_project: str | None = None,
 ) -> str:
     """Render the strategy directive block for this turn, or ``""`` when there
     is no actionable signal. Safe for ``business_type=None`` (emits only the
-    universal recovery part, if any). Output is capped at :data:`_MAX_CHARS`."""
+    universal recovery part, if any). ``focus_project`` is a one-line summary of
+    the specific project the caller named (matched upstream from FACT_PROPERTY);
+    when present it sharpens price/competitor objection handling. Output is
+    capped at :data:`_MAX_CHARS`."""
     if memory is None:
         return ""
 
@@ -389,7 +492,14 @@ def compose_strategy_block(
         sections.append(recovery)
 
     if _is_sales(business_type, is_outbound) and _has_sales_signal(memory):
-        objection = _objection_section(memory)
+        # A fresh escalation leads the sales guidance so the agent pivots to
+        # closing on a dramatic intent signal — but a call in trouble (recovery)
+        # takes precedence: don't push a close on a frustrated caller.
+        if not recovery:
+            escalation = _escalation_section(memory)
+            if escalation:
+                sections.append(escalation)
+        objection = _objection_section(memory, focus_project=focus_project)
         if objection:
             sections.append(objection)
         lead = score_lead(memory, business_type=business_type)
