@@ -235,7 +235,8 @@ _LEAD_INTENT_RE = re.compile(
     r"contact\s+me|call\s+me\s+back|call\s+me|reach\s+(?:out\s+to\s+)?me|get\s+back\s+to\s+me|"
     r"enquir(?:y|e|ing)|inquir(?:y|e|ing)|"
     r"want\s+to\s+know|tell\s+me\s+(?:more|about)|"
-    r"price\s+list|quote|details?\s+about|"
+    r"price(?:\s+list)?|pricing|cost|rate|how\s+much|kitna|enta|"
+    r"quote|details?\s+about|"
     # Transliterated Telugu / Hindi enquiry cues.
     r"vivar(?:alu|aalu|am)|ja+n?kari|"
     r"details?\s+kavali|brochure\s+kavali|"

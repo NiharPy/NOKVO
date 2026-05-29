@@ -261,6 +261,14 @@ const newCustomTab = ref({
   fields: [{ key: 'name', label: 'Name', type: 'text', required: true }],
 });
 const activeAgent = ref(null);
+// The agent shown on the dedicated "Agent" tab — the active one, else the first.
+const profileAgent = computed(() => activeAgent.value || agents.value[0] || null);
+const renameDraft = ref('');
+const isRenamingAgent = ref(false);
+// Keep the rename field aligned with whichever agent is currently shown.
+watch(() => profileAgent.value?.id, () => {
+  renameDraft.value = profileAgent.value?.name || '';
+});
 const chatLog = ref([]);
 const chatInput = ref('');
 const emailDrafts = ref([]);
@@ -803,6 +811,12 @@ const switchPage = (page) => {
   if (page === 'agent') {
     loadRuntimeStatus();
     loadPhoneLink();
+    // The agent picker is hidden here, so make sure the tester has an agent
+    // selected, and seed the rename field with the current name.
+    if (!activeAgent.value && agents.value.length) {
+      activeAgent.value = agents.value[0];
+    }
+    renameDraft.value = profileAgent.value?.name || '';
   }
   if (page === 'outgoing_agent') {
     loadOutgoingAgentWorkspace();
@@ -2896,6 +2910,27 @@ const createAgent = async () => {
     infoMsg.value = 'Agent created. Try it in the test console.';
   } catch (err) {
     errorMsg.value = extractErrorMessage(err, 'Agent creation failed.');
+  }
+};
+
+const renameAgent = async () => {
+  const agent = profileAgent.value;
+  const name = renameDraft.value.trim();
+  if (!agent || !name || name === agent.name) return;
+  errorMsg.value = '';
+  isRenamingAgent.value = true;
+  try {
+    const { data } = await api.patch(`/agents/${agent.id}`, { name }, { headers: authHeader() });
+    // Keep the agents list and the active reference in sync with the rename.
+    const idx = agents.value.findIndex((a) => a.id === data.id);
+    if (idx >= 0) agents.value.splice(idx, 1, data);
+    if (activeAgent.value?.id === data.id) activeAgent.value = data;
+    renameDraft.value = data.name;
+    infoMsg.value = 'Agent name updated.';
+  } catch (err) {
+    errorMsg.value = extractErrorMessage(err, 'Rename failed.');
+  } finally {
+    isRenamingAgent.value = false;
   }
 };
 
@@ -5822,24 +5857,14 @@ onBeforeUnmount(() => {
               <span>Appointments</span>
             </button>
             <button
-              v-if="!isMemberOnly && !onboardingV2Enabled"
+              v-if="!isMemberOnly"
               type="button"
               class="nav-page-button"
               :class="{ active: currentPage === 'agent' }"
               @click="switchPage('agent')"
             >
               <Bot :size="17" />
-              <span>Agent Studio</span>
-            </button>
-            <button
-              v-if="!isMemberOnly && onboardingV2Enabled"
-              type="button"
-              class="nav-page-button"
-              :class="{ active: currentPage === 'agent' }"
-              @click="switchPage('agent')"
-            >
-              <Bot :size="17" />
-              <span>Try Agent</span>
+              <span>Inbound Agent</span>
             </button>
             <button
               v-if="!isMemberOnly"
@@ -7142,17 +7167,33 @@ onBeforeUnmount(() => {
         </div>
       </section>
 
-      <!-- AGENT STUDIO -->
+      <!-- INBOUND AGENT -->
       <section v-if="currentPage === 'agent'" class="dashboard-section agent-studio-section">
         <div class="agent-hero">
           <div class="agent-hero-copy">
-            <span class="section-kicker">Agent Studio</span>
-            <h3>Build, test, and run your voice agent.</h3>
-            <p>
-              Sarvam STT → Qdrant retrieval → Azure OpenAI <strong>gpt-4.1-mini</strong> → Sarvam TTS,
-              all running on your tenant-isolated infra. Calls hit your own embedding deployment and
-              Knowledge Base collection — nothing leaks across organizations.
-            </p>
+            <span class="section-kicker">Inbound Agent</span>
+            <h3>{{ profileAgent?.name || 'Your inbound agent' }}</h3>
+            <p v-if="profileAgent?.description">{{ profileAgent.description }}</p>
+            <p v-else>Build, test, and run your inbound voice agent — STT → retrieval → LLM → TTS on your tenant-isolated infra.</p>
+            <div v-if="profileAgent" class="agent-rename-row agent-hero-rename">
+              <input
+                id="agent-rename"
+                v-model="renameDraft"
+                class="db-input"
+                type="text"
+                placeholder="Agent name"
+                @keyup.enter="renameAgent"
+              />
+              <button
+                type="button"
+                class="primary-button compact"
+                :disabled="isRenamingAgent || !renameDraft.trim() || renameDraft.trim() === profileAgent.name"
+                @click="renameAgent"
+              >
+                <CheckCircle2 :size="15" />
+                {{ isRenamingAgent ? 'Saving…' : 'Rename' }}
+              </button>
+            </div>
           </div>
           <div class="agent-pipeline-grid">
             <div class="pipeline-chip">
@@ -7362,7 +7403,7 @@ onBeforeUnmount(() => {
         </article>
 
         <div class="dashboard-grid agent-page-grid">
-          <article class="dashboard-card agent-upload-card">
+          <article v-if="!onboardingV2Enabled" class="dashboard-card agent-upload-card">
             <div class="compact-card-head">
               <div class="compact-icon-shell">
                 <Bot :size="18" />
@@ -7453,7 +7494,7 @@ onBeforeUnmount(() => {
             </div>
           </article>
 
-          <article class="dashboard-card agent-documents-card">
+          <article v-if="!onboardingV2Enabled" class="dashboard-card agent-documents-card">
             <div class="members-card-head">
               <div>
                 <h3>Agents</h3>
@@ -16698,6 +16739,26 @@ onBeforeUnmount(() => {
 @media (max-width: 720px) {
   .cost-stats {
     grid-template-columns: 1fr;
+  }
+}
+
+/* Inbound Agent — inline rename in the hero */
+.agent-rename-row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+.agent-rename-row .db-input {
+  flex: 1 1 auto;
+}
+.agent-hero-rename {
+  margin-top: 14px;
+  max-width: 420px;
+}
+@media (max-width: 540px) {
+  .agent-rename-row {
+    flex-direction: column;
+    align-items: stretch;
   }
 }
 </style>
