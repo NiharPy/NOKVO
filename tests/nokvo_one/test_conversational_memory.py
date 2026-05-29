@@ -16,9 +16,14 @@ Redis or the LLM. The store layer is exercised in
 """
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
+from app.services.agent_session_store import AgentSessionStore
 from app.services.conversational_memory import (
+    bootstrap_caller_memory,
+    promote_to_caller_memory,
     BUCKET_OBJECTIONS,
     ConversationalMemory,
     FACT_APPOINTMENT_TYPE,
@@ -29,6 +34,7 @@ from app.services.conversational_memory import (
     FACT_DIETARY,
     FACT_DOCTOR_PREFERENCE,
     FACT_EMAIL,
+    FACT_INCOME,
     FACT_ISSUE_TYPE,
     FACT_ITEM,
     FACT_LOCATION,
@@ -421,3 +427,149 @@ def test_project_slot_hydrates_from_property_fact() -> None:
     m.merge_text("interested in Raghava Urban Nest", turn_index=1)
     merged = hydrate_flow_collected({}, m)
     assert merged["project_name"] == "Raghava Urban Nest"
+
+
+# ── Budget: spelled-out amounts (issue #1) ───────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("my budget is quite limited, maybe half a crore", "0.5 crore"),
+        ("I can spend about a crore", "1 crore"),
+        ("fifty lakhs", "50 lakh"),
+        ("one and a half crore", "1.5 crore"),
+        ("two and a half crore", "2.5 crore"),
+        ("a couple of crore", "2 crore"),
+    ],
+)
+def test_extractor_budget_word_numbers(text: str, expected: str) -> None:
+    """The regex used to need a leading digit; spelled-out amounts a human rep
+    understands ('half a crore') must now parse too."""
+    m = ConversationalMemory()
+    m.merge_text(text, turn_index=1, business_type="real_estate")
+    assert m.snapshot().get(FACT_BUDGET) == expected
+
+
+def test_extractor_digit_budget_still_works() -> None:
+    m = ConversationalMemory()
+    m.merge_text("budget is around 80 lakhs", turn_index=1, business_type="real_estate")
+    assert "80 lakhs" in m.snapshot()[FACT_BUDGET]
+
+
+# ── Income vs budget (issue #5 data) ─────────────────────────────────────────
+
+
+def test_income_captured_not_as_budget() -> None:
+    """'I earn 1.5 lakhs a month' is income, not a budget — it must not land in
+    the budget slot (the old regex mis-filed it there)."""
+    m = ConversationalMemory()
+    m.merge_text("I earn around 1.5 lakhs a month", turn_index=1, business_type="real_estate")
+    snap = m.snapshot()
+    assert snap.get(FACT_INCOME) == "1.5 lakhs"
+    assert FACT_BUDGET not in snap
+
+
+def test_salary_phrasing_is_income() -> None:
+    m = ConversationalMemory()
+    m.merge_text("my salary is 80k", turn_index=1, business_type="real_estate")
+    snap = m.snapshot()
+    assert snap.get(FACT_INCOME) == "80k"
+    assert FACT_BUDGET not in snap
+
+
+# ── Repetition-complaint objection (issue #3) ────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "you keep asking me the same thing",
+        "I already told you that",
+        "stop asking me this",
+    ],
+)
+def test_repetition_complaint_objection(text: str) -> None:
+    m = ConversationalMemory()
+    m.merge_text(text, turn_index=1)
+    latest = m.latest_objection()
+    assert latest is not None
+    assert latest["code"] == "repetition_complaint"
+
+
+# ── Cross-call strategic persistence (issue #7) ──────────────────────────────
+
+
+class _FakeRedis:
+    """Minimal async stand-in so the caller-memory roundtrip runs without a
+    live Redis. Only get/setex are used by promote/bootstrap."""
+
+    def __init__(self) -> None:
+        self.store: dict[str, str] = {}
+
+    async def get(self, key: str):
+        return self.store.get(key)
+
+    async def setex(self, key: str, ttl: int, value: str) -> None:
+        self.store[key] = value
+
+
+def test_cross_call_persists_journey_signals(monkeypatch) -> None:
+    """A returning caller should open warm: objections raised, commitments
+    made, and the journey stage they reached must survive across calls."""
+    fake = _FakeRedis()
+    monkeypatch.setattr(AgentSessionStore, "client", staticmethod(lambda: fake))
+    monkeypatch.setattr(AgentSessionStore, "namespace", staticmethod(lambda tr: "t1"))
+
+    first = ConversationalMemory()
+    first.merge_text("my budget is 80 lakhs", turn_index=1, business_type="real_estate")
+    first.merge_text("it's a bit too expensive though", turn_index=2, business_type="real_estate")
+    first.merge_text("ok let's go ahead and book it", turn_index=3, business_type="real_estate")
+
+    asyncio.run(
+        promote_to_caller_memory(
+            None, phone="98765 43210", memory=first, business_type="real_estate"
+        )
+    )
+
+    second = ConversationalMemory()
+    asyncio.run(
+        bootstrap_caller_memory(
+            None, phone="9876543210", memory=second, business_type="real_estate"
+        )
+    )
+
+    assert second.has(FACT_BUDGET)
+    assert FACT_BUDGET in second.bootstrap_keys
+    obj_codes = {o.get("code") for o in second.objections}
+    assert "price_concern" in obj_codes
+    assert all(o.get("from_prior_call") for o in second.objections)
+    commit_codes = {c.get("code") for c in second.commitments}
+    assert "ready_to_book" in commit_codes
+    assert second.prior_stage == "closing"
+    assert any(n.get("from_prior_call") for n in second.salient_notes)
+
+
+def test_transient_objection_not_persisted(monkeypatch) -> None:
+    """'call later' is a moment, not a standing position — it must not be
+    carried into the next call."""
+    fake = _FakeRedis()
+    monkeypatch.setattr(AgentSessionStore, "client", staticmethod(lambda: fake))
+    monkeypatch.setattr(AgentSessionStore, "namespace", staticmethod(lambda tr: "t1"))
+
+    first = ConversationalMemory()
+    first.merge_text("I'm busy, call later", turn_index=1, business_type="real_estate")
+    first.merge_text("my budget is 60 lakhs", turn_index=2, business_type="real_estate")
+    asyncio.run(
+        promote_to_caller_memory(
+            None, phone="9000000000", memory=first, business_type="real_estate"
+        )
+    )
+
+    second = ConversationalMemory()
+    asyncio.run(
+        bootstrap_caller_memory(
+            None, phone="9000000000", memory=second, business_type="real_estate"
+        )
+    )
+    assert all(o.get("code") != "call_later" for o in second.objections)

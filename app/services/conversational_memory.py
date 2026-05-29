@@ -105,6 +105,7 @@ FACT_EMAIL = "email"
 # Real-estate domain
 FACT_BHK = "bhk"
 FACT_BUDGET = "budget"
+FACT_INCOME = "monthly_income"
 FACT_LOCATION = "location_preference"
 FACT_PURPOSE = "purpose"  # self-use | investment
 FACT_TIMELINE = "timeline"
@@ -173,6 +174,7 @@ SLOT_LABELS: dict[str, str] = {
     # Real estate
     FACT_BHK: "BHK preference",
     FACT_BUDGET: "Budget",
+    FACT_INCOME: "Monthly income",
     FACT_LOCATION: "Location",
     FACT_PURPOSE: "Purpose",
     FACT_PROPERTY: "Property",
@@ -224,6 +226,9 @@ FLOW_SLOT_TO_FACT: dict[str, str] = {
     # Real estate
     "bhk": FACT_BHK,
     "budget": FACT_BUDGET,
+    "monthly_income": FACT_INCOME,
+    "income": FACT_INCOME,
+    "salary": FACT_INCOME,
     "location": FACT_LOCATION,
     "location_preference": FACT_LOCATION,
     "area": FACT_LOCATION,
@@ -448,6 +453,41 @@ _BUDGET_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Spelled-out amounts the digit regex above misses: "half a crore", "a crore",
+# "fifty lakhs", "one and a half crore". Maps a leading word-number phrase onto
+# a float multiplier, then the matched unit gives the canonical value.
+_NUMBER_WORDS = {
+    "a": 1.0, "an": 1.0, "one": 1.0, "two": 2.0, "three": 3.0, "four": 4.0,
+    "five": 5.0, "six": 6.0, "seven": 7.0, "eight": 8.0, "nine": 9.0,
+    "ten": 10.0, "eleven": 11.0, "twelve": 12.0, "fifteen": 15.0,
+    "twenty": 20.0, "thirty": 30.0, "forty": 40.0, "fifty": 50.0,
+    "sixty": 60.0, "seventy": 70.0, "eighty": 80.0, "ninety": 90.0,
+    "hundred": 100.0, "couple": 2.0, "few": 3.0,
+}
+_FRACTION_WORDS = {"half": 0.5, "quarter": 0.25}
+_BUDGET_UNIT_CANON = {
+    "cr": "crore", "crore": "crore", "crores": "crore",
+    "lakh": "lakh", "lakhs": "lakh", "lac": "lakh", "lacs": "lakh",
+    "k": "k", "thousand": "k",
+}
+# A run of number/fraction words (and the fillers "and"/"of") followed by a unit.
+_BUDGET_WORD_RE = re.compile(
+    r"\b((?:(?:" + "|".join(_NUMBER_WORDS) + r"|" + "|".join(_FRACTION_WORDS) + r"|and|of)\s+){1,4})"
+    r"(cr|crore|crores|lakh|lakhs|lac|lacs|k|thousand)\b",
+    re.IGNORECASE,
+)
+
+# Income statements must NOT land in the budget slot. "I earn 1.5 lakhs a
+# month" describes income, not what they'll spend on a home.
+_INCOME_CUE_RE = re.compile(
+    r"\b(earn|earning|salary|income|take[\s-]?home|per\s+month|/\s*month|monthly|p\.?m\.?|in[\s-]?hand)\b",
+    re.IGNORECASE,
+)
+_INCOME_AMOUNT_RE = re.compile(
+    r"([0-9]+(?:\.[0-9]+)?\s*(?:cr|crore|crores|lakhs|lakh|lacs|lac|k|thousand))\b",
+    re.IGNORECASE,
+)
+
 _PURPOSE_SELF_RE = re.compile(
     r"\b(self[-\s]?use|own use|end use|family|to live|for living|own house|investment\s+nahi|"
     # Transliterated Telugu / Hindi self-use cues.
@@ -560,6 +600,7 @@ _OBJECTION_PATTERNS = (
     (re.compile(r"\b(expensive|costly|too high|out of budget|over budget)\b", re.IGNORECASE), "price_concern"),
     (re.compile(r"\b(already (?:have|bought|booked)|other (?:agent|developer|broker))\b", re.IGNORECASE), "competitor"),
     (re.compile(r"\b(later this year|next year|after months?|in a few months)\b", re.IGNORECASE), "long_horizon"),
+    (re.compile(r"\b(you (?:keep|already) ask(?:ing|ed)|already (?:told|said|gave) (?:you|that)|same (?:thing|question)( again)?|asked me (?:that|this)( already)?|i just (?:told|said)|stop asking)\b", re.IGNORECASE), "repetition_complaint"),
 )
 
 # Affirmative commitment / decision cues. We promote these to the
@@ -847,10 +888,57 @@ class MemoryExtractor:
 
     @staticmethod
     def _extract_budget(text: str) -> str | None:
+        # An income statement ("I earn 1.5 lakhs a month") is not a budget.
+        # Let _extract_income claim those so they don't pollute the budget slot.
+        if _INCOME_CUE_RE.search(text):
+            return None
         match = _BUDGET_RE.search(text)
+        if match:
+            return _clean_value(match.group(1))
+        return MemoryExtractor._spelled_amount(text)
+
+    @staticmethod
+    def _spelled_amount(text: str) -> str | None:
+        """Parse a spelled-out amount like 'half a crore' / 'fifty lakhs' /
+        'one and a half crore' into a canonical '<n> <unit>' string.
+
+        Semantics: integer words sum into the whole part, fraction words into
+        the fractional part. The article 'a'/'an' counts as 1 only when it is
+        the sole quantity ('a crore' → 1); in 'half a crore' / 'one and a half
+        crore' it's an article, not a number, so it must not add 1."""
+        match = _BUDGET_WORD_RE.search(text)
         if not match:
             return None
-        return _clean_value(match.group(1))
+        tokens = [w for w in match.group(1).lower().split() if w and w not in ("and", "of")]
+        unit = _BUDGET_UNIT_CANON.get(match.group(2).lower())
+        if not tokens or not unit:
+            return None
+        integers = [t for t in tokens if t in _NUMBER_WORDS and t not in ("a", "an")]
+        fractions = [t for t in tokens if t in _FRACTION_WORDS]
+        has_article = any(t in ("a", "an") for t in tokens)
+        if integers:
+            whole = sum(_NUMBER_WORDS[t] for t in integers)
+        elif fractions:
+            whole = 0.0  # "half a crore" — the 'a' is an article
+        elif has_article:
+            whole = 1.0  # "a crore"
+        else:
+            return None
+        total = whole + sum(_FRACTION_WORDS[t] for t in fractions)
+        if total <= 0:
+            return None
+        # Render 1.0 → "1", 0.5 → "0.5", 1.5 → "1.5".
+        return f"{total:g} {unit}"
+
+    @staticmethod
+    def _extract_income(text: str) -> str | None:
+        if not _INCOME_CUE_RE.search(text):
+            return None
+        match = _INCOME_AMOUNT_RE.search(text)
+        if match:
+            return _clean_value(match.group(1))
+        spelled = MemoryExtractor._spelled_amount(text)
+        return spelled
 
     @staticmethod
     def _extract_purpose(text: str) -> str | None:
@@ -1294,6 +1382,7 @@ _BUSINESS_EXTRACTORS: dict[str, tuple[tuple[str, str], ...]] = {
     "real_estate": (
         (FACT_BHK, "_extract_bhk"),
         (FACT_BUDGET, "_extract_budget"),
+        (FACT_INCOME, "_extract_income"),
         (FACT_PURPOSE, "_extract_purpose"),
         (FACT_LOCATION, "_extract_location"),
         (FACT_PROPERTY, "_extract_property"),
@@ -1337,7 +1426,7 @@ _UNIVERSAL_PROMPT_KEYS: tuple[str, ...] = (
     FACT_VISIT_DATE, FACT_VISIT_TIME,
 )
 _BUSINESS_PROMPT_KEYS: dict[str, tuple[str, ...]] = {
-    "real_estate": (FACT_BHK, FACT_BUDGET, FACT_LOCATION, FACT_PURPOSE, FACT_PROPERTY),
+    "real_estate": (FACT_BHK, FACT_BUDGET, FACT_INCOME, FACT_LOCATION, FACT_PURPOSE, FACT_PROPERTY),
     "clinics": (
         FACT_SYMPTOMS, FACT_APPOINTMENT_TYPE, FACT_DOCTOR_PREFERENCE,
         FACT_PATIENT_AGE, FACT_PATIENT_GENDER, FACT_INSURANCE, FACT_PRIOR_VISIT,
@@ -1371,7 +1460,7 @@ def _durable_fact_keys_for(business_type: str | None) -> tuple[str, ...]:
     base = (FACT_NAME, FACT_EMAIL, FACT_COMPANY, FACT_LANGUAGE_PREF, FACT_FAMILY_SIZE)
     bt = str(business_type or "").strip().lower()
     domain: dict[str, tuple[str, ...]] = {
-        "real_estate": (FACT_BHK, FACT_BUDGET, FACT_LOCATION, FACT_PURPOSE, FACT_TIMELINE),
+        "real_estate": (FACT_BHK, FACT_BUDGET, FACT_INCOME, FACT_LOCATION, FACT_PURPOSE, FACT_TIMELINE),
         "clinics": (FACT_DOCTOR_PREFERENCE, FACT_PATIENT_AGE, FACT_PATIENT_GENDER, FACT_INSURANCE, FACT_PRIOR_VISIT),
         "ecommerce": (FACT_SHIPPING_ADDRESS, FACT_PAYMENT_METHOD),
         "hospitality": (FACT_ROOM_TYPE, FACT_DIETARY, FACT_SEATING_PREFERENCE, FACT_PARTY_SIZE),
@@ -1411,6 +1500,10 @@ class ConversationalMemory:
     # for the same phone. Kept separate so the in-call merge can prefer
     # current-call values over historical ones at equal confidence.
     bootstrap_keys: set[str] = field(default_factory=set)
+    # Buying-journey stage the caller reached on their previous call (set
+    # by ``bootstrap_caller_memory``). Lets the strategy layer open a
+    # returning caller where they left off instead of from discovery.
+    prior_stage: str | None = None
 
     # ── Serialisation ────────────────────────────────────────────────
 
@@ -1423,6 +1516,7 @@ class ConversationalMemory:
             "salient_notes": list(self.salient_notes),
             "asked_questions": list(self.asked_questions),
             "bootstrap_keys": sorted(self.bootstrap_keys),
+            "prior_stage": self.prior_stage,
         }
 
     @classmethod
@@ -1442,6 +1536,7 @@ class ConversationalMemory:
             salient_notes=list(data.get("salient_notes") or []),
             asked_questions=list(data.get("asked_questions") or []),
             bootstrap_keys=set(data.get("bootstrap_keys") or []),
+            prior_stage=(str(data["prior_stage"]) if data.get("prior_stage") else None),
         )
 
     # ── Reads ────────────────────────────────────────────────────────
@@ -1686,6 +1781,13 @@ _CALLER_TTL_SECONDS = 60 * 60 * 24 * 30  # 30 days
 _DURABLE_SALIENT_CODES = frozenset({"allergy", "family", "note", "requirement", "reference"})
 _CALLER_SALIENT_MAX = 6
 
+# Objection / commitment codes worth carrying across calls. Transient ones
+# (``call_later``, ``repetition_complaint``) describe a moment, not a standing
+# position, so they're excluded — only durable buying-journey signals persist.
+_DURABLE_OBJECTION_CODES = frozenset({"price_concern", "competitor", "long_horizon"})
+_DURABLE_COMMITMENT_CODES = frozenset({"ready_to_book", "info_requested", "callback_requested", "interested"})
+_CALLER_BUCKET_MAX = 4
+
 
 def _normalise_phone(value: Any) -> str | None:
     if not value:
@@ -1762,6 +1864,46 @@ async def bootstrap_caller_memory(
             restored["from_prior_call"] = True
             memory._accept_salient(restored)
         memory.salient_notes = memory.salient_notes[-16:]
+
+    # Restore the buying-journey context: which objections the caller raised,
+    # what they committed to, and the stage they reached. Tagged
+    # ``from_prior_call`` so the strategy layer treats them as history (not a
+    # fresh signal) and the lead score is driven by the current call.
+    prior_objections = [
+        str(c) for c in (payload.get("objections") or []) if isinstance(c, str)
+    ]
+    for code in prior_objections:
+        memory.objections.append({"code": code, "from_prior_call": True})
+    memory.objections = memory.objections[-16:]
+
+    prior_commitments = [
+        str(c) for c in (payload.get("commitments") or []) if isinstance(c, str)
+    ]
+    for code in prior_commitments:
+        memory.commitments.append({"code": code, "from_prior_call": True})
+    memory.commitments = memory.commitments[-16:]
+
+    stage = payload.get("stage")
+    memory.prior_stage = str(stage) if stage else None
+
+    # One human-readable continuity line so the agent opens warm and can
+    # reference the prior arc ("last time we were arranging a site visit").
+    continuity_bits: list[str] = []
+    if memory.prior_stage:
+        continuity_bits.append(f"reached the {memory.prior_stage.replace('_', ' ')} stage")
+    if prior_objections:
+        continuity_bits.append("raised " + ", ".join(c.replace("_", " ") for c in prior_objections[:2]))
+    if prior_commitments:
+        continuity_bits.append("committed: " + ", ".join(c.replace("_", " ") for c in prior_commitments[:2]))
+    if continuity_bits:
+        memory._accept_salient(
+            {
+                "code": "note",
+                "text": "Returning caller — last call: " + "; ".join(continuity_bits) + ".",
+                "from_prior_call": True,
+            }
+        )
+        memory.salient_notes = memory.salient_notes[-16:]
     return memory
 
 
@@ -1790,16 +1932,45 @@ async def promote_to_caller_memory(
 
     payload_notes: list[dict[str, Any]] = []
     for note in memory.salient_notes:
+        # Don't re-persist a continuity note synthesized from a prior call —
+        # only genuinely durable facts the caller stated this call.
+        if note.get("from_prior_call"):
+            continue
         if str(note.get("code") or "") in _DURABLE_SALIENT_CODES:
             payload_notes.append({k: note[k] for k in ("code", "text") if k in note})
         if len(payload_notes) >= _CALLER_SALIENT_MAX:
             break
 
-    if not payload_facts and not payload_notes:
+    # Durable buying-journey signals raised on THIS call (de-duped, latest few).
+    def _durable_codes(bucket: list[dict[str, Any]], allowed: frozenset[str]) -> list[str]:
+        out: list[str] = []
+        for entry in bucket:
+            if entry.get("from_prior_call"):
+                continue
+            code = str(entry.get("code") or "")
+            if code in allowed and code not in out:
+                out.append(code)
+        return out[-_CALLER_BUCKET_MAX:]
+
+    payload_objections = _durable_codes(memory.objections, _DURABLE_OBJECTION_CODES)
+    payload_commitments = _durable_codes(memory.commitments, _DURABLE_COMMITMENT_CODES)
+
+    stage: str | None = None
+    try:
+        from app.services.conversation_strategy import journey_stage
+
+        stage = journey_stage(memory, business_type=business_type)
+    except Exception:
+        logger.debug("NOKVO-MEMORY: journey_stage failed during promote", exc_info=True)
+
+    if not (payload_facts or payload_notes or payload_objections or payload_commitments or stage):
         return
     payload = {
         "facts": payload_facts,
         "salient_notes": payload_notes,
+        "objections": payload_objections,
+        "commitments": payload_commitments,
+        "stage": stage,
         "business_type": str(business_type or "").strip().lower() or None,
         "updated_at": time.time(),
     }
@@ -1860,6 +2031,7 @@ __all__ = [
     # Real estate
     "FACT_BHK",
     "FACT_BUDGET",
+    "FACT_INCOME",
     "FACT_LOCATION",
     "FACT_PROPERTY",
     "FACT_PURPOSE",

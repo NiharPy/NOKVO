@@ -2553,6 +2553,7 @@ class NokvoOneVoicePipeline:
         covered_objectives: list[str] | None = None,
         outbound_memory: dict[str, Any] | None = None,
         conversational_memory_block: str | None = None,
+        conversation_strategy_block: str | None = None,
         field_questions_prompt: str | None = None,
         projects_block: str | None = None,
     ) -> list[dict[str, str]]:
@@ -2672,6 +2673,11 @@ class NokvoOneVoicePipeline:
         outbound_fewshot_block = language_outbound_fewshot(language)
         memory_block = (conversational_memory_block or "").strip()
         memory_section = f"\n\n{memory_block}\n" if memory_block else ""
+        strategy_block = (conversation_strategy_block or "").strip()
+        # Strategy is derived from the memory, so it sits right after it. In the
+        # inbound branch it also precedes field_questions so a tactical focus
+        # (e.g. handle the objection) overrides routine slot-filling.
+        strategy_section = f"\n{strategy_block}\n" if strategy_block else ""
         if _outbound_proactive:
             system_content = (
                 language_directive_top
@@ -2683,6 +2689,7 @@ class NokvoOneVoicePipeline:
                 "Tags are stripped before speaking — they only set the voice's tone.\n\n"
                 + campaign_rule
                 + memory_section
+                + strategy_section
                 + (f"\n\n{projects_block_section}" if projects_block_section else "")
                 + (f"\n\n{outbound_fewshot_block}" if outbound_fewshot_block else "")
                 + f"\n\n# REMINDER\nReply in {language_label} with natural English code-switching for loanwords, numbers, and ₹ amounts. Keep it to 1-2 sentences."
@@ -2770,6 +2777,11 @@ class NokvoOneVoicePipeline:
             + (
                 f"{memory_block}\n\n"
                 if memory_block
+                else ""
+            )
+            + (
+                f"{strategy_block}\n\n"
+                if strategy_block
                 else ""
             )
             + (
@@ -4445,6 +4457,7 @@ class NokvoOneVoicePipeline:
             bundle, language=language, project_names=project_names_for_prompt
         )
         memory_block_v2 = ""
+        strategy_block_v2 = ""
         if conversational_memory is not None:
             try:
                 memory_block_v2 = conversational_memory.compose_prompt_block(
@@ -4453,6 +4466,17 @@ class NokvoOneVoicePipeline:
                 )
             except Exception:
                 memory_block_v2 = ""
+            try:
+                from app.services.conversation_strategy import compose_strategy_block
+
+                strategy_block_v2 = compose_strategy_block(
+                    conversational_memory,
+                    business_type=bundle.organization_industry,
+                    is_outbound=outbound_context is not None,
+                    language=language,
+                )
+            except Exception:
+                strategy_block_v2 = ""
         messages = NokvoOneVoicePipeline._messages(
             user_text,
             chunks,
@@ -4467,6 +4491,7 @@ class NokvoOneVoicePipeline:
                 caller_text=user_text,
             ) if outbound_context is not None else None,
             conversational_memory_block=memory_block_v2,
+            conversation_strategy_block=strategy_block_v2,
             field_questions_prompt=field_questions_prompt,
             projects_block=projects_block,
         )
@@ -4931,6 +4956,7 @@ class NokvoOneVoicePipeline:
             bundle, language=language, project_names=project_names_for_prompt
         )
         memory_block = ""
+        strategy_block = ""
         if conversational_memory is not None:
             try:
                 memory_block = conversational_memory.compose_prompt_block(
@@ -4939,6 +4965,17 @@ class NokvoOneVoicePipeline:
                 )
             except Exception:
                 memory_block = ""
+            try:
+                from app.services.conversation_strategy import compose_strategy_block
+
+                strategy_block = compose_strategy_block(
+                    conversational_memory,
+                    business_type=bundle.organization_industry,
+                    is_outbound=outbound_context is not None,
+                    language=language,
+                )
+            except Exception:
+                strategy_block = ""
         messages = NokvoOneVoicePipeline._messages(
             user_text,
             chunks,
@@ -4951,6 +4988,7 @@ class NokvoOneVoicePipeline:
             covered_objectives=covered_objectives,
             outbound_memory=prompt_outbound_memory,
             conversational_memory_block=memory_block,
+            conversation_strategy_block=strategy_block,
             field_questions_prompt=field_questions_prompt,
             projects_block=projects_block,
         )
