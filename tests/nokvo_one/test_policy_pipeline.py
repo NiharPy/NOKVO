@@ -76,7 +76,7 @@ def _zapeats_cards() -> list[dict[str, Any]]:
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.new_event_loop().run_until_complete(coro)
 
 
 # ── 1) Cancellation answer without live context (the original failure) ──────
@@ -2033,6 +2033,31 @@ def test_extract_person_name_unit_cases():
     assert N("Do you guys have 4 BHK?") is None
     assert N("I'm looking for a 3 BHK") is None
     assert N("yes please") is None
+
+
+def test_extract_person_name_rejects_categorical_discovery_answers():
+    """Regression for a reported outbound bug: the agent confirmed 'the name is
+    Immediately' after the caller answered the timeline question. Single-word
+    timeline / intent / channel replies must NOT be treated as a person name."""
+    from app.services.tool_flow_policy import _extract_person_name as N
+
+    # Timeline answers
+    for answer in ("Immediately", "ASAP", "soon", "later", "Exploring", "browsing"):
+        assert N(answer) is None, f"timeline word {answer!r} mis-extracted as name"
+    # Purpose answers
+    for answer in ("investment", "Rental", "self-use", "self use", "own use"):
+        assert N(answer) is None, f"purpose word {answer!r} mis-extracted as name"
+    # Visit-preference answers
+    for answer in ("weekend", "Weekday", "weekends"):
+        assert N(answer) is None, f"channel word {answer!r} mis-extracted as name"
+    # Affirmation / acknowledgment particles — reported bug: "Ya" → name "Ya".
+    for answer in ("Ya", "ya", "Yah", "Yup", "Yeah", "Nope", "Sure", "Okay", "Fine"):
+        assert N(answer) is None, f"affirmation {answer!r} mis-extracted as name"
+    # Compound timeline phrases
+    for answer in ("right away", "this month", "next year", "within 6 months"):
+        assert N(answer) is None, f"compound timeline {answer!r} mis-extracted as name"
+    # Real names containing one of these tokens must still pass.
+    assert N("my name is Asha Soon") == "Asha Soon"
 
 
 def test_tool_flow_slot_confirm_accepts_ya():

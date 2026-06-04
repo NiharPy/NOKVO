@@ -1142,6 +1142,37 @@ class OutgoingLeadService:
         await db.refresh(form)
         return form
 
+    # ── Follow-up agent: opt-out kill switch ─────────────────────────────
+    @staticmethod
+    async def revoke_consent_and_cancel_followups(
+        lead: OutgoingLead, *, db: AsyncSession, reason: str = "opted_out"
+    ) -> None:
+        """Legal kill switch. Flip the lead's consent_status to 'revoked',
+        stamp opt_out_at, and cancel every pending follow-up for the lead.
+
+        Once revoked, ``lead_is_callable`` returns False and the lead is
+        permanently excluded from future campaign placement, follow-up
+        dispatch, and lead-sync pickups. This is irreversible from the
+        system's perspective — TRAI compliance requires that an opt-out
+        commitment survives even if the admin doesn't notice for weeks.
+        """
+        from datetime import datetime, timezone
+
+        lead.consent_status = LeadConsentStatus.revoked
+        if lead.opt_out_at is None:
+            lead.opt_out_at = datetime.now(timezone.utc)
+        db.add(lead)
+        await db.commit()
+        await db.refresh(lead)
+
+        # Lazy-import to avoid a service-layer cycle (followup service ↔
+        # outgoing_lead_service via the LeadConsentStatus enum).
+        from app.services.followup_scheduler_service import FollowupSchedulerService
+
+        await FollowupSchedulerService.cancel_for_lead(
+            lead_id=lead.id, reason=reason, db=db
+        )
+
 
 async def _notify_inbound_lead(
     db: AsyncSession,

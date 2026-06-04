@@ -573,6 +573,83 @@ class NokvoOneVoiceStreamService:
         return f"Hi again — still about {topic}, or something new?"
 
     @staticmethod
+    async def _outbound_opener_known_facts(
+        db: AsyncSession | None,
+        tenant_res: TenantResources,
+        campaign_context: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Assemble what we already know about THIS lead for a personalised
+        opener: name + enquiry / prior-call facts (bhk, location, budget) and a
+        ``returning`` flag. Two sources, best-effort: the dialer-provided
+        ``contact`` (the lead's own enquiry) and the cross-call caller-memory
+        blob (a prior call). An empty dict yields the cold template opener."""
+        facts: dict[str, Any] = {}
+        contact = (campaign_context or {}).get("contact") if isinstance(campaign_context, dict) else None
+        contact = contact if isinstance(contact, dict) else {}
+
+        for key in ("name", "full_name", "customer_name"):
+            if contact.get(key):
+                facts["name"] = str(contact[key]).strip()
+                break
+        for src, dst in (
+            ("bhk", "bhk"),
+            ("property_type", "bhk"),
+            ("location", "location"),
+            ("location_preference", "location"),
+            ("budget", "budget"),
+        ):
+            if contact.get(src) and not facts.get(dst):
+                facts[dst] = str(contact[src]).strip()
+
+        phone = (
+            contact.get("phone")
+            or contact.get("phone_e164")
+            or (campaign_context or {}).get("from_phone")
+            or (campaign_context or {}).get("to_phone")
+        )
+        if phone:
+            try:
+                from app.services.conversational_memory import (
+                    FACT_BHK,
+                    FACT_BUDGET,
+                    FACT_LOCATION,
+                    FACT_NAME,
+                    ConversationalMemory,
+                    bootstrap_caller_memory,
+                )
+
+                business_type = await _resolve_business_type(db, tenant_res)
+                prior = ConversationalMemory()
+                await bootstrap_caller_memory(
+                    tenant_res, phone=phone, memory=prior, business_type=business_type
+                )
+                if prior.facts or prior.prior_stage:
+                    facts["returning"] = True
+                for fkey, dst in (
+                    (FACT_NAME, "name"),
+                    (FACT_BHK, "bhk"),
+                    (FACT_LOCATION, "location"),
+                    (FACT_BUDGET, "budget"),
+                ):
+                    value = prior.get(fkey)
+                    if value and not facts.get(dst):
+                        facts[dst] = str(value).strip()
+                # Carry the prior-call buying-journey context too: the stage
+                # they reached and (if any) the last objection wording — so
+                # the opener can address it by name on a returning call
+                # instead of starting cold over the same concern.
+                if prior.prior_stage:
+                    facts["prior_stage"] = prior.prior_stage
+                for entry in prior.objections:
+                    if entry.get("from_prior_call") and entry.get("text"):
+                        facts["last_objection_code"] = str(entry.get("code") or "")
+                        facts["last_objection_text"] = str(entry.get("text") or "")[:120]
+                        break
+            except Exception:
+                logger.debug("NOKVO-MEMORY: opener known-facts bootstrap failed", exc_info=True)
+        return facts
+
+    @staticmethod
     async def _log_voice_call(
         db: AsyncSession | None,
         tenant_res: TenantResources,
@@ -801,7 +878,27 @@ class NokvoOneVoiceStreamService:
         # structured booking flow skips slots whose values the caller
         # already gave us mid-conversation.
         conv_memory = await load_memory(tenant_res, call_id)
-        turn_index = len(await AgentSessionStore.get_history(tenant_res, call_id))
+        # Use the monotonic counter from the unified session state instead
+        # of deriving from the conversation log's length. Pre-unification
+        # this was ``len(get_history)``, which produced collisions when the
+        # previous turn's ``append_turn`` had not yet flushed by the time
+        # the next user utterance arrived — two consecutive turns then
+        # shared the same index and the "newer wins on tie" tiebreaker in
+        # MemoryFact merge silently became order-dependent. ``next_turn_index``
+        # is bumped under the per-call lock by ``append_turn``, so it can't
+        # collide.
+        try:
+            from app.services.session_state_v2 import load_state as _load_state_v2
+
+            _state_for_turn_idx = await _load_state_v2(
+                AgentSessionStore.client(),
+                AgentSessionStore.namespace(tenant_res),
+                call_id,
+            )
+            turn_index = _state_for_turn_idx.next_turn_index
+        except Exception:
+            # Fall back to legacy derivation if the unified store hiccups.
+            turn_index = len(await AgentSessionStore.get_history(tenant_res, call_id))
         # Business type drives which domain slots the extractor mines and
         # which the prompt block renders. Resolved from the cached runtime
         # bundle so this is a near-free lookup; ``None`` falls back to the
@@ -831,6 +928,22 @@ class NokvoOneVoiceStreamService:
                     )
                 except Exception:
                     logger.debug("NOKVO-MEMORY: bootstrap failed", exc_info=True)
+            # Single-project auto-fill — when a real-estate org has exactly one
+            # active project in the inventory, seed FACT_PROPERTY so the booking
+            # FSM never has to ask "which project?" and the LLM can't paraphrase
+            # a hardcoded location list from the admin's free-text guidance as
+            # if it were the inventory. The strategy / booking layer treats
+            # this exactly like a bootstrapped fact.
+            if (business_type or "").lower() == "real_estate" and not conv_memory.has("property"):
+                try:
+                    from app.services.conversational_memory import FACT_PROPERTY, seed_facts
+                    from app.services.real_estate_project_service import load_active_projects
+
+                    _projects = await load_active_projects(db, tenant_res.organization_id)
+                    if len(_projects) == 1 and (_projects[0].name or "").strip():
+                        seed_facts(conv_memory, {FACT_PROPERTY: _projects[0].name.strip()})
+                except Exception:
+                    logger.debug("NOKVO-MEMORY: single-project autofill failed", exc_info=True)
         if source != "proactive_silence":
             conv_memory.merge_text(
                 cleaned,
@@ -851,6 +964,24 @@ class NokvoOneVoiceStreamService:
                     (session_state or {}).get("campaign_objectives_covered") or []
                 )
                 stored_outbound_memory = dict((session_state or {}).get("outbound_memory") or {})
+                # Seed the follow-up preamble inputs on the first turn so the
+                # composer can render the "FOLLOW-UP CALL" block. Subsequent
+                # turns find it already present in session state.
+                if (
+                    isinstance(campaign_context, dict)
+                    and campaign_context.get("is_followup")
+                    and not stored_outbound_memory.get("followup")
+                ):
+                    stored_outbound_memory["followup"] = {
+                        "is_followup": True,
+                        "attempt_n": campaign_context.get("attempt_n") or 1,
+                        "source_call_id": campaign_context.get("source_call_id"),
+                        # The prior promise text — surfaced by the composer in
+                        # the preamble. Pulled from the caller's prior memory
+                        # via bootstrap; not present here on first turn, so
+                        # we leave it blank for the WS-handler-seeded path.
+                        "prior_promise": "",
+                    }
                 prompt_outbound_memory = update_outbound_memory(
                     stored_outbound_memory,
                     caller_text=cleaned,
@@ -859,6 +990,17 @@ class NokvoOneVoiceStreamService:
                 covered_objectives = []
                 stored_outbound_memory = {}
                 prompt_outbound_memory = update_outbound_memory({}, caller_text=cleaned)
+            # Unify the two memory silos: feed the outbound turn-memory dict into
+            # the structured ConversationalMemory so the strategy layer (lead
+            # scoring, objection playbook) sees outbound-captured facts too.
+            # Low-confidence seed — never overrides an in-call extraction.
+            try:
+                from app.services.agent_outbound_context import outbound_memory_as_facts
+                from app.services.conversational_memory import seed_facts
+
+                seed_facts(conv_memory, outbound_memory_as_facts(prompt_outbound_memory))
+            except Exception:
+                logger.debug("NOKVO-MEMORY: outbound→conv seed failed", exc_info=True)
         stream_done = object()
         event_queue: asyncio.Queue[Any] = asyncio.Queue()
 
@@ -918,7 +1060,23 @@ class NokvoOneVoiceStreamService:
         # reassures the caller during retrieval. On outbound calls it sounds
         # like an extra agent turn ("one moment...") and can stack in front of
         # the actual sales reply, which prevents natural interruption.
-        latency_guard_enabled = outbound_context is None
+        # Also disabled mid-booking (tool_flow active): slot-fill turns are
+        # small LLM calls that finish well under the threshold, and the filler
+        # makes the booking conversation feel robotic ("one moment, I'm
+        # checking that. Got it, Nihar. What phone number…").
+        _tool_flow_active_for_guard = False
+        if outbound_context is None and call_id:
+            try:
+                _guard_state = await AgentSessionStore.get_state(tenant_res, call_id) or {}
+                _tf_for_guard = _guard_state.get("tool_flow") or {}
+                _tool_flow_active_for_guard = bool(
+                    _tf_for_guard.get("active") and not _tf_for_guard.get("completed")
+                )
+            except Exception:
+                _tool_flow_active_for_guard = False
+        latency_guard_enabled = (
+            outbound_context is None and not _tool_flow_active_for_guard
+        )
         try:
             while True:
                 timeout_s = (
@@ -1411,6 +1569,7 @@ class NokvoOneVoiceStreamService:
         call_id: str | None = None,
         campaign_context: dict[str, Any] | None = None,
         outbound_context_override: OutboundCampaignContext | None = None,
+        on_session_end: Any | None = None,
     ) -> None:
         await websocket.accept()
         session_started = perf_counter()
@@ -1965,7 +2124,14 @@ class NokvoOneVoiceStreamService:
         elif _outbound_proactive:
             # Use the deterministic, template-filled opener — no LLM call,
             # ~150ms faster first audio. The LLM takes over from turn 2.
-            outbound_opening_text = generate_outbound_opener_text(outbound_context, language=language)
+            # Personalise from what we already know about this lead (enquiry
+            # details + any prior call) so it opens warm, not one-size-fits-all.
+            opener_facts = await NokvoOneVoiceStreamService._outbound_opener_known_facts(
+                db, tenant_res, campaign_context
+            )
+            outbound_opening_text = generate_outbound_opener_text(
+                outbound_context, language=language, known_facts=opener_facts
+            )
             await NokvoOneVoiceStreamService._play_opener(
                 websocket,
                 tenant_res,
@@ -2255,6 +2421,17 @@ class NokvoOneVoiceStreamService:
                         phone=promote_phone,
                         memory=final_memory,
                         business_type=promote_business_type,
+                        call_id=call_id,
                     )
             except Exception:
                 logger.exception("NOKVO-MEMORY: promote_to_caller_memory failed at session end")
+            # Outbound-tester end-of-call hook. Runs after billing/memory so
+            # by the time it sends its `outcome` message all the durable
+            # side-effects are committed. Wrapped in try/except — a slow
+            # classifier or a client that already closed the WS must not
+            # surface as a 500 to the operator.
+            if on_session_end is not None:
+                try:
+                    await on_session_end(websocket)
+                except Exception:
+                    logger.exception("NOKVO-VOICE: on_session_end hook failed")

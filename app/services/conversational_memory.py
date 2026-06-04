@@ -148,6 +148,16 @@ FACT_OCCASION = "occasion"
 FACT_DIETARY = "dietary"
 FACT_SEATING_PREFERENCE = "seating_preference"
 
+# Follow-up agent signals
+# - promised_callback_at: caller asked to be called back at a specific time.
+#   Drives the highest-priority branch of the follow-up decision tree.
+#   Value: ISO-8601 string with TZ (UTC). Source: heuristic parser below.
+# - opted_out: caller asked to never be contacted again. Triggers the legal
+#   kill switch in the follow-up service (consent_status='revoked' + cancel
+#   pending follow-ups). Value: True (only present when detected).
+FACT_PROMISED_CALLBACK_AT = "promised_callback_at"
+FACT_OPTED_OUT = "opted_out"
+
 # Tracker-only buckets (lists, not single-valued slots)
 BUCKET_OBJECTIONS = "objections"
 BUCKET_COMMITMENTS = "commitments"
@@ -339,6 +349,24 @@ class MemoryFact:
     timestamp: float
     language: str | None = None
     raw: str | None = None
+    # Set True when the fact was restored from the per-phone caller-memory
+    # blob at session start (replaces the parallel ``bootstrap_keys`` set that
+    # ConversationalMemory used to track separately — same meaning, expressed
+    # on the fact itself for consistency with bucket entries which already
+    # carry an equivalent ``from_prior_call`` flag).
+    from_prior_call: bool = False
+
+    @property
+    def turn(self) -> int:
+        """Alias for ``source_turn``. Read-only.
+
+        Bucket entries (objections / commitments / salient_notes) historically
+        used ``turn`` while facts used ``source_turn``. Exposing both names
+        lets the FSM / strategy layer reference signals uniformly without
+        having to remember which bucket they came from. The storage name stays
+        ``source_turn`` until a follow-up rename PR.
+        """
+        return self.source_turn
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -352,6 +380,8 @@ class MemoryFact:
             d["language"] = self.language
         if self.raw:
             d["raw"] = self.raw[:200]
+        if self.from_prior_call:
+            d["from_prior_call"] = True
         return d
 
     @classmethod
@@ -364,6 +394,7 @@ class MemoryFact:
             timestamp=float(payload.get("timestamp") or time.time()),
             language=(str(payload.get("language")) if payload.get("language") else None),
             raw=(str(payload.get("raw")) if payload.get("raw") else None),
+            from_prior_call=bool(payload.get("from_prior_call")),
         )
 
 
@@ -613,12 +644,127 @@ _COMMITMENT_PATTERNS = (
     (re.compile(r"\b(call (?:me )?(?:back|later))\b", re.IGNORECASE), "callback_requested"),
 )
 
+# Resolution / acceptance cues. Multi-token phrases only — a bare "ok" or
+# "yeah" is too broad (it could be a cold-open filler or a permission-to-
+# continue reply). A match here, combined with the existence of a live
+# objection from a PRIOR turn, means the caller accepted the rebuttal and
+# the FSM should drop out of objection_handling cleanly.
+_RESOLUTION_PATTERNS = (
+    re.compile(
+        r"\b("
+        r"(?:ok|okay|alright|fine|sure|right)\s+(?:makes\s+sense|that\s+works|got\s+it|understood|fair\s+enough)|"
+        r"makes?\s+sense|fair\s+enough|got\s+it|understood|i\s+see|noted|"
+        r"that\s+(?:makes\s+sense|helps|works|sounds\s+(?:good|fine|fair|reasonable))|"
+        r"thanks?\s+for\s+(?:clarifying|explaining|the\s+info(?:rmation)?)|"
+        r"good\s+point|that'?s\s+(?:a\s+)?(?:good|fair)\s+point|"
+        r"i\s+(?:can|might|could)\s+(?:work|live)\s+with\s+that|"
+        r"sounds\s+(?:good|fair|reasonable)"
+        r")\b",
+        re.IGNORECASE,
+    ),
+)
+
 # Preferences (channel, contact time, contact mode). Stored as small
 # dicts so multiple co-exist.
 _CHANNEL_WHATSAPP_RE = re.compile(r"\bwhatsapp\b", re.IGNORECASE)
 _CHANNEL_EMAIL_RE = re.compile(r"\b(?:email me|over email|by mail)\b", re.IGNORECASE)
 _CHANNEL_VOICE_RE = re.compile(r"\b(?:call me|over (?:phone|call))\b", re.IGNORECASE)
 _TIME_PREF_RE = re.compile(r"\b(morning|afternoon|evening|weekday|weekdays|weekend|weekends)\b", re.IGNORECASE)
+
+# ── Follow-up agent: callback-time + opt-out extraction ────────────────────
+
+# Strong opt-out cues. Deliberately narrow — a bare "not interested" is an
+# objection (handled by the FSM), not a legal opt-out. We need explicit
+# "stop calling" / "don't contact" / "remove me" language to flip
+# consent_status='revoked', because that decision is irreversible from the
+# system's perspective.
+_OPT_OUT_RE = re.compile(
+    r"\b("
+    r"don'?t (?:ever )?(?:call|contact|phone|ring|reach out to) (?:me|us)(?: again)?|"
+    r"stop (?:calling|contacting|phoning) (?:me|us)|"
+    r"do not (?:call|contact|phone) (?:me|us)(?: again)?|"
+    r"remove me from (?:your|the|this) (?:list|database|records)|"
+    r"take me off (?:your|the|this) (?:list|database|records)|"
+    r"unsubscribe me|opt me out|"
+    r"no more calls|never call (?:me|us)(?: again)?|"
+    r"leave me alone|stop bothering me|"
+    r"add (?:me|us) to (?:the )?do(?:-| )not(?:-| )call(?: list| registry)?"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Callback-time trigger phrases. The caller MUST be asking to be called back
+# (not stating they'll call back themselves). We look for one of these
+# request frames first, then parse a time anchor in the same utterance.
+_CALLBACK_REQUEST_RE = re.compile(
+    r"\b("
+    r"call (?:me |us )?back|ring (?:me |us )?back|phone (?:me |us )?back|"
+    r"call (?:me|us)|ring (?:me|us)|phone (?:me|us)|reach (?:me|us)|"
+    r"try (?:me|us)|hit (?:me|us) up"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Caller-driven false-positive guard: "I'll call you back" is the caller
+# saying THEY will reach out, not a request for us to call them. Skip these.
+_CALLER_INITIATED_RE = re.compile(
+    r"\b(i'?ll|i will|let me) (?:call|ring|phone|reach) (?:you|back)\b",
+    re.IGNORECASE,
+)
+
+# Time-anchor patterns. Each compiled regex pairs with a parser that turns
+# the matched span into a (delta_kind, delta_value) tuple consumed by
+# :func:`_resolve_callback_anchor`. Order matters — match the most specific
+# (full date+time) first; least specific ("tomorrow") last.
+_CALLBACK_AT_HHMM_RE = re.compile(
+    r"\b(?:at|around|by)\s+(\d{1,2})(?:[:.](\d{2}))?\s*(am|pm|a\.m\.|p\.m\.)?",
+    re.IGNORECASE,
+)
+_CALLBACK_IN_DURATION_RE = re.compile(
+    r"\bin\s+(\d+|a|an|half an|one|two|three|four|five|six)\s+(minute|minutes|min|mins|"
+    r"hour|hours|hr|hrs|day|days|week|weeks)\b",
+    re.IGNORECASE,
+)
+_CALLBACK_AFTER_DURATION_RE = re.compile(
+    r"\bafter\s+(\d+|a|an|one|two|three|four|five|six)\s+(minute|minutes|min|mins|"
+    r"hour|hours|hr|hrs|day|days|week|weeks)\b",
+    re.IGNORECASE,
+)
+_CALLBACK_TOMORROW_RE = re.compile(r"\btomorrow\b", re.IGNORECASE)
+_CALLBACK_TODAY_RE = re.compile(r"\b(?:today|this (?:afternoon|evening|morning))\b", re.IGNORECASE)
+_CALLBACK_NEXT_WEEK_RE = re.compile(r"\bnext week\b", re.IGNORECASE)
+_CALLBACK_WEEKDAY_RE = re.compile(
+    r"\b(?:on |this |next |coming )?(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+    re.IGNORECASE,
+)
+_CALLBACK_PART_OF_DAY_RE = re.compile(
+    r"\b(?:in the |this )?(morning|afternoon|evening|noon|night)\b",
+    re.IGNORECASE,
+)
+
+# Number-word → int for "in two hours" style.
+_DURATION_NUMBER_WORDS: dict[str, int] = {
+    "a": 1, "an": 1, "half an": 1,  # "half an hour" handled specially below
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+}
+
+# Part-of-day → default local HH:MM. Used when caller says "tomorrow morning"
+# with no explicit clock time.
+_PART_OF_DAY_HOUR: dict[str, tuple[int, int]] = {
+    "morning": (10, 0),
+    "afternoon": (14, 0),
+    "noon": (12, 0),
+    "evening": (17, 0),
+    "night": (18, 0),  # cap at end of TRAI window; clamp will push further if needed
+}
+
+# Weekday name → ISO weekday number (Monday=1). The parser computes "next
+# <weekday>" by walking forward to the next occurrence (today excluded if
+# explicitly "next", included if just "<weekday>").
+_WEEKDAY_NUM: dict[str, int] = {
+    "monday": 1, "tuesday": 2, "wednesday": 3, "thursday": 4,
+    "friday": 5, "saturday": 6, "sunday": 7,
+}
 
 
 # Strong language-hint patterns — when the user explicitly asks the
@@ -826,6 +972,22 @@ _SALIENT_CUE_PATTERNS = (
 _SALIENT_MAX_LEN = 160
 
 
+def _parse_duration_qty(raw: str) -> float | None:
+    """Convert the duration quantifier from a callback-time phrase into a
+    numeric multiplier. Handles digit literals, the article "a"/"an", and
+    "half an" (returns 0.5)."""
+    raw = raw.strip().lower()
+    if raw == "half an":
+        return 0.5
+    if raw in _DURATION_NUMBER_WORDS:
+        return float(_DURATION_NUMBER_WORDS[raw])
+    try:
+        n = float(raw)
+        return n if n > 0 else None
+    except ValueError:
+        return None
+
+
 def _clean_value(text: str) -> str:
     return re.sub(r"\s+", " ", str(text or "")).strip(" .,:;-")
 
@@ -873,6 +1035,170 @@ class MemoryExtractor:
         if len(digits) >= 10:
             return digits[-10:]
         return digits or None
+
+    # ── Follow-up agent: opt-out + promised_callback_at ──────────────────
+
+    @staticmethod
+    def _extract_opted_out(text: str) -> bool | None:
+        """Return True iff the caller used an unambiguous opt-out phrase.
+
+        Returns None (not False) on no match so the existing ``_add`` helper
+        skips emitting the fact. Only present when triggered.
+        """
+        if _OPT_OUT_RE.search(text):
+            return True
+        return None
+
+    @staticmethod
+    def _extract_promised_callback_at(text: str) -> str | None:
+        """Extract a callback-time promise from the caller's utterance.
+
+        Two-stage:
+          1. Confirm the caller is *asking us to call back* (not the inverse
+             "I'll call you back"). Without this guard, "I'll call back
+             tomorrow" would schedule a follow-up call we never asked for.
+          2. Parse one of several time anchors (in N hours, tomorrow at 4,
+             next Tuesday, this evening, etc.) into a TZ-aware ISO string.
+
+        Returns the ISO-8601 string (UTC) the follow-up service can parse, or
+        None on no match / no parseable anchor. Always heuristic — confidence
+        is implied by the ``MemoryFact.confidence`` set by the caller in
+        :meth:`extract_turn`.
+        """
+        if _CALLER_INITIATED_RE.search(text):
+            # Caller said THEY will call — not a request.
+            return None
+        if not _CALLBACK_REQUEST_RE.search(text):
+            return None
+
+        from datetime import datetime, timedelta, time as _t, timezone as _tz
+        try:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo("Asia/Kolkata")
+        except Exception:
+            tz = _tz.utc
+
+        now_local = datetime.now(tz)
+        target: datetime | None = None
+        explicit_hhmm: tuple[int, int] | None = None
+        part_of_day: tuple[int, int] | None = None
+
+        # "at 4pm" / "at 4:30" / "by 11"
+        hm = _CALLBACK_AT_HHMM_RE.search(text)
+        if hm:
+            hour = int(hm.group(1))
+            minute = int(hm.group(2) or 0)
+            meridiem = (hm.group(3) or "").lower().replace(".", "")
+            if "pm" in meridiem and hour < 12:
+                hour += 12
+            elif "am" in meridiem and hour == 12:
+                hour = 0
+            elif not meridiem and 1 <= hour <= 7:
+                # Bare "at 4" in a business-day context: assume PM (16:00),
+                # because nobody books a callback for 4 AM.
+                hour += 12
+            if 0 <= hour <= 23 and 0 <= minute <= 59:
+                explicit_hhmm = (hour, minute)
+
+        # Part-of-day fallback ("this evening", "tomorrow morning")
+        pod = _CALLBACK_PART_OF_DAY_RE.search(text)
+        if pod:
+            part_of_day = _PART_OF_DAY_HOUR.get(pod.group(1).lower())
+
+        default_hm = explicit_hhmm or part_of_day or (10, 0)
+
+        # ── Anchor: "in N (hours|minutes|days)" ──
+        in_dur = _CALLBACK_IN_DURATION_RE.search(text)
+        if in_dur:
+            raw_num = in_dur.group(1).lower()
+            unit = in_dur.group(2).lower()
+            qty = _parse_duration_qty(raw_num)
+            if qty is not None:
+                if unit.startswith("min"):
+                    target = now_local + timedelta(minutes=qty)
+                elif unit.startswith("hour") or unit.startswith("hr"):
+                    target = now_local + timedelta(hours=qty)
+                elif unit.startswith("day"):
+                    target = now_local + timedelta(days=qty)
+                    target = target.replace(
+                        hour=default_hm[0], minute=default_hm[1],
+                        second=0, microsecond=0,
+                    )
+                elif unit.startswith("week"):
+                    target = now_local + timedelta(weeks=qty)
+                    target = target.replace(
+                        hour=default_hm[0], minute=default_hm[1],
+                        second=0, microsecond=0,
+                    )
+
+        # ── Anchor: "after N hours" (same as "in N hours") ──
+        if target is None:
+            after_dur = _CALLBACK_AFTER_DURATION_RE.search(text)
+            if after_dur:
+                raw_num = after_dur.group(1).lower()
+                unit = after_dur.group(2).lower()
+                qty = _parse_duration_qty(raw_num)
+                if qty is not None:
+                    if unit.startswith("min"):
+                        target = now_local + timedelta(minutes=qty)
+                    elif unit.startswith("hour") or unit.startswith("hr"):
+                        target = now_local + timedelta(hours=qty)
+                    elif unit.startswith("day"):
+                        target = now_local + timedelta(days=qty)
+                        target = target.replace(
+                            hour=default_hm[0], minute=default_hm[1],
+                            second=0, microsecond=0,
+                        )
+
+        # ── Anchor: "tomorrow" + optional time ──
+        if target is None and _CALLBACK_TOMORROW_RE.search(text):
+            tomorrow = (now_local + timedelta(days=1)).date()
+            target = datetime.combine(
+                tomorrow, _t(hour=default_hm[0], minute=default_hm[1]), tzinfo=tz,
+            )
+
+        # ── Anchor: "today" / "this afternoon|evening|morning" ──
+        if target is None and _CALLBACK_TODAY_RE.search(text):
+            target = now_local.replace(
+                hour=default_hm[0], minute=default_hm[1], second=0, microsecond=0,
+            )
+            if target <= now_local:
+                # "Today at 4pm" already passed — bump to tomorrow same time.
+                target = target + timedelta(days=1)
+
+        # ── Anchor: "next week" ──
+        if target is None and _CALLBACK_NEXT_WEEK_RE.search(text):
+            target = (now_local + timedelta(days=7)).replace(
+                hour=default_hm[0], minute=default_hm[1], second=0, microsecond=0,
+            )
+
+        # ── Anchor: weekday name ──
+        if target is None:
+            wd_match = _CALLBACK_WEEKDAY_RE.search(text)
+            if wd_match:
+                target_wd = _WEEKDAY_NUM[wd_match.group(1).lower()]
+                today_wd = now_local.isoweekday()
+                days_ahead = (target_wd - today_wd) % 7
+                # If the spoken weekday is today's weekday, assume "next week"
+                # — saying "call me Monday" on a Monday almost always means
+                # the upcoming Monday, not this exact moment + 1 week.
+                if days_ahead == 0:
+                    days_ahead = 7
+                target = (now_local + timedelta(days=days_ahead)).replace(
+                    hour=default_hm[0], minute=default_hm[1], second=0, microsecond=0,
+                )
+
+        # ── Anchor: bare "at 4pm" or part-of-day with no day reference ──
+        if target is None and (explicit_hhmm or part_of_day):
+            target = now_local.replace(
+                hour=default_hm[0], minute=default_hm[1], second=0, microsecond=0,
+            )
+            if target <= now_local:
+                target = target + timedelta(days=1)
+
+        if target is None:
+            return None
+        return target.astimezone(_tz.utc).isoformat()
 
     @staticmethod
     def _extract_bhk(text: str) -> str | None:
@@ -1324,6 +1650,16 @@ class MemoryExtractor:
                 continue
             _add(fact_key, extractor(clean_text))
 
+        # Follow-up agent signals — only mined from caller utterances. The
+        # agent's own template "shall I call you back tomorrow?" must not
+        # schedule a follow-up; only the human's reply does.
+        if role == "user":
+            _add(FACT_OPTED_OUT, cls._extract_opted_out(clean_text))
+            _add(
+                FACT_PROMISED_CALLBACK_AT,
+                cls._extract_promised_callback_at(clean_text),
+            )
+
         objections: list[dict[str, Any]] = []
         if role == "user":
             for pat, code in _OBJECTION_PATTERNS:
@@ -1456,7 +1792,17 @@ def _prompt_keys_for(business_type: str | None) -> tuple[str, ...] | None:
 def _durable_fact_keys_for(business_type: str | None) -> tuple[str, ...]:
     """Subset of facts worth persisting across calls for this business
     type. Identity + stable preferences always; domain facts that stay
-    true between calls (budget, insurance, dietary) when known."""
+    true between calls (budget, insurance, dietary) when known.
+
+    Follow-up facts (``promised_callback_at``, ``opted_out``) are always
+    durable — they're the contract the follow-up scheduler reads at call
+    end, and they must survive the gap between call and next call (when the
+    call ends prematurely without the scheduler being driven).
+    """
+    # Follow-up signals are universal — every business type needs them so
+    # the opt-out kill switch and promise-extraction loops fire regardless
+    # of whether the org is a clinic, real-estate brokerage, etc.
+    followup = (FACT_PROMISED_CALLBACK_AT, FACT_OPTED_OUT)
     base = (FACT_NAME, FACT_EMAIL, FACT_COMPANY, FACT_LANGUAGE_PREF, FACT_FAMILY_SIZE)
     bt = str(business_type or "").strip().lower()
     domain: dict[str, tuple[str, ...]] = {
@@ -1466,9 +1812,9 @@ def _durable_fact_keys_for(business_type: str | None) -> tuple[str, ...]:
         "hospitality": (FACT_ROOM_TYPE, FACT_DIETARY, FACT_SEATING_PREFERENCE, FACT_PARTY_SIZE),
     }
     if bt and bt != "other" and bt in domain:
-        return base + domain[bt]
+        return followup + base + domain[bt]
     # Unknown / other → persist identity plus every domain's durable keys.
-    combined = base
+    combined = followup + base
     for keys in domain.values():
         combined = combined + keys
     return combined
@@ -1496,14 +1842,23 @@ class ConversationalMemory:
     # agent must keep front-of-mind for the rest of the call.
     salient_notes: list[dict[str, Any]] = field(default_factory=list)
     asked_questions: list[dict[str, Any]] = field(default_factory=list)
-    # Caller-memory bootstrap snapshot — facts loaded from prior calls
-    # for the same phone. Kept separate so the in-call merge can prefer
-    # current-call values over historical ones at equal confidence.
-    bootstrap_keys: set[str] = field(default_factory=set)
     # Buying-journey stage the caller reached on their previous call (set
     # by ``bootstrap_caller_memory``). Lets the strategy layer open a
     # returning caller where they left off instead of from discovery.
     prior_stage: str | None = None
+
+    @property
+    def bootstrap_keys(self) -> set[str]:
+        """Computed view of which facts came from a prior call.
+
+        Historically tracked as a parallel ``set[str]`` instance field on
+        the dataclass; consolidated onto :attr:`MemoryFact.from_prior_call`
+        during the session-state unification so there's a single source of
+        truth. Existing callers that iterated over ``bootstrap_keys`` (e.g.
+        the prompt-block renderer) keep working unchanged. Mutating callers
+        (``bootstrap_caller_memory``) now stamp the per-fact flag directly.
+        """
+        return {key for key, fact in self.facts.items() if fact.from_prior_call}
 
     # ── Serialisation ────────────────────────────────────────────────
 
@@ -1515,6 +1870,10 @@ class ConversationalMemory:
             "preferences": list(self.preferences),
             "salient_notes": list(self.salient_notes),
             "asked_questions": list(self.asked_questions),
+            # ``bootstrap_keys`` is computed from per-fact flags now, but
+            # we keep emitting it in the serialised shape so an older code
+            # path that reads this blob during a deploy rollover still
+            # sees the prior-call markers it expects.
             "bootstrap_keys": sorted(self.bootstrap_keys),
             "prior_stage": self.prior_stage,
         }
@@ -1523,11 +1882,20 @@ class ConversationalMemory:
     def from_state_blob(cls, blob: Any) -> "ConversationalMemory":
         data = blob if isinstance(blob, dict) else {}
         facts_raw = data.get("facts") or {}
+        legacy_bootstrap_keys: set[str] = set(data.get("bootstrap_keys") or [])
         facts: dict[str, MemoryFact] = {}
         if isinstance(facts_raw, dict):
             for key, payload in facts_raw.items():
-                if isinstance(payload, dict):
-                    facts[str(key)] = MemoryFact.from_dict(payload)
+                if not isinstance(payload, dict):
+                    continue
+                fact = MemoryFact.from_dict(payload)
+                # Legacy migration: an older blob carried prior-call provenance
+                # in the parallel ``bootstrap_keys`` list. Re-stamp each fact
+                # so the new computed property answers correctly on the very
+                # next read.
+                if not fact.from_prior_call and fact.key in legacy_bootstrap_keys:
+                    fact.from_prior_call = True
+                facts[str(key)] = fact
         return cls(
             facts=facts,
             objections=list(data.get("objections") or []),
@@ -1535,7 +1903,6 @@ class ConversationalMemory:
             preferences=list(data.get("preferences") or []),
             salient_notes=list(data.get("salient_notes") or []),
             asked_questions=list(data.get("asked_questions") or []),
-            bootstrap_keys=set(data.get("bootstrap_keys") or []),
             prior_stage=(str(data["prior_stage"]) if data.get("prior_stage") else None),
         )
 
@@ -1623,7 +1990,66 @@ class ConversationalMemory:
             business_type=business_type,
         )
         self.merge_extracted(extracted)
+        if role == "user":
+            self._resolve_prior_objections(turn_index, text)
         return extracted
+
+    def _resolve_prior_objections(self, turn_index: int, text: str) -> None:
+        """Stamp ``resolved_at_turn`` on every prior-turn live objection when
+        the caller's current turn signals acceptance.
+
+        Two signals trigger resolution:
+
+          * a :data:`_RESOLUTION_PATTERNS` match in the caller's text
+            ("ok makes sense", "fair enough", "got it", …); or
+          * any commitment captured on the CURRENT turn (already in
+            ``self.commitments`` after :meth:`merge_extracted` ran) — a
+            soft "interested" / "ready_to_book" after an objection means
+            the rebuttal landed.
+
+        When resolution fires, every objection from a turn ``< turn_index``
+        that wasn't already resolved or restored from a prior call gets
+        ``resolved_at_turn=<turn_index>``. We also append a synthetic
+        ``objection_resolved`` commitment so :func:`conversation_strategy.latest_turn`
+        advances — without that, the FSM's "latest signal is an objection"
+        check would still see the old objection as live.
+        """
+        if not self.objections:
+            return
+        resolution_match = any(pat.search(text or "") for pat in _RESOLUTION_PATTERNS)
+        has_current_commitment = any(
+            isinstance(c, dict)
+            and c.get("turn") == turn_index
+            and not c.get("from_prior_call")
+            for c in self.commitments
+        )
+        if not (resolution_match or has_current_commitment):
+            return
+        changed = False
+        for obj in self.objections:
+            if not isinstance(obj, dict):
+                continue
+            if obj.get("from_prior_call"):
+                continue
+            if obj.get("resolved_at_turn") is not None:
+                continue
+            turn = obj.get("turn")
+            if isinstance(turn, int) and turn < turn_index:
+                obj["resolved_at_turn"] = turn_index
+                changed = True
+        if changed and resolution_match and not has_current_commitment:
+            # Synthetic commitment carries the latest_turn forward so the FSM
+            # exits objection_handling this turn even when the caller didn't
+            # use any of the canonical commitment phrases. ``ts`` follows the
+            # rest of this module's convention — ``time.time()`` float, not
+            # an ISO string.
+            self.commitments.append({
+                "code": "objection_resolved",
+                "text": (text or "")[:200],
+                "turn": turn_index,
+                "ts": time.time(),
+            })
+            self.commitments = self.commitments[-16:]
 
     def mark_asked(self, slot_key: str, turn_index: int) -> None:
         """Record that the agent has asked for ``slot_key`` on this
@@ -1840,9 +2266,11 @@ async def bootstrap_caller_memory(
                 continue
             if memory.has(key):
                 # Live-call fact already wins; bootstrap stays out of the
-                # way. We still tag the key so the prompt knows it was
-                # known historically (not silently corrected).
-                memory.bootstrap_keys.add(key)
+                # way. We still tag the existing fact so the prompt knows
+                # the slot was known historically (not silently corrected).
+                existing_fact = memory.facts.get(key)
+                if existing_fact is not None:
+                    existing_fact.from_prior_call = True
                 continue
             # Bootstrap facts come in at slightly reduced confidence so an
             # in-call correction can override them without needing the
@@ -1850,8 +2278,8 @@ async def bootstrap_caller_memory(
             fact = MemoryFact.from_dict(fact_payload)
             fact.confidence = min(fact.confidence, 0.7)
             fact.source_turn = -1  # signal "from before this call"
+            fact.from_prior_call = True
             memory.facts[key] = fact
-            memory.bootstrap_keys.add(key)
 
     # Restore durable salient notes (allergies, named family, standing
     # requirements) tagged so the prompt block flags them as prior-call.
@@ -1935,16 +2363,45 @@ async def promote_to_caller_memory(
     phone: Any,
     memory: ConversationalMemory,
     business_type: str | None = None,
+    call_id: str | None = None,
 ) -> None:
     """Persist the durable subset of ``memory`` to the per-caller
     Redis blob so the next call for the same phone opens warm. Keyed by
     the per-tenant namespace + normalised phone, so memory never leaks
-    across tenants."""
+    across tenants.
+
+    Idempotency: when ``call_id`` is supplied, the session state is
+    checked for a ``caller_memory_promoted_at`` marker. If already set,
+    the promote is a no-op. This defends against the failure mode where
+    the unified-store TTL extension (history 600s → unified 900s) lets a
+    delayed post-call hook (re-handled hangup webhook, manually
+    retriggered outcome classifier) pick up an alive-but-stale blob and
+    double-promote — which would clobber the caller-memory entry with
+    duplicate data and reset its 30-day TTL twice for the same call.
+    """
     norm = _normalise_phone(phone)
     if not norm:
         return
     if not memory:
         return
+    # Idempotency check — best-effort. A Redis hiccup is treated as
+    # "no marker", so we err on the side of doing the promote (preferable
+    # to silently dropping caller-memory updates).
+    if call_id:
+        try:
+            state = await AgentSessionStore.get_state(tenant_res, call_id)
+            if isinstance(state, dict) and state.get("caller_memory_promoted_at"):
+                logger.debug(
+                    "NOKVO-MEMORY: promote_to_caller_memory skipped for %s — already promoted",
+                    call_id,
+                )
+                return
+        except Exception:
+            logger.debug(
+                "NOKVO-MEMORY: idempotency probe failed for %s; proceeding with promote",
+                call_id,
+                exc_info=True,
+            )
     payload_facts: dict[str, Any] = {}
     for key in _durable_fact_keys_for(business_type):
         fact = memory.facts.get(key)
@@ -2025,6 +2482,24 @@ async def promote_to_caller_memory(
         )
     except Exception:
         logger.debug("NOKVO-MEMORY: promote_to_caller_memory failed", exc_info=True)
+        return
+    # Stamp the idempotency marker AFTER the durable write succeeded so a
+    # transient Redis error during promotion doesn't permanently block
+    # a retry. Best-effort — failure to write the marker only costs one
+    # extra duplicate-promote if the WS reconnects, which is bounded by
+    # the same 30-day TTL anyway.
+    if call_id:
+        try:
+            await AgentSessionStore.merge_state(
+                tenant_res,
+                call_id,
+                {"caller_memory_promoted_at": time.time()},
+            )
+        except Exception:
+            logger.debug(
+                "NOKVO-MEMORY: failed to stamp caller_memory_promoted_at marker",
+                exc_info=True,
+            )
 
 
 # ── Tool-flow integration helpers ───────────────────────────────────────────
@@ -2050,6 +2525,37 @@ def hydrate_flow_collected(
         if fact and fact.value not in (None, "", []):
             merged[slot_key] = fact.value
     return merged
+
+
+def seed_facts(
+    memory: ConversationalMemory,
+    facts: dict[str, Any],
+    *,
+    confidence: float = 0.55,
+) -> None:
+    """Inject externally-known facts (a CRM lead form, the outbound turn-memory
+    dict) into ``memory`` as low-confidence, gap-filling :class:`MemoryFact`s.
+
+    This is how the outbound path unifies its lightweight ``outbound_memory``
+    dict with the richer structured memory the strategy layer reads: the
+    strategy block and the "already known" prompt block then see the same
+    facts. Confidence is deliberately low so :meth:`_accept` never lets a seed
+    override a higher-confidence in-call extraction of the same slot."""
+    payload: list[MemoryFact] = []
+    for key, value in (facts or {}).items():
+        if value in (None, "", []):
+            continue
+        payload.append(
+            MemoryFact(
+                key=str(key),
+                value=value,
+                confidence=confidence,
+                source_turn=-1,
+                timestamp=time.time(),
+            )
+        )
+    if payload:
+        memory.merge_extracted({"facts": payload})
 
 
 __all__ = [
@@ -2110,4 +2616,5 @@ __all__ = [
     "load_memory",
     "promote_to_caller_memory",
     "save_memory",
+    "seed_facts",
 ]

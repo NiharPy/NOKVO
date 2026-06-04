@@ -281,7 +281,7 @@ def _clean(text: str) -> str:
 # Discourse fillers / titles that can precede a real name answer; stripped
 # repeatedly so "well, you know, it's Nihar" peels down to "Nihar".
 _NAME_DISCOURSE_PREFIX_RE = re.compile(
-    r"^(?:\s*(?:yeah|yes|yep|yup|no|nope|nah|ok|okay|well|so|umm?|uhh?|hmm+|"
+    r"^(?:\s*(?:yeah|yes|yep|yup|ya|yah|yaa|no|nope|nah|ok|okay|fine|well|so|umm?|uhh?|hmm+|"
     r"oh|hi+|hello|hey|sure|right|alright|actually|see|look|listen|please|"
     r"you\s+know|i\s+mean|it'?s|its|that'?s|"
     r"mr\.?|mrs\.?|ms\.?|dr\.?)\b[\s,\.]*)+",
@@ -312,7 +312,8 @@ _NAME_HONORIFIC_SUFFIX_RE = re.compile(
 # ("Nihar speaking") and, when they appear first, to reject the whole
 # utterance as a request/filler rather than a name.
 _NAME_STOP_WORDS = {
-    "yeah", "yes", "yep", "yup", "no", "nope", "nah", "ok", "okay", "well",
+    "yeah", "yes", "yep", "yup", "no", "nope", "nah", "not", "really",
+    "ok", "okay", "well",
     "so", "um", "uh", "hmm", "oh", "hi", "hello", "hey", "sure", "right",
     "alright", "actually", "please", "thanks", "thank", "you", "your",
     "yours", "my", "me", "mine", "i", "im", "i'm", "i'd", "id", "we", "they",
@@ -327,12 +328,39 @@ _NAME_STOP_WORDS = {
     "property", "price", "budget", "name", "names", "and", "or", "but", "to",
     "for", "of", "with", "in", "at", "on", "about", "is", "are", "was",
     "were", "be", "guys", "help", "trying",
+    # Additions surfaced by the eval framework: "Yeah, just wanted to know
+    # about your projects" was extracting as "Just Wanted". The leading
+    # adverbs / intent verbs are never part of a name.
+    "just", "wanted", "wants", "wanting", "could", "should", "might", "may",
+    "asking", "asked",
 }
+
+
+# Polite decline phrases the caller might say when they DON'T want to book a
+# visit or hand over personal info. These should never be confirmed as names
+# even though they contain no individual stop word at index 0 ("not" was added
+# to the stop set above, but a tokenwise rule misses multi-word forms like
+# "no thank you" or "not at the moment").
+_NAME_DECLINE_PHRASES_RE = re.compile(
+    r"^\s*(?:"
+    r"not\s+(?:really|interested|at\s+(?:the\s+)?(?:moment|time)|right\s+now|now|today)|"
+    r"no\s+(?:thanks|thank\s+you|thank\s+you\s+for|don'?t|not\s+now)|"
+    r"i\s+(?:don'?t|do\s+not)\s+want|"
+    r"maybe\s+(?:later|next\s+time|some\s+other\s+time)|"
+    r"some\s+other\s+time"
+    r")\b",
+    re.IGNORECASE,
+)
 
 
 def _extract_person_name(raw: str) -> str | None:
     value = _clean(raw)
     if not value:
+        return None
+    # Polite decline ("Not really, but thank you...", "No thanks") is never a
+    # name — reject it BEFORE peeling discourse prefixes, otherwise tokens like
+    # "really" survive the strip and get title-cased to "Not Really".
+    if _NAME_DECLINE_PHRASES_RE.search(value):
         return None
     # Peel discourse fillers and a name lead-in, alternating until stable so
     # "well, you know, the name is Nihar" reduces to "Nihar".
@@ -361,6 +389,33 @@ def _extract_person_name(raw: str) -> str | None:
     if re.search(
         r"\b(\d{1,2}\s*(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.))\b|"
         r"\b(noon|midnight|morning|afternoon|evening|night)\b",
+        lowered,
+    ):
+        return None
+    # Timeline / intent / discovery answers that arrive as one-word replies to
+    # "buy immediately or exploring?" / "self-use or investment?" / "weekday or
+    # weekend?" must NEVER be confirmed as a name. Without this, "Immediately"
+    # title-cases to a valid-looking name and the agent confirms "the name is
+    # Immediately." Single-utterance match only so multi-word names containing
+    # these tokens still parse.
+    if lowered in {
+        "immediately", "asap", "soon", "later", "eventually", "sometime",
+        "urgent", "urgently", "exploring", "browsing", "casually", "browse",
+        "away",  # "right away" peels to "away" after discourse-prefix strip
+        "investment", "investor", "rental", "rent",
+        # Affirmation / acknowledgment particles — common single-word replies
+        # to a yes/no question that must NOT be confirmed as a name.
+        "yes", "yeah", "yep", "yup", "ya", "yah", "yaa", "uh-huh", "uhuh", "mhm", "mmhm",
+        "no", "nope", "nah", "maybe", "definitely", "probably",
+        "sure", "okay", "ok", "alright", "fine",
+        "weekday", "weekdays", "weekend", "weekends",
+    }:
+        return None
+    if re.fullmatch(
+        r"right\s+away|in\s+a\s+few\s+(?:days|weeks|months)|"
+        r"this\s+(?:week|month|year)|next\s+(?:week|month|year)|"
+        r"within\s+\d+\s+(?:days|weeks|months)|"
+        r"self[\s-]?use|own\s+use|end\s+use|for\s+(?:self|investment|family|living)",
         lowered,
     ):
         return None
@@ -399,6 +454,37 @@ def _last_assistant_offered_visit(history: list[dict[str, str]]) -> bool:
             continue
         text = str(turn.get("content") or "")
         if _VISIT_INTENT_RE.search(text) or re.search(r"\b(schedule|book).{0,30}\bvisit\b", text, re.IGNORECASE):
+            return True
+    return False
+
+
+# Phrases the agent uses when it offers to share more info / details / brochure
+# / a callback. When the lead replies "yeah" to one of these, we should start
+# the leads_create flow so the slot-filling kicks in (name/phone first).
+# Mirrors :func:`_last_assistant_offered_visit` but for lead-capture offers.
+_LEAD_OFFER_RE = re.compile(
+    r"\b("
+    r"want\s+(?:to\s+know\s+)?(?:more|details?|info(?:rmation)?)|"
+    r"(?:share|send|give)\s+(?:you\s+)?(?:more\s+)?(?:details?|info(?:rmation)?|the\s+brochure)|"
+    r"(?:would\s+you\s+like|interested\s+in)\s+(?:more\s+)?(?:details?|info(?:rmation)?|amenities|location|brochure|features|pricing|price)|"
+    r"need\s+(?:more\s+)?(?:details?|info(?:rmation)?|a\s+quote)|"
+    r"(?:can|may)\s+(?:i|we)\s+(?:share|send)|"
+    r"call\s+(?:you\s+)?back|reach\s+(?:back|out\s+to\s+you)|get\s+(?:back|in\s+touch)\s+(?:to|with)\s+you|"
+    r"explain\s+(?:more|further|the\s+\w+)|tell\s+you\s+(?:more|about)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _last_assistant_offered_lead_capture(history: list[dict[str, str]]) -> bool:
+    """True when one of the last 4 assistant turns offered to share details /
+    info / brochure / a callback — i.e. anything that a "yes" from the lead
+    should plausibly turn into a lead-capture flow."""
+    for turn in reversed((history or [])[-4:]):
+        if turn.get("role") != "assistant":
+            continue
+        text = str(turn.get("content") or "")
+        if _LEAD_OFFER_RE.search(text):
             return True
     return False
 
@@ -484,7 +570,14 @@ def _start_flow_key(text: str, business_type: str | None, history: list[dict[str
         _VISIT_INTENT_RE.search(text) or (_YES_RE.search(text) and _last_assistant_offered_visit(history))
     ):
         return "real_estate_site_visit"
-    if _LEAD_INTENT_RE.search(text):
+    # Lead-capture trigger. Either an explicit interest phrase from the lead
+    # ("send me details", "I'm interested") OR a plain "yes/yeah" right after
+    # the agent offered to share details / a brochure / a callback. Without
+    # the yes-after-offer branch, a soft "yeah" never started any flow and
+    # the LLM was free to keep chatting without capturing name/phone.
+    if _LEAD_INTENT_RE.search(text) or (
+        _YES_RE.search(text) and _last_assistant_offered_lead_capture(history)
+    ):
         return "leads_create"
     return None
 
@@ -517,7 +610,17 @@ def evaluate_tool_flow_policy(
     history: list[dict[str, str]] | None = None,
     state: dict[str, Any] | None = None,
     language: str | None = None,
+    allowed_flow_keys: list[str] | None = None,
 ) -> dict[str, Any] | None:
+    """Evaluate the tool-flow policy for a turn.
+
+    ``allowed_flow_keys`` is an optional gate used by the outbound
+    pipeline to restrict which flows can START during this call based
+    on the campaign's selected objectives. ``None`` = all flows allowed
+    (inbound default). Once a flow is already active, this filter is
+    NOT enforced — pulling the rug mid-conversation would be worse than
+    completing a flow that wasn't strictly part of the campaign goals.
+    """
     value = _clean(text)
     if not value:
         return None
@@ -549,6 +652,12 @@ def evaluate_tool_flow_policy(
     if not flow_state.get("active"):
         flow_key = _start_flow_key(value, business_type, history)
         if not flow_key or flow_key not in (bundle.get("flows") or {}):
+            return None
+        # Outbound campaign objective gate. If the operator selected only
+        # "Book a site visit" for this campaign, ``leads_create`` must NOT
+        # start automatically — and vice-versa. ``allowed_flow_keys=None``
+        # means "all flows allowed" (inbound default).
+        if allowed_flow_keys is not None and flow_key not in allowed_flow_keys:
             return None
         # The caller asked a side question on the same turn that signals intent
         # ("Before I book, what services do you offer?"). Let the route fall
@@ -720,6 +829,15 @@ def evaluate_tool_flow_policy(
             collected_now = dict(flow_state.get("collected") or {})
             record_confirmation(flow_state, confirmation_key, collected_now.get(confirmation_key))
             append_audit_trail(flow_state, f"{confirmation_kind}_confirmed", detail=collected_now.get(confirmation_key))
+            # Clear ``pending_slot`` so the subsequent slot loop calls
+            # ``_next_slot`` and advances to the next real slot. Without
+            # this clear the FSM stayed stuck on the ``*_confirm`` pseudo
+            # slot — and when the caller volunteered the next slot's
+            # value in the same breath ("Yes, that's the phone. The time
+            # is 11am."), it never got captured and the LLM ad-libbed an
+            # uncommitted "before I confirm?" recap.
+            if flow_state.get("pending_slot", "").endswith("_confirm"):
+                flow_state["pending_slot"] = None
         elif _looks_negative(value):
             collected = dict(flow_state.get("collected") or {})
             if confirmation_key:
@@ -769,6 +887,9 @@ def evaluate_tool_flow_policy(
             collected_now = dict(flow_state.get("collected") or {})
             record_confirmation(flow_state, confirmation_key, collected_now.get(confirmation_key))
             append_audit_trail(flow_state, "name_confirmed", detail=collected_now.get(confirmation_key))
+            # Same advance-the-FSM fix as the id_confirmation path above.
+            if flow_state.get("pending_slot", "").endswith("_confirm"):
+                flow_state["pending_slot"] = None
         elif _looks_negative(value):
             # Look for an embedded correction first so "No, my name is
             # Nihar" still moves the conversation forward. Strip the

@@ -84,10 +84,16 @@ def test_journey_stage_closing_on_ready_to_book() -> None:
 # ── Strategy block assembly ──────────────────────────────────────────────────
 
 
-def test_block_empty_on_cold_open() -> None:
-    """A brand-new memory has no actionable signal — the block must be empty so
-    cold-open time-to-first-token is unaffected."""
-    assert compose_strategy_block(ConversationalMemory(), business_type="real_estate") == ""
+def test_cold_open_emits_discovery_agenda() -> None:
+    """A brand-new memory now triggers the proactive discovery agenda for
+    sales contexts — the agent has to take control of turn 1 rather than fall
+    back to "How can I help you?". Non-sales business types still get an
+    empty block (no signal, no recovery, no sales context)."""
+    block = compose_strategy_block(ConversationalMemory(), business_type="real_estate")
+    assert "COLD OPEN" in block
+    assert "How can I help you" in block  # banned-opener directive present
+    # Non-sales business → no discovery agenda, no recovery, no signal → empty.
+    assert compose_strategy_block(ConversationalMemory(), business_type="clinics") == ""
 
 
 def test_block_includes_price_playbook() -> None:

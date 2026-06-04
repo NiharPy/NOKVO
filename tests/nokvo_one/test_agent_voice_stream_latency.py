@@ -13,7 +13,7 @@ from app.services.sarvam_voice_service import SarvamVoiceService
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.new_event_loop().run_until_complete(coro)
 
 
 class _DisconnectingWebSocket:

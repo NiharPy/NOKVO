@@ -73,7 +73,7 @@ def _pcm_silence(seconds: float, sr: int = 16000) -> bytes:
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.new_event_loop().run_until_complete(coro)
 
 
 # ── 1) Audio quality probe ──────────────────────────────────────────────────

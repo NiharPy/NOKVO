@@ -305,45 +305,22 @@ async def _tester_stash_pop(token: str | None) -> dict[str, Any] | None:
 @router.post("/lead-sources/outbound-tester/prepare")
 async def prepare_outbound_tester_session(
     agent_prompt: str | None = Form(default=None),
-    doc_file: UploadFile | None = File(default=None),
     user: OrganizationUser = Depends(_admin_dep()),
     _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
 ):
-    """Stash optional doc text + prompt for the live outbound tester WS.
+    """Stash the optional agent_prompt for the live outbound tester WS.
 
-    Either input is optional and they compose: send only ``agent_prompt`` for a
-    pure single-prompt test, only ``doc_file`` to ground the agent in a brief,
-    or both. The doc is parsed with the same extractor outbound campaigns use,
-    so PDF/DOCX/TXT all work and the tester reflects production behavior.
-
-    Returns ``{tester_session_token, doc_chars, has_prompt}``. Token is single-
-    use, expires in 5 minutes, and the WS endpoint consumes it on open.
+    The agent_prompt is the agent's only "knowledge" — there is no
+    reference-document path. Returns ``{tester_session_token, has_prompt}``;
+    token is single-use, expires in 5 minutes, and the WS endpoint
+    consumes it on open. Sending no prompt is valid for tester sessions
+    that target a saved campaign (the campaign carries its own prompt).
     """
-    from app.services.outbound_campaign_service import _parse_document  # local import to avoid cycles
-
     prompt = (agent_prompt or "").strip()
-    doc_text = ""
-    if doc_file is not None:
-        try:
-            content = await doc_file.read()
-        finally:
-            await doc_file.close()
-        doc_text = (_parse_document(doc_file.filename or "doc.txt", content) or "").strip()
-        if not doc_text:
-            raise HTTPException(
-                status_code=400,
-                detail="The uploaded document is empty or could not be parsed.",
-            )
-    if not prompt and not doc_text:
-        raise HTTPException(
-            status_code=400,
-            detail="Provide a system prompt, a reference document, or both.",
-        )
-    token = await _tester_stash_put({"agent_prompt": prompt, "doc_text": doc_text[:8000]})
+    token = await _tester_stash_put({"agent_prompt": prompt, "doc_text": ""})
     return {
         "tester_session_token": token,
         "expires_in_seconds": _TESTER_STASH_TTL_SECONDS,
-        "doc_chars": len(doc_text),
         "has_prompt": bool(prompt),
     }
 
@@ -373,6 +350,7 @@ async def outbound_voice_tester_websocket(websocket: WebSocket):
     from app.services.agent_outbound_context import (
         OutboundCampaignContext,
         build_agent_config,
+        load_outbound_context,
     )
 
     async for db in deps.get_db():
@@ -389,50 +367,258 @@ async def outbound_voice_tester_websocket(websocket: WebSocket):
                 return []
             return [item.strip() for item in raw.replace("|", "\n").split("\n") if item.strip()]
 
-        # Pull doc text / system-prompt override from the one-shot stash if
-        # the frontend called /prepare first. The stash pop validates the
-        # token and clears it so it can't be reused.
-        stashed = await _tester_stash_pop(params.get("tester_session_token")) or {}
-        prompt_override = stashed.get("agent_prompt") or params.get("agent_prompt")
+        # New path — tester picks a real campaign and rehearses with its actual
+        # config (agent_prompt, objectives, exit_conditions, doc_text, persona
+        # fields). The query-param + preset stash path stays as a fallback for
+        # backwards-compat callers that still send the old fields.
+        outbound_context: OutboundCampaignContext | None = None
+        campaign_id_param = (params.get("campaign_id") or "").strip()
+        sample_phone: str | None = None
+        sample_name: str | None = None
+        if campaign_id_param:
+            try:
+                campaign_uuid = uuid.UUID(campaign_id_param)
+            except ValueError:
+                await websocket.close(code=1008)
+                return
+            campaign = await OutboundCampaignService.get_campaign(campaign_uuid, tr, db)
+            if campaign is None:
+                await websocket.close(code=1008)
+                return
+            # Pull a sample contact (first valid one) so the safety net has a
+            # phone / name to file a ticket or lead against. Without this, a
+            # tester call would compose the booking but persist nothing.
+            for contact in (campaign.contacts or []):
+                if isinstance(contact, dict):
+                    cand = str(contact.get("phone") or contact.get("phone_e164") or "").strip()
+                    if cand:
+                        sample_phone = cand
+                        sample_name = (contact.get("name") or contact.get("full_name") or "").strip() or None
+                        break
+            try:
+                outbound_context = await load_outbound_context(
+                    db, str(campaign.id), goal=campaign.name,
+                )
+            except Exception as exc:
+                logger.warning("NOKVO-OUTBOUND-TESTER: load_outbound_context failed: %r", exc)
+                outbound_context = None
 
-        agent_config = build_agent_config(
-            agent_prompt=prompt_override,
-            objectives=_split_list(params.get("objectives")),
-            exit_conditions=_split_list(params.get("exit_conditions")),
-            tone=params.get("tone"),
-            silence_timeout_seconds=params.get("silence_timeout_seconds"),
-            caller_name=params.get("caller_name"),
-            company_name=params.get("company_name"),
-            pitch_summary=params.get("pitch_summary"),
-            objective=params.get("objective"),
-            language=params.get("language"),
-        )
-        synthetic_id = f"tester-{uuid.uuid4()}"
-        outbound_context = OutboundCampaignContext(
-            campaign_id=synthetic_id,
-            name=params.get("name") or "Outbound tester",
-            goal=str(params.get("goal") or "").strip()[:1000],
-            agent_prompt=str(agent_config.get("agent_prompt") or "").strip()[:8000],
-            objectives=list(agent_config.get("objectives") or []),
-            exit_conditions=list(agent_config.get("exit_conditions") or []),
-            tone=(str(agent_config.get("tone")).strip() or None) if agent_config.get("tone") else None,
-            doc_text=(stashed.get("doc_text") or None) if stashed else None,
-            silence_timeout_seconds=float(agent_config.get("silence_timeout_seconds") or 8.0),
-            caller_name=str(agent_config.get("caller_name") or "Riya"),
-            company_name=str(agent_config.get("company_name") or ""),
-            pitch_summary=str(agent_config.get("pitch_summary") or ""),
-            objective=str(agent_config.get("objective") or "lead_qualification"),
-        )
+        if outbound_context is None:
+            # Pull doc text / system-prompt override from the one-shot stash if
+            # the frontend called /prepare first. The stash pop validates the
+            # token and clears it so it can't be reused.
+            stashed = await _tester_stash_pop(params.get("tester_session_token")) or {}
+            prompt_override = stashed.get("agent_prompt") or params.get("agent_prompt")
+
+            agent_config = build_agent_config(
+                agent_prompt=prompt_override,
+                objectives=_split_list(params.get("objectives")),
+                exit_conditions=_split_list(params.get("exit_conditions")),
+                tone=params.get("tone"),
+                silence_timeout_seconds=params.get("silence_timeout_seconds"),
+                caller_name=params.get("caller_name"),
+                company_name=params.get("company_name"),
+                pitch_summary=params.get("pitch_summary"),
+                objective=params.get("objective"),
+                language=params.get("language"),
+            )
+            synthetic_id = f"tester-{uuid.uuid4()}"
+            outbound_context = OutboundCampaignContext(
+                campaign_id=synthetic_id,
+                name=params.get("name") or "Outbound tester",
+                goal=str(params.get("goal") or "").strip()[:1000],
+                agent_prompt=str(agent_config.get("agent_prompt") or "").strip()[:8000],
+                objectives=list(agent_config.get("objectives") or []),
+                exit_conditions=list(agent_config.get("exit_conditions") or []),
+                tone=(str(agent_config.get("tone")).strip() or None) if agent_config.get("tone") else None,
+                doc_text=(stashed.get("doc_text") or None) if stashed else None,
+                silence_timeout_seconds=float(agent_config.get("silence_timeout_seconds") or 8.0),
+                caller_name=str(agent_config.get("caller_name") or "Riya"),
+                company_name=str(agent_config.get("company_name") or ""),
+                pitch_summary=str(agent_config.get("pitch_summary") or ""),
+                objective=str(agent_config.get("objective") or "lead_qualification"),
+            )
+
+        # Synthetic campaign_context so the downstream pipeline (safety net,
+        # opener personalisation) sees a contact phone/name and can persist a
+        # site visit or lead at session end even though no real number was dialled.
+        campaign_context_for_tester: dict[str, Any] | None = None
+        if sample_phone:
+            campaign_context_for_tester = {
+                "campaign_id": str(outbound_context.campaign_id),
+                "contact": {"phone": sample_phone, "name": sample_name or "Tester"},
+            }
+
+        call_id = f"tester:{outbound_context.campaign_id}"
+
+        # End-of-call routing: classify the transcript, persist a lead row
+        # if the operator played an interested / partial-interest prospect,
+        # and surface the result back to the frontend over the WS before
+        # the close handshake finishes. Captures the campaign ref so the
+        # closure can decide which campaign tab the lead lands in.
+        campaign_ref_for_persist = campaign if campaign_id_param else None
+        outbound_context_for_persist = outbound_context
+
+        async def _on_session_end(ws: WebSocket) -> None:
+            await _classify_and_persist_tester_outcome(
+                ws,
+                db=db,
+                tenant_res=tr,
+                call_id=call_id,
+                user_id=user.id,
+                campaign=campaign_ref_for_persist,
+                outbound_context=outbound_context_for_persist,
+            )
 
         await NokvoOneVoiceStreamService.run_session(
             websocket,
             tr,
             db=db,
             language=str(params.get("language") or "en"),
-            call_id=f"tester:{synthetic_id}",
+            call_id=call_id,
+            campaign_context=campaign_context_for_tester,
             outbound_context_override=outbound_context,
+            on_session_end=_on_session_end,
         )
         return
+
+
+async def _classify_and_persist_tester_outcome(
+    websocket: WebSocket,
+    *,
+    db: AsyncSession,
+    tenant_res: TenantResources,
+    call_id: str,
+    user_id: uuid.UUID,
+    campaign: OutboundCampaign | None,
+    outbound_context: Any | None,
+) -> None:
+    """Classify the tester transcript and route the outcome:
+
+      * ``interested``     → create lead under ``campaign.id`` so it shows
+                             in that campaign's tab on the Leads page.
+      * ``partial``        → create lead with ``data.uncategorized=True``
+                             (lands in the global Uncategorized tab).
+      * ``not_interested`` → no row created.
+
+    Sends ``{type: "outcome", outcome, reason, lead_id}`` over the WS so
+    the frontend can render the post-call banner. All persistence errors
+    are logged and swallowed — the operator must never see a 500 just
+    because the lead row failed to write.
+    """
+    from app.services.agent_session_store import AgentSessionStore
+    from app.services.outbound_call_outcome_classifier import (
+        OUTCOME_INTERESTED,
+        OUTCOME_NOT_INTERESTED,
+        classify_outbound_outcome,
+    )
+    from app.models.nokvo_one_tool_record import NokvoOneToolRecord
+
+    try:
+        history = await AgentSessionStore.get_history(tenant_res, call_id)
+    except Exception:
+        history = []
+
+    # AgentSessionStore returns {role, content} pairs; the classifier wants
+    # turn dicts with `query`/`answer` (matching the frontend tester shape).
+    transcript_turns: list[dict[str, Any]] = []
+    pending_user: str | None = None
+    for entry in history or []:
+        role = (entry.get("role") or "").lower()
+        content = (entry.get("content") or "").strip()
+        if not content:
+            continue
+        if role == "user":
+            if pending_user is not None:
+                transcript_turns.append({"query": pending_user, "answer": ""})
+            pending_user = content
+        elif role == "assistant":
+            transcript_turns.append({"query": pending_user or "", "answer": content})
+            pending_user = None
+        else:
+            transcript_turns.append({"query": "", "answer": content})
+    if pending_user is not None:
+        transcript_turns.append({"query": pending_user, "answer": ""})
+
+    campaign_name = campaign.name if campaign is not None else None
+    campaign_goal = None
+    if outbound_context is not None:
+        campaign_goal = getattr(outbound_context, "goal", None) or getattr(
+            outbound_context, "pitch_summary", None
+        )
+
+    outcome = await classify_outbound_outcome(
+        tenant_res,
+        transcript_turns=transcript_turns,
+        campaign_name=campaign_name,
+        campaign_goal=campaign_goal,
+    )
+
+    lead_id: str | None = None
+    if outcome.outcome != OUTCOME_NOT_INTERESTED:
+        try:
+            # Best-effort: lift name + phone from the transcript via the
+            # conversational memory promoted into the session blob. We
+            # avoid building a new NLP path here — the memory layer
+            # already does this work for inbound calls.
+            from app.services.conversational_memory import load_memory as _load_memory
+
+            memory = await _load_memory(tenant_res, call_id)
+            captured_name = memory.get("name") if hasattr(memory, "get") else None
+            captured_phone = memory.get("phone") if hasattr(memory, "get") else None
+
+            is_uncategorized = outcome.is_uncategorized
+            data: dict[str, Any] = {
+                "source": "outbound_tester",
+                "outcome": outcome.outcome,
+                "outcome_reason": outcome.reason,
+                "call_id": call_id,
+                "name": captured_name,
+                "phone": captured_phone,
+            }
+            if campaign is not None and not is_uncategorized:
+                data["campaign_id"] = str(campaign.id)
+                data["campaign_name"] = campaign.name
+            if is_uncategorized:
+                data["uncategorized"] = True
+                if campaign is not None:
+                    # Keep the originating campaign as a soft pointer so the
+                    # operator can still see "was tested against X" in the row
+                    # detail, but tab routing reads the explicit flag.
+                    data["originating_campaign_id"] = str(campaign.id)
+                    data["originating_campaign_name"] = campaign.name
+
+            record = NokvoOneToolRecord(
+                id=uuid.uuid4(),
+                organization_id=tenant_res.organization_id,
+                created_by_user_id=user_id,
+                record_type="lead",
+                status=outcome.outcome,
+                data={k: v for k, v in data.items() if v not in (None, "")},
+                contact_phone=str(captured_phone) if captured_phone else None,
+            )
+            db.add(record)
+            await db.commit()
+            lead_id = str(record.id)
+        except Exception:
+            logger.exception("NOKVO-OUTBOUND-TESTER: failed to persist outcome lead")
+
+    try:
+        await websocket.send_json(
+            {
+                "type": "outcome",
+                "outcome": outcome.outcome,
+                "reason": outcome.reason,
+                "lead_id": lead_id,
+                "uncategorized": outcome.is_uncategorized,
+                "campaign_id": str(campaign.id) if campaign is not None else None,
+                "campaign_name": campaign.name if campaign is not None else None,
+            }
+        )
+    except Exception:
+        # WS already closed by client — outcome is still persisted, the
+        # frontend can fall back to refreshing the Leads page to see it.
+        pass
 
 
 # ────────────────────────── Phone link configuration ──────────────────────────
@@ -931,8 +1117,9 @@ async def exotel_inbound_media_websocket(websocket: WebSocket, link_id: str):
 async def exotel_outbound_status(
     call_link_id: str, request: Request, db: AsyncSession = Depends(deps.get_db)
 ):
-    campaign, _contact = await OutboundCampaignService.get_by_call_link_id(call_link_id, db)
-    if not campaign:
+    campaign, contact = await OutboundCampaignService.get_by_call_link_id(call_link_id, db)
+    is_followup = bool(contact and contact.get("is_followup"))
+    if not campaign and not is_followup:
         return {"ok": False, "reason": "campaign_not_found"}
     try:
         payload = dict(await request.form())
@@ -951,7 +1138,12 @@ async def exotel_outbound_status(
         else "call.hangup"
     )
     await OutboundCampaignService.handle_call_status(
-        campaign, call_link_id, normalized, payload, db
+        campaign,
+        call_link_id,
+        normalized,
+        payload,
+        db,
+        followup_contact=contact if is_followup else None,
     )
     return {"ok": True, "call_link_id": call_link_id}
 
@@ -960,30 +1152,54 @@ async def exotel_outbound_status(
 async def exotel_outbound_media_websocket(websocket: WebSocket, call_link_id: str):
     async for db in deps.get_db():
         campaign, contact = await OutboundCampaignService.get_by_call_link_id(call_link_id, db)
-        if not campaign or not contact:
+        is_followup = bool(contact and contact.get("is_followup"))
+        if not contact:
             await websocket.close(code=1008)
             return
-        tr = await _tenant_by_tenant_id(db, campaign.tenant_id)
+        # Follow-up calls may not be attached to a campaign (manual
+        # follow-ups). When campaign is None, we still need the tenant
+        # to resolve infra — pull it from the lead via the contact's
+        # lead_id, attached via OutgoingLead.
+        tenant_id = campaign.tenant_id if campaign is not None else None
+        if tenant_id is None and contact.get("lead_id"):
+            from app.models.outgoing_lead import OutgoingLead as _OL
+            lead_res = await db.execute(
+                select(_OL).where(_OL.id == uuid.UUID(str(contact["lead_id"])))
+            )
+            lead = lead_res.scalars().first()
+            tenant_id = lead.tenant_id if lead else None
+        if not tenant_id:
+            await websocket.close(code=1008)
+            return
+        tr = await _tenant_by_tenant_id(db, tenant_id)
         if not tr:
             await websocket.close(code=1008)
             return
         # Outbound campaigns can be authored in any supported language —
         # pull it off the persisted agent_config (default "en" for legacy
-        # campaigns). Threading this through the adapter + session means
-        # the STT, TTS, opener, and system prompt all agree on the
-        # language for the entire call.
+        # campaigns). Follow-ups inherit the parent campaign's language
+        # when one is attached.
         campaign_language = str(
-            ((campaign.agent_config or {}).get("language") or "en")
+            ((campaign.agent_config or {}).get("language") if campaign else "en")
+            or "en"
         ).strip().lower() or "en"
         adapter = ExotelWebSocketAdapter(websocket, language=campaign_language)
         campaign_context = {
-            "campaign_id": str(campaign.id),
-            "goal": campaign.name,
+            "campaign_id": str(campaign.id) if campaign else None,
+            "goal": campaign.name if campaign else "Follow-up call",
             "contact": contact,
             "language": campaign_language,
+            "is_followup": is_followup,
+            "attempt_n": int(contact.get("_attempt_n") or 0) + 1 if is_followup else None,
+            "source_call_id": contact.get("_source_call_id") if is_followup else None,
             "opening_message": (
-                f"Start the outbound campaign call for {contact.get('name') or 'the recipient'}. "
-                "Use the campaign script context, introduce yourself briefly, and ask if this is a good time to talk."
+                f"Start the follow-up call for {contact.get('name') or 'the recipient'}. "
+                "Acknowledge the prior conversation briefly before asking your first question."
+                if is_followup
+                else (
+                    f"Start the outbound campaign call for {contact.get('name') or 'the recipient'}. "
+                    "Use the campaign script context, introduce yourself briefly, and ask if this is a good time to talk."
+                )
             ),
         }
         await NokvoOneVoiceStreamService.run_session(
@@ -1051,48 +1267,138 @@ async def create_campaign(
     name: str = Form(...),
     lead_ids: str | None = Form(None),
     excel_file: UploadFile | None = File(None),
-    doc_file: UploadFile = File(...),
+    doc_file: UploadFile | None = File(None),
     from_number: str | None = Form(None),
-    agent_prompt: str | None = Form(None),
+    agent_prompt: str = Form(...),
     objectives: str | None = Form(None),
     exit_conditions: str | None = Form(None),
     tone: str | None = Form(None),
     silence_timeout_seconds: float | None = Form(None),
+    followup_rules: str | None = Form(None),
     user: OrganizationUser = Depends(_admin_dep()),
     _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
     db: AsyncSession = Depends(deps.get_db),
 ):
+    """Create a campaign.
+
+    The campaign's "knowledge" is the ``agent_prompt`` itself — there is
+    no separate reference document. ``doc_file`` is kept as an optional
+    legacy input but new callers should leave it empty.
+
+    ``lead_ids`` is optional. When omitted, the campaign is created in
+    prompt-only mode and consented leads can be attached later via
+    ``POST /campaigns/{id}/leads``.
+    """
     tr = await _tenant_for_user(db, user)
+    if not (agent_prompt or "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Campaigns need an agent prompt — it's what the agent reads "
+                "during the call. Add one and try again."
+            ),
+        )
     try:
         parsed_lead_ids: list[uuid.UUID] = []
         if lead_ids:
             raw_ids = json.loads(lead_ids) if lead_ids.strip().startswith("[") else [x.strip() for x in lead_ids.split(",")]
             parsed_lead_ids = [uuid.UUID(str(item)) for item in raw_ids if str(item).strip()]
-        if not parsed_lead_ids:
-            raise ValueError(
-                "Outgoing Agent campaigns can only be created from consented leads imported from Meta Ads, "
-                "Google Ads, Google Forms, or Nokvo forms."
+        agent_config = {
+            "agent_prompt": agent_prompt,
+            "objectives": _parse_campaign_list_field(objectives),
+            "exit_conditions": _parse_campaign_list_field(exit_conditions),
+            "tone": tone,
+            "silence_timeout_seconds": silence_timeout_seconds,
+        }
+        # Follow-up rules — optional. Stored under agent_config.followup_rules
+        # so the FollowupSchedulerService can read them via effective_followup_rules.
+        if followup_rules:
+            try:
+                parsed_rules = json.loads(followup_rules)
+                if isinstance(parsed_rules, dict):
+                    agent_config["followup_rules"] = parsed_rules
+            except json.JSONDecodeError:
+                # Silently drop on parse failure — defaults still apply at
+                # read time, so the campaign creates without follow-up
+                # rules rather than 400ing on a UI bug.
+                pass
+        if parsed_lead_ids:
+            campaign = await OutboundCampaignService.create_campaign_from_leads(
+                tr,
+                db,
+                name=name,
+                lead_ids=parsed_lead_ids,
+                doc_file=doc_file,
+                from_number=from_number,
+                agent_config=agent_config,
             )
-        campaign = await OutboundCampaignService.create_campaign_from_leads(
-            tr,
-            db,
-            name=name,
-            lead_ids=parsed_lead_ids,
-            doc_file=doc_file,
-            from_number=from_number,
-            agent_config={
-                "agent_prompt": agent_prompt,
-                "objectives": _parse_campaign_list_field(objectives),
-                "exit_conditions": _parse_campaign_list_field(exit_conditions),
-                "tone": tone,
-                "silence_timeout_seconds": silence_timeout_seconds,
-            },
-        )
+        else:
+            campaign = await OutboundCampaignService.create_campaign_prompt_only(
+                tr,
+                db,
+                name=name,
+                from_number=from_number,
+                agent_config=agent_config,
+            )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
     except OutgoingLeadServiceError as exc:
         raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
     except Exception as exc:
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
+    return _campaign_response(campaign)
+
+
+@router.post("/campaigns/{campaign_id}/leads")
+async def attach_campaign_leads(
+    campaign_id: uuid.UUID,
+    lead_ids: str = Form(...),
+    user: OrganizationUser = Depends(_admin_dep()),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Attach consented leads to an existing draft campaign.
+
+    ``lead_ids`` may be a JSON array string (``"[\"uuid\", ...]"``) or a
+    comma-separated list. Each lead must be callable + scoped to the
+    caller's tenant. Already-attached leads are silently skipped.
+    """
+    tr = await _tenant_for_user(db, user)
+    campaign = await OutboundCampaignService.get_campaign(campaign_id, tr, db)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    try:
+        raw_ids = json.loads(lead_ids) if lead_ids.strip().startswith("[") else [
+            x.strip() for x in lead_ids.split(",")
+        ]
+        parsed = [uuid.UUID(str(item)) for item in raw_ids if str(item).strip()]
+        campaign = await OutboundCampaignService.attach_leads(
+            tr, db, campaign=campaign, lead_ids=parsed
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
+    except OutgoingLeadServiceError as exc:
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
+    return _campaign_response(campaign)
+
+
+@router.delete("/campaigns/{campaign_id}/leads/{lead_id}")
+async def detach_campaign_lead(
+    campaign_id: uuid.UUID,
+    lead_id: uuid.UUID,
+    user: OrganizationUser = Depends(_admin_dep()),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    tr = await _tenant_for_user(db, user)
+    campaign = await OutboundCampaignService.get_campaign(campaign_id, tr, db)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    try:
+        campaign = await OutboundCampaignService.detach_lead(
+            tr, db, campaign=campaign, lead_id=lead_id
+        )
+    except ValueError as exc:
         raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
     return _campaign_response(campaign)
 
@@ -1152,3 +1458,246 @@ async def cancel_campaign(
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=_safe_detail(exc)) from exc
     return _campaign_response(campaign)
+
+
+@router.delete("/campaigns/{campaign_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_campaign(
+    campaign_id: uuid.UUID,
+    user: OrganizationUser = Depends(_admin_dep()),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Hard-delete a campaign and its contact join rows.
+
+    Running campaigns are protected — operators must cancel them first.
+    Lead records and call-cost rows are NOT touched (leads outlive campaigns;
+    cost ledger remains as a billing audit trail).
+    """
+    tr = await _tenant_for_user(db, user)
+    campaign = await OutboundCampaignService.get_campaign(campaign_id, tr, db)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    try:
+        await OutboundCampaignService.delete_campaign(campaign, db)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=_safe_detail(exc)) from exc
+    return None
+
+
+# ───────────────────────── Follow-ups ─────────────────────────
+#
+# The follow-up agent surfaces here. Six endpoints, all admin + MFA gated:
+#   GET    /followups/summary               → tile counts for the dashboard
+#   GET    /followups?lead_id=…             → all rows for one lead (chip data)
+#   POST   /followups/{id}/pause            → admin pause one pending row
+#   POST   /followups/{id}/resume           → admin resume one paused row
+#   DELETE /followups?lead_id=…             → cancel all pending for a lead
+#   POST   /followups/manual                → admin schedules a one-off row
+#
+# The scheduler loop (app/services/followup_scheduler.py) does the actual
+# call placement. These endpoints exist for visibility + manual override —
+# the day-to-day flow needs none of them.
+
+
+def _followup_response(row) -> dict:
+    """Serializer. The schedule rows carry enums + UUIDs that JSON can't
+    encode directly, so we flatten to a stable shape the frontend can
+    consume in the chip + summary widgets."""
+    return {
+        "id": str(row.id),
+        "tenant_id": row.tenant_id,
+        "lead_id": str(row.lead_id),
+        "campaign_id": str(row.campaign_id) if row.campaign_id else None,
+        "source_call_id": row.source_call_id,
+        "scheduled_at": row.scheduled_at.isoformat() if row.scheduled_at else None,
+        "reason": row.reason.value if row.reason else None,
+        "attempts": int(row.attempts or 0),
+        "status": row.status.value if row.status else None,
+        "placed_call_id": row.placed_call_id,
+        "paused_at": row.paused_at.isoformat() if row.paused_at else None,
+        "paused_by": str(row.paused_by) if row.paused_by else None,
+        "cancelled_reason": row.cancelled_reason,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    }
+
+
+@router.get("/followups/summary")
+async def followups_summary(
+    user: OrganizationUser = Depends(_admin_dep()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Tile counts for the dashboard — scheduled / today / exhausted /
+    paused. One DB hit, scoped to the caller's tenant."""
+    from app.services.followup_scheduler_service import FollowupSchedulerService
+
+    tr = await _tenant_for_user(db, user)
+    return await FollowupSchedulerService.summary_for_tenant(
+        tenant_id=tr.tenant_id, db=db
+    )
+
+
+@router.get("/followups")
+async def list_followups_for_lead(
+    lead_id: uuid.UUID,
+    user: OrganizationUser = Depends(_admin_dep()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """All scheduled / completed / cancelled follow-ups for one lead.
+    Newest first. Powers the per-lead chip in the Leads tab."""
+    from app.services.followup_scheduler_service import FollowupSchedulerService
+
+    # Tenant scoping: ensure the lead belongs to this admin's tenant before
+    # returning its follow-up history. Skips the cross-tenant info leak.
+    tr = await _tenant_for_user(db, user)
+    lead_res = await db.execute(
+        select(OutgoingLead).where(OutgoingLead.id == lead_id)
+    )
+    lead = lead_res.scalars().first()
+    if lead is None or lead.tenant_id != tr.tenant_id:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    rows = await FollowupSchedulerService.for_lead(lead_id=lead_id, db=db)
+    return {"items": [_followup_response(r) for r in rows]}
+
+
+@router.post("/followups/{followup_id}/pause")
+async def pause_followup(
+    followup_id: uuid.UUID,
+    user: OrganizationUser = Depends(_admin_dep()),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Pause a pending follow-up. Status flips to ``paused``; the scheduler
+    skips paused rows on every tick. Idempotent — pausing an already-paused
+    row is a no-op."""
+    from app.services.followup_scheduler_service import FollowupSchedulerService
+
+    row = await FollowupSchedulerService.pause_row(
+        row_id=followup_id, by_user_id=user.id, db=db
+    )
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Follow-up not found or not pending",
+        )
+    return _followup_response(row)
+
+
+@router.post("/followups/{followup_id}/resume")
+async def resume_followup(
+    followup_id: uuid.UUID,
+    user: OrganizationUser = Depends(_admin_dep()),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Resume a paused follow-up. The scheduled_at is re-clamped to the
+    campaign's current call window (admin may have shifted hours)."""
+    from app.services.followup_scheduler_service import FollowupSchedulerService
+
+    row = await FollowupSchedulerService.resume_row(row_id=followup_id, db=db)
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Follow-up not found or not paused",
+        )
+    return _followup_response(row)
+
+
+@router.delete("/followups")
+async def cancel_followups_for_lead(
+    lead_id: uuid.UUID,
+    user: OrganizationUser = Depends(_admin_dep()),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Cancel every pending + paused follow-up for one lead. Surfaces the
+    count cancelled so the UI can show feedback. Audit trail is preserved
+    in ``cancelled_reason='admin'``."""
+    from app.services.followup_scheduler_service import FollowupSchedulerService
+
+    tr = await _tenant_for_user(db, user)
+    lead_res = await db.execute(
+        select(OutgoingLead).where(OutgoingLead.id == lead_id)
+    )
+    lead = lead_res.scalars().first()
+    if lead is None or lead.tenant_id != tr.tenant_id:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    count = await FollowupSchedulerService.cancel_for_lead(
+        lead_id=lead_id, reason="admin", db=db
+    )
+    return {"cancelled": count}
+
+
+@router.post("/followups/manual")
+async def schedule_manual_followup(
+    request: Request,
+    user: OrganizationUser = Depends(_admin_dep()),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Admin manually schedules a follow-up call for a lead.
+
+    Body: {lead_id, campaign_id?, scheduled_at (ISO string), note?}
+
+    The scheduled_at is clamped into the campaign's call window (or the
+    default window if no campaign is attached). Reason is set to
+    ``manual`` so the chip can mark it visibly distinct from auto rules.
+    """
+    from datetime import datetime
+    from app.models.lead_followup_schedule import (
+        FollowupReason,
+        FollowupStatus,
+        LeadFollowupSchedule,
+    )
+    from app.services.followup_scheduler_service import (
+        clamp_to_call_window,
+        effective_followup_rules,
+    )
+
+    body = await request.json()
+    lead_id = body.get("lead_id")
+    if not lead_id:
+        raise HTTPException(status_code=400, detail="lead_id required")
+    iso = body.get("scheduled_at")
+    if not iso:
+        raise HTTPException(status_code=400, detail="scheduled_at required")
+    try:
+        when = datetime.fromisoformat(iso)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="scheduled_at must be ISO-8601")
+
+    tr = await _tenant_for_user(db, user)
+    lead_res = await db.execute(
+        select(OutgoingLead).where(OutgoingLead.id == uuid.UUID(str(lead_id)))
+    )
+    lead = lead_res.scalars().first()
+    if lead is None or lead.tenant_id != tr.tenant_id:
+        raise HTTPException(status_code=404, detail="Lead not found")
+
+    campaign = None
+    if body.get("campaign_id"):
+        camp_res = await db.execute(
+            select(OutboundCampaign).where(
+                OutboundCampaign.id == uuid.UUID(str(body["campaign_id"]))
+            )
+        )
+        campaign = camp_res.scalars().first()
+        if campaign is None or campaign.tenant_id != tr.tenant_id:
+            raise HTTPException(status_code=404, detail="Campaign not found")
+
+    rules = effective_followup_rules(campaign)
+    when = clamp_to_call_window(when, rules)
+    row = LeadFollowupSchedule(
+        id=uuid.uuid4(),
+        tenant_id=tr.tenant_id,
+        lead_id=lead.id,
+        campaign_id=campaign.id if campaign else None,
+        source_call_id=None,
+        scheduled_at=when,
+        reason=FollowupReason.manual,
+        attempts=0,
+        status=FollowupStatus.pending,
+    )
+    db.add(row)
+    await db.commit()
+    await db.refresh(row)
+    return _followup_response(row)

@@ -1,7 +1,9 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
-import { useRouter } from 'vue-router';
+import { useRoute, useRouter } from 'vue-router';
 import axios from 'axios';
+import { pageKeyToRouteName } from '../router/pageKeys.js';
+import { provideDashboardState } from '../composables/useDashboardState.js';
 import QrcodeVue from 'qrcode.vue';
 import nokvoLogo from '../assets/nokvo-one-logo.png';
 import {
@@ -60,6 +62,7 @@ const props = defineProps({
 });
 defineEmits(['switch-mode']);
 const router = useRouter();
+const route = useRoute();
 
 const api = axios.create({ baseURL: API_BASE_URL });
 const connectApi = axios.create({ baseURL: 'http://localhost:8000/api/nokvo-one/connect' });
@@ -247,6 +250,11 @@ const clinicScheduleSettings = ref({});
 const blockedSlots = ref({});
 const tabRecords = ref({ leads: [], tickets: [], appointments: [] });
 const tabRecordsLoading = ref({});
+// Outbound campaigns drive the per-campaign tab strip on the Leads page so
+// each campaign's leads are separated. `activeLeadCampaignTab` is the selected
+// campaign id, or null for the "All" tab.
+const outboundCampaigns = ref([]);
+const activeLeadCampaignTab = ref(null);
 const timetableViewer = ref({ member: null, isLoading: false, selectedDate: '', visibleMonth: '' });
 const agents = ref([]);
 const predefinedTools = ref([]);
@@ -315,12 +323,12 @@ const phoneLink = ref(null);
 const phoneLinkInput = ref('');
 const isSavingPhoneLink = ref(false);
 const campaigns = ref([]);
-const defaultCampaignObjectives = [
-  'Confirm this is a good time to talk.',
-  'Briefly explain why we are calling.',
-  'Understand whether the lead is interested and what they need.',
-  'Capture the next step: appointment, callback, site visit, demo, or opt-out.',
-].join('\n');
+// Campaign-objective codes. Source of truth for the multi-select dropdown
+// AND the FSM gate on the backend. Adding a new code = update both ends.
+const CAMPAIGN_OBJECTIVE_OPTIONS = [
+  { value: 'site_visit', label: 'Book a site visit', description: 'Drive the lead toward visiting one of your projects.' },
+  { value: 'lead', label: 'Capture a lead', description: 'Record name + phone + your Lead Fields so the team can follow up.' },
+];
 const defaultCampaignExitConditions = [
   'Lead asks not to be called again.',
   'Lead says they are not interested.',
@@ -330,17 +338,51 @@ const defaultCampaignExitConditions = [
 const emptyCampaignForm = () => ({
   name: '',
   from_number: '',
-  doc_file: null,
   agent_prompt: 'You are making a consented outbound call. Be concise, explain the reason for the call, and guide the lead toward one clear next step.',
-  objectives: defaultCampaignObjectives,
+  // List of objective codes from CAMPAIGN_OBJECTIVE_OPTIONS. Defaults to
+  // both selected so a fresh campaign is willing to do either next step.
+  objectives: ['site_visit', 'lead'],
   exit_conditions: defaultCampaignExitConditions,
   tone: 'warm, direct, and respectful',
   silence_timeout_seconds: 5,
+  // Follow-up rules block — mirrors DEFAULT_FOLLOWUP_RULES on the backend
+  // (app/services/followup_scheduler_service.py). Stored alongside the
+  // other campaign fields and serialised into agent_config.followup_rules
+  // by the backend on create. Defaults: 3 attempts global, 9–7 IST window.
+  followup_rules: {
+    enabled: true,
+    max_attempts_per_lead: 3,
+    rules: {
+      no_answer: { delay_minutes: 120, max_attempts: 3 },
+      voicemail: { delay_minutes: 1440, max_attempts: 2 },
+      failed: { delay_minutes: 240, max_attempts: 2 },
+      partial: { delay_minutes: 4320, max_attempts: 1 },
+    },
+    call_window: {
+      start_local: '09:00',
+      end_local: '19:00',
+      timezone: 'Asia/Kolkata',
+    },
+  },
 });
+
+const toggleCampaignObjective = (code) => {
+  const idx = (campaignForm.value.objectives || []).indexOf(code);
+  if (idx >= 0) {
+    campaignForm.value.objectives.splice(idx, 1);
+  } else {
+    campaignForm.value.objectives = [...(campaignForm.value.objectives || []), code];
+  }
+};
+
+const campaignObjectiveLabel = (code) => {
+  const opt = CAMPAIGN_OBJECTIVE_OPTIONS.find((o) => o.value === code);
+  return opt ? opt.label : code;
+};
 const campaignForm = ref(emptyCampaignForm());
 const isCreatingCampaign = ref(false);
 const isLaunchingCampaign = ref(null);
-const outgoingTab = ref('leads');
+const outgoingTab = ref('campaigns');
 const leadConnections = ref([]);
 const leadForms = ref([]);
 const outgoingLeads = ref([]);
@@ -398,26 +440,19 @@ const OUTBOUND_OBJECTIVE_OPTIONS = [
   { value: 'renewal', label: 'Renewal' },
 ];
 
-// localStorage key that scopes a saved tester preset to the signed-in org
-// user so two operators on the same browser don't see each other's drafts.
-const OUTBOUND_TESTER_STORAGE_KEY = 'nokvo_one_outbound_tester_preset_v1';
-
+// Outbound tester now drives off a real campaign's config — admins pick one
+// of the org's saved campaigns and rehearse with the exact agent_prompt /
+// objectives / doc_text / persona that the production dialler would use.
+// (The old localStorage `nokvo_one_outbound_tester_preset_v1` workflow has
+// been removed; the campaign row IS the preset.)
 const _defaultOutboundTester = () => ({
-  // Campaign branding — the sales persona the agent introduces itself as.
-  // The deterministic opener stitches caller_name + company_name + pitch_summary
-  // into the first line; the system prompt template then takes over.
   caller_name: 'Riya',
   company_name: '',
   pitch_summary: '',
   objective: 'lead_qualification',
   name: 'Outbound test call',
   goal: '',
-  // Optional advanced overrides — leave both blank to use the default
-  // sales-persona template; set either to deviate.
   agent_prompt: '',
-  doc_file: null,         // File object selected by the user (NOT persisted)
-  doc_filename: '',       // surface filename in the UI after selection
-  doc_chars: 0,           // populated after the /prepare call; null on reset
   objectives: '',
   exit_conditions: '',
   tone: 'warm, direct, and respectful',
@@ -425,77 +460,14 @@ const _defaultOutboundTester = () => ({
 });
 
 const outboundTester = ref(_defaultOutboundTester());
-const outboundTesterSaved = ref({ savedAt: null, hasPreset: false });
-
-const _hydrateOutboundTesterFromStorage = () => {
-  try {
-    const raw = localStorage.getItem(OUTBOUND_TESTER_STORAGE_KEY);
-    if (!raw) return;
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== 'object') return;
-    // File handles aren't persistable — keep whatever the current session
-    // has selected. Everything else hydrates from the saved preset.
-    const currentFile = outboundTester.value.doc_file;
-    const currentFilename = outboundTester.value.doc_filename;
-    outboundTester.value = {
-      ..._defaultOutboundTester(),
-      ...parsed,
-      doc_file: currentFile,
-      doc_filename: currentFilename,
-      doc_chars: 0,
-    };
-    outboundTesterSaved.value = {
-      savedAt: parsed.__saved_at || null,
-      hasPreset: true,
-    };
-  } catch {
-    // Corrupt JSON in storage — silently ignore and stick with defaults.
-  }
-};
-
-const saveOutboundTesterPreset = () => {
-  try {
-    const { doc_file: _docFile, doc_chars: _docChars, ...persistable } = outboundTester.value;
-    const payload = { ...persistable, __saved_at: new Date().toISOString() };
-    localStorage.setItem(OUTBOUND_TESTER_STORAGE_KEY, JSON.stringify(payload));
-    outboundTesterSaved.value = {
-      savedAt: payload.__saved_at,
-      hasPreset: true,
-    };
-    infoMsg.value = 'Tester preset saved on this browser.';
-  } catch (err) {
-    errorMsg.value = 'Could not save the tester preset (browser storage unavailable).';
-  }
-};
-
-const clearOutboundTesterPreset = () => {
-  if (!window.confirm('Clear the saved tester preset?')) return;
-  try {
-    localStorage.removeItem(OUTBOUND_TESTER_STORAGE_KEY);
-  } catch {
-    // ignore
-  }
-  outboundTester.value = _defaultOutboundTester();
-  outboundTesterSaved.value = { savedAt: null, hasPreset: false };
-  infoMsg.value = 'Tester preset cleared.';
-};
-
-const onOutboundTesterDocSelected = (event) => {
-  const file = event.target?.files?.[0] || null;
-  outboundTester.value.doc_file = file;
-  outboundTester.value.doc_filename = file ? file.name : '';
-  outboundTester.value.doc_chars = 0;
-};
-
-const clearOutboundTesterDoc = () => {
-  outboundTester.value.doc_file = null;
-  outboundTester.value.doc_filename = '';
-  outboundTester.value.doc_chars = 0;
-};
-
-// Hydrate the preset on script load. Safe to call even before auth — the
-// preset lives in localStorage, not in any backend table.
-_hydrateOutboundTesterFromStorage();
+// `selectedTesterCampaignId` is the id of the campaign whose config will be
+// loaded server-side for the rehearsal. Null = fall back to the inline form.
+const selectedTesterCampaignId = ref(null);
+// Populated by the WS `outcome` event the server emits at end-of-call.
+// Shape: { outcome, reason, lead_id, uncategorized, campaign_id, campaign_name }.
+// Rendered as a banner inside the Tester card so the operator immediately
+// sees where the test lead landed (or that it was discarded).
+const outboundTesterOutcome = ref(null);
 
 // Per-second billing rate matches the server (₹8/minute → ₹2/15 per
 // second). We display the precise live total; the persisted ledger
@@ -798,6 +770,19 @@ const switchPage = (page) => {
     return;
   }
   currentPage.value = page;
+  // Drive Vue Router so the URL reflects the active page. The route watcher
+  // below mirrors the reverse direction (URL → currentPage) so deep-links
+  // and refreshes land on the right view.
+  const targetRouteName = pageKeyToRouteName[page];
+  if (targetRouteName && route.name !== targetRouteName) {
+    router.push({ name: targetRouteName }).catch((err) => {
+      // NavigationDuplicated is a no-op; swallow silently.
+      if (err && err.name !== 'NavigationDuplicated') {
+        // Don't break the legacy currentPage update on a routing miss.
+        console.warn('[switchPage] router.push failed:', err);
+      }
+    });
+  }
   errorMsg.value = '';
   infoMsg.value = '';
   if (page === 'my_timetable') {
@@ -1103,6 +1088,9 @@ const loadWorkspace = async () => {
     // We don't await it; the card renders a skeleton until the data
     // arrives a few hundred ms later.
     loadCostSummary();
+    // Follow-up agent: refresh the dashboard tile once at boot. Per-lead
+    // chips load lazily via loadFollowupsForLead when the user expands a row.
+    loadFollowupSummary();
     // Notifications: bulk inbox load + live WS subscription. Both are
     // fire-and-forget; failures are silent so a notifications outage
     // doesn't degrade the rest of the workspace.
@@ -1277,6 +1265,89 @@ const loadTabRecords = async (tab) => {
   } finally {
     tabRecordsLoading.value = { ...tabRecordsLoading.value, [tab]: false };
   }
+  // The Leads tab strip is driven by the org's outbound campaigns. Refresh the
+  // list alongside the lead records so a newly-created campaign appears as a
+  // tab without requiring a full page reload.
+  if (tab === 'leads') {
+    try {
+      const { data: campaigns } = await api.get('/agents/campaigns', {
+        headers: authHeader(),
+      });
+      outboundCampaigns.value = Array.isArray(campaigns) ? campaigns : [];
+    } catch (err) {
+      // Non-fatal: leads still render under "All" if campaigns can't load.
+      outboundCampaigns.value = [];
+    }
+  }
+};
+
+// Sentinel tab id for the Uncategorized strip. Records land here when the
+// outbound tester classifies the call as "partial" — soft yes, call-later,
+// "send details" — and the backend persists them with data.uncategorized=true.
+const UNCATEGORIZED_TAB_ID = '__uncategorized__';
+
+const _isUncategorizedRecord = (record) => Boolean(record?.data?.uncategorized);
+
+// Leads filtered to the active campaign tab. null = "All Leads",
+// UNCATEGORIZED_TAB_ID = the global uncategorized bucket, otherwise filter
+// by data.campaign_id.
+const filteredLeadRecords = computed(() => {
+  const all = tabRecords.value.leads || [];
+  const active = activeLeadCampaignTab.value;
+  if (!active) return all;
+  if (active === UNCATEGORIZED_TAB_ID) {
+    return all.filter(_isUncategorizedRecord);
+  }
+  return all.filter(
+    (r) => !_isUncategorizedRecord(r)
+      && String(r?.data?.campaign_id || '') === String(active),
+  );
+});
+
+// Tab strip composition:
+//   - "All Leads" first (always)
+//   - One tab per existing campaign (always, even with zero records — matches
+//     the product spec "a tab for that campaign is created in the leads page
+//     as well" the moment the campaign exists)
+//   - "Uncategorized" last (only when there are uncategorized records OR
+//     campaigns exist — the operator should see the bucket exists)
+const leadCampaignTabs = computed(() => {
+  const all = tabRecords.value.leads || [];
+  const counts = new Map();
+  let uncategorizedCount = 0;
+  for (const record of all) {
+    if (_isUncategorizedRecord(record)) {
+      uncategorizedCount += 1;
+      continue;
+    }
+    const cid = record?.data?.campaign_id;
+    if (!cid) continue;
+    counts.set(String(cid), (counts.get(String(cid)) || 0) + 1);
+  }
+  const tabs = [
+    { id: null, name: 'All Leads', count: all.length },
+  ];
+  for (const campaign of outboundCampaigns.value || []) {
+    const cid = String(campaign.id);
+    tabs.push({
+      id: cid,
+      name: campaign.name || `Campaign ${cid.slice(0, 6)}`,
+      count: counts.get(cid) || 0,
+    });
+  }
+  if (uncategorizedCount > 0 || (outboundCampaigns.value || []).length > 0) {
+    tabs.push({
+      id: UNCATEGORIZED_TAB_ID,
+      name: 'Uncategorized',
+      count: uncategorizedCount,
+      uncategorized: true,
+    });
+  }
+  return tabs;
+});
+
+const setActiveLeadCampaign = (id) => {
+  activeLeadCampaignTab.value = id;
 };
 
 const loadMemberScheduleExtras = async (memberList = members.value) => {
@@ -4018,13 +4089,12 @@ const toggleLeadSelection = (lead) => {
   else selectedLeadIds.value.push(lead.id);
 };
 
-const onCampaignFile = (event, key) => {
-  campaignForm.value[key] = event.target.files?.[0] || null;
-};
-
 const createCampaign = async () => {
-  if (!campaignForm.value.name.trim() || !selectedCallableLeads.value.length || !campaignForm.value.doc_file) {
-    errorMsg.value = 'Campaign name, at least one consented lead, and script document are required.';
+  // The agent_prompt IS the agent's knowledge — it's required. No separate
+  // doc upload. Leads are optional here; the operator can attach them later
+  // from the campaign card.
+  if (!campaignForm.value.name.trim() || !campaignForm.value.agent_prompt.trim()) {
+    errorMsg.value = 'Campaign name and an agent prompt are required — the prompt is what the agent reads on the call.';
     return;
   }
   isCreatingCampaign.value = true;
@@ -4032,25 +4102,120 @@ const createCampaign = async () => {
     const fd = new FormData();
     fd.append('name', campaignForm.value.name.trim());
     if (campaignForm.value.from_number.trim()) fd.append('from_number', campaignForm.value.from_number.trim());
-    if (campaignForm.value.agent_prompt.trim()) fd.append('agent_prompt', campaignForm.value.agent_prompt.trim());
-    if (campaignForm.value.objectives.trim()) fd.append('objectives', JSON.stringify(campaignForm.value.objectives.split('\n').map((item) => item.trim()).filter(Boolean)));
+    fd.append('agent_prompt', campaignForm.value.agent_prompt.trim());
+    // Objectives is now a list of structured codes (site_visit / lead) from
+    // the dropdown. Always send the JSON array (even when empty) so the
+    // backend knows the operator explicitly chose to skip side flows.
+    fd.append('objectives', JSON.stringify(Array.isArray(campaignForm.value.objectives) ? campaignForm.value.objectives : []));
     if (campaignForm.value.exit_conditions.trim()) fd.append('exit_conditions', JSON.stringify(campaignForm.value.exit_conditions.split('\n').map((item) => item.trim()).filter(Boolean)));
     if (campaignForm.value.tone.trim()) fd.append('tone', campaignForm.value.tone.trim());
     fd.append('silence_timeout_seconds', String(campaignForm.value.silence_timeout_seconds || 5));
-    fd.append('lead_ids', JSON.stringify(selectedCallableLeads.value.map((lead) => lead.id)));
-    fd.append('doc_file', campaignForm.value.doc_file);
+    // Follow-up rules — serialised into agent_config.followup_rules by the
+    // backend so the scheduler can read them. Only sent if the operator
+    // has actually configured them (always present in defaults, so we
+    // always send them — keeps the contract simple).
+    if (campaignForm.value.followup_rules) {
+      fd.append('followup_rules', JSON.stringify(campaignForm.value.followup_rules));
+    }
+    if (selectedCallableLeads.value.length) {
+      fd.append('lead_ids', JSON.stringify(selectedCallableLeads.value.map((lead) => lead.id)));
+    }
     await agentsApi.post('/campaigns', fd, { headers: { ...authHeader(), 'Content-Type': 'multipart/form-data' } });
     campaignForm.value = emptyCampaignForm();
     selectedLeadIds.value = [];
+    showCampaignCreateForm.value = false;
     await loadCampaigns();
     await loadOutgoingLeads();
-    infoMsg.value = 'Campaign created and script ingested.';
+    infoMsg.value = selectedCallableLeads.value.length
+      ? 'Campaign created with attached leads.'
+      : 'Campaign created. Attach consented leads from the card to launch later.';
   } catch (err) {
     if (await handleMfaProtectedError(err)) return;
     errorMsg.value = extractErrorMessage(err, 'Failed to create campaign.');
   } finally {
     isCreatingCampaign.value = false;
   }
+};
+
+// Toggle for the (collapsed-by-default) inline create form. Keeps the
+// Campaigns sub-tab visually clean when the operator just wants to look at
+// existing campaigns.
+const showCampaignCreateForm = ref(false);
+
+// Per-campaign expanded state. Holds the campaign id whose detail panel
+// is currently open. null = all collapsed.
+const expandedCampaignId = ref(null);
+
+const toggleCampaignExpansion = (id) => {
+  expandedCampaignId.value = expandedCampaignId.value === id ? null : id;
+};
+
+// Lead-attach UI state: which campaign card is currently picking leads,
+// plus the working selection.
+const campaignAttachLeadIds = ref([]);
+const campaignAttachInFlight = ref(null); // campaign id during request
+
+const startAttachLeadsToCampaign = async (campaignId) => {
+  campaignAttachLeadIds.value = [];
+  // Make sure the inventory list is fresh so the picker shows newly synced
+  // leads from a recent ad-source sync.
+  try {
+    await loadOutgoingLeads();
+  } catch (_) {}
+};
+
+const toggleCampaignAttachLead = (leadId) => {
+  const idx = campaignAttachLeadIds.value.indexOf(leadId);
+  if (idx >= 0) {
+    campaignAttachLeadIds.value.splice(idx, 1);
+  } else {
+    campaignAttachLeadIds.value.push(leadId);
+  }
+};
+
+const submitCampaignAttachLeads = async (campaignId) => {
+  if (!campaignAttachLeadIds.value.length) {
+    errorMsg.value = 'Pick at least one consented lead to attach.';
+    return;
+  }
+  campaignAttachInFlight.value = campaignId;
+  try {
+    const fd = new FormData();
+    fd.append('lead_ids', JSON.stringify(campaignAttachLeadIds.value));
+    await agentsApi.post(`/campaigns/${campaignId}/leads`, fd, {
+      headers: { ...authHeader(), 'Content-Type': 'multipart/form-data' },
+    });
+    campaignAttachLeadIds.value = [];
+    await Promise.all([loadCampaigns(), loadOutgoingLeads()]);
+    infoMsg.value = 'Leads attached to the campaign.';
+  } catch (err) {
+    if (await handleMfaProtectedError(err)) return;
+    errorMsg.value = extractErrorMessage(err, 'Failed to attach leads.');
+  } finally {
+    campaignAttachInFlight.value = null;
+  }
+};
+
+const detachLeadFromCampaign = async (campaignId, leadId) => {
+  if (!window.confirm('Remove this lead from the campaign?')) return;
+  try {
+    await agentsApi.delete(`/campaigns/${campaignId}/leads/${leadId}`, {
+      headers: authHeader(),
+    });
+    await Promise.all([loadCampaigns(), loadOutgoingLeads()]);
+  } catch (err) {
+    if (await handleMfaProtectedError(err)) return;
+    errorMsg.value = extractErrorMessage(err, 'Failed to detach lead.');
+  }
+};
+
+// "Test this campaign" entry-point on each campaign card. Switches the
+// sub-tab to Tester, pre-selects the campaign in the picker, and clears
+// any stale outcome banner from a prior session.
+const testCampaign = (campaignId) => {
+  selectedTesterCampaignId.value = campaignId;
+  outboundTesterOutcome.value = null;
+  outgoingTab.value = 'tester';
 };
 
 
@@ -4075,6 +4240,129 @@ const cancelCampaign = async (id) => {
   } catch (err) {
     if (await handleMfaProtectedError(err)) return;
     errorMsg.value = extractErrorMessage(err, 'Failed to cancel campaign.');
+  }
+};
+
+// Hard-delete a campaign. The backend refuses if the campaign is still running
+// (cancel-first). We collapse the expanded panel so we don't read state that
+// no longer exists.
+const removeCampaign = async (id, name) => {
+  const label = name ? `"${name}"` : 'this campaign';
+  if (!window.confirm(
+    `Remove ${label}? The campaign and its lead mappings are deleted permanently. ` +
+    'Lead records and the cost ledger are preserved.'
+  )) return;
+  try {
+    await agentsApi.delete(`/campaigns/${id}`, { headers: authHeader() });
+    if (expandedCampaignId.value === id) expandedCampaignId.value = null;
+    await loadCampaigns();
+  } catch (err) {
+    if (await handleMfaProtectedError(err)) return;
+    errorMsg.value = extractErrorMessage(err, 'Failed to remove campaign.');
+  }
+};
+
+// ── Follow-up agent ───────────────────────────────────────────────────
+//
+// Surfaces the schedule + admin override controls in the UI. State lives
+// here so any view can read it via useDashboardState; refresh is on-demand
+// (after a campaign launch, after a manual schedule, after pause/resume,
+// and on first paint of the LeadsView).
+
+const followupSummary = ref({
+  scheduled: 0,
+  in_flight: 0,
+  today: 0,
+  exhausted: 0,
+  paused: 0,
+  completed: 0,
+  cancelled: 0,
+});
+
+// Keyed by lead_id → list of follow-up rows (newest first). Populated
+// on-demand from /followups?lead_id when the chip opens its detail panel.
+const leadFollowupsByLeadId = ref({});
+
+const loadFollowupSummary = async () => {
+  try {
+    const { data } = await agentsApi.get('/followups/summary', { headers: authHeader() });
+    if (data && typeof data === 'object') {
+      followupSummary.value = { ...followupSummary.value, ...data };
+    }
+  } catch (err) {
+    // Silent — tile drops to skeleton; not worth a red banner.
+  }
+};
+
+const loadFollowupsForLead = async (leadId) => {
+  if (!leadId) return [];
+  try {
+    const { data } = await agentsApi.get('/followups', {
+      headers: authHeader(),
+      params: { lead_id: leadId },
+    });
+    const items = (data && Array.isArray(data.items)) ? data.items : [];
+    leadFollowupsByLeadId.value = { ...leadFollowupsByLeadId.value, [leadId]: items };
+    return items;
+  } catch (err) {
+    if (await handleMfaProtectedError(err)) return [];
+    errorMsg.value = extractErrorMessage(err, 'Failed to load follow-ups for lead.');
+    return [];
+  }
+};
+
+const pauseFollowup = async (followupId, leadId) => {
+  try {
+    await agentsApi.post(`/followups/${followupId}/pause`, {}, { headers: authHeader() });
+    if (leadId) await loadFollowupsForLead(leadId);
+    await loadFollowupSummary();
+  } catch (err) {
+    if (await handleMfaProtectedError(err)) return;
+    errorMsg.value = extractErrorMessage(err, 'Failed to pause follow-up.');
+  }
+};
+
+const resumeFollowup = async (followupId, leadId) => {
+  try {
+    await agentsApi.post(`/followups/${followupId}/resume`, {}, { headers: authHeader() });
+    if (leadId) await loadFollowupsForLead(leadId);
+    await loadFollowupSummary();
+  } catch (err) {
+    if (await handleMfaProtectedError(err)) return;
+    errorMsg.value = extractErrorMessage(err, 'Failed to resume follow-up.');
+  }
+};
+
+const cancelFollowupsForLead = async (leadId) => {
+  if (!leadId) return;
+  if (!window.confirm(
+    'Cancel every pending follow-up for this lead? '
+    + 'The lead remains active — you can schedule a new follow-up manually later.'
+  )) return;
+  try {
+    await agentsApi.delete('/followups', {
+      headers: authHeader(),
+      params: { lead_id: leadId },
+    });
+    await loadFollowupsForLead(leadId);
+    await loadFollowupSummary();
+  } catch (err) {
+    if (await handleMfaProtectedError(err)) return;
+    errorMsg.value = extractErrorMessage(err, 'Failed to cancel follow-ups.');
+  }
+};
+
+const scheduleManualFollowup = async (leadId, scheduledAtIso, campaignId = null) => {
+  try {
+    const body = { lead_id: leadId, scheduled_at: scheduledAtIso };
+    if (campaignId) body.campaign_id = campaignId;
+    await agentsApi.post('/followups/manual', body, { headers: authHeader() });
+    await loadFollowupsForLead(leadId);
+    await loadFollowupSummary();
+    infoMsg.value = 'Follow-up scheduled.';
+  } catch (err) {
+    if (await handleMfaProtectedError(err)) return;
+    errorMsg.value = extractErrorMessage(err, 'Failed to schedule follow-up.');
   }
 };
 
@@ -4489,15 +4777,19 @@ const _buildOutboundTesterWsUrl = (token, testerSessionToken) => {
   const tester = outboundTester.value || {};
   const params = new URLSearchParams({ token });
   if (tester.language) params.set('language', tester.language);
-  // Campaign branding — drives the deterministic opener and the sales prompt.
+  // Preferred path — admin selected a real campaign. The backend loads its
+  // agent_prompt / objectives / exit_conditions / doc_text / persona fields
+  // straight from the DB and ignores the per-field params below.
+  if (selectedTesterCampaignId.value) {
+    params.set('campaign_id', String(selectedTesterCampaignId.value));
+    return `ws://localhost:8000/api/nokvo-one/agents/voice/outbound-tester/ws?${params.toString()}`;
+  }
+  // Fallback (no campaign selected) — legacy per-field rehearsal.
   if (tester.caller_name) params.set('caller_name', tester.caller_name.trim());
   if (tester.company_name) params.set('company_name', tester.company_name.trim());
   if (tester.pitch_summary) params.set('pitch_summary', tester.pitch_summary.trim());
   if (tester.objective) params.set('objective', tester.objective);
   if (tester.goal) params.set('goal', tester.goal.trim());
-  // Prompt + doc travel through the one-shot /prepare stash; the WS URL
-  // just references it. When neither is set, no stash call is needed and
-  // the agent runs with the platform default outbound persona.
   if (testerSessionToken) params.set('tester_session_token', testerSessionToken);
   if (tester.objectives) params.set('objectives', tester.objectives.trim());
   if (tester.exit_conditions) params.set('exit_conditions', tester.exit_conditions.trim());
@@ -4507,22 +4799,24 @@ const _buildOutboundTesterWsUrl = (token, testerSessionToken) => {
 };
 
 const _prepareOutboundTesterSession = async () => {
+  // When a campaign is selected the backend ignores the per-field rehearsal
+  // payload entirely, so don't bother round-tripping the prompt stash.
+  if (selectedTesterCampaignId.value) {
+    return { tester_session_token: null, has_prompt: false };
+  }
   const tester = outboundTester.value || {};
   const prompt = (tester.agent_prompt || '').trim();
-  const file = tester.doc_file;
-  if (!prompt && !file) {
+  if (!prompt) {
     // Allowed — caller wants the platform default outbound persona.
-    return { tester_session_token: null, doc_chars: 0, has_prompt: false };
+    return { tester_session_token: null, has_prompt: false };
   }
   const form = new FormData();
-  if (prompt) form.append('agent_prompt', prompt);
-  if (file) form.append('doc_file', file);
+  form.append('agent_prompt', prompt);
   const { data } = await agentsApi.post(
     '/lead-sources/outbound-tester/prepare',
     form,
     { headers: { ...authHeader(), 'Content-Type': 'multipart/form-data' } },
   );
-  outboundTester.value.doc_chars = data?.doc_chars || 0;
   return data || {};
 };
 
@@ -4555,6 +4849,9 @@ const startVoiceCall = async (mode = 'inbound') => {
   voice.value.playbackChain = Promise.resolve();
   voice.value.firstSentenceMs = null;
   voice.value.ttsFirstAudioMs = null;
+  // Clear last call's outcome banner so the operator doesn't see a stale
+  // "saved as lead" surfacing from the previous test.
+  if (mode === 'outbound') outboundTesterOutcome.value = null;
   // VAD state
   voice.value.isInSpeech = false;
   voice.value.speechStartTime = 0;
@@ -4715,6 +5012,27 @@ const handleVoiceEvent = (msg) => {
       voice.value.errorMsg = msg.user_message || msg.error_message || 'STT failed';
       if (voice.value.status === 'thinking') voice.value.status = 'listening';
       break;
+    case 'outcome': {
+      // End-of-call routing decision from the outbound-tester classifier.
+      // Renders as a banner inside the Tester card so the operator can see
+      // whether the test lead was filed under the campaign tab, the global
+      // Uncategorized tab, or discarded.
+      outboundTesterOutcome.value = {
+        outcome: msg.outcome,
+        reason: msg.reason || '',
+        leadId: msg.lead_id || null,
+        uncategorized: Boolean(msg.uncategorized),
+        campaignId: msg.campaign_id || null,
+        campaignName: msg.campaign_name || '',
+      };
+      // Refresh the Leads page data in the background so the new tab
+      // count is correct the moment the operator switches over.
+      loadCampaigns().catch(() => {});
+      if (currentPage.value === 'leads') {
+        loadTabRecords('leads').catch(() => {});
+      }
+      break;
+    }
     default:
       break;
   }
@@ -4769,6 +5087,12 @@ const cleanupVoiceCall = () => {
     try { clearInterval(voice.value.vadTimer); } catch {}
     voice.value.vadTimer = null;
   }
+  // Drop the safety-net close timer set by endVoiceCall so it doesn't fire
+  // against a null ws after the server already closed cleanly.
+  if (voice.value.closeTimer) {
+    try { clearTimeout(voice.value.closeTimer); } catch {}
+    voice.value.closeTimer = null;
+  }
   // Stop the cost meter and refresh the dashboard tile so the call
   // that just ended shows up in the persisted totals. Refresh runs
   // fire-and-forget — the backend may take a moment to commit the row,
@@ -4798,8 +5122,18 @@ const cleanupVoiceCall = () => {
 
 const endVoiceCall = () => {
   if (voice.value.ws && voice.value.ws.readyState === WebSocket.OPEN) {
+    // Send `stop` and DON'T close client-side immediately. The server runs
+    // post-session work (transcript classification + lead persistence) in
+    // its `finally` block and sends a final {type:"outcome"} message before
+    // closing the WS. If we close first, that message never arrives and
+    // the outcome banner stays blank. Belt-and-braces: a 10s safety net
+    // closes the socket if the server somehow doesn't.
     try { voice.value.ws.send(JSON.stringify({ type: 'stop' })); } catch {}
-    try { voice.value.ws.close(); } catch {}
+    voice.value.status = 'ending';
+    if (voice.value.closeTimer) { try { clearTimeout(voice.value.closeTimer); } catch {} }
+    voice.value.closeTimer = setTimeout(() => {
+      try { voice.value.ws?.close(); } catch {}
+    }, 10000);
   } else {
     cleanupVoiceCall();
   }
@@ -4873,6 +5207,295 @@ onBeforeUnmount(() => {
   if (cursorTimer.value) clearTimeout(cursorTimer.value);
   closeNotificationsSocket();
 });
+
+// ── Real routing wire-up ───────────────────────────────────────────────
+// Mirror route.meta.pageKey into currentPage so deep-links, refreshes, and
+// browser back/forward all land on the correct page. We route through
+// switchPage() so the per-page data loaders (phoneLink, runtimeStatus,
+// loadTabRecords, etc.) fire on every navigation — not only when the user
+// clicks a nav button. Previously this watcher only updated currentPage,
+// which left views empty after a back/forward because the loader hooks
+// never ran. switchPage's router.push is a no-op when the route already
+// matches, so the loop is bounded.
+watch(
+  () => route.meta?.pageKey,
+  (pageKey) => {
+    if (!pageKey) return;
+    if (pageKey === currentPage.value) return;
+    // Pre-auth: just sync the label so the right v-if branch shows when the
+    // shell finishes initial render. switchPage() touches authed endpoints
+    // and would 401 noisily during the login screen.
+    if (authState.value !== 'ready') {
+      currentPage.value = pageKey;
+      return;
+    }
+    switchPage(pageKey);
+  },
+  { immediate: true },
+);
+
+// When auth resolves while sitting on a dashboard route, fire the page's
+// loaders once. Without this, a user that lands on /tickets via a deep link,
+// authenticates, and never clicks a nav button would see an empty page —
+// because bootstrap only loads the leads/tickets/appointments tab the user
+// happened to start on, and the route watcher above is bypassed pre-auth.
+watch(authState, async (newState, oldState) => {
+  if (newState !== 'ready' || oldState === 'ready') return;
+  await nextTick();
+  const pageKey = route.meta?.pageKey;
+  if (pageKey && pageKey !== 'dashboard') {
+    switchPage(pageKey);
+  }
+});
+
+// Expose the shell's live refs to extracted view components. Refs are kept
+// as Refs (not unwrapped) so destructuring in a view's <script setup>
+// preserves reactivity — Vue's template compiler auto-unwraps top-level
+// setup bindings that are Refs.
+provideDashboardState({
+  // Identity / org / theme
+  currentUser,
+  currentOrganization,
+  organizationInitial,
+  organizationHealth,
+  nokvoConnectEnabled,
+  themeMode,
+  errorMsg,
+  infoMsg,
+  isAdmin,
+  isMemberOnly,
+  onboardingV2Enabled,
+  isAuthenticating,
+  switchPage,
+
+  // Members / invites / dashboard
+  costSummary,
+  isLoadingCostSummary,
+  loadCostSummary,
+  formatMinutes,
+  memberPageLabel,
+  inviteForm,
+  isInviteDomainValid,
+  inviteValidationMessage,
+  isSavingMember,
+  inviteCanSubmit,
+  inviteMember,
+  filteredMembers,
+  members,
+  isLoadingMembers,
+  assignmentForMember,
+  openMemberTimetable,
+  startAssignmentEdit,
+  removingMemberId,
+  removeMember,
+
+  // Tabs / records / business type
+  businessTypeLabel,
+  ticketsTabLabel,
+  isRealEstateTemplate,
+  ticketFieldTitle,
+  ticketTitleLabel,
+  ticketSingularLabel,
+  schemaFor,
+  startFieldEdit,
+  fieldTypeIcon,
+  fieldTypeLabel,
+  tabRecords,
+  tabRecordsLoading,
+  loadTabRecords,
+  ticketRecordTitle,
+  ticketRecordSubtitle,
+  ticketRecordPriority,
+  ticketRecordOwner,
+  recordPhone,
+  phoneHref,
+  formatRelativeDate,
+
+  // Leads
+  leadCampaignTabs,
+  activeLeadCampaignTab,
+  setActiveLeadCampaign,
+  UNCATEGORIZED_TAB_ID,
+  filteredLeadRecords,
+  leadRecordTitle,
+  leadRecordSubtitle,
+  leadRecordBudget,
+  leadRecordLocation,
+
+  // Appointments
+  showAppointmentsTab,
+  appointmentRecordTitle,
+  appointmentRecordSubtitle,
+  appointmentRecordTime,
+  appointmentAssignedLabel,
+  customTabs,
+  customTabActionInProgress,
+  deleteCustomTab,
+  newCustomTab,
+  addCustomTabField,
+  removeCustomTabField,
+  submitCustomTab,
+
+  // Projects
+  projectDraft,
+  saveProject,
+  startNewProject,
+  isSavingProject,
+  projects,
+  isLoadingProjects,
+  startEditProject,
+  deleteProject,
+  isDeletingProjectId,
+
+  // My timetable
+  isLoadingMyTimetable,
+  myTimetable,
+  shiftMyCalendarMonth,
+  myCalendarMonthLabel,
+  myCalendarDays,
+  selectMyCalendarDate,
+  myCalendarSelectedLabel,
+  myCalendarSelectedIsWorking,
+  myCalendarSelectedItems,
+  formatCalendarTime,
+  isMutatingMyBlock,
+  removeMyBlock,
+  myAssignedQueuedItems,
+  bufferDurationOptions,
+  bufferForm,
+  addBuffer,
+  unavailableForm,
+  addUnavailability,
+  formatSlotRange,
+
+  // Inbound agent
+  agents,
+  activeAgent,
+  profileAgent,
+  renameDraft,
+  isRenamingAgent,
+  renameAgent,
+  runtimeStatus,
+  voice,
+  liveCostRupees,
+  liveCostDuration,
+  voiceLanguageOptions,
+  startVoiceCall,
+  endVoiceCall,
+  sendTextToVoiceAgent,
+  chatInput,
+  chatLog,
+  sendChat,
+  newAgent,
+  toolCatalogDefaults,
+  selectDefaultAgentTools,
+  businessPromptPlaceholder,
+  toolCatalogGroups,
+  toggleAgentToolGroup,
+  isAgentToolGroupAllOn,
+  toggleAgentTool,
+  createAgent,
+  phoneLinkInput,
+  isSavingPhoneLink,
+  savePhoneLink,
+  phoneLink,
+  emailDrafts,
+  loadEmailDrafts,
+  discardDraft,
+
+  // Outgoing agent
+  isLoadingLeadSources,
+  loadOutgoingAgentWorkspace,
+  requestLeadOAuth,
+  nokvoLeadForm,
+  NOKVO_FORM_FIELD_TYPES,
+  addNokvoFormField,
+  removeNokvoFormField,
+  createNokvoLeadForm,
+  lastNokvoFormLink,
+  copyNokvoFormLink,
+  outgoingTab,
+  loadCampaigns,
+  leadForms,
+  selectedCallableLeads,
+  outgoingLeads,
+  selectedLeadIds,
+  toggleLeadSelection,
+  outboundTester,
+  OUTBOUND_OBJECTIVE_OPTIONS,
+  selectedTesterCampaignId,
+  campaigns,
+  outboundTesterOutcome,
+  showCampaignCreateForm,
+  campaignForm,
+  CAMPAIGN_OBJECTIVE_OPTIONS,
+  toggleCampaignObjective,
+  isCreatingCampaign,
+  createCampaign,
+  expandedCampaignId,
+  toggleCampaignExpansion,
+  campaignObjectiveLabel,
+  detachLeadFromCampaign,
+  campaignAttachLeadIds,
+  toggleCampaignAttachLead,
+  submitCampaignAttachLeads,
+  campaignAttachInFlight,
+  testCampaign,
+  isLaunchingCampaign,
+  launchCampaign,
+  cancelCampaign,
+  removeCampaign,
+
+  // Follow-up agent
+  followupSummary,
+  leadFollowupsByLeadId,
+  loadFollowupSummary,
+  loadFollowupsForLead,
+  pauseFollowup,
+  resumeFollowup,
+  cancelFollowupsForLead,
+  scheduleManualFollowup,
+
+  // Knowledge base
+  kbStats,
+  formatBytes,
+  kbError,
+  kbInfo,
+  kbDocumentUploadEnabled,
+  kbForm,
+  kbBulkQueue,
+  isUploadingKb,
+  isUploadingKbBulk,
+  handleKbDrop,
+  handleKbFileChange,
+  clearKbFile,
+  removeBulkQueueItem,
+  kbDocumentTypes,
+  uploadKnowledgeDocument,
+  uploadKnowledgeDocumentsBulk,
+  kbSinglePromptConfig,
+  isDisablingSinglePromptAgent,
+  disableSinglePromptVoiceAgent,
+  kbSinglePromptForm,
+  isSavingSinglePromptAgent,
+  kbSinglePromptCanSubmit,
+  saveSinglePromptVoiceAgent,
+  kbQuery,
+  testKnowledgeRetrieval,
+  isSearchingKb,
+  kbResults,
+  kbDocuments,
+  kbExpandedDocs,
+  kbChunksByDoc,
+  toggleKnowledgeChunks,
+  approveKnowledgeDocument,
+  rejectKnowledgeDocument,
+  removeKnowledgeDocument,
+  isLoadingKb,
+  isReconcilingKb,
+  reconcileKnowledgeDocuments,
+  loadKnowledgeDocuments,
+});
 </script>
 
 <template>
@@ -4886,8 +5509,10 @@ onBeforeUnmount(() => {
       <div class="ambient-orb orb-bottom"></div>
     </div>
 
+    <!-- Pre-auth mode bar — theme toggle for the login/signup screens.
+         Post-auth, theme + bell + settings live in the floating dock. -->
     <div
-      v-if="authState !== 'ready' || !['nokvo_connect', 'nokvo_connect_step2'].includes(currentPage)"
+      v-if="authState !== 'ready'"
       class="mode-bar"
     >
       <button type="button" class="mode-link" @click="toggleThemeMode">
@@ -5023,12 +5648,83 @@ onBeforeUnmount(() => {
       </button>
     </div>
 
-    <main v-if="authState !== 'ready'" class="login-layout">
-      <div class="brand-block">
-        <img class="brand-block-logo" :src="nokvoLogo" alt="Nokvo One" />
-      </div>
+    <main v-if="authState !== 'ready'" class="auth-v2">
+      <!-- LEFT: brand / marketing stage -->
+      <aside class="auth-v2__stage" aria-hidden="true">
+        <div class="auth-v2__mesh"></div>
+        <div class="auth-v2__grid"></div>
+        <div class="auth-v2__orb auth-v2__orb--a"></div>
+        <div class="auth-v2__orb auth-v2__orb--b"></div>
+        <div class="auth-v2__orb auth-v2__orb--c"></div>
+        <div class="auth-v2__noise"></div>
 
-      <div class="login-card">
+        <div class="auth-v2__stage-content">
+          <div class="auth-v2__brand">
+            <span class="auth-v2__brand-mark">
+              <span class="auth-v2__brand-glyph">N</span>
+            </span>
+            <span class="auth-v2__brand-name">Nokvo<span>/One</span></span>
+          </div>
+
+          <div class="auth-v2__pitch">
+            <span class="auth-v2__pitch-eyebrow">
+              <span class="auth-v2__pulse"></span>
+              Voice AI platform · India
+            </span>
+            <h1 class="auth-v2__pitch-title">
+              Voice agents<br />
+              that <em>close.</em>
+            </h1>
+            <p class="auth-v2__pitch-sub">
+              Inbound and outbound campaigns on tenant-isolated infra. STT, LLM, TTS, retrieval —
+              one pipeline, audited and yours.
+            </p>
+          </div>
+
+          <ul class="auth-v2__highlights">
+            <li>
+              <span class="auth-v2__check">✓</span>
+              <div>
+                <strong>Tenant-isolated infrastructure</strong>
+                <small>Azure OpenAI, Qdrant, Redis — your tenant, your data, audited.</small>
+              </div>
+            </li>
+            <li>
+              <span class="auth-v2__check">✓</span>
+              <div>
+                <strong>Sub-second LLM-to-voice</strong>
+                <small>Sarvam STT/TTS streaming, semantic cache, top-k retrieval.</small>
+              </div>
+            </li>
+            <li>
+              <span class="auth-v2__check">✓</span>
+              <div>
+                <strong>Consented outbound campaigns</strong>
+                <small>Meta, Google Ads, Forms — every lead carries a call-consent flag.</small>
+              </div>
+            </li>
+          </ul>
+
+          <footer class="auth-v2__stage-foot">
+            <div class="auth-v2__trust">
+              <span class="auth-v2__trust-dot"></span>
+              <span>SOC-aligned · MFA enforced · audit log</span>
+            </div>
+            <span class="auth-v2__copy">© Nokvo · v1</span>
+          </footer>
+        </div>
+      </aside>
+
+      <!-- RIGHT: form -->
+      <section class="auth-v2__form-shell">
+        <div class="auth-v2__brand auth-v2__brand--mobile">
+          <span class="auth-v2__brand-mark">
+            <span class="auth-v2__brand-glyph">N</span>
+          </span>
+          <span class="auth-v2__brand-name">Nokvo<span>/One</span></span>
+        </div>
+
+        <div class="auth-v2__card">
         <div v-if="errorMsg" class="message error">{{ errorMsg }}</div>
         <div v-else-if="infoMsg" class="message info">{{ infoMsg }}</div>
 
@@ -5190,7 +5886,7 @@ onBeforeUnmount(() => {
             Scan this QR with the authenticator for this work email. Your TOTP secret is encrypted at rest.
           </p>
           <div v-if="mfaSetupMode !== 'session_verify' && totpUri" class="qr-shell">
-            <QrcodeVue :value="totpUri" :size="168" level="M" background="#ffffff" foreground="#111111" />
+            <QrcodeVue :value="totpUri" :size="168" level="M" background="var(--surface)" foreground="#111111" />
           </div>
           <div v-if="mfaSetupMode !== 'session_verify' && totpSecret" class="secret-note">
             Manual entry key: <code>{{ totpSecret }}</code>
@@ -5664,13 +6360,12 @@ onBeforeUnmount(() => {
             </button>
           </div>
         </div>
-      </div>
+      </div><!-- /.auth-v2__card -->
 
-      <div class="footer-links">
-        <p>
+        <p class="auth-v2__foot-note">
           Self-serve with work-email signup. Activations are reviewed by Nokvo before calling features unlock.
         </p>
-      </div>
+      </section><!-- /.auth-v2__form-shell -->
     </main>
 
     <main
@@ -5806,2869 +6501,204 @@ onBeforeUnmount(() => {
       </div>
     </main>
 
-    <main v-else class="workspace-layout dashboard-layout">
-      <div class="floating-top-nav">
-        <nav class="dashboard-nav">
-          <div class="dashboard-brand">
-            <img class="brand-logo" :src="nokvoLogo" alt="Nokvo One" />
-          </div>
+    <main v-else class="n-shell">
+      <header class="n-shell-dock" role="banner">
+        <div class="n-shell-dock__glow" aria-hidden="true"></div>
+        <div class="n-shell-dock__inner">
+          <a class="n-shell-brand" href="#" @click.prevent="switchPage('dashboard')" aria-label="Nokvo One home">
+            <span class="n-shell-brand__mark">
+              <span class="n-shell-brand__mark-glyph">N</span>
+              <span class="n-shell-brand__mark-shine" aria-hidden="true"></span>
+            </span>
+          </a>
 
-          <div class="dashboard-nav-actions">
+          <span class="n-shell-dock__rule" aria-hidden="true"></span>
+
+          <nav class="n-shell-nav" aria-label="Primary">
             <button
               v-if="isMemberOnly"
               type="button"
-              class="nav-page-button"
-              :class="{ active: currentPage === 'my_timetable' }"
+              class="n-shell-nav__item"
+              :class="{ 'is-active': currentPage === 'my_timetable' }"
               @click="switchPage('my_timetable')"
             >
-              <CalendarDays :size="17" />
-              <span>My Timetable</span>
+              <CalendarDays :size="14" />
+              <span>My timetable</span>
             </button>
-            <button v-if="!isMemberOnly" type="button" class="nav-page-button" :class="{ active: currentPage === 'dashboard' }" @click="switchPage('dashboard')">
-              <Database :size="17" />
-              <span>Dashboard</span>
-            </button>
-            <button v-if="!isMemberOnly" type="button" class="nav-page-button" :class="{ active: currentPage === 'tickets' }" @click="switchPage('tickets')">
-              <MessageSquare :size="17" />
-              <span>{{ ticketsTabLabel }}</span>
-            </button>
-            <button v-if="!isMemberOnly" type="button" class="nav-page-button" :class="{ active: currentPage === 'leads' }" @click="switchPage('leads')">
-              <UserPlus :size="17" />
-              <span>Leads</span>
-            </button>
-            <button
-              v-if="!isMemberOnly && isRealEstateTemplate"
-              type="button"
-              class="nav-page-button"
-              :class="{ active: currentPage === 'projects' }"
-              @click="switchPage('projects')"
-            >
-              <Layers :size="17" />
-              <span>Projects</span>
-            </button>
-            <button
-              v-if="!isMemberOnly && showAppointmentsTab"
-              type="button"
-              class="nav-page-button"
-              :class="{ active: currentPage === 'appointments' }"
-              @click="switchPage('appointments')"
-            >
-              <CalendarDays :size="17" />
-              <span>Appointments</span>
-            </button>
-            <button
-              v-if="!isMemberOnly"
-              type="button"
-              class="nav-page-button"
-              :class="{ active: currentPage === 'agent' }"
-              @click="switchPage('agent')"
-            >
-              <Bot :size="17" />
-              <span>Inbound Agent</span>
-            </button>
-            <button
-              v-if="!isMemberOnly"
-              type="button"
-              class="nav-page-button"
-              :class="{ active: currentPage === 'outgoing_agent' }"
-              @click="switchPage('outgoing_agent')"
-            >
-              <PhoneCall :size="17" />
-              <span>Outgoing Agent</span>
-            </button>
-            <button
-              v-if="!isMemberOnly"
-              type="button"
-              class="nav-page-button"
-              :class="{ active: currentPage === 'knowledge_base' }"
-              @click="switchPage('knowledge_base')"
-            >
-              <BookOpen :size="17" />
-              <span>Knowledge Base</span>
-            </button>
-            <button
-              v-if="!isMemberOnly && nokvoConnectEnabled"
-              type="button"
-              class="nav-page-button"
-              :class="{ active: currentPage === 'nokvo_connect' }"
-              @click="switchPage('nokvo_connect')"
-            >
-              <Plug :size="17" />
-              <span>Nokvo Connect</span>
-            </button>
-            <button type="button" class="org-avatar-button" @click="handleLogout">
-              <span class="org-avatar-initial">{{ organizationInitial }}</span>
-              <span class="org-avatar-name">{{ currentOrganization?.name }}</span>
-            </button>
-          </div>
-        </nav>
-      </div>
 
-      <section class="dashboard-header">
-        <div>
-          <span class="section-kicker">Nokvo One Workspace</span>
-          <h2>{{ currentOrganization?.name }}</h2>
-        </div>
-        <div class="dashboard-header-actions">
-          <span class="dashboard-context-pill">
-            <Shield :size="15" />
-            {{ currentUser?.role || 'Workspace' }}
-          </span>
-        </div>
-      </section>
-
-      <div v-if="errorMsg" class="message error dashboard-message">{{ errorMsg }}</div>
-      <div v-else-if="infoMsg" class="message info dashboard-message">{{ infoMsg }}</div>
-
-      <!-- DASHBOARD: MFA-pending banner -->
-      <div
-        v-if="onboardingV2Enabled && currentUser?.mfa_pending && currentPage === 'dashboard'"
-        class="mfa-pending-banner"
-      >
-        <div class="mfa-pending-icon">
-          <Shield :size="18" />
-        </div>
-        <div class="mfa-pending-copy">
-          <strong>Secure advanced actions</strong>
-          <span>Enable MFA to unlock calling, campaigns, invites, and integrations.</span>
-        </div>
-        <button type="button" class="primary-button compact" :disabled="isAuthenticating" @click="startSessionTotpSetup">
-          Set up MFA
-        </button>
-      </div>
-
-      <!-- DASHBOARD: v2 Try-Agent banner -->
-      <section
-        v-if="onboardingV2Enabled && currentPage === 'dashboard' && agents.length > 0"
-        class="dashboard-section try-agent-banner"
-      >
-        <article class="dashboard-card try-agent-card">
-          <div class="try-agent-copy">
-            <span class="section-kicker">Try it</span>
-            <h3>Test {{ activeAgent?.name || agents[0]?.name || 'your agent' }} right now</h3>
-            <p>
-              No phone number needed. Send a test message or tap-to-talk inside the workspace.
-              Tool calls are sandboxed and audited.
-            </p>
-          </div>
-          <div class="try-agent-actions">
-            <button
-              type="button"
-              class="primary-button"
-              @click="activeAgent = activeAgent || agents[0]; switchPage('agent')"
-            >
-              <MessageSquare :size="16" />
-              Send a message
-            </button>
-            <button
-              type="button"
-              class="ghost-button"
-              @click="activeAgent = activeAgent || agents[0]; switchPage('agent')"
-            >
-              <Mic :size="16" />
-              Tap to talk
-            </button>
-          </div>
-        </article>
-      </section>
-
-      <!-- MEMBER TIMETABLE — own schedule + buffer/unavailable actions -->
-      <section v-if="currentPage === 'my_timetable'" class="dashboard-section member-timetable-section">
-        <div class="dashboard-section-head">
-          <div>
-            <span class="section-kicker">Your schedule</span>
-            <h3>My timetable</h3>
-          </div>
-          <p>View your working window, add a buffer, or mark yourself unavailable. Changes apply immediately.</p>
-        </div>
-
-        <div v-if="isLoadingMyTimetable && !myTimetable" class="empty-state">Loading your timetable…</div>
-
-        <div v-else class="my-calendar-shell">
-          <section class="timetable-calendar-card my-calendar-card">
-            <div class="timetable-calendar-head">
-              <button type="button" class="ghost-button compact icon-only" aria-label="Previous month" @click="shiftMyCalendarMonth(-1)">
-                <ChevronLeft :size="16" />
-              </button>
-              <strong>{{ myCalendarMonthLabel }}</strong>
-              <button type="button" class="ghost-button compact icon-only" aria-label="Next month" @click="shiftMyCalendarMonth(1)">
-                <ChevronRight :size="16" />
-              </button>
-            </div>
-            <div class="timetable-weekdays">
-              <span v-for="day in ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']" :key="day">{{ day }}</span>
-            </div>
-            <div class="timetable-month-grid">
-              <button
-                v-for="day in myCalendarDays"
-                :key="day.key"
-                type="button"
-                class="timetable-date-cell"
-                :class="{
-                  muted: !day.inMonth,
-                  today: day.isToday,
-                  active: day.isSelected,
-                  busy: day.itemCount,
-                  'has-visit': day.visitCount,
-                  'working-day': day.isWorkingDay && day.inMonth,
-                }"
-                @click="selectMyCalendarDate(day.key)"
-              >
-                <span>{{ day.dayNumber }}</span>
-                <small v-if="day.visitCount && day.blockCount">{{ day.visitCount }} visit{{ day.visitCount === 1 ? '' : 's' }} · {{ day.blockCount }} block</small>
-                <small v-else-if="day.visitCount">{{ day.visitCount }} visit{{ day.visitCount === 1 ? '' : 's' }}</small>
-                <small v-else-if="day.blockCount">{{ day.blockCount }} block{{ day.blockCount === 1 ? '' : 's' }}</small>
-                <small v-else-if="day.isWorkingDay && day.inMonth" class="my-calendar-working-hint">on duty</small>
-              </button>
-            </div>
-            <div class="my-calendar-legend">
-              <span><i class="legend-dot working"></i> Working day</span>
-              <span><i class="legend-dot visit"></i> Customer visit</span>
-              <span><i class="legend-dot blocked"></i> Blocked time</span>
-              <span><i class="legend-dot today"></i> Today</span>
-            </div>
-          </section>
-
-          <section class="timetable-selected-day my-calendar-selected">
-            <div class="timetable-queue-head">
-              <div>
-                <span class="section-kicker">Selected date</span>
-                <h4>{{ myCalendarSelectedLabel }}</h4>
-              </div>
-              <span class="status-chip" :class="{ active: myCalendarSelectedIsWorking }">
-                {{ myCalendarSelectedIsWorking ? 'Working day' : 'Off-day' }}
-              </span>
-            </div>
-
-            <dl v-if="myCalendarSelectedIsWorking && myTimetable?.assignment?.start_time && myTimetable?.assignment?.end_time" class="dashboard-detail-list my-calendar-hours">
-              <div>
-                <dt>Working hours</dt>
-                <dd>
-                  {{ myTimetable.assignment.start_time }} – {{ myTimetable.assignment.end_time }}
-                  <small>({{ myTimetable.assignment.timezone || 'Asia/Kolkata' }})</small>
-                </dd>
-              </div>
-              <div v-if="myTimetable?.assignment?.appointment_duration_minutes">
-                <dt>Slot duration</dt>
-                <dd>{{ myTimetable.assignment.appointment_duration_minutes }} min</dd>
-              </div>
-            </dl>
-
-            <div v-if="!myCalendarSelectedItems.length" class="kb-empty compact my-calendar-empty">
-              <div class="kb-empty-icon">
-                <CalendarDays :size="22" />
-              </div>
-              <strong>Nothing scheduled on this date.</strong>
-              <span>Customer visits and your own buffers will appear here.</span>
-            </div>
-
-            <div v-else class="timetable-day-list">
-              <article
-                v-for="item in myCalendarSelectedItems"
-                :key="`${item.recordType}-${item.id}`"
-                class="timetable-event"
-                :class="{ blocked: item.isBlocked }"
-              >
-                <div class="timetable-time">
-                  <strong>{{ formatCalendarTime(item.start) }}</strong>
-                  <span>{{ item.end ? formatCalendarTime(item.end) : '' }}</span>
-                </div>
-                <div class="timetable-event-main">
-                  <div>
-                    <strong>{{ item.title }}</strong>
-                    <span>{{ item.detail || item.typeLabel }}</span>
-                    <a v-if="!item.isBlocked && item.phoneHref" class="record-call-link timetable-call-link" :href="item.phoneHref">
-                      <PhoneCall :size="14" />
-                      Call {{ item.phone }}
-                    </a>
-                  </div>
-                  <button
-                    v-if="item.isBlocked"
-                    type="button"
-                    class="dashboard-inline-button"
-                    :disabled="isMutatingMyBlock"
-                    @click="removeMyBlock(item.id)"
-                  >
-                    <Trash2 :size="14" />
-                    Remove
-                  </button>
-                  <small v-else>{{ item.status }}</small>
-                </div>
-              </article>
-            </div>
-          </section>
-        </div>
-
-        <div v-if="myAssignedQueuedItems.length" class="my-calendar-queue">
-          <div class="dashboard-section-head">
-            <div>
-              <span class="section-kicker">Assigned queue</span>
-              <h4>Awaiting a scheduled time</h4>
-            </div>
-            <p>Customer work assigned to you that hasn't been booked into a slot yet.</p>
-          </div>
-          <ul class="timetable-day-list my-calendar-queue-list">
-            <li v-for="item in myAssignedQueuedItems" :key="`${item.recordType}-${item.id}`" class="timetable-event">
-              <div class="timetable-event-main">
-                <div>
-                  <strong>{{ item.title }}</strong>
-                  <span>{{ item.detail || item.typeLabel }}</span>
-                  <a v-if="item.phoneHref" class="record-call-link timetable-call-link" :href="item.phoneHref">
-                    <PhoneCall :size="14" />
-                    Call {{ item.phone }}
-                  </a>
-                </div>
-                <small>{{ item.status }}</small>
-              </div>
-            </li>
-          </ul>
-        </div>
-
-        <div v-if="myTimetable" class="member-timetable-grid">
-          <article class="dashboard-card member-timetable-card">
-            <div class="dashboard-card-glow"></div>
-            <div class="member-timetable-card-head">
-              <h4>Working window</h4>
-              <span class="readonly-tag">Set by admin</span>
-            </div>
-            <dl class="dashboard-detail-list">
-              <div>
-                <dt>Days</dt>
-                <dd>{{ (myTimetable?.assignment?.working_days || []).join(', ') || 'No days configured yet' }}</dd>
-              </div>
-              <div>
-                <dt>Hours</dt>
-                <dd>
-                  <template v-if="myTimetable?.assignment?.start_time && myTimetable?.assignment?.end_time">
-                    {{ myTimetable.assignment.start_time }} – {{ myTimetable.assignment.end_time }}
-                    ({{ myTimetable.assignment.timezone || 'Asia/Kolkata' }})
-                  </template>
-                  <template v-else>Not set</template>
-                </dd>
-              </div>
-              <div>
-                <dt>Status</dt>
-                <dd>
-                  <span v-if="myTimetable?.assignment?.is_assignable">Accepting work</span>
-                  <span v-else>Not assignable yet</span>
-                </dd>
-              </div>
-              <div v-if="(myTimetable?.assignment?.request_types || []).length">
-                <dt>Handles</dt>
-                <dd>{{ (myTimetable.assignment.request_types || []).join(', ') }}</dd>
-              </div>
-            </dl>
-          </article>
-
-          <article class="dashboard-card member-timetable-card member-action-card buffer-card">
-            <div class="dashboard-card-glow"></div>
-            <header class="member-action-head">
-              <div class="member-action-icon">
-                <Clock :size="20" />
-              </div>
-              <div class="member-action-title">
-                <h4>Add buffer</h4>
-                <p>Short break between requests — lunch, a quick call, or back-to-back recovery.</p>
-              </div>
-            </header>
-            <form class="member-action-form" @submit.prevent="addBuffer">
-              <label class="member-field member-field-wide">
-                <span class="member-field-label">Start time</span>
-                <input
-                  v-model="bufferForm.start_time"
-                  type="datetime-local"
-                  class="member-field-input"
-                  required
-                />
-              </label>
-              <div class="member-field member-field-wide">
-                <span class="member-field-label">Duration</span>
-                <div class="member-duration-pills" role="radiogroup" aria-label="Buffer duration">
-                  <button
-                    v-for="opt in bufferDurationOptions"
-                    :key="opt.minutes"
-                    type="button"
-                    role="radio"
-                    :aria-checked="bufferForm.duration_minutes === opt.minutes"
-                    class="member-duration-pill"
-                    :class="{ active: bufferForm.duration_minutes === opt.minutes }"
-                    @click="bufferForm.duration_minutes = opt.minutes"
-                  >
-                    {{ opt.label }}
-                  </button>
-                </div>
-              </div>
-              <label class="member-field member-field-wide">
-                <span class="member-field-label">Note <small>(optional)</small></span>
-                <input
-                  v-model="bufferForm.reason"
-                  type="text"
-                  maxlength="240"
-                  class="member-field-input"
-                  placeholder="e.g. lunch break"
-                />
-              </label>
-              <button
-                type="submit"
-                class="member-action-submit"
-                :disabled="isMutatingMyBlock || !bufferForm.start_time"
-              >
-                <Plus :size="16" />
-                {{ isMutatingMyBlock ? 'Adding…' : 'Add buffer' }}
-              </button>
-            </form>
-          </article>
-
-          <article class="dashboard-card member-timetable-card member-action-card unavailable-card">
-            <div class="dashboard-card-glow"></div>
-            <header class="member-action-head">
-              <div class="member-action-icon unavailable-icon">
-                <CalendarOff :size="20" />
-              </div>
-              <div class="member-action-title">
-                <h4>Mark unavailable</h4>
-                <p>Longer time off — leave, an offsite, or anything that takes you out of rotation.</p>
-              </div>
-            </header>
-            <form class="member-action-form" @submit.prevent="addUnavailability">
-              <label class="member-field">
-                <span class="member-field-label">From</span>
-                <input
-                  v-model="unavailableForm.start_time"
-                  type="datetime-local"
-                  class="member-field-input"
-                  required
-                />
-              </label>
-              <label class="member-field">
-                <span class="member-field-label">Until</span>
-                <input
-                  v-model="unavailableForm.end_time"
-                  type="datetime-local"
-                  class="member-field-input"
-                  required
-                />
-              </label>
-              <label class="member-field member-field-wide">
-                <span class="member-field-label">Reason <small>(optional)</small></span>
-                <input
-                  v-model="unavailableForm.reason"
-                  type="text"
-                  maxlength="240"
-                  class="member-field-input"
-                  placeholder="e.g. annual leave, training, doctor's appointment"
-                />
-              </label>
-              <button
-                type="submit"
-                class="member-action-submit unavailable-submit"
-                :disabled="isMutatingMyBlock || !unavailableForm.start_time || !unavailableForm.end_time"
-              >
-                <CalendarOff :size="16" />
-                {{ isMutatingMyBlock ? 'Saving…' : 'Mark unavailable' }}
-              </button>
-            </form>
-          </article>
-
-          <article class="dashboard-card member-timetable-card member-timetable-card-wide">
-            <div class="dashboard-card-glow"></div>
-            <h4>Upcoming blocks</h4>
-            <p v-if="!(myTimetable?.blocked_slots || []).length" class="empty-state">
-              No buffers or unavailability scheduled.
-            </p>
-            <ul v-else class="member-timetable-blocks">
-              <li v-for="slot in myTimetable.blocked_slots" :key="slot.id" class="member-timetable-block">
-                <div class="member-timetable-block-meta">
-                  <strong>{{ slot.reason || 'Block' }}</strong>
-                  <span>{{ formatSlotRange(slot) }}</span>
-                </div>
-                <button
-                  type="button"
-                  class="dashboard-inline-button"
-                  :disabled="isMutatingMyBlock"
-                  @click="removeMyBlock(slot.id)"
-                >
-                  <Trash2 :size="14" />
-                  Remove
-                </button>
-              </li>
-            </ul>
-          </article>
-        </div>
-      </section>
-
-      <!-- ORGANIZATION HEALTH (dedicated page, opened from the settings menu) -->
-      <section v-if="currentPage === 'organization_health'" class="dashboard-section">
-        <div class="dashboard-section-head">
-          <div>
-            <span class="section-kicker">Settings</span>
-            <h3>Organization Health</h3>
-          </div>
-          <p>Live readiness across security, agent setup, knowledge, runtime, outbound, and infrastructure.</p>
-        </div>
-
-        <div class="dashboard-grid overview-grid org-health-grid">
-          <article class="dashboard-card organization-card">
-            <div class="dashboard-card-glow"></div>
-            <div class="organization-card-head">
-              <div class="organization-ident">
-                <div class="organization-mark">{{ organizationInitial }}</div>
-                <div>
-                  <h3>{{ currentOrganization?.name }}</h3>
-                  <p>{{ currentUser?.role }} workspace</p>
-                </div>
-              </div>
-              <span class="status-chip" :class="{ active: currentOrganization?.status === 'active' }">
-                <span class="status-dot"></span>
-                {{ currentOrganization?.status }}
-              </span>
-            </div>
-
-            <div class="health-tracker">
-              <div class="health-score-card" :class="`health-${organizationHealth.state}`">
-                <div class="health-ring" :style="{ background: organizationHealth.ringStyle }">
-                  <div>
-                    <strong>{{ organizationHealth.score }}</strong>
-                    <span>/100</span>
-                  </div>
-                </div>
-                <div>
-                  <span class="micro-label">Workspace health</span>
-                  <h4>{{ organizationHealth.label }}</h4>
-                  <p>{{ organizationHealth.openIssues ? `${organizationHealth.openIssues} area${organizationHealth.openIssues === 1 ? '' : 's'} need attention.` : 'All critical areas are clear.' }}</p>
-                </div>
-              </div>
-
-              <div class="health-check-grid">
-                <div v-for="item in organizationHealth.checks" :key="item.key" class="health-check" :data-state="item.state">
-                  <span class="health-check-dot"></span>
-                  <div>
-                    <strong>{{ item.label }}</strong>
-                    <small>{{ item.detail }}</small>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </article>
-        </div>
-      </section>
-
-      <!-- DASHBOARD -->
-      <section v-if="currentPage === 'dashboard'" class="dashboard-section">
-        <div class="dashboard-section-head">
-          <div>
-            <span class="section-kicker">Billing</span>
-            <h3>Conversation cost</h3>
-          </div>
-          <p>Billed at ₹8 per minute of conversation (₹0.13 per second). Totals reflect the persisted call-cost ledger.</p>
-        </div>
-
-        <div class="dashboard-grid overview-grid cost-grid">
-          <article class="dashboard-card cost-card">
-            <div class="dashboard-card-glow"></div>
-            <div class="compact-card-head">
-              <div class="compact-icon-shell">
-                <Wallet :size="18" />
-              </div>
-              <div>
-                <h3>Call cost ledger</h3>
-                <p v-if="costSummary?.rate?.rupees_per_minute">₹{{ costSummary.rate.rupees_per_minute }} / minute · ₹{{ costSummary.rate.rupees_per_second_display }} / second</p>
-                <p v-else>₹8 / minute · ₹0.13 / second</p>
-              </div>
-              <button
-                type="button"
-                class="dashboard-inline-button cost-refresh-button"
-                @click="loadCostSummary"
-                :disabled="isLoadingCostSummary"
-                :aria-label="isLoadingCostSummary ? 'Refreshing' : 'Refresh'"
-              >
+            <!-- Operations group -->
+            <template v-if="!isMemberOnly">
+              <button type="button" class="n-shell-nav__item" :class="{ 'is-active': currentPage === 'dashboard' }" @click="switchPage('dashboard')">
                 <Activity :size="14" />
-                {{ isLoadingCostSummary ? 'Refreshing…' : 'Refresh' }}
+                <span>Dashboard</span>
               </button>
-            </div>
-            <div class="cost-stats">
-              <div class="cost-stat">
-                <span class="cost-stat-label">Today</span>
-                <strong class="cost-stat-value">{{ costSummary?.today?.rupees_formatted || '—' }}</strong>
-                <small class="cost-stat-meta">{{ costSummary?.today?.call_count ?? 0 }} call{{ (costSummary?.today?.call_count ?? 0) === 1 ? '' : 's' }}</small>
-              </div>
-              <div class="cost-stat">
-                <span class="cost-stat-label">This month</span>
-                <strong class="cost-stat-value">{{ costSummary?.this_month?.rupees_formatted || '—' }}</strong>
-                <small class="cost-stat-meta">{{ costSummary?.this_month?.call_count ?? 0 }} call{{ (costSummary?.this_month?.call_count ?? 0) === 1 ? '' : 's' }}</small>
-              </div>
-              <div class="cost-stat cost-stat-minutes">
-                <span class="cost-stat-label">Minutes today</span>
-                <strong class="cost-stat-value">{{ formatMinutes(costSummary?.today?.seconds) }}</strong>
-                <small class="cost-stat-meta">conversation time</small>
-              </div>
-              <div class="cost-stat cost-stat-minutes">
-                <span class="cost-stat-label">Minutes this month</span>
-                <strong class="cost-stat-value">{{ formatMinutes(costSummary?.this_month?.seconds) }}</strong>
-                <small class="cost-stat-meta">conversation time</small>
-              </div>
-            </div>
-            <div v-if="costSummary?.recent_calls?.length" class="cost-recent">
-              <div class="cost-recent-head">
-                <span class="micro-label">Recent calls</span>
-              </div>
-              <ul class="cost-recent-list">
-                <li v-for="call in costSummary.recent_calls" :key="call.id" class="cost-recent-row">
-                  <div>
-                    <strong>{{ call.rupees_formatted }}</strong>
-                    <small>{{ Math.round(Number(call.duration_seconds || 0)) }}s · {{ call.kind }}</small>
-                  </div>
-                  <small class="cost-recent-time">{{ call.started_at ? new Date(call.started_at).toLocaleString() : '' }}</small>
-                </li>
-              </ul>
-            </div>
-            <p v-else class="cost-empty">No calls billed yet. Costs appear here as soon as voice sessions complete.</p>
-          </article>
-        </div>
-
-        <div class="dashboard-section-head">
-          <div>
-            <span class="section-kicker">Controls</span>
-            <h3>Quick Actions</h3>
-          </div>
-          <p>Invite teammates under your verified workspace domain.</p>
-        </div>
-
-        <div class="dashboard-grid control-grid">
-          <article class="dashboard-card invite-card wide-card expanded-invite-card">
-            <div class="invite-context-panel">
-              <div class="compact-card-head">
-                <div class="compact-icon-shell">
-                  <UserPlus :size="18" />
-                </div>
-                <div>
-                  <h3>Invite {{ memberPageLabel }}</h3>
-                  <p>Email invite link. Invitee sets their own password and TOTP.</p>
-                </div>
-              </div>
-              <div class="invite-domain-banner">
-                <span>Allowed Domain</span>
-                <strong>{{ currentOrganization?.email_domain }}</strong>
-                <small>Invites are restricted to verified work email addresses from this domain.</small>
-              </div>
-            </div>
-            <form class="invite-form dashboard-invite-form" @submit.prevent="inviteMember">
-              <div class="invite-field-grid">
-                <label class="invite-field invite-field-wide">
-                  <span>Work Email</span>
-                  <input v-model="inviteForm.email" type="email" placeholder="name@yourcompany.com" required />
-                </label>
-                <label class="invite-field">
-                  <span>Full Name</span>
-                  <input v-model="inviteForm.full_name" type="text" placeholder="Full name" />
-                </label>
-                <label class="invite-field">
-                  <span>Role</span>
-                  <select v-model="inviteForm.role">
-                    <option value="member">Member</option>
-                    <option value="manager">Manager</option>
-                    <option value="viewer">Viewer</option>
-                    <option value="admin">Admin</option>
-                  </select>
-                </label>
-              </div>
-              <div class="invite-action-block">
-                <p :class="['invite-helper', { invalid: !isInviteDomainValid }]">
-                  {{ inviteValidationMessage }}
-                </p>
-                <button type="submit" :disabled="isSavingMember || !inviteCanSubmit">
-                  <UserPlus :size="15" />
-                  {{ isSavingMember ? 'Inviting...' : 'Send Invite' }}
-                </button>
-              </div>
-            </form>
-          </article>
-        </div>
-
-        <article id="dashboard-members" class="dashboard-card wide-card members-card dashboard-team-card">
-          <div class="members-card-head">
-            <div>
-              <span class="section-kicker">Access</span>
-              <h3>{{ memberPageLabel }}</h3>
-              <p>Manage access and assignment availability for incoming calls, leads, tickets, and appointments.</p>
-            </div>
-            <div class="members-summary">
-              <span>{{ filteredMembers.length }} visible</span>
-              <span>{{ members.length }} total</span>
-            </div>
-          </div>
-
-          <div v-if="isLoadingMembers" class="empty-state">Loading members...</div>
-          <div v-else-if="!filteredMembers.length" class="empty-state">No members match the current filter.</div>
-          <div v-else class="team-card-grid">
-            <div v-for="m in filteredMembers" :key="m.id" class="team-member-card">
-              <div class="team-member-main">
-                <div class="team-avatar">{{ (m.full_name || m.email || 'N').trim().charAt(0).toUpperCase() }}</div>
-                <div class="team-identity">
-                  <strong>{{ m.full_name || 'Unnamed member' }}</strong>
-                  <small>{{ m.email }}</small>
-                </div>
-                <div class="team-badges">
-                  <span>{{ m.role }}</span>
-                  <span :class="{ active: m.status === 'active' }">{{ m.status }}</span>
-                </div>
-              </div>
-
-              <div class="team-assignment-panel">
-                <div>
-                  <span class="micro-label">Availability</span>
-                  <p>{{ assignmentForMember(m.id).availability_summary }}</p>
-                </div>
-                <div class="team-load-pill">
-                  <span>Current load</span>
-                  <strong>{{ assignmentForMember(m.id).active_request_count || 0 }}</strong>
-                </div>
-                <button type="button" class="ghost-button compact" @click="openMemberTimetable(m)">
-                  <CalendarDays :size="15" />
-                  Timetable
-                </button>
-                <button type="button" class="ghost-button compact" @click="startAssignmentEdit(m)">
-                  <CalendarDays :size="15" />
-                  Schedule
-                </button>
-                <button
-                  v-if="isAdmin && m.id !== currentUser?.id"
-                  type="button"
-                  class="ghost-button compact danger"
-                  :disabled="removingMemberId === m.id"
-                  @click="removeMember(m)"
-                >
-                  <Trash2 :size="15" />
-                  {{ removingMemberId === m.id ? 'Removing…' : 'Remove' }}
-                </button>
-              </div>
-            </div>
-          </div>
-        </article>
-      </section>
-
-      <!-- MEMBERS -->
-      <section v-if="false" class="dashboard-section">
-        <div class="dashboard-section-head">
-          <div>
-            <span class="section-kicker">Access</span>
-            <h3>{{ memberPageLabel }}</h3>
-          </div>
-          <p>Manage access and assignment availability for incoming calls, leads, tickets, and appointments.</p>
-        </div>
-
-        <div class="dashboard-grid control-grid">
-          <article class="dashboard-card invite-card">
-            <div class="compact-card-head">
-              <div class="compact-icon-shell">
-                <UserPlus :size="18" />
-              </div>
-              <div>
-                <h3>Invite {{ memberPageLabel }}</h3>
-                <p>Add admins, managers, or members under the same verified domain.</p>
-              </div>
-            </div>
-            <div class="invite-domain-banner">
-              <span>Allowed Domain</span>
-              <strong>{{ currentOrganization?.email_domain }}</strong>
-            </div>
-            <form class="invite-form dashboard-invite-form" @submit.prevent="inviteMember">
-              <label class="invite-field">
-                <span>Work Email</span>
-                <input v-model="inviteForm.email" type="email" placeholder="name@yourcompany.com" required />
-              </label>
-              <label class="invite-field">
-                <span>Full Name</span>
-                <input v-model="inviteForm.full_name" type="text" placeholder="Full name" />
-              </label>
-              <label class="invite-field">
-                <span>Role</span>
-                <select v-model="inviteForm.role">
-                  <option value="member">Member</option>
-                  <option value="manager">Manager</option>
-                  <option value="viewer">Viewer</option>
-                  <option value="admin">Admin</option>
-                </select>
-              </label>
-              <div class="invite-action-block">
-                <button type="submit" :disabled="isSavingMember || !inviteCanSubmit">
-                  {{ isSavingMember ? 'Inviting...' : 'Send Invite' }}
-                </button>
-                <p :class="['invite-helper', { invalid: !isInviteDomainValid }]">
-                  {{ inviteValidationMessage }}
-                </p>
-              </div>
-            </form>
-          </article>
-
-          <article class="dashboard-card wide-card members-card">
-            <div class="members-card-head">
-              <div>
-                <h3>{{ memberPageLabel }}</h3>
-                <p>Use filter & sort in the top nav to slice this list.</p>
-              </div>
-              <div class="members-summary">
-                <span>{{ filteredMembers.length }} visible</span>
-                <span>{{ members.length }} total</span>
-              </div>
-            </div>
-
-            <div v-if="isLoadingMembers" class="empty-state">Loading members...</div>
-            <div v-else-if="!filteredMembers.length" class="empty-state">No members match the current filter.</div>
-            <div v-else class="member-table dashboard-member-table">
-              <div class="member-row member-head">
-                <span>{{ memberPageLabel }}</span>
-                <span>Role</span>
-                <span>Status</span>
-                <span>Assignment</span>
-              </div>
-              <div v-for="m in filteredMembers" :key="m.id" class="member-row">
-                <div class="member-meta">
-                  <strong>{{ m.full_name || 'Unnamed member' }}</strong>
-                  <small>{{ m.email }}</small>
-                </div>
-                <span class="readonly-tag">{{ m.role }}</span>
-                <span class="readonly-tag">{{ m.status }}</span>
-                <div class="assignment-summary-cell">
-                  <span class="readonly-tag">{{ assignmentForMember(m.id).availability_summary }}</span>
-                  <span class="readonly-tag">Current load: {{ assignmentForMember(m.id).active_request_count || 0 }}</span>
-                  <button type="button" class="ghost-button compact" @click="startAssignmentEdit(m)">Schedule</button>
-                </div>
-              </div>
-            </div>
-          </article>
-        </div>
-      </section>
-
-      <!-- TICKETS -->
-      <section v-if="currentPage === 'tickets'" class="dashboard-section">
-        <div class="dashboard-section-head">
-          <div>
-            <span class="section-kicker">{{ businessTypeLabel }}</span>
-            <h3>{{ ticketsTabLabel }}</h3>
-          </div>
-          <p>Choose the details your team tracks for {{ isRealEstateTemplate ? 'site visits' : 'support requests' }}.</p>
-        </div>
-
-        <div class="dashboard-grid control-grid">
-          <article class="dashboard-card wide-card members-card field-schema-card">
-            <div class="members-card-head">
-              <div>
-                <h3>{{ ticketFieldTitle }}</h3>
-                <p>These fields appear when your team captures or reviews a {{ ticketSingularLabel }}.</p>
-              </div>
-              <div class="field-card-actions">
-                <span class="status-chip">{{ schemaFor('tickets').length }} fields</span>
-                <button type="button" class="ghost-button compact" @click="startFieldEdit('tickets', ticketFieldTitle)">Edit Fields</button>
-              </div>
-            </div>
-            <div class="field-schema-grid">
-              <div
-                v-for="field in schemaFor('tickets')"
-                :key="field.key"
-                class="field-schema-tile"
-                :class="{ required: field.required }"
-              >
-                <div class="field-schema-icon">
-                  <component :is="fieldTypeIcon(field.type)" :size="14" />
-                </div>
-                <div class="field-schema-body">
-                  <strong>{{ field.label }}</strong>
-                  <span class="field-schema-meta">
-                    {{ fieldTypeLabel(field.type) }}<em v-if="field.required"> · required</em>
-                  </span>
-                </div>
-              </div>
-            </div>
-          </article>
-
-        </div>
-
-        <article class="dashboard-card wide-card members-card">
-          <div class="members-card-head">
-            <div>
-              <h3>{{ ticketTitleLabel }} Records</h3>
-              <p>Inbound calls handled by the voice or chat agent appear here as {{ isRealEstateTemplate ? 'site visits' : 'tickets' }}.</p>
-            </div>
-            <div class="field-card-actions">
-              <span class="status-chip">{{ (tabRecords.tickets || []).length }} records</span>
+              <button type="button" class="n-shell-nav__item" :class="{ 'is-active': currentPage === 'tickets' }" @click="switchPage('tickets')">
+                <FileText :size="14" />
+                <span>{{ ticketsTabLabel }}</span>
+              </button>
+              <button type="button" class="n-shell-nav__item" :class="{ 'is-active': currentPage === 'leads' }" @click="switchPage('leads')">
+                <UserPlus :size="14" />
+                <span>Leads</span>
+              </button>
               <button
+                v-if="isRealEstateTemplate"
                 type="button"
-                class="ghost-button compact"
-                :disabled="tabRecordsLoading.tickets"
-                @click="loadTabRecords('tickets')"
+                class="n-shell-nav__item"
+                :class="{ 'is-active': currentPage === 'projects' }"
+                @click="switchPage('projects')"
               >
-                {{ tabRecordsLoading.tickets ? 'Refreshing' : 'Refresh' }}
+                <Layers :size="14" />
+                <span>Projects</span>
               </button>
-            </div>
-          </div>
-
-          <div v-if="tabRecordsLoading.tickets" class="empty-state compact">Loading {{ ticketSingularLabel }} records...</div>
-          <div v-else-if="!(tabRecords.tickets || []).length" class="empty-state compact">
-            No {{ ticketSingularLabel }} records yet.
-          </div>
-          <div v-else class="tab-record-list">
-            <div v-for="record in tabRecords.tickets" :key="record.id" class="tab-record-row">
-              <div class="tab-record-primary">
-                <strong>{{ ticketRecordTitle(record) }}</strong>
-                <small>{{ ticketRecordSubtitle(record) }}</small>
-                <a v-if="phoneHref(recordPhone(record))" class="record-call-link" :href="phoneHref(recordPhone(record))">
-                  <PhoneCall :size="14" />
-                  Call {{ recordPhone(record) }}
-                </a>
-              </div>
-              <div class="tab-record-meta">
-                <div>
-                  <span>Priority</span>
-                  <strong>{{ ticketRecordPriority(record) }}</strong>
-                </div>
-                <div>
-                  <span>Owner</span>
-                  <strong>{{ ticketRecordOwner(record) }}</strong>
-                </div>
-                <div>
-                  <span>Status</span>
-                  <strong>{{ record.status || 'open' }}</strong>
-                </div>
-                <div>
-                  <span>Created</span>
-                  <strong>{{ formatRelativeDate(record.created_at) || 'Unknown' }}</strong>
-                </div>
-              </div>
-            </div>
-          </div>
-        </article>
-      </section>
-
-      <!-- LEADS -->
-      <section v-if="currentPage === 'leads'" class="dashboard-section">
-        <div class="dashboard-section-head">
-          <div>
-            <span class="section-kicker">{{ businessTypeLabel }}</span>
-            <h3>Leads</h3>
-          </div>
-          <p>Choose the details your team needs to qualify new customers.</p>
-        </div>
-
-        <div class="dashboard-grid control-grid">
-          <article class="dashboard-card wide-card members-card field-schema-card">
-            <div class="members-card-head">
-              <div>
-                <h3>Lead Fields</h3>
-                <p>These fields guide customer intake, follow-up, and agent-created leads.</p>
-              </div>
-              <div class="field-card-actions">
-                <span class="status-chip">{{ schemaFor('leads').length }} fields</span>
-                <button type="button" class="ghost-button compact" @click="startFieldEdit('leads', 'Lead Fields')">Edit Fields</button>
-              </div>
-            </div>
-            <div class="field-schema-grid">
-              <div
-                v-for="field in schemaFor('leads')"
-                :key="field.key"
-                class="field-schema-tile"
-                :class="{ required: field.required }"
-              >
-                <div class="field-schema-icon">
-                  <component :is="fieldTypeIcon(field.type)" :size="14" />
-                </div>
-                <div class="field-schema-body">
-                  <strong>{{ field.label }}</strong>
-                  <span class="field-schema-meta">
-                    {{ fieldTypeLabel(field.type) }}<em v-if="field.required"> · required</em>
-                  </span>
-                </div>
-              </div>
-            </div>
-          </article>
-
-        </div>
-
-        <article class="dashboard-card wide-card members-card">
-          <div class="members-card-head">
-            <div>
-              <h3>Lead Records</h3>
-              <p>Outbound campaign calls and any agent-created leads appear here.</p>
-            </div>
-            <div class="field-card-actions">
-              <span class="status-chip">{{ (tabRecords.leads || []).length }} records</span>
               <button
+                v-if="showAppointmentsTab"
                 type="button"
-                class="ghost-button compact"
-                :disabled="tabRecordsLoading.leads"
-                @click="loadTabRecords('leads')"
+                class="n-shell-nav__item"
+                :class="{ 'is-active': currentPage === 'appointments' }"
+                @click="switchPage('appointments')"
               >
-                {{ tabRecordsLoading.leads ? 'Refreshing' : 'Refresh' }}
+                <CalendarDays :size="14" />
+                <span>Appointments</span>
               </button>
-            </div>
-          </div>
 
-          <div v-if="tabRecordsLoading.leads" class="empty-state compact">Loading lead records...</div>
-          <div v-else-if="!(tabRecords.leads || []).length" class="empty-state compact">
-            No lead records yet.
-          </div>
-          <div v-else class="tab-record-list">
-            <div v-for="record in tabRecords.leads" :key="record.id" class="tab-record-row">
-              <div class="tab-record-primary">
-                <strong>{{ leadRecordTitle(record) }}</strong>
-                <small>{{ leadRecordSubtitle(record) }}</small>
-                <a v-if="phoneHref(recordPhone(record))" class="record-call-link" :href="phoneHref(recordPhone(record))">
-                  <PhoneCall :size="14" />
-                  Call {{ recordPhone(record) }}
-                </a>
-              </div>
-              <div class="tab-record-meta">
-                <div>
-                  <span>Budget</span>
-                  <strong>{{ leadRecordBudget(record) }}</strong>
-                </div>
-                <div>
-                  <span>Location</span>
-                  <strong>{{ leadRecordLocation(record) }}</strong>
-                </div>
-                <div>
-                  <span>Status</span>
-                  <strong>{{ record.status || 'new' }}</strong>
-                </div>
-                <div>
-                  <span>Created</span>
-                  <strong>{{ formatRelativeDate(record.created_at) || 'Unknown' }}</strong>
-                </div>
-              </div>
-            </div>
-          </div>
-        </article>
-      </section>
+              <span class="n-shell-nav__divider" aria-hidden="true"></span>
 
-      <!-- APPOINTMENTS -->
-      <section v-if="currentPage === 'appointments' && showAppointmentsTab" class="dashboard-section">
-        <div class="dashboard-section-head">
-          <div>
-            <span class="section-kicker">Clinics</span>
-            <h3>Appointments</h3>
-          </div>
-          <p>Choose the details needed to book and follow up on visits.</p>
-        </div>
-
-        <article class="dashboard-card wide-card members-card">
-          <div class="members-card-head">
-            <div>
-              <h3>Appointment Fields</h3>
-              <p>Clinic agents use these fields for scheduling and appointment follow-up.</p>
-            </div>
-            <div class="field-card-actions">
-              <span class="status-chip">{{ schemaFor('appointments').length }} fields</span>
-              <button type="button" class="ghost-button compact" @click="startFieldEdit('appointments', 'Appointment Fields')">Edit Fields</button>
-            </div>
-          </div>
-          <div class="schema-field-grid">
-            <div v-for="field in schemaFor('appointments')" :key="field.key" class="schema-field-row">
-              <strong>{{ field.label }}</strong>
-              <span>{{ field.type }}{{ field.required ? ' · required' : '' }}</span>
-            </div>
-          </div>
-        </article>
-
-        <article class="dashboard-card wide-card members-card">
-          <div class="members-card-head">
-            <div>
-              <h3>Appointment Records</h3>
-              <p>Requests created by the voice agent, chat agent, or team tools appear here.</p>
-            </div>
-            <div class="field-card-actions">
-              <span class="status-chip">{{ (tabRecords.appointments || []).length }} records</span>
-              <button
-                type="button"
-                class="ghost-button compact"
-                :disabled="tabRecordsLoading.appointments"
-                @click="loadTabRecords('appointments')"
-              >
-                {{ tabRecordsLoading.appointments ? 'Refreshing' : 'Refresh' }}
+              <!-- Agents group -->
+              <button type="button" class="n-shell-nav__item" :class="{ 'is-active': currentPage === 'agent' }" @click="switchPage('agent')">
+                <Bot :size="14" />
+                <span>Inbound</span>
               </button>
-            </div>
-          </div>
-
-          <div v-if="tabRecordsLoading.appointments" class="empty-state compact">Loading appointment records...</div>
-          <div v-else-if="!(tabRecords.appointments || []).length" class="empty-state compact">
-            No appointment records yet.
-          </div>
-          <div v-else class="tab-record-list appointment-record-list">
-            <div v-for="record in tabRecords.appointments" :key="record.id" class="tab-record-row">
-              <div class="tab-record-primary">
-                <strong>{{ appointmentRecordTitle(record) }}</strong>
-                <small>{{ appointmentRecordSubtitle(record) }}</small>
-                <a v-if="phoneHref(recordPhone(record))" class="record-call-link" :href="phoneHref(recordPhone(record))">
-                  <PhoneCall :size="14" />
-                  Call {{ recordPhone(record) }}
-                </a>
-              </div>
-              <div class="tab-record-meta">
-                <div>
-                  <span>Requested Slot</span>
-                  <strong>{{ appointmentRecordTime(record) }}</strong>
-                </div>
-                <div>
-                  <span>Assigned To</span>
-                  <strong>{{ appointmentAssignedLabel(record) }}</strong>
-                </div>
-                <div>
-                  <span>Status</span>
-                  <strong>{{ record.status || 'requested' }}</strong>
-                </div>
-                <div>
-                  <span>Created</span>
-                  <strong>{{ formatRelativeDate(record.created_at) || 'Unknown' }}</strong>
-                </div>
-              </div>
-            </div>
-          </div>
-        </article>
-
-        <article class="dashboard-card agent-documents-card">
-          <div class="members-card-head">
-            <div>
-              <h3>Custom Tabs</h3>
-              <p>
-                Define org-specific resource tabs (e.g. Deliveries, Properties) — agents
-                automatically get 8 CRUD tools per tab.
-              </p>
-            </div>
-            <span class="status-chip">{{ customTabs.length }} / 8</span>
-          </div>
-
-          <div class="custom-tab-list">
-            <div v-if="!customTabs.length" class="empty-state compact">
-              No custom tabs yet. Add one below to extend your agent's toolset.
-            </div>
-            <div v-for="tab in customTabs" :key="tab.slug" class="custom-tab-row">
-              <div>
-                <strong>{{ tab.label }}</strong>
-                <small>slug: <code>{{ tab.slug }}</code> · {{ (tab.fields || []).length }} fields</small>
-                <small>statuses: {{ ((tab.status_vocabulary || {}).all || []).join(', ') }}</small>
-              </div>
-              <button
-                type="button"
-                class="ghost-button compact danger"
-                :disabled="customTabActionInProgress"
-                @click="deleteCustomTab(tab.slug)"
-              >
-                Remove
+              <button type="button" class="n-shell-nav__item" :class="{ 'is-active': currentPage === 'outgoing_agent' }" @click="switchPage('outgoing_agent')">
+                <PhoneCall :size="14" />
+                <span>Outbound</span>
               </button>
-            </div>
-          </div>
-
-          <div class="db-form-block custom-tab-form">
-            <label class="db-label">Add custom tab</label>
-            <div class="custom-tab-form-row">
-              <input
-                v-model="newCustomTab.label"
-                class="db-input"
-                type="text"
-                placeholder="Label (e.g. Deliveries)"
-              />
-              <input
-                v-model="newCustomTab.slug"
-                class="db-input"
-                type="text"
-                placeholder="Slug (e.g. deliveries)"
-              />
-            </div>
-            <div class="custom-tab-form-row">
-              <input
-                v-model="newCustomTab.statusList"
-                class="db-input"
-                type="text"
-                placeholder="Statuses (comma-separated, e.g. pending,in_transit,delivered)"
-              />
-            </div>
-            <div class="custom-tab-fields">
-              <div
-                v-for="(field, idx) in newCustomTab.fields"
-                :key="`cf-${idx}`"
-                class="custom-tab-field-row"
-              >
-                <input v-model="field.key" class="db-input compact" placeholder="key" />
-                <input v-model="field.label" class="db-input compact" placeholder="label" />
-                <select v-model="field.type" class="db-input compact">
-                  <option value="text">text</option>
-                  <option value="textarea">textarea</option>
-                  <option value="phone">phone</option>
-                  <option value="email">email</option>
-                  <option value="number">number</option>
-                  <option value="currency">currency</option>
-                  <option value="date">date</option>
-                  <option value="datetime">datetime</option>
-                  <option value="select">select</option>
-                </select>
-                <label class="custom-tab-required-toggle">
-                  <input type="checkbox" v-model="field.required" />
-                  required
-                </label>
-                <button
-                  type="button"
-                  class="link-button"
-                  @click="removeCustomTabField(idx)"
-                  :disabled="newCustomTab.fields.length <= 1"
-                >
-                  Remove
-                </button>
-              </div>
-              <button type="button" class="link-button" @click="addCustomTabField">
-                + Add field
+              <button type="button" class="n-shell-nav__item" :class="{ 'is-active': currentPage === 'knowledge_base' }" @click="switchPage('knowledge_base')">
+                <BookOpen :size="14" />
+                <span>Knowledge</span>
               </button>
-            </div>
-            <div class="db-actions">
-              <button
-                type="button"
-                class="primary-button compact"
-                :disabled="customTabActionInProgress || !newCustomTab.label || !newCustomTab.slug"
-                @click="submitCustomTab"
-              >
-                Create tab
-              </button>
-            </div>
-          </div>
-        </article>
-      </section>
+            </template>
+          </nav>
 
-      <!-- PROJECTS (real-estate only) -->
-      <section v-if="currentPage === 'projects'" class="dashboard-section projects-section">
-        <div class="dashboard-section-head">
-          <div>
-            <span class="section-kicker">Real-estate inventory</span>
-            <h3>Projects</h3>
-          </div>
-          <p>The inbound agent uses these projects when answering callers and when creating leads or site visits.</p>
-        </div>
+          <span class="n-shell-dock__rule" aria-hidden="true"></span>
 
-        <div class="projects-layout">
-          <article class="dashboard-card projects-form-card">
-            <div class="dashboard-card-glow"></div>
-            <div class="compact-card-head">
-              <div class="compact-icon-shell">
-                <Layers :size="18" />
-              </div>
-              <div>
-                <h3>{{ projectDraft.id ? 'Edit project' : 'Add a project' }}</h3>
-                <p>Capture name, RERA, price, configurations, and amenities so the agent can pitch confidently.</p>
-              </div>
-            </div>
-
-            <form class="projects-form" @submit.prevent="saveProject">
-              <div class="re-form-row">
-                <label>
-                  <span>Name *</span>
-                  <input v-model="projectDraft.name" type="text" placeholder="Skyline Heights" required />
-                </label>
-                <label>
-                  <span>Location</span>
-                  <input v-model="projectDraft.location" type="text" placeholder="HSR Layout, Bangalore" />
-                </label>
-              </div>
-              <div class="re-form-row">
-                <label>
-                  <span>Property type</span>
-                  <input v-model="projectDraft.property_type" type="text" placeholder="Apartments / Villas / Plots" />
-                </label>
-                <label>
-                  <span>RERA number</span>
-                  <input v-model="projectDraft.rera_number" type="text" placeholder="PRM/KA/RERA/1251/..." />
-                </label>
-              </div>
-              <div class="re-form-row">
-                <label>
-                  <span>Price (min)</span>
-                  <input v-model="projectDraft.price_min" type="number" min="0" step="1" />
-                </label>
-                <label>
-                  <span>Price (max)</span>
-                  <input v-model="projectDraft.price_max" type="number" min="0" step="1" />
-                </label>
-                <label>
-                  <span>Price label</span>
-                  <input v-model="projectDraft.price_display" type="text" placeholder="₹95L – ₹1.45Cr" />
-                </label>
-              </div>
-              <div class="re-form-row">
-                <label>
-                  <span>Configurations</span>
-                  <input v-model="projectDraft.configurations" type="text" placeholder="2 BHK, 3 BHK" />
-                </label>
-                <label>
-                  <span>Possession</span>
-                  <input v-model="projectDraft.possession_date" type="text" placeholder="Dec 2027" />
-                </label>
-              </div>
-              <label class="re-form-fullwidth">
-                <span>Amenities</span>
-                <textarea v-model="projectDraft.amenities" rows="2" placeholder="Pool, Clubhouse, EV charging"></textarea>
-              </label>
-              <label class="re-form-fullwidth">
-                <span>Description</span>
-                <textarea v-model="projectDraft.description" rows="4" placeholder="Premium gated community..."></textarea>
-              </label>
-              <div class="re-form-row">
-                <label>
-                  <span>Builder</span>
-                  <input v-model="projectDraft.builder_name" type="text" />
-                </label>
-                <label>
-                  <span>Brochure URL</span>
-                  <input v-model="projectDraft.brochure_url" type="url" placeholder="https://..." />
-                </label>
-                <label>
-                  <span>Site contact</span>
-                  <input v-model="projectDraft.contact_phone" type="tel" />
-                </label>
-              </div>
-
-              <div class="mfa-actions">
-                <button v-if="projectDraft.id" type="button" class="ghost-button" :disabled="isSavingProject" @click="startNewProject">Cancel edit</button>
-                <button type="submit" class="primary-button" :disabled="isSavingProject">
-                  {{ isSavingProject ? 'Saving…' : (projectDraft.id ? 'Update project' : 'Add project') }}
-                </button>
-              </div>
-            </form>
-          </article>
-
-          <article class="dashboard-card projects-list-card">
-            <div class="dashboard-card-glow"></div>
-            <div class="compact-card-head">
-              <div class="compact-icon-shell">
-                <Database :size="18" />
-              </div>
-              <div>
-                <h3>Current projects ({{ projects.length }})</h3>
-                <p>Click "Edit" to load a project into the form. Removal is permanent.</p>
-              </div>
-            </div>
-
-            <p v-if="isLoadingProjects" class="login-help compact">Loading…</p>
-            <p v-else-if="!projects.length" class="login-help compact">No projects yet — add your first one to teach the agent your inventory.</p>
-            <ul v-else class="projects-list">
-              <li v-for="project in projects" :key="project.id" class="projects-list-item">
-                <div class="projects-list-body">
-                  <strong>{{ project.name }}</strong>
-                  <small v-if="project.location">📍 {{ project.location }}</small>
-                  <small v-if="project.price_display">💰 {{ project.price_display }}</small>
-                  <small v-if="project.rera_number">RERA: {{ project.rera_number }}</small>
-                  <small v-if="project.property_type">🏢 {{ project.property_type }}</small>
-                  <small v-if="(project.configurations || []).length">{{ project.configurations.join(', ') }}</small>
-                </div>
-                <div class="projects-list-actions">
-                  <button type="button" class="ghost-button compact" @click="startEditProject(project)">Edit</button>
-                  <button type="button" class="ghost-button compact danger" :disabled="isDeletingProjectId === project.id" @click="deleteProject(project)">
-                    {{ isDeletingProjectId === project.id ? 'Removing…' : 'Remove' }}
-                  </button>
-                </div>
-              </li>
-            </ul>
-          </article>
-        </div>
-      </section>
-
-      <!-- INBOUND AGENT -->
-      <section v-if="currentPage === 'agent'" class="dashboard-section agent-studio-section">
-        <div class="agent-hero">
-          <div class="agent-hero-copy">
-            <span class="section-kicker">Inbound Agent</span>
-            <h3>{{ profileAgent?.name || 'Your inbound agent' }}</h3>
-            <p v-if="profileAgent?.description">{{ profileAgent.description }}</p>
-            <p v-else>Build, test, and run your inbound voice agent — STT → retrieval → LLM → TTS on your tenant-isolated infra.</p>
-            <div v-if="profileAgent" class="agent-rename-row agent-hero-rename">
-              <input
-                id="agent-rename"
-                v-model="renameDraft"
-                class="db-input"
-                type="text"
-                placeholder="Agent name"
-                @keyup.enter="renameAgent"
-              />
-              <button
-                type="button"
-                class="primary-button compact"
-                :disabled="isRenamingAgent || !renameDraft.trim() || renameDraft.trim() === profileAgent.name"
-                @click="renameAgent"
-              >
-                <CheckCircle2 :size="15" />
-                {{ isRenamingAgent ? 'Saving…' : 'Rename' }}
-              </button>
-            </div>
-          </div>
-          <div class="agent-pipeline-grid">
-            <div class="pipeline-chip">
-              <Mic :size="16" />
-              <div>
-                <span>STT</span>
-                <strong>{{ runtimeStatus?.stt?.model || 'Sarvam saaras:v3' }}</strong>
-                <small :class="`chip-status-${runtimeStatus?.stt?.status || 'unknown'}`">
-                  {{ runtimeStatus?.stt?.status || 'unknown' }}
-                </small>
-              </div>
-            </div>
-            <div class="pipeline-chip">
-              <Brain :size="16" />
-              <div>
-                <span>LLM</span>
-                <strong>{{ runtimeStatus?.llm?.model || 'gpt-4.1-mini' }}</strong>
-                <small>South India</small>
-              </div>
-            </div>
-            <div class="pipeline-chip">
-              <Volume2 :size="16" />
-              <div>
-                <span>TTS</span>
-                <strong>{{ runtimeStatus?.tts?.model || 'Sarvam bulbul:v3' }}</strong>
-                <small :class="`chip-status-${runtimeStatus?.tts?.status || 'unknown'}`">
-                  {{ runtimeStatus?.tts?.status || 'unknown' }}
-                </small>
-              </div>
-            </div>
-            <div class="pipeline-chip">
-              <Layers :size="16" />
-              <div>
-                <span>Embeddings</span>
-                <strong>text-embedding-3-small</strong>
-                <small>1536-dim · cosine</small>
-              </div>
-            </div>
-            <div class="pipeline-chip">
-              <Database :size="16" />
-              <div>
-                <span>Vector store</span>
-                <strong>Qdrant</strong>
-                <small>{{ runtimeStatus?.knowledge_scope?.replace(/_/g, ' ') || 'tenant collection' }}</small>
-              </div>
-            </div>
-            <div class="pipeline-chip">
-              <Activity :size="16" />
-              <div>
-                <span>Cache</span>
-                <strong>{{ runtimeStatus?.optimization?.semantic_cache_enabled ? 'Redis on' : 'off' }}</strong>
-                <small>top-k {{ runtimeStatus?.optimization?.qdrant_top_k || 3 }}</small>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <div v-if="currentOrganization?.status === 'pending_approval'" class="message info dashboard-message">
-          Your organization is awaiting Nokvo activation. Voice testing and agent CRUD work today; outbound
-          calling unlocks after approval.
-        </div>
-
-        <!-- VOICE TESTER -->
-        <article class="dashboard-card voice-tester-card">
-          <div class="kb-card-head">
-            <div class="kb-card-icon kb-card-icon-primary">
-              <Mic :size="18" />
-            </div>
-            <div>
-              <h4>Voice Tester</h4>
-              <p>Talk to your agent live in the browser. Audio → Sarvam STT → RAG → LLM → Sarvam TTS, full pipeline.</p>
-            </div>
-            <div class="voice-status-badge" :class="`voice-status-${voice.status}`">
-              <span class="voice-status-dot"></span>
-              {{ voice.status }}
-            </div>
-            <div v-if="voice.callStartedAt" class="voice-cost-meter" title="Live call cost (₹8/min)">
-              <Wallet :size="13" />
-              <strong>₹{{ liveCostRupees }}</strong>
-              <span>{{ liveCostDuration }}</span>
-            </div>
-          </div>
-
-          <div class="voice-controls">
-            <select v-model="voice.language" :disabled="voice.status !== 'idle' && voice.status !== 'error'">
-              <option v-for="opt in voiceLanguageOptions" :key="opt.value" :value="opt.value">
-                {{ opt.label }}
-              </option>
-            </select>
-            <button
-              v-if="voice.status === 'idle' || voice.status === 'error'"
-              type="button"
-              class="primary-button compact"
-              @click="startVoiceCall"
-            >
-              <PhoneCall :size="15" />
-              Start Call
-            </button>
-            <button
-              v-else
-              type="button"
-              class="ghost-button compact"
-              @click="endVoiceCall"
-            >
-              <Square :size="15" />
-              End Call
-            </button>
+          <div class="n-shell-foot">
             <button
               type="button"
-              class="ghost-button compact"
-              :disabled="!voice.ws"
-              @click="sendTextToVoiceAgent"
-              title="Send a text-only query through the same pipeline"
+              class="n-shell-icon-btn"
+              @click="toggleThemeMode"
+              :aria-label="themeToggleLabel"
+              :title="themeToggleLabel"
             >
-              <MessageSquare :size="15" />
-              Send Text Turn
+              <SunMedium v-if="themeMode === 'dark'" :size="15" />
+              <Moon v-else :size="15" />
             </button>
-            <input
-              v-if="voice.ws"
-              v-model="chatInput"
-              type="text"
-              class="voice-text-input"
-              placeholder="Type a query to send through the pipeline"
-              @keyup.enter="sendTextToVoiceAgent"
-            />
-          </div>
 
-          <div v-if="voice.errorMsg" class="message error dashboard-message">{{ voice.errorMsg }}</div>
-
-          <div class="voice-live-row" v-if="voice.liveTranscript">
-            <Radio :size="14" />
-            <em>{{ voice.liveTranscript }}</em>
-            <span v-if="voice.transcriptLang" class="kb-pill kb-pill-soft">{{ voice.transcriptLang }}</span>
-          </div>
-
-          <div class="voice-latency-row" v-if="voice.firstSentenceMs || voice.ttsFirstAudioMs">
-            <span v-if="voice.firstSentenceMs">LLM first sentence: <strong>{{ voice.firstSentenceMs }}ms</strong></span>
-            <span v-if="voice.ttsFirstAudioMs">TTS first audio: <strong>{{ voice.ttsFirstAudioMs }}ms</strong></span>
-            <span v-if="voice.callId">call: <code>{{ voice.callId.slice(0, 8) }}</code></span>
-          </div>
-
-          <div v-if="!voice.turns.length && voice.status === 'idle'" class="kb-empty voice-empty">
-            <div class="kb-empty-icon">
-              <Mic :size="24" />
-            </div>
-            <strong>Start a call to test the pipeline.</strong>
-            <span>Choose a language, hit Start Call, allow mic access, and speak. Audio plays back in real time.</span>
-          </div>
-
-          <div v-if="voice.turns.length" class="voice-transcript">
-            <div v-for="turn in voice.turns" :key="turn.id" class="voice-turn">
-              <div class="voice-turn-user">
-                <span class="kb-pill kb-pill-type">caller</span>
-                <p>{{ turn.query }}</p>
-              </div>
-              <div class="voice-turn-agent">
-                <span class="kb-pill kb-pill-status-approved">agent</span>
-                <p>{{ turn.sentences.join(' ') || turn.answer || '…' }}</p>
-                <div class="voice-turn-meta">
-                  <span v-if="turn.latencyMs">first sentence {{ turn.latencyMs }}ms</span>
-                  <span v-if="turn.cacheHit" class="kb-pill kb-pill-soft">cache hit</span>
-                  <span v-if="turn.citations.length" class="kb-pill kb-pill-soft">{{ turn.citations.length }} citation{{ turn.citations.length === 1 ? '' : 's' }}</span>
-                </div>
-              </div>
-            </div>
-          </div>
-        </article>
-
-        <!-- PHONE LINK -->
-        <article class="dashboard-card phone-link-card">
-          <div class="kb-card-head">
-            <div class="kb-card-icon">
-              <PhoneCall :size="18" />
-            </div>
-            <div>
-              <h4>Exotel Phone Link</h4>
-              <p>Set a stable link ID, then configure the URLs below in your Exotel portal under the inbound number.</p>
-            </div>
-          </div>
-
-          <div class="kb-form-grid">
-            <label class="kb-field kb-field-wide">
-              <span>Link ID (any unique string)</span>
-              <input v-model="phoneLinkInput" type="text" placeholder="acme-india-line-1" :disabled="!isAdmin" />
-            </label>
-          </div>
-
-          <div class="kb-card-actions" v-if="isAdmin">
-            <button type="button" class="primary-button compact" :disabled="isSavingPhoneLink" @click="savePhoneLink">
-              <CheckCircle2 :size="15" />
-              {{ isSavingPhoneLink ? 'Saving…' : 'Save Link' }}
-            </button>
-            <span class="kb-card-hint" v-if="phoneLink?.status === 'linked'">linked · {{ phoneLink.link_id }}</span>
-            <span class="kb-card-hint" v-else>not linked yet</span>
-          </div>
-
-          <div v-if="phoneLink?.exotel_webhook_url" class="phone-link-urls">
-            <div class="phone-link-url-row">
-              <span>Inbound webhook (HTTP POST)</span>
-              <code>{{ phoneLink.exotel_webhook_url }}</code>
-            </div>
-            <div class="phone-link-url-row">
-              <span>Inbound media stream (WSS)</span>
-              <code>{{ phoneLink.exotel_media_url }}</code>
-            </div>
-          </div>
-        </article>
-
-        <div class="dashboard-grid agent-page-grid">
-          <article v-if="!onboardingV2Enabled" class="dashboard-card agent-upload-card">
-            <div class="compact-card-head">
-              <div class="compact-icon-shell">
-                <Bot :size="18" />
-              </div>
-              <div>
-                <h3>Create Agent</h3>
-                <p>Pick from the safe predefined tool catalog. No MCP toolkit generator on Nokvo One.</p>
-              </div>
-            </div>
-
-            <div class="db-form-block">
-              <label class="db-label" for="agent-name">Agent Name</label>
-              <input id="agent-name" v-model="newAgent.name" class="db-input" type="text" placeholder="Sales Sidekick" />
-            </div>
-
-            <div class="db-form-block">
-              <label class="db-label" for="agent-description">Description</label>
-              <input id="agent-description" v-model="newAgent.description" class="db-input" type="text" placeholder="One-line purpose" />
-            </div>
-
-            <div class="db-form-block">
-              <label class="db-label" for="agent-prompt">System Prompt</label>
-              <textarea id="agent-prompt" v-model="newAgent.system_prompt" class="db-input toolkit-textarea" :placeholder="businessPromptPlaceholder"></textarea>
-              <p class="form-hint">Global Nokvo rules and {{ businessTypeLabel }} template rules are injected by the backend at runtime.</p>
-            </div>
-
-            <div class="db-form-block">
-              <div class="agent-tools-head">
-                <label class="db-label">Enabled Tools</label>
-                <button
-                  type="button"
-                  class="link-button"
-                  :disabled="!toolCatalogDefaults.length"
-                  @click="selectDefaultAgentTools"
-                >
-                  Reset to recommended
-                </button>
-              </div>
-              <p class="form-hint">
-                Tools are generated from your {{ businessTypeLabel }} tab schema. Adjust a tab's fields under
-                Workspace → Business Type to change tool inputs.
-              </p>
-              <div v-if="!toolCatalogGroups.length" class="empty-state compact">
-                No tools available yet. Pick a Business Type to populate the catalog.
-              </div>
-              <div
-                v-for="group in toolCatalogGroups"
-                :key="group.label"
-                class="agent-tool-group"
-              >
-                <div class="agent-tool-group-head">
-                  <strong>{{ group.label }}</strong>
-                  <span class="status-chip">{{ group.tools.length }} tools</span>
-                  <button
-                    type="button"
-                    class="link-button"
-                    @click="toggleAgentToolGroup(group)"
-                  >
-                    {{ isAgentToolGroupAllOn(group) ? 'Deselect all' : 'Select all' }}
-                  </button>
-                </div>
-                <div class="provider-grid provider-grid-dual">
-                  <label
-                    v-for="t in group.tools"
-                    :key="t.key"
-                    class="provider-option"
-                    :class="{ active: newAgent.tool_keys.includes(t.key) }"
-                  >
-                    <input
-                      type="checkbox"
-                      class="sr-only"
-                      :checked="newAgent.tool_keys.includes(t.key)"
-                      @change="toggleAgentTool(t.key)"
-                    />
-                    <strong class="provider-name">{{ t.display_name }}</strong>
-                    <small>{{ t.description }}</small>
-                    <small v-if="t.requires_confirmation" class="agent-warning">Requires human confirmation</small>
-                  </label>
-                </div>
-              </div>
-            </div>
-
-            <div class="db-actions">
-              <button type="button" class="primary-button" @click="createAgent">
-                <CheckCircle2 :size="16" />
-                Create Agent
-              </button>
-            </div>
-          </article>
-
-          <article v-if="!onboardingV2Enabled" class="dashboard-card agent-documents-card">
-            <div class="members-card-head">
-              <div>
-                <h3>Agents</h3>
-                <p>Pick an agent to test in the chat console below.</p>
-              </div>
-              <span class="status-chip">{{ agents.length }} agents</span>
-            </div>
-
-            <div class="agent-document-list">
-              <div v-if="!agents.length" class="empty-state compact">No agents yet. Create one to start testing.</div>
-              <button
-                v-for="a in agents"
-                :key="a.id"
-                type="button"
-                class="agent-document-row toolkit-list-row"
-                :class="{ active: activeAgent?.id === a.id }"
-                @click="activeAgent = a; chatLog = []"
-              >
-                <div class="agent-document-main">
-                  <div class="agent-document-icon">
-                    <Bot :size="18" />
-                  </div>
-                  <div>
-                    <strong>{{ a.name }}</strong>
-                    <small>{{ (a.tool_keys || []).length }} tool(s) · {{ a.description || 'No description' }}</small>
-                  </div>
-                </div>
-                <span class="status-chip">{{ activeAgent?.id === a.id ? 'Active' : 'Idle' }}</span>
-              </button>
-            </div>
-          </article>
-
-          <article class="dashboard-card wide-card agent-test-card">
-            <div class="members-card-head">
-              <div>
-                <h3>Chat Tester</h3>
-                <p>Talk to {{ activeAgent?.name || 'an agent' }}. Tool calls are sandboxed and audited.</p>
-              </div>
-              <span class="status-chip">{{ activeAgent ? activeAgent.name : 'No agent selected' }}</span>
-            </div>
-
-            <div class="agent-console-grid">
-              <div class="db-form-block">
-                <label class="db-label" for="chat-input">Message</label>
-                <textarea id="chat-input" v-model="chatInput" class="db-input toolkit-textarea compact" placeholder="Ask the agent..."></textarea>
-                <div class="db-actions">
-                  <button type="button" class="ghost-button" :disabled="!activeAgent" @click="chatLog = []">Clear</button>
-                  <button type="button" class="primary-button" :disabled="!activeAgent || !chatInput.trim()" @click="sendChat">
-                    <MessageSquare :size="16" />
-                    Send
-                  </button>
-                </div>
-              </div>
-
-              <div class="agent-console-results">
-                <div class="agent-result-panel">
-                  <strong>Conversation</strong>
-                  <p v-if="!chatLog.length">Pick an agent and send a message to start.</p>
-                  <div v-else class="agent-event-list">
-                    <div
-                      v-for="(turn, i) in chatLog"
-                      :key="i"
-                      class="agent-event-row"
-                      :class="{
-                        'event-transcript': turn.role === 'user',
-                        'event-answer': turn.role === 'agent',
-                        'event-error': turn.role === 'system',
-                      }"
-                    >
-                      <span>{{ turn.role }}</span>
-                      <p>{{ turn.text }}</p>
-                      <p v-if="turn.tool_calls?.length" class="event-detail">
-                        Tool calls:
-                        <span v-for="(tc, idx) in turn.tool_calls" :key="idx">
-                          {{ tc.tool }}{{ tc.ok === false ? ` (error: ${tc.error})` : '' }}{{ idx < turn.tool_calls.length - 1 ? ', ' : '' }}
-                        </span>
-                      </p>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <div class="agent-voice-panel">
-              <div class="members-card-head">
-                <div>
-                  <h3>Email Drafts</h3>
-                  <p>Drafts created by the agent stay queued until a human confirms or discards them. Nokvo One never sends email automatically.</p>
-                </div>
-                <button type="button" class="ghost-button compact" @click="loadEmailDrafts">Refresh</button>
-              </div>
-
-              <div class="agent-document-list">
-                <div v-if="!emailDrafts.length" class="empty-state compact">No drafts yet. They appear here when the agent calls send_email_draft.</div>
-                <div v-for="d in emailDrafts" :key="d.id" class="agent-document-row">
-                  <div class="agent-document-main">
-                    <div class="agent-document-icon">
-                      <Bot :size="18" />
-                    </div>
-                    <div>
-                      <strong>{{ d.data?.subject }}</strong>
-                      <small>to {{ d.data?.to_email }} · {{ d.status }}</small>
-                      <p class="agent-warning">{{ d.data?.body }}</p>
-                    </div>
-                  </div>
-                  <div class="agent-document-actions">
-                    <span class="status-chip">{{ d.status }}</span>
-                    <button
-                      v-if="d.status === 'pending_confirmation'"
-                      type="button"
-                      class="ghost-button compact"
-                      @click="discardDraft(d.id)"
-                    >
-                      <XCircle :size="15" />
-                      Discard
-                    </button>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </article>
-        </div>
-      </section>
-
-      <!-- OUTGOING AGENT -->
-      <section v-if="currentPage === 'outgoing_agent'" class="dashboard-section outgoing-agent-section">
-        <div class="dashboard-section-head">
-          <div>
-            <span class="section-kicker">Outgoing Agent</span>
-          </div>
-          <button type="button" class="dashboard-inline-button" :disabled="isLoadingLeadSources" @click="loadOutgoingAgentWorkspace">
-            <Search :size="16" />
-            Refresh
-          </button>
-        </div>
-
-        <!-- Connections (always visible, no longer a tab) -->
-        <div class="dashboard-grid agent-page-grid outgoing-connections-pinned">
-          <article class="dashboard-card">
-            <div class="members-card-head">
-              <div>
-                <h3>Ad &amp; form connections</h3>
-                <p>OAuth connects source systems. Imported leads still need consent fields or form-level call consent before campaigns can use them.</p>
-              </div>
-            </div>
-            <div class="outgoing-provider-stack">
+            <div v-if="!isMemberOnly" class="n-shell-bell">
               <button
                 type="button"
-                class="provider-icon-tile"
-                aria-label="Connect Facebook Ads"
-                title="Facebook Ads"
-                @click="requestLeadOAuth('meta_ads', 'facebook_ads')"
+                class="n-shell-icon-btn n-shell-bell__trigger"
+                :class="{ 'is-active': isNotificationsOpen, 'has-unread': unreadCount > 0 }"
+                @click="openNotifications"
+                aria-label="Notifications"
+                title="Notifications"
               >
-                <svg viewBox="0 0 24 24" width="28" height="28" fill="#1877F2" aria-hidden="true">
-                  <path d="M22 12.07C22 6.51 17.52 2 12 2S2 6.51 2 12.07c0 5.02 3.66 9.18 8.44 9.93v-7.02H7.9v-2.91h2.54V9.86c0-2.51 1.49-3.9 3.77-3.9 1.09 0 2.24.2 2.24.2v2.47h-1.26c-1.24 0-1.63.77-1.63 1.56v1.88h2.77l-.44 2.91h-2.33V22c4.78-.75 8.44-4.91 8.44-9.93z"/>
-                </svg>
-                <span class="provider-icon-label">Facebook Ads</span>
-              </button>
-              <button
-                type="button"
-                class="provider-icon-tile"
-                aria-label="Connect Instagram Ads"
-                title="Instagram Ads"
-                @click="requestLeadOAuth('meta_ads', 'instagram_ads')"
-              >
-                <svg viewBox="0 0 24 24" width="28" height="28" aria-hidden="true">
-                  <defs>
-                    <linearGradient id="igGradient" x1="0%" y1="100%" x2="100%" y2="0%">
-                      <stop offset="0%" stop-color="#FED576"/>
-                      <stop offset="30%" stop-color="#F47133"/>
-                      <stop offset="60%" stop-color="#BC3081"/>
-                      <stop offset="100%" stop-color="#4C63D2"/>
-                    </linearGradient>
-                  </defs>
-                  <path
-                    fill="url(#igGradient)"
-                    d="M12 2.16c3.2 0 3.58.012 4.85.07 1.17.054 1.8.25 2.23.41.56.22.96.48 1.38.9.42.42.68.82.9 1.38.16.42.36 1.06.41 2.23.058 1.27.07 1.64.07 4.85s-.012 3.58-.07 4.85c-.054 1.17-.25 1.8-.41 2.23-.22.56-.48.96-.9 1.38-.42.42-.82.68-1.38.9-.42.16-1.06.36-2.23.41-1.27.058-1.64.07-4.85.07s-3.58-.012-4.85-.07c-1.17-.054-1.8-.25-2.23-.41a3.75 3.75 0 0 1-1.38-.9 3.75 3.75 0 0 1-.9-1.38c-.16-.42-.36-1.06-.41-2.23C2.172 15.58 2.16 15.2 2.16 12s.012-3.58.07-4.85c.054-1.17.25-1.8.41-2.23.22-.56.48-.96.9-1.38.42-.42.82-.68 1.38-.9.42-.16 1.06-.36 2.23-.41C8.42 2.172 8.8 2.16 12 2.16M12 0C8.74 0 8.33.014 7.05.072 5.78.13 4.9.336 4.14.63a5.92 5.92 0 0 0-2.14 1.39A5.92 5.92 0 0 0 .63 4.14C.336 4.9.13 5.78.072 7.05.014 8.33 0 8.74 0 12s.014 3.67.072 4.95c.058 1.27.264 2.15.558 2.91.3.79.71 1.46 1.39 2.14.68.68 1.35 1.09 2.14 1.39.76.294 1.64.5 2.91.558C8.33 23.986 8.74 24 12 24s3.67-.014 4.95-.072c1.27-.058 2.15-.264 2.91-.558a5.92 5.92 0 0 0 2.14-1.39 5.92 5.92 0 0 0 1.39-2.14c.294-.76.5-1.64.558-2.91.058-1.28.072-1.69.072-4.95s-.014-3.67-.072-4.95c-.058-1.27-.264-2.15-.558-2.91a5.92 5.92 0 0 0-1.39-2.14A5.92 5.92 0 0 0 19.86.63C19.1.336 18.22.13 16.95.072 15.67.014 15.26 0 12 0z"
-                  />
-                  <path fill="url(#igGradient)" d="M12 5.84A6.16 6.16 0 1 0 12 18.16 6.16 6.16 0 0 0 12 5.84zm0 10.16A4 4 0 1 1 12 8a4 4 0 0 1 0 8z"/>
-                  <circle fill="url(#igGradient)" cx="18.41" cy="5.59" r="1.44"/>
-                </svg>
-                <span class="provider-icon-label">Instagram Ads</span>
-              </button>
-              <button
-                type="button"
-                class="provider-icon-tile"
-                aria-label="Connect Google Ads"
-                title="Google Ads"
-                @click="requestLeadOAuth('google_ads')"
-              >
-                <svg viewBox="0 0 24 24" width="28" height="28" aria-hidden="true">
-                  <path fill="#FBBC04" d="M3.96 11.92 9.46 2.4a3.42 3.42 0 0 1 4.66-1.25 3.42 3.42 0 0 1 1.25 4.66l-5.5 9.52A3.42 3.42 0 0 1 5.21 16.6a3.42 3.42 0 0 1-1.25-4.68z"/>
-                  <path fill="#4285F4" d="M20.04 22h-2.1l-6.2-10.74 3.4-1.96L21.3 19.4a1.71 1.71 0 0 1-.62 2.34c-.27.16-.43.26-.64.26z"/>
-                  <circle fill="#34A853" cx="5.43" cy="18.57" r="3.43"/>
-                </svg>
-                <span class="provider-icon-label">Google Ads</span>
-              </button>
-              <button
-                type="button"
-                class="provider-icon-tile"
-                aria-label="Connect Google Forms"
-                title="Google Forms"
-                @click="requestLeadOAuth('google_forms')"
-              >
-                <svg viewBox="0 0 24 24" width="28" height="28" aria-hidden="true">
-                  <path fill="#673AB7" d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6z"/>
-                  <path fill="#9575CD" d="M14 2v6h6l-6-6z"/>
-                  <path fill="#FFFFFF" d="M7.7 11.3 8.85 12.4l1.8-1.85.7.7-2.5 2.55-1.85-1.85.7-.7zm4.05.3h4.5v1.1h-4.5v-1.1zm-4.05 3.05L8.85 15.7l1.8-1.85.7.7-2.5 2.55-1.85-1.85.7-.7zm4.05.4h4.5v1.1h-4.5v-1.1z"/>
-                </svg>
-                <span class="provider-icon-label">Google Forms</span>
-              </button>
-            </div>
-          </article>
-
-          <article class="dashboard-card">
-            <div class="members-card-head">
-              <div>
-                <h3>Create Nokvo form</h3>
-                <p>Public lead form with a required call-consent checkbox. Name and phone are added automatically.</p>
-              </div>
-            </div>
-            <div class="nokvo-form-builder">
-              <label class="kb-field">
-                <span>Form name</span>
-                <input v-model="nokvoLeadForm.name" type="text" placeholder="Site visit enquiry" />
-              </label>
-              <label class="kb-field kb-field-wide">
-                <span>Call-consent text</span>
-                <input v-model="nokvoLeadForm.consent_text" type="text" />
-              </label>
-
-              <div class="nokvo-form-fields">
-                <div class="nokvo-form-fields-head">
-                  <span>Custom fields</span>
-                  <button type="button" class="ghost-button compact" @click="addNokvoFormField">
-                    <Plus :size="14" />
-                    Add field
-                  </button>
-                </div>
-                <p v-if="!nokvoLeadForm.fields.length" class="nokvo-form-empty">
-                  No custom fields yet. Name, Phone, and the consent checkbox are always included.
-                </p>
-                <div
-                  v-for="(field, index) in nokvoLeadForm.fields"
-                  :key="index"
-                  class="nokvo-form-field-row"
-                >
-                  <input
-                    v-model="field.label"
-                    type="text"
-                    class="nokvo-form-field-label"
-                    placeholder="Field label (e.g. Email)"
-                  />
-                  <select v-model="field.type" class="nokvo-form-field-type">
-                    <option v-for="opt in NOKVO_FORM_FIELD_TYPES" :key="opt.value" :value="opt.value">
-                      {{ opt.label }}
-                    </option>
-                  </select>
-                  <label class="nokvo-form-field-required">
-                    <input type="checkbox" v-model="field.required" />
-                    <span>Required</span>
-                  </label>
-                  <button
-                    type="button"
-                    class="nokvo-form-field-remove"
-                    aria-label="Remove field"
-                    @click="removeNokvoFormField(index)"
-                  >
-                    <Trash2 :size="14" />
-                  </button>
-                </div>
-              </div>
-            </div>
-            <div class="kb-card-actions">
-              <button type="button" class="primary-button compact" @click="createNokvoLeadForm">
-                <Plus :size="15" />
-                Create form link
-              </button>
-            </div>
-            <div v-if="lastNokvoFormLink" class="nokvo-form-link-callout">
-              <strong>Share this URL with leads:</strong>
-              <code>{{ lastNokvoFormLink }}</code>
-              <button type="button" class="ghost-button compact" @click="copyNokvoFormLink">
-                Copy link
-              </button>
-            </div>
-          </article>
-
-        </div>
-
-        <div class="outgoing-tabs">
-          <button type="button" :class="{ active: outgoingTab === 'leads' }" @click="outgoingTab = 'leads'">
-            <Users :size="15" />
-            Leads
-          </button>
-          <button type="button" :class="{ active: outgoingTab === 'forms' }" @click="outgoingTab = 'forms'">
-            <FileText :size="15" />
-            Forms
-          </button>
-          <button type="button" :class="{ active: outgoingTab === 'campaigns' }" @click="outgoingTab = 'campaigns'; loadCampaigns()">
-            <PhoneCall :size="15" />
-            Campaigns
-          </button>
-          <button type="button" :class="{ active: outgoingTab === 'tester' }" @click="outgoingTab = 'tester'">
-            <Mic :size="15" />
-            Tester
-          </button>
-        </div>
-
-        <section v-if="outgoingTab === 'forms'" class="dashboard-grid agent-page-grid">
-          <article class="dashboard-card wide-card">
-            <div class="members-card-head">
-              <div>
-                <h3>Forms</h3>
-                <p>Only active forms with consent mapping can produce callable leads.</p>
-              </div>
-              <span class="status-chip">{{ leadForms.length }} forms</span>
-            </div>
-            <div class="agent-document-list">
-              <div v-if="!leadForms.length" class="empty-state compact">No forms registered yet.</div>
-              <div v-for="form in leadForms" :key="form.id" class="agent-document-row">
-                <div class="agent-document-main">
-                  <div class="agent-document-icon">
-                    <FileText :size="18" />
-                  </div>
-                  <div>
-                    <strong>{{ form.name }}</strong>
-                    <small>{{ form.provider }} · {{ form.status }}<template v-if="form.provider_form_id"> · {{ form.provider_form_id }}</template></small>
-                    <p v-if="form.public_url" class="agent-warning">{{ form.public_url }}</p>
-                  </div>
-                </div>
-                <span class="status-chip">{{ form.consent_field_key || form.default_call_consent ? 'Consent mapped' : 'Needs consent map' }}</span>
-              </div>
-            </div>
-          </article>
-        </section>
-
-        <section v-else-if="outgoingTab === 'leads'" class="dashboard-card">
-          <div class="members-card-head">
-            <div>
-              <h3>Consented leads</h3>
-              <p>Select callable leads for the next campaign. Unknown-consent rows are visible but blocked.</p>
-            </div>
-            <span class="status-chip">{{ selectedCallableLeads.length }} selected</span>
-          </div>
-
-          <div class="outgoing-lead-list">
-            <div v-if="!outgoingLeads.length" class="empty-state compact">No leads imported yet. Connect a source or publish a Nokvo form.</div>
-            <article
-              v-for="lead in outgoingLeads"
-              :key="lead.id"
-              role="button"
-              tabindex="0"
-              class="agent-document-row outgoing-lead-row"
-              :class="{ active: selectedLeadIds.includes(lead.id), disabled: !lead.callable }"
-              @click="toggleLeadSelection(lead)"
-              @keydown.enter.prevent="toggleLeadSelection(lead)"
-              @keydown.space.prevent="toggleLeadSelection(lead)"
-            >
-              <div class="agent-document-main">
-                <div class="agent-document-icon">
-                  <PhoneCall :size="18" />
-                </div>
-                <div>
-                  <strong>{{ lead.name || lead.phone_e164 || 'Unnamed lead' }}</strong>
-                  <small>{{ lead.source_provider }} · {{ lead.phone_e164 || 'no phone' }} · {{ lead.consent_status }}</small>
-                </div>
-              </div>
-              <div class="outgoing-lead-actions">
-                <a
-                  v-if="phoneHref(lead.phone_e164 || lead.phone_raw)"
-                  class="record-call-link"
-                  :href="phoneHref(lead.phone_e164 || lead.phone_raw)"
-                  @click.stop
-                >
-                  <PhoneCall :size="14" />
-                  Call
-                </a>
-                <span class="status-chip">{{ lead.callable ? 'Callable' : 'Blocked' }}</span>
-              </div>
-            </article>
-          </div>
-        </section>
-
-        <section v-else-if="outgoingTab === 'tester'" class="dashboard-grid agent-page-grid">
-          <article class="dashboard-card">
-            <div class="members-card-head">
-              <div>
-                <h3>Outbound tester</h3>
-                <p>Rehearse the outbound agent live. Edit the goal, objectives, and tone, then call into the same pipeline that drives campaigns — no campaign row required.</p>
-              </div>
-            </div>
-            <div class="outbound-tester-form">
-              <label class="kb-field">
-                <span>Caller name</span>
-                <input v-model="outboundTester.caller_name" type="text" placeholder="Riya" />
-              </label>
-              <label class="kb-field">
-                <span>Company name</span>
-                <input v-model="outboundTester.company_name" type="text" placeholder="Raghava Constructions" />
-              </label>
-              <label class="kb-field kb-field-wide">
-                <span>Pitch summary <em>(one-liner the agent says in the opener)</em></span>
-                <input v-model="outboundTester.pitch_summary" type="text" placeholder="our new 2BHK apartments in Kompally starting at 78 lakhs" />
-              </label>
-              <label class="kb-field">
-                <span>Objective</span>
-                <select v-model="outboundTester.objective" :disabled="voice.status !== 'idle' && voice.status !== 'error'">
-                  <option v-for="opt in OUTBOUND_OBJECTIVE_OPTIONS" :key="opt.value" :value="opt.value">
-                    {{ opt.label }}
-                  </option>
-                </select>
-              </label>
-              <label class="kb-field">
-                <span>Language</span>
-                <select v-model="outboundTester.language" :disabled="voice.status !== 'idle' && voice.status !== 'error'">
-                  <option v-for="opt in voiceLanguageOptions" :key="opt.value" :value="opt.value">
-                    {{ opt.label }}
-                  </option>
-                </select>
-              </label>
-              <label class="kb-field kb-field-wide">
-                <span>Goal <em>(plain-language, e.g. "book demo for Saturday")</em></span>
-                <input v-model="outboundTester.goal" type="text" placeholder="Confirm the prospect can take a 15-minute site visit this week." />
-              </label>
-              <label class="kb-field">
-                <span>Session name</span>
-                <input v-model="outboundTester.name" type="text" placeholder="Outbound test call" />
-              </label>
-              <label class="kb-field kb-field-wide">
-                <span>System prompt (optional)</span>
-                <textarea v-model="outboundTester.agent_prompt" rows="3" placeholder="Drive a single-prompt persona, e.g. 'You're a Raghava sales rep confirming Saturday site visits in Kompally'. Leave blank to use the default outbound persona."></textarea>
-              </label>
-              <div class="kb-field kb-field-wide outbound-tester-doc">
-                <span>Reference document (optional)</span>
-                <p class="outbound-tester-hint">
-                  One PDF / DOCX / TXT. The agent grounds itself in this brief during the call. Use a prompt, a doc, or both.
-                </p>
-                <div class="outbound-tester-doc-row">
-                  <label class="ghost-button compact outbound-tester-doc-pick">
-                    <Upload :size="14" />
-                    <span>{{ outboundTester.doc_filename ? 'Replace document' : 'Choose document' }}</span>
-                    <input
-                      type="file"
-                      accept=".pdf,.docx,.doc,.txt,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain"
-                      @change="onOutboundTesterDocSelected"
-                    />
-                  </label>
-                  <button
-                    v-if="outboundTester.doc_filename"
-                    type="button"
-                    class="ghost-button compact danger"
-                    @click="clearOutboundTesterDoc"
-                  >
-                    <Trash2 :size="14" />
-                    Remove
-                  </button>
-                </div>
-                <p v-if="outboundTester.doc_filename" class="outbound-tester-doc-name">
-                  <FileText :size="14" />
-                  <span>{{ outboundTester.doc_filename }}</span>
-                  <span v-if="outboundTester.doc_chars" class="outbound-tester-doc-chars">{{ outboundTester.doc_chars.toLocaleString() }} characters parsed</span>
-                </p>
-              </div>
-              <label class="kb-field kb-field-wide">
-                <span>Objectives (one per line)</span>
-                <textarea v-model="outboundTester.objectives" rows="3"></textarea>
-              </label>
-              <label class="kb-field kb-field-wide">
-                <span>Exit conditions (one per line)</span>
-                <textarea v-model="outboundTester.exit_conditions" rows="2"></textarea>
-              </label>
-              <label class="kb-field">
-                <span>Tone</span>
-                <input v-model="outboundTester.tone" type="text" placeholder="warm, direct, and respectful" />
-              </label>
-            </div>
-            <div class="outbound-tester-save-row">
-              <button type="button" class="primary-button compact" @click="saveOutboundTesterPreset">
-                <CheckCircle2 :size="15" />
-                Save preset
-              </button>
-              <button
-                v-if="outboundTesterSaved.hasPreset"
-                type="button"
-                class="ghost-button compact danger"
-                @click="clearOutboundTesterPreset"
-              >
-                <Trash2 :size="14" />
-                Clear saved
-              </button>
-              <span v-if="outboundTesterSaved.savedAt" class="outbound-tester-save-meta">
-                Saved {{ new Date(outboundTesterSaved.savedAt).toLocaleString() }}
-              </span>
-            </div>
-          </article>
-
-          <article class="dashboard-card voice-tester-card outbound-tester-call">
-            <div class="kb-card-head">
-              <div class="kb-card-icon kb-card-icon-primary">
-                <Mic :size="18" />
-              </div>
-              <div>
-                <h4>Live test call</h4>
-                <p>Click Start, talk to the agent, and watch the same STT → LLM → TTS pipeline campaigns use.</p>
-              </div>
-              <div class="voice-status-badge" :class="`voice-status-${voice.status}`">
-                <span class="voice-status-dot"></span>
-                {{ voice.status }}
-              </div>
-              <div v-if="voice.callStartedAt" class="voice-cost-meter" title="Live call cost (₹8/min)">
-                <Wallet :size="13" />
-                <strong>₹{{ liveCostRupees }}</strong>
-                <span>{{ liveCostDuration }}</span>
-              </div>
-            </div>
-
-            <div class="voice-controls">
-              <button
-                v-if="voice.status === 'idle' || voice.status === 'error'"
-                type="button"
-                class="primary-button compact"
-                @click="startVoiceCall('outbound')"
-              >
-                <PhoneCall :size="15" />
-                Start Test Call
-              </button>
-              <button
-                v-else
-                type="button"
-                class="ghost-button compact"
-                @click="endVoiceCall"
-              >
-                <Square :size="15" />
-                End Call
-              </button>
-              <button
-                type="button"
-                class="ghost-button compact"
-                :disabled="!voice.ws"
-                @click="sendTextToVoiceAgent"
-                title="Send a text-only turn through the same pipeline"
-              >
-                <MessageSquare :size="15" />
-                Send Text Turn
-              </button>
-              <input
-                v-if="voice.ws"
-                v-model="chatInput"
-                type="text"
-                class="voice-text-input"
-                placeholder="Type a reply to send through the pipeline"
-                @keyup.enter="sendTextToVoiceAgent"
-              />
-            </div>
-
-            <div v-if="voice.errorMsg" class="message error dashboard-message">{{ voice.errorMsg }}</div>
-
-            <div class="voice-live-row" v-if="voice.liveTranscript">
-              <Radio :size="14" />
-              <em>{{ voice.liveTranscript }}</em>
-              <span v-if="voice.transcriptLang" class="kb-pill kb-pill-soft">{{ voice.transcriptLang }}</span>
-            </div>
-
-            <div class="voice-latency-row" v-if="voice.firstSentenceMs || voice.ttsFirstAudioMs">
-              <span v-if="voice.firstSentenceMs">LLM first sentence: <strong>{{ voice.firstSentenceMs }}ms</strong></span>
-              <span v-if="voice.ttsFirstAudioMs">TTS first audio: <strong>{{ voice.ttsFirstAudioMs }}ms</strong></span>
-              <span v-if="voice.callId">call: <code>{{ voice.callId.slice(0, 8) }}</code></span>
-            </div>
-
-            <div v-if="!voice.turns.length && voice.status === 'idle'" class="kb-empty voice-empty">
-              Set the goal on the left, hit Start Test Call, and the agent will open the conversation.
-            </div>
-
-            <div class="voice-turns">
-              <div v-for="turn in voice.turns" :key="turn.id" class="voice-turn">
-                <div class="voice-turn-user">
-                  <strong>You</strong>
-                  <span>{{ turn.query }}</span>
-                </div>
-                <div class="voice-turn-agent">
-                  <strong>Agent</strong>
-                  <span>{{ turn.answer || turn.sentences.join(' ') }}</span>
-                </div>
-                <div class="voice-turn-meta">
-                  <span v-if="turn.latencyMs">{{ turn.latencyMs }}ms</span>
-                  <span v-if="turn.cacheHit" class="kb-pill kb-pill-soft">cache</span>
-                </div>
-              </div>
-            </div>
-          </article>
-        </section>
-
-        <section v-else class="dashboard-card campaign-card">
-          <div class="kb-card-head">
-            <div class="kb-card-icon">
-              <PhoneCall :size="18" />
-            </div>
-            <div>
-              <h4>Outbound Campaigns</h4>
-              <p>Create campaigns from selected consented leads. Excel contacts are no longer accepted for calling.</p>
-            </div>
-            <button type="button" class="ghost-button compact" @click="loadCampaigns">Refresh</button>
-          </div>
-          <div v-if="isAdmin" class="campaign-create">
-            <div class="kb-form-grid">
-              <label class="kb-field">
-                <span>Campaign name</span>
-                <input v-model="campaignForm.name" type="text" placeholder="Diwali outreach" />
-              </label>
-              <label class="kb-field">
-                <span>From number (optional)</span>
-                <input v-model="campaignForm.from_number" type="text" placeholder="+91XXXXXXXXXX" />
-              </label>
-              <label class="kb-field">
-                <span>Agent prompt</span>
-                <textarea v-model="campaignForm.agent_prompt" rows="3" placeholder="Role, tone, and call strategy"></textarea>
-              </label>
-              <label class="kb-field">
-                <span>Objectives</span>
-                <textarea v-model="campaignForm.objectives" rows="4" placeholder="One objective per line"></textarea>
-              </label>
-              <label class="kb-field">
-                <span>Exit conditions</span>
-                <textarea v-model="campaignForm.exit_conditions" rows="4" placeholder="One exit condition per line"></textarea>
-              </label>
-              <label class="kb-field">
-                <span>Tone</span>
-                <input v-model="campaignForm.tone" type="text" placeholder="warm, direct, and respectful" />
-              </label>
-              <label class="kb-field">
-                <span>Silence nudge after seconds</span>
-                <input v-model.number="campaignForm.silence_timeout_seconds" type="number" min="2" max="20" step="1" />
-              </label>
-              <label class="kb-field">
-                <span>Script document (PDF/DOCX/TXT)</span>
-                <input type="file" accept=".pdf,.docx,.txt,.md" @change="onCampaignFile($event, 'doc_file')" />
-                <small v-if="campaignForm.doc_file">{{ campaignForm.doc_file.name }} · {{ formatBytes(campaignForm.doc_file.size) }}</small>
-              </label>
-              <div class="kb-field">
-                <span>Selected leads</span>
-                <strong>{{ selectedCallableLeads.length }} callable lead(s)</strong>
-                <small>Go to Leads tab to change selection.</small>
-              </div>
-            </div>
-            <div class="kb-card-actions">
-              <button
-                type="button"
-                class="primary-button compact"
-                :disabled="isCreatingCampaign || !selectedCallableLeads.length"
-                @click="createCampaign"
-              >
-                <Plus :size="15" />
-                {{ isCreatingCampaign ? 'Creating & ingesting…' : 'Create Campaign' }}
-              </button>
-              <span class="kb-card-hint">Script auto-indexes to Qdrant scoped to this campaign.</span>
-            </div>
-          </div>
-
-          <div v-if="!campaigns.length" class="kb-empty">
-            <div class="kb-empty-icon">
-              <PhoneCall :size="24" />
-            </div>
-            <strong>No outbound campaigns yet.</strong>
-            <span>Select consented leads and add a script to start.</span>
-          </div>
-
-          <div v-else class="kb-doc-list">
-            <article v-for="c in campaigns" :key="c.id" class="kb-doc-card">
-              <div class="kb-doc-icon">
-                <PhoneCall :size="18" />
-              </div>
-              <div class="kb-doc-body">
-                <div class="kb-doc-title-row">
-                  <strong>{{ c.name }}</strong>
-                  <span class="kb-pill" :class="`kb-pill-status-${c.status === 'running' ? 'approved' : c.status === 'draft' ? 'pending' : 'rejected'}`">
-                    {{ c.status }}
-                  </span>
-                </div>
-                <div class="kb-doc-meta">
-                  <span><strong>{{ c.total_count }}</strong> contacts</span>
-                  <span><strong>{{ c.answered_count }}</strong> answered</span>
-                  <span v-if="c.failed_count"><strong>{{ c.failed_count }}</strong> failed</span>
-                  <span v-if="c.from_number">from {{ c.from_number }}</span>
-                  <span v-if="c.agent_config?.objectives?.length"><strong>{{ c.agent_config.objectives.length }}</strong> objectives</span>
-                  <span v-if="c.agent_config?.silence_timeout_seconds">nudges after {{ c.agent_config.silence_timeout_seconds }}s</span>
-                  <span v-if="c.created_at">created {{ formatRelativeDate(c.created_at) }}</span>
-                </div>
-              </div>
-              <div class="kb-doc-actions" v-if="isAdmin">
-                <button
-                  v-if="c.status === 'draft'"
-                  type="button"
-                  class="primary-button compact"
-                  :disabled="isLaunchingCampaign === c.id"
-                  @click="launchCampaign(c.id)"
-                >
-                  <Play :size="15" />
-                  {{ isLaunchingCampaign === c.id ? 'Launching…' : 'Launch' }}
-                </button>
-                <button
-                  v-if="c.status === 'draft' || c.status === 'running'"
-                  type="button"
-                  class="ghost-button compact"
-                  @click="cancelCampaign(c.id)"
-                >
-                  <XCircle :size="15" />
-                  Cancel
-                </button>
-              </div>
-            </article>
-          </div>
-        </section>
-      </section>
-
-      <!-- KNOWLEDGE BASE -->
-      <section v-if="currentPage === 'knowledge_base'" class="dashboard-section kb-section">
-        <div class="kb-hero">
-          <div class="kb-hero-copy">
-            <span class="section-kicker">Knowledge Base</span>
-            <h3>Documents your agent answers from.</h3>
-            <p>
-              Uploads are stored in your tenant blob, chunked, and embedded with
-              <strong>text-embedding-3-small</strong> on your dedicated Azure OpenAI
-              deployment in <strong>South India</strong>. Only approved documents
-              ever serve answers.
-            </p>
-            <div class="kb-hero-pill-row">
-              <span class="kb-pill kb-pill-soft">
-                <span class="kb-pill-dot"></span>
-                Azure OpenAI · South India
-              </span>
-              <span class="kb-pill kb-pill-soft">text-embedding-3-small</span>
-              <span class="kb-pill kb-pill-soft">1536-dim · cosine</span>
-            </div>
-          </div>
-          <div class="kb-hero-stats">
-            <div class="kb-stat-card">
-              <span class="kb-stat-label">Documents</span>
-              <strong class="kb-stat-value">{{ kbStats.total }}</strong>
-              <span class="kb-stat-meta">{{ kbStats.approved }} approved · {{ kbStats.pending }} pending</span>
-            </div>
-            <div class="kb-stat-card">
-              <span class="kb-stat-label">Chunks</span>
-              <strong class="kb-stat-value">{{ kbStats.chunks }}</strong>
-              <span class="kb-stat-meta">{{ kbStats.vectors }} vectors in Qdrant</span>
-            </div>
-            <div class="kb-stat-card">
-              <span class="kb-stat-label">Storage</span>
-              <strong class="kb-stat-value">{{ formatBytes(kbStats.bytes) || '—' }}</strong>
-              <span class="kb-stat-meta">{{ kbStats.errors }} with errors</span>
-            </div>
-          </div>
-        </div>
-
-        <div v-if="kbError" class="message error dashboard-message">{{ kbError }}</div>
-        <div v-else-if="kbInfo" class="message info dashboard-message">{{ kbInfo }}</div>
-
-        <div class="kb-grid">
-          <article v-if="isAdmin && kbDocumentUploadEnabled" class="dashboard-card kb-card kb-upload-card">
-            <div class="kb-card-head">
-              <div class="kb-card-icon kb-card-icon-primary">
-                <Upload :size="18" />
-              </div>
-              <div>
-                <h4>Upload Document</h4>
-                <p>PDF, DOCX, TXT, or Markdown · embeds on save.</p>
-              </div>
-            </div>
-
-            <label
-              class="kb-dropzone"
-              :class="{ 'has-file': kbForm.file || kbBulkQueue.length, 'is-busy': isUploadingKb || isUploadingKbBulk }"
-              @dragover.prevent
-              @drop.prevent="handleKbDrop"
-            >
-              <input
-                ref="kbUploadInputRef"
-                class="kb-dropzone-input"
-                type="file"
-                multiple
-                accept=".pdf,.docx,.txt,.md,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain,text/markdown"
-                @change="handleKbFileChange"
-              />
-              <div v-if="!kbForm.file && !kbBulkQueue.length" class="kb-dropzone-empty">
-                <div class="kb-dropzone-icon">
-                  <Upload :size="22" />
-                </div>
-                <strong>Drop files or click to browse</strong>
-                <span>PDF, DOCX, TXT, MD · pick one for a named upload or many for bulk embed</span>
-              </div>
-              <div v-else-if="kbForm.file && !kbBulkQueue.length" class="kb-dropzone-filled">
-                <div class="kb-dropzone-icon">
-                  <FileText :size="20" />
-                </div>
-                <div class="kb-dropzone-file">
-                  <strong>{{ kbForm.file.name }}</strong>
-                  <span>{{ formatBytes(kbForm.file.size) }} · {{ kbForm.file.type || 'unknown type' }}</span>
-                </div>
-                <button
-                  type="button"
-                  class="kb-link-button"
-                  @click.prevent.stop="clearKbFile"
-                >
-                  Replace
-                </button>
-              </div>
-              <div v-else class="kb-dropzone-filled kb-dropzone-bulk">
-                <div class="kb-dropzone-icon">
-                  <FileText :size="20" />
-                </div>
-                <div class="kb-dropzone-file">
-                  <strong>{{ kbBulkQueue.length }} files queued for bulk embed</strong>
-                  <span>Tags &amp; type below apply to all. Filenames become document names.</span>
-                </div>
-                <button
-                  type="button"
-                  class="kb-link-button"
-                  :disabled="isUploadingKbBulk"
-                  @click.prevent.stop="clearKbFile"
-                >
-                  Clear
-                </button>
-              </div>
-            </label>
-
-            <ul v-if="kbBulkQueue.length" class="kb-bulk-queue">
-              <li v-for="(entry, idx) in kbBulkQueue" :key="entry.file.name + idx" :class="`kb-bulk-row kb-bulk-${entry.status}`">
-                <div class="kb-bulk-row-top">
-                  <div class="kb-bulk-row-main">
-                    <FileText :size="14" />
-                    <span class="kb-bulk-name">{{ entry.name }}</span>
-                    <span class="kb-bulk-size">{{ formatBytes(entry.file.size) }}</span>
-                  </div>
-                  <div class="kb-bulk-status">
-                    <span v-if="entry.status === 'queued'">Queued</span>
-                    <span v-else-if="entry.status === 'uploading'">Embedding…</span>
-                    <span v-else-if="entry.status === 'done'" class="kb-bulk-done">Embedded</span>
-                    <span v-else class="kb-bulk-error">Failed</span>
-                    <button
-                      v-if="entry.status === 'queued' && !isUploadingKbBulk"
-                      type="button"
-                      class="kb-link-button"
-                      @click="removeBulkQueueItem(idx)"
-                    >
-                      Remove
-                    </button>
-                  </div>
-                </div>
-                <div v-if="entry.status === 'error' && entry.error" class="kb-bulk-error-detail">
-                  {{ entry.error }}
-                </div>
-              </li>
-            </ul>
-
-            <div v-if="!kbBulkQueue.length" class="kb-form-grid">
-              <label class="kb-field">
-                <span>Name</span>
-                <input v-model="kbForm.name" type="text" placeholder="Refund policy v2" />
-              </label>
-              <label class="kb-field">
-                <span>Type</span>
-                <select v-model="kbForm.document_type">
-                  <option v-for="opt in kbDocumentTypes" :key="opt.value" :value="opt.value">
-                    {{ opt.label }}
-                  </option>
-                </select>
-              </label>
-              <label class="kb-field kb-field-wide">
-                <span>Description</span>
-                <input v-model="kbForm.description" type="text" placeholder="Optional summary" />
-              </label>
-              <label class="kb-field kb-field-wide">
-                <span>Tags</span>
-                <input v-model="kbForm.tags" type="text" placeholder="refunds, returns, escalation" />
-              </label>
-            </div>
-
-            <div v-else class="kb-form-grid">
-              <label class="kb-field">
-                <span>Type (applies to all)</span>
-                <select v-model="kbForm.document_type" :disabled="isUploadingKbBulk">
-                  <option v-for="opt in kbDocumentTypes" :key="opt.value" :value="opt.value">
-                    {{ opt.label }}
-                  </option>
-                </select>
-              </label>
-              <label class="kb-field kb-field-wide">
-                <span>Tags (applies to all)</span>
-                <input v-model="kbForm.tags" type="text" placeholder="refunds, returns, escalation" :disabled="isUploadingKbBulk" />
-              </label>
-            </div>
-
-            <div class="kb-card-actions">
-              <button
-                v-if="!kbBulkQueue.length"
-                type="button"
-                class="primary-button compact"
-                :disabled="isUploadingKb || !kbForm.file"
-                @click="uploadKnowledgeDocument"
-              >
-                <Upload :size="15" />
-                {{ isUploadingKb ? 'Embedding…' : 'Upload & Embed' }}
-              </button>
-              <button
-                v-else
-                type="button"
-                class="primary-button compact"
-                :disabled="isUploadingKbBulk || !kbBulkQueue.length"
-                @click="uploadKnowledgeDocumentsBulk"
-              >
-                <Upload :size="15" />
-                {{ isUploadingKbBulk ? 'Embedding…' : `Upload &amp; Embed ${kbBulkQueue.length} Files` }}
-              </button>
-              <span class="kb-card-hint">
-                <template v-if="isUploadingKb || isUploadingKbBulk">Chunking and calling Azure OpenAI…</template>
-                <template v-else-if="kbBulkQueue.length">2 files embed in parallel to stay under Azure OpenAI rate limits.</template>
-                <template v-else>Approved by default if text is extractable.</template>
-              </span>
-            </div>
-          </article>
-
-          <article v-if="isAdmin" class="dashboard-card kb-card kb-single-prompt-card">
-            <div class="kb-card-head">
-              <div class="kb-card-icon kb-card-icon-primary">
-                <Mic :size="18" />
-              </div>
-              <div>
-                <h4>Single Prompt Voice Agent</h4>
-                <p>Give the live voice agent one operating prompt. It works alongside approved Knowledge Base documents.</p>
-              </div>
-            </div>
-
-            <div v-if="kbSinglePromptConfig?.enabled" class="kb-single-status">
-              <CheckCircle2 :size="16" />
-              <div>
-                <strong>Single prompt route active</strong>
-                <span>
-                  <template v-if="kbSinglePromptConfig.updated_at">Updated {{ formatRelativeDate(kbSinglePromptConfig.updated_at) }}</template>
-                  <template v-else>Runtime prompt enabled</template>
-                </span>
-              </div>
-              <button
-                type="button"
-                class="kb-link-button kb-single-disable"
-                :disabled="isDisablingSinglePromptAgent"
-                @click="disableSinglePromptVoiceAgent"
-              >
-                {{ isDisablingSinglePromptAgent ? 'Removing…' : 'Remove prompt' }}
-              </button>
-            </div>
-
-            <label class="kb-field kb-field-wide">
-              <span>Single Prompt</span>
-              <textarea
-                v-model="kbSinglePromptForm.prompt"
-                class="kb-prompt-textarea"
-                placeholder="You are a warm phone agent for the clinic. Greet callers briefly, answer only from approved Knowledge Base documents, ask for the missing detail when needed, and keep every reply under three sentences."
-                :disabled="isSavingSinglePromptAgent"
-              ></textarea>
-            </label>
-
-            <div class="kb-card-actions">
-              <button
-                type="button"
-                class="primary-button compact"
-                :disabled="isSavingSinglePromptAgent || !kbSinglePromptCanSubmit"
-                @click="saveSinglePromptVoiceAgent"
-              >
-                <CheckCircle2 :size="15" />
-                {{ isSavingSinglePromptAgent ? 'Configuring…' : 'Configure Voice Agent' }}
-              </button>
-              <span class="kb-card-hint">Applies this prompt to the live voice runtime. Knowledge still comes from approved documents.</span>
-            </div>
-          </article>
-
-          <article v-else class="dashboard-card kb-card kb-readonly-card">
-            <div class="kb-card-head">
-              <div class="kb-card-icon">
-                <Shield :size="18" />
-              </div>
-              <div>
-                <h4>Read-only access</h4>
-                <p>Only admins can upload or approve Knowledge Base documents. Ask an admin to add new sources.</p>
-              </div>
-            </div>
-          </article>
-
-          <article class="dashboard-card kb-card kb-search-card">
-            <div class="kb-card-head">
-              <div class="kb-card-icon">
-                <Search :size="18" />
-              </div>
-              <div>
-                <h4>Test Retrieval</h4>
-                <p>Embed a query and inspect the chunks your agent would surface.</p>
-              </div>
-            </div>
-
-            <div class="kb-search-bar">
-              <Search :size="15" class="kb-search-bar-icon" />
-              <input
-                v-model="kbQuery"
-                type="text"
-                placeholder="What is the refund window?"
-                @keyup.enter="testKnowledgeRetrieval"
-              />
-              <button
-                type="button"
-                class="primary-button compact kb-search-submit"
-                :disabled="isSearchingKb || !kbQuery.trim()"
-                @click="testKnowledgeRetrieval"
-              >
-                {{ isSearchingKb ? 'Searching…' : 'Search' }}
-              </button>
-            </div>
-
-            <div v-if="kbResults.length" class="kb-results">
-              <div v-for="(chunk, idx) in kbResults" :key="chunk.chunk_id" class="kb-result-card">
-                <div class="kb-result-head">
-                  <span class="kb-result-rank">#{{ idx + 1 }}</span>
-                  <strong>{{ chunk.document_name }}</strong>
-                  <span class="kb-pill kb-pill-score">{{ chunk.score.toFixed(3) }}</span>
-                </div>
-                <p class="kb-result-text">{{ chunk.text.slice(0, 320) }}{{ chunk.text.length > 320 ? '…' : '' }}</p>
-              </div>
-            </div>
-            <div v-else-if="!isSearchingKb && kbQuery" class="kb-search-empty">
-              No results yet — try a different phrasing or upload more documents.
-            </div>
-          </article>
-        </div>
-
-        <div class="kb-list-head">
-          <div>
-            <span class="section-kicker">Indexed</span>
-            <h4>{{ kbDocuments.length }} document{{ kbDocuments.length === 1 ? '' : 's' }}</h4>
-            <p>Pending uploads still embed; only approved documents serve answers in production.</p>
-          </div>
-          <div class="kb-list-actions">
-            <button
-              v-if="isAdmin"
-              type="button"
-              class="ghost-button compact"
-              :disabled="isReconcilingKb"
-              @click="reconcileKnowledgeDocuments"
-              title="Rebuild this list from chunks that already exist in Qdrant (used when an earlier upload landed vectors but lost the metadata)"
-            >
-              <Database :size="15" />
-              {{ isReconcilingKb ? 'Reconciling…' : 'Reconcile from Qdrant' }}
-            </button>
-            <button
-              type="button"
-              class="ghost-button compact"
-              :disabled="isLoadingKb"
-              @click="loadKnowledgeDocuments"
-            >
-              <Database :size="15" />
-              {{ isLoadingKb ? 'Loading…' : 'Refresh' }}
-            </button>
-          </div>
-        </div>
-
-        <div v-if="!kbDocuments.length && !isLoadingKb" class="kb-empty">
-          <div class="kb-empty-icon">
-            <BookOpen :size="28" />
-          </div>
-          <strong>No documents yet.</strong>
-          <span>Upload your first policy or FAQ to start grounding the agent. <template v-if="isAdmin">If you've already uploaded but the list is empty, click <em>Reconcile from Qdrant</em> to rebuild the registry from any orphaned embeddings.</template></span>
-        </div>
-
-        <div v-else class="kb-doc-list">
-          <article
-            v-for="doc in kbDocuments"
-            :key="doc.id"
-            class="kb-doc-card"
-            :class="`kb-doc-status-${doc.approval_status}`"
-          >
-            <div class="kb-doc-icon">
-              <FileText :size="18" />
-            </div>
-            <div class="kb-doc-body">
-              <div class="kb-doc-title-row">
-                <strong>{{ doc.name }}</strong>
-                <span class="kb-pill kb-pill-type">{{ doc.document_type }}</span>
+                <Bell :size="15" />
                 <span
-                  class="kb-pill"
-                  :class="`kb-pill-status-${doc.approval_status}`"
-                >
-                  {{ doc.approval_status }}
-                </span>
-              </div>
-              <p v-if="doc.description" class="kb-doc-desc">{{ doc.description }}</p>
-              <div class="kb-doc-meta">
-                <span><strong>{{ doc.chunk_count }}</strong> chunks</span>
-                <span><strong>{{ doc.qdrant_point_count }}</strong> vectors</span>
-                <span v-if="doc.created_at">added {{ formatRelativeDate(doc.created_at) }}</span>
-                <span v-if="doc.tags && doc.tags.length" class="kb-doc-tags">
-                  <span v-for="tag in doc.tags.slice(0, 4)" :key="tag" class="kb-tag">{{ tag }}</span>
-                </span>
-              </div>
-              <p v-if="doc.last_error" class="kb-doc-error">{{ doc.last_error }}</p>
-
-              <!-- Lazy-loaded chunk viewer. Lets the admin see exactly
-                   what the agent is grounding on for this document. -->
-              <div v-if="kbExpandedDocs[doc.id]" class="kb-doc-chunks">
-                <div v-if="kbChunksByDoc[doc.id]?.loading" class="kb-doc-chunks-status">
-                  Loading chunks…
-                </div>
-                <div v-else-if="kbChunksByDoc[doc.id]?.error" class="kb-doc-chunks-status kb-doc-chunks-error">
-                  {{ kbChunksByDoc[doc.id].error }}
-                </div>
-                <div v-else-if="!kbChunksByDoc[doc.id]?.chunks?.length" class="kb-doc-chunks-status">
-                  No chunks indexed for this document.
-                </div>
-                <ol v-else class="kb-doc-chunks-list">
-                  <li
-                    v-for="chunk in kbChunksByDoc[doc.id].chunks"
-                    :key="chunk.index"
-                    class="kb-chunk"
-                  >
-                    <div class="kb-chunk-head">
-                      <span class="kb-chunk-index">#{{ chunk.index + 1 }}</span>
-                      <span v-if="chunk.section_title" class="kb-chunk-section">{{ chunk.section_title }}</span>
-                      <span class="kb-chunk-meta">{{ chunk.token_count }} tok · {{ chunk.char_end - chunk.char_start }} chars</span>
-                    </div>
-                    <p class="kb-chunk-text">{{ chunk.text }}</p>
-                  </li>
-                </ol>
-              </div>
-            </div>
-            <div class="kb-doc-actions">
-              <button
-                type="button"
-                class="ghost-button compact"
-                @click="toggleKnowledgeChunks(doc.id)"
-                :title="kbExpandedDocs[doc.id] ? 'Hide chunks' : 'View chunks the agent uses for retrieval'"
-              >
-                <FileText :size="15" />
-                {{ kbExpandedDocs[doc.id] ? 'Hide chunks' : 'View chunks' }}
+                  v-if="unreadCount > 0"
+                  class="n-shell-bell__badge"
+                  :aria-label="`${unreadCount} unread`"
+                >{{ unreadCount > 99 ? '99+' : unreadCount }}</span>
               </button>
-              <template v-if="isAdmin">
-                <button
-                  v-if="doc.approval_status !== 'approved' && doc.chunk_count > 0"
-                  type="button"
-                  class="primary-button compact"
-                  @click="approveKnowledgeDocument(doc.id)"
-                >
-                  <CheckCircle2 :size="15" />
-                  Approve
-                </button>
-                <button
-                  v-if="doc.approval_status === 'approved'"
-                  type="button"
-                  class="ghost-button compact"
-                  @click="rejectKnowledgeDocument(doc.id)"
-                >
-                  <XCircle :size="15" />
-                  Revoke
-                </button>
-                <button
-                  type="button"
-                  class="ghost-button compact danger"
-                  @click="removeKnowledgeDocument(doc.id, doc.name)"
-                  title="Delete document, embeddings, and generated cards"
-                >
-                  <Trash2 :size="15" />
-                  Remove
-                </button>
-              </template>
+              <div v-if="isNotificationsOpen" class="n-shell-bell__panel" role="dialog" aria-label="Notifications">
+                <header class="n-shell-bell__head">
+                  <strong>Notifications</strong>
+                  <button
+                    v-if="unreadCount > 0"
+                    type="button"
+                    class="n-shell-bell__mark-all"
+                    @click="markAllNotificationsRead"
+                  >
+                    Mark all read
+                  </button>
+                </header>
+                <p v-if="!notifications.length && !isLoadingNotifications" class="n-shell-bell__empty">
+                  Nothing new. Hot leads, integration issues, and outbound batch results show up here.
+                </p>
+                <p v-else-if="isLoadingNotifications && !notifications.length" class="n-shell-bell__empty">
+                  Loading…
+                </p>
+                <ul v-else class="n-shell-bell__list">
+                  <li
+                    v-for="notif in notifications"
+                    :key="notif.id"
+                    class="n-shell-bell__row"
+                    :class="[`severity-${notif.severity}`, { 'is-unread': !notif.read_at }]"
+                    @click="markNotificationRead(notif)"
+                  >
+                    <span class="n-shell-bell__dot" :class="`severity-${notif.severity}`"></span>
+                    <div class="n-shell-bell__row-body">
+                      <strong>{{ notif.title }}</strong>
+                      <small v-if="notif.body">{{ notif.body }}</small>
+                      <small class="n-shell-bell__row-time">
+                        {{ notif.created_at ? new Date(notif.created_at).toLocaleString() : '' }}
+                      </small>
+                    </div>
+                  </li>
+                </ul>
+              </div>
             </div>
-          </article>
+
+            <button
+              v-if="!isMemberOnly"
+              type="button"
+              class="n-shell-icon-btn"
+              :class="{ 'is-active': currentPage === 'advanced_settings' || currentPage === 'nokvo_connect' || currentPage === 'nokvo_connect_step2' }"
+              @click="switchPage('advanced_settings')"
+              aria-label="Settings"
+              title="Settings"
+            >
+              <Settings2 :size="15" />
+            </button>
+            <button type="button" class="n-shell-user" @click="handleLogout" aria-label="Account">
+              <span class="n-shell-user__avatar">
+                <span class="n-shell-user__avatar-letter">{{ organizationInitial }}</span>
+                <span class="n-shell-user__online" aria-hidden="true"></span>
+              </span>
+              <span class="n-shell-user__meta">
+                <span class="n-shell-user__org n-truncate">{{ currentOrganization?.name || 'Workspace' }}</span>
+                <span class="n-shell-user__role">{{ currentUser?.role || 'member' }}</span>
+              </span>
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <section class="n-shell-banner" v-if="errorMsg || infoMsg">
+        <div class="n-shell-banner__inner" :class="errorMsg ? 'is-error' : 'is-info'">
+          <span class="n-dot" :class="errorMsg ? 'n-dot--danger' : 'n-dot--success'"></span>
+          <span>{{ errorMsg || infoMsg }}</span>
         </div>
       </section>
+
+      <section
+        v-if="onboardingV2Enabled && currentUser?.mfa_pending && currentPage === 'dashboard'"
+        class="n-shell-callout"
+      >
+        <div class="n-shell-callout__inner">
+          <div class="n-shell-callout__icon">
+            <Shield :size="16" />
+          </div>
+          <div class="n-shell-callout__copy">
+            <strong>Secure advanced actions</strong>
+            <span>Enable multi-factor auth to unlock calling, campaigns, invites and integrations.</span>
+          </div>
+          <button type="button" class="n-btn n-btn--brand n-btn--sm" :disabled="isAuthenticating" @click="startSessionTotpSetup">
+            Set up MFA
+          </button>
+        </div>
+      </section>
+
+      <router-view v-if="authState === 'ready'" />
     </main>
 
     <div v-if="pendingLeadOAuth" class="field-modal-shell">
@@ -9135,6 +7165,1209 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+/* ============================================================
+   v2 shell styles (premium minimalism). Reads design-system tokens.
+   ============================================================ */
+.n-shell {
+  position: relative;
+  z-index: 1;
+  min-height: 100vh;
+  background: var(--n-bg);
+  color: var(--n-text);
+  font-family: var(--n-font-body);
+  display: flex;
+  flex-direction: column;
+}
+
+/* ─── Floating bottom dock ─────────────────────────── */
+.n-shell { padding-bottom: calc(96px + env(safe-area-inset-bottom)); }
+
+.n-shell-dock {
+  position: fixed;
+  z-index: 40;
+  left: 50%;
+  bottom: max(20px, env(safe-area-inset-bottom, 0px));
+  transform: translateX(-50%);
+  isolation: isolate;
+  /* Float-rise entrance */
+  animation: nDockRise 480ms var(--n-ease) 100ms both;
+}
+@keyframes nDockRise {
+  from { opacity: 0; transform: translate(-50%, 16px); }
+  to { opacity: 1; transform: translate(-50%, 0); }
+}
+
+.n-shell-dock__glow {
+  position: absolute;
+  inset: -28px;
+  z-index: -1;
+  background:
+    radial-gradient(60% 80% at 50% 100%, rgba(99, 102, 241, 0.14), transparent 70%);
+  filter: blur(18px);
+  pointer-events: none;
+}
+
+.n-shell-dock__inner {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 10px 7px 8px;
+  background: rgba(255, 255, 255, 0.42);
+  backdrop-filter: saturate(200%) blur(28px);
+  -webkit-backdrop-filter: saturate(200%) blur(28px);
+  border: 1px solid rgba(255, 255, 255, 0.45);
+  border-radius: 22px;
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.6) inset,
+    0 0 0 1px rgba(228, 228, 231, 0.35),
+    0 12px 32px -12px rgba(15, 15, 20, 0.16),
+    0 4px 14px -4px rgba(99, 102, 241, 0.16);
+}
+:deep(.org-shell.dark) .n-shell-dock__inner {
+  background: rgba(20, 20, 25, 0.45);
+  border-color: rgba(255, 255, 255, 0.08);
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.05) inset,
+    0 0 0 1px rgba(255, 255, 255, 0.04),
+    0 14px 36px -10px rgba(0, 0, 0, 0.7),
+    0 6px 18px -4px rgba(99, 102, 241, 0.24);
+}
+
+.n-shell-dock__rule {
+  display: inline-block;
+  width: 1px;
+  height: 22px;
+  background: linear-gradient(180deg, transparent, var(--n-border-strong) 25%, var(--n-border-strong) 75%, transparent);
+  margin: 0 4px;
+  opacity: 0.65;
+}
+
+/* ─── Brand (mark only) ─────────────────────────── */
+.n-shell-brand {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px;
+  color: var(--n-text);
+  text-decoration: none;
+  cursor: pointer;
+  border-radius: 12px;
+  transition: background var(--n-t-fast) var(--n-ease);
+}
+.n-shell-brand:hover { background: rgba(99, 102, 241, 0.08); }
+.n-shell-brand:hover .n-shell-brand__mark {
+  box-shadow:
+    0 0 0 1px rgba(99, 102, 241, 0.18),
+    0 6px 16px -6px rgba(99, 102, 241, 0.45),
+    0 1px 0 rgba(255, 255, 255, 0.12) inset;
+}
+.n-shell-brand__mark {
+  position: relative;
+  width: 30px;
+  height: 30px;
+  background:
+    radial-gradient(circle at 30% 25%, #4f46e5 0%, #312e81 100%);
+  border-radius: 9px;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.04) inset,
+    0 4px 10px -4px rgba(49, 46, 129, 0.5),
+    0 1px 0 rgba(255, 255, 255, 0.1) inset;
+  transition: box-shadow var(--n-t-base) var(--n-ease);
+  flex-shrink: 0;
+}
+.n-shell-brand__mark-glyph {
+  position: relative;
+  z-index: 1;
+  font-family: var(--n-font-display);
+  font-weight: 600;
+  font-size: 14px;
+  letter-spacing: -0.06em;
+  color: #ffffff;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+}
+.n-shell-brand__mark-shine {
+  position: absolute;
+  inset: 0;
+  background:
+    linear-gradient(155deg, rgba(255, 255, 255, 0.28) 0%, transparent 35%, transparent 65%, rgba(255, 255, 255, 0.05) 100%);
+  pointer-events: none;
+}
+.n-shell-brand__name {
+  font-family: var(--n-font-display);
+  font-weight: 600;
+  font-size: 14px;
+  letter-spacing: -0.025em;
+  color: var(--n-text);
+}
+.n-shell-brand__name-soft {
+  color: var(--n-text-4);
+  font-weight: 400;
+  margin-left: 1px;
+}
+
+/* ─── Nav ────────────────────────────────────────── */
+.n-shell-nav {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+}
+
+.n-shell-nav__divider {
+  display: inline-block;
+  width: 1px;
+  height: 18px;
+  background: var(--n-border-strong);
+  opacity: 0.6;
+  margin: 0 6px;
+}
+
+.n-shell-nav__item {
+  appearance: none;
+  background: transparent;
+  border: 0;
+  color: var(--n-text-3);
+  font-family: var(--n-font-body);
+  font-size: 12.5px;
+  font-weight: 500;
+  letter-spacing: -0.005em;
+  padding: 8px 10px;
+  border-radius: 10px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  position: relative;
+  transition:
+    color var(--n-t-fast) var(--n-ease),
+    background var(--n-t-fast) var(--n-ease),
+    transform var(--n-t-fast) var(--n-ease);
+}
+.n-shell-nav__item:hover {
+  color: var(--n-text);
+  background: rgba(15, 15, 20, 0.04);
+}
+.n-shell-nav__item:active { transform: translateY(0.5px); }
+.n-shell-nav__item.is-active {
+  color: var(--n-brand-ink);
+  background: linear-gradient(180deg, rgba(99, 102, 241, 0.14), rgba(99, 102, 241, 0.08));
+  box-shadow:
+    0 0 0 1px rgba(99, 102, 241, 0.16) inset,
+    0 1px 0 rgba(255, 255, 255, 0.4) inset,
+    0 2px 4px -1px rgba(99, 102, 241, 0.18);
+}
+.n-shell-nav__item.is-active svg {
+  color: var(--n-brand);
+}
+.n-shell-nav__item.is-active::after {
+  content: '';
+  position: absolute;
+  bottom: -8px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 4px;
+  height: 4px;
+  background: var(--n-brand);
+  border-radius: 50%;
+  box-shadow: 0 0 8px rgba(99, 102, 241, 0.5);
+}
+:deep(.org-shell.dark) .n-shell-nav__item.is-active {
+  color: var(--n-brand);
+  background: rgba(99, 102, 241, 0.18);
+}
+:deep(.org-shell.dark) .n-shell-nav__item:hover { background: rgba(255, 255, 255, 0.04); }
+
+/* ─── Right cluster ─────────────────────────────── */
+.n-shell-foot {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.n-shell-icon-btn {
+  appearance: none;
+  background: transparent;
+  border: 0;
+  border-radius: 10px;
+  padding: 8px;
+  color: var(--n-text-3);
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  transition: color var(--n-t-fast) var(--n-ease),
+              background var(--n-t-fast) var(--n-ease);
+}
+.n-shell-icon-btn:hover {
+  color: var(--n-text);
+  background: rgba(15, 15, 20, 0.04);
+}
+:deep(.org-shell.dark) .n-shell-icon-btn:hover { background: rgba(255, 255, 255, 0.04); }
+.n-shell-icon-btn.is-active {
+  color: var(--n-brand);
+  background: linear-gradient(180deg, rgba(99, 102, 241, 0.14), rgba(99, 102, 241, 0.08));
+  box-shadow: 0 0 0 1px rgba(99, 102, 241, 0.16) inset;
+}
+
+/* ─── Bell + notif panel (opens upward) ─────────── */
+.n-shell-bell { position: relative; }
+.n-shell-bell__trigger { position: relative; }
+.n-shell-bell__trigger.has-unread {
+  color: var(--n-text);
+}
+.n-shell-bell__badge {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  background: linear-gradient(180deg, #f43f5e 0%, #e11d48 100%);
+  color: #ffffff;
+  font-family: var(--n-font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  border-radius: 8px;
+  display: grid;
+  place-items: center;
+  border: 2px solid rgba(255, 255, 255, 0.85);
+  box-shadow: 0 1px 4px -1px rgba(244, 63, 94, 0.45);
+  letter-spacing: -0.02em;
+  line-height: 1;
+}
+:deep(.org-shell.dark) .n-shell-bell__badge {
+  border-color: rgba(20, 20, 25, 0.85);
+}
+
+.n-shell-bell__panel {
+  position: absolute;
+  bottom: calc(100% + 14px);
+  right: -8px;
+  width: min(360px, calc(100vw - 32px));
+  max-height: min(520px, calc(100vh - 140px));
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.92);
+  backdrop-filter: saturate(200%) blur(28px);
+  -webkit-backdrop-filter: saturate(200%) blur(28px);
+  border: 1px solid var(--n-border);
+  border-radius: 18px;
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.6) inset,
+    0 24px 48px -16px rgba(15, 15, 20, 0.22),
+    0 8px 16px -4px rgba(99, 102, 241, 0.12);
+  display: grid;
+  grid-template-rows: auto 1fr;
+  animation: nBellPop 240ms var(--n-ease) both;
+}
+:deep(.org-shell.dark) .n-shell-bell__panel {
+  background: rgba(18, 18, 24, 0.92);
+  border-color: rgba(255, 255, 255, 0.07);
+}
+@keyframes nBellPop {
+  from { opacity: 0; transform: translateY(6px) scale(0.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+/* Tail pointing down toward the bell */
+.n-shell-bell__panel::after {
+  content: '';
+  position: absolute;
+  bottom: -7px;
+  right: 25px;
+  width: 14px;
+  height: 14px;
+  background: inherit;
+  border-right: 1px solid var(--n-border);
+  border-bottom: 1px solid var(--n-border);
+  transform: rotate(45deg);
+}
+
+.n-shell-bell__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 18px 12px;
+  border-bottom: 1px solid var(--n-border-subtle);
+}
+.n-shell-bell__head strong {
+  font-family: var(--n-font-display);
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--n-text);
+  letter-spacing: -0.005em;
+}
+.n-shell-bell__mark-all {
+  appearance: none;
+  background: transparent;
+  border: 0;
+  color: var(--n-brand);
+  font-family: var(--n-font-body);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 6px;
+  transition: background var(--n-t-fast) var(--n-ease);
+}
+.n-shell-bell__mark-all:hover { background: var(--n-brand-soft); }
+
+.n-shell-bell__empty {
+  margin: 0;
+  padding: 24px 20px;
+  text-align: center;
+  font-size: 13px;
+  color: var(--n-text-3);
+  line-height: 1.5;
+}
+
+.n-shell-bell__list {
+  list-style: none;
+  margin: 0;
+  padding: 4px 0;
+  overflow-y: auto;
+  max-height: 420px;
+}
+.n-shell-bell__row {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 12px 18px;
+  cursor: pointer;
+  transition: background var(--n-t-fast) var(--n-ease);
+  border-left: 2px solid transparent;
+}
+.n-shell-bell__row:hover { background: var(--n-surface); }
+.n-shell-bell__row.is-unread {
+  background: var(--n-brand-soft);
+  border-left-color: var(--n-brand);
+}
+.n-shell-bell__row.is-unread:hover { background: rgba(99, 102, 241, 0.16); }
+
+.n-shell-bell__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--n-text-4);
+  margin-top: 5px;
+  flex-shrink: 0;
+}
+.n-shell-bell__dot.severity-info { background: var(--n-info); box-shadow: 0 0 0 3px var(--n-info-soft); }
+.n-shell-bell__dot.severity-warning { background: var(--n-warning); box-shadow: 0 0 0 3px var(--n-warning-soft); }
+.n-shell-bell__dot.severity-error,
+.n-shell-bell__dot.severity-critical { background: var(--n-danger); box-shadow: 0 0 0 3px var(--n-danger-soft); }
+.n-shell-bell__dot.severity-success { background: var(--n-success); box-shadow: 0 0 0 3px var(--n-success-soft); }
+
+.n-shell-bell__row-body { display: grid; gap: 2px; min-width: 0; }
+.n-shell-bell__row-body strong {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--n-text);
+  letter-spacing: -0.005em;
+  line-height: 1.35;
+}
+.n-shell-bell__row-body small {
+  font-size: 12px;
+  color: var(--n-text-3);
+  line-height: 1.45;
+}
+.n-shell-bell__row-time {
+  font-family: var(--n-font-mono) !important;
+  font-size: 10.5px !important;
+  color: var(--n-text-4) !important;
+  letter-spacing: 0.02em;
+  margin-top: 2px;
+}
+
+.n-shell-user {
+  appearance: none;
+  background: transparent;
+  border: 0;
+  border-radius: 999px;
+  padding: 3px 12px 3px 3px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  color: var(--n-text);
+  transition: background var(--n-t-fast) var(--n-ease);
+  margin-left: 4px;
+}
+.n-shell-user:hover { background: rgba(15, 15, 20, 0.04); }
+:deep(.org-shell.dark) .n-shell-user:hover { background: rgba(255, 255, 255, 0.04); }
+
+.n-shell-user__avatar {
+  position: relative;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, var(--n-brand-soft) 0%, var(--n-surface-2) 100%);
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  border: 1px solid rgba(99, 102, 241, 0.12);
+}
+.n-shell-user__avatar-letter {
+  font-family: var(--n-font-display);
+  font-weight: 600;
+  font-size: 12.5px;
+  color: var(--n-brand-ink);
+  letter-spacing: -0.02em;
+}
+.n-shell-user__online {
+  position: absolute;
+  bottom: -1px;
+  right: -1px;
+  width: 9px;
+  height: 9px;
+  background: var(--n-success);
+  border: 2px solid var(--n-bg);
+  border-radius: 50%;
+}
+
+.n-shell-user__meta { display: grid; line-height: 1.15; text-align: left; max-width: 140px; }
+.n-shell-user__org {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--n-text);
+  letter-spacing: -0.01em;
+}
+.n-shell-user__role {
+  font-family: var(--n-font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--n-text-3);
+}
+
+@media (max-width: 1100px) {
+  .n-shell-cmdk span { display: none; }
+  .n-shell-cmdk { padding: 6px 8px; }
+}
+
+/* ─── Banner & callout ─────────────────────────────── */
+.n-shell-banner {
+  max-width: var(--n-content-w);
+  margin: 12px auto 0;
+  padding: 0 var(--n-page-x);
+}
+.n-shell-banner__inner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px;
+  border-radius: var(--n-r-lg);
+  background: var(--n-surface);
+  border: 1px solid var(--n-border);
+  color: var(--n-text);
+  font-size: 13px;
+}
+.n-shell-banner__inner.is-error { background: var(--n-danger-soft); border-color: rgba(220, 38, 38, 0.18); color: var(--n-danger-2); }
+.n-shell-banner__inner.is-info { background: var(--n-success-soft); border-color: rgba(5, 150, 105, 0.18); color: var(--n-success-2); }
+
+.n-shell-callout {
+  max-width: var(--n-content-w);
+  margin: 16px auto 0;
+  padding: 0 var(--n-page-x);
+}
+.n-shell-callout__inner {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 16px;
+  align-items: center;
+  padding: 16px 20px;
+  background: var(--n-brand-soft);
+  border: 1px solid rgba(99, 102, 241, 0.18);
+  border-radius: var(--n-r-xl);
+}
+.n-shell-callout__icon {
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  background: var(--n-bg);
+  color: var(--n-brand);
+  display: grid;
+  place-items: center;
+  border: 1px solid rgba(99, 102, 241, 0.18);
+}
+.n-shell-callout__copy { display: grid; gap: 2px; }
+.n-shell-callout__copy strong {
+  font-family: var(--n-font-display);
+  font-size: 14px;
+  color: var(--n-brand-ink);
+  font-weight: 600;
+  letter-spacing: -0.005em;
+}
+.n-shell-callout__copy span {
+  font-size: 13px;
+  color: var(--n-text-2);
+}
+
+/* ─── Responsive ─────────────────────────────────── */
+@media (max-width: 1100px) {
+  .n-shell-nav__item span { display: none; }
+  .n-shell-nav__item { padding: 8px; }
+  .n-shell-nav__divider { margin: 0 3px; height: 16px; }
+  .n-shell-user__meta { display: none; }
+  .n-shell-user { padding: 3px; }
+}
+@media (max-width: 720px) {
+  .n-shell-dock { left: 12px; right: 12px; transform: none; bottom: max(12px, env(safe-area-inset-bottom, 0px)); }
+  @keyframes nDockRise { from { opacity: 0; transform: translateY(16px); } to { opacity: 1; transform: translateY(0); } }
+  .n-shell-dock__inner { width: 100%; justify-content: space-between; }
+  .n-shell-dock__rule { display: none; }
+}
+
+/* ============================================================
+   v2 AUTH (login / signup / MFA / invite / wizards)
+   ============================================================ */
+.auth-v2 {
+  position: relative;
+  min-height: 100vh;
+  display: grid;
+  grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr);
+  font-family: var(--n-font-body);
+  color: var(--n-text);
+  background: var(--n-bg);
+}
+
+@media (max-width: 960px) {
+  .auth-v2 { grid-template-columns: 1fr; }
+  .auth-v2__stage { display: none; }
+}
+
+/* ─── Left stage ─────────────────────────────────────── */
+.auth-v2__stage {
+  position: relative;
+  overflow: hidden;
+  isolation: isolate;
+  background:
+    radial-gradient(140% 100% at -10% 110%, #1e1b4b 0%, transparent 55%),
+    radial-gradient(120% 100% at 110% -10%, #312e81 0%, transparent 55%),
+    linear-gradient(135deg, #0a0a18 0%, #14132b 35%, #1d1849 100%);
+  color: #f5f3ff;
+}
+
+/* Mesh wash overlay */
+.auth-v2__mesh {
+  position: absolute;
+  inset: -10%;
+  background:
+    radial-gradient(38% 28% at 22% 28%, rgba(99, 102, 241, 0.55), transparent 70%),
+    radial-gradient(34% 24% at 78% 70%, rgba(168, 85, 247, 0.42), transparent 70%),
+    radial-gradient(30% 22% at 12% 88%, rgba(56, 189, 248, 0.28), transparent 70%);
+  filter: blur(40px) saturate(140%);
+  opacity: 0.95;
+  z-index: 1;
+  pointer-events: none;
+  animation: authMesh 24s linear infinite;
+}
+@keyframes authMesh {
+  0%   { transform: translate(0, 0) scale(1); }
+  33%  { transform: translate(2%, -1.5%) scale(1.03); }
+  66%  { transform: translate(-2%, 1.5%) scale(0.99); }
+  100% { transform: translate(0, 0) scale(1); }
+}
+
+/* Subtle dot grid above mesh */
+.auth-v2__grid {
+  position: absolute;
+  inset: 0;
+  background-image:
+    radial-gradient(rgba(255, 255, 255, 0.08) 1px, transparent 1.5px);
+  background-size: 28px 28px;
+  background-position: 0 0;
+  mask-image: radial-gradient(80% 70% at 50% 50%, #000 40%, transparent 100%);
+  z-index: 2;
+  pointer-events: none;
+}
+
+/* Floating orbs (premium signature) */
+.auth-v2__orb {
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(40px);
+  z-index: 3;
+  pointer-events: none;
+  opacity: 0.55;
+  mix-blend-mode: screen;
+}
+.auth-v2__orb--a {
+  width: 360px; height: 360px;
+  background: radial-gradient(circle, #818cf8 0%, transparent 70%);
+  top: -120px; left: -80px;
+  animation: authOrbA 14s ease-in-out infinite;
+}
+.auth-v2__orb--b {
+  width: 480px; height: 480px;
+  background: radial-gradient(circle, #c084fc 0%, transparent 70%);
+  bottom: -160px; right: -120px;
+  animation: authOrbB 18s ease-in-out infinite;
+}
+.auth-v2__orb--c {
+  width: 240px; height: 240px;
+  background: radial-gradient(circle, #38bdf8 0%, transparent 70%);
+  top: 45%; left: 35%;
+  animation: authOrbC 22s ease-in-out infinite;
+  opacity: 0.4;
+}
+@keyframes authOrbA {
+  0%, 100% { transform: translate(0, 0); }
+  50% { transform: translate(40px, 60px); }
+}
+@keyframes authOrbB {
+  0%, 100% { transform: translate(0, 0); }
+  50% { transform: translate(-50px, -40px); }
+}
+@keyframes authOrbC {
+  0%, 100% { transform: translate(0, 0); }
+  50% { transform: translate(30px, -50px); }
+}
+
+/* SVG grain overlay */
+.auth-v2__noise {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  opacity: 0.18;
+  mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='180' height='180'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 1  0 0 0 0 1  0 0 0 0 1  0 0 0 0.6 0'/></filter><rect width='180' height='180' filter='url(%23n)'/></svg>");
+  background-size: 180px;
+  pointer-events: none;
+}
+
+/* Stage content */
+.auth-v2__stage-content {
+  position: relative;
+  z-index: 5;
+  height: 100%;
+  min-height: 100vh;
+  padding: 48px clamp(40px, 5vw, 72px);
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  gap: 32px;
+  animation: authFade 640ms var(--n-ease) 80ms both;
+}
+
+@keyframes authFade {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* Brand on stage */
+.auth-v2__brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 11px;
+}
+.auth-v2__brand-mark {
+  position: relative;
+  width: 36px;
+  height: 36px;
+  background: radial-gradient(circle at 30% 25%, #6366f1 0%, #312e81 100%);
+  border-radius: 11px;
+  display: grid;
+  place-items: center;
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.08) inset,
+    0 4px 12px -2px rgba(99, 102, 241, 0.55),
+    0 1px 0 rgba(255, 255, 255, 0.18) inset;
+}
+.auth-v2__brand-glyph {
+  font-family: var(--n-font-display);
+  font-weight: 600;
+  font-size: 17px;
+  color: #fff;
+  letter-spacing: -0.06em;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+}
+.auth-v2__brand-name {
+  font-family: var(--n-font-display);
+  font-weight: 600;
+  font-size: 16px;
+  letter-spacing: -0.02em;
+}
+.auth-v2__brand-name span { color: rgba(255, 255, 255, 0.45); font-weight: 400; }
+
+.auth-v2__brand--mobile { display: none; margin-bottom: 24px; }
+
+/* Pitch block (the headline) */
+.auth-v2__pitch { display: grid; gap: 18px; max-width: 30ch; align-self: end; }
+.auth-v2__pitch-eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--n-font-mono);
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: rgba(255, 255, 255, 0.75);
+  padding: 5px 12px;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 999px;
+  width: max-content;
+  backdrop-filter: blur(8px);
+}
+.auth-v2__pulse {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #34d399;
+  box-shadow: 0 0 0 4px rgba(52, 211, 153, 0.18);
+  animation: authPulse 1.6s ease-in-out infinite;
+}
+@keyframes authPulse {
+  0%, 100% { opacity: 0.7; transform: scale(1); }
+  50% { opacity: 1; transform: scale(1.15); }
+}
+
+.auth-v2__pitch-title {
+  margin: 0;
+  font-family: var(--n-font-display);
+  font-weight: 600;
+  font-size: clamp(48px, 5.2vw, 80px);
+  line-height: 0.96;
+  letter-spacing: -0.035em;
+  color: #ffffff;
+}
+.auth-v2__pitch-title em {
+  font-style: italic;
+  font-weight: 400;
+  background: linear-gradient(135deg, #c7d2fe 0%, #f0abfc 50%, #93c5fd 100%);
+  background-clip: text;
+  -webkit-background-clip: text;
+  color: transparent;
+}
+.auth-v2__pitch-sub {
+  margin: 0;
+  font-size: 15px;
+  line-height: 1.6;
+  color: rgba(245, 243, 255, 0.7);
+  max-width: 42ch;
+}
+
+/* Highlights */
+.auth-v2__highlights {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 14px;
+  align-self: end;
+}
+.auth-v2__highlights li {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 12px;
+  align-items: start;
+  padding: 14px 16px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 14px;
+  backdrop-filter: blur(8px);
+  transition: background 200ms ease, border-color 200ms ease, transform 200ms ease;
+}
+.auth-v2__highlights li:hover {
+  background: rgba(255, 255, 255, 0.07);
+  border-color: rgba(255, 255, 255, 0.14);
+  transform: translateY(-1px);
+}
+.auth-v2__check {
+  width: 22px;
+  height: 22px;
+  border-radius: 7px;
+  background: linear-gradient(135deg, #6366f1 0%, #4f46e5 100%);
+  color: #ffffff;
+  font-size: 12px;
+  font-weight: 700;
+  display: grid;
+  place-items: center;
+  margin-top: 2px;
+  box-shadow: 0 2px 6px -1px rgba(99, 102, 241, 0.4);
+}
+.auth-v2__highlights strong {
+  display: block;
+  font-family: var(--n-font-display);
+  font-size: 14px;
+  font-weight: 600;
+  color: #ffffff;
+  letter-spacing: -0.005em;
+}
+.auth-v2__highlights small {
+  display: block;
+  font-size: 12.5px;
+  color: rgba(245, 243, 255, 0.6);
+  line-height: 1.5;
+  margin-top: 2px;
+}
+
+/* Stage footer */
+.auth-v2__stage-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  font-size: 12px;
+  color: rgba(245, 243, 255, 0.5);
+  padding-top: 8px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+.auth-v2__trust { display: inline-flex; align-items: center; gap: 8px; }
+.auth-v2__trust-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #34d399;
+  box-shadow: 0 0 0 3px rgba(52, 211, 153, 0.18);
+}
+.auth-v2__copy { font-family: var(--n-font-mono); letter-spacing: 0.04em; }
+
+/* ─── Right form shell ────────────────────────────── */
+.auth-v2__form-shell {
+  position: relative;
+  display: grid;
+  place-items: center;
+  padding: 48px clamp(24px, 4vw, 64px);
+  background:
+    radial-gradient(800px 400px at 100% 0%, rgba(99, 102, 241, 0.05), transparent 60%),
+    var(--n-bg);
+  overflow-y: auto;
+}
+
+@media (max-width: 960px) {
+  .auth-v2__brand--mobile { display: inline-flex; }
+  .auth-v2__brand--mobile .auth-v2__brand-name { color: var(--n-text); }
+  .auth-v2__brand--mobile .auth-v2__brand-name span { color: var(--n-text-3); }
+}
+
+.auth-v2__card {
+  position: relative;
+  width: 100%;
+  max-width: 440px;
+  padding: 36px 40px;
+  background: var(--n-bg-elev);
+  border: 1px solid var(--n-border);
+  border-radius: 20px;
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.6) inset,
+    0 24px 48px -16px rgba(15, 15, 20, 0.12),
+    0 8px 16px -4px rgba(99, 102, 241, 0.08);
+  animation: authFade 600ms var(--n-ease) 140ms both;
+}
+:deep(.org-shell.dark) .auth-v2__card {
+  background: var(--n-bg-elev);
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.05) inset,
+    0 24px 48px -16px rgba(0, 0, 0, 0.6),
+    0 8px 16px -4px rgba(99, 102, 241, 0.12);
+}
+
+.auth-v2__foot-note {
+  margin: 24px auto 0;
+  max-width: 440px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--n-text-3);
+  line-height: 1.5;
+}
+
+/* ─── Override the legacy auth primitives inside .auth-v2 ─── */
+.auth-v2 :deep(.message) {
+  border-radius: 12px;
+  padding: 10px 14px;
+  font-size: 13px;
+  margin-bottom: 18px;
+  border-width: 1px;
+  border-style: solid;
+}
+.auth-v2 :deep(.message.error) {
+  background: var(--n-danger-soft);
+  border-color: rgba(220, 38, 38, 0.2);
+  color: var(--n-danger-2);
+}
+.auth-v2 :deep(.message.info) {
+  background: var(--n-success-soft);
+  border-color: rgba(5, 150, 105, 0.2);
+  color: var(--n-success-2);
+}
+
+.auth-v2 :deep(.mfa-panel) {
+  display: grid;
+  gap: 14px;
+  background: transparent;
+  border: 0;
+  padding: 0;
+  box-shadow: none;
+}
+.auth-v2 :deep(.mfa-head) { display: grid; gap: 6px; margin-bottom: 6px; }
+.auth-v2 :deep(.mfa-head strong) {
+  font-family: var(--n-font-display);
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: -0.025em;
+  color: var(--n-text);
+  line-height: 1.2;
+}
+.auth-v2 :deep(.mfa-head span) {
+  font-size: 13.5px;
+  color: var(--n-text-3);
+  line-height: 1.5;
+}
+
+.auth-v2 :deep(.code-label) {
+  font-family: var(--n-font-body);
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--n-text-2);
+  letter-spacing: -0.005em;
+  display: block;
+  margin: 4px 0 6px;
+}
+
+.auth-v2 :deep(.totp-input) {
+  appearance: none;
+  width: 100%;
+  font-family: var(--n-font-body);
+  font-size: 14px;
+  color: var(--n-text);
+  background: var(--n-bg);
+  border: 1px solid var(--n-border);
+  border-radius: 10px;
+  padding: 11px 14px;
+  line-height: 1.4;
+  transition:
+    border-color var(--n-t-fast) var(--n-ease),
+    box-shadow var(--n-t-fast) var(--n-ease);
+}
+.auth-v2 :deep(.totp-input::placeholder) { color: var(--n-text-4); }
+.auth-v2 :deep(.totp-input:hover) { border-color: var(--n-border-strong); }
+.auth-v2 :deep(.totp-input:focus) {
+  outline: none;
+  border-color: var(--n-brand);
+  box-shadow: var(--n-shadow-focus);
+}
+.auth-v2 :deep(.totp-input[inputmode="numeric"]) {
+  font-family: var(--n-font-mono);
+  letter-spacing: 0.5em;
+  text-align: center;
+  font-size: 22px;
+  padding: 14px 12px;
+}
+
+.auth-v2 :deep(.mfa-actions) {
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+  margin-top: 10px;
+}
+.auth-v2 :deep(.primary-button) {
+  appearance: none;
+  border: 0;
+  background: linear-gradient(180deg, #6366f1 0%, #4f46e5 100%);
+  color: #ffffff;
+  font-family: var(--n-font-body);
+  font-size: 14px;
+  font-weight: 500;
+  letter-spacing: -0.005em;
+  padding: 11px 22px;
+  border-radius: 10px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.2) inset,
+    0 4px 12px -2px rgba(99, 102, 241, 0.4);
+  transition:
+    transform var(--n-t-fast) var(--n-ease),
+    box-shadow var(--n-t-fast) var(--n-ease);
+}
+.auth-v2 :deep(.primary-button:hover:not(:disabled)) {
+  transform: translateY(-1px);
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.25) inset,
+    0 8px 18px -4px rgba(99, 102, 241, 0.55);
+}
+.auth-v2 :deep(.primary-button:disabled) { opacity: 0.55; cursor: not-allowed; transform: none; }
+
+.auth-v2 :deep(.ghost-button) {
+  appearance: none;
+  background: transparent;
+  border: 1px solid var(--n-border);
+  color: var(--n-text-2);
+  font-family: var(--n-font-body);
+  font-size: 14px;
+  font-weight: 500;
+  letter-spacing: -0.005em;
+  padding: 10px 18px;
+  border-radius: 10px;
+  cursor: pointer;
+  transition: background var(--n-t-fast) var(--n-ease),
+              border-color var(--n-t-fast) var(--n-ease),
+              color var(--n-t-fast) var(--n-ease);
+}
+.auth-v2 :deep(.ghost-button:hover:not(:disabled)) {
+  background: var(--n-surface);
+  border-color: var(--n-border-strong);
+  color: var(--n-text);
+}
+
+.auth-v2 :deep(.login-help) {
+  font-size: 12.5px;
+  color: var(--n-text-3);
+  line-height: 1.55;
+  margin: 4px 0 0;
+}
+.auth-v2 :deep(.login-help.compact) { margin: 0; }
+
+/* Google button + divider */
+.auth-v2 :deep(.google-action) { margin-bottom: 4px; }
+.auth-v2 :deep(.google-button-host) {
+  display: flex;
+  justify-content: center;
+  border-radius: 10px;
+  overflow: hidden;
+}
+.auth-v2 :deep(.google-button-host iframe) { border-radius: 10px !important; }
+.auth-v2 :deep(.google-fallback-button) {
+  width: 100%;
+  appearance: none;
+  background: var(--n-bg);
+  border: 1px solid var(--n-border);
+  border-radius: 10px;
+  padding: 11px 14px;
+  font-family: var(--n-font-body);
+  font-size: 14px;
+  color: var(--n-text);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  cursor: not-allowed;
+  opacity: 0.65;
+}
+.auth-v2 :deep(.google-mark) {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #4285F4, #34A853, #FBBC05, #EA4335);
+  color: #ffffff;
+  font-weight: 700;
+  display: grid;
+  place-items: center;
+  font-size: 12px;
+  font-family: var(--n-font-display);
+}
+
+.auth-v2 :deep(.auth-divider) {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 4px 0 4px;
+  color: var(--n-text-4);
+  font-family: var(--n-font-mono);
+  font-size: 11px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+}
+.auth-v2 :deep(.auth-divider::before),
+.auth-v2 :deep(.auth-divider::after) {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--n-border);
+}
+
+/* QR + secret + provisioning */
+.auth-v2 :deep(.qr-shell) {
+  background: var(--n-bg);
+  border: 1px solid var(--n-border);
+  border-radius: 14px;
+  padding: 16px;
+  display: grid;
+  place-items: center;
+  margin: 6px 0;
+}
+.auth-v2 :deep(.secret-note) {
+  font-size: 12px;
+  color: var(--n-text-3);
+  background: var(--n-surface);
+  padding: 10px 12px;
+  border-radius: 8px;
+  word-break: break-all;
+}
+.auth-v2 :deep(.secret-note code) {
+  font-family: var(--n-font-mono);
+  font-size: 11.5px;
+  color: var(--n-text);
+}
+
+.auth-v2 :deep(.provisioning-block) {
+  background: var(--n-surface);
+  border: 1px solid var(--n-border-subtle);
+  border-radius: 14px;
+  padding: 16px;
+}
+.auth-v2 :deep(.provisioning-head) {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.auth-v2 :deep(.provisioning-head strong) { font-size: 13px; font-weight: 600; color: var(--n-text); }
+.auth-v2 :deep(.provisioning-steps) {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+.auth-v2 :deep(.provisioning-steps li) {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 10px;
+  align-items: center;
+  padding: 10px 12px;
+  background: var(--n-bg);
+  border: 1px solid var(--n-border-subtle);
+  border-radius: 10px;
+  font-size: 12.5px;
+}
+.auth-v2 :deep(.provisioning-steps li strong) { font-size: 12.5px; color: var(--n-text); display: block; }
+.auth-v2 :deep(.provisioning-steps li small) { font-size: 11.5px; color: var(--n-text-3); display: block; }
+.auth-v2 :deep(.step-marker) {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--n-text-4);
+}
+.auth-v2 :deep(.step-marker[data-state="running"]) { background: var(--n-brand); box-shadow: 0 0 0 3px var(--n-brand-soft); animation: authPulse 1.6s ease-in-out infinite; }
+.auth-v2 :deep(.step-marker[data-state="success"]),
+.auth-v2 :deep(.step-marker[data-state="completed"]) { background: var(--n-success); box-shadow: 0 0 0 3px var(--n-success-soft); }
+.auth-v2 :deep(.step-marker[data-state="failed"]),
+.auth-v2 :deep(.step-marker[data-state="error"]) { background: var(--n-danger); box-shadow: 0 0 0 3px var(--n-danger-soft); }
+.auth-v2 :deep(.step-state) {
+  font-family: var(--n-font-mono);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--n-text-4);
+}
+
+/* Wizards (business type / outcome / real estate / sample upload) — give
+   them breathing room so they don't overflow the card. */
+.auth-v2 :deep(.outcome-wizard),
+.auth-v2 :deep(.real-estate-wizard) { display: grid; gap: 14px; }
+
+/* Hide the legacy footer-links wrapper if it shows up */
+.auth-v2 :deep(.footer-links) { display: none; }
+
+/* ============================================================
+   Legacy styles below — kept for non-redesigned views.
+   ============================================================ */
 .org-shell {
   position: relative;
   min-height: 100vh;
@@ -9142,8 +8375,8 @@ onBeforeUnmount(() => {
   overflow: hidden;
   --cursor-x: 50%;
   --cursor-y: 30%;
-  background: #fbfaee;
-  color: #1b1c15;
+  background: var(--paper);
+  color: var(--ink);
   display: flex;
   flex-direction: column;
 }
@@ -9189,7 +8422,7 @@ onBeforeUnmount(() => {
 .mode-link {
   border: 1px solid rgba(27, 28, 21, 0.12);
   background: rgba(255, 255, 255, 0.82);
-  color: #1b1c15;
+  color: var(--ink);
   padding: 0.8rem 1rem;
   border-radius: 999px;
   display: inline-flex;
@@ -9248,7 +8481,7 @@ onBeforeUnmount(() => {
     linear-gradient(135deg, #f4e8d2 0%, #f6c8a3 35%, #b3c8f0 70%, #d9b8f5 100%);
   background-size: 180% 180%, 180% 180%, 180% 180%, 200% 200%;
   background-position: 0% 0%, 100% 0%, 50% 100%, 0% 50%;
-  color: #1b1c15;
+  color: var(--ink);
   overflow: hidden;
   animation: connect-bg-drift 18s ease-in-out infinite alternate,
     connect-layout-in 0.55s ease-out both;
@@ -9275,8 +8508,8 @@ onBeforeUnmount(() => {
   border-radius: 999px;
   border: 1px solid rgba(27, 28, 21, 0.18);
   background: rgba(255, 255, 255, 0.72);
-  color: #1b1c15;
-  font-family: Manrope, sans-serif;
+  color: var(--ink);
+  font-family: var(--nokvo-body);
   font-size: 0.85rem;
   font-weight: 600;
   cursor: pointer;
@@ -9290,7 +8523,8 @@ onBeforeUnmount(() => {
 }
 
 .connect-title {
-  font-family: 'Playfair Display', Manrope, serif;
+  font-family: var(--nokvo-display);
+  font-optical-sizing: auto;
   font-size: clamp(2.75rem, 6vw, 4.75rem);
   font-weight: 700;
   letter-spacing: -0.01em;
@@ -9323,8 +8557,8 @@ onBeforeUnmount(() => {
   border-radius: 999px;
   border: 1px solid rgba(27, 28, 21, 0.18);
   background: rgba(27, 28, 21, 0.88);
-  color: #f4f0e1;
-  font-family: Manrope, sans-serif;
+  color: var(--surface);
+  font-family: var(--nokvo-body);
   font-size: 0.95rem;
   font-weight: 600;
   letter-spacing: 0.01em;
@@ -9340,7 +8574,7 @@ onBeforeUnmount(() => {
 .connect-continue-button:hover {
   transform: translateY(-1px);
   box-shadow: 0 12px 30px rgba(27, 28, 21, 0.24);
-  background: #1b1c15;
+  background: var(--ink);
 }
 
 .connect-continue-button:active {
@@ -9354,13 +8588,13 @@ onBeforeUnmount(() => {
 
 .org-shell.dark .connect-continue-button {
   background: rgba(244, 240, 225, 0.92);
-  color: #1b1c15;
+  color: var(--ink);
   border-color: rgba(244, 240, 225, 0.3);
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
 }
 
 .org-shell.dark .connect-continue-button:hover {
-  background: #ffffff;
+  background: var(--surface);
 }
 
 .connect-layout--scroll {
@@ -9383,17 +8617,18 @@ onBeforeUnmount(() => {
   border-radius: 18px;
   padding: 1.75rem;
   box-shadow: 0 18px 48px rgba(27, 28, 21, 0.12);
-  color: #1b1c15;
+  color: var(--ink);
 }
 
 .connect-panel-head h2 {
-  font-family: 'Playfair Display', Manrope, serif;
+  font-family: var(--nokvo-display);
+  font-optical-sizing: auto;
   font-size: 1.6rem;
   margin: 0 0 0.35rem;
 }
 
 .connect-panel-head p {
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.92rem;
   margin: 0;
 }
@@ -9410,8 +8645,8 @@ onBeforeUnmount(() => {
 }
 
 .connect-secret-callout {
-  background: #1b1c15;
-  color: #f4f0e1;
+  background: var(--ink);
+  color: var(--surface);
   border-radius: 12px;
   padding: 1rem 1.1rem;
   display: flex;
@@ -9420,7 +8655,7 @@ onBeforeUnmount(() => {
 }
 
 .connect-secret-callout strong {
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-size: 0.95rem;
 }
 
@@ -9450,7 +8685,7 @@ onBeforeUnmount(() => {
 
 .connect-secret-subline code {
   font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
-  color: #f4f0e1;
+  color: var(--surface);
   word-break: break-all;
 }
 
@@ -9458,7 +8693,7 @@ onBeforeUnmount(() => {
   align-self: flex-end;
   background: rgba(244, 240, 225, 0.12);
   border: 1px solid rgba(244, 240, 225, 0.22);
-  color: #f4f0e1;
+  color: var(--surface);
   padding: 0.4rem 0.85rem;
   border-radius: 999px;
   cursor: pointer;
@@ -9488,7 +8723,7 @@ onBeforeUnmount(() => {
   flex-direction: column;
   gap: 0.3rem;
   font-size: 0.82rem;
-  color: #5f5f53;
+  color: var(--muted);
 }
 
 .connect-create-form input,
@@ -9499,7 +8734,7 @@ onBeforeUnmount(() => {
   border-radius: 8px;
   padding: 0.6rem 0.75rem;
   font-size: 0.9rem;
-  color: #1b1c15;
+  color: var(--ink);
   font-family: inherit;
 }
 
@@ -9523,13 +8758,13 @@ onBeforeUnmount(() => {
 }
 
 .connect-key-list h3 {
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-size: 0.95rem;
   margin: 0.5rem 0 0;
 }
 
 .connect-key-empty {
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.88rem;
   padding: 0.75rem 0;
 }
@@ -9553,14 +8788,14 @@ onBeforeUnmount(() => {
 
 .connect-key-card-head strong {
   display: block;
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-size: 0.92rem;
 }
 
 .connect-key-card-head code {
   font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 0.78rem;
-  color: #5f5f53;
+  color: var(--muted);
 }
 
 .connect-key-status {
@@ -9584,7 +8819,7 @@ onBeforeUnmount(() => {
   gap: 0.45rem 1rem;
   margin: 0;
   font-size: 0.78rem;
-  color: #5f5f53;
+  color: var(--muted);
 }
 
 .connect-key-card-meta div {
@@ -9593,12 +8828,12 @@ onBeforeUnmount(() => {
 }
 
 .connect-key-card-meta dt {
-  color: #5f5f53;
+  color: var(--muted);
 }
 
 .connect-key-card-meta dd {
   margin: 0;
-  color: #1b1c15;
+  color: var(--ink);
   font-weight: 600;
 }
 
@@ -9620,7 +8855,7 @@ onBeforeUnmount(() => {
 .org-shell.dark .connect-panel {
   background: rgba(28, 29, 24, 0.72);
   border-color: rgba(244, 240, 225, 0.16);
-  color: #f4f0e1;
+  color: var(--surface);
 }
 
 .org-shell.dark .connect-panel-head p,
@@ -9636,7 +8871,7 @@ onBeforeUnmount(() => {
 .org-shell.dark .connect-create-form textarea {
   background: rgba(28, 29, 24, 0.6);
   border-color: rgba(244, 240, 225, 0.2);
-  color: #f4f0e1;
+  color: var(--surface);
 }
 
 .org-shell.dark .connect-key-card {
@@ -9645,7 +8880,7 @@ onBeforeUnmount(() => {
 }
 
 .org-shell.dark .connect-key-card-meta dd {
-  color: #f4f0e1;
+  color: var(--surface);
 }
 
 @keyframes connect-char-in {
@@ -9666,7 +8901,7 @@ onBeforeUnmount(() => {
 }
 
 .org-shell.dark .connect-layout {
-  color: #f4f0e1;
+  color: var(--surface);
   background:
     radial-gradient(circle at 12% 18%, rgba(255, 168, 78, 0.4), transparent 55%),
     radial-gradient(circle at 88% 14%, rgba(80, 140, 220, 0.45), transparent 55%),
@@ -9677,7 +8912,7 @@ onBeforeUnmount(() => {
 .org-shell.dark .connect-back-link {
   border-color: rgba(244, 240, 225, 0.28);
   background: rgba(28, 29, 24, 0.7);
-  color: #f4f0e1;
+  color: var(--surface);
 }
 
 .org-shell.dark .connect-back-link:hover {
@@ -9724,7 +8959,7 @@ onBeforeUnmount(() => {
 }
 
 .brand-block h1 {
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-size: clamp(2.25rem, 4vw, 3rem);
   letter-spacing: -0.05em;
   font-weight: 700;
@@ -9732,13 +8967,13 @@ onBeforeUnmount(() => {
 
 .brand-block p {
   margin: 0;
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 1rem;
 }
 
 .login-card {
   background: rgba(255, 255, 255, 0.82);
-  border: 1px solid #e4e3d7;
+  border: 1px solid var(--line-solid);
   box-shadow: 0 20px 60px -30px rgba(27, 28, 21, 0.18);
   backdrop-filter: blur(16px);
   width: 100%;
@@ -9767,9 +9002,9 @@ onBeforeUnmount(() => {
   width: 100%;
   min-height: 44px;
   border-radius: 999px;
-  border: 1px solid #d9d8ce;
-  background: #ffffff;
-  color: #1b1c15;
+  border: 1px solid var(--line-solid);
+  background: var(--surface);
+  color: var(--ink);
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -9786,7 +9021,7 @@ onBeforeUnmount(() => {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border: 1px solid #d9d8ce;
+  border: 1px solid var(--line-solid);
   font-family: Arial, sans-serif;
   font-weight: 700;
   color: #4285f4;
@@ -9797,7 +9032,7 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 0.6rem;
   margin: 0.4rem 0;
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.78rem;
   letter-spacing: 0.06em;
   text-transform: uppercase;
@@ -9825,7 +9060,7 @@ onBeforeUnmount(() => {
 .footer-links p {
   margin-top: 1rem;
   text-align: center;
-  color: #5f5f53;
+  color: var(--muted);
   line-height: 1.6;
 }
 
@@ -9845,12 +9080,12 @@ onBeforeUnmount(() => {
 }
 
 .mfa-head strong {
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-size: 1.1rem;
 }
 
 .mfa-head span {
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.92rem;
 }
 
@@ -9860,32 +9095,32 @@ onBeforeUnmount(() => {
   padding: 1rem;
   border-radius: 1rem;
   background: rgba(255, 255, 255, 0.92);
-  border: 1px solid #e4e3d7;
+  border: 1px solid var(--line-solid);
 }
 
 .secret-note {
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.92rem;
   text-align: center;
 }
 
 .secret-note code {
-  color: #1b1c15;
+  color: var(--ink);
   font-weight: 700;
 }
 
 .code-label {
   font-size: 0.86rem;
   font-weight: 700;
-  color: #1b1c15;
+  color: var(--ink);
 }
 
 .totp-input {
   width: 100%;
   border-radius: 0.9rem;
-  border: 1px solid #d9d8ce;
+  border: 1px solid var(--line-solid);
   background: rgba(255, 255, 255, 0.8);
-  color: #1b1c15;
+  color: var(--ink);
   padding: 1rem;
   font-size: 1.05rem;
 }
@@ -9909,14 +9144,14 @@ onBeforeUnmount(() => {
 
 .ghost-button {
   border: 1px solid #d8d7cc;
-  background: #fffef8;
-  color: #1b1c15;
+  background: var(--surface);
+  color: var(--ink);
 }
 
 .primary-button {
   border: none;
   background: #1d1c0f;
-  color: #ffffff;
+  color: var(--surface);
 }
 
 .ghost-button.compact,
@@ -9964,8 +9199,8 @@ onBeforeUnmount(() => {
 }
 
 .provider-option {
-  border: 1px solid #e4e3d7;
-  background: #fbfaee;
+  border: 1px solid var(--line-solid);
+  background: var(--paper);
   border-radius: 0.95rem;
   padding: 1rem 0.9rem;
   display: flex;
@@ -9982,29 +9217,29 @@ onBeforeUnmount(() => {
 
 .provider-option.active {
   border-color: #000000;
-  background: #efeee3;
+  background: var(--paper-2);
   box-shadow: inset 0 0 0 1px #000000;
 }
 
 .provider-name {
   font-weight: 700;
-  color: #1b1c15;
+  color: var(--ink);
 }
 
 .provider-option small {
-  color: #5f5f53;
+  color: var(--muted);
 }
 
 .schema-preview {
-  border: 1px solid #e4e3d7;
-  background: #fbfaee;
+  border: 1px solid var(--line-solid);
+  background: var(--paper);
   border-radius: 0.95rem;
   padding: 1rem;
 }
 
 .schema-preview strong,
 .schema-field-row strong {
-  color: #1b1c15;
+  color: var(--ink);
 }
 
 .schema-preview-grid,
@@ -10017,7 +9252,7 @@ onBeforeUnmount(() => {
 
 .schema-preview-grid span,
 .schema-field-row {
-  border: 1px solid #e4e3d7;
+  border: 1px solid var(--line-solid);
   background: rgba(255, 255, 255, 0.72);
   border-radius: 0.8rem;
   padding: 0.85rem;
@@ -10031,7 +9266,7 @@ onBeforeUnmount(() => {
 
 .schema-field-row span,
 .form-hint {
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.88rem;
 }
 
@@ -10070,8 +9305,8 @@ onBeforeUnmount(() => {
   max-height: min(760px, 88vh);
   overflow: auto;
   border-radius: 1.1rem;
-  border: 1px solid #e4e3d7;
-  background: #fffef8;
+  border: 1px solid var(--line-solid);
+  background: var(--surface);
   box-shadow: 0 28px 90px -34px rgba(27, 28, 21, 0.45);
   padding: 1.4rem;
 }
@@ -10089,8 +9324,8 @@ onBeforeUnmount(() => {
   align-items: end;
   padding: 0.85rem;
   border-radius: 0.9rem;
-  border: 1px solid #e4e3d7;
-  background: #fbfaee;
+  border: 1px solid var(--line-solid);
+  background: var(--paper);
 }
 
 .field-editor-row label {
@@ -10100,7 +9335,7 @@ onBeforeUnmount(() => {
 }
 
 .field-editor-row label span {
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.72rem;
   font-weight: 800;
   letter-spacing: 0.05em;
@@ -10111,9 +9346,9 @@ onBeforeUnmount(() => {
 .field-editor-row select {
   width: 100%;
   border-radius: 0.75rem;
-  border: 1px solid #d9d8ce;
-  background: #ffffff;
-  color: #1b1c15;
+  border: 1px solid var(--line-solid);
+  background: var(--surface);
+  color: var(--ink);
   padding: 0.75rem 0.8rem;
   font-size: 0.92rem;
 }
@@ -10180,7 +9415,7 @@ onBeforeUnmount(() => {
 
 .clinic-schedule-panel,
 .blocked-slot-panel {
-  border-top: 1px solid #e4e3d7;
+  border-top: 1px solid var(--line-solid);
   padding-top: 1rem;
 }
 
@@ -10201,7 +9436,7 @@ onBeforeUnmount(() => {
 .assignment-form-grid label span,
 .assignment-two-col label span,
 .blocked-slot-form label span {
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.72rem;
   font-weight: 800;
   letter-spacing: 0.05em;
@@ -10215,9 +9450,9 @@ onBeforeUnmount(() => {
 .blocked-slot-form input {
   width: 100%;
   border-radius: 0.75rem;
-  border: 1px solid #d9d8ce;
-  background: #ffffff;
-  color: #1b1c15;
+  border: 1px solid var(--line-solid);
+  background: var(--surface);
+  color: var(--ink);
   padding: 0.75rem 0.8rem;
   font-size: 0.92rem;
 }
@@ -10232,9 +9467,9 @@ onBeforeUnmount(() => {
   grid-template-columns: auto minmax(220px, 1fr) auto auto;
   align-items: center;
   gap: 0.8rem;
-  border: 1px solid #e4e3d7;
+  border: 1px solid var(--line-solid);
   border-radius: 0.8rem;
-  background: #fbfaee;
+  background: var(--paper);
   padding: 0.75rem 0.85rem;
 }
 
@@ -10251,16 +9486,16 @@ onBeforeUnmount(() => {
 }
 
 .schedule-status-pill.inactive {
-  border-color: #e4e3d7;
+  border-color: var(--line-solid);
   background: #fff9e8;
   color: #7a5b1e;
 }
 
 .calendar-timezone {
-  border: 1px solid #d9d8ce;
+  border: 1px solid var(--line-solid);
   border-radius: 999px;
-  background: #ffffff;
-  color: #5f5f53;
+  background: var(--surface);
+  color: var(--muted);
   font-size: 0.78rem;
   font-weight: 800;
   padding: 0.45rem 0.7rem;
@@ -10269,9 +9504,9 @@ onBeforeUnmount(() => {
 
 .schedule-calendar-card {
   overflow: hidden;
-  border: 1px solid #d9d8ce;
+  border: 1px solid var(--line-solid);
   border-radius: 0.8rem;
-  background: #ffffff;
+  background: var(--surface);
   box-shadow: 0 14px 28px rgba(27, 28, 21, 0.08);
 }
 
@@ -10280,9 +9515,9 @@ onBeforeUnmount(() => {
   align-items: center;
   justify-content: space-between;
   gap: 1rem;
-  border-bottom: 1px solid #e4e3d7;
+  border-bottom: 1px solid var(--line-solid);
   background: #f5f4e8;
-  color: #1b1c15;
+  color: var(--ink);
   padding: 0.9rem 1rem;
 }
 
@@ -10296,7 +9531,7 @@ onBeforeUnmount(() => {
 }
 
 .calendar-card-head span {
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.82rem;
   font-weight: 700;
 }
@@ -10311,8 +9546,8 @@ onBeforeUnmount(() => {
 }
 
 .schedule-quick-actions {
-  border-bottom: 1px solid #e4e3d7;
-  background: #fffef8;
+  border-bottom: 1px solid var(--line-solid);
+  background: var(--surface);
   padding: 0.75rem 1rem;
 }
 
@@ -10333,9 +9568,9 @@ onBeforeUnmount(() => {
   justify-content: flex-start;
   gap: 0.36rem;
   border: 0;
-  border-right: 1px solid #e4e3d7;
-  background: #fbfaee;
-  color: #1b1c15;
+  border-right: 1px solid var(--line-solid);
+  background: var(--paper);
+  color: var(--ink);
   cursor: pointer;
   padding: 0.85rem 0.75rem;
   text-align: left;
@@ -10365,7 +9600,7 @@ onBeforeUnmount(() => {
 }
 
 .week-day-card strong {
-  color: #1b1c15;
+  color: var(--ink);
   font-size: 0.92rem;
 }
 
@@ -10387,9 +9622,9 @@ onBeforeUnmount(() => {
 .time-planner-card {
   display: grid;
   gap: 0.9rem;
-  border: 1px solid #d9d8ce;
+  border: 1px solid var(--line-solid);
   border-radius: 0.8rem;
-  background: #ffffff;
+  background: var(--surface);
   padding: 1rem;
 }
 
@@ -10406,7 +9641,7 @@ onBeforeUnmount(() => {
 }
 
 .micro-label {
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.72rem;
   font-weight: 900;
   letter-spacing: 0.06em;
@@ -10414,7 +9649,7 @@ onBeforeUnmount(() => {
 }
 
 .time-planner-head strong {
-  color: #1b1c15;
+  color: var(--ink);
   font-size: 1.28rem;
   line-height: 1.2;
 }
@@ -10440,10 +9675,10 @@ onBeforeUnmount(() => {
   display: grid;
   gap: 0.18rem;
   min-height: 66px;
-  border: 1px solid #e4e3d7;
+  border: 1px solid var(--line-solid);
   border-radius: 0.75rem;
-  background: #fbfaee;
-  color: #1b1c15;
+  background: var(--paper);
+  color: var(--ink);
   cursor: pointer;
   padding: 0.72rem;
   text-align: left;
@@ -10462,7 +9697,7 @@ onBeforeUnmount(() => {
 }
 
 .time-preset-button span {
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.72rem;
   font-weight: 900;
   letter-spacing: 0.04em;
@@ -10470,7 +9705,7 @@ onBeforeUnmount(() => {
 }
 
 .time-preset-button strong {
-  color: #1b1c15;
+  color: var(--ink);
   font-size: 0.86rem;
 }
 
@@ -10481,9 +9716,9 @@ onBeforeUnmount(() => {
 }
 
 .time-input-card {
-  border: 1px solid #e4e3d7;
+  border: 1px solid var(--line-solid);
   border-radius: 0.8rem;
-  background: #fbfaee;
+  background: var(--paper);
   padding: 0.75rem;
 }
 
@@ -10498,9 +9733,9 @@ onBeforeUnmount(() => {
   grid-template-columns: minmax(170px, 0.5fr) minmax(0, 1fr);
   gap: 0.9rem;
   align-items: center;
-  border: 1px solid #d9d8ce;
+  border: 1px solid var(--line-solid);
   border-radius: 0.8rem;
-  background: #ffffff;
+  background: var(--surface);
   padding: 1rem;
 }
 
@@ -10515,16 +9750,16 @@ onBeforeUnmount(() => {
 
 .capacity-planner-card p {
   margin: 0;
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.88rem;
   line-height: 1.45;
 }
 
 .blocked-slot-form {
   align-items: end;
-  border: 1px solid #e4e3d7;
+  border: 1px solid var(--line-solid);
   border-radius: 0.8rem;
-  background: #ffffff;
+  background: var(--surface);
   padding: 0.85rem;
 }
 
@@ -10546,7 +9781,7 @@ onBeforeUnmount(() => {
 .calendar-event-card {
   grid-template-columns: 82px minmax(0, 1fr) 42px;
   border-left: 4px solid #34776c;
-  background: #ffffff;
+  background: var(--surface);
 }
 
 .event-date-badge {
@@ -10568,7 +9803,7 @@ onBeforeUnmount(() => {
 }
 
 .event-date-badge strong {
-  color: #1b1c15;
+  color: var(--ink);
   font-size: 0.82rem;
 }
 
@@ -10580,13 +9815,13 @@ onBeforeUnmount(() => {
 
 .event-main strong {
   overflow: hidden;
-  color: #1b1c15;
+  color: var(--ink);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .event-main span {
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.84rem;
 }
 
@@ -10601,14 +9836,14 @@ onBeforeUnmount(() => {
   flex-direction: row !important;
   align-items: center;
   gap: 0.4rem;
-  border: 1px solid #e4e3d7;
-  background: #fbfaee;
+  border: 1px solid var(--line-solid);
+  background: var(--paper);
   border-radius: 999px;
   padding: 0.55rem 0.75rem;
 }
 
 .assignment-chip span {
-  color: #1b1c15 !important;
+  color: var(--ink) !important;
   font-size: 0.78rem !important;
   letter-spacing: 0 !important;
   text-transform: none !important;
@@ -10628,14 +9863,14 @@ onBeforeUnmount(() => {
   grid-template-columns: 1fr auto 42px;
   gap: 0.7rem;
   align-items: center;
-  border: 1px solid #e4e3d7;
+  border: 1px solid var(--line-solid);
   border-radius: 0.8rem;
-  background: #fbfaee;
+  background: var(--paper);
   padding: 0.75rem;
 }
 
 .blocked-slot-row span {
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.85rem;
 }
 
@@ -10661,7 +9896,7 @@ onBeforeUnmount(() => {
   border-radius: 0.9rem;
   border: 1px solid #c4c7c7;
   background: #f5f4e8;
-  color: #1b1c15;
+  color: var(--ink);
   padding: 1rem 1rem;
   font-size: 1rem;
   box-shadow: inset 0 1px 2px rgba(27, 28, 21, 0.04);
@@ -10733,7 +9968,7 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   gap: 0.8rem;
-  border-bottom: 1px solid #e4e3d7;
+  border-bottom: 1px solid var(--line-solid);
   padding-bottom: 0.4rem;
 }
 
@@ -10750,12 +9985,12 @@ onBeforeUnmount(() => {
   height: 1.8rem;
   flex: 0 0 1.8rem;
   border-radius: 999px;
-  background: #1b1c15;
-  color: #fffef8;
+  background: var(--ink);
+  color: var(--surface);
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-weight: 800;
   font-size: 0.78rem;
 }
@@ -10779,12 +10014,12 @@ onBeforeUnmount(() => {
   width: 2.2rem;
   height: 2.2rem;
   border-radius: 0.8rem;
-  background: #1b1c15;
-  color: #ffffff;
+  background: var(--ink);
+  color: var(--surface);
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-weight: 800;
 }
 
@@ -10796,13 +10031,13 @@ onBeforeUnmount(() => {
 }
 
 .brand-copy strong {
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-size: 1.05rem;
   line-height: 1;
 }
 
 .brand-copy span {
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.78rem;
 }
 
@@ -10827,7 +10062,7 @@ onBeforeUnmount(() => {
 .dashboard-inline-button {
   border: 1px solid rgba(196, 199, 199, 0.6);
   background: rgba(255, 255, 255, 0.88);
-  color: #1b1c15;
+  color: var(--ink);
   border-radius: 999px;
   transition: transform 0.2s ease, box-shadow 0.2s ease, background 0.2s ease;
 }
@@ -10870,9 +10105,9 @@ onBeforeUnmount(() => {
 }
 
 .nav-page-button.active {
-  background: #1b1c15;
-  border-color: #1b1c15;
-  color: #ffffff;
+  background: var(--ink);
+  border-color: var(--ink);
+  color: var(--surface);
 }
 
 .nav-icon-button:hover,
@@ -10897,7 +10132,7 @@ onBeforeUnmount(() => {
 .org-avatar-button {
   border-color: rgba(116, 120, 120, 0.35);
   overflow: hidden;
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-weight: 800;
 }
 
@@ -10909,7 +10144,7 @@ onBeforeUnmount(() => {
 }
 
 .dashboard-header h2 {
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-size: clamp(2.1rem, 4vw, 3rem);
   letter-spacing: -0.04em;
   line-height: 1.05;
@@ -10938,9 +10173,9 @@ onBeforeUnmount(() => {
 }
 
 .dashboard-primary-button {
-  border: 1px solid #1b1c15;
-  background: #1b1c15;
-  color: #ffffff;
+  border: 1px solid var(--ink);
+  background: var(--ink);
+  color: var(--surface);
   border-radius: 0.8rem;
 }
 
@@ -10980,7 +10215,7 @@ onBeforeUnmount(() => {
 .summary-pill span {
   display: block;
   margin-bottom: 0.22rem;
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.72rem;
   font-weight: 700;
   text-transform: uppercase;
@@ -10988,7 +10223,7 @@ onBeforeUnmount(() => {
 }
 
 .summary-pill strong {
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-size: 0.98rem;
 }
 
@@ -11006,14 +10241,14 @@ onBeforeUnmount(() => {
 }
 
 .dashboard-section-head h3 {
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-size: 1.55rem;
   letter-spacing: -0.03em;
 }
 
 .dashboard-section-head p {
   max-width: 28rem;
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.94rem;
   line-height: 1.7;
   text-align: right;
@@ -11022,7 +10257,7 @@ onBeforeUnmount(() => {
 .section-kicker {
   display: inline-block;
   margin-bottom: 0.35rem;
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.72rem;
   font-weight: 800;
   letter-spacing: 0.08em;
@@ -11054,7 +10289,7 @@ onBeforeUnmount(() => {
 
 .member-timetable-card h4 {
   margin: 0;
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-size: 1.05rem;
   letter-spacing: -0.01em;
 }
@@ -11107,7 +10342,7 @@ onBeforeUnmount(() => {
   align-items: center;
   justify-content: center;
   background: linear-gradient(145deg, rgba(23, 63, 29, 0.16), rgba(23, 63, 29, 0.05));
-  color: #173f1d;
+  color: var(--nokvo-green);
   box-shadow: inset 0 0 0 1px rgba(23, 63, 29, 0.18);
 }
 
@@ -11119,7 +10354,7 @@ onBeforeUnmount(() => {
 
 .member-action-title h4 {
   margin: 0 0 0.15rem;
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-size: 1.05rem;
   letter-spacing: -0.01em;
 }
@@ -11148,7 +10383,7 @@ onBeforeUnmount(() => {
 }
 
 .member-field-label {
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-size: 0.72rem;
   font-weight: 700;
   letter-spacing: 0.06em;
@@ -11173,7 +10408,7 @@ onBeforeUnmount(() => {
   border-radius: 0.75rem;
   border: 1px solid rgba(196, 199, 199, 0.55);
   background: rgba(255, 255, 255, 0.85);
-  color: var(--nokvo-ink, #1b1c15);
+  color: var(--nokvo-ink, var(--ink));
   font-family: inherit;
   font-size: 0.92rem;
   line-height: 1.2;
@@ -11191,7 +10426,7 @@ onBeforeUnmount(() => {
 .member-field-input:focus {
   outline: none;
   border-color: rgba(23, 63, 29, 0.6);
-  background: #ffffff;
+  background: var(--surface);
   box-shadow: 0 0 0 3px rgba(23, 63, 29, 0.12);
 }
 
@@ -11208,8 +10443,8 @@ onBeforeUnmount(() => {
   border-radius: 999px;
   border: 1px solid rgba(196, 199, 199, 0.55);
   background: rgba(255, 255, 255, 0.7);
-  color: var(--nokvo-ink, #1b1c15);
-  font-family: Manrope, sans-serif;
+  color: var(--nokvo-ink, var(--ink));
+  font-family: var(--nokvo-body);
   font-size: 0.85rem;
   font-weight: 700;
   cursor: pointer;
@@ -11223,9 +10458,9 @@ onBeforeUnmount(() => {
 }
 
 .member-duration-pill.active {
-  background: linear-gradient(180deg, #1f4a26, #173f1d);
-  border-color: #173f1d;
-  color: #fffef8;
+  background: linear-gradient(180deg, #1f4a26, var(--nokvo-green));
+  border-color: var(--nokvo-green);
+  color: var(--surface);
   box-shadow: 0 10px 22px -16px rgba(23, 63, 29, 0.75);
 }
 
@@ -11241,10 +10476,10 @@ onBeforeUnmount(() => {
   gap: 0.5rem;
   padding: 0.85rem 1rem;
   border-radius: 0.85rem;
-  border: 1px solid #173f1d;
-  background: linear-gradient(180deg, #1f4a26, #173f1d);
-  color: #fffef8;
-  font-family: Manrope, sans-serif;
+  border: 1px solid var(--nokvo-green);
+  background: linear-gradient(180deg, #1f4a26, var(--nokvo-green));
+  color: var(--surface);
+  font-family: var(--nokvo-body);
   font-size: 0.92rem;
   font-weight: 800;
   letter-spacing: 0.01em;
@@ -11302,7 +10537,7 @@ onBeforeUnmount(() => {
 }
 
 .member-timetable-block-meta strong {
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-weight: 700;
 }
 
@@ -11416,18 +10651,18 @@ onBeforeUnmount(() => {
   height: 2.6rem;
   border-radius: 0.9rem;
   border: 1px solid rgba(196, 199, 199, 0.45);
-  background: #efeee3;
+  background: var(--paper-2);
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-weight: 800;
 }
 
 .organization-card h3,
 .compact-card-head h3,
 .members-card-head h3 {
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-size: 1.2rem;
   line-height: 1.15;
 }
@@ -11436,7 +10671,7 @@ onBeforeUnmount(() => {
 .compact-card-head p,
 .members-card-head p {
   margin-top: 0.18rem;
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.9rem;
   line-height: 1.6;
 }
@@ -11512,12 +10747,12 @@ onBeforeUnmount(() => {
   width: 4.15rem;
   height: 4.15rem;
   border-radius: 999px;
-  background: #fffef8;
+  background: var(--surface);
 }
 
 .health-ring strong {
-  color: #1b1c15;
-  font-family: Manrope, sans-serif;
+  color: var(--ink);
+  font-family: var(--nokvo-body);
   font-size: 1.35rem;
   line-height: 1;
 }
@@ -11530,8 +10765,8 @@ onBeforeUnmount(() => {
 
 .health-score-card h4 {
   margin: 0.16rem 0 0;
-  color: #1b1c15;
-  font-family: Manrope, sans-serif;
+  color: var(--ink);
+  font-family: var(--nokvo-body);
   font-size: 1.35rem;
 }
 
@@ -11578,7 +10813,7 @@ onBeforeUnmount(() => {
 .health-check strong {
   display: block;
   color: #20231c;
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-size: 0.92rem;
 }
 
@@ -11599,7 +10834,7 @@ onBeforeUnmount(() => {
   justify-content: space-between;
   gap: 0.8rem;
   margin-bottom: 0.55rem;
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.78rem;
   font-weight: 700;
   text-transform: uppercase;
@@ -11607,7 +10842,7 @@ onBeforeUnmount(() => {
 }
 
 .usage-labels strong {
-  color: #1b1c15;
+  color: var(--ink);
 }
 
 .usage-track {
@@ -11615,13 +10850,13 @@ onBeforeUnmount(() => {
   height: 0.45rem;
   overflow: hidden;
   border-radius: 999px;
-  background: #e4e3d7;
+  background: var(--line-solid);
 }
 
 .usage-fill {
   height: 100%;
   border-radius: 999px;
-  background: #1b1c15;
+  background: var(--ink);
 }
 
 .organization-metrics,
@@ -11637,7 +10872,7 @@ onBeforeUnmount(() => {
 .organization-metrics span,
 .workspace-profile-grid span {
   display: block;
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.72rem;
   font-weight: 700;
   text-transform: uppercase;
@@ -11647,7 +10882,7 @@ onBeforeUnmount(() => {
 
 .organization-metrics strong,
 .workspace-profile-grid strong {
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-size: 1rem;
 }
 
@@ -11658,7 +10893,7 @@ onBeforeUnmount(() => {
 }
 
 .dashboard-detail-list dt {
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.76rem;
   font-weight: 700;
   text-transform: uppercase;
@@ -11667,7 +10902,7 @@ onBeforeUnmount(() => {
 
 .dashboard-detail-list dd {
   margin-top: 0.22rem;
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-size: 1rem;
   font-weight: 700;
 }
@@ -11759,7 +10994,7 @@ onBeforeUnmount(() => {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  background: #efeee3;
+  background: var(--paper-2);
   border: 1px solid rgba(196, 199, 199, 0.45);
 }
 
@@ -11770,13 +11005,13 @@ onBeforeUnmount(() => {
 }
 
 .agent-document-main strong {
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   line-height: 1.3;
 }
 
 .agent-document-main small {
   margin-top: 0.24rem;
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.78rem;
   line-height: 1.45;
   word-break: break-word;
@@ -11836,7 +11071,7 @@ onBeforeUnmount(() => {
 }
 
 .agent-tool-group-head strong {
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-size: 0.92rem;
   letter-spacing: 0.01em;
 }
@@ -11868,13 +11103,13 @@ onBeforeUnmount(() => {
 }
 
 .custom-tab-row strong {
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   display: block;
 }
 
 .custom-tab-row small {
   display: block;
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.74rem;
   margin-top: 0.1rem;
 }
@@ -11924,7 +11159,7 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 0.3rem;
   font-size: 0.78rem;
-  color: #5f5f53;
+  color: var(--muted);
 }
 
 .ghost-button.danger {
@@ -12047,7 +11282,7 @@ onBeforeUnmount(() => {
   flex-direction: column;
   gap: 0.25rem;
   font-size: 0.8rem;
-  color: #5f5f53;
+  color: var(--muted);
 }
 
 .re-form-row input,
@@ -12264,14 +11499,14 @@ onBeforeUnmount(() => {
 
 .sample-mode-tab strong {
   display: block;
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-size: 0.9rem;
   margin-bottom: 0.18rem;
 }
 
 .sample-mode-tab small {
   display: block;
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.76rem;
   line-height: 1.4;
 }
@@ -12297,7 +11532,7 @@ onBeforeUnmount(() => {
   display: flex;
   justify-content: space-between;
   margin-top: 0.4rem;
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.76rem;
 }
 
@@ -12310,7 +11545,7 @@ onBeforeUnmount(() => {
   top: calc(100% + 0.45rem);
   right: 0;
   min-width: 280px;
-  background: #ffffff;
+  background: var(--surface);
   border: 1px solid rgba(95, 95, 83, 0.2);
   border-radius: 10px;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.08);
@@ -12335,14 +11570,14 @@ onBeforeUnmount(() => {
 
 .nav-settings-item strong {
   display: block;
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-size: 0.88rem;
   margin-bottom: 0.15rem;
 }
 
 .nav-settings-item small {
   display: block;
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.76rem;
   line-height: 1.35;
 }
@@ -12367,7 +11602,7 @@ onBeforeUnmount(() => {
 
 .try-agent-card p {
   margin: 0;
-  color: #5f5f53;
+  color: var(--muted);
   line-height: 1.5;
 }
 
@@ -12405,7 +11640,7 @@ onBeforeUnmount(() => {
   padding: 0.55rem 0.7rem;
   font-size: 0.85rem;
   font-family: inherit;
-  color: #1b1c15;
+  color: var(--ink);
   resize: vertical;
 }
 
@@ -12413,21 +11648,27 @@ onBeforeUnmount(() => {
   align-self: start;
 }
 
-.outbound-tester-save-row {
+.outbound-tester-campaign-row {
   margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--line-soft);
+}
+
+.outbound-tester-campaign-row .kb-field {
   display: flex;
-  align-items: center;
-  gap: 0.6rem;
-  flex-wrap: wrap;
+  flex-direction: column;
+  gap: 0.4rem;
 }
 
-.outbound-tester-save-meta {
-  font-size: 0.78rem;
-  color: #5f5f53;
-}
-
-.org-shell.dark .outbound-tester-save-meta {
-  color: rgba(244, 240, 225, 0.7);
+.outbound-tester-campaign-row select {
+  border: 1px solid var(--line-solid);
+  background: var(--surface);
+  border-radius: var(--r-sm);
+  padding: 0.55rem 0.7rem;
+  font-family: var(--nokvo-body);
+  font-size: var(--fs-small);
+  color: var(--ink);
+  cursor: pointer;
 }
 
 .outbound-tester-doc {
@@ -12439,7 +11680,7 @@ onBeforeUnmount(() => {
 .outbound-tester-hint {
   margin: 0;
   font-size: 0.78rem;
-  color: #5f5f53;
+  color: var(--muted);
 }
 
 .outbound-tester-doc-row {
@@ -12463,11 +11704,11 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 0.4rem;
   font-size: 0.82rem;
-  color: #1b1c15;
+  color: var(--ink);
 }
 
 .outbound-tester-doc-chars {
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.74rem;
 }
 
@@ -12477,13 +11718,13 @@ onBeforeUnmount(() => {
 }
 
 .org-shell.dark .outbound-tester-doc-name {
-  color: #f4f0e1;
+  color: var(--surface);
 }
 
 .org-shell.dark .outbound-tester-form textarea {
   background: rgba(28, 29, 24, 0.6);
   border-color: rgba(244, 240, 225, 0.2);
-  color: #f4f0e1;
+  color: var(--surface);
 }
 
 .nokvo-form-builder {
@@ -12511,9 +11752,9 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-size: 0.82rem;
-  color: #5f5f53;
+  color: var(--muted);
   font-weight: 600;
   letter-spacing: 0.02em;
 }
@@ -12521,7 +11762,7 @@ onBeforeUnmount(() => {
 .nokvo-form-empty {
   margin: 0;
   font-size: 0.8rem;
-  color: #5f5f53;
+  color: var(--muted);
 }
 
 .nokvo-form-field-row {
@@ -12539,7 +11780,7 @@ onBeforeUnmount(() => {
   padding: 0.5rem 0.65rem;
   font-size: 0.85rem;
   font-family: inherit;
-  color: #1b1c15;
+  color: var(--ink);
 }
 
 .nokvo-form-field-required {
@@ -12547,7 +11788,7 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 0.35rem;
   font-size: 0.8rem;
-  color: #5f5f53;
+  color: var(--muted);
   white-space: nowrap;
 }
 
@@ -12584,14 +11825,14 @@ onBeforeUnmount(() => {
   font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 0.78rem;
   word-break: break-all;
-  color: #1b1c15;
+  color: var(--ink);
 }
 
 .org-shell.dark .nokvo-form-field-label,
 .org-shell.dark .nokvo-form-field-type {
   background: rgba(28, 29, 24, 0.6);
   border-color: rgba(244, 240, 225, 0.2);
-  color: #f4f0e1;
+  color: var(--surface);
 }
 
 .org-shell.dark .nokvo-form-fields,
@@ -12604,7 +11845,7 @@ onBeforeUnmount(() => {
 }
 
 .org-shell.dark .nokvo-form-link-callout code {
-  color: #f4f0e1;
+  color: var(--surface);
 }
 
 .org-shell.dark .nokvo-form-empty,
@@ -12636,15 +11877,15 @@ onBeforeUnmount(() => {
   border-radius: 12px;
   border: 1px solid rgba(27, 28, 21, 0.12);
   background: rgba(255, 255, 255, 0.85);
-  color: #1b1c15;
+  color: var(--ink);
   cursor: pointer;
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   transition: background 0.15s ease, transform 0.15s ease, border-color 0.15s ease;
   text-align: center;
 }
 
 .provider-icon-tile:hover {
-  background: #ffffff;
+  background: var(--surface);
   border-color: rgba(27, 28, 21, 0.22);
   transform: translateY(-1px);
 }
@@ -12662,7 +11903,7 @@ onBeforeUnmount(() => {
 .org-shell.dark .provider-icon-tile {
   background: rgba(28, 29, 24, 0.75);
   border-color: rgba(244, 240, 225, 0.18);
-  color: #f4f0e1;
+  color: var(--surface);
 }
 
 .org-shell.dark .provider-icon-tile:hover {
@@ -12676,7 +11917,7 @@ onBeforeUnmount(() => {
   gap: 0.4rem;
   border: 1px solid rgba(196, 199, 199, 0.6);
   background: rgba(255, 255, 255, 0.88);
-  color: #1b1c15;
+  color: var(--ink);
   border-radius: 999px;
   padding: 0.6rem 0.85rem;
   font-size: 0.8rem;
@@ -12685,9 +11926,9 @@ onBeforeUnmount(() => {
 }
 
 .outgoing-tabs button.active {
-  background: #1b1c15;
-  border-color: #1b1c15;
-  color: #ffffff;
+  background: var(--ink);
+  border-color: var(--ink);
+  color: var(--surface);
 }
 
 .outgoing-provider-grid .provider-option {
@@ -12766,7 +12007,7 @@ onBeforeUnmount(() => {
 }
 
 .mfa-pending-copy strong {
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   color: #1d2b19;
   font-size: 0.95rem;
 }
@@ -12783,23 +12024,75 @@ onBeforeUnmount(() => {
   color: #6b3f0a;
 }
 
-/* Nokvo Prime aesthetic */
+/* Nokvo Prime aesthetic — warm editorial / organic, forest-green ink-on-paper */
 .org-shell {
   --nokvo-ink: #151710;
   --nokvo-muted: #67685f;
   --nokvo-soft: #f6f4ea;
   --nokvo-panel: rgba(255, 254, 248, 0.88);
-  --nokvo-panel-solid: #fffef8;
-  --nokvo-line: rgba(26, 43, 23, 0.13);
-  --nokvo-green: #173f1d;
+  --nokvo-panel-solid: var(--surface);
+  --nokvo-line: rgba(26, 43, 23, 0.10);
+  --nokvo-green: rgb(23, 63, 29);
   --nokvo-green-2: #23572a;
   --nokvo-green-soft: #e8f1e0;
   --nokvo-warn: #b66514;
-  background:
-    linear-gradient(180deg, rgba(255, 253, 245, 0.98), rgba(247, 245, 235, 0.98)),
-    #f8f6ec;
+  /* Restrained type system. Display = Fraunces (optical serif, used sparingly),
+     body = Manrope (humanist sans), data = JetBrains Mono. */
+  --nokvo-display: 'Fraunces', 'Playfair Display', Georgia, "Times New Roman", serif;
+  --nokvo-body: 'Manrope', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --nokvo-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* P0 consolidated design tokens. The component used to hardcode ~155 distinct
+     hex colors, 20 radii and 49 box-shadows; these tokens collapse the most
+     common ones to a single source of truth so the look is cohesive and a
+     theme swap is one edit. New code MUST use these, not raw hex. */
+  --ink: #1b1c15;
+  --ink-soft: #2a2c25;
+  --muted: #5f5f53;
+  --muted-soft: #67685f;
+  --paper: #fbfaf5;
+  --paper-2: #f6f5ef;
+  --surface: #fffef8;
+  --surface-elevated: #fffef8;
+  --line-solid: rgb(228, 227, 215);
+  --line-soft: rgba(26, 43, 23, 0.06);
+  --danger: #c0392b;
+  --success: #2f6d3a;
+
+  /* Canonical radius scale (was 20+ ad-hoc values). */
+  --r-xs: 6px;
+  --r-sm: 10px;
+  --r-md: 14px;
+  --r-lg: 20px;
+  --r-pill: 999px;
+
+  /* Canonical shadow scale (was 49 ad-hoc values). */
+  --shadow-hair: 0 1px 2px rgba(21, 23, 16, 0.04);
+  --shadow-card: 0 12px 28px -22px rgba(21, 23, 16, 0.18);
+  --shadow-pop: 0 22px 50px -28px rgba(21, 23, 16, 0.28);
+  --shadow-focus: 0 0 0 3px rgba(23, 63, 29, 0.18);
+
+  /* Type scale — 6 sizes + 3 line-heights, used in place of one-off rems. */
+  --fs-display: clamp(2.75rem, 5.4vw, 4.25rem);
+  --fs-h2: 1.85rem;
+  --fs-h3: 1.2rem;
+  --fs-h4: 1rem;
+  --fs-body: 0.95rem;
+  --fs-small: 0.85rem;
+  --fs-eyebrow: 0.72rem;
+  --lh-tight: 1.1;
+  --lh-snug: 1.3;
+  --lh-body: 1.55;
+  --ring: 0 0 0 3px rgba(23, 63, 29, 0.22);
+
+  /* Minimalist surface — a single near-flat warm-paper wash. No radials, no
+     grain, no orbs: restraint over atmosphere. Hierarchy is carried by
+     whitespace, hairline rules and quiet typography. */
+  background: linear-gradient(180deg, var(--paper) 0%, var(--paper-2) 100%);
   color: var(--nokvo-ink);
-  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-family: var(--nokvo-body);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 
 .ambient-orb {
@@ -12821,8 +12114,8 @@ onBeforeUnmount(() => {
   min-height: calc(100vh - 2.5rem);
   border-radius: 1.25rem;
   border-color: var(--nokvo-line);
-  background: rgba(255, 254, 248, 0.8);
-  box-shadow: 0 22px 70px -46px rgba(21, 23, 16, 0.35);
+  background: rgba(255, 254, 248, 0.7);
+  box-shadow: none;
 }
 
 .dashboard-brand {
@@ -12844,7 +12137,7 @@ onBeforeUnmount(() => {
 .mfa-pending-icon {
   border-radius: 0.75rem;
   background: linear-gradient(145deg, var(--nokvo-green), #0f2c15);
-  color: #fffef8;
+  color: var(--surface);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18), 0 12px 28px -20px rgba(23, 63, 29, 0.7);
 }
 
@@ -12903,12 +12196,12 @@ onBeforeUnmount(() => {
 .nav-page-button.active {
   border-color: rgba(23, 63, 29, 0.1);
   background: linear-gradient(180deg, var(--nokvo-green-2), var(--nokvo-green));
-  color: #fffef8;
+  color: var(--surface);
   box-shadow: 0 14px 26px -20px rgba(23, 63, 29, 0.8);
 }
 
 .nav-page-button.active svg {
-  color: #fffef8;
+  color: var(--surface);
 }
 
 .dashboard-nav-actions > .nav-icon-button:first-of-type {
@@ -12922,17 +12215,27 @@ onBeforeUnmount(() => {
   min-height: 6.2rem;
 }
 
+/* h1 / h2 — the only place the display serif speaks loudly. */
 .dashboard-header h2,
-.brand-block h1,
+.brand-block h1 {
+  font-family: var(--nokvo-display);
+  font-optical-sizing: auto;
+  font-weight: 500;
+  letter-spacing: -0.012em;
+  line-height: var(--lh-tight);
+}
+
+/* h3 / h4 — restrained body voice, larger size. Manrope keeps cards calm. */
 .dashboard-section-head h3,
 .try-agent-card h3,
 .organization-card h3,
 .compact-card-head h3,
 .members-card-head h3,
 .health-score-card h4 {
-  font-family: Georgia, "Times New Roman", serif;
-  font-weight: 700;
-  letter-spacing: -0.035em;
+  font-family: var(--nokvo-body);
+  font-weight: 600;
+  letter-spacing: -0.008em;
+  line-height: var(--lh-snug);
 }
 
 .dashboard-header h2 {
@@ -12946,10 +12249,11 @@ onBeforeUnmount(() => {
 .kb-field > span,
 .dashboard-detail-list dt,
 .tab-record-meta span {
-  color: #77786f;
-  font-size: 0.72rem;
+  color: var(--muted);
+  font-size: var(--fs-eyebrow);
   letter-spacing: 0.18em;
-  font-weight: 800;
+  font-weight: 700;
+  text-transform: uppercase;
 }
 
 .dashboard-header-actions {
@@ -12969,9 +12273,9 @@ onBeforeUnmount(() => {
 
 .primary-button,
 .dashboard-primary-button {
-  background: linear-gradient(180deg, var(--nokvo-green-2), var(--nokvo-green));
-  color: #fffef8;
-  box-shadow: 0 16px 30px -22px rgba(23, 63, 29, 0.8);
+  background: var(--nokvo-green);
+  color: var(--surface);
+  box-shadow: none;
 }
 
 .dashboard-card,
@@ -12980,7 +12284,7 @@ onBeforeUnmount(() => {
   border-radius: 1.15rem;
   border-color: var(--nokvo-line);
   background: var(--nokvo-panel);
-  box-shadow: 0 22px 70px -52px rgba(21, 23, 16, 0.36);
+  box-shadow: 0 1px 2px rgba(21, 23, 16, 0.03);
 }
 
 .dashboard-grid {
@@ -13035,8 +12339,9 @@ onBeforeUnmount(() => {
   place-items: center;
   border-radius: 999px;
   background: linear-gradient(180deg, var(--nokvo-green-2), var(--nokvo-green));
-  color: #fffef8;
-  font-family: Georgia, "Times New Roman", serif;
+  color: var(--surface);
+  font-family: var(--nokvo-display);
+  font-optical-sizing: auto;
   font-size: 2.2rem;
   line-height: 1;
   letter-spacing: 0.12em;
@@ -13097,7 +12402,7 @@ onBeforeUnmount(() => {
 .status-chip.active {
   border-color: rgba(47, 109, 58, 0.18);
   background: #e8f1e0;
-  color: #173f1d;
+  color: var(--nokvo-green);
 }
 
 .provider-option {
@@ -13116,13 +12421,13 @@ onBeforeUnmount(() => {
 .outgoing-tabs button.active {
   border-color: var(--nokvo-green);
   background: var(--nokvo-green);
-  color: #fffef8;
+  color: var(--surface);
   box-shadow: 0 12px 24px -20px rgba(23, 63, 29, 0.78);
 }
 
 .provider-option.active .provider-name,
 .provider-option.active small {
-  color: #fffef8;
+  color: var(--surface);
 }
 
 .outgoing-tabs {
@@ -13261,7 +12566,7 @@ onBeforeUnmount(() => {
 .agent-result-panel strong {
   display: block;
   margin-bottom: 0.55rem;
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
 }
 
 .agent-result-panel p {
@@ -13293,7 +12598,7 @@ onBeforeUnmount(() => {
 .agent-event-row span {
   display: block;
   margin-bottom: 0.3rem;
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.72rem;
   font-weight: 800;
   letter-spacing: 0.05em;
@@ -13345,7 +12650,7 @@ onBeforeUnmount(() => {
 }
 
 .provisioning-head strong {
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
 }
 
 .provisioning-steps {
@@ -13417,7 +12722,7 @@ onBeforeUnmount(() => {
 
 .provisioning-steps strong {
   display: block;
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-size: 0.92rem;
   line-height: 1.2;
 }
@@ -13425,7 +12730,7 @@ onBeforeUnmount(() => {
 .provisioning-steps small {
   display: block;
   margin-top: 0.18rem;
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.78rem;
 }
 
@@ -13434,7 +12739,7 @@ onBeforeUnmount(() => {
   font-weight: 800;
   letter-spacing: 0.06em;
   text-transform: uppercase;
-  color: #5f5f53;
+  color: var(--muted);
 }
 
 .org-shell.dark .provisioning-block,
@@ -13472,7 +12777,7 @@ onBeforeUnmount(() => {
 .members-summary span {
   padding: 0.45rem 0.65rem;
   border-radius: 999px;
-  background: #efeee3;
+  background: var(--paper-2);
   color: #444748;
   font-size: 0.76rem;
   font-weight: 700;
@@ -13490,7 +12795,7 @@ onBeforeUnmount(() => {
 .invite-field span {
   display: block;
   margin-bottom: 0.35rem;
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.72rem;
   font-weight: 700;
   letter-spacing: 0.06em;
@@ -13499,7 +12804,7 @@ onBeforeUnmount(() => {
 
 .invite-domain-banner strong {
   display: block;
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-size: 1.3rem;
   overflow-wrap: anywhere;
 }
@@ -13507,7 +12812,7 @@ onBeforeUnmount(() => {
 .invite-domain-banner small {
   display: block;
   margin-top: 0.45rem;
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.86rem;
   line-height: 1.45;
 }
@@ -13585,9 +12890,9 @@ onBeforeUnmount(() => {
   width: 100%;
   min-height: 3.25rem;
   border-radius: 0.95rem;
-  border: 1px solid #d9d8ce;
+  border: 1px solid var(--line-solid);
   background: rgba(255, 255, 255, 0.8);
-  color: #1b1c15;
+  color: var(--ink);
   padding: 1rem 1.05rem;
   font-size: 1rem;
 }
@@ -13602,7 +12907,7 @@ onBeforeUnmount(() => {
   border-radius: 0.95rem;
   border: none;
   background: #1d1c0f;
-  color: #ffffff;
+  color: var(--surface);
   padding: 0.95rem 1.2rem;
   font-weight: 800;
 }
@@ -13614,7 +12919,7 @@ onBeforeUnmount(() => {
 
 .invite-helper {
   margin: 0;
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.82rem;
   line-height: 1.6;
 }
@@ -13661,8 +12966,8 @@ onBeforeUnmount(() => {
   place-items: center;
   border-radius: 0.85rem;
   background: linear-gradient(145deg, #e9f1df, #f7f4e9);
-  color: #173f1d;
-  font-family: Manrope, sans-serif;
+  color: var(--nokvo-green);
+  font-family: var(--nokvo-body);
   font-weight: 900;
 }
 
@@ -13674,7 +12979,7 @@ onBeforeUnmount(() => {
 
 .team-identity strong {
   color: var(--nokvo-ink);
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-size: 1rem;
 }
 
@@ -13705,7 +13010,7 @@ onBeforeUnmount(() => {
 
 .team-badges span.active {
   background: #e8f1e0;
-  color: #173f1d;
+  color: var(--nokvo-green);
 }
 
 .team-assignment-panel {
@@ -13778,7 +13083,7 @@ onBeforeUnmount(() => {
   display: block;
   margin-top: 0.18rem;
   color: var(--nokvo-ink);
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
 }
 
 .timetable-calendar-shell {
@@ -13818,7 +13123,7 @@ onBeforeUnmount(() => {
 
 .timetable-calendar-head strong {
   color: var(--nokvo-ink);
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   text-align: center;
 }
 
@@ -13884,7 +13189,7 @@ onBeforeUnmount(() => {
   width: 1.72rem;
   height: 1.72rem;
   border-radius: 999px;
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-size: 0.86rem;
   font-weight: 900;
 }
@@ -13912,13 +13217,13 @@ onBeforeUnmount(() => {
 
 .timetable-date-cell.active {
   background: var(--nokvo-green);
-  color: #fffef8;
+  color: var(--surface);
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.16);
 }
 
 .timetable-date-cell.active span {
   background: rgba(255, 254, 248, 0.18);
-  color: #fffef8;
+  color: var(--surface);
 }
 
 .timetable-date-cell.active small {
@@ -13956,7 +13261,7 @@ onBeforeUnmount(() => {
 
 .timetable-day-label {
   color: var(--nokvo-ink);
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-weight: 900;
   padding-top: 0.35rem;
 }
@@ -14007,7 +13312,7 @@ onBeforeUnmount(() => {
 
 .timetable-time strong {
   color: var(--nokvo-ink);
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
 }
 
 .timetable-time span,
@@ -14026,7 +13331,7 @@ onBeforeUnmount(() => {
 .timetable-event-main strong {
   display: block;
   color: var(--nokvo-ink);
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
 }
 
 .timetable-event-main small {
@@ -14057,7 +13362,7 @@ onBeforeUnmount(() => {
 .timetable-queue-head h4 {
   margin: 0.12rem 0 0;
   color: var(--nokvo-ink);
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-size: 1rem;
   letter-spacing: 0;
 }
@@ -14087,7 +13392,7 @@ onBeforeUnmount(() => {
 .timetable-ticket-primary strong {
   min-width: 0;
   color: var(--nokvo-ink);
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   overflow-wrap: anywhere;
 }
 
@@ -14134,7 +13439,7 @@ onBeforeUnmount(() => {
   display: block;
   min-width: 0;
   color: var(--nokvo-ink);
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-size: 0.88rem;
   overflow-wrap: anywhere;
 }
@@ -14150,7 +13455,7 @@ onBeforeUnmount(() => {
 
 .member-head {
   border-top: none;
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.82rem;
   text-transform: uppercase;
   letter-spacing: 0.06em;
@@ -14168,7 +13473,7 @@ onBeforeUnmount(() => {
 }
 
 .member-meta small {
-  color: #5f5f53;
+  color: var(--muted);
 }
 
 .tab-record-list {
@@ -14205,7 +13510,7 @@ onBeforeUnmount(() => {
 
 .tab-record-primary small,
 .tab-record-meta span {
-  color: #5f5f53;
+  color: var(--muted);
 }
 
 .tab-record-primary small {
@@ -14263,7 +13568,7 @@ onBeforeUnmount(() => {
 }
 
 .readonly-tag {
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.9rem;
 }
 
@@ -14282,12 +13587,12 @@ onBeforeUnmount(() => {
 
 .message.info {
   background: #e9e9dd;
-  color: #1b1c15;
+  color: var(--ink);
 }
 
 .empty-state {
   padding: 1rem 0;
-  color: #5f5f53;
+  color: var(--muted);
 }
 
 .empty-state.compact {
@@ -14300,7 +13605,7 @@ onBeforeUnmount(() => {
   z-index: 1;
   margin-top: auto;
   width: 100%;
-  border-top: 1px solid #e4e3d7;
+  border-top: 1px solid var(--line-solid);
   padding: 1.5rem 2rem;
   display: flex;
   justify-content: space-between;
@@ -14326,8 +13631,26 @@ onBeforeUnmount(() => {
 /* ─── Dark theme ─── */
 
 .org-shell.dark {
-  background: #131511;
-  color: #f2f1e5;
+  /* Dark variants of the P0 tokens. Any token-driven code switches themes
+     automatically; the older hand-written ``.org-shell.dark .foo`` overrides
+     below remain authoritative for now (separate cleanup pass). */
+  --ink: #f2f1e5;
+  --ink-soft: #d1cfc1;
+  --muted: #97968d;
+  --muted-soft: #7d7c72;
+  --paper: #131511;
+  --paper-2: #1a1c17;
+  --surface: #1f211b;
+  --surface-elevated: #25271f;
+  --line-solid: rgba(242, 241, 229, 0.10);
+  --line-soft: rgba(242, 241, 229, 0.05);
+  --shadow-hair: 0 1px 2px rgba(0, 0, 0, 0.5);
+  --shadow-card: 0 12px 28px -22px rgba(0, 0, 0, 0.6);
+  --shadow-pop: 0 22px 50px -28px rgba(0, 0, 0, 0.7);
+  --ring: 0 0 0 3px rgba(232, 241, 224, 0.22);
+
+  background: var(--paper);
+  color: var(--ink);
 }
 
 .org-shell.dark::before {
@@ -14400,8 +13723,8 @@ onBeforeUnmount(() => {
 }
 
 .org-shell.dark .google-mark {
-  background: #ffffff;
-  border-color: #ffffff;
+  background: var(--surface);
+  border-color: var(--surface);
 }
 
 .org-shell.dark .dashboard-brand {
@@ -14904,7 +14227,7 @@ onBeforeUnmount(() => {
 }
 
 .agent-hero-copy h3 {
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-size: 1.55rem;
   line-height: 1.15;
   margin-top: 0.3rem;
@@ -14935,7 +14258,7 @@ onBeforeUnmount(() => {
 
 .pipeline-chip > svg {
   margin-top: 0.18rem;
-  color: #5f5f53;
+  color: var(--muted);
   flex-shrink: 0;
 }
 
@@ -14950,11 +14273,11 @@ onBeforeUnmount(() => {
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: #5f5f53;
+  color: var(--muted);
 }
 
 .pipeline-chip strong {
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-size: 0.85rem;
   line-height: 1.2;
   margin-top: 0.1rem;
@@ -14965,7 +14288,7 @@ onBeforeUnmount(() => {
 
 .pipeline-chip small {
   font-size: 0.7rem;
-  color: #5f5f53;
+  color: var(--muted);
   margin-top: 0.18rem;
 }
 
@@ -14982,6 +14305,328 @@ onBeforeUnmount(() => {
   gap: 1rem;
 }
 
+.campaign-head-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.campaign-create--prompt-first {
+  background: rgba(15, 23, 42, 0.04);
+  border-radius: 0.9rem;
+  padding: 1rem 1rem 0.85rem;
+  margin-bottom: 0.35rem;
+}
+
+.campaign-objective-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 0.5rem;
+  margin-top: 0.35rem;
+}
+
+.campaign-objective-tile {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.55rem;
+  padding: 0.65rem 0.8rem;
+  border: 1px solid var(--line-solid);
+  border-radius: 0.65rem;
+  background: var(--surface);
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+
+.campaign-objective-tile:hover {
+  border-color: var(--ink);
+}
+
+.campaign-objective-tile.active {
+  border-color: var(--nokvo-green);
+  background: rgba(5, 150, 105, 0.05);
+}
+
+.campaign-objective-tile input[type="checkbox"] {
+  margin-top: 0.2rem;
+}
+
+.campaign-objective-tile strong {
+  display: block;
+  font-size: 0.88rem;
+  line-height: 1.2;
+}
+
+.campaign-objective-tile small {
+  display: block;
+  margin-top: 0.2rem;
+  color: var(--muted);
+  font-size: 0.74rem;
+  line-height: 1.35;
+}
+
+.campaign-objective-warning {
+  display: block;
+  margin-top: 0.45rem;
+  color: #b88528;
+  font-size: 0.78rem;
+}
+
+.campaign-card-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+}
+
+.campaign-card-row {
+  border: 1px solid var(--line-soft);
+  border-radius: 0.9rem;
+  background: var(--surface);
+  transition: border-color 140ms ease, box-shadow 140ms ease, background 140ms ease;
+  overflow: hidden;
+}
+
+.campaign-card-row.expanded {
+  border-color: var(--ink);
+  box-shadow: 0 8px 24px -16px rgba(15, 23, 42, 0.18);
+}
+
+.campaign-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.85rem 1rem;
+  cursor: pointer;
+}
+
+.campaign-card-header:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: -2px;
+}
+
+.campaign-card-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.55rem;
+  font-family: var(--nokvo-body);
+}
+
+.campaign-card-title strong {
+  font-size: 0.98rem;
+  font-weight: 700;
+}
+
+.campaign-card-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.9rem;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+.campaign-card-meta strong {
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+
+.campaign-card-body {
+  border-top: 1px solid var(--line-soft);
+  padding: 0.95rem 1rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.campaign-card-section {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+}
+
+.campaign-card-section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.campaign-card-section-head strong {
+  font-size: 0.86rem;
+  font-weight: 700;
+}
+
+.campaign-card-section-head small {
+  font-size: 0.74rem;
+  color: var(--muted);
+}
+
+.campaign-prompt-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  background: rgba(15, 23, 42, 0.04);
+  padding: 0.75rem 0.9rem;
+  border-radius: 0.7rem;
+  font-size: 0.85rem;
+  color: var(--ink);
+}
+
+.campaign-prompt-block {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.campaign-prompt-block--row {
+  flex-direction: row;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.campaign-prompt-kicker {
+  text-transform: uppercase;
+  font-size: 0.65rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+
+.campaign-prompt-block p {
+  margin: 0;
+  line-height: 1.5;
+}
+
+.campaign-prompt-block ul {
+  margin: 0;
+  padding-left: 1.1rem;
+  line-height: 1.55;
+}
+
+.campaign-attached-leads {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.campaign-attached-leads li {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.55rem 0.75rem;
+  border-radius: 0.7rem;
+  background: rgba(15, 23, 42, 0.03);
+}
+
+.campaign-attached-leads li strong {
+  display: block;
+  font-size: 0.88rem;
+}
+
+.campaign-attached-leads li small {
+  font-size: 0.74rem;
+  color: var(--muted);
+}
+
+.campaign-lead-picker {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 0.45rem;
+  max-height: 260px;
+  overflow-y: auto;
+  padding-right: 0.25rem;
+}
+
+.campaign-lead-picker-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.7rem;
+  border: 1px solid var(--line-soft);
+  border-radius: 0.65rem;
+  cursor: pointer;
+  background: var(--surface);
+  transition: border-color 120ms ease, background 120ms ease;
+}
+
+.campaign-lead-picker-row:hover {
+  border-color: var(--ink);
+}
+
+.campaign-lead-picker-row.active {
+  border-color: var(--nokvo-green);
+  background: rgba(5, 150, 105, 0.05);
+}
+
+.campaign-lead-picker-row strong {
+  display: block;
+  font-size: 0.85rem;
+}
+
+.campaign-lead-picker-row small {
+  display: block;
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+
+.campaign-card-section--actions {
+  flex-direction: row;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  padding-top: 0.4rem;
+  border-top: 1px dashed var(--line-soft);
+}
+
+/* End-of-call outcome banner inside the Tester card. Colour-coded by the
+   classifier's verdict so the operator can scan the result without reading. */
+.outbound-tester-outcome {
+  border-radius: 0.85rem;
+  padding: 0.85rem 1rem;
+  margin: 0.6rem 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  border: 1px solid var(--line-solid);
+  background: var(--surface);
+}
+
+.outbound-tester-outcome-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.8rem;
+}
+
+.outbound-tester-outcome-head strong {
+  font-size: 0.95rem;
+}
+
+.outbound-tester-outcome p {
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--ink);
+  opacity: 0.85;
+}
+
+.outbound-tester-outcome--interested {
+  background: rgba(5, 150, 105, 0.07);
+  border-color: rgba(5, 150, 105, 0.4);
+}
+
+.outbound-tester-outcome--partial {
+  background: rgba(184, 133, 40, 0.08);
+  border-color: rgba(184, 133, 40, 0.35);
+}
+
+.outbound-tester-outcome--not_interested {
+  background: rgba(15, 23, 42, 0.05);
+  border-color: var(--line-solid);
+  opacity: 0.9;
+}
+
 .voice-status-badge {
   display: inline-flex;
   align-items: center;
@@ -14994,7 +14639,7 @@ onBeforeUnmount(() => {
   text-transform: uppercase;
   border: 1px solid rgba(196, 199, 199, 0.6);
   background: rgba(255, 255, 255, 0.7);
-  color: #5f5f53;
+  color: var(--muted);
 }
 
 .voice-status-dot {
@@ -15005,7 +14650,7 @@ onBeforeUnmount(() => {
   opacity: 0.6;
 }
 
-.voice-status-idle { color: #5f5f53; }
+.voice-status-idle { color: var(--muted); }
 .voice-status-connecting { color: #b45309; }
 .voice-status-listening { color: #047857; background: rgba(5, 150, 105, 0.08); border-color: rgba(5, 150, 105, 0.3); }
 .voice-status-thinking { color: #1d4ed8; background: rgba(59, 130, 246, 0.08); border-color: rgba(59, 130, 246, 0.3); }
@@ -15057,10 +14702,10 @@ onBeforeUnmount(() => {
   flex-wrap: wrap;
   gap: 0.9rem;
   font-size: 0.78rem;
-  color: #5f5f53;
+  color: var(--muted);
 }
 
-.voice-latency-row strong { color: #1b1c15; font-variant-numeric: tabular-nums; }
+.voice-latency-row strong { color: var(--ink); font-variant-numeric: tabular-nums; }
 .voice-latency-row code {
   background: rgba(15, 23, 42, 0.06);
   padding: 0.1rem 0.35rem;
@@ -15098,7 +14743,7 @@ onBeforeUnmount(() => {
 .voice-turn-user p,
 .voice-turn-agent p {
   margin: 0;
-  color: #1b1c15;
+  color: var(--ink);
   font-size: 0.9rem;
   line-height: 1.55;
 }
@@ -15109,7 +14754,7 @@ onBeforeUnmount(() => {
   flex-wrap: wrap;
   gap: 0.5rem;
   font-size: 0.72rem;
-  color: #5f5f53;
+  color: var(--muted);
 }
 
 .phone-link-urls {
@@ -15129,7 +14774,7 @@ onBeforeUnmount(() => {
   font-weight: 700;
   letter-spacing: 0.07em;
   text-transform: uppercase;
-  color: #5f5f53;
+  color: var(--muted);
 }
 
 .phone-link-url-row code {
@@ -15194,7 +14839,7 @@ onBeforeUnmount(() => {
 }
 
 .kb-hero-copy h3 {
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-size: 1.7rem;
   line-height: 1.15;
   margin-top: 0.4rem;
@@ -15225,7 +14870,7 @@ onBeforeUnmount(() => {
   font-weight: 700;
   letter-spacing: 0.05em;
   text-transform: uppercase;
-  background: #efeee3;
+  background: var(--paper-2);
   color: #2a2a1f;
   border: 1px solid rgba(196, 199, 199, 0.55);
 }
@@ -15245,7 +14890,7 @@ onBeforeUnmount(() => {
 
 .kb-pill-type {
   background: rgba(15, 23, 42, 0.06);
-  color: #1b1c15;
+  color: var(--ink);
 }
 
 .kb-pill-status-approved {
@@ -15297,21 +14942,21 @@ onBeforeUnmount(() => {
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.07em;
-  color: #5f5f53;
+  color: var(--muted);
 }
 
 .kb-stat-value {
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-size: 1.85rem;
   line-height: 1;
   margin-top: 0.4rem;
-  color: #1b1c15;
+  color: var(--ink);
   font-variant-numeric: tabular-nums;
 }
 
 .kb-stat-meta {
   margin-top: 0.55rem;
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.74rem;
 }
 
@@ -15341,19 +14986,19 @@ onBeforeUnmount(() => {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  background: #efeee3;
+  background: var(--paper-2);
   border: 1px solid rgba(196, 199, 199, 0.55);
-  color: #1b1c15;
+  color: var(--ink);
 }
 
 .kb-card-icon-primary {
   background: #1d1c0f;
-  color: #fffef8;
+  color: var(--surface);
   border-color: #1d1c0f;
 }
 
 .kb-card-head h4 {
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-size: 1.05rem;
   line-height: 1.2;
   margin: 0;
@@ -15361,7 +15006,7 @@ onBeforeUnmount(() => {
 
 .kb-card-head p {
   margin: 0.18rem 0 0;
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.85rem;
   line-height: 1.55;
 }
@@ -15474,7 +15119,7 @@ onBeforeUnmount(() => {
 .kb-chunk {
   padding: 0.6rem 0.7rem;
   border-radius: 0.45rem;
-  background: #ffffff;
+  background: var(--surface);
   border: 1px solid #ece9d7;
 }
 .kb-chunk-head {
@@ -15488,7 +15133,7 @@ onBeforeUnmount(() => {
 }
 .kb-chunk-index {
   font-weight: 700;
-  color: #1b1c15;
+  color: var(--ink);
 }
 .kb-chunk-section {
   padding: 0.05rem 0.45rem;
@@ -15506,7 +15151,7 @@ onBeforeUnmount(() => {
   margin: 0;
   font-size: 0.83rem;
   line-height: 1.45;
-  color: #1b1c15;
+  color: var(--ink);
   white-space: pre-wrap;
   word-break: break-word;
 }
@@ -15566,12 +15211,12 @@ onBeforeUnmount(() => {
 }
 
 .kb-dropzone-empty strong {
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-size: 0.98rem;
 }
 
 .kb-dropzone-empty span {
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.8rem;
 }
 
@@ -15582,9 +15227,9 @@ onBeforeUnmount(() => {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  background: #fffef8;
+  background: var(--surface);
   border: 1px solid rgba(196, 199, 199, 0.55);
-  color: #1b1c15;
+  color: var(--ink);
   flex: 0 0 auto;
 }
 
@@ -15597,7 +15242,7 @@ onBeforeUnmount(() => {
 }
 
 .kb-dropzone-file strong {
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-size: 0.95rem;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -15605,7 +15250,7 @@ onBeforeUnmount(() => {
 }
 
 .kb-dropzone-file span {
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.78rem;
 }
 
@@ -15647,7 +15292,7 @@ onBeforeUnmount(() => {
   font-weight: 700;
   letter-spacing: 0.07em;
   text-transform: uppercase;
-  color: #5f5f53;
+  color: var(--muted);
 }
 
 .kb-field input,
@@ -15660,7 +15305,7 @@ onBeforeUnmount(() => {
   border: 1px solid rgba(196, 199, 199, 0.6);
   background: rgba(255, 255, 255, 0.85);
   font-size: 0.92rem;
-  color: #1b1c15;
+  color: var(--ink);
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
 
@@ -15679,6 +15324,38 @@ onBeforeUnmount(() => {
   line-height: 1.5;
 }
 
+.kb-single-tradeoff {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 0.55rem;
+  margin: 0.35rem 0 0.8rem;
+}
+
+.kb-single-tradeoff-tile {
+  border: 1px solid var(--line-soft);
+  border-radius: 0.7rem;
+  padding: 0.65rem 0.8rem;
+  background: rgba(15, 23, 42, 0.025);
+}
+
+.kb-single-tradeoff-tile strong {
+  display: block;
+  font-size: 0.85rem;
+  margin-bottom: 0.35rem;
+}
+
+.kb-single-tradeoff-tile ul {
+  margin: 0;
+  padding-left: 1.05rem;
+  color: var(--muted);
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+
+.kb-single-tradeoff-tile li {
+  margin-bottom: 0.18rem;
+}
+
 .kb-single-status {
   display: flex;
   align-items: flex-start;
@@ -15688,7 +15365,7 @@ onBeforeUnmount(() => {
   border-radius: 0.75rem;
   border: 1px solid rgba(5, 150, 105, 0.25);
   background: rgba(5, 150, 105, 0.08);
-  color: #1b1c15;
+  color: var(--ink);
 }
 
 .kb-single-status svg {
@@ -15705,7 +15382,7 @@ onBeforeUnmount(() => {
 }
 
 .kb-single-status strong {
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-size: 0.9rem;
 }
 
@@ -15727,7 +15404,7 @@ onBeforeUnmount(() => {
 }
 
 .kb-card-hint {
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.78rem;
 }
 
@@ -15749,7 +15426,7 @@ onBeforeUnmount(() => {
 .kb-search-bar-icon {
   position: absolute;
   left: 0.95rem;
-  color: #5f5f53;
+  color: var(--muted);
   pointer-events: none;
 }
 
@@ -15788,15 +15465,15 @@ onBeforeUnmount(() => {
 }
 
 .kb-result-rank {
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-weight: 800;
   font-size: 0.78rem;
-  color: #5f5f53;
+  color: var(--muted);
 }
 
 .kb-result-head strong {
   flex: 1;
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-size: 0.95rem;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -15811,7 +15488,7 @@ onBeforeUnmount(() => {
 }
 
 .kb-search-empty {
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.85rem;
   padding: 0.4rem 0.2rem;
 }
@@ -15825,7 +15502,7 @@ onBeforeUnmount(() => {
 }
 
 .kb-list-head h4 {
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-size: 1.25rem;
   line-height: 1.2;
   margin: 0.3rem 0 0.2rem;
@@ -15833,7 +15510,7 @@ onBeforeUnmount(() => {
 
 .kb-list-head p {
   margin: 0;
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.85rem;
 }
 
@@ -15862,19 +15539,19 @@ onBeforeUnmount(() => {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  background: #efeee3;
-  color: #1b1c15;
+  background: var(--paper-2);
+  color: var(--ink);
   border: 1px solid rgba(196, 199, 199, 0.55);
   margin-bottom: 0.5rem;
 }
 
 .kb-empty strong {
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-size: 1rem;
 }
 
 .kb-empty span {
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.85rem;
 }
 
@@ -15919,9 +15596,9 @@ onBeforeUnmount(() => {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  background: #efeee3;
+  background: var(--paper-2);
   border: 1px solid rgba(196, 199, 199, 0.55);
-  color: #1b1c15;
+  color: var(--ink);
 }
 
 .kb-doc-body {
@@ -15939,7 +15616,7 @@ onBeforeUnmount(() => {
 }
 
 .kb-doc-title-row strong {
-  font-family: Manrope, sans-serif;
+  font-family: var(--nokvo-body);
   font-size: 1rem;
   line-height: 1.3;
 }
@@ -15955,12 +15632,12 @@ onBeforeUnmount(() => {
   display: flex;
   flex-wrap: wrap;
   gap: 0.8rem;
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.78rem;
 }
 
 .kb-doc-meta strong {
-  color: #1b1c15;
+  color: var(--ink);
   font-weight: 800;
 }
 
@@ -15975,7 +15652,7 @@ onBeforeUnmount(() => {
   padding: 0.18rem 0.5rem;
   border-radius: 999px;
   font-size: 0.7rem;
-  color: #1b1c15;
+  color: var(--ink);
 }
 
 .kb-doc-error {
@@ -16239,7 +15916,7 @@ onBeforeUnmount(() => {
   padding: 0.75rem 0.9rem;
   border-radius: 0.8rem;
   background: rgba(255, 255, 255, 0.72);
-  border: 1px solid #e4e3d7;
+  border: 1px solid var(--line-solid);
   transition: border-color 0.15s ease;
 }
 .field-schema-tile:hover {
@@ -16253,8 +15930,8 @@ onBeforeUnmount(() => {
   align-items: center;
   justify-content: center;
   border-radius: 0.55rem;
-  background: #efeee3;
-  color: #5f5f53;
+  background: var(--paper-2);
+  color: var(--muted);
 }
 .field-schema-body {
   display: flex;
@@ -16266,12 +15943,12 @@ onBeforeUnmount(() => {
 .field-schema-body strong {
   font-size: 0.92rem;
   font-weight: 600;
-  color: #1b1c15;
+  color: var(--ink);
   word-break: break-word;
 }
 .field-schema-meta {
   font-size: 0.78rem;
-  color: #5f5f53;
+  color: var(--muted);
 }
 .field-schema-meta em {
   font-style: normal;
@@ -16311,9 +15988,9 @@ onBeforeUnmount(() => {
   gap: 0.45rem;
   padding: 0.35rem 0.75rem;
   border-radius: 999px;
-  border: 1px solid #e4e3d7;
+  border: 1px solid var(--line-solid);
   background: rgba(255, 255, 255, 0.72);
-  color: #1b1c15;
+  color: var(--ink);
   font-size: 0.82rem;
   font-variant-numeric: tabular-nums;
 }
@@ -16321,7 +15998,7 @@ onBeforeUnmount(() => {
   font-weight: 700;
 }
 .voice-cost-meter span {
-  color: #5f5f53;
+  color: var(--muted);
   font-size: 0.74rem;
 }
 .org-shell.dark .voice-cost-meter {
@@ -16639,106 +16316,225 @@ onBeforeUnmount(() => {
 .org-health-grid .organization-card {
   grid-column: 1 / -1;
 }
+/* ── Call cost ledger ─────────────────────────────────────────────────────
+   Token-driven Nokvo Prime rebuild. Rupee totals carry editorial weight in
+   Fraunces; minutes and counts stay restrained (Manrope tabular). Recent
+   calls render as an editorial list, not boxed tiles. Replaces the older
+   indigo-fallback styling (--surface-muted / --surface-border / --text-*)
+   that clashed against the warm-paper Prime aesthetic. */
+
 .cost-card {
   position: relative;
+  padding: 1.5rem 1.65rem;
 }
+
 .cost-card .compact-card-head {
   align-items: flex-start;
+  padding-bottom: 1.15rem;
+  border-bottom: 1px solid var(--line-soft);
+  margin-bottom: 1.15rem;
 }
+
+.cost-card .compact-card-head h3 {
+  font-size: 1.05rem;
+  font-weight: 600;
+  letter-spacing: -0.005em;
+  color: var(--ink);
+  margin: 0;
+}
+
+.cost-card .compact-card-head > div:nth-child(2) p {
+  margin: 0.2rem 0 0;
+  color: var(--muted);
+  font-size: var(--fs-small);
+  font-variant-numeric: tabular-nums;
+}
+
 .cost-refresh-button {
   margin-left: auto;
   align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.42rem 0.85rem;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--line-solid);
+  background: transparent;
+  color: var(--muted);
+  font-family: var(--nokvo-body);
+  font-size: var(--fs-eyebrow);
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: color 140ms ease, border-color 140ms ease, background 140ms ease;
 }
+.cost-refresh-button:hover:not(:disabled) {
+  color: var(--ink);
+  border-color: var(--ink);
+  background: var(--paper);
+}
+.cost-refresh-button:disabled {
+  opacity: 0.5;
+  cursor: progress;
+}
+
 .cost-stats {
   display: grid;
-  /* auto-fit wraps the five tiles (3 rupee totals + 2 minute totals)
-     onto two rows on narrower viewports while keeping them in one row
-     on a wide dashboard. */
-  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
-  gap: 16px;
-  margin: 18px 0 4px;
+  grid-template-columns: repeat(2, 1fr);
+  column-gap: 1.6rem;
+  row-gap: 1.2rem;
+  margin: 0 0 1.25rem;
 }
-.cost-stat-minutes {
-  /* Slightly subdued styling so the minutes tiles read as a supporting
-     metric next to the rupee totals, not a competing headline. */
-  background: var(--surface-subtle, rgba(15, 23, 42, 0.04));
-}
+
 .cost-stat {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  padding: 16px 18px;
-  border-radius: 14px;
-  background: var(--surface-muted, rgba(99, 102, 241, 0.06));
-  border: 1px solid var(--surface-border, rgba(99, 102, 241, 0.14));
+  gap: 0.4rem;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  position: relative;
 }
+
+/* Vertical hairline between the two columns — disappears when stacked. */
+.cost-stat:nth-child(odd)::after {
+  content: "";
+  position: absolute;
+  right: -0.8rem;
+  top: 0.25rem;
+  bottom: 0.25rem;
+  width: 1px;
+  background: var(--line-soft);
+}
+
 .cost-stat-label {
-  font-size: 11px;
-  letter-spacing: 0.08em;
+  font-family: var(--nokvo-body);
+  font-size: var(--fs-eyebrow);
+  letter-spacing: 0.16em;
   text-transform: uppercase;
-  color: var(--text-muted, #6b7280);
-}
-.cost-stat-value {
-  font-size: 24px;
   font-weight: 700;
-  color: var(--text-primary, #111827);
+  color: var(--muted);
+}
+
+.cost-stat-value {
+  font-family: var(--nokvo-display);
+  font-optical-sizing: auto;
+  font-weight: 500;
+  font-size: clamp(1.85rem, 3.6vw, 2.55rem);
+  line-height: 1.05;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.012em;
+}
+
+/* Minutes tiles speak in the body voice — quieter, secondary metric. */
+.cost-stat-minutes .cost-stat-value {
+  font-family: var(--nokvo-body);
+  font-weight: 600;
+  font-size: 1.35rem;
+  letter-spacing: -0.004em;
+}
+
+.cost-stat-meta {
+  font-family: var(--nokvo-body);
+  font-size: var(--fs-small);
+  color: var(--muted);
   font-variant-numeric: tabular-nums;
 }
-.cost-stat-meta {
-  font-size: 12px;
-  color: var(--text-muted, #6b7280);
-}
+
 .cost-recent {
-  margin-top: 18px;
-  padding-top: 14px;
-  border-top: 1px dashed var(--surface-border, rgba(99, 102, 241, 0.18));
+  margin-top: 0.4rem;
+  padding-top: 1.1rem;
+  border-top: 1px solid var(--line-soft);
 }
+
 .cost-recent-head {
-  margin-bottom: 8px;
+  margin-bottom: 0.55rem;
 }
+
 .cost-recent-list {
   list-style: none;
   padding: 0;
   margin: 0;
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  max-height: 240px;
+  gap: 0;
+  max-height: 264px;
   overflow-y: auto;
+  scrollbar-width: thin;
 }
+
 .cost-recent-row {
   display: flex;
   justify-content: space-between;
-  align-items: center;
-  gap: 16px;
-  padding: 8px 12px;
-  border-radius: 10px;
-  background: var(--surface-subtle, rgba(15, 23, 42, 0.03));
+  align-items: baseline;
+  gap: 1rem;
+  padding: 0.65rem 0;
+  border-bottom: 1px solid var(--line-soft);
+  transition: background 140ms ease;
 }
+.cost-recent-row:last-child {
+  border-bottom: 0;
+}
+.cost-recent-row:hover {
+  background: var(--paper);
+}
+
 .cost-recent-row strong {
+  font-family: var(--nokvo-display);
+  font-optical-sizing: auto;
+  font-weight: 500;
   font-variant-numeric: tabular-nums;
-  font-size: 14px;
+  font-size: 1rem;
+  color: var(--ink);
+  letter-spacing: -0.005em;
 }
+
 .cost-recent-row small {
   display: block;
-  font-size: 11px;
-  color: var(--text-muted, #6b7280);
-  text-transform: lowercase;
+  margin-top: 0.12rem;
+  font-family: var(--nokvo-mono);
+  font-size: 0.72rem;
+  color: var(--muted);
+  letter-spacing: 0.04em;
 }
+
 .cost-recent-time {
-  font-size: 11px;
-  color: var(--text-muted, #6b7280);
+  font-family: var(--nokvo-mono);
+  font-size: 0.72rem;
+  color: var(--muted);
   white-space: nowrap;
+  letter-spacing: 0.02em;
 }
+
 .cost-empty {
-  margin-top: 16px;
-  font-size: 13px;
-  color: var(--text-muted, #6b7280);
+  margin-top: 0.4rem;
+  padding: 1rem 0 0.25rem;
+  border-top: 1px solid var(--line-soft);
+  font-family: var(--nokvo-body);
+  font-size: var(--fs-small);
+  color: var(--muted);
+  font-style: italic;
 }
 
 @media (max-width: 720px) {
+  .cost-card {
+    padding: 1.25rem 1.25rem;
+  }
   .cost-stats {
     grid-template-columns: 1fr;
+    row-gap: 1rem;
+  }
+  .cost-stat:nth-child(odd)::after {
+    display: none;
+  }
+  .cost-stat-value {
+    font-size: 1.85rem;
+  }
+  .cost-stat-minutes .cost-stat-value {
+    font-size: 1.2rem;
   }
 }
 
@@ -16759,6 +16555,114 @@ onBeforeUnmount(() => {
   .agent-rename-row {
     flex-direction: column;
     align-items: stretch;
+  }
+}
+
+/* ── Lead campaign tabs ───────────────────────────────────────────────────
+   One tab per outbound campaign with leads, plus an "All Leads" default.
+   Lives inside the Leads card, above the records list. */
+.lead-campaign-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin: 0.85rem 0 0.95rem;
+  padding-bottom: 0.85rem;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.lead-campaign-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.42rem 0.85rem 0.42rem 0.95rem;
+  border: 1px solid var(--line-solid);
+  background: transparent;
+  border-radius: var(--r-pill);
+  color: var(--muted);
+  font-family: var(--nokvo-body);
+  font-size: var(--fs-small);
+  font-weight: 600;
+  letter-spacing: 0.005em;
+  cursor: pointer;
+  transition: color 140ms ease, border-color 140ms ease, background 140ms ease;
+}
+
+.lead-campaign-tab:hover {
+  color: var(--ink);
+  border-color: var(--ink);
+}
+
+.lead-campaign-tab.active {
+  color: var(--surface);
+  background: var(--nokvo-green);
+  border-color: var(--nokvo-green);
+}
+
+.lead-campaign-tab-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.55rem;
+  padding: 0 0.35rem;
+  height: 1.25rem;
+  font-family: var(--nokvo-mono);
+  font-size: 0.7rem;
+  font-weight: 600;
+  border-radius: var(--r-pill);
+  background: var(--paper-2);
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.lead-campaign-tab.active .lead-campaign-tab-count {
+  background: rgba(255, 254, 248, 0.18);
+  color: var(--surface);
+}
+
+/* Uncategorized tab — distinct from regular campaign tabs because it
+   represents records the tester couldn't fit anywhere else. Dashed border
+   + amber accent so it reads as "needs triage" without being alarming. */
+.lead-campaign-tab--uncategorized {
+  border-style: dashed;
+  color: var(--ink);
+  opacity: 0.75;
+}
+
+.lead-campaign-tab--uncategorized:hover {
+  opacity: 1;
+  border-color: var(--ink);
+}
+
+.lead-campaign-tab--uncategorized.active {
+  background: #b88528;
+  border-color: #b88528;
+  border-style: solid;
+  color: #fffbf0;
+  opacity: 1;
+}
+
+/* P5 — beautification primitives.
+   Universal keyboard focus ring (token-driven, drops the ad-hoc rings) and a
+   reduce-motion guard so the connect-screen gradient drift + char reveal don't
+   harass anyone who's asked the OS to slow down. */
+.org-shell button:focus-visible,
+.org-shell a:focus-visible,
+.org-shell [role="button"]:focus-visible,
+.org-shell input:focus-visible,
+.org-shell select:focus-visible,
+.org-shell textarea:focus-visible {
+  outline: none;
+  box-shadow: var(--ring);
+  border-radius: var(--r-sm);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .org-shell *,
+  .org-shell *::before,
+  .org-shell *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
   }
 }
 </style>

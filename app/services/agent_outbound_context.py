@@ -478,7 +478,14 @@ _OUTBOUND_UNIVERSAL_TURN_RULES = """# OUTBOUND TURN-TAKING RULES — ALWAYS FOLL
 - After a short permission reply to the opener, ask one discovery question. Do not pitch features first.
 - If they already gave a detail, use it and move forward; do not ask again.
 - If they are busy, not interested, wrong number, frustrated, or ask not to be called, stop pitching and close politely.
-- Do not push past their answer. A respectful outbound call sounds like a conversation, not a script."""
+- Do not push past their answer. A respectful outbound call sounds like a conversation, not a script.
+
+# OUTBOUND FACTUAL SCOPE — HARD BOUNDARY
+- This campaign brief (persona, goal, pitch summary, objectives, and the campaign document below) is your ENTIRE source of facts.
+- Do NOT draw on the organisation's inbound knowledge base, property inventory, admin single-prompt, or general world knowledge for product / pricing / specification / availability claims.
+- If the caller asks something that isn't covered by THIS brief, do not guess and do not improvise from training data. Say something like "Let me have our team confirm and get back to you on that," capture the question, and move on.
+- Facts the caller gives you (name, BHK, budget, location, timeline) ARE in scope — they belong to this call's memory.
+- The whole call is bounded by this campaign. Nothing outside it is authoritative for what you tell the prospect."""
 
 
 def compose_outbound_system_section(
@@ -486,6 +493,11 @@ def compose_outbound_system_section(
     *,
     covered_objectives: list[str] | None = None,
     outbound_memory: dict[str, Any] | None = None,
+    tool_flow_state: dict[str, Any] | None = None,
+    tool_flow_bundle: dict[str, Any] | None = None,
+    language: str | None = None,
+    turn_index: int | None = None,
+    conversational_memory: Any = None,
 ) -> str:
     """Build the system-prompt fragment for an outbound turn.
 
@@ -494,11 +506,74 @@ def compose_outbound_system_section(
     — it's the template that's been tuned to produce humane outbound
     behaviour: respect the prospect's time, accept "no" twice and exit,
     disclose AI on ask, never claim actions the system can't take.
+
+    ``tool_flow_state`` / ``tool_flow_bundle`` are the live booking-flow
+    snapshot. When an inbound-style tool_flow (site visit or lead capture)
+    is active, the rendered block tells the LLM exactly which slot to ask
+    for next — without that, the model drifts back into general chat and
+    never collects name/phone/date, so the tool never fires.
+
+    ``turn_index`` is the 1-based turn number used to inject anti-loop
+    guidance: by turn 5+, the model is told to close on the next slot or
+    wrap politely, not re-open with "is this a good time to talk".
     """
     if context is None or not context.is_proactive:
         return ""
     remaining = context.remaining_objectives(covered_objectives or [])
     parts: list[str] = []
+
+    # ── Follow-up preamble ──────────────────────────────────────────────
+    # Surface a "this is a follow-up call" block at the very top so the LLM
+    # opens by acknowledging the prior conversation instead of restarting.
+    # Source: ``outbound_memory['followup']`` — seeded once at session start
+    # from the WebSocket handler's ``campaign_context``. Carries attempt
+    # number, prior promise text, and (via ``conversational_memory``) the
+    # caller's prior objections / commitments / preferences.
+    followup = (outbound_memory or {}).get("followup") if outbound_memory else None
+    if followup and followup.get("is_followup"):
+        attempt_n = int(followup.get("attempt_n") or 1)
+        prior_promise = str(followup.get("prior_promise") or "").strip()
+        prior_objections: list[str] = []
+        prior_commitments: list[str] = []
+        prior_preferences: list[str] = []
+        if conversational_memory is not None:
+            for obj in (getattr(conversational_memory, "objections", []) or [])[-5:]:
+                code = str((obj or {}).get("code") or "")
+                text = str((obj or {}).get("text") or "")
+                if code:
+                    prior_objections.append(f"{code}" + (f" ({text[:80]})" if text else ""))
+            for c in (getattr(conversational_memory, "commitments", []) or [])[-5:]:
+                code = str((c or {}).get("code") or "")
+                if code:
+                    prior_commitments.append(code)
+            for p in (getattr(conversational_memory, "preferences", []) or [])[-5:]:
+                k = str((p or {}).get("key") or "")
+                v = str((p or {}).get("value") or "")
+                if k and v:
+                    prior_preferences.append(f"{k}={v}")
+
+        objections_line = ", ".join(prior_objections) if prior_objections else "—"
+        commitments_line = ", ".join(prior_commitments) if prior_commitments else "—"
+        preferences_line = ", ".join(prior_preferences) if prior_preferences else "—"
+        promise_line = prior_promise or "—"
+
+        parts.append(
+            "═══ FOLLOW-UP CALL ═══\n"
+            f"This is attempt {attempt_n}. The customer's previous call ended recently.\n"
+            f"What they said last time:\n"
+            f"  - Promise to be called back: {promise_line}\n"
+            f"  - Objections: {objections_line}\n"
+            f"  - Commitments: {commitments_line}\n"
+            f"  - Preferences: {preferences_line}\n"
+            "Open by acknowledging the prior conversation — DO NOT restart with "
+            "\"Is this a good time to talk?\". Examples that work:\n"
+            "  - \"Hi {name}, calling back as we discussed about {pitch}…\"\n"
+            "  - \"Hi {name}, you'd asked to call back around now — got a minute?\"\n"
+            "If the customer's previous turn raised an objection, address it FIRST, "
+            "then resume where the previous call ended.\n"
+            "══════════════════════"
+        )
+
     # If the operator provided a custom agent_prompt, prefer it but still
     # append the hard rules so AI-disclosure / "no twice = end" stay locked.
     if context.agent_prompt and context.agent_prompt != DEFAULT_AGENT_PROMPT:
@@ -513,6 +588,89 @@ def compose_outbound_system_section(
             )
         )
     parts.append(_OUTBOUND_UNIVERSAL_TURN_RULES)
+
+    # Real-estate outbound FSM mode block. Tells the LLM whether it's in
+    # ``sale`` (default proactive seller), ``site_visit`` (the lead said
+    # yes — drive the booking), or ``outbound_lead`` (capturing org lead
+    # fields). The block carries the don't-invent-caller-preferences
+    # guardrail so the LLM doesn't attribute project facts to the lead.
+    # Empty for non-real-estate orgs so other industries keep their
+    # existing behaviour.
+    try:
+        from app.services.real_estate_outbound_agent_fsm import (
+            current_mode as _outbound_mode,
+            enabled_for_business_type as _outbound_fsm_enabled,
+            mode_block_for_prompt as _outbound_mode_block,
+        )
+    except Exception:
+        _outbound_mode = None  # type: ignore[assignment]
+        _outbound_fsm_enabled = None  # type: ignore[assignment]
+        _outbound_mode_block = None  # type: ignore[assignment]
+
+    business_type_hint = ""
+    # The compose function doesn't take business_type directly — read it from
+    # the outbound context's pitch summary as a best-effort hint, OR just
+    # always render the block (it's only loaded for real-estate campaigns
+    # in practice, but be defensive). Calling code can suppress by leaving
+    # tool_flow_state empty and not setting the mode block fallback.
+    if _outbound_mode is not None and _outbound_mode_block is not None:
+        _state_for_mode = {"tool_flow": tool_flow_state or {}}
+        _mode = _outbound_mode(
+            _state_for_mode,
+            list(context.objectives or []),
+            memory=conversational_memory,
+        )
+        _pending_label = None
+        _pending_question = None
+        if tool_flow_state and tool_flow_bundle is not None:
+            _flow_key = str(tool_flow_state.get("flow_key") or "")
+            _flow_def = ((tool_flow_bundle.get("flows") or {}).get(_flow_key) or {})
+            _pending_slot_key = str(tool_flow_state.get("pending_slot") or "")
+            for _slot in (_flow_def.get("slots") or []):
+                if not isinstance(_slot, dict):
+                    continue
+                _skey = str(_slot.get("key") or "")
+                if _pending_slot_key and _skey != _pending_slot_key:
+                    continue
+                if not _pending_slot_key and (tool_flow_state.get("collected") or {}).get(_skey):
+                    continue
+                _pending_label = str(_slot.get("label") or _skey)
+                _questions = _slot.get("questions") or {}
+                _pending_question = str(
+                    _questions.get(language) or _questions.get("en") or ""
+                )
+                break
+        parts.append(
+            _outbound_mode_block(
+                _mode,
+                list(context.objectives or []),
+                pending_slot_label=_pending_label,
+                pending_slot_question=_pending_question,
+                memory=conversational_memory,
+            )
+        )
+
+    # Anti-loop reminder. The LLM, left to free-form, will sometimes re-ask
+    # turn-1 framing questions ("Is this a good time to talk about X?") in
+    # the middle of a call because the system prompt re-renders every turn.
+    # By turn 3+ we explicitly forbid that pattern and nudge toward closure.
+    if turn_index is not None and turn_index >= 3:
+        loop_block = (
+            "# TURN PROGRESS — DO NOT REWIND\n"
+            f"You are on turn {turn_index}. The conversation is already underway.\n"
+            "- NEVER re-ask opener-style framing questions: 'Is this a good time?', "
+            "'Can I tell you about X?', 'May I share more?'. You already had permission. Move forward.\n"
+            "- If you already explained the project once, do not re-explain it. Pivot to a qualifier or a close.\n"
+            "- If you do not yet have name + phone, your next reply should aim for one of them."
+        )
+        if turn_index >= 6:
+            loop_block += (
+                "\n- You're past turn 5. Either land the next slot (name / phone / "
+                "date / time) in this reply, or wrap the call politely. Do not "
+                "open new discovery threads."
+            )
+        parts.append(loop_block)
+
     # Campaign overview always rendered so the model has goal + pitch even
     # when the custom-persona branch was taken.
     overview_parts: list[str] = []
@@ -523,10 +681,25 @@ def compose_outbound_system_section(
     overview_parts.append(f"Objective: {context.objective}")
     parts.append("# CAMPAIGN OVERVIEW\n" + "\n".join(overview_parts))
     if context.objectives:
-        objectives_render = "\n".join(f"  - {item}" for item in context.objectives)
-        section = f"# OBJECTIVES (ask in order until covered)\n{objectives_render}"
+        # Campaign objectives are now stored as structured codes ("site_visit",
+        # "lead"); render them as human-readable labels for the LLM. Unknown
+        # codes (legacy free-text rows from earlier campaigns) fall through
+        # unchanged so existing campaigns keep working.
+        try:
+            from app.services.real_estate_outbound_agent_fsm import OBJECTIVE_LABELS as _OBJ_LABELS
+        except Exception:
+            _OBJ_LABELS = {}
+        labeled_objectives = [
+            _OBJ_LABELS.get(str(item).strip().lower(), str(item))
+            for item in context.objectives
+        ]
+        objectives_render = "\n".join(f"  - {item}" for item in labeled_objectives)
+        section = f"# OBJECTIVES (drive toward at least one)\n{objectives_render}"
         if remaining:
-            remaining_render = "\n".join(f"  - {item}" for item in remaining)
+            remaining_render = "\n".join(
+                f"  - {_OBJ_LABELS.get(str(item).strip().lower(), str(item))}"
+                for item in remaining
+            )
             section += f"\n\nStill pending this call:\n{remaining_render}"
         else:
             section += "\n\nAll objectives covered — confirm the next step and wrap the call politely."
@@ -534,6 +707,19 @@ def compose_outbound_system_section(
     memory_section = render_outbound_memory(outbound_memory)
     if memory_section:
         parts.append(memory_section)
+    # Active booking-flow block. When the inbound-style tool_flow regex has
+    # latched on (yes-after-offer or explicit booking intent), this surfaces
+    # the slot state so the LLM drives toward filling the next one rather
+    # than chatting around it. The block is INTENTIONALLY placed late so
+    # recency bias keeps it top of mind for the next reply.
+    if tool_flow_state:
+        booking_block = render_booking_flow_state(
+            tool_flow_state,
+            tool_flow_bundle,
+            language=language,
+        )
+        if booking_block:
+            parts.append(booking_block)
     if context.exit_conditions:
         exit_render = "\n".join(f"  - {item}" for item in context.exit_conditions)
         parts.append(f"# EXIT CONDITIONS (when ANY is met, close the call warmly)\n{exit_render}")
@@ -542,10 +728,29 @@ def compose_outbound_system_section(
     return "\n\n".join(parts)
 
 
+def _opener_enquiry_phrase(facts: dict[str, Any], code: str) -> str:
+    """A short, language-appropriate phrase naming what the lead is looking for
+    (e.g. ``"3 BHK options in Gachibowli"``) from known facts. Empty when we
+    don't know enough to personalise."""
+    bhk = str(facts.get("bhk") or "").strip()
+    location = str(facts.get("location") or "").strip()
+    if not (bhk or location):
+        return ""
+    if code == "te":
+        unit = f"{bhk} options" if bhk else "options"
+        return f"{unit} {location} lo" if location else unit
+    if code == "hi":
+        unit = f"{bhk} options" if bhk else "options"
+        return f"{location} mein {unit}" if location else unit
+    unit = f"{bhk} options" if bhk else "your requirement"
+    return f"{unit} in {location}" if location else unit
+
+
 def generate_outbound_opener_text(
     context: OutboundCampaignContext,
     *,
     language: str | None = None,
+    known_facts: dict[str, Any] | None = None,
 ) -> str:
     """Deterministic, template-filled opener.
 
@@ -555,22 +760,40 @@ def generate_outbound_opener_text(
     render the line with proper tones.
 
     ``language`` switches the opener template so Telugu / Hindi campaigns
-    don't start every call with English. The opener uses the same natural
-    code-switching style the system prompt mandates downstream (English
-    loanwords + native particles), so the first impression matches the
-    rest of the call's register.
+    don't start every call with English. ``known_facts`` (optional) carries
+    what we already know about THIS lead — ``name`` plus any enquiry / prior-call
+    facts (``bhk``, ``location``) and a ``returning`` flag — so the opener is
+    personalised ("you'd enquired about 3 BHK in Gachibowli") instead of a cold
+    one-size-fits-all line. Falls back to the campaign pitch when nothing is known.
     """
     caller = (context.caller_name or "Riya").strip() or "Riya"
     company = (context.company_name or "").strip()
     pitch = (context.pitch_summary or context.goal or "").strip()
     code = (language or "").strip().lower()[:2]
 
+    facts = known_facts or {}
+    lead_name = str(facts.get("name") or "").strip()
+    returning = bool(facts.get("returning"))
+    enquiry = _opener_enquiry_phrase(facts, code)
+
     if code == "te":
+        name_part = f" {lead_name}" if lead_name else ""
         intro_te = (
-            f"Hello, nenu {caller}, {company} nundi maatalaadutunna."
+            f"Hello{name_part}, nenu {caller}, {company} nundi maatalaadutunna."
             if company
-            else f"Hello, nenu {caller} maatalaadutunna."
+            else f"Hello{name_part}, nenu {caller} maatalaadutunna."
         )
+        if enquiry:
+            reason = (
+                f"Last time meeru {enquiry} gurinchi adigaru"
+                if returning
+                else f"Meeru {enquiry} gurinchi enquiry chesaru"
+            )
+            return (
+                f"[warm]{intro_te}[/warm] "
+                f"[neutral]{reason}.[/neutral] "
+                "[question]Ippudu okka minute maatalaadagalara?[/question]"
+            )
         if pitch:
             return (
                 f"[warm]{intro_te}[/warm] "
@@ -583,11 +806,23 @@ def generate_outbound_opener_text(
         )
 
     if code == "hi":
+        name_part = f" {lead_name}" if lead_name else ""
         intro_hi = (
-            f"Namaste, main {caller} bol raha hoon, {company} se."
+            f"Namaste{name_part}, main {caller} bol raha hoon, {company} se."
             if company
-            else f"Namaste, main {caller} bol raha hoon."
+            else f"Namaste{name_part}, main {caller} bol raha hoon."
         )
+        if enquiry:
+            reason = (
+                f"Pichhli baar humne {enquiry} ke baare mein baat ki thi"
+                if returning
+                else f"Aapne {enquiry} ke baare mein enquiry ki thi"
+            )
+            return (
+                f"[warm]{intro_hi}[/warm] "
+                f"[neutral]{reason}.[/neutral] "
+                "[question]Kya abhi ek minute baat kar sakte hain?[/question]"
+            )
         if pitch:
             return (
                 f"[warm]{intro_hi}[/warm] "
@@ -599,11 +834,23 @@ def generate_outbound_opener_text(
             "[question]Kya abhi ek minute baat kar sakte hain?[/question]"
         )
 
+    name_part = f" {lead_name}" if lead_name else ""
     intro = (
-        f"Hi, this is {caller} from {company}."
+        f"Hi{name_part}, this is {caller} from {company}."
         if company
-        else f"Hi, this is {caller}."
+        else f"Hi{name_part}, this is {caller}."
     )
+    if enquiry:
+        reason = (
+            f"we'd spoken about {enquiry} last time"
+            if returning
+            else f"you'd enquired about {enquiry}"
+        )
+        return (
+            f"[warm]{intro}[/warm] "
+            f"[neutral]I'm calling — {reason}.[/neutral] "
+            "[question]Is now a good time to talk for a minute?[/question]"
+        )
     if pitch:
         return (
             f"[warm]{intro}[/warm] "
@@ -650,9 +897,23 @@ def infer_covered_objectives(
         if not objective_tokens:
             continue
         overlap = objective_tokens & transcript_tokens
-        next_step_objective = bool({"next", "step", "appointment", "callback", "demo", "visit"} & objective_tokens)
-        threshold = 1 if len(objective_tokens) <= 3 or next_step_objective else 2
-        if len(overlap) >= threshold:
+        # Tightened next-step handling. Previously ANY single token overlap on a
+        # "next step" objective marked it covered, so a stray "appointment" /
+        # "callback" word in the objective text covered it even when no next step
+        # was actually agreed. Now a next-step objective is covered only when an
+        # actual next-step ACTION was discussed in the turn — not on incidental
+        # token overlap.
+        _action_tokens = {
+            "appointment", "callback", "visit", "demo", "meeting",
+            "book", "booking", "schedule",
+        }
+        is_next_step = bool(({"next", "step"} | _action_tokens) & objective_tokens)
+        if is_next_step:
+            covered_now = bool(overlap & _action_tokens)
+        else:
+            threshold = 1 if len(objective_tokens) <= 3 else 2
+            covered_now = len(overlap) >= threshold
+        if covered_now:
             covered.append(objective)
             covered_lower.add(normalized)
     return covered
@@ -676,6 +937,7 @@ _OUTBOUND_MEMORY_LABELS = {
     "timeline": "Timeline",
     "location_preference": "Location preference",
     "visit_preference": "Visit preference",
+    "next_step": "Agreed next step",
     "requested_info": "Requested info",
     "objection": "Objection / constraint",
 }
@@ -746,13 +1008,17 @@ def update_outbound_memory(
         raw = bhk_match.group(1)
         _remember(memory, "bhk", f"{_BHK_WORDS.get(raw, raw)} BHK")
 
-    budget_match = re.search(
-        r"\b(?:budget(?:\s+is)?|around|about|upto|up to|under|within|near)?\s*"
-        r"(?:rs\.?|inr|₹)?\s*([0-9]+(?:\.[0-9]+)?\s*(?:cr|crore|crores|lakh|lakhs|lac|lacs))\b",
-        lower,
-    )
-    if budget_match:
-        _remember(memory, "budget", budget_match.group(1))
+    # Reuse the inbound budget extractor so outbound memory understands the
+    # same spelled-out amounts ("half a crore", "fifty lakhs", "one and a half
+    # crore") the inbound extractor was fixed to handle — not just digit+unit.
+    try:
+        from app.services.conversational_memory import MemoryExtractor as _ME
+
+        budget_value = _ME._extract_budget(text)
+    except Exception:
+        budget_value = None
+    if budget_value:
+        _remember(memory, "budget", budget_value)
 
     if re.search(r"\b(self[-\s]?use|own use|end use|family|to live|for living)\b", lower):
         _remember(memory, "purpose", "self-use")
@@ -801,10 +1067,29 @@ def update_outbound_memory(
         combined = list(dict.fromkeys(prior + info_hits))
         _remember(memory, "requested_info", ", ".join(combined))
 
-    if re.search(r"\b(not interested|don't call|do not call|remove me|wrong number|busy|call later)\b", lower):
-        _remember(memory, "objection", text)
-    elif re.search(r"\b(expensive|costly|too high|out of budget)\b", lower):
-        _remember(memory, "objection", "price concern")
+    # Next-step TYPE — distinguish a committed site visit from a callback
+    # brush-off or a meeting, so the CRM and objective coverage don't conflate
+    # them (a "call me back" is not the same outcome as "I'll come visit").
+    if re.search(r"\b(site\s*visit|come (?:and )?(?:see|visit)|visit the (?:site|property|project|flat)|tour|in person)\b", lower):
+        _remember(memory, "next_step", "site_visit")
+    elif re.search(r"\b(appointment|meeting|demo|schedule a (?:call|meeting))\b", lower):
+        _remember(memory, "next_step", "appointment")
+    elif re.search(r"\b(call back|callback|call me (?:back|later)|ring me (?:back|later))\b", lower):
+        _remember(memory, "next_step", "callback")
+
+    # Objection parity with inbound: reuse the inbound objection patterns so
+    # outbound captures competitor / long-horizon / timing brush-offs too — not
+    # just the old binary not-interested / price split.
+    try:
+        from app.services.conversational_memory import _OBJECTION_PATTERNS as _OBJ
+    except Exception:
+        _OBJ = ()
+    for pat, code in _OBJ:
+        if pat.search(text):
+            # do_not_call keeps the caller's verbatim words (the interest-signal
+            # check greps them); the rest store a readable label of the code.
+            _remember(memory, "objection", text if code == "do_not_call" else code.replace("_", " "))
+            break
 
     return memory
 
@@ -823,6 +1108,138 @@ def render_outbound_memory(memory: dict[str, Any] | None) -> str:
         "build the next reply around them.\n"
         + "\n".join(items)
     )
+
+
+def outbound_memory_as_facts(memory: dict[str, Any] | None) -> dict[str, Any]:
+    """Map the lightweight outbound turn-memory dict onto canonical
+    ConversationalMemory fact keys, so the structured-memory + strategy layer
+    can be seeded with what the outbound extractor captured (lead scoring,
+    objection playbook). Only the slot-shaped keys map; free-form ones
+    (visit_preference, next_step, requested_info, objection) ride their own
+    channels."""
+    from app.services.conversational_memory import (
+        FACT_BHK,
+        FACT_BUDGET,
+        FACT_LOCATION,
+        FACT_NAME,
+        FACT_PHONE,
+        FACT_PURPOSE,
+        FACT_TIMELINE,
+    )
+
+    mapping = {
+        "name": FACT_NAME,
+        "phone": FACT_PHONE,
+        "bhk": FACT_BHK,
+        "budget": FACT_BUDGET,
+        "timeline": FACT_TIMELINE,
+        "location_preference": FACT_LOCATION,
+        "purpose": FACT_PURPOSE,
+    }
+    out: dict[str, Any] = {}
+    for okey, fkey in mapping.items():
+        value = str((memory or {}).get(okey) or "").strip()
+        if value:
+            out[fkey] = value
+    return out
+
+
+_FLOW_LABEL = {
+    "real_estate_site_visit": "site-visit booking",
+    "leads_create": "lead capture",
+}
+
+
+def render_booking_flow_state(
+    flow_state: dict[str, Any] | None,
+    bundle: dict[str, Any] | None,
+    *,
+    language: str | None = None,
+) -> str:
+    """Render the active tool_flow as a high-priority system block.
+
+    When the inbound tool_flow regex starts a booking flow for an outbound
+    call (e.g. "yeah" right after the agent offered a site visit), this
+    block tells the LLM *what's been collected* and *what slot to ask
+    next*. The deterministic slot question is included verbatim so the
+    LLM has something concrete to paraphrase rather than drifting back
+    to free-form chat.
+    """
+    if not isinstance(flow_state, dict) or not flow_state.get("active"):
+        return ""
+    if flow_state.get("completed"):
+        return ""
+    flow_key = str(flow_state.get("flow_key") or "")
+    if not flow_key:
+        return ""
+    collected = dict(flow_state.get("collected") or {})
+    pending_slot = str(flow_state.get("pending_slot") or "")
+
+    slot_defs: list[dict[str, Any]] = []
+    if bundle:
+        flow_def = ((bundle.get("flows") or {}).get(flow_key) or {})
+        slot_defs = [s for s in (flow_def.get("slots") or []) if isinstance(s, dict)]
+
+    lang_code = (language or "en").split("-")[0].lower()
+
+    captured_lines: list[str] = []
+    missing_lines: list[str] = []
+    next_slot_def: dict[str, Any] | None = None
+    for slot in slot_defs:
+        skey = str(slot.get("key") or "")
+        if not skey:
+            continue
+        label = str(slot.get("label") or skey.replace("_", " ").title())
+        value = collected.get(skey)
+        if value not in (None, ""):
+            captured_lines.append(f"  ✓ {label}: {value}")
+            continue
+        questions = slot.get("questions") or {}
+        question = questions.get(lang_code) or questions.get("en") or ""
+        missing_lines.append(f"  ✗ {label} — still needed")
+        if next_slot_def is None and (not pending_slot or pending_slot == skey):
+            next_slot_def = {"key": skey, "label": label, "question": question}
+
+    # No slot definitions reached (bundle missing) — render a minimal block
+    # from collected only so the LLM still sees what's captured.
+    if not slot_defs:
+        for key, value in collected.items():
+            if value in (None, ""):
+                continue
+            captured_lines.append(f"  ✓ {key.replace('_', ' ').title()}: {value}")
+
+    flow_label = _FLOW_LABEL.get(flow_key, flow_key.replace("_", " "))
+    parts: list[str] = [
+        f"# ACTIVE BOOKING FLOW — DRIVE TO COMPLETION",
+        f"You're capturing a {flow_label}. The system records this once every required slot is filled.",
+    ]
+    if captured_lines:
+        parts.append("Captured so far:")
+        parts.extend(captured_lines)
+    if missing_lines:
+        parts.append("Still needed:")
+        parts.extend(missing_lines)
+    if next_slot_def:
+        parts.append(
+            "YOUR NEXT REPLY must move toward filling "
+            f"**{next_slot_def['label']}** next."
+        )
+        if next_slot_def["question"]:
+            parts.append(
+                f'Reference question: "{next_slot_def["question"]}" '
+                "— paraphrase in your persona; do NOT read it verbatim, and never stack two asks."
+            )
+        parts.append(
+            "If the lead just answered a question of yours, take ONE acknowledgment "
+            "(e.g. \"Got it.\") and then ask for the next slot. Do not pivot back to "
+            "general project chat — that's the most common failure mode."
+        )
+    elif not missing_lines:
+        parts.append(
+            "All slots are filled — confirm the next step in one short sentence and wrap the call. "
+            "The system will record this booking automatically."
+        )
+    return "\n".join(parts)
 
 
 PROACTIVE_NUDGE_PROMPT = (

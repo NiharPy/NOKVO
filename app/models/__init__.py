@@ -20,6 +20,11 @@ from app.models.outgoing_lead import (
     OutboundCampaignContact,
     OutgoingLead,
 )
+from app.models.lead_followup_schedule import (
+    FollowupReason,
+    FollowupStatus,
+    LeadFollowupSchedule,
+)
 from app.models.member_assignment import (
     ClinicMemberScheduleSettings,
     MemberBlockedSlot,
@@ -64,4 +69,7 @@ __all__ = [
     "CallCost",
     "Notification",
     "RealEstateProject",
+    "FollowupReason",
+    "FollowupStatus",
+    "LeadFollowupSchedule",
 ]

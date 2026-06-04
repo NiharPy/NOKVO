@@ -1,0 +1,32 @@
+{
+  "name": "site_visit_flow_starts_on_yes_after_offer",
+  "description": "Agent offers a site visit, caller says 'yeah'. The real_estate_site_visit FSM must start and advance through slot collection. Mirrors the booking transcript that motivated the cold-open + NBA changes.",
+  "business_type": "real_estate",
+  "outbound": false,
+  "company_name": "Raghava Constructions",
+  "focus_project": "Skyline Heights",
+  "turns": [
+    {"role": "user", "text": "Can I know details about your projects?"},
+    {"role": "assistant", "text": "Sure! Skyline Heights has premium 3 and 4 BHK apartments. Would you like to schedule a site visit?"},
+    {"role": "user", "text": "Yeah"},
+    {"role": "assistant", "text": "Great! May I have your name?"},
+    {"role": "user", "text": "My name is Nihar"}
+  ],
+  "expected": [
+    {
+      "turn_index": 2,
+      "asserts": [
+        {"op": "equals", "field": "tool_flow_active", "expected": true},
+        {"op": "equals", "field": "tool_flow_flow_key", "expected": "real_estate_site_visit"},
+        {"op": "equals", "field": "mode", "expected": "site_visit"}
+      ]
+    },
+    {
+      "turn_index": 3,
+      "asserts": [
+        {"op": "equals", "field": "tool_flow_active", "expected": true},
+        {"op": "equals", "field": "extracted_name", "expected": "Nihar"}
+      ]
+    }
+  ]
+}

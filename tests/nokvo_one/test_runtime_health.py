@@ -18,7 +18,7 @@ from app.services.agent_runtime_health import build_health_report
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.new_event_loop().run_until_complete(coro)
 
 
 def _tenant(*, provider_status: dict[str, Any] | None = None) -> SimpleNamespace:

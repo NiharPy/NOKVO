@@ -43,9 +43,12 @@ from app.services.conversational_memory import (
     FACT_BUDGET,
     FACT_INCOME,
     FACT_LOCATION,
+    FACT_NAME,
+    FACT_PHONE,
     FACT_PURPOSE,
     FACT_TIMELINE,
     FACT_VISIT_DATE,
+    FACT_VISIT_TIME,
     ConversationalMemory,
 )
 
@@ -61,10 +64,14 @@ def _is_sales(business_type: str | None, is_outbound: bool) -> bool:
 
 def _current_codes(bucket: list[dict], *, key: str = "code") -> list[str]:
     """Codes from a bucket raised on THIS call (skip restored prior-call
-    entries), de-duped, most-recent last."""
+    entries AND objections whose ``resolved_at_turn`` is set), de-duped,
+    most-recent last. The resolved-skip is what lets the FSM exit
+    ``objection_handling`` cleanly after a successful rebuttal."""
     out: list[str] = []
     for entry in bucket or []:
         if not isinstance(entry, dict) or entry.get("from_prior_call"):
+            continue
+        if entry.get("resolved_at_turn") is not None:
             continue
         code = str(entry.get(key) or "")
         if code and code not in out:
@@ -304,6 +311,16 @@ def journey_stage(
 # threaded in), keeping this module pure.
 
 
+def latest_turn(memory: ConversationalMemory) -> int:
+    """Public alias for :func:`_latest_turn` — exported so the inbound /
+    outbound FSM modules can reuse the same "what is the most recent
+    turn that captured any signal" computation instead of duplicating
+    it. The leading-underscore version stays for backwards-compat with
+    any in-repo caller that already imports the private name.
+    """
+    return _latest_turn(memory)
+
+
 def _latest_turn(memory: ConversationalMemory) -> int:
     """Highest turn index any current-call signal was captured on. ``-1`` when
     nothing has been captured yet (cold open). Bootstrap facts (source_turn
@@ -377,6 +394,188 @@ def _escalation_section(memory: ConversationalMemory) -> str | None:
     )
 
 
+# ── Cold-open discovery agenda ───────────────────────────────────────────────
+#
+# The sales blocks below all gate on ``_has_sales_signal(memory)`` so a turn-1
+# cold open emits nothing — which is why the inbound real-estate agent kept
+# defaulting to passive "How can I help you?" framing. The discovery agenda
+# is the explicit "you are the host, not the receptionist" steering wheel for
+# that first turn: name the project, ask one concrete discovery question, and
+# don't open with help-desk language.
+
+# Project-specific suggested first questions. The pipeline can pass any of
+# these via ``cold_open_question_override`` if the org wants a different
+# opener; the default is purpose + configuration in one breath because that
+# splits 90% of inbound real-estate calls into useful branches.
+_DEFAULT_DISCOVERY_QUESTION = (
+    "What kind of property are you looking for today — investment or for living in?"
+)
+
+
+def _discovery_agenda_section(
+    *,
+    focus_project: str | None,
+    company_name: str | None,
+    discovery_question_override: str | None = None,
+) -> str:
+    """Cold-open marching orders. Fires only when there's no sales signal yet
+    AND we're in a sales context. Tells the LLM to take control on turn 1.
+    """
+    project_label = (focus_project or "").strip() or (company_name or "").strip() or "our project"
+    expert_line = (
+        f"a property expert for {project_label}"
+        if focus_project
+        else f"a property expert at {project_label}"
+        if company_name
+        else "a property expert here"
+    )
+    question = (discovery_question_override or "").strip() or _DEFAULT_DISCOVERY_QUESTION
+    return (
+        "# COLD OPEN — YOU LEAD THIS TURN\n"
+        "This is the start of the call. You must take control of the conversation — the caller "
+        "expects you to host them, not the other way around.\n"
+        f"- Greet briefly + warmly. Say you are {expert_line}.\n"
+        f"- Immediately ask ONE open-ended discovery question: \"{question}\"\n"
+        "- BANNED openers: 'How can I help you?', 'How may I assist you?', 'What can I do for you?'. "
+        "These hand the floor back; you need to keep it.\n"
+        "- BANNED on this turn: pitching features, listing amenities, naming prices. Discovery first."
+    )
+
+
+# ── Upsell / cross-sell ──────────────────────────────────────────────────────
+#
+# Rules fire when the memory holds enough signal to justify the pitch. They
+# are pure deterministic checks — no LLM call, no DB access — and gated to
+# fire at most once per turn to avoid stacking three competing directives.
+
+
+# Budget headroom heuristic. Indian income strings reaching the canonical
+# parser come through as raw integers (₹2L → 200000) when normalised; we
+# stay generous with the threshold and let the LLM make the final judgement.
+_INCOME_HEADROOM_MONTHLY_INR = 200_000  # ₹2L / month
+_BUDGET_LOW_TIER_INR = 12_000_000        # ₹1.2 Cr — anything under this from a high-income lead is upsell candidate
+
+_NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
+
+
+def _coerce_inr_amount(value: object) -> float | None:
+    """Pull the largest number out of a raw INR string and scale crude
+    "lakhs / crore" tokens. Returns ``None`` when the input is unparseable.
+    Approximate by design — used only to bucket leads into upsell tiers."""
+    if value in (None, ""):
+        return None
+    text = str(value).lower()
+    match = _NUMBER_RE.search(text.replace(",", ""))
+    if not match:
+        return None
+    try:
+        n = float(match.group(0))
+    except ValueError:
+        return None
+    if "cr" in text or "crore" in text:
+        n *= 10_000_000
+    elif "lakh" in text or "lac" in text or " l" in text or text.strip().endswith("l"):
+        n *= 100_000
+    elif "k" in text and n < 1000:
+        n *= 1_000
+    return n
+
+
+def _upsell_section(
+    memory: ConversationalMemory,
+    *,
+    sold_out_locations: list[str] | None = None,
+    alternative_pitch: str | None = None,
+) -> str | None:
+    """Two rules. At most one fires per turn (whichever matches first), so the
+    strategy block never tries to upsell AND cross-sell in the same breath.
+
+    Rule 1 — budget headroom: caller stated an income above the headroom
+    threshold but a budget below the upsell tier. Ask if they'd be open to
+    seeing a premium unit before committing to a visit.
+
+    Rule 2 — location cross-sell: caller's stated location is in
+    ``sold_out_locations`` and the operator provided an ``alternative_pitch``.
+    Don't reject — pivot to the alternative with launch-pricing framing.
+    """
+    # Rule 2 has higher priority because losing the lead to a sold-out
+    # project is the more expensive failure mode.
+    if alternative_pitch and sold_out_locations:
+        location_value = str(memory.get(FACT_LOCATION) or "").strip().lower()
+        if location_value:
+            for entry in sold_out_locations:
+                if not entry:
+                    continue
+                if str(entry).strip().lower() in location_value or location_value in str(entry).strip().lower():
+                    return (
+                        "# UPSELL / CROSS-SELL — location cross-sell\n"
+                        f"- The caller's preferred location is sold out. Do NOT reject them. Pivot to "
+                        f"the alternative: {alternative_pitch.strip()}\n"
+                        "- Frame the alternative as a positive ('only X mins away', 'launch pricing'); "
+                        "don't apologise for the substitution."
+                    )
+
+    if memory.has(FACT_INCOME):
+        income_raw = memory.get(FACT_INCOME)
+        budget_raw = memory.get(FACT_BUDGET) if memory.has(FACT_BUDGET) else None
+        income = _coerce_inr_amount(income_raw)
+        budget = _coerce_inr_amount(budget_raw)
+        if income is not None and income >= _INCOME_HEADROOM_MONTHLY_INR:
+            # Budget is missing → still upsell-eligible (offer the higher tier
+            # before they anchor low). Budget present but low → explicit upsell.
+            if budget is None or budget <= _BUDGET_LOW_TIER_INR:
+                income_label = str(income_raw).strip() if income_raw else "their income"
+                budget_phrase = (
+                    f"a budget around {str(budget_raw).strip()}"
+                    if budget_raw
+                    else "no budget yet"
+                )
+                return (
+                    "# UPSELL — budget headroom\n"
+                    f"- The caller's income (~{income_label}/month) qualifies them for a premium "
+                    "tier, but they've signalled "
+                    f"{budget_phrase}. Before booking the visit, proactively ask if they'd be open to "
+                    "seeing a higher-tier unit (e.g. a larger BHK or a premium configuration) for "
+                    "better ROI. Frame it as a one-line offer, not a hard sell."
+                )
+    return None
+
+
+# ── Next Best Action ─────────────────────────────────────────────────────────
+#
+# The bare "fill the most important missing qualifier" line in the warm-lead
+# posture gives the LLM too much latitude. Compute the missing fact in
+# priority order and dictate the exact question.
+
+
+# Ordered list — each tuple is ``(fact_key, label, question)``. The first
+# missing entry wins. ``visit_date`` and ``visit_time`` come last because the
+# slot-fill FSM owns those once we reach the closing stage.
+_NEXT_BEST_ACTION_PRIORITY: list[tuple[str, str, str]] = [
+    (FACT_NAME, "name", "Could you tell me your name, please?"),
+    (FACT_PHONE, "phone number", "What phone number should our team use to reach you?"),
+    (FACT_PURPOSE, "purpose (self-use or investment)", "Are you looking at this for self-use or as an investment?"),
+    (FACT_BHK, "BHK / configuration", "How many bedrooms are you looking for — 2 BHK, 3 BHK, or larger?"),
+    (FACT_LOCATION, "preferred location / area", "Which area or part of town are you focused on?"),
+    (FACT_BUDGET, "budget range", "What's the budget range you're working with?"),
+    (FACT_TIMELINE, "buying timeline", "When are you looking to buy or move in?"),
+    (FACT_VISIT_DATE, "visit date", "Would a weekday or weekend work better for the site visit?"),
+    (FACT_VISIT_TIME, "visit time", "What time of day suits you best for the visit?"),
+]
+
+
+def _next_best_action(memory: ConversationalMemory) -> tuple[str, str] | None:
+    """Return ``(label, question)`` for the highest-priority missing fact.
+
+    ``None`` when every priority slot is already captured — at which point
+    the closing flow takes over.
+    """
+    for fact_key, label, question in _NEXT_BEST_ACTION_PRIORITY:
+        if not memory.has(fact_key):
+            return label, question
+    return None
+
+
 # ── Block assembly ───────────────────────────────────────────────────────────
 
 
@@ -428,14 +627,28 @@ def _objection_section(
     return "\n".join(lines)
 
 
-def _lead_section(lead: LeadAssessment, stage: str) -> str:
+def _lead_section(
+    lead: LeadAssessment,
+    stage: str,
+    memory: ConversationalMemory | None = None,
+) -> str:
     reason = "; ".join(lead.reasons) if lead.reasons else "—"
-    return (
-        "# LEAD STRATEGY\n"
-        f"- Lead read: {lead.tier.upper()} ({reason}).\n"
-        f"- {lead.posture}\n"
-        f"- Journey stage: {stage}. Goal this turn: {_STAGE_GOAL.get(stage, '')}"
-    )
+    lines = [
+        "# LEAD STRATEGY",
+        f"- Lead read: {lead.tier.upper()} ({reason}).",
+        f"- {lead.posture}",
+        f"- Journey stage: {stage}. Goal this turn: {_STAGE_GOAL.get(stage, '')}",
+    ]
+    # Next Best Action — only meaningful for leads we're still qualifying.
+    # The closing / booked / at-risk postures already give the LLM a specific
+    # next move (close, confirm, recover) so a redundant "ask name" directive
+    # would compete with the posture itself.
+    if memory is not None and lead.tier in {"hot", "warm"} and stage in {"discovery", "qualification"}:
+        nba = _next_best_action(memory)
+        if nba is not None:
+            _, question = nba
+            lines.append(f"- Next Best Action: ask exactly — \"{question}\"")
+    return "\n".join(lines)
 
 
 def _affordability_section(memory: ConversationalMemory) -> str | None:
@@ -475,13 +688,27 @@ def compose_strategy_block(
     is_outbound: bool = False,
     language: str | None = None,
     focus_project: str | None = None,
+    company_name: str | None = None,
+    discovery_question_override: str | None = None,
+    sold_out_locations: list[str] | None = None,
+    alternative_pitch: str | None = None,
 ) -> str:
     """Render the strategy directive block for this turn, or ``""`` when there
     is no actionable signal. Safe for ``business_type=None`` (emits only the
     universal recovery part, if any). ``focus_project`` is a one-line summary of
     the specific project the caller named (matched upstream from FACT_PROPERTY);
-    when present it sharpens price/competitor objection handling. Output is
-    capped at :data:`_MAX_CHARS`."""
+    when present it sharpens price/competitor objection handling.
+
+    Cold-open handling: when ``_is_sales`` is True but ``_has_sales_signal`` is
+    False (the inbound real-estate cold-open problem), a discovery-agenda block
+    is emitted so the LLM takes control of turn 1 instead of falling back to
+    "How can I help you?" framing.
+
+    Upsell / cross-sell hooks: ``sold_out_locations`` + ``alternative_pitch``
+    let the caller pass project inventory state to drive the cross-sell rule;
+    the budget-headroom rule is purely memory-driven.
+
+    Output is capped at :data:`_MAX_CHARS`."""
     if memory is None:
         return ""
 
@@ -491,26 +718,50 @@ def compose_strategy_block(
     if recovery:
         sections.append(recovery)
 
-    if _is_sales(business_type, is_outbound) and _has_sales_signal(memory):
-        # A fresh escalation leads the sales guidance so the agent pivots to
-        # closing on a dramatic intent signal — but a call in trouble (recovery)
-        # takes precedence: don't push a close on a frustrated caller.
-        if not recovery:
-            escalation = _escalation_section(memory)
-            if escalation:
-                sections.append(escalation)
-        objection = _objection_section(memory, focus_project=focus_project)
-        if objection:
-            sections.append(objection)
-        lead = score_lead(memory, business_type=business_type)
-        stage = journey_stage(memory, business_type=business_type)
-        sections.append(_lead_section(lead, stage))
-        affordability = _affordability_section(memory)
-        if affordability:
-            sections.append(affordability)
-        continuity = _continuity_section(memory)
-        if continuity:
-            sections.append(continuity)
+    if _is_sales(business_type, is_outbound):
+        # Cold-open agenda: real-estate / outbound calls cannot afford a
+        # passive turn 1. When there's no sales signal yet AND we're not in
+        # recovery mode, lead with the discovery-agenda directive so the
+        # LLM names the project and asks one specific question.
+        if not _has_sales_signal(memory) and not recovery:
+            sections.append(
+                _discovery_agenda_section(
+                    focus_project=focus_project,
+                    company_name=company_name,
+                    discovery_question_override=discovery_question_override,
+                )
+            )
+        if _has_sales_signal(memory):
+            # A fresh escalation leads the sales guidance so the agent pivots to
+            # closing on a dramatic intent signal — but a call in trouble (recovery)
+            # takes precedence: don't push a close on a frustrated caller.
+            if not recovery:
+                escalation = _escalation_section(memory)
+                if escalation:
+                    sections.append(escalation)
+            objection = _objection_section(memory, focus_project=focus_project)
+            if objection:
+                sections.append(objection)
+            lead = score_lead(memory, business_type=business_type)
+            stage = journey_stage(memory, business_type=business_type)
+            sections.append(_lead_section(lead, stage, memory))
+            # Upsell / cross-sell rules — at most one fires. Suppressed on
+            # recovery and at-risk leads (don't pile a pitch on someone we're
+            # trying to calm down).
+            if not recovery and lead.tier != "at_risk":
+                upsell = _upsell_section(
+                    memory,
+                    sold_out_locations=sold_out_locations,
+                    alternative_pitch=alternative_pitch,
+                )
+                if upsell:
+                    sections.append(upsell)
+            affordability = _affordability_section(memory)
+            if affordability:
+                sections.append(affordability)
+            continuity = _continuity_section(memory)
+            if continuity:
+                sections.append(continuity)
 
     if not sections:
         return ""

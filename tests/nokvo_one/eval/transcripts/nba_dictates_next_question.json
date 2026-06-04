@@ -1,0 +1,19 @@
+{
+  "name": "nba_dictates_next_question",
+  "description": "Once the caller shares an interest signal (budget), the strategy block must emit an explicit Next Best Action with the next missing slot's question. Catches the regression where the LLM gets vague 'fill the missing qualifier' guidance and ad-libs.",
+  "business_type": "real_estate",
+  "outbound": false,
+  "company_name": "Raghava Constructions",
+  "turns": [
+    {"role": "user", "text": "Looking for a 3 BHK in Kokapet under ₹2.5 crore"}
+  ],
+  "expected": [
+    {
+      "turn_index": 1,
+      "asserts": [
+        {"op": "contains", "field": "strategy_block", "expected": "Next Best Action"},
+        {"op": "contains", "field": "strategy_block", "expected": "WARM"}
+      ]
+    }
+  ]
+}

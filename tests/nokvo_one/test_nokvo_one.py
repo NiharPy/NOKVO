@@ -277,7 +277,7 @@ class _FakeOrgDB:
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.new_event_loop().run_until_complete(coro)
 
 
 def test_send_email_draft_dispatch_creates_pending_confirmation():
@@ -1716,7 +1716,7 @@ def test_outcome_tracker_rejects_unknown_status():
         )
 
     with pytest.raises(ValueError):
-        asyncio.get_event_loop().run_until_complete(_go())
+        asyncio.new_event_loop().run_until_complete(_go())
 
 
 # ─────────── Outcome-aware returning-caller opener ───────────
@@ -1906,7 +1906,7 @@ def test_runtime_context_rejects_unknown_surface():
     from app.services.agent_runtime_context import build
 
     with pytest.raises(ValueError):
-        asyncio.get_event_loop().run_until_complete(
+        asyncio.new_event_loop().run_until_complete(
             build(db=None, tenant_res=None, surface="carrier_pigeon")  # type: ignore[arg-type]
         )
 
@@ -1918,8 +1918,16 @@ def test_pipeline_suppresses_smalltalk_when_awaiting_confirmation():
     """Reproduces the live bug: 'Yes' alone got 'Sure, go ahead.' because the
     SMALLTALK template fired before the FSM saw the confirmation flag.
     Guards: every awaiting_* flag is referenced AND the template return
-    path is gated by ``not suppress_template``."""
-    pipeline_source = open("app/services/nokvo_one_voice_pipeline.py").read()
+    path is gated by ``not suppress_template``.
+
+    The router body now lives in ``pipeline/turn_router.py`` after the
+    monolith refactor; we check both files so the architectural marker
+    test isn't coupled to where the code happens to sit."""
+    pipeline_source = (
+        open("app/services/nokvo_one_voice_pipeline.py").read()
+        + "\n"
+        + open("app/services/pipeline/turn_router.py").read()
+    )
     assert "suppress_template" in pipeline_source
     for flag in (
         "awaiting_slot_confirm",
@@ -2021,8 +2029,15 @@ def test_affirmative_regex_matches_telugu_and_hindi():
 def test_pipeline_skips_clinic_fsm_for_non_clinic_orgs():
     """Real-estate orgs must not see clinic prompts ('patient', 'eye concern').
     The pipeline checks organization.industry before calling
-    evaluate_voice_turn_policy and skips it for anything that isn't 'clinics'."""
-    pipeline_source = open("app/services/nokvo_one_voice_pipeline.py").read()
+    evaluate_voice_turn_policy and skips it for anything that isn't 'clinics'.
+
+    Source check spans both files because the router body now lives in
+    ``pipeline/turn_router.py``."""
+    pipeline_source = (
+        open("app/services/nokvo_one_voice_pipeline.py").read()
+        + "\n"
+        + open("app/services/pipeline/turn_router.py").read()
+    )
     assert "is_clinic_org" in pipeline_source
     assert "organization_industry" in pipeline_source
     # The clinic FSM call must be conditional on is_clinic_org.
@@ -2041,8 +2056,15 @@ def test_pipeline_dispatches_tool_flow_availability_check():
     re-asking "What date would you prefer?".
 
     Guard: the source must (a) have a `tool_flow_needs_lookup` branch and
-    (b) call `_handle_availability_check` from that branch."""
-    src = open("app/services/nokvo_one_voice_pipeline.py").read()
+    (b) call ``_handle_availability_check`` from that branch.
+
+    Source check spans both pipeline files because the router body now
+    lives in ``pipeline/turn_router.py``."""
+    src = (
+        open("app/services/nokvo_one_voice_pipeline.py").read()
+        + "\n"
+        + open("app/services/pipeline/turn_router.py").read()
+    )
     # All four landmarks must be present in source — proves the dispatch
     # branch exists, calls the scheduler handler, and is gated on the
     # specific availability_check intent rather than any answerless return.
@@ -2058,8 +2080,15 @@ def test_pipeline_falls_back_to_slot_question_when_no_scheduler_match():
     """When the scheduler can't satisfy the availability lookup (no
     assignable site_visit agents yet), the pipeline must fall back to
     asking the original missing slot directly — NOT swallow the turn and
-    fall through to RAG."""
-    src = open("app/services/nokvo_one_voice_pipeline.py").read()
+    fall through to RAG.
+
+    Source check spans both pipeline files because the router body now
+    lives in ``pipeline/turn_router.py``."""
+    src = (
+        open("app/services/nokvo_one_voice_pipeline.py").read()
+        + "\n"
+        + open("app/services/pipeline/turn_router.py").read()
+    )
     # The fallback branch is `elif tool_flow_needs_lookup and not tool_flow.get("answer"):`
     assert "elif tool_flow_needs_lookup and not tool_flow.get(\"answer\")" in src
     # And it must build_tool_flow_questions to look up the slot prompt.

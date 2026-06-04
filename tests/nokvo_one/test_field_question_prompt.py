@@ -166,6 +166,22 @@ def test_operator_override_of_field_label_propagates_to_prompt():
     assert "patient_name" not in prompt
 
 
+def test_field_collection_header_is_mandatory_with_pre_confirm_check():
+    """The header must be imperative (not informational) and must include the
+    pre-confirm checklist that stops the LLM from closing a booking before
+    every required field has been captured. Reported bug: agent confirmed a
+    site visit while skipping admin-configured custom fields."""
+    catalog = build_tool_flow_questions("real_estate")
+    prompt = format_field_questions_prompt(catalog, language="en")
+    assert "MANDATORY" in prompt
+    assert "PRE-CONFIRM CHECK" in prompt
+    # Anti-pattern explicitly forbidden.
+    assert "feels complete" in prompt.lower()
+    # Closing verbs the LLM must verify against before using.
+    for verb in ("booked", "confirmed", "all set", "captured"):
+        assert verb in prompt.lower()
+
+
 def test_site_visit_flow_asks_every_configured_ticket_field():
     """The site-visit flow must surface EVERY writable Site Visit (tickets)
     field — including custom number / select fields that the old hardcoded

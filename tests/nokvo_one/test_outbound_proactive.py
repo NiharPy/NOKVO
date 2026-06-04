@@ -12,16 +12,24 @@ from app.services.agent_outbound_context import (
     OutboundCampaignContext,
     build_agent_config,
     compose_outbound_system_section,
+    generate_outbound_opener_text,
     infer_covered_objectives,
+    outbound_memory_as_facts,
     render_outbound_memory,
     update_outbound_memory,
+)
+from app.services.conversational_memory import (
+    FACT_BHK,
+    FACT_BUDGET,
+    ConversationalMemory,
+    seed_facts,
 )
 from app.services.nokvo_one_voice_pipeline import NokvoOneVoicePipeline
 from app.services.outbound_campaign_service import OutboundCampaignService
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.new_event_loop().run_until_complete(coro)
 
 
 class _Upload:
@@ -367,3 +375,169 @@ def test_create_campaign_from_leads_persists_proactive_config(monkeypatch):
     assert campaign.agent_config["silence_timeout_seconds"] == 3.0
     assert campaign.contacts[0]["script_indexed_points"] == 3
     assert lead.call_status == LeadCallStatus.queued
+
+
+# ── Gap 2: word-number budget in outbound memory ─────────────────────────────
+
+
+def test_outbound_system_section_declares_factual_scope():
+    """The outbound system prompt must explicitly forbid drawing on the inbound
+    knowledge base / property inventory / admin single-prompt — campaign brief
+    is the entire factual scope. Regression for: outbound agent improvising
+    product facts from inbound resources."""
+    context = OutboundCampaignContext(
+        campaign_id=str(uuid.uuid4()),
+        name="RE outreach",
+        goal="Re-engage enquiry leads",
+        agent_prompt="",
+        objectives=["Book site visit"],
+        exit_conditions=[],
+        tone="warm",
+        doc_text=None,
+        caller_name="Riya",
+        company_name="Raghava",
+        pitch_summary="our new project",
+    )
+    section = compose_outbound_system_section(context)
+    assert "OUTBOUND FACTUAL SCOPE" in section
+    assert "knowledge base" in section.lower()
+    assert "property inventory" in section.lower() or "inventory" in section.lower()
+    assert "general world knowledge" in section.lower() or "training data" in section.lower()
+
+
+def test_outbound_memory_budget_handles_word_numbers():
+    """The outbound extractor now reuses the inbound budget parser, so spelled-out
+    amounts a human understands are captured — not just digit+unit."""
+    m = update_outbound_memory({}, caller_text="my budget is quite limited, maybe half a crore")
+    assert m["budget"] == "0.5 crore"
+    m2 = update_outbound_memory({}, caller_text="we can stretch to one and a half crore")
+    assert m2["budget"] == "1.5 crore"
+
+
+# ── Gap 3: next-step typing + objection parity + coverage tightening ─────────
+
+
+def test_outbound_memory_distinguishes_callback_from_site_visit():
+    cb = update_outbound_memory({}, caller_text="just call me back next week")
+    assert cb["next_step"] == "callback"
+    sv = update_outbound_memory({}, caller_text="sure, I'll come visit the site on Saturday")
+    assert sv["next_step"] == "site_visit"
+
+
+def test_outbound_memory_captures_competitor_objection():
+    """Outbound now recognises the full inbound objection vocabulary, not just
+    not-interested / price."""
+    m = update_outbound_memory({}, caller_text="I already booked with another builder")
+    assert m["objection"] == "competitor"
+
+
+def test_infer_covered_objectives_requires_real_next_step_action():
+    """A next-step objective is NOT covered by incidental token overlap — only
+    when an actual next-step action is discussed."""
+    context = OutboundCampaignContext(
+        campaign_id=str(uuid.uuid4()),
+        name="RE campaign",
+        goal="Book site visits",
+        agent_prompt="",
+        objectives=["Capture the next step: appointment, callback, or site visit."],
+        exit_conditions=[],
+        tone=None,
+        doc_text=None,
+    )
+    # No next step discussed — only generic chit-chat that happens to share a
+    # word ("step") would have falsely covered it before.
+    not_covered = infer_covered_objectives(
+        context,
+        caller_text="watch your step there, it's slippery",
+        agent_answer="noted",
+        already_covered=[],
+    )
+    assert context.objectives[0] not in not_covered
+    # A real next step — covered.
+    covered = infer_covered_objectives(
+        context,
+        caller_text="okay, let's set up a site visit",
+        agent_answer="great, I'll schedule the visit",
+        already_covered=[],
+    )
+    assert context.objectives[0] in covered
+
+
+# ── Gap 1: outbound memory feeds the structured ConversationalMemory ─────────
+
+
+def test_outbound_memory_as_facts_maps_to_canonical_keys():
+    facts = outbound_memory_as_facts({"bhk": "3 BHK", "budget": "0.5 crore", "visit_preference": "weekend"})
+    assert facts[FACT_BHK] == "3 BHK"
+    assert facts[FACT_BUDGET] == "0.5 crore"
+    # Free-form keys without a canonical fact are not mapped.
+    assert "weekend" not in facts.values()
+
+
+def test_seed_facts_fills_gaps_without_overriding_in_call_extraction():
+    mem = ConversationalMemory()
+    # In-call extraction captures a high-confidence BHK.
+    mem.merge_text("I want a 4 BHK", turn_index=1, business_type="real_estate")
+    # Seeding from outbound memory must NOT clobber it, but SHOULD fill a gap.
+    seed_facts(mem, {FACT_BHK: "2 BHK", FACT_BUDGET: "0.5 crore"})
+    assert mem.get(FACT_BHK) == "4 BHK"  # in-call value wins
+    assert mem.get(FACT_BUDGET) == "0.5 crore"  # gap filled
+
+
+# ── Gap 5: personalised opener ───────────────────────────────────────────────
+
+
+def _opener_context() -> OutboundCampaignContext:
+    return OutboundCampaignContext(
+        campaign_id=str(uuid.uuid4()),
+        name="RE outreach",
+        goal="Re-engage enquiry leads",
+        agent_prompt="",
+        objectives=["Book site visit"],
+        exit_conditions=[],
+        tone="warm",
+        doc_text=None,
+        caller_name="Riya",
+        company_name="Raghava",
+        pitch_summary="our new project",
+    )
+
+
+def test_opener_personalises_from_lead_enquiry():
+    text = generate_outbound_opener_text(
+        _opener_context(),
+        language="en",
+        known_facts={"name": "Nihar", "bhk": "3 BHK", "location": "Gachibowli"},
+    )
+    assert "Nihar" in text
+    assert "3 BHK" in text
+    assert "Gachibowli" in text
+    assert "enquired about" in text
+
+
+def test_opener_returning_lead_references_prior_call():
+    text = generate_outbound_opener_text(
+        _opener_context(),
+        language="en",
+        known_facts={"name": "Asha", "bhk": "2 BHK", "returning": True},
+    )
+    assert "Asha" in text
+    assert "last time" in text.lower()
+
+
+def test_opener_falls_back_to_pitch_when_nothing_known():
+    text = generate_outbound_opener_text(_opener_context(), language="en", known_facts={})
+    assert "our new project" in text
+    assert "this is Riya from Raghava" in text
+
+
+def test_opener_personalises_in_hindi_and_telugu():
+    """Multilingual parity — personalisation isn't English-only."""
+    hi = generate_outbound_opener_text(
+        _opener_context(), language="hi", known_facts={"name": "Nihar", "bhk": "3 BHK"}
+    )
+    assert "Nihar" in hi and "3 BHK" in hi
+    te = generate_outbound_opener_text(
+        _opener_context(), language="te", known_facts={"name": "Asha", "location": "Gachibowli"}
+    )
+    assert "Asha" in te and "Gachibowli" in te

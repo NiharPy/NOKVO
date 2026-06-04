@@ -272,25 +272,42 @@ class OutboundCampaignService:
         *,
         name: str,
         lead_ids: list[uuid.UUID],
-        doc_file: UploadFile,
+        doc_file: UploadFile | None = None,
         from_number: str | None = None,
         agent_config: dict[str, Any] | None = None,
     ) -> OutboundCampaign:
-        leads = await OutgoingLeadService.validate_callable_leads(tenant_res, db, lead_ids)
-        doc_bytes = await doc_file.read()
-        doc_text = _parse_document(doc_file.filename or "doc.txt", doc_bytes)
+        """Create a campaign with pre-attached leads.
 
-        doc_blob_path: str | None = None
-        try:
-            from app.services.azure_blob_service import AzureBlobService
-            blob_name = f"campaigns/{tenant_res.tenant_id}/{uuid.uuid4()}/{doc_file.filename}"
-            await AzureBlobService.upload_bytes(
-                tenant_res, doc_bytes, blob_name,
-                content_type="application/octet-stream",
+        ``doc_file`` is kept as an optional input for backwards compat —
+        the agent's knowledge now lives in ``agent_config.agent_prompt``,
+        so most callers will not pass one. When provided, the doc is
+        indexed to Qdrant as before; when absent, indexing is skipped.
+        """
+        cfg = build_agent_config(**dict(agent_config or {}))
+        if not str(cfg.get("agent_prompt") or "").strip():
+            raise ValueError(
+                "Campaigns need an agent prompt — it's what the agent reads "
+                "during the call. Add one and try again."
             )
-            doc_blob_path = blob_name
-        except Exception:
-            pass
+
+        leads = await OutgoingLeadService.validate_callable_leads(tenant_res, db, lead_ids)
+
+        doc_text: str | None = None
+        doc_blob_path: str | None = None
+        indexed_points = 0
+        if doc_file is not None:
+            doc_bytes = await doc_file.read()
+            doc_text = _parse_document(doc_file.filename or "doc.txt", doc_bytes)
+            try:
+                from app.services.azure_blob_service import AzureBlobService
+                blob_name = f"campaigns/{tenant_res.tenant_id}/{uuid.uuid4()}/{doc_file.filename}"
+                await AzureBlobService.upload_bytes(
+                    tenant_res, doc_bytes, blob_name,
+                    content_type="application/octet-stream",
+                )
+                doc_blob_path = blob_name
+            except Exception:
+                pass
 
         exotel_cfg = dict((tenant_res.provider_status or {}).get("exotel") or {})
         caller_id = (
@@ -303,13 +320,14 @@ class OutboundCampaignService:
             raise ValueError("No Exotel caller ID is configured. Link an Exotel number first.")
 
         campaign_id = uuid.uuid4()
-        indexed_points = await OutboundCampaignService._index_campaign_script(
-            tenant_res,
-            campaign_id,
-            name,
-            doc_text,
-            db=db,
-        )
+        if doc_text:
+            indexed_points = await OutboundCampaignService._index_campaign_script(
+                tenant_res,
+                campaign_id,
+                name,
+                doc_text,
+                db=db,
+            )
 
         contacts: list[dict[str, Any]] = []
         campaign_contact_rows: list[OutboundCampaignContact] = []
@@ -362,13 +380,193 @@ class OutboundCampaignService:
             contacts=contacts,
             doc_blob_path=doc_blob_path,
             doc_text=doc_text,
-            agent_config=build_agent_config(**dict(agent_config or {})),
+            agent_config=cfg,
             from_number=caller_id,
             total_count=len(contacts),
         )
         db.add(campaign)
         for row in campaign_contact_rows:
             db.add(row)
+        await db.commit()
+        await db.refresh(campaign)
+        invalidate_outbound_context(campaign.id)
+        return campaign
+
+    @staticmethod
+    async def create_campaign_prompt_only(
+        tenant_res: TenantResources,
+        db: AsyncSession,
+        *,
+        name: str,
+        from_number: str | None = None,
+        agent_config: dict[str, Any] | None = None,
+    ) -> OutboundCampaign:
+        """Create a campaign with just a name + agent_prompt.
+
+        The agent_prompt IS the knowledge — there's no separate reference
+        document. ``from_number`` is resolved against tenant defaults but
+        may end up ``None`` for a draft (caller ID check is deferred to
+        launch time). Leads are attached later via :meth:`attach_leads`.
+        """
+        cfg = build_agent_config(**dict(agent_config or {}))
+        if not str(cfg.get("agent_prompt") or "").strip():
+            raise ValueError(
+                "Campaigns need an agent prompt — it's what the agent reads "
+                "during the call. Add one and try again."
+            )
+
+        exotel_cfg = dict((tenant_res.provider_status or {}).get("exotel") or {})
+        caller_id = (
+            from_number
+            or exotel_cfg.get("from_number")
+            or tenant_res.twilio_phone_number
+            or settings.EXOTEL_CALLER_ID
+            or None
+        )
+
+        campaign = OutboundCampaign(
+            id=uuid.uuid4(),
+            tenant_id=tenant_res.tenant_id,
+            name=name,
+            status=CampaignStatus.draft,
+            contacts=[],
+            doc_blob_path=None,
+            doc_text=None,
+            agent_config=cfg,
+            from_number=caller_id,
+            total_count=0,
+        )
+        db.add(campaign)
+        await db.commit()
+        await db.refresh(campaign)
+        invalidate_outbound_context(campaign.id)
+        return campaign
+
+    @staticmethod
+    async def attach_leads(
+        tenant_res: TenantResources,
+        db: AsyncSession,
+        *,
+        campaign: OutboundCampaign,
+        lead_ids: list[uuid.UUID],
+    ) -> OutboundCampaign:
+        """Attach consented leads to an existing campaign.
+
+        Validates each lead is callable + same tenant, appends to the
+        inline ``contacts`` snapshot, creates ``OutboundCampaignContact``
+        rows for the launch path, and marks each lead ``queued``.
+        Idempotent — already-attached leads are skipped silently.
+        """
+        if not lead_ids:
+            raise ValueError("Provide at least one lead to attach.")
+        if campaign.status not in (CampaignStatus.draft,):
+            raise ValueError("Leads can only be attached to draft campaigns.")
+
+        leads = await OutgoingLeadService.validate_callable_leads(tenant_res, db, lead_ids)
+
+        contacts = list(campaign.contacts or [])
+        already_attached_ids = {str(c.get("lead_id")) for c in contacts if c.get("lead_id")}
+        existing_rows_res = await db.execute(
+            select(OutboundCampaignContact).where(
+                OutboundCampaignContact.campaign_id == campaign.id
+            )
+        )
+        existing_rows = {row.outgoing_lead_id for row in existing_rows_res.scalars().all()}
+
+        added = 0
+        for lead in leads:
+            if str(lead.id) in already_attached_ids and lead.id in existing_rows:
+                continue
+            link_id = str(uuid.uuid4())
+            snapshot = {
+                "lead_id": str(lead.id),
+                "phone": lead.phone_e164,
+                "name": lead.name or lead.phone_e164,
+                "email": lead.email,
+                "source_provider": lead.source_provider.value if hasattr(lead.source_provider, "value") else lead.source_provider,
+                "capture_form_id": str(lead.capture_form_id) if lead.capture_form_id else None,
+                "provider_lead_id": lead.provider_lead_id,
+                "consent_status": lead.consent_status.value if hasattr(lead.consent_status, "value") else lead.consent_status,
+                "consent_text": lead.consent_text,
+                "consented_at": lead.consented_at.isoformat() if lead.consented_at else None,
+            }
+            contacts.append(
+                {
+                    "phone": lead.phone_e164,
+                    "name": lead.name or lead.phone_e164,
+                    "status": "pending",
+                    "call_id": None,
+                    "call_link_id": link_id,
+                    "duration_s": None,
+                    "answered_at": None,
+                    "lead_id": str(lead.id),
+                    "source_provider": snapshot["source_provider"],
+                    "consent_status": snapshot["consent_status"],
+                    "consent_text": snapshot["consent_text"],
+                }
+            )
+            if lead.id not in existing_rows:
+                db.add(
+                    OutboundCampaignContact(
+                        campaign_id=campaign.id,
+                        outgoing_lead_id=lead.id,
+                        status="pending",
+                        call_link_id=link_id,
+                        snapshot=snapshot,
+                    )
+                )
+            lead.call_status = LeadCallStatus.queued
+            db.add(lead)
+            added += 1
+
+        campaign.contacts = contacts
+        campaign.total_count = len(contacts)
+        db.add(campaign)
+        await db.commit()
+        await db.refresh(campaign)
+        invalidate_outbound_context(campaign.id)
+        return campaign
+
+    @staticmethod
+    async def detach_lead(
+        tenant_res: TenantResources,
+        db: AsyncSession,
+        *,
+        campaign: OutboundCampaign,
+        lead_id: uuid.UUID,
+    ) -> OutboundCampaign:
+        """Remove a lead from a draft campaign (and reset its call_status)."""
+        if campaign.status != CampaignStatus.draft:
+            raise ValueError("Leads can only be detached from draft campaigns.")
+
+        lead_id_str = str(lead_id)
+        contacts = [c for c in (campaign.contacts or []) if str(c.get("lead_id")) != lead_id_str]
+        if len(contacts) == len(campaign.contacts or []):
+            raise ValueError("Lead is not attached to this campaign.")
+
+        row_res = await db.execute(
+            select(OutboundCampaignContact).where(
+                OutboundCampaignContact.campaign_id == campaign.id,
+                OutboundCampaignContact.outgoing_lead_id == lead_id,
+            )
+        )
+        for row in row_res.scalars().all():
+            await db.delete(row)
+
+        lead_res = await db.execute(
+            select(OutgoingLead).where(
+                OutgoingLead.id == lead_id,
+                OutgoingLead.tenant_id == tenant_res.tenant_id,
+            )
+        )
+        lead = lead_res.scalars().first()
+        if lead is not None and lead.call_status == LeadCallStatus.queued:
+            lead.call_status = LeadCallStatus.new
+            db.add(lead)
+
+        campaign.contacts = contacts
+        campaign.total_count = len(contacts)
+        db.add(campaign)
         await db.commit()
         await db.refresh(campaign)
         invalidate_outbound_context(campaign.id)
@@ -407,6 +605,40 @@ class OutboundCampaignService:
         await db.commit()
         await db.refresh(campaign)
         return campaign
+
+    @staticmethod
+    async def delete_campaign(
+        campaign: OutboundCampaign, db: AsyncSession
+    ) -> None:
+        """Hard-delete a campaign and its contact join rows.
+
+        Running campaigns must be cancelled first — refusing to delete one in
+        flight is the only safe behaviour; we don't want to orphan in-flight
+        Exotel calls or partially-processed leads.
+
+        Contacts (``outbound_campaign_contacts``) have a FK to the campaign
+        without ON DELETE CASCADE, so they must be removed first. The actual
+        ``OutgoingLead`` rows are NOT touched — leads outlive campaigns.
+
+        Cost-ledger rows reference ``campaign_id`` but as a nullable index
+        (no FK), so they remain intact as a billing audit trail.
+        """
+        if campaign.status == CampaignStatus.running:
+            raise ValueError(
+                "Cancel the campaign before deleting it. Running campaigns are protected."
+            )
+
+        # Drop the join rows first so the FK constraint stays happy.
+        contacts = await db.execute(
+            select(OutboundCampaignContact).where(
+                OutboundCampaignContact.campaign_id == campaign.id
+            )
+        )
+        for row in contacts.scalars().all():
+            await db.delete(row)
+
+        await db.delete(campaign)
+        await db.commit()
 
     # ------------------------------------------------------------------
     # Launch
@@ -495,21 +727,39 @@ class OutboundCampaignService:
 
     @staticmethod
     async def handle_call_status(
-        campaign: OutboundCampaign,
+        campaign: OutboundCampaign | None,
         call_link_id: str,
         event_type: str,
         payload: dict,
         db: AsyncSession,
+        followup_contact: dict | None = None,
     ) -> None:
-        contacts = list(campaign.contacts or [])
-        target = next((c for c in contacts if c.get("call_link_id") == call_link_id), None)
-        if not target:
-            return
+        """Webhook entry for call.answered / call.hangup / call.failed /
+        call.machine.detection.ended.
+
+        ``followup_contact`` carries the synthetic contact dict produced by
+        :meth:`get_by_call_link_id` when the call_link_id resolved against
+        ``lead_followup_schedules`` instead of a regular campaign contact.
+        In that case ``campaign`` may be None (manual follow-up not tied to
+        a campaign) and the contacts list lives in-memory only.
+        """
+        is_followup_synthetic = followup_contact is not None
+        if is_followup_synthetic:
+            contacts: list[dict] = [followup_contact]
+            target = followup_contact
+        else:
+            if campaign is None:
+                return
+            contacts = list(campaign.contacts or [])
+            target = next((c for c in contacts if c.get("call_link_id") == call_link_id), None)
+            if not target:
+                return
 
         if event_type == "call.answered":
             target["status"] = "answered"
             target["answered_at"] = datetime.now(timezone.utc).isoformat()
-            campaign.answered_count = (campaign.answered_count or 0) + 1
+            if campaign is not None:
+                campaign.answered_count = (campaign.answered_count or 0) + 1
             if target.get("lead_id"):
                 lead_res = await db.execute(select(OutgoingLead).where(OutgoingLead.id == uuid.UUID(str(target["lead_id"]))))
                 lead = lead_res.scalars().first()
@@ -521,7 +771,8 @@ class OutboundCampaignService:
             hangup_cause = payload.get("hangup_cause", "")
             if target["status"] not in ("answered",):
                 target["status"] = "no_answer" if "no_answer" in hangup_cause.lower() else "failed"
-                campaign.failed_count = (campaign.failed_count or 0) + 1
+                if campaign is not None:
+                    campaign.failed_count = (campaign.failed_count or 0) + 1
             duration = payload.get("duration_seconds") or 0
             target["duration_s"] = int(duration)
 
@@ -529,12 +780,20 @@ class OutboundCampaignService:
             # this call gets its outcome derived from the call disposition,
             # and a follow-up callback is auto-scheduled for no_show /
             # failed_followup states.
+            converted_outcome = False
+            tenant_for_lookups = (
+                campaign.tenant_id if campaign is not None else target.get("tenant_id")
+            )
             try:
                 from app.services.outcome_tracker import OutcomeTracker
                 from app.models.tenant_resources import TenantResources
+                from app.services.outcome_tracker import OUTCOME_STATES
+                from app.services import flow_session
 
+                if tenant_for_lookups is None:
+                    raise RuntimeError("no tenant context for outcome closure")
                 tr_res = await db.execute(
-                    select(TenantResources).where(TenantResources.tenant_id == campaign.tenant_id)
+                    select(TenantResources).where(TenantResources.tenant_id == tenant_for_lookups)
                 )
                 tr = tr_res.scalars().first()
                 org_id = tr.organization_id if tr else None
@@ -552,14 +811,163 @@ class OutboundCampaignService:
                             disposition=target["status"],
                             notes=f"hangup_cause={hangup_cause}" if hangup_cause else None,
                         )
-                        await OutcomeTracker.auto_followup_if_needed(
-                            db,
-                            organization_id=org_id,
-                            record_id=rec_uuid,
-                        )
-            except Exception:
-                pass
+                        # Note: we no longer call auto_followup_if_needed
+                        # here — the follow-up agent below owns the
+                        # scheduling decision (promise > rule > clamp >
+                        # caps), and double-firing would create two pending
+                        # rows for the same lead.
 
+                # Conversion kill switch: if any created record reached the
+                # 'completed' outcome (i.e. a successful booking/lead row),
+                # we treat the call as converted and follow-up enqueue will
+                # cancel pending follow-ups instead of scheduling more.
+                from app.models.nokvo_one_tool_record import NokvoOneToolRecord
+
+                if org_id and created_record_ids:
+                    for rec_id in created_record_ids:
+                        try:
+                            rec_uuid = uuid.UUID(str(rec_id))
+                        except (TypeError, ValueError):
+                            continue
+                        rec = await db.execute(
+                            select(NokvoOneToolRecord)
+                            .where(NokvoOneToolRecord.id == rec_uuid)
+                            .where(NokvoOneToolRecord.organization_id == org_id)
+                        )
+                        record = rec.scalars().first()
+                        if record is None:
+                            continue
+                        outcome = flow_session.outcome_summary(record.data or {})
+                        if (
+                            outcome
+                            and outcome.get("status") == OUTCOME_STATES.completed
+                        ):
+                            converted_outcome = True
+                            break
+            except Exception:
+                logger.exception("NOKVO-CAMPAIGN: outcome closure failed")
+
+            # ── Follow-up agent enqueue ──────────────────────────────────
+            # Read the prior call's session memory to surface a callback
+            # promise or opt-out cue. If neither is present, the follow-up
+            # service falls back to the campaign's admin-set disposition
+            # rules. Either way, four kill switches gate the actual insert.
+            try:
+                from app.services.followup_scheduler_service import (
+                    FollowupCue,
+                    FollowupSchedulerService,
+                )
+                from app.services.conversational_memory import (
+                    FACT_OPTED_OUT,
+                    FACT_PROMISED_CALLBACK_AT,
+                )
+                from app.services.agent_session_store import AgentSessionStore
+                from app.services.outgoing_lead_service import (
+                    OutgoingLeadService,
+                )
+                from app.models.tenant_resources import TenantResources
+                from datetime import datetime
+
+                if target.get("lead_id"):
+                    lead_id = uuid.UUID(str(target["lead_id"]))
+                    lead_res = await db.execute(
+                        select(OutgoingLead).where(OutgoingLead.id == lead_id)
+                    )
+                    lead = lead_res.scalars().first()
+                else:
+                    lead = None
+
+                # Inspect session memory for opt-out / promise cues. The
+                # session may already have been promoted + GC'd by another
+                # post-call hook; we gracefully degrade to disposition-only.
+                cue_opted_out = False
+                cue_promised: datetime | None = None
+                call_id = target.get("call_id") or call_link_id
+                tenant_for_cue = (
+                    campaign.tenant_id if campaign is not None else target.get("tenant_id")
+                )
+                tr_res2 = (
+                    await db.execute(
+                        select(TenantResources).where(
+                            TenantResources.tenant_id == tenant_for_cue
+                        )
+                    )
+                    if tenant_for_cue
+                    else None
+                )
+                tr2 = tr_res2.scalars().first() if tr_res2 is not None else None
+                if tr2 and call_id:
+                    try:
+                        state = await AgentSessionStore.get_state(tr2, call_id)
+                        facts = ((state or {}).get("memory") or {}).get("facts") or {}
+                        opt_fact = facts.get(FACT_OPTED_OUT) or {}
+                        if opt_fact.get("value") is True:
+                            cue_opted_out = True
+                        promised_fact = facts.get(FACT_PROMISED_CALLBACK_AT) or {}
+                        iso = promised_fact.get("value")
+                        if isinstance(iso, str) and iso:
+                            try:
+                                cue_promised = datetime.fromisoformat(iso)
+                            except ValueError:
+                                cue_promised = None
+                    except Exception:
+                        logger.debug(
+                            "NOKVO-CAMPAIGN: session inspect for cues failed",
+                            exc_info=True,
+                        )
+
+                # Opt-out is the legal kill switch — flip consent + cancel
+                # pending follow-ups, then stop. Don't enqueue anything.
+                if lead and cue_opted_out:
+                    await OutgoingLeadService.revoke_consent_and_cancel_followups(
+                        lead, db=db, reason="opted_out"
+                    )
+                elif lead:
+                    cue = FollowupCue(
+                        promised_callback_at=cue_promised,
+                        opted_out=False,
+                        converted=converted_outcome,
+                    )
+                    await FollowupSchedulerService.enqueue_after_call(
+                        lead=lead,
+                        campaign=campaign,
+                        source_call_id=call_id,
+                        disposition=target["status"],
+                        outcome=None,
+                        cue=cue,
+                        db=db,
+                    )
+            except Exception:
+                logger.exception("NOKVO-CAMPAIGN: follow-up enqueue failed")
+
+        # Follow-up synthetic path: just update the follow-up row state.
+        # No campaign contact row to update, no batch terminal check.
+        if is_followup_synthetic:
+            terminal = {"answered", "no_answer", "failed"}
+            if target.get("status") in terminal:
+                from app.models.lead_followup_schedule import (
+                    FollowupStatus,
+                    LeadFollowupSchedule,
+                )
+
+                followup_id = target.get("_followup_id")
+                if followup_id:
+                    try:
+                        fid = uuid.UUID(str(followup_id))
+                        row = await db.get(LeadFollowupSchedule, fid)
+                        if row is not None:
+                            row.status = FollowupStatus.completed
+                            db.add(row)
+                            await db.commit()
+                    except Exception:
+                        logger.exception(
+                            "NOKVO-CAMPAIGN: failed to mark follow-up row complete"
+                        )
+            else:
+                await db.commit()
+            return
+
+        # Regular campaign path.
         campaign.contacts = contacts
         contact_res = await db.execute(
             select(OutboundCampaignContact).where(
@@ -654,7 +1062,17 @@ class OutboundCampaignService:
     async def get_by_call_link_id(
         call_link_id: str, db: AsyncSession
     ) -> tuple[OutboundCampaign | None, dict | None]:
-        """Return (campaign, contact) matching the call_link_id."""
+        """Return (campaign, contact) matching the call_link_id.
+
+        Resolution order:
+          1. Campaign contact (regular launch). The contact dict lives
+             inline in ``campaign.contacts`` JSONB.
+          2. Follow-up schedule row (placed_call_id). Returns a synthetic
+             contact dict so the rest of the webhook pipeline behaves
+             identically. The synthetic dict carries ``_followup_id`` and
+             ``is_followup=True`` so downstream code can detect follow-up
+             state without an extra DB hit.
+        """
         result = await db.execute(
             select(OutboundCampaign).where(
                 OutboundCampaign.status.in_([CampaignStatus.running, CampaignStatus.completed])
@@ -664,7 +1082,53 @@ class OutboundCampaignService:
             for contact in campaign.contacts or []:
                 if contact.get("call_link_id") == call_link_id:
                     return campaign, contact
-        return None, None
+
+        # Fall through: follow-up table.
+        from app.models.lead_followup_schedule import (
+            FollowupStatus,
+            LeadFollowupSchedule,
+        )
+
+        fr_res = await db.execute(
+            select(LeadFollowupSchedule)
+            .where(LeadFollowupSchedule.placed_call_id == call_link_id)
+            .where(
+                LeadFollowupSchedule.status.in_(
+                    [FollowupStatus.in_flight, FollowupStatus.completed]
+                )
+            )
+            .limit(1)
+        )
+        followup = fr_res.scalars().first()
+        if followup is None:
+            return None, None
+
+        lead_res = await db.execute(
+            select(OutgoingLead).where(OutgoingLead.id == followup.lead_id)
+        )
+        lead = lead_res.scalars().first()
+
+        campaign = None
+        if followup.campaign_id is not None:
+            cr_res = await db.execute(
+                select(OutboundCampaign).where(
+                    OutboundCampaign.id == followup.campaign_id
+                )
+            )
+            campaign = cr_res.scalars().first()
+
+        synthetic_contact = {
+            "call_link_id": call_link_id,
+            "lead_id": str(followup.lead_id),
+            "phone": (lead.phone_e164 or lead.phone_raw) if lead else None,
+            "name": (lead.name if lead else None) or "",
+            "status": "calling",
+            "is_followup": True,
+            "_followup_id": str(followup.id),
+            "_source_call_id": followup.source_call_id,
+            "_attempt_n": int(followup.attempts or 0),
+        }
+        return campaign, synthetic_contact
 
     # ------------------------------------------------------------------
     # Chunks for agent injection

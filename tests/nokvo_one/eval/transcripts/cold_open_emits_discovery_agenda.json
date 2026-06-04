@@ -1,0 +1,20 @@
+{
+  "name": "cold_open_emits_discovery_agenda",
+  "description": "First user turn with no sales signal. The strategy block must include the COLD OPEN discovery agenda so the LLM takes control of turn 1 (no 'How can I help you?' fallback).",
+  "business_type": "real_estate",
+  "outbound": false,
+  "company_name": "Raghava Constructions",
+  "focus_project": "Skyline Heights",
+  "turns": [
+    {"role": "user", "text": "Hello"}
+  ],
+  "expected": [
+    {
+      "turn_index": 1,
+      "asserts": [
+        {"op": "contains", "field": "strategy_block", "expected": "COLD OPEN"},
+        {"op": "contains", "field": "strategy_block", "expected": "How can I help you"}
+      ]
+    }
+  ]
+}

@@ -18,7 +18,7 @@ from app.services.nokvo_one_provisioning_service import (
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.new_event_loop().run_until_complete(coro)
 
 
 def _common_patches(

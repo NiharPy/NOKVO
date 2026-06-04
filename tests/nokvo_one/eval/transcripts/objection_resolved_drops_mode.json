@@ -1,0 +1,30 @@
+{
+  "name": "objection_resolved_drops_mode",
+  "description": "Caller raises a price objection, agent rebuts, caller says 'fair enough, makes sense'. The FSM must enter objection_handling on the objection turn and exit on the acceptance turn.",
+  "business_type": "real_estate",
+  "outbound": false,
+  "company_name": "Raghava Constructions",
+  "turns": [
+    {"role": "user", "text": "Tell me about your projects."},
+    {"role": "assistant", "text": "We have Skyline Heights with 3 and 4 BHK apartments starting at ₹2.45 crore."},
+    {"role": "user", "text": "That's too expensive for me honestly."},
+    {"role": "assistant", "text": "I understand. We have payment plans starting at ₹52k/month EMI and the price includes premium amenities and parking. The location is appreciating fast — a one-time investment for long-term gains."},
+    {"role": "user", "text": "Fair enough, makes sense."}
+  ],
+  "expected": [
+    {
+      "turn_index": 2,
+      "asserts": [
+        {"op": "equals", "field": "mode", "expected": "objection_handling"},
+        {"op": "list_contains", "field": "objections_live_codes", "expected": "price_concern"}
+      ]
+    },
+    {
+      "turn_index": 3,
+      "asserts": [
+        {"op": "in", "field": "mode", "expected": ["query", "site_visit"]},
+        {"op": "list_not_contains", "field": "objections_live_codes", "expected": "price_concern"}
+      ]
+    }
+  ]
+}

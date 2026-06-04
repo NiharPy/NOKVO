@@ -4,6 +4,42 @@ import OrganizationPortal from '../components/OrganizationPortal.vue';
 import ConsoleLoginCard from '../components/ConsoleLoginCard.vue';
 import SuperAdminDashboard from '../components/SuperAdminDashboard.vue';
 
+// Dashboard views. Each view owns one page section that used to live inside
+// NokvoOneApp.vue under v-if="currentPage === '<key>'". During the migration
+// the v-if blocks remain in NokvoOneApp.vue; a route→currentPage watcher
+// keeps them in sync so deep-linking works immediately. As each section is
+// pulled out into its view file, its v-if block is deleted from the shell.
+const DashboardView = () => import('../views/DashboardView.vue');
+const TicketsView = () => import('../views/TicketsView.vue');
+const LeadsView = () => import('../views/LeadsView.vue');
+const AppointmentsView = () => import('../views/AppointmentsView.vue');
+const ProjectsView = () => import('../views/ProjectsView.vue');
+const AgentView = () => import('../views/AgentView.vue');
+const OutgoingAgentView = () => import('../views/OutgoingAgentView.vue');
+const KnowledgeBaseView = () => import('../views/KnowledgeBaseView.vue');
+const MyTimetableView = () => import('../views/MyTimetableView.vue');
+const OrganizationHealthView = () => import('../views/OrganizationHealthView.vue');
+const NokvoConnectView = () => import('../views/NokvoConnectView.vue');
+const AdvancedSettingsView = () => import('../views/AdvancedSettingsView.vue');
+
+const dashboardChildren = [
+  { path: '', redirect: { name: 'dash-home' } },
+  { path: 'home', component: DashboardView, name: 'dash-home', meta: { pageKey: 'dashboard' } },
+  { path: 'tickets', component: TicketsView, name: 'dash-tickets', meta: { pageKey: 'tickets' } },
+  { path: 'leads', component: LeadsView, name: 'dash-leads', meta: { pageKey: 'leads' } },
+  { path: 'appointments', component: AppointmentsView, name: 'dash-appointments', meta: { pageKey: 'appointments' } },
+  { path: 'projects', component: ProjectsView, name: 'dash-projects', meta: { pageKey: 'projects' } },
+  { path: 'agent', component: AgentView, name: 'dash-agent', meta: { pageKey: 'agent' } },
+  { path: 'campaigns', component: OutgoingAgentView, name: 'dash-campaigns', meta: { pageKey: 'outgoing_agent' } },
+  { path: 'campaigns/:campaignId', component: OutgoingAgentView, name: 'dash-campaign-detail', meta: { pageKey: 'outgoing_agent' } },
+  { path: 'knowledge-base', component: KnowledgeBaseView, name: 'dash-knowledge', meta: { pageKey: 'knowledge_base' } },
+  { path: 'my-timetable', component: MyTimetableView, name: 'dash-my-timetable', meta: { pageKey: 'my_timetable' } },
+  { path: 'organization-health', component: OrganizationHealthView, name: 'dash-org-health', meta: { pageKey: 'organization_health' } },
+  { path: 'connect', component: NokvoConnectView, name: 'dash-connect', meta: { pageKey: 'nokvo_connect' } },
+  { path: 'connect/keys', component: NokvoConnectView, name: 'dash-connect-keys', meta: { pageKey: 'nokvo_connect_step2' } },
+  { path: 'advanced-settings', component: AdvancedSettingsView, name: 'dash-advanced', meta: { pageKey: 'advanced_settings' } },
+];
+
 const routes = [
   // ── Root redirect ──────────────────────────────────────────────
   { path: '/', redirect: '/nokvo-one' },
@@ -32,6 +68,7 @@ const routes = [
     component: NokvoOneApp,
     props: { initialAuthState: 'ready' },
     name: 'nokvo-one-dashboard',
+    children: dashboardChildren,
   },
   // Deep-link routes handled internally by the component
   {
@@ -92,5 +129,10 @@ const router = createRouter({
   history: createWebHistory(),
   routes,
 });
+
+// pageKeyToRouteName moved to ./pageKeys.js to break a circular import with
+// NokvoOneApp.vue (which uses it in switchPage). Re-exported here so any
+// existing consumers continue to work.
+export { pageKeyToRouteName } from './pageKeys.js';
 
 export default router;

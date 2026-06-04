@@ -350,9 +350,9 @@ class AzureGroundedLLM:
             if attempt < attempts - 1:
                 wait_for = retry_after if retry_after > 0 else 0.6 * (2 ** attempt)
                 wait_for = min(wait_for, 3.5)
-                print(
-                    f"[NOKVO-LLM] 429 (complete) attempt {attempt + 1}/{attempts} — sleeping {wait_for:.2f}s "
-                    f"(retry_after={retry_after_hdr!r})"
+                logger.warning(
+                    "NOKVO-LLM: 429 (complete) attempt %s/%s — sleeping %.2fs (retry_after=%r)",
+                    attempt + 1, attempts, wait_for, retry_after_hdr,
                 )
                 await asyncio.sleep(wait_for)
                 continue
@@ -435,9 +435,9 @@ class AzureGroundedLLM:
                     if attempt < attempts - 1:
                         wait_for = retry_after if retry_after > 0 else 0.6 * (2 ** attempt)
                         wait_for = min(wait_for, retry_wait_cap)
-                        print(
-                            f"[NOKVO-LLM] 429 attempt {attempt + 1}/{attempts} — sleeping {wait_for:.2f}s "
-                            f"(retry_after={retry_after_hdr!r})"
+                        logger.warning(
+                            "NOKVO-LLM: 429 attempt %s/%s — sleeping %.2fs (retry_after=%r)",
+                            attempt + 1, attempts, wait_for, retry_after_hdr,
                         )
                         await asyncio.sleep(wait_for)
                         continue
@@ -888,13 +888,16 @@ class NokvoOneVoicePipeline:
                 payload_filters=payload_filters,
                 db=db,
             )
-            print(
-                f"[NOKVO-RETRIEVE] tenant={tenant_res.tenant_id} label={label} "
-                f"query={query[:60]!r} filters={payload_filters} "
-                f"min_score={min_score} top_k={effective_top_k} "
-                f"raw_results={len(points)} scores="
-                f"{[round(float(getattr(p, 'score', 0.0) or 0.0), 3) for p in points[:5]]} "
-                f"qdrant_ms={int((perf_counter() - started) * 1000)}"
+            # Debug-level so production stdout/log volume doesn't carry the
+            # caller's query text or per-turn retrieval stats by default; ops
+            # can flip the logger to DEBUG when actually investigating.
+            logger.debug(
+                "NOKVO-RETRIEVE: tenant=%s label=%s query=%r filters=%s min_score=%s "
+                "top_k=%s raw_results=%s scores=%s qdrant_ms=%s",
+                tenant_res.tenant_id, label, query[:60], payload_filters,
+                min_score, effective_top_k, len(points),
+                [round(float(getattr(p, 'score', 0.0) or 0.0), 3) for p in points[:5]],
+                int((perf_counter() - started) * 1000),
             )
             return points
 
@@ -1767,26 +1770,53 @@ class NokvoOneVoicePipeline:
         # Inline retry + graceful fallback. Retry count + delay come from the
         # canonical agent spec (:class:`RetryPolicy`) — not hardcoded.
         from app.services.agent_spec import RETRY_POLICY
+        from app.db.session import AsyncSessionLocal
 
         result = None
         last_exc: Exception | None = None
         max_inline_attempts = 1 + RETRY_POLICY.inline_retries
         for attempt in range(max_inline_attempts):
+            # First attempt uses the shared call session (tests assert
+            # on its commit flag). Retries use a fresh AsyncSession to
+            # sidestep greenlet_spawn / session-corruption issues that
+            # the long-lived call session can accumulate across many turns.
+            use_fresh_session = attempt > 0
             try:
-                result = await PredefinedToolsService.execute(
-                    db,
-                    tenant_res.organization_id,
-                    None,
-                    tool,
-                    args,
-                    session_id=call_id,
-                )
-                await db.commit()
+                if use_fresh_session:
+                    async with AsyncSessionLocal() as tool_db:
+                        result = await PredefinedToolsService.execute(
+                            tool_db,
+                            tenant_res.organization_id,
+                            None,
+                            tool,
+                            args,
+                            session_id=call_id,
+                        )
+                        await tool_db.commit()
+                else:
+                    result = await PredefinedToolsService.execute(
+                        db,
+                        tenant_res.organization_id,
+                        None,
+                        tool,
+                        args,
+                        session_id=call_id,
+                    )
+                    await db.commit()
                 last_exc = None
                 break
             except Exception as exc:  # noqa: BLE001 — voice tool entry, broad catch by design
                 last_exc = exc
-                if db is not None:
+                logger.warning(
+                    "NOKVO-APPT: %s failed (attempt %s/%s, fresh_session=%s): %r",
+                    tool.key,
+                    attempt + 1,
+                    max_inline_attempts,
+                    use_fresh_session,
+                    exc,
+                    exc_info=True,
+                )
+                if not use_fresh_session and db is not None:
                     try:
                         await db.rollback()
                     except Exception:
@@ -2323,6 +2353,9 @@ class NokvoOneVoicePipeline:
                         "auto_lead_created": True,
                         "auto_site_visit_created": True,
                         "auto_site_visit_id": sv_result.get("ticket_id") or sv_result.get("id"),
+                        # FSM terminal mode marker. Booking landed — call
+                        # ended in site_visit, not inbound_lead.
+                        "agent_mode_final": "site_visit",
                     },
                 )
                 return {
@@ -2338,6 +2371,65 @@ class NokvoOneVoicePipeline:
             campaign_context=campaign_context,
             outbound_context=outbound_context,
         )
+        # Phone-less inbound lead: caller showed interest but hung up before
+        # giving a number. By spec they still belong in the Leads → Uncategorized
+        # tab so the operator can see the engagement. The ``leads_create`` tool
+        # requires phone, so we write a NokvoOneToolRecord directly with whatever
+        # facts we did capture.
+        if not args.get("phone") and call_surface == "voice_inbound":
+            from app.models.nokvo_one_tool_record import NokvoOneToolRecord
+
+            direct_data: dict[str, Any] = {
+                "source": "voice_inbound",
+                "auto_created_from_call": True,
+                "uncategorized": True,
+                "agent_mode_final": "inbound_lead",
+                "no_phone": True,
+                "call_id": call_id,
+                "name": str(args.get("name") or "Property inquiry"),
+                "requested_info": memory.get("requested_info"),
+                "purpose": memory.get("purpose"),
+                "timeline": memory.get("timeline"),
+                "visit_preference": memory.get("visit_preference"),
+                "objection": memory.get("objection"),
+                "budget_label": memory.get("budget"),
+                "property_type": args.get("property_type"),
+                "location": args.get("location"),
+            }
+            direct_data = {k: v for k, v in direct_data.items() if v not in (None, "")}
+            record = NokvoOneToolRecord(
+                id=uuid.uuid4(),
+                organization_id=tenant_res.organization_id,
+                record_type="lead",
+                status="new",
+                data=direct_data,
+            )
+            try:
+                db.add(record)
+                await db.commit()
+                await AgentSessionStore.merge_state(
+                    tenant_res,
+                    call_id,
+                    {
+                        "auto_lead_created": True,
+                        "auto_lead_id": str(record.id),
+                        "agent_mode_final": "inbound_lead",
+                    },
+                )
+                return {
+                    "tool": "leads_create_phoneless",
+                    "arguments": direct_data,
+                    "result": {"ok": True, "id": str(record.id)},
+                }
+            except Exception:
+                logger.exception(
+                    "NOKVO-INBOUND-LEAD: failed to persist phoneless uncategorized lead"
+                )
+                try:
+                    await db.rollback()
+                except Exception:
+                    pass
+                return None
         if not args.get("phone"):
             return None
         tool = catalog.get("leads_create")
@@ -2384,6 +2476,16 @@ class NokvoOneVoicePipeline:
         partial_visit_time = _first_collected(lambda k: "time" in k.lower())
         booking_abandoned = bool(project_hint or partial_visit_date or partial_visit_time)
 
+        # Inbound real-estate FSM terminal state. Caller showed interest
+        # (asked questions, mentioned BHK/budget/location, maybe even
+        # started a booking but didn't confirm) and hung up. By spec, the
+        # auto-created lead lands in the Leads page's Uncategorized tab
+        # (data.uncategorized=true is what the frontend filters on).
+        #
+        # We DO NOT mark outbound auto-leads as uncategorized — those have
+        # their own outcome classifier that decides interested vs
+        # partial vs not_interested for tab routing.
+        is_inbound = (call_surface == "voice_inbound")
         metadata = {
             "source": call_surface or "voice_call",
             "auto_created_from_call": True,
@@ -2398,6 +2500,12 @@ class NokvoOneVoicePipeline:
             "partial_visit_date": partial_visit_date,
             "partial_visit_time": partial_visit_time,
             "booking_abandoned": True if booking_abandoned else None,
+            # FSM terminal mode marker. The frontend Uncategorized tab
+            # filters on ``data.uncategorized === true``; setting it here
+            # is what routes the row off the campaign tab and into the
+            # uncategorized bucket.
+            "uncategorized": True if is_inbound else None,
+            "agent_mode_final": "inbound_lead" if is_inbound else None,
         }
         if lead_id:
             await NokvoOneVoicePipeline._patch_record_metadata(
@@ -2408,7 +2516,11 @@ class NokvoOneVoicePipeline:
         await AgentSessionStore.merge_state(
             tenant_res,
             call_id,
-            {"auto_lead_created": True, "auto_lead_id": lead_id},
+            {
+                "auto_lead_created": True,
+                "auto_lead_id": lead_id,
+                "agent_mode_final": "inbound_lead" if is_inbound else "query",
+            },
         )
         return {"tool": "leads_create", "arguments": args, "result": result}
 
@@ -2592,30 +2704,65 @@ class NokvoOneVoicePipeline:
             args = {k: v for k, v in raw_args.items() if v not in (None, "")}
         # Same retry shape as the clinic appointment path — reads from spec.
         from app.services.agent_spec import RETRY_POLICY
+        from app.db.session import AsyncSessionLocal
 
         result = None
         last_exc: Exception | None = None
         max_inline_attempts = 1 + RETRY_POLICY.inline_retries
         for attempt in range(max_inline_attempts):
+            # First attempt uses the shared call session (matches the
+            # historical behaviour the tests cover). Retries fall back to
+            # a fresh AsyncSession because the long-lived WS-bound session
+            # can sit in a state where ``await db.commit()`` raises
+            # ``greenlet_spawn has not been called`` — a one-shot session
+            # sidesteps that entire class of session-corruption issues.
+            use_fresh_session = attempt > 0
             try:
-                result = await PredefinedToolsService.execute(
-                    db,
-                    tenant_res.organization_id,
-                    None,
-                    tool,
-                    args,
-                    session_id=call_id,
-                )
-                await db.commit()
+                if use_fresh_session:
+                    async with AsyncSessionLocal() as tool_db:
+                        result = await PredefinedToolsService.execute(
+                            tool_db,
+                            tenant_res.organization_id,
+                            None,
+                            tool,
+                            args,
+                            session_id=call_id,
+                        )
+                        await tool_db.commit()
+                else:
+                    result = await PredefinedToolsService.execute(
+                        db,
+                        tenant_res.organization_id,
+                        None,
+                        tool,
+                        args,
+                        session_id=call_id,
+                    )
+                    await db.commit()
                 last_exc = None
                 break
             except Exception as exc:  # noqa: BLE001 — voice tool entry, broad catch by design
                 last_exc = exc
-                if db is not None:
+                logger.warning(
+                    "NOKVO-TOOL-FLOW: %s failed (attempt %s/%s, fresh_session=%s) args=%s: %r",
+                    tool.key,
+                    attempt + 1,
+                    max_inline_attempts,
+                    use_fresh_session,
+                    {k: v for k, v in args.items() if k != "record_data"},
+                    exc,
+                    exc_info=True,
+                )
+                # Only roll back the shared session — the fresh session's
+                # ``async with`` block already rolls itself back on
+                # exception.
+                if not use_fresh_session and db is not None:
                     try:
                         await db.rollback()
                     except Exception:
-                        pass
+                        logger.exception(
+                            "NOKVO-TOOL-FLOW: rollback after %s failure crashed", tool.key
+                        )
                 if attempt < max_inline_attempts - 1:
                     await asyncio.sleep(RETRY_POLICY.inline_delay_seconds)
         if result is None:
@@ -2741,6 +2888,24 @@ class NokvoOneVoicePipeline:
     ) -> None:
         patch = route.get("state_patch") if isinstance(route, dict) else None
         if isinstance(patch, dict) and patch:
+            # Real-estate inbound FSM: when the route's state_patch carries a
+            # tool_flow update, re-derive agent_mode from the resulting state
+            # and bake it into the patch so observability tools see the
+            # transition without needing to recompute. Phase 1 — real-estate
+            # only; non-real-estate orgs skip the augmentation.
+            if "tool_flow" in patch:
+                try:
+                    from app.services.real_estate_agent_fsm import current_mode as _fsm_current_mode
+
+                    # Approximate the post-patch state by overlaying the patch
+                    # onto an empty state — current_mode only consults
+                    # ``tool_flow`` fields, so a partial overlay is sufficient.
+                    patch.setdefault(
+                        "agent_mode",
+                        _fsm_current_mode({"tool_flow": patch.get("tool_flow") or {}}),
+                    )
+                except Exception:
+                    pass
             await AgentSessionStore.merge_state(tenant_res, call_id, patch)
 
     @staticmethod
@@ -2760,263 +2925,38 @@ class NokvoOneVoicePipeline:
         conversation_strategy_block: str | None = None,
         field_questions_prompt: str | None = None,
         projects_block: str | None = None,
+        tool_flow_state: dict[str, Any] | None = None,
+        tool_flow_bundle: dict[str, Any] | None = None,
+        turn_index: int | None = None,
+        agent_mode_block: str | None = None,
+        conversational_memory: Any = None,
     ) -> list[dict[str, str]]:
-        language_label = SarvamVoiceService.language_label(language)
-        context_parts: list[str] = []
-        remaining = settings.AGENT_MAX_CONTEXT_CHARS
-        for index, chunk in enumerate(chunks, start=1):
-            text = re.sub(r"\s+", " ", str(chunk.get("text") or "")).strip()
-            if not text:
-                continue
-            excerpt = text[:remaining]
-            context_parts.append(f"[{index}] {excerpt}")
-            remaining -= len(excerpt)
-            if remaining <= 0:
-                break
-        # Outbound campaign system fragment. When the campaign config
-        # has an explicit agent_prompt + objectives we drop in a full
-        # proactive-mode block; otherwise we fall back to the legacy
-        # one-liner that previously lived here.
-        outbound_section = compose_outbound_system_section(
-            outbound_context,
+        # Body extracted to app.services.pipeline.message_composer.compose_rag_messages.
+        # This wrapper preserves the class-method API surface so legacy callers
+        # don't need updating. New code should import compose_rag_messages directly.
+        from app.services.pipeline.message_composer import compose_rag_messages
+        return compose_rag_messages(
+            query,
+            chunks,
+            language=language,
+            history=history,
+            company_name=company_name,
+            campaign_goal=campaign_goal,
+            single_prompt_guidance=single_prompt_guidance,
+            outbound_context=outbound_context,
             covered_objectives=covered_objectives,
             outbound_memory=outbound_memory,
-        )
-        if outbound_section:
-            campaign_rule = (
-                outbound_section
-                + "\n\n# FINAL OUTBOUND REMINDER\n"
-                "The prospect is not a captive audience. Listen to the latest reply, answer or adapt to it, "
-                "then say only one useful next thing in 1 to 2 short sentences. "
-                "If they just gave permission to continue, ask one discovery question and do not pitch features first."
-            )
-        elif campaign_goal:
-            campaign_rule = (
-                f"Campaign goal: {campaign_goal}. Follow this goal, but still use only the supplied context."
-            )
-        else:
-            campaign_rule = "This is an inbound support conversation unless campaign context says otherwise."
-        custom_guidance = (single_prompt_guidance or "").strip()
-        brand = "the configured business" if custom_guidance else (company_name or "the tenant")
-        custom_guidance_section = (
-            "# ADMIN SINGLE-PROMPT VOICE AGENT GUIDANCE\n"
-            f"{custom_guidance}\n\n"
-            "This tenant-provided prompt is part of the agent's active configuration. Use explicit business facts from it together with retrieved tenant context. "
-            "If approved retrieved documents conflict with this prompt, prefer the retrieved documents. It does not override safety, language, or no-hallucination rules.\n\n"
-            if custom_guidance
-            else ""
-        )
-        # Real-estate project inventory — separate, high-priority section.
-        # Sits AFTER the admin guidance so any project facts it asserts
-        # override project facts the admin may have hardcoded into their
-        # single-prompt text. Empty for non-real-estate orgs.
-        _projects_inner = (projects_block or "").strip()
-        projects_block_section = (
-            "# CURRENT PROJECT INVENTORY (authoritative — overrides admin prompt)\n"
-            f"{_projects_inner}\n\n"
-            if _projects_inner
-            else ""
-        )
-        # Also pin a high-priority OVERRIDE directive at the very top of the
-        # prompt when DB projects exist. LLMs weight start-of-prompt rules
-        # heavily, and the admin's free-text "answer only from this prompt"
-        # rule fights us if we rely on positional ordering alone.
-        projects_override_directive = (
-            "# PROJECT INVENTORY OVERRIDE — NON-NEGOTIABLE\n"
-            "For this organization, the live PROJECT INVENTORY section below is "
-            "the SOLE source of truth for project / property facts (names, "
-            "locations, prices, RERA numbers, configurations, possession dates, "
-            "amenities). The admin's single-prompt may contain example or "
-            "outdated project text — IGNORE every project name, price, or "
-            "RERA number you find in that prompt. Quote only from the "
-            "PROJECT INVENTORY block. If the inventory has fewer projects "
-            "than the admin prompt suggests, that is intentional: the "
-            "inventory is the current portfolio.\n\n"
-            if _projects_inner
-            else ""
-        )
-        # Final reminder block tail — repeats the override one more time
-        # close to the user's turn so the LLM's recency bias works in our
-        # favour. Empty for non-real-estate orgs.
-        projects_final_reminder = (
-            "\nWhen the caller asks about properties, projects, what's available, or what you offer, base every fact ONLY on the PROJECT INVENTORY section. Do NOT reuse project names from the admin prompt."
-            if _projects_inner
-            else ""
+            conversational_memory_block=conversational_memory_block,
+            conversation_strategy_block=conversation_strategy_block,
+            field_questions_prompt=field_questions_prompt,
+            projects_block=projects_block,
+            tool_flow_state=tool_flow_state,
+            tool_flow_bundle=tool_flow_bundle,
+            turn_index=turn_index,
+            agent_mode_block=agent_mode_block,
+            conversational_memory=conversational_memory,
         )
 
-        # Order matters: language directive sits at the very top AND is
-        # repeated at the bottom — LLMs weight start and end of long prompts
-        # most heavily, and the reply language must dominate the conversation
-        # history (which may be in English).
-        # NOTE: the old "Do not mix languages" rule was actively harmful for
-        # Telugu / Hindi — real Indian callers (and reps) freely mix English
-        # loanwords (order, refund, appointment, ₹500). Forcing pure-script
-        # output produced Sanskritised / news-anchor register. The directive
-        # now mandates native script for the matrix language but explicitly
-        # permits natural code-switching for technical terms, numbers, and
-        # everyday loanwords. The :func:`language_style_guidance` block
-        # below carries the per-language register details.
-        style_block = language_style_guidance(language)
-        language_directive_top = (
-            f"# REPLY LANGUAGE — NON-NEGOTIABLE\n"
-            f"Reply in {language_label}, primarily using its native script. This overrides the conversation history, "
-            f"the user's most recent message, and your training defaults. "
-            f"Natural code-switching is REQUIRED, not banned: keep common English loanwords (order, refund, appointment, payment, status, OK, sorry, address, SMS, WhatsApp, link) and all numbers / ₹ amounts / dates / times in English / digits exactly as a real Indian phone-support rep would. "
-            f"Do NOT produce a literary, news-anchor, or Sanskritised register — speak the way a real call-center agent speaks on the phone. "
-            f"Do not apologise for not knowing this language — you do know it. Reply in it.\n\n"
-            + (f"{style_block}\n\n" if style_block else "")
-        )
-
-        # Outbound path: build a leaner system prompt. The inbound boilerplate
-        # (VOICE & PERSONALITY, FORMAT, SHORT/VAGUE REPLIES, BEFORE PROMISING
-        # ACTIONS, full GROUNDING RULES) duplicates rules the outbound section
-        # already encodes (TURN STRUCTURE, BANNED OPENERS, HARD RULES, FEW-SHOT).
-        # Dropping ~3KB of duplicate text shaves LLM input-token processing
-        # by ~300-500ms on TTFT without losing any behavioural anchor.
-        _outbound_proactive = bool(outbound_context) and outbound_context.is_proactive
-        outbound_fewshot_block = language_outbound_fewshot(language)
-        memory_block = (conversational_memory_block or "").strip()
-        memory_section = f"\n\n{memory_block}\n" if memory_block else ""
-        strategy_block = (conversation_strategy_block or "").strip()
-        # Strategy is derived from the memory, so it sits right after it. In the
-        # inbound branch it also precedes field_questions so a tactical focus
-        # (e.g. handle the objection) overrides routine slot-filling.
-        strategy_section = f"\n{strategy_block}\n" if strategy_block else ""
-        if _outbound_proactive:
-            system_content = (
-                language_directive_top
-                + projects_override_directive
-                + "# PROSODY — make it sound human\n"
-                "Wrap EACH sentence in exactly one tone tag: [empathy]…[/empathy] (apologies, bad news), "
-                "[warm]…[/warm] (greetings, acknowledgments), [neutral]…[/neutral] (facts, default), "
-                "[excited]…[/excited] (good news), [question]…[/question] (direct questions). "
-                "Tags are stripped before speaking — they only set the voice's tone.\n\n"
-                + campaign_rule
-                + memory_section
-                + strategy_section
-                + (f"\n\n{projects_block_section}" if projects_block_section else "")
-                + (f"\n\n{outbound_fewshot_block}" if outbound_fewshot_block else "")
-                + f"\n\n# REMINDER\nReply in {language_label} with natural English code-switching for loanwords, numbers, and ₹ amounts. Keep it to 1-2 sentences."
-                + projects_final_reminder
-            )
-            messages: list[dict[str, str]] = [{"role": "system", "content": system_content}]
-            # Outbound conversations are short by design — keep the last 6
-            # turns instead of 8 to trim a couple hundred more input tokens.
-            for turn in history[-6:]:
-                role = turn.get("role") if turn.get("role") in {"user", "assistant"} else "user"
-                messages.append({"role": role, "content": str(turn.get("content") or "")[:600]})
-            user_content = (
-                f"Latest prospect reply — respond to this first:\n{query}\n\n"
-                f"Campaign brief context, if needed:\n{chr(10).join(context_parts)}\n\n"
-                f"Reply in {language_label}."
-            )
-            messages.append({"role": "user", "content": user_content})
-            return messages
-
-        system_content = (
-            language_directive_top
-            + projects_override_directive
-            + f"You are Nokvo One's live voice agent for {brand}. Talk like a real person on a phone call — "
-            "not a help-center bot.\n\n"
-            "# PROSODY — make it sound human\n"
-            "Your reply is going to be spoken aloud. Wrap EACH sentence in exactly one of these tone tags:\n"
-            "  [empathy]…[/empathy]   — apologies, bad news, 'sorry to hear that'. Slower, softer.\n"
-            "  [warm]…[/warm]         — greetings, acknowledgments, 'of course', 'got it'.\n"
-            "  [neutral]…[/neutral]   — facts, policies, statements. DEFAULT.\n"
-            "  [excited]…[/excited]   — good news, enthusiasm.\n"
-            "  [question]…[/question] — direct questions.\n"
-            "Examples:\n"
-            "  [empathy]Oh, that's frustrating.[/empathy] [question]What's your order number?[/question]\n"
-            "  [warm]Of course.[/warm] [neutral]Refunds within 2 minutes go back to your original payment method.[/neutral]\n"
-            "Tags are stripped before being spoken; they only control the voice's tone. Most replies are mostly [neutral] with one warm or empathic opener.\n\n"
-            "# VOICE & PERSONALITY\n"
-            f"{custom_guidance_section}"
-            f"{projects_block_section}"
-            "- Use contractions: 'I'll', 'you're', 'let's' — same in every language (equivalent informal forms).\n"
-            "- Open with quick acknowledgments — 'Sure', 'Got it', 'Of course', 'Okay', 'Right' — not 'I understand your concern' or 'Thank you for reaching out'.\n"
-            "- When the caller is frustrated, hurt, or angry: ACKNOWLEDGE the feeling first in one short phrase ('Oh that's frustrating', 'Sorry to hear that'), THEN help. Don't skip to 'please provide your order number'.\n"
-            "- Replace stiff phrases: 'Please provide your order number' → 'What's your order number?' · 'I will assist you' → 'Yeah, I can help' · 'Kindly hold on' → 'One sec' · 'How may I help you today?' → 'What can I help you with?'\n"
-            "- Vary openers across turns. Don't start every reply with the same word.\n\n"
-            "# FORMAT\n"
-            "- Keep replies SHORT — 1 to 3 sentences. The first must be immediately useful.\n"
-            "- Be specific: name the policy, the threshold, the ₹ amount, the time limit — whatever's in the context.\n"
-            "- No markdown, bullets, lists, filenames, or citations.\n\n"
-            "# USE THE CONVERSATION\n"
-            "- If the caller mentioned an order number, name, or issue earlier, USE IT — don't ask again.\n"
-            "- If they correct you, briefly acknowledge ('Ah, my mistake') and adjust. Don't repeat the same wrong assumption.\n"
-            "- React to what they just said before launching into your answer.\n\n"
-            "# BEFORE PROMISING ACTIONS\n"
-            "You cannot actually cancel orders, issue refunds, or escalate from this call. Before saying 'I'll cancel' or 'I'll refund':\n"
-            "- Ask for the order number / customer details if you don't have them.\n"
-            "- Say the next step — 'I'll pass this to our cancellation team' — not 'I've cancelled it'.\n\n"
-            "# SHORT OR VAGUE REPLIES ('yes', 'ok', 'hmm', 'hi')\n"
-            "- Don't assume what they want. Don't pull a cancellation/refund topic out of thin air.\n"
-            "- If you asked a question last turn, treat their short reply as the answer to that.\n"
-            "- If you didn't ask anything specific, respond openly: 'What can I help you with?'\n\n"
-            "# GROUNDING RULES — non-negotiable for company-specific facts\n"
-            "1. Answer only with facts stated explicitly in the retrieved tenant context or the active admin single-prompt guidance. "
-            "If the user's question is partially covered, state EVERY relevant fact the context contains (city, name, hours, number, etc.) and ONLY then say the remaining detail must be confirmed by support. "
-            "Refuse only when nothing in the context is relevant.\n"
-            "1a. CRITICAL FOR NON-ENGLISH REPLIES: When responding in Telugu, Hindi, Tamil, Bengali, Marathi, Gujarati, Kannada, Malayalam, Punjabi, or Urdu — NEVER use 'I don't have that information' if the retrieved context or admin guidance contains ANY relevant fact. "
-            "Translate the facts you DO have into the target language and share them. Only after sharing should you note what's missing. "
-            "Example: caller asks 'where is the clinic?' in Telugu, context says 'clinic is in KPHB, Hyderabad'. CORRECT response: share KPHB+Hyderabad in Telugu and offer to follow up for the exact street. INCORRECT: 'I don't have the exact address'.\n"
-            "1b. AMBIGUOUS PRONOUNS — when the user says 'where is it', 'how much is this', 'when do they open', or similar pronoun-style questions without explicit subject, "
-            "assume they're asking about the business (the clinic / restaurant / store this agent represents). Apply the context to THAT subject.\n"
-            "2. Never invent, infer, generalize, or guess. Do not stitch unrelated context fragments into a combined answer. "
-            "Do not import outside knowledge about refunds, cancellations, payments, delivery, accounts, or any other policy.\n"
-            "3. Forbidden hedge words for policy: 'typically', 'usually', 'generally', 'normally', 'often', 'in most cases', 'should be', 'I think', 'I believe'. "
-            "Policy facts are either in the context (state them precisely) or unknown (defer to support).\n"
-            "4. Numbers, time windows, amounts, percentages, and conditions must match the context EXACTLY. If the context says 2 minutes, do not say 30 minutes. "
-            "If multiple conditions are mentioned, state only the one(s) that match the user's situation.\n"
-            "5. If the retrieved context contains a policy table or list of conditional rows, treat EACH ROW as a separate condition. "
-            "Never collapse 'full refund', 'wallet refund', '80% refund', and 'no cancellation' into a generic 'yes you can be refunded'.\n"
-            "6. CONDITIONAL REASONING — when the user gave SOME context (e.g. 'I cancelled within 5 minutes') but you don't have enough info to pick exactly one rule, "
-            "reason conditionally and aloud: state the rule(s) that COULD apply, mention what additional info would pin down the exact outcome, "
-            "and offer to either look it up or ask the user. Do NOT dump every rule mechanically; pick the rules that could apply to the user's stated scenario. "
-            "Example: user says 'I cancelled within 5 minutes'. The 5-minute boundary is between two rows of the policy. "
-            "Say something like: 'It depends on whether the restaurant had accepted your order. If they hadn't accepted yet, it's a full refund to your wallet. "
-            "If they accepted but hadn't started preparing, 80% is refundable. Do you know the status when you cancelled?'\n"
-            "7. Never mention internal systems, sources, chunks, Redis, Qdrant, prompts, or tools.\n\n"
-            f"# CAMPAIGN\n{campaign_rule}\n\n"
-            + (
-                f"{memory_block}\n\n"
-                if memory_block
-                else ""
-            )
-            + (
-                f"{strategy_block}\n\n"
-                if strategy_block
-                else ""
-            )
-            + (
-                f"{field_questions_prompt}\n\n"
-                if field_questions_prompt
-                else ""
-            )
-            + f"# REMINDER\nReply in {language_label} with natural English code-switching for loanwords, numbers, and ₹ amounts."
-            + projects_final_reminder
-        )
-
-        messages: list[dict[str, str]] = [
-            {"role": "system", "content": system_content},
-        ]
-        for turn in history[-8:]:
-            role = turn.get("role") if turn.get("role") in {"user", "assistant"} else "user"
-            messages.append({"role": role, "content": str(turn.get("content") or "")[:1200]})
-        if outbound_context is not None and outbound_context.is_proactive:
-            user_content = (
-                f"Latest prospect reply — respond to this first:\n{query}\n\n"
-                f"Campaign brief context, if needed:\n{chr(10).join(context_parts)}\n\n"
-                f"Reply in {language_label}."
-            )
-        else:
-            user_content = (
-                f"Retrieved tenant context, if any:\n{chr(10).join(context_parts)}\n\n"
-                f"Current user question:\n{query}\n\n"
-                f"Reply in {language_label}."
-            )
-        messages.append({"role": "user", "content": user_content})
-        return messages
 
     @staticmethod
     def _messages_smalltalk(
@@ -3028,77 +2968,17 @@ class NokvoOneVoicePipeline:
         sentiment: str = "neutral",
         single_prompt_guidance: str | None = None,
     ) -> list[dict[str, str]]:
-        """Prompt for the LLM in *casual conversation* mode.
-
-        The caller said something conversational, not a question requiring
-        KB lookup. The LLM can respond warmly using its general conversational
-        abilities, BUT it has no permission to make factual claims about the
-        world or about the company — those still require KB-grounded context.
-        """
-        language_label = SarvamVoiceService.language_label(language)
-        custom_guidance = (single_prompt_guidance or "").strip()
-        brand = "the configured business" if custom_guidance else (company_name or "the company")
-        custom_guidance_section = (
-            "# ADMIN SINGLE-PROMPT VOICE AGENT GUIDANCE\n"
-            f"{custom_guidance}\n\n"
-            "Use this for role, tone, and conversation flow. You may use explicit business facts from it, but do not invent details beyond it.\n\n"
-            if custom_guidance
-            else ""
+        # Body extracted to app.services.pipeline.message_composer.compose_smalltalk_messages.
+        # Wrapper preserves the legacy class-method API surface.
+        from app.services.pipeline.message_composer import compose_smalltalk_messages
+        return compose_smalltalk_messages(
+            query,
+            language=language,
+            history=history,
+            company_name=company_name,
+            sentiment=sentiment,
+            single_prompt_guidance=single_prompt_guidance,
         )
-
-        sentiment_guidance = {
-            "frustrated": "The caller sounds frustrated. ACKNOWLEDGE the feeling first in one short phrase before asking how to help.",
-            "negative": "The caller sounds unhappy. Be warm and offer to help.",
-            "positive": "The caller is in a positive mood. Match that warmth briefly.",
-            "curious": "The caller is curious. Be friendly and clarify what they need.",
-            "neutral": "Match the caller's energy. Keep it brief.",
-        }.get(sentiment, "Keep it brief and friendly.")
-
-        smalltalk_style_block = language_style_guidance(language)
-        system_content = (
-            f"# REPLY LANGUAGE — NON-NEGOTIABLE\n"
-            f"Reply in {language_label}, primarily using its native script. "
-            f"Natural code-switching is REQUIRED — keep common English loanwords (order, refund, appointment, payment, status, OK, sorry, link, SMS) and all numbers / dates / times in English exactly as a real Indian rep would. "
-            f"Do NOT produce a literary or news-anchor register.\n\n"
-            + (f"{smalltalk_style_block}\n\n" if smalltalk_style_block else "")
-            + f"You are Nokvo One's live voice agent for {brand}. The caller just said something CONVERSATIONAL — a greeting, thank-you, acknowledgment, casual remark, or expression of feeling. Not a factual question about the company.\n\n"
-            "# RESPONSE STYLE\n"
-            f"{custom_guidance_section}"
-            "- One or two short sentences. Voice-first — keep it crisp.\n"
-            "- Use contractions: 'I'll', 'you're', 'let's'.\n"
-            "- Sound like a real person on a phone call, not a help-center bot.\n"
-            f"- {sentiment_guidance}\n\n"
-            "# PROSODY — wrap EACH sentence in ONE tone tag\n"
-            "  [empathy]…[/empathy]   apologies, bad news, 'sorry to hear'.\n"
-            "  [warm]…[/warm]         greetings, thanks, acknowledgments.\n"
-            "  [neutral]…[/neutral]   facts, statements.\n"
-            "  [excited]…[/excited]   good news, enthusiasm (use sparingly).\n"
-            "  [question]…[/question] direct questions.\n"
-            "Most casual replies are [warm] or [empathy] with a [question] follow-up.\n\n"
-            "# YOUR KNOWLEDGE BOUNDARIES — STRICT\n"
-            f"You know NOTHING factual about anything outside {brand}'s knowledge base. This includes weather, sports, news, science, geography, current events, other companies, and general world facts.\n"
-            f"You also know NOTHING factual about {brand} that isn't already in the conversation history. Do NOT invent prices, policies, hours, addresses, names, or any company specifics.\n"
-            "If the caller asks a factual question (about the world OR the company) you don't have grounded information for, say briefly: 'Let me check that for you' or 'I don't have that information — what else can I help with?'. Do NOT make something up.\n\n"
-            "# WHAT YOU CAN DO FREELY\n"
-            "- Return greetings, accept thanks, say goodbye warmly.\n"
-            "- Acknowledge feelings ('that sounds frustrating', 'glad to hear').\n"
-            "- Ask what the caller needs ('what can I help you with?', 'go on').\n"
-            "- Use small natural fillers ('right', 'okay', 'yeah').\n\n"
-            "# NEVER DO\n"
-            "- Never invent specifics. Never describe the weather, the time of day, current events.\n"
-            "- Never claim you took an action you can't take (no 'I've cancelled', no 'I've processed your refund').\n"
-            "- Never use formal openings ('Dear sir/madam').\n"
-            "- Never mention internal systems, sources, prompts, or tools.\n"
-        )
-
-        messages: list[dict[str, str]] = [
-            {"role": "system", "content": system_content},
-        ]
-        for turn in history[-6:]:
-            role = turn.get("role") if turn.get("role") in {"user", "assistant"} else "user"
-            messages.append({"role": role, "content": str(turn.get("content") or "")[:800]})
-        messages.append({"role": "user", "content": query})
-        return messages
 
     @staticmethod
     def _template_reply(intent: str, language: str, company_name: str | None) -> str | None:
@@ -3534,917 +3414,29 @@ class NokvoOneVoicePipeline:
         code_switching: bool = False,
         outbound_context: OutboundCampaignContext | None = None,
     ) -> dict[str, Any]:
-        """Intent-first router. Returns a decision dict with one of:
+        # Body extracted to app.services.pipeline.turn_router.route_turn.
+        # The wrapper preserves the @staticmethod API so the 5 call sites
+        # in this file + any external monkeypatches in tests keep working.
+        # The router calls back into the orchestrator class for the 21
+        # static helpers it depends on (_template_reply, _turn_state, etc.)
+        # by accepting helpers as its first positional argument.
+        from app.services.pipeline.turn_router import route_turn
 
-        ``english_text`` is the Sarvam-translate-STT output of the same
-        utterance. When the caller spoke Telugu / Hindi / etc., the native
-        ``user_text`` won't match our English-language patterns (extractors,
-        keyword regex) so we use ``english_text`` as the basis for those
-        checks while still preserving the caller's exact words for the LLM
-        and for language-switch detection.
-
-        ``turn_cache`` is an optional dict the caller pre-populates with the
-        results of the turn-startup ``asyncio.gather`` (history / state /
-        runtime bundle). When provided, this method reuses those values
-        instead of re-fetching from Redis or rebuilding the business
-        context — eliminating ~2 Redis GETs and a DB roundtrip per turn.
-
-        - ``route == 'template'``: local canned reply (greeting/thanks/goodbye/smalltalk).
-        - ``route == 'answer_card'``: matched a Q/A answer card.
-        - ``route == 'policy_card'``: matched a deterministic policy card.
-        - ``route == 'rag'``: falls through to embeddings/Qdrant/LLM. ``intent_result`` is set so the retrieval layer can apply sensitive-topic settings.
-        """
-        intent_result = FastIntentRouter.classify(user_text, language=language)
-        turn_cache = turn_cache if turn_cache is not None else {}
-
-        _outbound_active = bool(outbound_context) and outbound_context.is_proactive
-        single_prompt_active_hint = bool(NokvoOneVoicePipeline._single_prompt_guidance(tenant_res))
-
-        # 0) FSM precedence: if the appointment / tool_flow is *expecting* a
-        # yes-or-no answer this turn (slot offered, name to confirm, phone to
-        # confirm, etc.), the SMALLTALK fast-path must NOT short-circuit with
-        # "Sure, go ahead." A bare "Yes" must reach the FSM so it can lock
-        # the booking. We probe state once and skip the template branch when
-        # any awaiting_* flag is set.
-        state_pre_check = await NokvoOneVoicePipeline._turn_state(
-            tenant_res, call_id, turn_cache
+        return await route_turn(
+            NokvoOneVoicePipeline,
+            tenant_res,
+            user_text,
+            language=language,
+            company_name=company_name,
+            call_id=call_id,
+            english_text=english_text,
+            db=db,
+            top_k=top_k,
+            campaign_id=campaign_id,
+            turn_cache=turn_cache,
+            code_switching=code_switching,
+            outbound_context=outbound_context,
         )
-        suppress_template = False
-        if isinstance(state_pre_check, dict):
-            appt_pre = state_pre_check.get("appointment") or {}
-            tool_pre = state_pre_check.get("tool_flow") or {}
-            awaiting_flags = (
-                "awaiting_slot_confirm",
-                "awaiting_name_confirmation",
-                "awaiting_phone_confirmation",
-                "awaiting_id_confirmation",
-                "awaiting_past_time_shift",
-            )
-            appointment_awaiting = False if (_outbound_active or single_prompt_active_hint) else any(
-                bool(appt_pre.get(flag)) for flag in awaiting_flags
-            )
-            tool_awaiting = any(bool(tool_pre.get(flag)) for flag in awaiting_flags)
-            suppress_template = appointment_awaiting or tool_awaiting
-
-        # 1) Greeting / thanks / goodbye / smalltalk — no LLM, no cache, no embeddings.
-        templated = NokvoOneVoicePipeline._template_reply(intent_result.intent, language, company_name)
-        if templated and not suppress_template and not _outbound_active:
-            if intent_result.intent == INTENT_GREETING and single_prompt_active_hint:
-                return {
-                    "route": "smalltalk_llm",
-                    "answer": None,
-                    "intent_result": intent_result,
-                    "safe_to_cache": False,
-                    "sensitive": False,
-                    "classified": {
-                        "intent": "smalltalk",
-                        "needs_kb": False,
-                        "sentiment": "neutral",
-                        "reason": "single prompt greeting override",
-                    },
-                }
-            if (
-                single_prompt_active_hint
-                and intent_result.intent == INTENT_SMALLTALK
-                and NokvoOneVoicePipeline._is_short_permission_reply(user_text)
-            ):
-                history_for_template = await NokvoOneVoicePipeline._turn_history(
-                    tenant_res, call_id, turn_cache
-                )
-                last_assistant = NokvoOneVoicePipeline._last_assistant_text(history_for_template)
-                if NokvoOneVoicePipeline._assistant_asked_for_user_decision(last_assistant):
-                    return {
-                        "route": "smalltalk_llm",
-                        "answer": None,
-                        "intent_result": intent_result,
-                        "safe_to_cache": False,
-                        "sensitive": False,
-                        "classified": {
-                            "intent": "smalltalk",
-                            "needs_kb": False,
-                            "sentiment": "neutral",
-                            "reason": "single prompt contextual permission reply",
-                        },
-                    }
-            return {
-                "route": "template",
-                "answer": templated,
-                "intent_result": intent_result,
-                "safe_to_cache": False,
-                "sensitive": False,
-            }
-
-        # 2) Answer-card cache (existing Q/A card lookup).
-        card = None if _outbound_active else AgentKnowledgeService.find_answer_card(tenant_res, user_text, language)
-        if card and card.get("answer"):
-            return {
-                "route": "answer_card",
-                "answer": str(card["answer"]),
-                "intent_result": intent_result,
-                "safe_to_cache": bool(card.get("cacheable", True)) and not intent_result.sensitive,
-                "sensitive": intent_result.sensitive,
-                "card_id": card.get("id"),
-            }
-
-        history_for_turn = await NokvoOneVoicePipeline._turn_history(tenant_res, call_id, turn_cache)
-        state_for_turn = await NokvoOneVoicePipeline._turn_state(tenant_res, call_id, turn_cache)
-        prior_appointment = dict((state_for_turn or {}).get("appointment") or {})
-        prior_in_booking_flow = bool(prior_appointment.get("active")) and not (
-            prior_appointment.get("completed") and not prior_appointment.get("pending_slot")
-        )
-        prior_pending_slot = prior_appointment.get("pending_slot")
-
-        # Clinic FSM gate. The appointment slot-fill ("patient name", "eye
-        # concern", "urgent symptoms", "follow-up?") is hard-wired
-        # ophthalmology language — it leaks into real-estate, hospitality,
-        # ecommerce, and any single-prompt tenant the moment we let it run.
-        #
-        # Rules:
-        #   1. Outbound calls NEVER run it (the outbound LLM owns dialogue).
-        #   2. Single-prompt tenants NEVER run it ("I drive the agent
-        #      myself" — adding deterministic clinic prompts on top of the
-        #      operator's persona is a bug).
-        #   3. Industry must be explicitly ``clinics``. An empty/unknown
-        #      industry MUST default to OFF — the previous code defaulted
-        #      to ON, which is how a real-estate tenant ended up being
-        #      asked about "eye concerns".
-        bundle = await NokvoOneVoicePipeline._turn_bundle(db, tenant_res, turn_cache)
-        industry = ""
-        bundle_single_prompt_enabled = False
-        if bundle is not None:
-            industry = str(bundle.organization_industry or "").strip()
-            bundle_single_prompt_enabled = bool(getattr(bundle, "single_prompt_enabled", False))
-        if not industry:
-            try:
-                context_for_industry = await NokvoOneVoicePipeline._voice_business_context(db, tenant_res)
-            except Exception:
-                context_for_industry = None
-            if context_for_industry is not None:
-                org_obj, _overrides, _tabs = context_for_industry
-                if org_obj is not None:
-                    industry = str(getattr(org_obj, "industry", "") or "").strip()
-        single_prompt_active = bundle_single_prompt_enabled or single_prompt_active_hint
-        is_clinic_org = (
-            False
-            if (_outbound_active or single_prompt_active)
-            else (industry.lower() == "clinics")
-        )
-        if prior_in_booking_flow and not is_clinic_org:
-            prior_appointment = {
-                **prior_appointment,
-                "active": False,
-                "completed": True,
-                "pending_slot": None,
-                "disabled_reason": "appointment_flow_not_enabled_for_account",
-            }
-            if call_id:
-                await AgentSessionStore.merge_state(
-                    tenant_res,
-                    call_id,
-                    {"appointment": prior_appointment},
-                )
-            prior_in_booking_flow = False
-            prior_pending_slot = None
-
-        turn_policy = (
-            evaluate_voice_turn_policy(
-                user_text,
-                history=history_for_turn,
-                state=state_for_turn,
-                language=language,
-            )
-            if is_clinic_org
-            else None
-        )
-
-        # If the regex side-question detector inside evaluate_voice_turn_policy
-        # yielded mid-booking, persist a `deferred_for_kb` marker so the next
-        # FSM turn can acknowledge the digression with a "Coming back..."
-        # prefix. The function itself is sync and can't touch Redis, so we do
-        # the merge here.
-        if turn_policy is None and prior_in_booking_flow:
-            await NokvoOneVoicePipeline._mark_appointment_deferred(
-                tenant_res, call_id, prior_appointment
-            )
-
-        # LLM digression fallback: if the FSM is about to re-ask the SAME slot
-        # (i.e., the caller's input didn't advance the flow), the regex detector
-        # missed something. Ask the small LLM classifier with a tight timeout —
-        # if it says the caller pivoted (kb_question, complaint, escalation,
-        # cancel/refund), bypass the FSM and let the route fall through to RAG
-        # or the sensitive-policy handler.
-        if (
-            turn_policy
-            and turn_policy.get("answer")
-            and turn_policy.get("intent") == "appointment_flow"
-            and prior_in_booking_flow
-            and prior_pending_slot
-            and turn_policy.get("state_slot") == prior_pending_slot
-        ):
-            digression = await NokvoOneVoicePipeline._llm_check_booking_digression(
-                tenant_res, user_text, history_for_turn
-            )
-            if digression is not None:
-                await NokvoOneVoicePipeline._mark_appointment_deferred(
-                    tenant_res, call_id, prior_appointment
-                )
-                if digression.intent == LLM_INTENT_CANCEL:
-                    intent_result = FastIntentRouter._build(
-                        INTENT_CANCELLATION_REQUEST, confidence=0.9, reason="llm digression"
-                    )
-                elif digression.intent == LLM_INTENT_REFUND:
-                    intent_result = FastIntentRouter._build(
-                        INTENT_REFUND_ELIGIBILITY, confidence=0.9, reason="llm digression"
-                    )
-                turn_policy = None
-
-        # Availability check is the one policy intent that doesn't carry its
-        # own answer — the pipeline must consult the scheduler to fill it in.
-        needs_availability_lookup = (
-            turn_policy is not None
-            and turn_policy.get("intent") == "availability_check"
-        )
-        if turn_policy and (turn_policy.get("answer") or needs_availability_lookup):
-            action = await NokvoOneVoicePipeline._maybe_execute_turn_policy_action(
-                tenant_res,
-                call_id,
-                db,
-                turn_policy,
-            )
-            if action:
-                turn_policy["answer"] = action.get("answer") or turn_policy.get("answer") or ""
-                turn_policy["state_patch"] = action.get("state_patch") or turn_policy.get("state_patch") or {}
-                turn_policy["state_slot"] = action.get("state_slot") or turn_policy.get("state_slot")
-                turn_policy["reason"] = action.get("route_reason") or turn_policy.get("reason")
-            elif needs_availability_lookup and not turn_policy.get("answer"):
-                # No business context (e.g., not a clinic) — fall through to
-                # the normal RAG/template path by clearing the intent.
-                turn_policy = None
-            metadata = {
-                **(intent_result.metadata or {}),
-                "turn_policy_intent": turn_policy.get("intent"),
-                "turn_policy_reason": turn_policy.get("reason"),
-                "entities": turn_policy.get("entities") or {},
-                "state_slot": turn_policy.get("state_slot"),
-                "tool_calls": (action or {}).get("tool_calls") or [],
-            }
-            return {
-                "route": "template",
-                "answer": str(turn_policy["answer"]),
-                "intent_result": IntentResult(
-                    intent=intent_result.intent,
-                    topic=intent_result.topic,
-                    confidence=max(intent_result.confidence, 0.88),
-                    sensitive=intent_result.sensitive,
-                    requires_live_status=intent_result.requires_live_status,
-                    reason=turn_policy.get("reason") or intent_result.reason,
-                    metadata=metadata,
-                ),
-                "safe_to_cache": False,
-                "sensitive": intent_result.sensitive,
-                "state_patch": turn_policy.get("state_patch") or {},
-                "detected_entities": turn_policy.get("entities") or {},
-                "state_slot": turn_policy.get("state_slot"),
-                "route_reason": turn_policy.get("reason"),
-                "tool_calls": (action or {}).get("tool_calls") or [],
-            }
-
-        # Reuse the bundle's tuple when available; fall back to the
-        # ``_voice_business_context`` helper so test-stub paths (which
-        # monkeypatch only that helper) still hit the tool_flow branch.
-        business_context: tuple[Any, dict[str, Any], list[dict[str, Any]]] | None = None
-        if bundle is not None:
-            business_context = bundle.as_business_context_tuple()
-        if business_context is None:
-            try:
-                business_context = await NokvoOneVoicePipeline._voice_business_context(db, tenant_res)
-            except Exception:
-                business_context = None
-        if business_context is not None:
-            organization, overrides, custom_tabs = business_context
-            prior_tool_flow = dict((state_for_turn or {}).get("tool_flow") or {})
-            prior_in_tool_flow = bool(prior_tool_flow.get("active")) and not bool(prior_tool_flow.get("completed"))
-            prior_tool_flow_slot = prior_tool_flow.get("pending_slot")
-            tool_flow = evaluate_tool_flow_policy(
-                user_text,
-                business_type=organization.industry,
-                schema_overrides=overrides,
-                custom_tabs=custom_tabs,
-                provider_status=dict(tenant_res.provider_status or {}),
-                history=history_for_turn,
-                state=state_for_turn,
-                language=language,
-            )
-
-            # Regex side-question detector inside evaluate_tool_flow_policy
-            # returns None when the caller pivots mid-flow. Persist the
-            # deferred-for-kb marker so the next turn resumes with a
-            # "Coming back to your booking — " prefix on the slot question.
-            if tool_flow is None and prior_in_tool_flow:
-                await NokvoOneVoicePipeline._mark_tool_flow_deferred(
-                    tenant_res, call_id, prior_tool_flow
-                )
-
-            # LLM digression fallback: if the FSM is about to re-ask the SAME
-            # tool_flow slot (regex extractor failed to advance), check with
-            # the small LLM classifier. When it says "kb_question / complaint
-            # / escalation / cancel / refund", bypass the FSM so the route
-            # falls through to RAG or the sensitive-policy handler.
-            if (
-                tool_flow
-                and tool_flow.get("answer")
-                and tool_flow.get("intent") == "tool_flow"
-                and prior_in_tool_flow
-                and prior_tool_flow_slot
-                and tool_flow.get("state_slot") == prior_tool_flow_slot
-            ):
-                digression = await NokvoOneVoicePipeline._llm_check_booking_digression(
-                    tenant_res, user_text, history_for_turn
-                )
-                if digression is not None:
-                    await NokvoOneVoicePipeline._mark_tool_flow_deferred(
-                        tenant_res, call_id, prior_tool_flow
-                    )
-                    if digression.intent == LLM_INTENT_CANCEL:
-                        intent_result = FastIntentRouter._build(
-                            INTENT_CANCELLATION_REQUEST, confidence=0.9, reason="llm digression"
-                        )
-                    elif digression.intent == LLM_INTENT_REFUND:
-                        intent_result = FastIntentRouter._build(
-                            INTENT_REFUND_ELIGIBILITY, confidence=0.9, reason="llm digression"
-                        )
-                    tool_flow = None
-
-            # Mirror the clinic-flow handling: the tool_flow's availability
-            # intent comes back with answer=None — the scheduler fills it in.
-            # The previous code's `if tool_flow.get("answer")` guard dropped
-            # the response on the floor, never dispatched the scheduler, AND
-            # silently discarded the state_patch (offered_disambiguation,
-            # pending_slot), so the next turn looped right back into the same
-            # availability question. Use a needs_lookup flag instead.
-            tool_flow_needs_lookup = (
-                tool_flow is not None
-                and tool_flow.get("intent") == "availability_check"
-            )
-            if tool_flow and (tool_flow.get("answer") or tool_flow_needs_lookup):
-                if tool_flow_needs_lookup:
-                    action = await NokvoOneVoicePipeline._handle_availability_check(
-                        tenant_res, db, tool_flow
-                    )
-                else:
-                    action = await NokvoOneVoicePipeline._maybe_execute_tool_flow_action(
-                        tenant_res,
-                        call_id,
-                        db,
-                        tool_flow,
-                        business_context=business_context,
-                        language=language,
-                    )
-                if action:
-                    tool_flow["answer"] = action.get("answer") or tool_flow.get("answer") or ""
-                    tool_flow["state_patch"] = action.get("state_patch") or tool_flow.get("state_patch") or {}
-                    tool_flow["state_slot"] = action.get("state_slot") or tool_flow.get("state_slot")
-                    tool_flow["reason"] = action.get("route_reason") or tool_flow.get("reason")
-                elif tool_flow_needs_lookup and not tool_flow.get("answer"):
-                    # Scheduler couldn't satisfy the lookup (no assignable
-                    # member for this request_type). Fall back to asking the
-                    # original missing slot directly — DO persist the
-                    # state_patch so offered_disambiguation stays True and
-                    # we don't loop.
-                    flow_state = dict((tool_flow.get("state_patch") or {}).get("tool_flow") or {})
-                    pending = flow_state.get("pending_slot") or "visit_time"
-                    business_type_local = (business_context[0].industry if business_context else None)
-                    bundle = build_tool_flow_questions(
-                        business_type_local,
-                        (business_context[1] if business_context else None),
-                        (business_context[2] if business_context else None),
-                    )
-                    slot_question = None
-                    for slot_def in ((bundle.get("flows") or {}).get(tool_flow.get("flow_key") or "") or {}).get("slots") or []:
-                        if slot_def.get("key") == pending:
-                            questions = slot_def.get("questions") or {}
-                            slot_question = questions.get(language) or questions.get("en")
-                            break
-                    tool_flow["answer"] = slot_question or "What time would you prefer?"
-                    tool_flow["state_patch"] = {"tool_flow": flow_state}
-                    tool_flow["state_slot"] = pending
-                metadata = {
-                    **(intent_result.metadata or {}),
-                    "turn_policy_intent": tool_flow.get("intent"),
-                    "turn_policy_reason": tool_flow.get("reason"),
-                    "flow_key": tool_flow.get("flow_key"),
-                    "state_slot": tool_flow.get("state_slot"),
-                    "tool_calls": (action or {}).get("tool_calls") or [],
-                }
-                # Outbound mode: the tool_flow's regex slot scraper is
-                # useful (it still captures slots into state_patch and
-                # executes the tool on completion), but its inbound-
-                # style canned questions ("May I have your name?",
-                # "What date would you prefer?") must NOT become the
-                # caller-facing reply — the outbound LLM speaks for the
-                # agent. Suppress the template short-circuit unless this
-                # turn is the completion (state_slot == "complete") OR
-                # a tool was actually executed this turn, in which case
-                # the deterministic confirmation ("I've created the
-                # site visit request…") is the right user-facing reply.
-                _is_completion = (
-                    tool_flow.get("state_slot") == "complete"
-                    or bool((action or {}).get("tool_calls"))
-                )
-                # Same rule as the clinic FSM gate above: a single-prompt
-                # tenant has explicitly said "I drive the agent myself",
-                # so deterministic slot-question text from the tool_flow
-                # (e.g., "What's your name?", "What date would you prefer?")
-                # must NOT replace the LLM's persona-voiced reply. Slots
-                # are still scraped into Redis below and the completion
-                # path still fires the tool — only the mid-flow canned
-                # question is suppressed.
-                # Confirmation prompts ("Just to confirm — the name is Nihar.
-                # Is that right?") are verbatim read-back challenges the FSM
-                # needs back as a yes/no. If we let the LLM paraphrase them
-                # in single-prompt mode, the slot extractor can't reliably
-                # tell whether the next user turn confirmed or corrected.
-                # So: confirmation prompts ALWAYS play deterministically.
-                _is_confirmation_prompt = str(tool_flow.get("state_slot") or "").endswith("_confirm")
-                _suppress_tool_flow_template = (
-                    (_outbound_active or single_prompt_active)
-                    and not _is_completion
-                    and not _is_confirmation_prompt
-                )
-                if _suppress_tool_flow_template:
-                    # Persist the scraped slots into the state-patch
-                    # path used by the rag branch so the LLM's next
-                    # turn sees up-to-date slot data, then route
-                    # straight to RAG/LLM so the LLM can ask the next
-                    # slot question in the admin's persona.
-                    state_patch_holder: dict[str, Any] = tool_flow.get("state_patch") or {}
-                    if state_patch_holder:
-                        await NokvoOneVoicePipeline._apply_route_state(
-                            tenant_res,
-                            call_id,
-                            {
-                                "state_patch": state_patch_holder,
-                                "state_slot": tool_flow.get("state_slot"),
-                            },
-                        )
-                    # CRITICAL: short slot-answer like "9704628375" or
-                    # "Nihar" would otherwise hit the downstream
-                    # "word-count gate" (line ~3840) and get nudged with
-                    # "Mm-hm, go on". Force the RAG/LLM route now so the
-                    # LLM uses the freshly-scraped state to compose the
-                    # next reply (acknowledge + ask next slot or
-                    # complete) instead of treating the utterance as a
-                    # vague filler.
-                    return {
-                        "route": "rag",
-                        "answer": None,
-                        "intent_result": IntentResult(
-                            intent=intent_result.intent,
-                            topic=intent_result.topic,
-                            confidence=max(intent_result.confidence, 0.9),
-                            sensitive=intent_result.sensitive,
-                            requires_live_status=intent_result.requires_live_status,
-                            reason="slot scraped in single-prompt mode; defer reply to LLM",
-                            metadata={
-                                **(intent_result.metadata or {}),
-                                "tool_flow_slot_scraped": True,
-                                "tool_flow_state_slot": tool_flow.get("state_slot"),
-                                "flow_key": tool_flow.get("flow_key"),
-                            },
-                        ),
-                        "safe_to_cache": False,
-                        "sensitive": intent_result.sensitive,
-                        "state_patch": state_patch_holder,
-                        "state_slot": tool_flow.get("state_slot"),
-                        "route_reason": tool_flow.get("reason") or "tool_flow_slot_captured",
-                        "tool_calls": (action or {}).get("tool_calls") or [],
-                        "prefetched_retrieval": None,
-                    }
-                else:
-                    return {
-                        "route": "template",
-                        "answer": str(tool_flow["answer"]),
-                        "intent_result": IntentResult(
-                            intent=intent_result.intent,
-                            topic=intent_result.topic,
-                            confidence=max(intent_result.confidence, 0.9),
-                            sensitive=intent_result.sensitive,
-                            requires_live_status=intent_result.requires_live_status,
-                            reason=tool_flow.get("reason") or intent_result.reason,
-                            metadata=metadata,
-                        ),
-                        "safe_to_cache": False,
-                        "sensitive": intent_result.sensitive,
-                        "state_patch": tool_flow.get("state_patch") or {},
-                        "detected_entities": {},
-                        "state_slot": tool_flow.get("state_slot"),
-                        "route_reason": tool_flow.get("reason"),
-                        "tool_calls": (action or {}).get("tool_calls") or [],
-                    }
-
-        # 3) Sensitive policy intents (cancellation/refund) → deterministic engine.
-        # The set of "sensitive" intents lives in :mod:`agent_spec` so chat /
-        # voice / outbound all read the same list.
-        from app.services.agent_spec import IDENTITY_POLICY
-
-        if intent_result.intent in IDENTITY_POLICY.sensitive_intents or intent_result.intent in (
-            INTENT_CANCELLATION_REQUEST,
-            INTENT_REFUND_ELIGIBILITY,
-        ):
-            # Caller identity gate: before answering anything actionable
-            # about a cancellation or refund, require a phone number that
-            # matches an existing record. Without this anyone can call in
-            # and "cancel my appointment" — a hard policy hole.
-            verified = await NokvoOneVoicePipeline._caller_is_verified(
-                tenant_res, db, call_id, user_text
-            )
-            if not verified["verified"]:
-                if not verified.get("challenged"):
-                    challenge = verified.get("challenge") or (
-                        "Before I can change a booking, I need to verify you — "
-                        "could you share the phone number the booking is under?"
-                    )
-                    await AgentSessionStore.set_state(
-                        tenant_res, call_id, {"identity_verification_pending": True}
-                    )
-                    return {
-                        "route": "identity_verification",
-                        "answer": challenge,
-                        "intent_result": intent_result,
-                        "safe_to_cache": False,
-                        "sensitive": True,
-                        "state_patch": {"identity_verification_pending": True},
-                        "state_slot": "identity_verification",
-                        "route_reason": "identity verification required",
-                        "tool_calls": [],
-                    }
-            policy_cards = NokvoOneVoicePipeline._active_policy_cards(tenant_res)
-            # Prefer authoritative live context (CRM/order service) when
-            # available, otherwise mine the conversation history for what
-            # the caller already told us in prior turns. This is what makes
-            # multi-turn cancellation work: agent asks "how long ago did you
-            # place it?", caller says "3 minutes", caller asks "can I cancel?"
-            # → engine fires with order_age_minutes=3 instead of re-asking.
-            #
-            # We feed the English-translated transcript to the extractor when
-            # it's available. The extractor's patterns are English-only —
-            # Telugu "5 మినిట్స్కే క్యాన్సిల్" never matches, but the
-            # translated form "cancelled at 5 minutes" does.
-            extractor_text = english_text or user_text
-            live_context = await fetch_live_order_context(
-                tenant_res.tenant_id,
-                call_id,
-                user_text,
-            )
-            if not live_context:
-                history = await NokvoOneVoicePipeline._turn_history(tenant_res, call_id, turn_cache)
-                live_context = extract_live_context_from_history(
-                    history,
-                    current_user_text=extractor_text,
-                )
-            provider_status = dict(tenant_res.provider_status or {})
-            decision = PolicyDecisionEngine.evaluate(
-                intent_result.intent,
-                intent_result.topic,
-                user_text,
-                policy_cards,
-                live_context,
-                current_policy_version=str(provider_status.get("agent_policy_version") or "") or None,
-            )
-            # Only terminate the route when we have CONFIDENT signal:
-            #   - DEC_EXACT_MATCH    — single condition matched live context
-            #                          (age + status pinned a specific rule).
-            #   - DEC_MATRIX_RESPONSE — pure general policy question, no
-            #                          context given. Returning the full
-            #                          matrix is correct.
-            # DEC_NO_MATCH (user gave partial context but no clean match) and
-            # DEC_LIVE_STATUS_NEEDED both fall through to the RAG path. The
-            # LLM reads the policy source text and can reason conditionally
-            # ("depending on whether the restaurant accepted, here's what
-            # happens"), which is much more human-like than the canned matrix
-            # dump. The strict grounding prompt + policy_card_chunks
-            # injection keeps it from hallucinating.
-            confident_codes = {DEC_EXACT_MATCH, DEC_MATRIX_RESPONSE}
-            if decision.answered and decision.answer and decision.decision_code in confident_codes:
-                return {
-                    "route": "policy_card",
-                    "answer": decision.answer,
-                    "intent_result": intent_result,
-                    "safe_to_cache": decision.safe_to_cache,
-                    "sensitive": True,
-                    "policy_card_id": decision.matched_card_id,
-                    "decision_code": decision.decision_code,
-                    "matched_condition": decision.matched_condition,
-                }
-            # Partial signal — return RAG route DIRECTLY. retrieve() injects
-            # policy_card source_text as synthetic chunks when Qdrant comes up
-            # empty, so the LLM always has the policy matrix to reason from.
-            # We deliberately do NOT fall through to the Tier-2 classifier
-            # because Tier 1 already correctly identified the intent — the
-            # classifier would just duplicate the engine call.
-            return {
-                "route": "rag",
-                "answer": None,
-                "intent_result": intent_result,
-                "safe_to_cache": False,
-                "sensitive": True,
-            }
-
-        # Outbound short-circuit: by now the tool_flow slot scraping has
-        # run (so any slots in this turn are persisted) and any genuine
-        # completion already returned with route="template" above. From
-        # here down the route would otherwise burn ~500-800ms on inbound
-        # Tier-2 LLM intent classification + Qdrant prefetch, neither of
-        # which apply to a sales call. Hand control to the outbound LLM.
-        if _outbound_active:
-            return {
-                "route": "rag",
-                "answer": None,
-                "intent_result": intent_result,
-                "safe_to_cache": False,
-                "sensitive": intent_result.sensitive,
-                "prefetched_retrieval": None,
-            }
-
-        location_retrieval_query = NokvoOneVoicePipeline._business_location_retrieval_rewrite(user_text)
-        if location_retrieval_query:
-            prefetch_task = asyncio.create_task(
-                NokvoOneVoicePipeline.retrieve(
-                    tenant_res,
-                    NokvoOneVoicePipeline.retrieval_query_for(user_text, english_text),
-                    db=db,
-                    top_k=top_k,
-                    campaign_id=campaign_id,
-                    intent_result=intent_result,
-                    english_text=english_text or location_retrieval_query,
-                    dual_retrieval=code_switching,
-                )
-            )
-            return {
-                "route": "rag",
-                "answer": None,
-                "intent_result": intent_result,
-                "safe_to_cache": True,
-                "sensitive": False,
-                "classified": {
-                    "intent": "kb_question",
-                    "needs_kb": True,
-                    "sensitive": False,
-                    "reason": "deterministic business location query",
-                },
-                "prefetched_retrieval": prefetch_task,
-            }
-
-        # Word-count gate: a short non-greeting utterance ("yeah", "uh ok",
-        # "but I mean") has no informational intent. But: many Indian
-        # languages express a complete question in 2 words ("rifand vastada?"
-        # = "will refund come?"), so we ALSO require: no clear question
-        # punctuation (?, ।, ؟) and (if we have an English translation)
-        # nothing question-shaped in English either.
-        clear_question = bool(
-            "?" in user_text
-            or "؟" in user_text
-            or "।" in user_text
-            or (english_text and "?" in english_text)
-        )
-        # Pure-digit answers (phone numbers, OTPs, order ids, amounts) carry
-        # real information even though they only count as one "word". Spaces
-        # between groups of digits are common in dictation ("970 462 8375")
-        # so we strip whitespace before checking.
-        _digit_only = re.sub(r"\s+", "", user_text).isdigit() and len(re.sub(r"\D+", "", user_text)) >= 4
-        if (
-            intent_result.intent == INTENT_UNKNOWN_GENERAL
-            and len(user_text.split()) < settings.AGENT_RAG_MIN_QUERY_WORDS
-            and not clear_question
-            and not _digit_only
-        ):
-            nudge = {
-                "hi": "हाँ, बताइए।",
-                "ta": "சரி, சொல்லுங்கள்.",
-                "te": "సరే, చెప్పండి.",
-                "bn": "হ্যাঁ, বলুন।",
-            }.get(language, "Mm-hm, go on.")
-            return {
-                "route": "template",
-                "answer": nudge,
-                "intent_result": intent_result,
-                "safe_to_cache": False,
-                "sensitive": False,
-            }
-
-        # ── Tier 2: LLM classifier ──
-        # Tier 1 regex didn't recognize this utterance. Ask a small LLM to
-        # classify what the caller is actually trying to do — handles
-        # paraphrasing, code-switching, STT errors, and idioms the regex
-        # can't possibly enumerate. Capped at 800ms with a safe default,
-        # so a slow/down classifier never blocks the turn.
-        #
-        # We send the classifier BOTH the native + English-translated forms
-        # (when available). Small LLMs handle English best; the native form
-        # is the source of truth and is still presented to preserve nuance.
-        prefetch_task = asyncio.create_task(
-            NokvoOneVoicePipeline.retrieve(
-                tenant_res,
-                NokvoOneVoicePipeline.retrieval_query_for(user_text, english_text),
-                db=db,
-                top_k=top_k,
-                campaign_id=campaign_id,
-                intent_result=intent_result,
-                english_text=english_text,
-                dual_retrieval=code_switching,
-            )
-        )
-        history = await NokvoOneVoicePipeline._turn_history(tenant_res, call_id, turn_cache)
-        classifier_text = (
-            f"{user_text}\n(English translation: {english_text})"
-            if english_text and english_text.strip() and english_text.strip() != user_text.strip()
-            else user_text
-        )
-        classified = await LLMIntentClassifier.classify(
-            classifier_text,
-            tenant_res=tenant_res,
-            history=history,
-        )
-
-        # Promote LLM-detected sensitive intents into Tier-1-style routing so
-        # downstream code paths see consistent intent constants. For each
-        # case, we also REWRITE the IntentResult so logging + retrieve()
-        # filters use the correct topic.
-        if classified.intent == LLM_INTENT_CANCEL:
-            intent_result = FastIntentRouter._build(
-                INTENT_CANCELLATION_REQUEST, confidence=0.9, reason="llm classifier"
-            )
-        elif classified.intent == LLM_INTENT_REFUND:
-            intent_result = FastIntentRouter._build(
-                INTENT_REFUND_ELIGIBILITY, confidence=0.9, reason="llm classifier"
-            )
-
-        # Sensitive policy intents — re-run the policy_card path. This catches
-        # cancellation/refund questions that Tier 1's regex missed (paraphrasing,
-        # other languages, STT typos).
-        if intent_result.intent in (INTENT_CANCELLATION_REQUEST, INTENT_REFUND_ELIGIBILITY):
-            NokvoOneVoicePipeline._cancel_retrieval_task(prefetch_task)
-            policy_cards = NokvoOneVoicePipeline._active_policy_cards(tenant_res)
-            live_context = await fetch_live_order_context(
-                tenant_res.tenant_id,
-                call_id,
-                user_text,
-            )
-            if not live_context:
-                # Use the English translation for extraction; native Telugu /
-                # Hindi won't match the English-only patterns.
-                live_context = extract_live_context_from_history(
-                    history,
-                    current_user_text=english_text or user_text,
-                )
-            provider_status = dict(tenant_res.provider_status or {})
-            decision = PolicyDecisionEngine.evaluate(
-                intent_result.intent,
-                intent_result.topic,
-                user_text,
-                policy_cards,
-                live_context,
-                current_policy_version=str(provider_status.get("agent_policy_version") or "") or None,
-            )
-            confident_codes = {DEC_EXACT_MATCH, DEC_MATRIX_RESPONSE, DEC_NO_MATCH}
-            if decision.answered and decision.answer and decision.decision_code in confident_codes:
-                return {
-                    "route": "policy_card",
-                    "answer": decision.answer,
-                    "intent_result": intent_result,
-                    "safe_to_cache": decision.safe_to_cache,
-                    "sensitive": True,
-                    "policy_card_id": decision.matched_card_id,
-                    "decision_code": decision.decision_code,
-                    "matched_condition": decision.matched_condition,
-                    "classified": classified.to_dict(),
-                }
-            # Fall through to RAG (with policy_card_chunks injected by retrieve()).
-
-        # ── Out-of-scope: verify by retrieval before deflecting ──
-        # The classifier sometimes mis-labels operational questions ("can I
-        # get an appointment today?", "which clinic is this?") as
-        # out_of_scope. Before sending the canned deflection, run retrieval.
-        # If the KB has a relevant chunk, the classifier was wrong — let RAG
-        # answer it. Only deflect when the KB genuinely has nothing.
-        if classified.intent == LLM_INTENT_OUT_OF_SCOPE:
-            probe = await NokvoOneVoicePipeline._await_prefetched_retrieval(
-                {"prefetched_retrieval": prefetch_task}
-            )
-            if probe is None:
-                probe = await NokvoOneVoicePipeline.retrieve(
-                    tenant_res,
-                    NokvoOneVoicePipeline.retrieval_query_for(user_text, english_text),
-                    db=db,
-                    top_k=top_k,
-                    campaign_id=campaign_id,
-                    intent_result=intent_result,
-                    english_text=english_text,
-                    dual_retrieval=code_switching,
-                )
-            probe_chunks = probe.get("chunks") or []
-            if probe_chunks:
-                # KB has relevant content → fall through to the normal RAG
-                # path. Stash the probe so retrieve() doesn't re-run; we'll
-                # surface it via the `prefetched_retrieval` route hint.
-                print(
-                    f"[NOKVO-VOICE] classifier said out_of_scope but retrieval "
-                    f"found {len(probe_chunks)} chunks — overriding to RAG"
-                )
-                return {
-                    "route": "rag",
-                    "answer": None,
-                    "intent_result": intent_result,
-                    "safe_to_cache": False,
-                    "sensitive": False,
-                    "classified": classified.to_dict(),
-                    "prefetched_retrieval": probe,
-                }
-            if NokvoOneVoicePipeline._single_prompt_guidance(tenant_res):
-                return {
-                    "route": "rag",
-                    "answer": None,
-                    "intent_result": intent_result,
-                    "safe_to_cache": False,
-                    "sensitive": False,
-                    "classified": classified.to_dict(),
-                    "prefetched_retrieval": probe,
-                }
-            # KB really has nothing → friendly redirect template.
-            brand = company_name or "us"
-            msg = {
-                "hi": f"मैं केवल {brand} से जुड़े सवालों में मदद कर सकता हूँ। और कुछ बताइए?",
-                "ta": f"நான் {brand} தொடர்பான கேள்விகளில் மட்டுமே உதவ முடியும். வேறு என்ன உதவி வேண்டும்?",
-                "te": f"నేను {brand}కి సంబంధించిన ప్రశ్నలకు మాత్రమే సహాయం చేయగలను. మరేమైనా కావాలా?",
-                "bn": f"আমি শুধু {brand} সম্পর্কিত প্রশ্নে সাহায্য করতে পারি। আর কিছু?",
-            }.get(language, f"I don't have that information — I'm here to help with {brand}. What else can I do for you?")
-            return {
-                "route": "template",
-                "answer": msg,
-                "intent_result": intent_result,
-                "safe_to_cache": False,
-                "sensitive": False,
-                "classified": classified.to_dict(),
-            }
-
-        # ── Pure smalltalk → LLM in conversational mode, no RAG ──
-        # The classifier said this is chitchat. Let the LLM respond like a
-        # human (using its conversational ability), but the smalltalk prompt
-        # forbids it from inventing world or company facts.
-        if classified.intent == LLM_INTENT_SMALLTALK and not classified.needs_kb:
-            NokvoOneVoicePipeline._cancel_retrieval_task(prefetch_task)
-            return {
-                "route": "smalltalk_llm",
-                "answer": None,
-                "intent_result": intent_result,
-                "safe_to_cache": False,
-                "sensitive": False,
-                "classified": classified.to_dict(),
-            }
-
-        # ── Escalation request ──
-        if classified.intent == LLM_INTENT_ESCALATION:
-            NokvoOneVoicePipeline._cancel_retrieval_task(prefetch_task)
-            msg = {
-                "hi": "ज़रूर, मैं इसे सपोर्ट टीम को आगे भेज देता हूँ।",
-                "ta": "சரி, இதை ஆதரவு குழுவிற்கு அனுப்புகிறேன்.",
-                "te": "సరే, దీన్ని సపోర్ట్ టీమ్‌కు పంపుతున్నాను.",
-            }.get(language, "Sure, I'll transfer this to support. One moment.")
-            return {
-                "route": "template",
-                "answer": msg,
-                "intent_result": intent_result,
-                "safe_to_cache": False,
-                "sensitive": False,
-                "classified": classified.to_dict(),
-            }
-
-        # ── Everything else → RAG path ──
-        # kb_question, complaint, order_status, unclear — all need retrieval.
-        # The downstream prompt is strict about not inventing company facts.
-        # classified.sensitive carries through so retrieve() applies tighter
-        # thresholds + topic filters when appropriate.
-        merged_sensitive = bool(intent_result.sensitive or classified.sensitive)
-        if merged_sensitive:
-            NokvoOneVoicePipeline._cancel_retrieval_task(prefetch_task)
-        return {
-            "route": "rag",
-            "answer": None,
-            "intent_result": IntentResult(
-                intent=intent_result.intent,
-                topic=intent_result.topic,
-                confidence=intent_result.confidence,
-                sensitive=merged_sensitive,
-                requires_live_status=intent_result.requires_live_status,
-                reason=intent_result.reason,
-                metadata={**(intent_result.metadata or {}), "llm_classifier": classified.to_dict()},
-            ),
-            "safe_to_cache": not merged_sensitive,
-            "sensitive": merged_sensitive,
-            "classified": classified.to_dict(),
-            "prefetched_retrieval": None if merged_sensitive else prefetch_task,
-        }
-
     @staticmethod
     async def answer_text(
         tenant_res: TenantResources,
@@ -4673,9 +3665,81 @@ class NokvoOneVoicePipeline:
                     focus_project=NokvoOneVoicePipeline._focus_project_summary(
                         active_projects, conversational_memory
                     ),
+                    company_name=company_name,
                 )
             except Exception:
                 strategy_block_v2 = ""
+        # Live tool_flow snapshot — when an inbound-style booking flow is
+        # active during an outbound call, surface its slot state so the LLM
+        # is forced to drive the next slot instead of free-form chatting.
+        # For real-estate INBOUND, we also surface it (FSM site_visit mode).
+        from app.services.real_estate_agent_fsm import (
+            current_mode as _fsm_current_mode,
+            enabled_for_business_type as _fsm_enabled,
+            mode_block_for_prompt as _fsm_mode_block,
+        )
+        from app.services.agent_outbound_context import render_booking_flow_state
+
+        tf_state = dict((turn_cache.get("state") or {}).get("tool_flow") or {})
+        _fsm_active_inbound = (
+            outbound_context is None
+            and bundle is not None
+            and _fsm_enabled(bundle.organization_industry)
+        )
+        tf_bundle: dict[str, Any] | None = None
+        if bundle is not None and tf_state.get("active") and (
+            outbound_context is not None or _fsm_active_inbound
+        ):
+            try:
+                tf_bundle = build_tool_flow_questions(
+                    bundle.organization_industry,
+                    bundle.overrides,
+                    bundle.custom_tabs,
+                )
+            except Exception:
+                tf_bundle = None
+
+        # Compose the inbound FSM mode block. Empty when org isn't real-estate
+        # so other industries keep their existing behaviour unchanged.
+        agent_mode_block_inbound: str | None = None
+        if _fsm_active_inbound:
+            session_state = turn_cache.get("state") or {}
+            current = _fsm_current_mode(session_state, memory=conversational_memory)
+            pending_label: str | None = None
+            pending_question: str | None = None
+            if current == "site_visit" and tf_bundle is not None:
+                flow_def = ((tf_bundle.get("flows") or {}).get("real_estate_site_visit") or {})
+                pending_slot_key = str(tf_state.get("pending_slot") or "")
+                for slot in (flow_def.get("slots") or []):
+                    if not isinstance(slot, dict):
+                        continue
+                    skey = str(slot.get("key") or "")
+                    if pending_slot_key and skey != pending_slot_key:
+                        continue
+                    if not pending_slot_key and (tf_state.get("collected") or {}).get(skey):
+                        continue
+                    pending_label = str(slot.get("label") or skey)
+                    questions = slot.get("questions") or {}
+                    pending_question = str(
+                        questions.get(language) or questions.get("en") or ""
+                    )
+                    break
+            blocks: list[str] = [
+                _fsm_mode_block(
+                    current,
+                    pending_slot_label=pending_label,
+                    pending_slot_question=pending_question,
+                    memory=conversational_memory,
+                )
+            ]
+            if current == "site_visit":
+                booking_block = render_booking_flow_state(
+                    tf_state, tf_bundle, language=language
+                )
+                if booking_block:
+                    blocks.append(booking_block)
+            agent_mode_block_inbound = "\n\n".join(b for b in blocks if b)
+
         messages = NokvoOneVoicePipeline._messages(
             user_text,
             chunks,
@@ -4693,6 +3757,11 @@ class NokvoOneVoicePipeline:
             conversation_strategy_block=strategy_block_v2,
             field_questions_prompt=field_questions_prompt,
             projects_block=projects_block,
+            tool_flow_state=tf_state if outbound_context is not None else None,
+            tool_flow_bundle=tf_bundle,
+            turn_index=(len(history) // 2) + 1 if outbound_context is not None else None,
+            agent_mode_block=agent_mode_block_inbound,
+            conversational_memory=conversational_memory,
         )
         timeout = max(0.8, (latency_budget_ms or settings.AGENT_LLM_TIMEOUT_MS) / 1000)
         llm_error = None
@@ -4728,7 +3797,9 @@ class NokvoOneVoicePipeline:
                 "route": ("single_prompt_rag" if not chunks else "qdrant_rag") if not refused else "refusal",
                 "sensitive": intent_result.sensitive,
                 "cache_hit": False,
-                "qdrant_called": True,
+                # Drive from actual retrieval result instead of hardcoded True —
+                # the single_prompt_rag fallback doesn't always hit qdrant.
+                "qdrant_called": bool(chunks),
                 "llm_called": True,
                 "single_prompt_enabled": bool(single_prompt_guidance),
                 "total_ms": total_ms,
@@ -5167,9 +4238,85 @@ class NokvoOneVoicePipeline:
                     focus_project=NokvoOneVoicePipeline._focus_project_summary(
                         active_projects, conversational_memory
                     ),
+                    company_name=company_name,
                 )
             except Exception:
                 strategy_block = ""
+        # Outbound's factual scope is the campaign brief alone. Suppress the
+        # inbound real-estate project inventory block here so the campaign
+        # doc_text + agent_prompt are the only product/pricing/availability
+        # source the LLM sees. Inbound paths keep their inventory pin.
+        _projects_block_for_messages = "" if outbound_mode else projects_block
+        # Live tool_flow snapshot — surfaced for outbound and for real-estate
+        # inbound (FSM site_visit mode).
+        from app.services.real_estate_agent_fsm import (
+            current_mode as _fsm_current_mode,
+            enabled_for_business_type as _fsm_enabled,
+            mode_block_for_prompt as _fsm_mode_block,
+        )
+        from app.services.agent_outbound_context import render_booking_flow_state
+
+        tf_state_for_msg = dict((turn_cache.get("state") or {}).get("tool_flow") or {})
+        _fsm_active_inbound_streaming = (
+            not outbound_mode
+            and bundle is not None
+            and _fsm_enabled(bundle.organization_industry)
+        )
+        tf_bundle_for_msg: dict[str, Any] | None = None
+        if bundle is not None and tf_state_for_msg.get("active") and (
+            outbound_mode or _fsm_active_inbound_streaming
+        ):
+            try:
+                tf_bundle_for_msg = build_tool_flow_questions(
+                    bundle.organization_industry,
+                    bundle.overrides,
+                    bundle.custom_tabs,
+                )
+            except Exception:
+                tf_bundle_for_msg = None
+
+        agent_mode_block_inbound_streaming: str | None = None
+        if _fsm_active_inbound_streaming:
+            current = _fsm_current_mode(
+                turn_cache.get("state") or {}, memory=conversational_memory
+            )
+            pending_label: str | None = None
+            pending_question: str | None = None
+            if current == "site_visit" and tf_bundle_for_msg is not None:
+                flow_def = (
+                    (tf_bundle_for_msg.get("flows") or {}).get("real_estate_site_visit") or {}
+                )
+                pending_slot_key = str(tf_state_for_msg.get("pending_slot") or "")
+                for slot in (flow_def.get("slots") or []):
+                    if not isinstance(slot, dict):
+                        continue
+                    skey = str(slot.get("key") or "")
+                    if pending_slot_key and skey != pending_slot_key:
+                        continue
+                    if not pending_slot_key and (tf_state_for_msg.get("collected") or {}).get(skey):
+                        continue
+                    pending_label = str(slot.get("label") or skey)
+                    questions = slot.get("questions") or {}
+                    pending_question = str(
+                        questions.get(language) or questions.get("en") or ""
+                    )
+                    break
+            blocks: list[str] = [
+                _fsm_mode_block(
+                    current,
+                    pending_slot_label=pending_label,
+                    pending_slot_question=pending_question,
+                    memory=conversational_memory,
+                )
+            ]
+            if current == "site_visit":
+                booking_block = render_booking_flow_state(
+                    tf_state_for_msg, tf_bundle_for_msg, language=language
+                )
+                if booking_block:
+                    blocks.append(booking_block)
+            agent_mode_block_inbound_streaming = "\n\n".join(b for b in blocks if b)
+
         messages = NokvoOneVoicePipeline._messages(
             user_text,
             chunks,
@@ -5184,7 +4331,12 @@ class NokvoOneVoicePipeline:
             conversational_memory_block=memory_block,
             conversation_strategy_block=strategy_block,
             field_questions_prompt=field_questions_prompt,
-            projects_block=projects_block,
+            projects_block=_projects_block_for_messages,
+            tool_flow_state=tf_state_for_msg if outbound_mode else None,
+            tool_flow_bundle=tf_bundle_for_msg,
+            turn_index=(len(history) // 2) + 1 if outbound_mode else None,
+            agent_mode_block=agent_mode_block_inbound_streaming,
+            conversational_memory=conversational_memory,
         )
         # Prosody-aware streaming: the LLM is asked to wrap each sentence in a
         # [tone]…[/tone] tag. The parser strips the tags and emits one chunk
@@ -5193,9 +4345,16 @@ class NokvoOneVoicePipeline:
         answer_parts: list[str] = []
         rate_limited = False
         # Outbound: hard token cap so the model physically cannot generate a
-        # paragraph reply. 48 tokens keeps it near the 1-2 sentence target.
-        # Inbound keeps the default 180.
-        _stream_max_tokens = 48 if outbound_mode else 180
+        # paragraph reply. Hindi / Telugu / Tamil tokenise to 2-3× more tokens
+        # per equivalent sentence than English, so the 48-token English cap
+        # would cut them mid-clause. Lift the cap proportionally for those
+        # languages so the 1-2 sentence target still ends cleanly. Inbound
+        # keeps the default 180.
+        _lang_code = (language or "en").split("-")[0].lower()[:2]
+        if outbound_mode:
+            _stream_max_tokens = 96 if _lang_code in {"hi", "te", "ta", "bn", "kn", "mr"} else 48
+        else:
+            _stream_max_tokens = 180
         try:
             async for chunk in AzureGroundedLLM.stream_prosody(
                 tenant_res,
@@ -5290,7 +4449,9 @@ class NokvoOneVoicePipeline:
                 "route": ("single_prompt_rag" if not chunks else "qdrant_rag") if not refused else "refusal",
                 "sensitive": intent_result.sensitive,
                 "cache_hit": False,
-                "qdrant_called": True,
+                # Drive from actual retrieval result instead of hardcoded True —
+                # the single_prompt_rag fallback doesn't always hit qdrant.
+                "qdrant_called": bool(chunks),
                 "llm_called": True,
                 "single_prompt_enabled": bool(single_prompt_guidance),
                 "total_ms": total_ms,

@@ -118,15 +118,25 @@ from app.services.lead_sync_scheduler import (  # noqa: E402
     start_scheduler as start_lead_sync_scheduler,
     stop_scheduler as stop_lead_sync_scheduler,
 )
+# Follow-up agent: drains lead_followup_schedules every 60s and places the
+# scheduled outbound calls via Exotel. Honours promise-extracted callback
+# times over admin disposition rules, clamps into the call window, and
+# enforces the four kill switches (opt-out, conversion, max attempts, pause).
+from app.services.followup_scheduler import (  # noqa: E402
+    start_followup_scheduler,
+    stop_followup_scheduler,
+)
 
 
 @app.on_event("startup")
 async def _start_retry_scheduler() -> None:
     start_scheduler()
     start_lead_sync_scheduler()
+    start_followup_scheduler()
 
 
 @app.on_event("shutdown")
 async def _stop_retry_scheduler() -> None:
     await stop_scheduler()
     await stop_lead_sync_scheduler()
+    await stop_followup_scheduler()

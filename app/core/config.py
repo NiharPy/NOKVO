@@ -102,6 +102,13 @@ class Settings(BaseSettings):
     # Redis (Rate Limiting & Tenant Cache)
     REDIS_URL: str = "redis://localhost:6379"
 
+    # Session-state v2 dual-write rollout. When True (the default for one
+    # deploy cycle), every unified-store write also updates the legacy
+    # ``:state`` and ``:history`` keys so a code rollback during the rollout
+    # window can still serve in-flight calls. Flip to False once one full
+    # deploy cycle has elapsed and the legacy reader is no longer needed.
+    SESSION_STATE_V2_DUAL_WRITE: bool = True
+
     # Azure Provisioning
     AZURE_SUBSCRIPTION_ID: str = ""
     AZURE_DEFAULT_REGION: str = "centralindia"
@@ -239,7 +246,10 @@ class Settings(BaseSettings):
     AGENT_MAX_FIRST_SENTENCE_CHARS: int = 110     # Force TTS dispatch after this many chars
     VOICE_EOU_DEBOUNCE_MS: int = 900      # Silence before firing a streaming-STT turn
     VOICE_EOU_CONTINUATION_BONUS_MS: int = 1100  # Extra wait when speech likely continues
-    VOICE_FIRST_SENTENCE_TIMEOUT_MS: int = 900  # Speak a short hold if LLM has not yielded
+    VOICE_FIRST_SENTENCE_TIMEOUT_MS: int = 1800  # Speak a short hold if LLM has not yielded. The
+    # typical first-sentence latency for the GPT-4 family ~900-1200ms, so the older 900ms threshold
+    # caused the "one moment, I'm checking that" filler to fire on nearly every turn. 1800ms keeps
+    # the safety net for truly slow turns without polluting normal-pace ones.
     VOICE_LLM_STREAM_RETRY_ATTEMPTS: int = 2
     VOICE_LLM_STREAM_MAX_RETRY_WAIT_MS: int = 350
 
