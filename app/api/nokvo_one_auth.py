@@ -70,10 +70,15 @@ from app.services.nokvo_one_business_templates import (
     business_type_options,
     custom_tabs_from_overrides,
     default_custom_tab_status_vocabulary,
+    field_catalog_for,
     normalize_business_type,
     normalize_custom_tab_slug,
 )
-from app.services.tool_flow_questions import ensure_tool_flow_questions
+from app.services.tool_flow_questions import (
+    _kind_for_field,
+    _question_for_kind,
+    ensure_tool_flow_questions,
+)
 
 
 
@@ -220,7 +225,7 @@ async def _issue_full_session(
 
 def _summary_from_provision_dict(provision: dict) -> NokvoOneProvisioningSummary:
     ps = dict(provision.get("provider_status") or {})
-    exotel = ps.get("exotel") or {}
+    exotel = ps.get("plivo") or {}  # telephony status (Plivo) — field name kept for API compat
     return NokvoOneProvisioningSummary(
         tenant_id=provision["tenant_id"],
         azure_resource_group_name=provision.get("azure_resource_group_name"),
@@ -251,7 +256,7 @@ def _summary_from_provision_dict(provision: dict) -> NokvoOneProvisioningSummary
 
 def _summary_from_tenant_resources(tr: TenantResources) -> NokvoOneProvisioningSummary:
     ps = dict(tr.provider_status or {})
-    exotel = ps.get("exotel") or {}
+    exotel = ps.get("plivo") or {}  # telephony status (Plivo) — field name kept for API compat
     return NokvoOneProvisioningSummary(
         tenant_id=tr.tenant_id,
         azure_resource_group_name=tr.azure_resource_group_name,
@@ -1244,6 +1249,63 @@ async def nokvo_one_save_business_template(
         organization=_organization_response(organization),
         business_template=_resolved_business_template(organization, tenant_res),
     )
+
+
+@router.get("/business-template/field-catalog/{schema_key}")
+async def nokvo_one_get_field_catalog(
+    schema_key: str,
+    user: OrganizationUser = Depends(
+        deps.RequireNokvoOneOrganization(
+            allowed_statuses=["pending_approval", "active", "suspended"],
+            allowed_roles=["admin", "manager"],
+        )
+    ),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """The selectable field palette for a record (tab): each field with the agent's
+    question + whether it's currently selected. The admin picks a subset; the agent
+    asks EXACTLY the selected fields. Used by the onboarding / Leads / Site-Visit pickers."""
+    schema_key = schema_key.strip().lower()
+    org_res = await db.execute(select(Organization).where(Organization.id == user.organization_id))
+    organization = org_res.scalars().first()
+    if organization is None:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    config = business_type_config(organization.industry)
+    if config is None:
+        raise HTTPException(status_code=409, detail="Business Type is not selected")
+    if schema_key not in (config.get("schemas") or {}):
+        raise HTTPException(status_code=400, detail="This field group is not available for the selected Business Type")
+
+    tenant_res = await _tenant_resources_for_org(db, organization.id)
+    overrides = dict((tenant_res.provider_status or {}).get("business_template_schema_overrides") or {})
+    effective = overrides.get(schema_key) or (config.get("schemas") or {}).get(schema_key) or []
+    selected = {str(f.get("key")): f for f in effective if isinstance(f, dict)}
+
+    palette = field_catalog_for(organization.industry, schema_key)
+    palette_keys = {f["key"] for f in palette}
+    # Surface any custom fields the admin already added that aren't in the palette,
+    # so the picker shows the full current selection.
+    for key, f in selected.items():
+        if key not in palette_keys:
+            palette.append({"key": key, "label": f.get("label") or key, "type": f.get("type") or "text", "required": bool(f.get("required"))})
+
+    fields = []
+    for f in palette:
+        key = f["key"]
+        is_sel = key in selected
+        label = (selected.get(key, {}).get("label")) or f["label"]
+        kind = _kind_for_field(f)
+        fields.append({
+            "key": key,
+            "label": label,
+            "type": f.get("type") or "text",
+            "kind": kind,
+            "agent_question": _question_for_kind(kind, label, "en"),
+            "selected": is_sel,
+            "required": bool(selected[key].get("required")) if is_sel else bool(f.get("required")),
+            "custom": key not in palette_keys,
+        })
+    return {"schema_key": schema_key, "fields": fields}
 
 
 @router.patch("/business-template/schemas/{schema_key}", response_model=NokvoOneBusinessTemplateOptionResponse)

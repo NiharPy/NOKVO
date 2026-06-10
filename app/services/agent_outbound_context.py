@@ -222,6 +222,13 @@ def build_agent_config(
     pitch_summary: str | None = None,
     objective: str | None = None,
     language: str | None = None,
+    # Passthrough fields that the campaign service stores on agent_config
+    # but build_agent_config doesn't validate or transform. ``followup_rules``
+    # is the disposition-retry policy the follow-up scheduler reads via
+    # ``effective_followup_rules``; anything in ``_extra`` is preserved
+    # verbatim so future agent_config additions don't need a signature bump.
+    followup_rules: Any = None,
+    **_extra: Any,
 ) -> dict[str, Any]:
     """Normalize campaign proactive-agent config.
 
@@ -260,7 +267,7 @@ def build_agent_config(
         lang_short = lang_raw.split("-", 1)[0][:2]
     else:
         lang_short = ""
-    return {
+    cfg: dict[str, Any] = {
         "agent_prompt": prompt,
         "objectives": objective_list,
         "exit_conditions": exits,
@@ -272,6 +279,13 @@ def build_agent_config(
         "objective": obj,
         "language": lang_short,
     }
+    # Preserve the follow-up scheduler's per-campaign rules block when the
+    # caller supplied one. The scheduler reads it via ``effective_followup_rules``
+    # and merges with DEFAULT_FOLLOWUP_RULES, so a missing/None value here
+    # just means "use the platform defaults".
+    if isinstance(followup_rules, dict) and followup_rules:
+        cfg["followup_rules"] = followup_rules
+    return cfg
 
 
 def _build_context(campaign: OutboundCampaign, *, goal: str | None = None) -> OutboundCampaignContext:
@@ -480,6 +494,18 @@ _OUTBOUND_UNIVERSAL_TURN_RULES = """# OUTBOUND TURN-TAKING RULES — ALWAYS FOLL
 - If they are busy, not interested, wrong number, frustrated, or ask not to be called, stop pitching and close politely.
 - Do not push past their answer. A respectful outbound call sounds like a conversation, not a script.
 
+# CALLBACK REQUEST — HARD RULE
+If the caller asks to be called back at a specific time ("call me later",
+"call me in two hours", "call me tomorrow at 4 PM", "call back next week"):
+1. Acknowledge the time in one sentence: "Sure, I'll call you back in 2 hours."
+2. Do NOT continue collecting name, phone, BHK, budget, visit date, or any
+   other slot. The system already recorded the callback time from this turn.
+3. Close politely in the next reply: "Thanks for your time, talk soon." Then stop.
+4. Do NOT try to book anything, do NOT keep pitching, do NOT ask "while
+   we're on the call." The caller said they want to end — honour it.
+The follow-up scheduler will place the call at the requested time. Your job
+on THIS call is to confirm the time and end gracefully.
+
 # OUTBOUND FACTUAL SCOPE — HARD BOUNDARY
 - This campaign brief (persona, goal, pitch summary, objectives, and the campaign document below) is your ENTIRE source of facts.
 - Do NOT draw on the organisation's inbound knowledge base, property inventory, admin single-prompt, or general world knowledge for product / pricing / specification / availability claims.
@@ -523,56 +549,84 @@ def compose_outbound_system_section(
     parts: list[str] = []
 
     # ── Follow-up preamble ──────────────────────────────────────────────
-    # Surface a "this is a follow-up call" block at the very top so the LLM
-    # opens by acknowledging the prior conversation instead of restarting.
+    # Two flavours, in priority order:
+    #   1. Handoff note — a 3-sentence human-readable summary written by the
+    #      post-call condenser (``call_condenser_service``) immediately after
+    #      the prior call ended. Small models read prose much better than
+    #      structured JSON; managers also read it directly in the leads tab.
+    #   2. Structured fallback — when no handoff note exists (call too short,
+    #      condenser failed, or this is a campaign that doesn't have the
+    #      condenser enabled), surface raw objections / commitments /
+    #      preferences from ConversationalMemory. The original behaviour.
+    #
     # Source: ``outbound_memory['followup']`` — seeded once at session start
-    # from the WebSocket handler's ``campaign_context``. Carries attempt
-    # number, prior promise text, and (via ``conversational_memory``) the
-    # caller's prior objections / commitments / preferences.
+    # from the WebSocket handler's ``campaign_context``. Carries
+    # ``is_followup``, ``attempt_n``, ``handoff_note`` (optional), and the
+    # prior promise text.
     followup = (outbound_memory or {}).get("followup") if outbound_memory else None
     if followup and followup.get("is_followup"):
         attempt_n = int(followup.get("attempt_n") or 1)
-        prior_promise = str(followup.get("prior_promise") or "").strip()
-        prior_objections: list[str] = []
-        prior_commitments: list[str] = []
-        prior_preferences: list[str] = []
-        if conversational_memory is not None:
-            for obj in (getattr(conversational_memory, "objections", []) or [])[-5:]:
-                code = str((obj or {}).get("code") or "")
-                text = str((obj or {}).get("text") or "")
-                if code:
-                    prior_objections.append(f"{code}" + (f" ({text[:80]})" if text else ""))
-            for c in (getattr(conversational_memory, "commitments", []) or [])[-5:]:
-                code = str((c or {}).get("code") or "")
-                if code:
-                    prior_commitments.append(code)
-            for p in (getattr(conversational_memory, "preferences", []) or [])[-5:]:
-                k = str((p or {}).get("key") or "")
-                v = str((p or {}).get("value") or "")
-                if k and v:
-                    prior_preferences.append(f"{k}={v}")
+        handoff_note = str(followup.get("handoff_note") or "").strip()
 
-        objections_line = ", ".join(prior_objections) if prior_objections else "—"
-        commitments_line = ", ".join(prior_commitments) if prior_commitments else "—"
-        preferences_line = ", ".join(prior_preferences) if prior_preferences else "—"
-        promise_line = prior_promise or "—"
+        if handoff_note:
+            # The model reads prose 10× better than structured slots, so
+            # this is the preferred path. Keep it short — the note itself
+            # carries all the context.
+            parts.append(
+                "═══ FOLLOW-UP CALL ═══\n"
+                f"This is attempt {attempt_n}. Here are the notes from the last call:\n\n"
+                f"{handoff_note}\n\n"
+                "Open warmly by referencing these notes — DO NOT restart with "
+                "\"Is this a good time to talk?\". If the notes mention an "
+                "unresolved objection, address it FIRST. Then resume where "
+                "the previous call ended.\n"
+                "══════════════════════"
+            )
+        else:
+            # Structured fallback. Use raw signals from conversational
+            # memory so the LLM still has SOME prior context even when
+            # the condenser couldn't produce a note.
+            prior_promise = str(followup.get("prior_promise") or "").strip()
+            prior_objections: list[str] = []
+            prior_commitments: list[str] = []
+            prior_preferences: list[str] = []
+            if conversational_memory is not None:
+                for obj in (getattr(conversational_memory, "objections", []) or [])[-5:]:
+                    code = str((obj or {}).get("code") or "")
+                    text = str((obj or {}).get("text") or "")
+                    if code:
+                        prior_objections.append(f"{code}" + (f" ({text[:80]})" if text else ""))
+                for c in (getattr(conversational_memory, "commitments", []) or [])[-5:]:
+                    code = str((c or {}).get("code") or "")
+                    if code:
+                        prior_commitments.append(code)
+                for p in (getattr(conversational_memory, "preferences", []) or [])[-5:]:
+                    k = str((p or {}).get("key") or "")
+                    v = str((p or {}).get("value") or "")
+                    if k and v:
+                        prior_preferences.append(f"{k}={v}")
 
-        parts.append(
-            "═══ FOLLOW-UP CALL ═══\n"
-            f"This is attempt {attempt_n}. The customer's previous call ended recently.\n"
-            f"What they said last time:\n"
-            f"  - Promise to be called back: {promise_line}\n"
-            f"  - Objections: {objections_line}\n"
-            f"  - Commitments: {commitments_line}\n"
-            f"  - Preferences: {preferences_line}\n"
-            "Open by acknowledging the prior conversation — DO NOT restart with "
-            "\"Is this a good time to talk?\". Examples that work:\n"
-            "  - \"Hi {name}, calling back as we discussed about {pitch}…\"\n"
-            "  - \"Hi {name}, you'd asked to call back around now — got a minute?\"\n"
-            "If the customer's previous turn raised an objection, address it FIRST, "
-            "then resume where the previous call ended.\n"
-            "══════════════════════"
-        )
+            objections_line = ", ".join(prior_objections) if prior_objections else "—"
+            commitments_line = ", ".join(prior_commitments) if prior_commitments else "—"
+            preferences_line = ", ".join(prior_preferences) if prior_preferences else "—"
+            promise_line = prior_promise or "—"
+
+            parts.append(
+                "═══ FOLLOW-UP CALL ═══\n"
+                f"This is attempt {attempt_n}. The customer's previous call ended recently.\n"
+                f"What they said last time:\n"
+                f"  - Promise to be called back: {promise_line}\n"
+                f"  - Objections: {objections_line}\n"
+                f"  - Commitments: {commitments_line}\n"
+                f"  - Preferences: {preferences_line}\n"
+                "Open by acknowledging the prior conversation — DO NOT restart with "
+                "\"Is this a good time to talk?\". Examples that work:\n"
+                "  - \"Hi {name}, calling back as we discussed about {pitch}…\"\n"
+                "  - \"Hi {name}, you'd asked to call back around now — got a minute?\"\n"
+                "If the customer's previous turn raised an objection, address it FIRST, "
+                "then resume where the previous call ended.\n"
+                "══════════════════════"
+            )
 
     # If the operator provided a custom agent_prompt, prefer it but still
     # append the hard rules so AI-disclosure / "no twice = end" stay locked.

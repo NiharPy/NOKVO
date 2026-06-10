@@ -2,6 +2,8 @@
 import { computed, onMounted, ref, watch } from 'vue';
 import { Building2, Shield, LogOut, CheckCircle2, AlertTriangle, MapPin, Mail, User, Phone, Languages, BadgeCheck, Database, FolderTree, Mic } from 'lucide-vue-next';
 
+import { SUPERADMIN_API_BASE } from '../config.js';
+
 const props = defineProps({
   theme: {
     type: String,
@@ -104,7 +106,7 @@ function formatCurrency(value) {
 const loadOrganizations = async () => {
   try {
     const token = localStorage.getItem(SUPERADMIN_ACCESS_TOKEN_KEY);
-    const response = await fetch('http://localhost:8000/superadmin/tenants', {
+    const response = await fetch(`${SUPERADMIN_API_BASE}/tenants`, {
       headers: {
         'Authorization': `Bearer ${token}`,
       },
@@ -147,7 +149,7 @@ const handleCreateOrg = async () => {
       twilio_auto_provision: twilioAutoProvision.value
     });
     
-    const response = await fetch('http://localhost:8000/superadmin/tenants/provision/stream', {
+    const response = await fetch(`${SUPERADMIN_API_BASE}/tenants/provision/stream`, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${token}`,
@@ -246,7 +248,7 @@ const loadNokvoOnePending = async () => {
   const token = localStorage.getItem(SUPERADMIN_ACCESS_TOKEN_KEY);
   if (!token) return;
   try {
-    const res = await fetch('http://localhost:8000/superadmin/tenants/nokvo-one/pending', {
+    const res = await fetch(`${SUPERADMIN_API_BASE}/tenants/nokvo-one/pending`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     if (!res.ok) return;
@@ -260,7 +262,7 @@ const approveNokvoOne = async (orgId, enableCalling) => {
   const token = localStorage.getItem(SUPERADMIN_ACCESS_TOKEN_KEY);
   if (!token) return;
   const res = await fetch(
-    `http://localhost:8000/superadmin/tenants/nokvo-one/${orgId}/approve`,
+    `${SUPERADMIN_API_BASE}/tenants/nokvo-one/${orgId}/approve`,
     {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },

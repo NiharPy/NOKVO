@@ -116,6 +116,15 @@ def _format_transcript(turns: list[dict[str, Any]] | None) -> str:
     return "\n".join(lines)
 
 
+def _ls_chain(name: str):
+    try:
+        from langsmith.run_helpers import traceable
+        return traceable(name=name, run_type="chain")
+    except Exception:
+        return lambda fn: fn
+
+
+@_ls_chain("outcome_classifier")
 async def classify_outbound_outcome(
     tenant_res: TenantResources,
     *,

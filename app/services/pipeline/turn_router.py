@@ -34,7 +34,6 @@ import re
 from typing import Any
 
 from app.core.config import settings
-from app.services.agent_knowledge_service import AgentKnowledgeService
 from app.services.agent_outbound_context import OutboundCampaignContext
 from app.services.agent_session_store import AgentSessionStore
 from app.services.fast_intent_router import (
@@ -66,6 +65,10 @@ from app.models.tenant_resources import TenantResources
 from app.services.tool_flow_policy import evaluate_tool_flow_policy
 from app.services.tool_flow_questions import build_tool_flow_questions
 from app.services.voice_turn_policy import evaluate_voice_turn_policy
+from app.services.pipeline.booking_shadow import (
+    run_shadow_compare,
+    unified_booking_engine_enabled,
+)
 
 try:  # SQLAlchemy is a heavy import; gracefully degrade for unit tests that don't need it
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -169,18 +172,8 @@ async def route_turn(
             "sensitive": False,
         }
 
-    # 2) Answer-card cache (existing Q/A card lookup).
-    card = None if _outbound_active else AgentKnowledgeService.find_answer_card(tenant_res, user_text, language)
-    if card and card.get("answer"):
-        return {
-            "route": "answer_card",
-            "answer": str(card["answer"]),
-            "intent_result": intent_result,
-            "safe_to_cache": bool(card.get("cacheable", True)) and not intent_result.sensitive,
-            "sensitive": intent_result.sensitive,
-            "card_id": card.get("id"),
-        }
-
+    # (Knowledge-Base answer-card fast-path retired — the agent answers from its
+    # vertical system prompt; no Q/A card lookup.)
     history_for_turn = await helpers._turn_history(tenant_res, call_id, turn_cache)
     state_for_turn = await helpers._turn_state(tenant_res, call_id, turn_cache)
     prior_appointment = dict((state_for_turn or {}).get("appointment") or {})
@@ -241,6 +234,13 @@ async def route_turn(
         prior_in_booking_flow = False
         prior_pending_slot = None
 
+    # S3: per-tenant cutover to the unified engine. When ON for a clinic, skip
+    # the bespoke appointment FSM so the turn falls through to the generic
+    # tool_flow block (which now builds + drives `clinic_appointment`). Default
+    # OFF → behaviour unchanged.
+    unified_on = is_clinic_org and unified_booking_engine_enabled(
+        dict(tenant_res.provider_status or {})
+    )
     turn_policy = (
         evaluate_voice_turn_policy(
             user_text,
@@ -248,9 +248,28 @@ async def route_turn(
             state=state_for_turn,
             language=language,
         )
-        if is_clinic_org
+        if (is_clinic_org and not unified_on)
         else None
     )
+    # Shadow-compare: when the unified engine is OFF, still run it for clinics on
+    # a copy of the state and log how its decision would differ — observability
+    # before the flip. Best-effort; never affects the caller.
+    if is_clinic_org and not unified_on and bundle is not None:
+        _shadow_bc = bundle.as_business_context_tuple()
+        if _shadow_bc is not None:
+            _s_org, _s_overrides, _s_tabs = _shadow_bc
+            run_shadow_compare(
+                user_text=user_text,
+                history=history_for_turn,
+                state=state_for_turn,
+                language=language,
+                business_type=getattr(_s_org, "industry", None),
+                schema_overrides=_s_overrides,
+                custom_tabs=_s_tabs,
+                provider_status=dict(tenant_res.provider_status or {}),
+                bespoke_turn_policy=turn_policy,
+                call_id=call_id,
+            )
 
     # If the regex side-question detector inside evaluate_voice_turn_policy
     # yielded mid-booking, persist a `deferred_for_kb` marker so the next
@@ -801,8 +820,9 @@ async def route_turn(
     # Tier 1 regex didn't recognize this utterance. Ask a small LLM to
     # classify what the caller is actually trying to do — handles
     # paraphrasing, code-switching, STT errors, and idioms the regex
-    # can't possibly enumerate. Capped at 800ms with a safe default,
-    # so a slow/down classifier never blocks the turn.
+    # can't possibly enumerate. Capped at NOKVO_INTENT_CLASSIFIER_TIMEOUT_MS
+    # (default 2500ms) with a safe default, so a slow/down classifier never
+    # blocks the turn indefinitely.
     #
     # We send the classifier BOTH the native + English-translated forms
     # (when available). Small LLMs handle English best; the native form

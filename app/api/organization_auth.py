@@ -114,8 +114,8 @@ from app.services.toolkit_generator_service import ToolkitGeneratorService
 from app.services.qdrant_service import QdrantService
 from app.services.agent_knowledge_service import AgentKnowledgeService
 from app.schemas.outbound_campaign import CampaignDetailOut, CampaignOut
-from app.services.exotel_bridge_service import ExotelBridgeService, ExotelWebSocketAdapter
-from app.services.exotel_service import ExotelService
+from app.services.plivo_bridge_service import PlivoBridgeService, PlivoWebSocketAdapter
+from app.services.plivo_service import PlivoService
 from app.services.nokvo_one_voice_pipeline import NokvoOneVoicePipeline as AgentRuntimeService
 from app.services.nokvo_one_voice_stream_service import NokvoOneVoiceStreamService
 from app.services.outbound_campaign_service import OutboundCampaignService
@@ -315,7 +315,7 @@ async def _get_tenant_resources_for_org(db: AsyncSession, organization_id: uuid.
 
 
 def _agent_phone_link_response(tenant_res: TenantResources) -> dict:
-    return ExotelService.phone_link_response(tenant_res)
+    return PlivoService.legacy_phone_link_response(tenant_res)
 
 
 async def _get_tenant_resources_by_agent_phone_link(db: AsyncSession, link_id: str) -> TenantResources | None:
@@ -1819,7 +1819,7 @@ async def link_agent_phone_number(
     tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
     try:
         public_base_url = settings.AGENT_PUBLIC_BASE_URL or str(request.base_url).rstrip("/")
-        link = await ExotelService.link_agent_phone_number(
+        link = await PlivoService.link_agent_phone_number(
             tenant_res,
             db,
             phone_number=payload.phone_number,
@@ -1838,7 +1838,7 @@ async def unlink_agent_phone_number(
 ):
     tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
     try:
-        await ExotelService.unlink_agent_phone_number(tenant_res, db)
+        await PlivoService.unlink_agent_phone_number(tenant_res, db)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
     return OrganizationAgentPhoneLinkResponse(**_agent_phone_link_response(tenant_res))
@@ -1977,35 +1977,55 @@ async def cancel_agent_campaign(
         raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
 
 
-@router.post("/agent/exotel/voice/{link_id}", response_class=PlainTextResponse)
-async def exotel_agent_voice_webhook(
+def _org_plivo_stream_xml(media_url: str) -> str:
+    rate = settings.PLIVO_DEFAULT_SAMPLE_RATE or 8000
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response>"
+        f'<Stream bidirectional="true" keepCallAlive="true" audioTrack="inbound" '
+        f'contentType="audio/x-l16;rate={rate}">{media_url}</Stream>'
+        "</Response>"
+    )
+
+
+@router.post("/agent/plivo/voice/{link_id}", response_class=PlainTextResponse)
+async def plivo_agent_voice_webhook(
     link_id: str,
     request: Request,
     db: AsyncSession = Depends(deps.get_db),
 ):
     tenant_res = await _get_tenant_resources_by_agent_phone_link(db, link_id)
     if not tenant_res:
-        return PlainTextResponse("NOKVO agent is not linked to this number.", status_code=404)
+        return PlainTextResponse("<Response><Hangup/></Response>", media_type="application/xml", status_code=404)
     host = request.url.hostname or "localhost"
     scheme = "wss" if request.url.scheme == "https" else "ws"
     port = f":{request.url.port}" if request.url.port else ""
-    media_url = f"{scheme}://{host}{port}/api/org-auth/agent/exotel/media/{link_id}"
-    return PlainTextResponse(media_url, media_type="text/plain")
+    media_url = f"{scheme}://{host}{port}/api/org-auth/agent/plivo/media/{link_id}"
+    return PlainTextResponse(_org_plivo_stream_xml(media_url), media_type="application/xml")
 
 
-@router.websocket("/agent/exotel/media/{link_id}")
-async def exotel_agent_media_websocket(websocket: WebSocket, link_id: str):
+@router.websocket("/agent/plivo/media/{link_id}")
+async def plivo_agent_media_websocket(websocket: WebSocket, link_id: str):
     async for db in deps.get_db():
         tenant_res = await _get_tenant_resources_by_agent_phone_link(db, link_id)
         if not tenant_res:
             await websocket.close(code=1008)
             return
-        await ExotelBridgeService.run_session(websocket, tenant_res, db=db)
+        await PlivoBridgeService.run_session(websocket, tenant_res, db=db)
         return
 
 
-@router.post("/agent/exotel/outbound-status/{call_link_id}")
-async def exotel_outbound_status_callback(
+@router.post("/agent/plivo/outbound-answer/{call_link_id}", response_class=PlainTextResponse)
+async def plivo_agent_outbound_answer(call_link_id: str, request: Request):
+    host = request.url.hostname or "localhost"
+    scheme = "wss" if request.url.scheme == "https" else "ws"
+    port = f":{request.url.port}" if request.url.port else ""
+    media_url = f"{scheme}://{host}{port}/api/org-auth/agent/plivo/outbound-media/{call_link_id}"
+    return PlainTextResponse(_org_plivo_stream_xml(media_url), media_type="application/xml")
+
+
+@router.post("/agent/plivo/outbound-status/{call_link_id}")
+async def plivo_outbound_status_callback(
     call_link_id: str,
     request: Request,
     db: AsyncSession = Depends(deps.get_db),
@@ -2023,8 +2043,8 @@ async def exotel_outbound_status_callback(
     return {"ok": True, "call_link_id": call_link_id}
 
 
-@router.websocket("/agent/exotel/outbound-media/{call_link_id}")
-async def exotel_outbound_media_websocket(websocket: WebSocket, call_link_id: str):
+@router.websocket("/agent/plivo/outbound-media/{call_link_id}")
+async def plivo_outbound_media_websocket(websocket: WebSocket, call_link_id: str):
     async for db in deps.get_db():
         campaign, contact = await OutboundCampaignService.get_by_call_link_id(call_link_id, db)
         if not campaign or not contact:
@@ -2034,7 +2054,7 @@ async def exotel_outbound_media_websocket(websocket: WebSocket, call_link_id: st
         if not tenant_res:
             await websocket.close(code=1008)
             return
-        adapter = ExotelWebSocketAdapter(websocket, language="en")
+        adapter = PlivoWebSocketAdapter(websocket, language="en")
         campaign_context = {
             "campaign_id": str(campaign.id),
             "goal": campaign.name,

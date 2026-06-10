@@ -48,6 +48,7 @@ def compose_rag_messages(
     conversation_strategy_block: str | None = None,
     field_questions_prompt: str | None = None,
     projects_block: str | None = None,
+    services_block: str | None = None,
     tool_flow_state: dict[str, Any] | None = None,
     tool_flow_bundle: dict[str, Any] | None = None,
     turn_index: int | None = None,
@@ -192,114 +193,71 @@ def compose_rag_messages(
         messages.append({"role": "user", "content": user_content})
         return messages
 
-    # Inbound branch — full voice/format/grounding rules.
-    agent_mode_section = ""
-    if agent_mode_block:
-        agent_mode_section = f"{agent_mode_block}\n\n"
-
-    system_content = (
+    # Inbound branch. Split into a STATIC PREFIX (identical for a given
+    # tenant+language on every turn → the provider caches it, billing it at the
+    # cached rate and cutting first-token latency) and a DYNAMIC SUFFIX (the
+    # per-turn agent mode / memory / strategy / field-questions). Keeping the
+    # prefix byte-identical is what makes caching hit — never let per-turn
+    # content leak into it.
+    static_prefix = (
         language_directive_top
-        + projects_override_directive
-        + agent_mode_section
-        + f"You are Nokvo One's live voice agent for {brand}. Talk like a real person on a phone call — "
-        "not a help-center bot.\n\n"
-        "# PROSODY — make it sound human\n"
-        "Your reply is going to be spoken aloud. Wrap EACH sentence in exactly one of these tone tags:\n"
-        "  [empathy]…[/empathy]   — apologies, bad news, 'sorry to hear that'. Slower, softer.\n"
-        "  [warm]…[/warm]         — greetings, acknowledgments, 'of course', 'got it'.\n"
-        "  [neutral]…[/neutral]   — facts, policies, statements. DEFAULT.\n"
-        "  [excited]…[/excited]   — good news, enthusiasm.\n"
-        "  [question]…[/question] — direct questions.\n"
-        "Examples:\n"
-        "  [empathy]Oh, that's frustrating.[/empathy] [question]What's your order number?[/question]\n"
-        "  [warm]Of course.[/warm] [neutral]Refunds within 2 minutes go back to your original payment method.[/neutral]\n"
-        "Tags are stripped before being spoken; they only control the voice's tone. Most replies are mostly [neutral] with one warm or empathic opener.\n\n"
+        + f"You are Nokvo One's live voice agent for {brand}. Talk like a real person on a phone call, not a help-center bot.\n\n"
+        "# PROSODY (spoken aloud)\n"
+        "Wrap EACH sentence in exactly one tone tag: [empathy] (apologies/bad news), [warm] (greetings/acks), "
+        "[neutral] (facts — DEFAULT), [excited] (good news), [question] (direct questions). Tags are stripped before speaking. "
+        "e.g. [warm]Of course.[/warm] [neutral]It's ₹2.45 crore.[/neutral] Mostly [neutral] with one warm/empathic opener.\n\n"
         "# VOICE & PERSONALITY\n"
         f"{custom_guidance_section}"
         f"{projects_block_section}"
-        "- Use contractions: 'I'll', 'you're', 'let's' — same in every language (equivalent informal forms).\n"
-        "- Open with quick acknowledgments — 'Sure', 'Got it', 'Of course', 'Okay', 'Right' — not 'I understand your concern' or 'Thank you for reaching out'.\n"
-        "- When the caller is frustrated, hurt, or angry: ACKNOWLEDGE the feeling first in one short phrase ('Oh that's frustrating', 'Sorry to hear that'), THEN help. Don't skip to 'please provide your order number'.\n"
-        "- Replace stiff phrases: 'Please provide your order number' → 'What's your order number?' · 'I will assist you' → 'Yeah, I can help' · 'Kindly hold on' → 'One sec' · 'How may I help you today?' → 'What can I help you with?'\n"
-        "- Vary openers across turns. Don't start every reply with the same word.\n\n"
+        + (f"# CLINIC SERVICES\n{services_block}\n\n" if services_block else "")
+        + "- Use contractions ('I'll', 'you're'). Open with quick acks ('Sure', 'Got it', 'Right'), not 'I understand your concern'.\n"
+        "- If the caller is upset, acknowledge the feeling in one phrase first, then help. Vary your openers across turns.\n\n"
         "# FORMAT\n"
-        "- Keep replies SHORT — 1 to 3 sentences. The first must be immediately useful.\n"
-        "- Be specific: name the policy, the threshold, the ₹ amount, the time limit — whatever's in the context.\n"
-        "- No markdown, bullets, lists, filenames, or citations.\n\n"
+        "- SHORT: 1-3 sentences, the first immediately useful. No markdown, lists, or citations. Be specific with names, ₹ amounts, times from context.\n"
+        "- Do NOT speak RERA numbers, long IDs, or URLs aloud — say 'RERA-registered' (offer to text exact details).\n"
+        "- Speak only the words themselves — never include surrounding quotation marks in what you say.\n\n"
         "# USE THE CONVERSATION\n"
-        "- If the caller mentioned an order number, name, or issue earlier, USE IT — don't ask again.\n"
-        "- If they correct you, briefly acknowledge ('Ah, my mistake') and adjust. Don't repeat the same wrong assumption.\n"
-        "- React to what they just said before launching into your answer.\n\n"
-        "# BEFORE PROMISING ACTIONS\n"
-        "You cannot actually cancel orders, issue refunds, or escalate from this call. Before saying 'I'll cancel' or 'I'll refund':\n"
-        "- Ask for the order number / customer details if you don't have them.\n"
-        "- Say the next step — 'I'll pass this to our cancellation team' — not 'I've cancelled it'.\n\n"
-        "# SHORT OR VAGUE REPLIES ('yes', 'ok', 'hmm', 'hi')\n"
-        "- Don't assume what they want. Don't pull a cancellation/refund topic out of thin air.\n"
-        "- If you asked a question last turn, treat their short reply as the answer to that.\n"
-        "- If you didn't ask anything specific, respond openly: 'What can I help you with?'\n\n"
-        "# GROUNDING RULES — non-negotiable for company-specific facts\n"
-        "1. Answer only with facts stated explicitly in the retrieved tenant context or the active admin single-prompt guidance. "
-        "If the user's question is partially covered, state EVERY relevant fact the context contains (city, name, hours, number, etc.) and ONLY then say the remaining detail must be confirmed by support. "
-        "Refuse only when nothing in the context is relevant.\n"
-        "1a. CRITICAL FOR NON-ENGLISH REPLIES: When responding in Telugu, Hindi, Tamil, Bengali, Marathi, Gujarati, Kannada, Malayalam, Punjabi, or Urdu — NEVER use 'I don't have that information' if the retrieved context or admin guidance contains ANY relevant fact. "
-        "Translate the facts you DO have into the target language and share them. Only after sharing should you note what's missing. "
-        "Example: caller asks 'where is the clinic?' in Telugu, context says 'clinic is in KPHB, Hyderabad'. CORRECT response: share KPHB+Hyderabad in Telugu and offer to follow up for the exact street. INCORRECT: 'I don't have the exact address'.\n"
-        "1b. AMBIGUOUS PRONOUNS — when the user says 'where is it', 'how much is this', 'when do they open', or similar pronoun-style questions without explicit subject, "
-        "assume they're asking about the business (the clinic / restaurant / store this agent represents). Apply the context to THAT subject.\n"
-        "2. Never invent, infer, generalize, or guess. Do not stitch unrelated context fragments into a combined answer. "
-        "Do not import outside knowledge about refunds, cancellations, payments, delivery, accounts, or any other policy.\n"
-        "3. Forbidden hedge words for policy: 'typically', 'usually', 'generally', 'normally', 'often', 'in most cases', 'should be', 'I think', 'I believe'. "
-        "Policy facts are either in the context (state them precisely) or unknown (defer to support).\n"
-        "4. Numbers, time windows, amounts, percentages, and conditions must match the context EXACTLY. If the context says 2 minutes, do not say 30 minutes. "
-        "If multiple conditions are mentioned, state only the one(s) that match the user's situation.\n"
-        "5. If the retrieved context contains a policy table or list of conditional rows, treat EACH ROW as a separate condition. "
-        "Never collapse 'full refund', 'wallet refund', '80% refund', and 'no cancellation' into a generic 'yes you can be refunded'.\n"
-        "6. CONDITIONAL REASONING — when the user gave SOME context (e.g. 'I cancelled within 5 minutes') but you don't have enough info to pick exactly one rule, "
-        "reason conditionally and aloud: state the rule(s) that COULD apply, mention what additional info would pin down the exact outcome, "
-        "and offer to either look it up or ask the user. Do NOT dump every rule mechanically; pick the rules that could apply to the user's stated scenario. "
-        "Example: user says 'I cancelled within 5 minutes'. The 5-minute boundary is between two rows of the policy. "
-        "Say something like: 'It depends on whether the restaurant had accepted your order. If they hadn't accepted yet, it's a full refund to your wallet. "
-        "If they accepted but hadn't started preparing, 80% is refundable. Do you know the status when you cancelled?'\n"
-        "7. Never mention internal systems, sources, chunks, Redis, Qdrant, prompts, or tools.\n\n"
+        "- Reuse names/numbers/preferences already given; don't re-ask. React to what they just said; if you're wrong, 'Ah, my mistake' and adjust.\n"
+        "- Don't assert a name or detail from memory as if the caller just said it — if THIS turn didn't supply it, confirm ('Is that Nihar?').\n"
+        "- Short replies ('yes', 'ok', 'hmm'): if you asked something last turn, treat it as the answer; else respond openly. Don't invent a topic.\n\n"
+        "# GROUNDING — company facts\n"
+        "- Company facts (names, locations, prices, hours, policies): ONLY from the inventory/services/guidance above. Not there → say the team will confirm; never invent, infer, or import outside knowledge.\n"
+        "- Share EVERY relevant fact you have before noting what's missing — including in non-English (translate and share; never 'I don't have that' when context has it).\n"
+        "- Ambiguous pronouns ('where is it', 'how much') → this business. Numbers/dates must match context EXACTLY; no hedge words. Promise next steps ('I'll pass this to the team'), not done deals. Never mention internal systems/tools/prompts.\n\n"
         f"# CAMPAIGN\n{campaign_rule}\n\n"
-        + (
-            f"{memory_block}\n\n"
-            if memory_block
-            else ""
-        )
-        + (
-            f"{strategy_block}\n\n"
-            if strategy_block
-            else ""
-        )
-        + (
-            f"{field_questions_prompt}\n\n"
-            if field_questions_prompt
-            else ""
-        )
+    )
+
+    # Conditional assembly: the FIELD-COLLECTION SCRIPT (record schemas + collection
+    # rules, the biggest dynamic block) is only relevant once a record-capture flow
+    # is actually in progress. On pure Q&A / enquiry turns it's dead weight — and the
+    # FSM re-includes it the moment a flow starts — so gate it on an active flow.
+    _tf = tool_flow_state or {}
+    booking_active = bool(_tf.get("active")) and not _tf.get("completed")
+    include_fields = bool(field_questions_prompt) and (booking_active or bool(_tf.get("pending_slot")))
+    dynamic_suffix = (
+        (f"{agent_mode_block}\n\n" if agent_mode_block else "")
+        + (f"{memory_block}\n\n" if memory_block else "")
+        + (f"{strategy_block}\n\n" if strategy_block else "")
+        + (f"{field_questions_prompt}\n\n" if include_fields else "")
         + f"# REMINDER\nReply in {language_label} with natural English code-switching for loanwords, numbers, and ₹ amounts."
         + projects_final_reminder
     )
 
-    messages = [
-        {"role": "system", "content": system_content},
-    ]
-    for turn in history[-8:]:
+    messages = [{"role": "system", "content": static_prefix}]
+    if dynamic_suffix.strip():
+        messages.append({"role": "system", "content": dynamic_suffix})
+    # Send window = last 8 turns verbatim (a 2-turn buffer over the condense
+    # window of 6) so an exchange evicted-for-condensing stays verbatim until the
+    # async rolling-summary fold absorbs it — lossless under rapid-fire. Older
+    # context lives in the `# CONVERSATION SO FAR` summary in the suffix above.
+    for turn in history[-settings.IN_CALL_SUMMARY_SEND_WINDOW:]:
         role = turn.get("role") if turn.get("role") in {"user", "assistant"} else "user"
         messages.append({"role": role, "content": str(turn.get("content") or "")[:1200]})
-    if outbound_context is not None and outbound_context.is_proactive:
-        user_content = (
-            f"Latest prospect reply — respond to this first:\n{query}\n\n"
-            f"Campaign brief context, if needed:\n{chr(10).join(context_parts)}\n\n"
-            f"Reply in {language_label}."
-        )
-    else:
-        user_content = (
-            f"Retrieved tenant context, if any:\n{chr(10).join(context_parts)}\n\n"
-            f"Current user question:\n{query}\n\n"
-            f"Reply in {language_label}."
-        )
+    # (KB/document-RAG retired — no retrieved-context slot.)
+    user_content = (
+        f"Current user question:\n{query}\n\n"
+        f"Reply in {language_label}."
+    )
     messages.append({"role": "user", "content": user_content})
     return messages
 

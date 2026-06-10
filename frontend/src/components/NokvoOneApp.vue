@@ -9,7 +9,6 @@ import nokvoLogo from '../assets/nokvo-one-logo.png';
 import {
   Activity,
   Bell,
-  BookOpen,
   Bot,
   Brain,
   CalendarDays,
@@ -33,10 +32,12 @@ import {
   Plug,
   Plus,
   Radio,
+  Repeat,
   Search,
   Settings2,
   Shield,
   Square,
+  Stethoscope,
   SunMedium,
   SunMedium as Sun,
   Trash2,
@@ -49,7 +50,16 @@ import {
   XCircle,
 } from 'lucide-vue-next';
 
-const API_BASE_URL = 'http://localhost:8000/api/nokvo-one';
+import {
+  NOKVO_ONE_API_BASE,
+  NOKVO_ONE_AGENTS_BASE,
+  NOKVO_ONE_KB_BASE,
+  NOKVO_ONE_SERVICES_BASE,
+  NOKVO_CONNECT_API_BASE,
+  wsUrl,
+} from '../config.js';
+
+const API_BASE_URL = NOKVO_ONE_API_BASE;
 const ACCESS_TOKEN_KEY = 'nokvo_one_access_token';
 const REFRESH_TOKEN_KEY = 'nokvo_one_refresh_token';
 const THEME_KEY = 'nokvo_one_theme_mode';
@@ -65,7 +75,7 @@ const router = useRouter();
 const route = useRoute();
 
 const api = axios.create({ baseURL: API_BASE_URL });
-const connectApi = axios.create({ baseURL: 'http://localhost:8000/api/nokvo-one/connect' });
+const connectApi = axios.create({ baseURL: NOKVO_CONNECT_API_BASE });
 
 const orgShellRef = ref(null);
 const themeMode = ref(localStorage.getItem(THEME_KEY) || 'light');
@@ -537,7 +547,8 @@ const isSavingBusinessType = ref(false);
 const fieldEditor = ref({
   key: null,
   title: '',
-  fields: [],
+  items: [],
+  isLoading: false,
   isSaving: false,
 });
 const assignmentEditor = ref({
@@ -582,6 +593,9 @@ const memberPageLabel = computed(() => currentBusinessTemplate.value?.member_lab
 const businessTypeRequired = computed(() => !currentOrganization.value?.industry);
 const businessTemplateTabs = computed(() => currentBusinessTemplate.value?.tabs || []);
 const showAppointmentsTab = computed(() => businessTemplateTabs.value.includes('appointments'));
+// Config-driven, like appointments. Clinics drop the generic Tickets tab
+// (appointments are their primary record), so this is false for clinics.
+const showTicketsTab = computed(() => businessTemplateTabs.value.includes('tickets'));
 const isClinicTemplate = computed(() => currentOrganization.value?.industry === 'clinics');
 const schemaFor = (key) => currentBusinessTemplate.value?.schemas?.[key] || [];
 
@@ -701,14 +715,6 @@ const organizationHealth = computed(() => {
       detail: agents.value.length ? 'At least one agent is configured and ready to test.' : 'Create an agent before live workflows can run.',
     },
     {
-      key: 'knowledge',
-      label: 'Knowledge base',
-      state: approvedDocs ? (kbIssueCount ? 'warn' : 'good') : 'warn',
-      detail: approvedDocs
-        ? `${approvedDocs} approved document${approvedDocs === 1 ? '' : 's'}${kbIssueCount ? `, ${kbIssueCount} item${kbIssueCount === 1 ? '' : 's'} need review.` : '.'}`
-        : 'No approved knowledge documents yet.',
-    },
-    {
       key: 'runtime',
       label: 'Voice runtime',
       state: runtimeHasBadStatus ? 'blocked' : (runtimeStatus.value ? 'good' : 'warn'),
@@ -762,6 +768,7 @@ const toggleThemeMode = () => {
 
 const switchPage = (page) => {
   if (page === 'appointments' && !showAppointmentsTab.value) return;
+  if (page === 'tickets' && !showTicketsTab.value) return;
   // Nokvo Connect is feature-flagged. When disabled, swallow any attempt to
   // navigate to its landing pages (nav button is already hidden, but this
   // catches deep-links / programmatic calls) so the user can't reach a
@@ -789,9 +796,13 @@ const switchPage = (page) => {
     loadMyTimetable();
     return;
   }
-  if (page === 'knowledge_base') {
-    loadKnowledgeDocuments();
-    loadSinglePromptAgent();
+  if (page === 'followups') {
+    loadFollowupPipeline();
+    return;
+  }
+  if (page === 'services') {
+    loadClinicServices();
+    return;
   }
   if (page === 'agent') {
     loadRuntimeStatus();
@@ -855,7 +866,7 @@ const PROVISIONING_LABELS = {
   blob_prefix: 'Shared blob prefix',
   qdrant_collection: 'Qdrant collection (shared cluster)',
   redis_namespace: 'Redis namespace (shared)',
-  exotel_placeholder: 'Exotel slot',
+  plivo_telephony: 'Plivo telephony (subaccount + number)',
 };
 
 const stepLabel = (name) => PROVISIONING_LABELS[name] || name;
@@ -879,10 +890,12 @@ const stepDescription = (name, status, summary) => {
       return summary.qdrant_collection_name || 'Pending';
     case 'redis_namespace':
       return summary.redis_namespace || 'Pending';
-    case 'exotel_placeholder':
-      return summary.exotel_status === 'pending_credentials'
-        ? 'Slot reserved · credentials to be added by superadmin'
-        : summary.exotel_status || 'Pending';
+    case 'plivo_telephony':
+      if (summary.exotel_status === 'pending_provisioning')
+        return 'Reserved · Plivo not configured yet';
+      return summary.exotel_status === 'linked'
+        ? 'Subaccount + number provisioned'
+        : summary.exotel_status || 'Number pending carrier verification';
     default:
       return '';
   }
@@ -1219,7 +1232,7 @@ const connectNotificationsSocket = () => {
   closeNotificationsSocket();
   const token = localStorage.getItem(ACCESS_TOKEN_KEY);
   if (!token) return;
-  const url = `ws://localhost:8000/api/nokvo-one/notifications/ws?token=${encodeURIComponent(token)}`;
+  const url = wsUrl(`/api/nokvo-one/notifications/ws?token=${encodeURIComponent(token)}`);
   let sock;
   try {
     sock = new WebSocket(url);
@@ -1734,12 +1747,13 @@ const finishRealEstateWizard = async () => {
     activeAgent.value = agent;
     try {
       await kbApi.post(
-        '/single-prompt-agent',
-        { prompt },
+        '/business-facts',
+        { business_facts: prompt },
         { headers: authHeader() },
       );
     } catch {
-      // Single-prompt write is best-effort; the agent has the prompt either way.
+      // Business-facts write is best-effort; the agent runs on the curated
+      // per-vertical prompt regardless of whether facts were captured here.
     }
     infoMsg.value = `Your agent "${agent.name}" is ready.`;
     authState.value = 'ready';
@@ -1796,24 +1810,25 @@ const submitSampleUpload = async () => {
     }
     return;
   }
-  // mode === 'prompt'
+  // mode === 'prompt' — captured as the org's Business facts (the agent's
+  // persona is the curated per-vertical prompt; this is just org specifics).
   const prompt = (sampleUpload.value.prompt || '').trim();
   if (prompt.length < 20) {
-    errorMsg.value = 'Prompt must be at least 20 characters.';
+    errorMsg.value = 'Please add at least 20 characters of business details.';
     return;
   }
   sampleUpload.value.isUploading = true;
   errorMsg.value = '';
   try {
     await kbApi.post(
-      '/single-prompt-agent',
-      { prompt },
+      '/business-facts',
+      { business_facts: prompt },
       { headers: authHeader() },
     );
-    infoMsg.value = 'Your single-prompt agent is configured. You can refine it later in Settings.';
+    infoMsg.value = 'Your business details are saved. You can refine them later in Advanced Settings.';
     skipSampleUpload();
   } catch (err) {
-    errorMsg.value = extractErrorMessage(err, 'Could not save the single-prompt setup.');
+    errorMsg.value = extractErrorMessage(err, 'Could not save your business details.');
   } finally {
     sampleUpload.value.isUploading = false;
   }
@@ -1821,17 +1836,30 @@ const submitSampleUpload = async () => {
 
 const cloneFields = (key) => schemaFor(key).map((field) => ({ ...field }));
 
-const startFieldEdit = (key, title) => {
-  fieldEditor.value = {
-    key,
-    title,
-    fields: cloneFields(key),
-    isSaving: false,
-  };
+const startFieldEdit = async (key, title) => {
+  // Catalog-driven picker: fetch the selectable field palette for this record and
+  // let the admin choose exactly which fields the agent collects. The agent then
+  // asks ONLY the selected fields. Falls back to the current schema if the catalog
+  // endpoint is unavailable.
+  fieldEditor.value = { key, title, items: [], isLoading: true, isSaving: false };
+  try {
+    const { data } = await api.get(`/business-template/field-catalog/${key}`, { headers: authHeader() });
+    fieldEditor.value.items = (data.fields || []).map((f) => ({ ...f }));
+  } catch (err) {
+    fieldEditor.value.items = cloneFields(key).map((f) => ({
+      ...f,
+      selected: true,
+      kind: 'generic',
+      agent_question: '',
+      custom: true,
+    }));
+  } finally {
+    if (fieldEditor.value.key === key) fieldEditor.value.isLoading = false;
+  }
 };
 
 const closeFieldEdit = () => {
-  fieldEditor.value = { key: null, title: '', fields: [], isSaving: false };
+  fieldEditor.value = { key: null, title: '', items: [], isLoading: false, isSaving: false };
 };
 
 const addCustomTabField = () => {
@@ -2531,30 +2559,41 @@ const closeMemberTimetable = () => {
 };
 
 const addField = () => {
-  fieldEditor.value.fields.push({
-    key: `custom_${fieldEditor.value.fields.length + 1}`,
+  fieldEditor.value.items.push({
+    key: `custom_${fieldEditor.value.items.length + 1}`,
     label: 'New Field',
     type: 'text',
+    kind: 'generic',
+    agent_question: '',
+    selected: true,
     required: false,
+    custom: true,
   });
 };
 
 const removeField = (index) => {
-  if (fieldEditor.value.fields.length <= 1) return;
-  fieldEditor.value.fields.splice(index, 1);
+  fieldEditor.value.items.splice(index, 1);
 };
 
 const saveFieldEdit = async () => {
   if (!fieldEditor.value.key) return;
+  // Only the SELECTED fields are saved → the agent asks exactly these, in order.
+  const fields = fieldEditor.value.items
+    .filter((it) => it.selected)
+    .map((it) => ({
+      key: (it.key || it.label || 'field').trim().toLowerCase().replace(/[\s-]+/g, '_').replace(/[^a-z0-9_]/g, ''),
+      label: (it.label || '').trim(),
+      type: it.type || 'text',
+      required: Boolean(it.required),
+    }))
+    .filter((f) => f.key && f.label);
+  if (!fields.length) {
+    errorMsg.value = 'Select at least one field for the agent to collect.';
+    return;
+  }
   fieldEditor.value.isSaving = true;
   errorMsg.value = '';
   try {
-    const fields = fieldEditor.value.fields.map((field) => ({
-      key: (field.key || field.label || 'field').trim().toLowerCase().replace(/[\s-]+/g, '_').replace(/[^a-z0-9_]/g, ''),
-      label: (field.label || '').trim(),
-      type: field.type || 'text',
-      required: Boolean(field.required),
-    }));
     const { data } = await api.patch(
       `/business-template/schemas/${fieldEditor.value.key}`,
       { fields },
@@ -2577,7 +2616,7 @@ const PROVISIONING_STEP_ORDER = [
   'blob_prefix',
   'qdrant_collection',
   'redis_namespace',
-  'exotel_placeholder',
+  'plivo_telephony',
 ];
 
 const seedProvisioningSteps = () => {
@@ -3326,7 +3365,7 @@ const formatSlotRange = (slot) => {
   return `${start.toLocaleString([], opts)} → ${tail}`;
 };
 
-const kbApi = axios.create({ baseURL: 'http://localhost:8000/api/nokvo-one/knowledge-base' });
+const kbApi = axios.create({ baseURL: NOKVO_ONE_KB_BASE });
 
 const loadKnowledgeDocuments = async () => {
   isLoadingKb.value = true;
@@ -3857,7 +3896,55 @@ const formatBytes = (bytes) => {
 
 // ─────────────────────── Agent Studio: pipeline / phone / campaigns / voice ───────────────────────
 
-const agentsApi = axios.create({ baseURL: 'http://localhost:8000/api/nokvo-one/agents' });
+const agentsApi = axios.create({ baseURL: NOKVO_ONE_AGENTS_BASE });
+
+// ── Clinic services (catalog + doctor mapping) ───────────────────────────
+const servicesApi = axios.create({ baseURL: NOKVO_ONE_SERVICES_BASE });
+const clinicServices = ref([]);
+const clinicDoctors = ref([]);
+const isLoadingServices = ref(false);
+
+const loadClinicServices = async () => {
+  isLoadingServices.value = true;
+  try {
+    const [svc, docs] = await Promise.all([
+      servicesApi.get('/', { headers: authHeader() }),
+      servicesApi.get('/doctors', { headers: authHeader() }),
+    ]);
+    clinicServices.value = Array.isArray(svc.data) ? svc.data : [];
+    clinicDoctors.value = Array.isArray(docs.data) ? docs.data : [];
+  } catch (err) {
+    if (await handleMfaProtectedError(err)) return;
+    errorMsg.value = extractErrorMessage(err, 'Failed to load services.');
+  } finally {
+    isLoadingServices.value = false;
+  }
+};
+
+const saveClinicService = async (payload) => {
+  // payload may include an id (update) or not (create). doctor_ids on create;
+  // mapping is set separately via setServiceDoctors for updates.
+  if (payload.id) {
+    const { id, doctor_ids, ...patch } = payload;
+    await servicesApi.patch(`/${id}`, patch, { headers: authHeader() });
+    if (Array.isArray(doctor_ids)) {
+      await servicesApi.put(`/${id}/doctors`, { doctor_ids }, { headers: authHeader() });
+    }
+  } else {
+    await servicesApi.post('/', payload, { headers: authHeader() });
+  }
+  await loadClinicServices();
+};
+
+const setServiceDoctors = async (serviceId, doctorIds) => {
+  await servicesApi.put(`/${serviceId}/doctors`, { doctor_ids: doctorIds }, { headers: authHeader() });
+  await loadClinicServices();
+};
+
+const deleteClinicService = async (serviceId) => {
+  await servicesApi.delete(`/${serviceId}`, { headers: authHeader() });
+  await loadClinicServices();
+};
 
 const loadRuntimeStatus = async () => {
   try {
@@ -3872,7 +3959,8 @@ const loadPhoneLink = async () => {
   try {
     const { data } = await agentsApi.get('/phone-link', { headers: authHeader() });
     phoneLink.value = data;
-    phoneLinkInput.value = data.link_id || '';
+    // The tenant enters THEIR own number to forward to the assigned Plivo DID.
+    phoneLinkInput.value = data.forward_from_number || '';
   } catch (err) {
     phoneLink.value = null;
   }
@@ -3883,7 +3971,7 @@ const savePhoneLink = async () => {
   try {
     const { data } = await agentsApi.post(
       '/phone-link',
-      { link_id: phoneLinkInput.value.trim() || null },
+      { forward_from_number: phoneLinkInput.value.trim() || null },
       { headers: authHeader() },
     );
     phoneLink.value = data;
@@ -4282,6 +4370,75 @@ const followupSummary = ref({
 // Keyed by lead_id → list of follow-up rows (newest first). Populated
 // on-demand from /followups?lead_id when the chip opens its detail panel.
 const leadFollowupsByLeadId = ref({});
+// Keyed by lead_id → { handoff_note, handoff_note_generated_at }. Filled
+// by the same endpoint as the follow-up rows so the LeadsView drawer can
+// render the manager-readable summary above the schedule list without an
+// extra round-trip.
+const leadHandoffByLeadId = ref({});
+
+// Business facts: the org's free-text specifics (hours, services, prices,
+// staff) appended to the curated per-vertical agent prompt. Replaces the old
+// admin "single prompt". Edited in Advanced Settings.
+const businessFacts = ref('');
+const loadBusinessFacts = async () => {
+  try {
+    const { data } = await kbApi.get('/business-facts', { headers: authHeader() });
+    businessFacts.value = String(data?.business_facts || '');
+    return businessFacts.value;
+  } catch (err) {
+    if (await handleMfaProtectedError(err)) return '';
+    errorMsg.value = extractErrorMessage(err, 'Failed to load business facts.');
+    return '';
+  }
+};
+const saveBusinessFacts = async (text) => {
+  const { data } = await kbApi.post(
+    '/business-facts',
+    { business_facts: String(text || '') },
+    { headers: authHeader() },
+  );
+  businessFacts.value = String(data?.business_facts || '');
+  return businessFacts.value;
+};
+
+// Full Follow-Up Pipeline payload (counts + bucketed queue + today's queue
+// with handoff notes + conversion ROI). Loaded on demand when the Follow-ups
+// page is opened. null until first load so the view can show a skeleton.
+const followupPipeline = ref(null);
+
+const loadFollowupPipeline = async () => {
+  try {
+    const { data } = await agentsApi.get('/followups/pipeline', { headers: authHeader() });
+    if (data && typeof data === 'object') {
+      followupPipeline.value = data;
+    }
+  } catch (err) {
+    if (await handleMfaProtectedError(err)) return;
+    errorMsg.value = extractErrorMessage(err, 'Failed to load the follow-up pipeline.');
+  }
+};
+
+// Outgoing-lead list for the manual "Add follow-up" picker. Returns a light
+// {id, name, phone} array; fetched on demand when the form opens (follow-ups
+// schedule against OutgoingLead, not the inbound tool-records the tabs show).
+const loadOutgoingLeadsForPicker = async () => {
+  try {
+    const { data } = await agentsApi.get('/lead-sources/leads', {
+      headers: authHeader(),
+      params: { limit: 200 },
+    });
+    if (!Array.isArray(data)) return [];
+    return data.map((l) => ({
+      id: l.id,
+      name: l.name || l.phone_e164 || l.phone_raw || 'Lead',
+      phone: l.phone_e164 || l.phone_raw || null,
+    }));
+  } catch (err) {
+    if (await handleMfaProtectedError(err)) return [];
+    errorMsg.value = extractErrorMessage(err, 'Failed to load leads for the picker.');
+    return [];
+  }
+};
 
 const loadFollowupSummary = async () => {
   try {
@@ -4303,6 +4460,19 @@ const loadFollowupsForLead = async (leadId) => {
     });
     const items = (data && Array.isArray(data.items)) ? data.items : [];
     leadFollowupsByLeadId.value = { ...leadFollowupsByLeadId.value, [leadId]: items };
+    // The same endpoint returns the lead's handoff note alongside its
+    // schedule rows. Stash it under the lead id so the drawer can render
+    // it on the same render pass.
+    const leadEnvelope = (data && typeof data.lead === 'object') ? data.lead : null;
+    if (leadEnvelope) {
+      leadHandoffByLeadId.value = {
+        ...leadHandoffByLeadId.value,
+        [leadId]: {
+          handoff_note: leadEnvelope.handoff_note || null,
+          handoff_note_generated_at: leadEnvelope.handoff_note_generated_at || null,
+        },
+      };
+    }
     return items;
   } catch (err) {
     if (await handleMfaProtectedError(err)) return [];
@@ -4782,7 +4952,7 @@ const _buildOutboundTesterWsUrl = (token, testerSessionToken) => {
   // straight from the DB and ignores the per-field params below.
   if (selectedTesterCampaignId.value) {
     params.set('campaign_id', String(selectedTesterCampaignId.value));
-    return `ws://localhost:8000/api/nokvo-one/agents/voice/outbound-tester/ws?${params.toString()}`;
+    return wsUrl(`/api/nokvo-one/agents/voice/outbound-tester/ws?${params.toString()}`);
   }
   // Fallback (no campaign selected) — legacy per-field rehearsal.
   if (tester.caller_name) params.set('caller_name', tester.caller_name.trim());
@@ -4795,7 +4965,7 @@ const _buildOutboundTesterWsUrl = (token, testerSessionToken) => {
   if (tester.exit_conditions) params.set('exit_conditions', tester.exit_conditions.trim());
   if (tester.tone) params.set('tone', tester.tone.trim());
   if (tester.name) params.set('name', tester.name.trim());
-  return `ws://localhost:8000/api/nokvo-one/agents/voice/outbound-tester/ws?${params.toString()}`;
+  return wsUrl(`/api/nokvo-one/agents/voice/outbound-tester/ws?${params.toString()}`);
 };
 
 const _prepareOutboundTesterSession = async () => {
@@ -4902,10 +5072,13 @@ const startVoiceCall = async (mode = 'inbound') => {
     // Continuous PCM capture with rolling pre-roll buffer (replaces MediaRecorder).
     setupPcmCapture(voice.value.audioCtx, stream);
 
-    const wsUrl = mode === 'outbound'
+    // Local var; shadows the imported wsUrl() helper from ../config.js.
+    // Renaming to ``socketUrl`` avoids that collision so we can still call
+    // wsUrl() for the inbound fallback path below.
+    const socketUrl = mode === 'outbound'
       ? _buildOutboundTesterWsUrl(encodeURIComponent(token), testerSessionToken)
-      : `ws://localhost:8000/api/nokvo-one/agents/voice/ws?token=${encodeURIComponent(token)}`;
-    const ws = new WebSocket(wsUrl);
+      : wsUrl(`/api/nokvo-one/agents/voice/ws?token=${encodeURIComponent(token)}`);
+    const ws = new WebSocket(socketUrl);
     ws.binaryType = 'arraybuffer';
     voice.value.ws = ws;
 
@@ -5447,8 +5620,23 @@ provideDashboardState({
   removeCampaign,
 
   // Follow-up agent
+  businessFacts,
+  loadBusinessFacts,
+  saveBusinessFacts,
+  // Clinic services
+  clinicServices,
+  clinicDoctors,
+  isLoadingServices,
+  loadClinicServices,
+  saveClinicService,
+  setServiceDoctors,
+  deleteClinicService,
   followupSummary,
+  followupPipeline,
+  loadFollowupPipeline,
+  loadOutgoingLeadsForPicker,
   leadFollowupsByLeadId,
+  leadHandoffByLeadId,
   loadFollowupSummary,
   loadFollowupsForLead,
   pauseFollowup,
@@ -6532,13 +6720,17 @@ provideDashboardState({
                 <Activity :size="14" />
                 <span>Dashboard</span>
               </button>
-              <button type="button" class="n-shell-nav__item" :class="{ 'is-active': currentPage === 'tickets' }" @click="switchPage('tickets')">
+              <button v-if="showTicketsTab" type="button" class="n-shell-nav__item" :class="{ 'is-active': currentPage === 'tickets' }" @click="switchPage('tickets')">
                 <FileText :size="14" />
                 <span>{{ ticketsTabLabel }}</span>
               </button>
               <button type="button" class="n-shell-nav__item" :class="{ 'is-active': currentPage === 'leads' }" @click="switchPage('leads')">
                 <UserPlus :size="14" />
                 <span>Leads</span>
+              </button>
+              <button type="button" class="n-shell-nav__item" :class="{ 'is-active': currentPage === 'followups' }" @click="switchPage('followups')">
+                <Repeat :size="14" />
+                <span>Follow-ups</span>
               </button>
               <button
                 v-if="isRealEstateTemplate"
@@ -6549,6 +6741,16 @@ provideDashboardState({
               >
                 <Layers :size="14" />
                 <span>Projects</span>
+              </button>
+              <button
+                v-if="isClinicTemplate"
+                type="button"
+                class="n-shell-nav__item"
+                :class="{ 'is-active': currentPage === 'services' }"
+                @click="switchPage('services')"
+              >
+                <Stethoscope :size="14" />
+                <span>Services</span>
               </button>
               <button
                 v-if="showAppointmentsTab"
@@ -6571,10 +6773,6 @@ provideDashboardState({
               <button type="button" class="n-shell-nav__item" :class="{ 'is-active': currentPage === 'outgoing_agent' }" @click="switchPage('outgoing_agent')">
                 <PhoneCall :size="14" />
                 <span>Outbound</span>
-              </button>
-              <button type="button" class="n-shell-nav__item" :class="{ 'is-active': currentPage === 'knowledge_base' }" @click="switchPage('knowledge_base')">
-                <BookOpen :size="14" />
-                <span>Knowledge</span>
               </button>
             </template>
           </nav>
@@ -6876,29 +7074,43 @@ provideDashboardState({
       <section class="field-modal">
         <div class="members-card-head">
           <div>
-            <h3>Edit {{ fieldEditor.title }}</h3>
-            <p>Use plain names your team recognizes. Required fields appear as must-fill details.</p>
+            <h3>{{ fieldEditor.title }}</h3>
+            <p>Tick the details the agent should ask for. It collects ONLY the selected fields, in this order — and stores them on this tab.</p>
           </div>
           <button type="button" class="ghost-button compact" @click="closeFieldEdit">Close</button>
         </div>
 
-        <div class="field-editor-list">
-          <div v-for="(field, index) in fieldEditor.fields" :key="`${field.key}:${index}`" class="field-editor-row">
-            <label>
-              <span>Field Name</span>
-              <input v-model="field.label" type="text" placeholder="Customer Name" />
+        <div v-if="fieldEditor.isLoading" class="field-editor-list">
+          <p class="field-editor-empty">Loading fields…</p>
+        </div>
+        <div v-else class="field-editor-list">
+          <div
+            v-for="(field, index) in fieldEditor.items"
+            :key="`${field.key}:${index}`"
+            class="field-editor-row catalog-row"
+            :class="{ 'is-selected': field.selected }"
+          >
+            <label class="field-required-toggle">
+              <input v-model="field.selected" type="checkbox" />
+              <span>Collect</span>
             </label>
             <label>
+              <span>Field</span>
+              <input v-if="field.custom" v-model="field.label" type="text" placeholder="Field name" />
+              <strong v-else class="catalog-field-name">{{ field.label }}</strong>
+            </label>
+            <label v-if="field.custom">
               <span>Type</span>
               <select v-model="field.type">
                 <option v-for="type in fieldTypes" :key="type" :value="type">{{ type }}</option>
               </select>
             </label>
             <label class="field-required-toggle">
-              <input v-model="field.required" type="checkbox" />
+              <input v-model="field.required" type="checkbox" :disabled="!field.selected" />
               <span>Required</span>
             </label>
-            <button type="button" class="nav-icon-button" :disabled="fieldEditor.fields.length <= 1" @click="removeField(index)">
+            <p v-if="field.agent_question" class="catalog-question">Agent asks: “{{ field.agent_question }}”</p>
+            <button v-if="field.custom" type="button" class="nav-icon-button" @click="removeField(index)">
               <Trash2 :size="16" />
             </button>
           </div>
@@ -6907,9 +7119,9 @@ provideDashboardState({
         <div class="field-modal-actions">
           <button type="button" class="ghost-button compact" @click="addField">
             <Plus :size="15" />
-            Add Field
+            Add custom field
           </button>
-          <button type="button" class="primary-button compact" :disabled="fieldEditor.isSaving" @click="saveFieldEdit">
+          <button type="button" class="primary-button compact" :disabled="fieldEditor.isSaving || fieldEditor.isLoading" @click="saveFieldEdit">
             {{ fieldEditor.isSaving ? 'Saving...' : 'Save Fields' }}
           </button>
         </div>
@@ -9326,6 +9538,31 @@ provideDashboardState({
   border-radius: 0.9rem;
   border: 1px solid var(--line-solid);
   background: var(--paper);
+}
+
+/* Catalog-driven picker rows: [Collect] [Field] [Required] + the agent's question. */
+.field-editor-row.catalog-row {
+  grid-template-columns: 88px minmax(160px, 1fr) 110px;
+  align-items: center;
+  opacity: 0.72;
+}
+.field-editor-row.catalog-row.is-selected {
+  opacity: 1;
+  border-color: var(--accent, #6b8f5e);
+}
+.field-editor-row.catalog-row .catalog-field-name {
+  font-weight: 600;
+}
+.field-editor-row.catalog-row .catalog-question {
+  grid-column: 1 / -1;
+  margin: 0;
+  font-size: 0.82rem;
+  color: var(--muted);
+  font-style: italic;
+}
+.field-editor-empty {
+  color: var(--muted);
+  padding: 1rem 0;
 }
 
 .field-editor-row label {

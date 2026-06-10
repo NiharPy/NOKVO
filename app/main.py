@@ -45,10 +45,10 @@ from app.api import (
     nokvo_one_members,
     nokvo_one_agents,
     nokvo_one_billing,
-    nokvo_one_knowledge_base,
     nokvo_one_outcomes,
     nokvo_one_projects,
     nokvo_one_requests,
+    nokvo_one_services,
     nokvo_one_voice,
     connect_admin,
     connect_public,
@@ -63,15 +63,11 @@ app.include_router(nokvo_one_outcomes.router, prefix="/api/nokvo-one", tags=["no
 app.include_router(nokvo_one_members.router, prefix="/api/nokvo-one/members", tags=["nokvo-one-members"])
 app.include_router(nokvo_one_agents.router, prefix="/api/nokvo-one/agents", tags=["nokvo-one-agents"])
 app.include_router(nokvo_one_projects.router, prefix="/api/nokvo-one/projects", tags=["nokvo-one-projects"])
+app.include_router(nokvo_one_services.router, prefix="/api/nokvo-one/services", tags=["nokvo-one-services"])
 app.include_router(
     nokvo_one_voice.router,
     prefix="/api/nokvo-one/agents",
     tags=["nokvo-one-voice"],
-)
-app.include_router(
-    nokvo_one_knowledge_base.router,
-    prefix="/api/nokvo-one/knowledge-base",
-    tags=["nokvo-one-knowledge-base"],
 )
 # Billing (per-call cost ledger summary) + notification inbox / live fanout
 app.include_router(
@@ -126,10 +122,16 @@ from app.services.followup_scheduler import (  # noqa: E402
     start_followup_scheduler,
     stop_followup_scheduler,
 )
+# Prompt-observability seam. ``init_tracer`` reads the LangSmith config
+# and sets up the SDK (or no-ops cleanly when LANGSMITH_API_KEY is unset).
+from app.services.langsmith_tracer import init_tracer  # noqa: E402
 
 
 @app.on_event("startup")
 async def _start_retry_scheduler() -> None:
+    # Tracing first so any startup-side LLM call (rare, but possible if a
+    # scheduler kicks one off in its first tick) is observed too.
+    init_tracer()
     start_scheduler()
     start_lead_sync_scheduler()
     start_followup_scheduler()

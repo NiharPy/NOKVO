@@ -12,11 +12,12 @@ import SuperAdminDashboard from '../components/SuperAdminDashboard.vue';
 const DashboardView = () => import('../views/DashboardView.vue');
 const TicketsView = () => import('../views/TicketsView.vue');
 const LeadsView = () => import('../views/LeadsView.vue');
+const FollowUpPipeline = () => import('../views/FollowUpPipeline.vue');
 const AppointmentsView = () => import('../views/AppointmentsView.vue');
 const ProjectsView = () => import('../views/ProjectsView.vue');
+const ServicesView = () => import('../views/ServicesView.vue');
 const AgentView = () => import('../views/AgentView.vue');
 const OutgoingAgentView = () => import('../views/OutgoingAgentView.vue');
-const KnowledgeBaseView = () => import('../views/KnowledgeBaseView.vue');
 const MyTimetableView = () => import('../views/MyTimetableView.vue');
 const OrganizationHealthView = () => import('../views/OrganizationHealthView.vue');
 const NokvoConnectView = () => import('../views/NokvoConnectView.vue');
@@ -27,12 +28,13 @@ const dashboardChildren = [
   { path: 'home', component: DashboardView, name: 'dash-home', meta: { pageKey: 'dashboard' } },
   { path: 'tickets', component: TicketsView, name: 'dash-tickets', meta: { pageKey: 'tickets' } },
   { path: 'leads', component: LeadsView, name: 'dash-leads', meta: { pageKey: 'leads' } },
+  { path: 'followups', component: FollowUpPipeline, name: 'dash-followups', meta: { pageKey: 'followups' } },
   { path: 'appointments', component: AppointmentsView, name: 'dash-appointments', meta: { pageKey: 'appointments' } },
   { path: 'projects', component: ProjectsView, name: 'dash-projects', meta: { pageKey: 'projects' } },
+  { path: 'services', component: ServicesView, name: 'dash-services', meta: { pageKey: 'services' } },
   { path: 'agent', component: AgentView, name: 'dash-agent', meta: { pageKey: 'agent' } },
   { path: 'campaigns', component: OutgoingAgentView, name: 'dash-campaigns', meta: { pageKey: 'outgoing_agent' } },
   { path: 'campaigns/:campaignId', component: OutgoingAgentView, name: 'dash-campaign-detail', meta: { pageKey: 'outgoing_agent' } },
-  { path: 'knowledge-base', component: KnowledgeBaseView, name: 'dash-knowledge', meta: { pageKey: 'knowledge_base' } },
   { path: 'my-timetable', component: MyTimetableView, name: 'dash-my-timetable', meta: { pageKey: 'my_timetable' } },
   { path: 'organization-health', component: OrganizationHealthView, name: 'dash-org-health', meta: { pageKey: 'organization_health' } },
   { path: 'connect', component: NokvoConnectView, name: 'dash-connect', meta: { pageKey: 'nokvo_connect' } },

@@ -212,6 +212,12 @@ def _project_match_score(spoken: str, spoken_tokens: set[str], project: RealEsta
     score = 0.0
     if spoken and (spoken in name_norm or name_norm in spoken):
         score = 0.8
+    # De-spaced comparison so STT word-splitting / concatenation still matches:
+    # "sky line heights" ≈ "Skyline Heights", "Greenacres" ≈ "Green Acres".
+    spoken_ns = spoken.replace(" ", "")
+    name_ns = name_norm.replace(" ", "")
+    if spoken_ns and name_ns and (spoken_ns == name_ns or spoken_ns in name_ns or name_ns in spoken_ns):
+        score = max(score, 0.85)
     name_tokens = _project_tokens(project.name)
     if spoken_tokens and name_tokens:
         overlap = spoken_tokens & name_tokens

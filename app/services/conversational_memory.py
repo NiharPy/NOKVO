@@ -628,7 +628,10 @@ _CORRECTION_RE = re.compile(
 _OBJECTION_PATTERNS = (
     (re.compile(r"\b(not interested|don't call|do not call|remove me|wrong number)\b", re.IGNORECASE), "do_not_call"),
     (re.compile(r"\b(busy|call later|later please|not (?:now|today))\b", re.IGNORECASE), "call_later"),
-    (re.compile(r"\b(expensive|costly|too high|out of budget|over budget)\b", re.IGNORECASE), "price_concern"),
+    (re.compile(r"\b(expensive|costly|too high|too much|out of budget|over budget|"
+                r"(?:can'?t|cannot|can\s+not)\s+afford|(?:not|don'?t)\s+afford|"
+                r"beyond (?:my |our )?budget|out of (?:my |our )?(?:budget|range)|pricey|"
+                r"bahut\s*mehenga|mehnga|budget\s*se\s*bahar)\b", re.IGNORECASE), "price_concern"),
     (re.compile(r"\b(already (?:have|bought|booked)|other (?:agent|developer|broker))\b", re.IGNORECASE), "competitor"),
     (re.compile(r"\b(later this year|next year|after months?|in a few months)\b", re.IGNORECASE), "long_horizon"),
     (re.compile(r"\b(you (?:keep|already) ask(?:ing|ed)|already (?:told|said|gave) (?:you|that)|same (?:thing|question)( again)?|asked me (?:that|this)( already)?|i just (?:told|said)|stop asking)\b", re.IGNORECASE), "repetition_complaint"),
@@ -688,8 +691,20 @@ _OPT_OUT_RE = re.compile(
     r"unsubscribe me|opt me out|"
     r"no more calls|never call (?:me|us)(?: again)?|"
     r"leave me alone|stop bothering me|"
-    r"add (?:me|us) to (?:the )?do(?:-| )not(?:-| )call(?: list| registry)?"
-    r")\b",
+    r"add (?:me|us) to (?:the )?do(?:-| )not(?:-| )call(?: list| registry)?|"
+    # Hindi (transliterated): "call/phone mat karo/karna", "mat bulao",
+    # "dobara call mat karna", "pareshan mat karo".
+    r"(?:call|phone|fon)\s*mat\s*(?:karo|karna|kijiye|kariye)|"
+    r"mat\s*(?:bulao|bulaya?o|karo)\b|"
+    r"dobara\s*(?:call|phone|fon)?\s*mat|"
+    r"pareshan\s*mat\s*karo|"
+    # Telugu (transliterated): "call/phone cheyaku/cheyakandi/cheyyaku/cheyyoddu".
+    r"(?:call|phone|fon)\s*chey(?:aku|akandi|yaku|yoddu|yakandi)|"
+    r"call\s*cheyy?(?:aku|oddu|akandi)"
+    r")\b|"
+    # Devanagari / Telugu script opt-outs (\b is unreliable around these).
+    r"(call\s*मत\s*कर|फ़?ोन\s*मत\s*कर|मुझे\s*मत\s*बुला|"
+    r"కాల్\s*చేయ(?:కండి|వద్దు|కు)|ఫోన్\s*చేయ(?:కండి|వద్దు|కు))",
     re.IGNORECASE,
 )
 
@@ -1846,6 +1861,14 @@ class ConversationalMemory:
     # by ``bootstrap_caller_memory``). Lets the strategy layer open a
     # returning caller where they left off instead of from discovery.
     prior_stage: str | None = None
+    # LLM-condensed running narrative of the call so far (everything older than
+    # the verbatim window). Maintained async by in_call_summary_service.fold so
+    # the agent stays aware of the whole conversation on long calls.
+    rolling_summary: str = ""
+    # Count of leading history turns already folded into ``rolling_summary`` (the
+    # fold cursor — only turns past this and older than the condense window get
+    # folded next, so each exchange is summarized exactly once).
+    summarized_turns: int = 0
 
     @property
     def bootstrap_keys(self) -> set[str]:
@@ -1876,6 +1899,8 @@ class ConversationalMemory:
             # sees the prior-call markers it expects.
             "bootstrap_keys": sorted(self.bootstrap_keys),
             "prior_stage": self.prior_stage,
+            "rolling_summary": self.rolling_summary,
+            "summarized_turns": self.summarized_turns,
         }
 
     @classmethod
@@ -1904,6 +1929,8 @@ class ConversationalMemory:
             salient_notes=list(data.get("salient_notes") or []),
             asked_questions=list(data.get("asked_questions") or []),
             prior_stage=(str(data["prior_stage"]) if data.get("prior_stage") else None),
+            rolling_summary=str(data.get("rolling_summary") or ""),
+            summarized_turns=int(data.get("summarized_turns") or 0),
         )
 
     # ── Reads ────────────────────────────────────────────────────────
@@ -2137,8 +2164,20 @@ class ConversationalMemory:
             if text:
                 salient_lines.append(f"  - {text}")
 
-        if not lines and not salient_lines:
+        summary_text = (self.rolling_summary or "").strip()
+        if not lines and not salient_lines and not summary_text:
             return ""
+
+        # The rolling narrative of everything older than the verbatim window —
+        # so the agent stays aware of the whole call, not just recent turns.
+        summary_section = (
+            "# CONVERSATION SO FAR\n"
+            "The running summary of this call so far (older context beyond the recent turns). "
+            "Use it to stay consistent — don't re-ask what's settled, and pick up open threads.\n"
+            f"{summary_text}\n\n"
+            if summary_text
+            else ""
+        )
 
         header = (
             "# CONVERSATIONAL MEMORY — already known about this caller\n"
@@ -2155,7 +2194,7 @@ class ConversationalMemory:
             if lines:
                 block += "\n"
             block += "Key details to remember:\n" + "\n".join(salient_lines)
-        return block
+        return summary_section + block
 
 
 # ── Session-store load / save ───────────────────────────────────────────────

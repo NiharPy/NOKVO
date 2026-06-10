@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import uuid
 from dataclasses import dataclass, field
@@ -39,6 +40,8 @@ from app.models.nokvo_one_tool_record import NokvoOneToolRecord
 from app.models.organization import Organization
 from app.services.nokvo_one_assignment_service import NokvoOneAssignmentService
 
+
+logger = logging.getLogger("nokvo_one.predefined_tools")
 
 JSONSchema = dict[str, Any]
 ToolHandler = Callable[..., Awaitable[dict[str, Any]]]
@@ -213,6 +216,8 @@ MACRO_CATALOG: dict[str, tuple[PredefinedTool, ...]] = {
                     "phone": {"type": "string", "minLength": 4, "maxLength": 32},
                     "email": {"type": "string", "format": "email"},
                     "reason": {"type": "string", "minLength": 1, "maxLength": 500},
+                    "service": {"type": "string", "maxLength": 200, "description": "The clinic service the patient is booking (used to route to a doctor who provides it)."},
+                    "service_id": {"type": "string", "maxLength": 64},
                     "preferred_doctor": {"type": "string", "maxLength": 200},
                     "department": {"type": "string", "maxLength": 200},
                     "appointment_time": {"type": "string", "format": "date-time"},
@@ -237,7 +242,11 @@ MACRO_CATALOG: dict[str, tuple[PredefinedTool, ...]] = {
             handler_name="macro_qualify_lead_and_schedule_visit",
             input_schema={
                 "type": "object",
-                "required": ["name", "phone", "visit_at"],
+                # Strictly field-driven: the FSM enforces the admin's OWN required
+                # fields (the configured Site Visit Fields). The tool only needs a
+                # contactable phone to create a usable lead; name/visit_at are
+                # optional so a form like {name, budget, phone} (no date) still books.
+                "required": ["phone"],
                 "properties": {
                     "name": {"type": "string", "minLength": 1, "maxLength": 200},
                     "phone": {"type": "string", "minLength": 4, "maxLength": 32},
@@ -477,7 +486,16 @@ def _validate_tool_arguments(tool: PredefinedTool, arguments: dict[str, Any]) ->
     if schema.get("additionalProperties") is False:
         extra = [key for key in arguments if key not in properties]
         if extra:
-            raise ValueError(f"Unsupported fields for {tool.key}: {', '.join(extra)}")
+            # The voice pipeline intentionally over-supplies field aliases
+            # (name→customer_name/patient_name/…, phone→mobile/contact_phone/…) to
+            # be robust across tool schemas. DROP the ones this tool doesn't accept
+            # rather than raising — a raise here previously failed the whole action,
+            # triggered a fresh-session retry, and cascaded into MissingGreenlet
+            # (and the record was lost). Tolerant by design: extras are noise, not
+            # a reason to abort.
+            for key in extra:
+                arguments.pop(key, None)
+            logger.debug("Dropped unsupported fields for %s: %s", tool.key, extra)
 
     for key, value in arguments.items():
         field = properties.get(key)
@@ -958,6 +976,42 @@ class PredefinedToolsService:
 
     @staticmethod
     async def _handle_macro_book_appointment_with_lead_capture(db, org_id, user_id, tool, args):
+        # Service-first routing (clinics): resolve the requested service to the
+        # doctors who provide it, so the assignment engine only considers
+        # eligible doctors. Unmatched / no service → eligible_member_ids stays
+        # None (assign as before). We keep the caller's spoken service text even
+        # when it doesn't match a configured service, so the record shows intent.
+        from app.services.clinic_service_service import (
+            load_active_services,
+            find_service_match,
+            provider_member_ids_for_service,
+        )
+
+        service_name: str | None = None
+        service_id_str: str | None = None
+        eligible_member_ids: list[uuid.UUID] | None = None
+        spoken_service = args.get("service")
+        spoken_service = spoken_service.strip() if isinstance(spoken_service, str) else None
+        # Resolve the service from an explicit service/service_id arg, else fall
+        # back to matching the free-text reason ("I want a dental cleaning") —
+        # the reason slot is always collected, so this gives service-first
+        # routing without a dedicated FSM slot.
+        services = await load_active_services(db, org_id)
+        matched_service = None
+        if services:
+            matched_service = find_service_match(
+                services, service_id=args.get("service_id"), name=spoken_service
+            )
+            if matched_service is None and args.get("reason"):
+                matched_service = find_service_match(services, name=str(args.get("reason")))
+        if matched_service is not None:
+            service_name = matched_service.name
+            service_id_str = str(matched_service.id)
+            ids = await provider_member_ids_for_service(db, matched_service.id)
+            eligible_member_ids = ids or None
+        elif spoken_service:
+            service_name = spoken_service
+
         lead = NokvoOneToolRecord(
             id=uuid.uuid4(),
             organization_id=org_id,
@@ -984,6 +1038,8 @@ class PredefinedToolsService:
             data={
                 "patient_name": args["patient_name"],
                 "phone": args["phone"],
+                "service": service_name,
+                "service_id": service_id_str,
                 "doctor": args.get("preferred_doctor"),
                 "department": args.get("department"),
                 "appointment_time": args["appointment_time"],
@@ -1014,7 +1070,9 @@ class PredefinedToolsService:
                 "reason": args["reason"],
                 "related_lead_id": str(lead.id),
                 "assignment_source": tool.key,
+                "service": service_name,
             },
+            eligible_member_ids=eligible_member_ids,
         )
         scheduled_time = (assignment or {}).get("scheduled_time")
         return {
@@ -1055,11 +1113,11 @@ class PredefinedToolsService:
         # the macro still works if invoked without it.
         record_data = dict(args.get("record_data") or {})
         if not record_data:
-            record_data = {
-                "name": args["name"],
-                "phone": args["phone"],
-                "visit_date": args["visit_at"],
-            }
+            record_data = {"phone": args.get("phone")}
+            if args.get("name") not in (None, ""):
+                record_data["name"] = args["name"]
+            if args.get("visit_at") not in (None, ""):
+                record_data["visit_date"] = args["visit_at"]
             for key in ("email", "property_type", "budget", "location"):
                 if args.get(key) not in (None, ""):
                     record_data[key] = args[key]
@@ -1091,10 +1149,10 @@ class PredefinedToolsService:
             contact_email=contact_email or args.get("email"),
         )
         callback_data = {
-            "contact_name": args["name"],
-            "contact_phone": args["phone"],
-            "callback_at": args["visit_at"],
-            "notes": args.get("notes") or "Site visit scheduled.",
+            "contact_name": args.get("name"),
+            "contact_phone": args.get("phone"),
+            "callback_at": args.get("visit_at"),
+            "notes": args.get("notes") or ("Site visit scheduled." if args.get("visit_at") else "Call back to schedule a site visit."),
             "related_ticket_id": str(site_visit.id),
         }
         if project_id_str:
@@ -1109,12 +1167,14 @@ class PredefinedToolsService:
             record_type="callback",
             status="scheduled",
             data=callback_data,
-            contact_phone=args["phone"],
+            contact_phone=args.get("phone"),
         )
         db.add(site_visit)
         db.add(callback)
         await db.flush()
-        visit_at = _parse_tool_datetime(args["visit_at"], field_name="visit_at")
+        # visit_at is optional now (the admin may not collect a date) — when absent
+        # the callback is unscheduled and the assignment picks the next available slot.
+        visit_at = _parse_tool_datetime(args["visit_at"], field_name="visit_at") if args.get("visit_at") else None
         assignment = await _assign_existing_record(
             db,
             org_id,
@@ -1123,17 +1183,17 @@ class PredefinedToolsService:
             requested_time=visit_at,
             summary=_assignment_summary_for(record_data, fallback="Real-estate site visit"),
             metadata={
-                "contact_name": args["name"],
-                "contact_phone": args["phone"],
-                "visit_at": args["visit_at"],
-                "callback_at": args["visit_at"],
+                "contact_name": args.get("name"),
+                "contact_phone": args.get("phone"),
+                "visit_at": args.get("visit_at"),
+                "callback_at": args.get("visit_at"),
                 "related_ticket_id": str(site_visit.id),
                 "assignment_source": tool.key,
                 "project_id": project_id_str,
                 "project_name": project_name_str,
             },
         )
-        scheduled_visit = (assignment or {}).get("scheduled_time") or args["visit_at"]
+        scheduled_visit = (assignment or {}).get("scheduled_time") or args.get("visit_at")
         return {
             "ok": True,
             "id": str(site_visit.id),
@@ -1143,7 +1203,7 @@ class PredefinedToolsService:
             "callback_id": str(callback.id),
             "callback_status": callback.status,
             "scheduled_for": scheduled_visit,
-            "requested_for": args["visit_at"],
+            "requested_for": args.get("visit_at"),
             "time_adjusted": bool((assignment or {}).get("time_adjusted")),
             "assignment": assignment,
             "assigned_member_name": assignment.get("selected_member_name") if assignment else None,
@@ -1343,11 +1403,17 @@ class PredefinedToolsService:
 
 
 def _row_summary(rec: NokvoOneToolRecord) -> dict[str, Any]:
+    data = rec.data or {}
     return {
         "id": str(rec.id),
         "record_type": rec.record_type,
         "status": rec.status,
-        "data": rec.data or {},
+        "data": data,
+        # System field, auto-generated by the post-call condenser (not part of
+        # the operator-configured schema). Surfaced top-level so the Leads /
+        # Site Visits tabs can render a fixed "Handoff note" column.
+        "handoff_note": data.get("handoff_note"),
+        "handoff_note_generated_at": data.get("handoff_note_generated_at"),
         "created_at": rec.created_at.isoformat() if rec.created_at else None,
     }
 
@@ -1432,6 +1498,7 @@ async def _assign_existing_record(
     requested_time: datetime,
     summary: str,
     metadata: dict[str, Any] | None = None,
+    eligible_member_ids: list[uuid.UUID] | None = None,
 ) -> dict[str, Any] | None:
     organization = await _load_organization(db, org_id)
     if organization is None:
@@ -1445,6 +1512,7 @@ async def _assign_existing_record(
         summary=summary,
         metadata=metadata or {},
         record_type=rec.record_type,
+        eligible_member_ids=eligible_member_ids,
     )
     scheduled_time = assignment.get("scheduled_time")
     requested_at_resp = assignment.get("requested_time")

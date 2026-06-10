@@ -107,8 +107,11 @@ def test_messages_embed_field_collection_block_when_provided():
         history=[],
         company_name="Acme",
         field_questions_prompt=field_prompt,
+        # Field-collection is conditional now — only embedded once a record-capture
+        # flow is active (it's dead weight on pure Q&A turns).
+        tool_flow_state={"active": True, "flow_key": "real_estate_site_visit", "pending_slot": "visit_date"},
     )
-    sys_prompt = msgs[0]["content"]
+    sys_prompt = "\n".join(m["content"] for m in msgs if m["role"] == "system")
     assert "# FIELD-COLLECTION SCRIPT" in sys_prompt
     # The exact phrasing the agent should use for visit_date.
     assert "What date would you prefer?" in sys_prompt
@@ -125,7 +128,7 @@ def test_messages_omit_field_collection_block_when_no_prompt():
         history=[],
         company_name="Acme",
     )
-    sys_prompt = msgs[0]["content"]
+    sys_prompt = "\n".join(m["content"] for m in msgs if m["role"] == "system")
     assert "# FIELD-COLLECTION SCRIPT" not in sys_prompt
 
 
@@ -173,13 +176,14 @@ def test_field_collection_header_is_mandatory_with_pre_confirm_check():
     site visit while skipping admin-configured custom fields."""
     catalog = build_tool_flow_questions("real_estate")
     prompt = format_field_questions_prompt(catalog, language="en")
-    assert "MANDATORY" in prompt
-    assert "PRE-CONFIRM CHECK" in prompt
-    # Anti-pattern explicitly forbidden.
-    assert "feels complete" in prompt.lower()
+    low = prompt.lower()
+    # Imperative: required fields must be collected before confirming/closing.
+    assert "required" in low and ("before confirming" in low or "before closing" in low)
+    # The pre-confirm guard that stops closing a record with gaps.
+    assert "verify every required field" in low and "never confirm" in low
     # Closing verbs the LLM must verify against before using.
-    for verb in ("booked", "confirmed", "all set", "captured"):
-        assert verb in prompt.lower()
+    for verb in ("booked", "confirmed", "all set"):
+        assert verb in low
 
 
 def test_site_visit_flow_asks_every_configured_ticket_field():

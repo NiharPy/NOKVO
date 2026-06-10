@@ -27,8 +27,10 @@ const totpSecret = ref('');
 const SUPERADMIN_ACCESS_TOKEN_KEY = 'superadmin_access_token';
 const SUPERADMIN_REFRESH_TOKEN_KEY = 'superadmin_refresh_token';
 
+import { API_BASE_URL } from '../config.js';
+
 const api = axios.create({
-  baseURL: 'http://localhost:8000/api',
+  baseURL: API_BASE_URL,
 });
 
 const handleLogin = async () => {

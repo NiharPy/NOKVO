@@ -1,11 +1,47 @@
 <script setup>
-import { computed } from 'vue';
-import { ArrowUpRight, KeyRound, Plug, Shield, Webhook } from 'lucide-vue-next';
+import { computed, onMounted, ref } from 'vue';
+import { ArrowUpRight, KeyRound, Plug, Save, Shield, Webhook } from 'lucide-vue-next';
 import { useRouter } from 'vue-router';
 import { useDashboardState } from '../composables/useDashboardState.js';
 
 const router = useRouter();
-const { nokvoConnectEnabled } = useDashboardState();
+const {
+  nokvoConnectEnabled,
+  businessFacts,
+  loadBusinessFacts,
+  saveBusinessFacts,
+} = useDashboardState();
+
+// ── Business facts ────────────────────────────────────────────────────────
+// The agent's persona is a fixed, product-curated per-vertical prompt; the
+// operator only supplies their org's specifics here. Saved facts are appended
+// to the prompt at call time.
+const factsDraft = ref('');
+const factsSaving = ref(false);
+const factsSaved = ref(false);
+
+onMounted(async () => {
+  if (typeof loadBusinessFacts === 'function') {
+    const current = await loadBusinessFacts();
+    factsDraft.value = current || businessFacts?.value || '';
+  } else {
+    factsDraft.value = businessFacts?.value || '';
+  }
+});
+
+const factsDirty = computed(() => (factsDraft.value || '') !== (businessFacts?.value || ''));
+
+async function onSaveFacts() {
+  if (factsSaving.value || typeof saveBusinessFacts !== 'function') return;
+  factsSaving.value = true;
+  factsSaved.value = false;
+  try {
+    await saveBusinessFacts(factsDraft.value);
+    factsSaved.value = true;
+  } finally {
+    factsSaving.value = false;
+  }
+}
 
 const sections = computed(() => [
   {
@@ -62,6 +98,43 @@ const sections = computed(() => [
     </header>
 
     <section class="n-section n-rise" data-delay="1">
+      <header class="n-section__head">
+        <div>
+          <h2 class="n-section__title">Business facts</h2>
+          <p class="n-section__sub">
+            Your agent's style and skills are tuned for your industry automatically. Add the
+            specifics only your business knows — hours, services, pricing, staff, location, policies —
+            and the agent will use them on every call.
+          </p>
+        </div>
+      </header>
+      <div class="adv__facts n-card">
+        <textarea
+          v-model="factsDraft"
+          class="adv__facts-input"
+          rows="9"
+          maxlength="4000"
+          placeholder="e.g. Open Mon–Sat 9am–7pm, closed Sunday. We sell 2 & 3 BHK flats in Kompally and Kondapur. Site visits are free; our team picks you up. Booking amount ₹1 lakh, refundable within 7 days."
+        ></textarea>
+        <div class="adv__facts-foot">
+          <span class="adv__facts-meta">
+            {{ (factsDraft || '').length }}/4000
+            <em v-if="factsSaved && !factsDirty"> · saved</em>
+          </span>
+          <button
+            type="button"
+            class="n-btn n-btn--brand n-btn--sm"
+            :disabled="factsSaving || !factsDirty"
+            @click="onSaveFacts"
+          >
+            <Save :size="13" />
+            {{ factsSaving ? 'Saving…' : 'Save business facts' }}
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <section class="n-section n-rise" data-delay="2">
       <div class="adv__grid">
         <button
           v-for="(s, i) in sections"
@@ -91,6 +164,41 @@ const sections = computed(() => [
 </template>
 
 <style scoped>
+.adv__facts {
+  padding: 16px;
+  display: grid;
+  gap: 12px;
+}
+.adv__facts-input {
+  width: 100%;
+  resize: vertical;
+  min-height: 160px;
+  padding: 12px 14px;
+  border: 1px solid var(--n-border);
+  border-radius: var(--n-r-md);
+  background: var(--n-bg, var(--n-surface));
+  color: var(--n-text);
+  font-family: var(--n-font-body);
+  font-size: 13px;
+  line-height: 1.55;
+}
+.adv__facts-input:focus {
+  outline: none;
+  border-color: var(--n-border-strong);
+}
+.adv__facts-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.adv__facts-meta {
+  font-family: var(--n-font-mono);
+  font-size: 11px;
+  color: var(--n-text-3);
+}
+.adv__facts-meta em { color: var(--n-brand-ink); font-style: normal; }
+
 .adv__grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));

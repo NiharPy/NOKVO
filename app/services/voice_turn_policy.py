@@ -6,6 +6,9 @@ from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from app.services.datetime_parse import try_parse_date as _canonical_parse_date
+from app.services.datetime_parse import try_parse_time as _canonical_parse_time
+
 
 _APPOINTMENT_LOCAL_TZ = ZoneInfo("Asia/Kolkata")
 _MONTH_LOOKUP = {
@@ -322,14 +325,19 @@ def normalize_phone_number(text: str, *, expected: bool = False) -> str | None:
         return None
     has_phone_hint = bool(_PHONE_HINT_RE.search(raw))
     pure_number = _is_pure_numberish(raw)
+    # Strip a leading trunk zero ("0 98765 43210") so it reads as a 10-digit mobile.
+    if len(digits) == 11 and digits.startswith("0"):
+        digits = digits[1:]
     if len(digits) == 10 and digits[0] in "6789" and (pure_number or has_phone_hint or expected):
         return digits
     if digits.startswith("91") and len(digits) == 12 and digits[2] in "6789":
         return f"+{digits}"
     if raw.startswith("+") and 8 <= len(digits) <= 15:
         return f"+{digits}"
-    if expected or has_phone_hint:
-        return digits
+    # Deliberately strict: do NOT accept arbitrary 7–15 digit blobs just because
+    # a phone was expected. An STT-mangled number (a dropped digit, a spurious
+    # letter) must fail here so the agent re-asks/reads back rather than saving
+    # an uncallable number silently.
     return None
 
 
@@ -420,6 +428,14 @@ def extract_turn_entities(text: str, *, expected_slot: str | None = None) -> dic
         entities["time_text"] = time_match.group(0)
     elif expected_slot == "preferred_time" and _BARE_TIME_RE.fullmatch(value):
         entities["time_text"] = value
+    # A bare hour after a time cue ("tomorrow at 11", "friday by 3"): only
+    # captured when a date is also present, so a combined date+time answer fills
+    # in one turn. The cue + co-occurring date keep this from grabbing stray
+    # numbers (order ids, BHK counts) as a time.
+    if "date_text" in entities and "time_text" not in entities:
+        cue = re.search(r"\b(?:at|by|around)\s+(\d{1,2})(?::([0-5]\d))?\b", dt_value)
+        if cue:
+            entities["time_text"] = f"{cue.group(1)}:{cue.group(2)}" if cue.group(2) else cue.group(1)
     urgent = _URGENT_SYMPTOM_RE.search(value)
     if urgent:
         entities["urgent_symptom"] = urgent.group(0)
@@ -559,102 +575,24 @@ def _looks_like_reason(text: str) -> bool:
 
 
 def _parse_slot_date(raw: str | None) -> date | None:
-    """Best-effort parse of slot-fill date strings.
+    """Best-effort parse of slot-fill date strings (used to detect "appointment
+    is in the past" before the tool round-trip).
 
-    Mirrors the lighter cases handled by ``NokvoOneVoicePipeline._parse_appointment_date``
-    so the policy layer can detect "appointment is in the past" *before* the
-    tool round-trip, instead of letting the caller finish four more questions
-    and only then be told to start over.
+    Delegates to the single canonical parser (``datetime_parse``), which is the
+    hardened pipeline implementation. This used to be a lighter duplicate that
+    drifted from the pipeline parser; consolidating fixes that divergence.
+
+    ``now`` is computed from this module's ``datetime`` (which tests patch via
+    ``_patch_now``) and forwarded, so relative dates ("today"/"tomorrow") resolve
+    against the same clock the past-time check uses.
     """
-    if not raw:
-        return None
-    text = re.sub(r"\s+", " ", normalize_relative_datetime_text(str(raw)).strip().lower())
-    if not text:
-        return None
-    today = datetime.now(_APPOINTMENT_LOCAL_TZ).date()
-    if text in {"today"}:
-        return today
-    if text in {"tomorrow"}:
-        return today + timedelta(days=1)
-    if text in {"day after tomorrow"}:
-        return today + timedelta(days=2)
-    # 20 may 2026 / 20th may / may 20 / 20-05-2026 / 20/05
-    match = re.match(
-        r"(\d{1,2})(?:st|nd|rd|th)?\s+([a-z]{3,9})(?:\s+(\d{2,4}))?$",
-        text,
-    )
-    if match:
-        day = int(match.group(1))
-        month = _MONTH_LOOKUP.get(match.group(2)[:3])
-        year = int(match.group(3)) if match.group(3) else today.year
-        if year < 100:
-            year += 2000
-        if month and 1 <= day <= 31:
-            try:
-                candidate = date(year, month, day)
-                if candidate < today and not match.group(3):
-                    candidate = date(year + 1, month, day)
-                return candidate
-            except ValueError:
-                return None
-    match = re.match(r"([a-z]{3,9})\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s+(\d{2,4}))?$", text)
-    if match:
-        month = _MONTH_LOOKUP.get(match.group(1)[:3])
-        day = int(match.group(2))
-        year = int(match.group(3)) if match.group(3) else today.year
-        if year < 100:
-            year += 2000
-        if month and 1 <= day <= 31:
-            try:
-                candidate = date(year, month, day)
-                if candidate < today and not match.group(3):
-                    candidate = date(year + 1, month, day)
-                return candidate
-            except ValueError:
-                return None
-    match = re.match(r"(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?$", text)
-    if match:
-        day = int(match.group(1))
-        month = int(match.group(2))
-        year = int(match.group(3)) if match.group(3) else today.year
-        if year < 100:
-            year += 2000
-        if 1 <= month <= 12 and 1 <= day <= 31:
-            try:
-                return date(year, month, day)
-            except ValueError:
-                return None
-    return None
+    return _canonical_parse_date(raw, now=datetime.now(_APPOINTMENT_LOCAL_TZ))
 
 
 def _parse_slot_time(raw: str | None) -> time | None:
-    if not raw:
-        return None
-    text = re.sub(r"\s+", " ", normalize_relative_datetime_text(str(raw)).strip().lower())
-    if not text:
-        return None
-    named = {
-        "morning": time(9, 0), "afternoon": time(14, 0),
-        "evening": time(17, 0), "night": time(19, 0), "noon": time(12, 0),
-    }
-    for label, value in named.items():
-        if label in text:
-            return value
-    ampm = re.search(r"\b(\d{1,2})(?::([0-5]\d))?\s*(am|pm)\b", text)
-    if ampm:
-        hour = int(ampm.group(1))
-        minute = int(ampm.group(2) or 0)
-        suffix = ampm.group(3)
-        if 1 <= hour <= 12:
-            if suffix == "pm" and hour != 12:
-                hour += 12
-            if suffix == "am" and hour == 12:
-                hour = 0
-            return time(hour, minute)
-    twenty_four = re.search(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", text)
-    if twenty_four:
-        return time(int(twenty_four.group(1)), int(twenty_four.group(2)))
-    return None
+    """Slot-fill time parse — delegates to the canonical parser. (The old local
+    copy mis-resolved "midnight" to 7 PM; the canonical parser handles it.)"""
+    return _canonical_parse_time(raw)
 
 
 def _appointment_is_past(date_text: str | None, time_text: str | None) -> bool:

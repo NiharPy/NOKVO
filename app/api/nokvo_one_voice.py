@@ -5,12 +5,13 @@ endpoints described in the architecture spec:
 
   - GET  /runtime/status                          — pipeline diagnostics
   - WS   /voice/ws                                 — browser mic tester (admin/manager JWT)
-  - GET  /phone-link                               — tenant's Exotel link config
-  - POST /phone-link                               — admin sets/clears the link_id
-  - POST /exotel/voice/{link_id}                   — Exotel inbound webhook
-  - WS   /exotel/media/{link_id}                   — Exotel inbound media stream
-  - POST /exotel/outbound-status/{call_link_id}    — outbound call status
-  - WS   /exotel/outbound-media/{call_link_id}     — outbound media stream
+  - GET  /phone-link                               — assigned Plivo DID + forwarding info
+  - POST /phone-link                               — tenant saves their forward-from number
+  - POST /plivo/voice/{link_id}                    — Plivo inbound answer (Stream XML)
+  - WS   /plivo/media/{link_id}                    — Plivo inbound media stream
+  - POST /plivo/outbound-answer/{call_link_id}     — Plivo outbound answer (Stream XML)
+  - POST /plivo/outbound-status/{call_link_id}     — outbound call status
+  - WS   /plivo/outbound-media/{call_link_id}      — outbound media stream
   - GET  /campaigns                                — list outbound campaigns
   - POST /campaigns                                — create + auto-ingest script (admin)
   - GET  /campaigns/{id}                           — single campaign
@@ -64,7 +65,7 @@ from app.models.outgoing_lead import (
 )
 from app.models.outbound_campaign import OutboundCampaign
 from app.models.tenant_resources import TenantResources
-from app.services.exotel_bridge_service import ExotelBridgeService, ExotelWebSocketAdapter
+from app.services.plivo_bridge_service import PlivoBridgeService, PlivoWebSocketAdapter
 from app.services.nokvo_one_voice_pipeline import NokvoOneVoicePipeline
 from app.services.nokvo_one_voice_stream_service import NokvoOneVoiceStreamService
 from app.services.outgoing_lead_service import (
@@ -458,14 +459,28 @@ async def outbound_voice_tester_websocket(websocket: WebSocket):
         # closure can decide which campaign tab the lead lands in.
         campaign_ref_for_persist = campaign if campaign_id_param else None
         outbound_context_for_persist = outbound_context
+        # Eagerly capture every ORM-bound primitive the closure will need
+        # downstream. By the time _on_session_end fires (potentially many
+        # minutes into the call, after multiple commits have flowed
+        # through ``db``), the originally-loaded ``user`` and ``tr`` ORM
+        # instances are detached / expired in ways that make attribute
+        # access raise SQLAlchemy's MissingGreenlet — the implicit lazy-
+        # load wants an async context that isn't bound at that moment.
+        # Snapshot everything to scalars while we're still in the request
+        # scope and thread those through.
+        user_id_for_persist = user.id
+        org_id_for_persist = tr.organization_id
+        tenant_id_for_persist = tr.tenant_id
 
         async def _on_session_end(ws: WebSocket) -> None:
             await _classify_and_persist_tester_outcome(
                 ws,
                 db=db,
                 tenant_res=tr,
+                tenant_id=tenant_id_for_persist,
+                organization_id=org_id_for_persist,
                 call_id=call_id,
-                user_id=user.id,
+                user_id=user_id_for_persist,
                 campaign=campaign_ref_for_persist,
                 outbound_context=outbound_context_for_persist,
             )
@@ -492,6 +507,8 @@ async def _classify_and_persist_tester_outcome(
     user_id: uuid.UUID,
     campaign: OutboundCampaign | None,
     outbound_context: Any | None,
+    tenant_id: str | None = None,
+    organization_id: uuid.UUID | None = None,
 ) -> None:
     """Classify the tester transcript and route the outcome:
 
@@ -513,6 +530,13 @@ async def _classify_and_persist_tester_outcome(
         classify_outbound_outcome,
     )
     from app.models.nokvo_one_tool_record import NokvoOneToolRecord
+
+    # Resolve identifiers from the eagerly-captured primitives when the
+    # caller passed them — these are the only safe path to read tenant /
+    # organization at session end. Falling back to the ORM attributes
+    # would trigger SQLAlchemy's MissingGreenlet because the long-lived
+    # ``tenant_res`` may be detached / expired by the time this closure
+    # fires. Both kwargs are optional for back-compat with older callers.
 
     try:
         history = await AgentSessionStore.get_history(tenant_res, call_id)
@@ -590,7 +614,7 @@ async def _classify_and_persist_tester_outcome(
 
             record = NokvoOneToolRecord(
                 id=uuid.uuid4(),
-                organization_id=tenant_res.organization_id,
+                organization_id=organization_id,
                 created_by_user_id=user_id,
                 record_type="lead",
                 status=outcome.outcome,
@@ -625,7 +649,9 @@ async def _classify_and_persist_tester_outcome(
 
 
 class PhoneLinkConfigRequest(BaseModel):
-    link_id: str | None = None
+    # The tenant's own number that they forward to the assigned Plivo DID. Stored
+    # for display / caller-ID matching (the DID + webhook are auto-provisioned).
+    forward_from_number: str | None = None
 
 
 class LeadOauthStartRequest(BaseModel):
@@ -735,27 +761,26 @@ def _lead_response(lead: OutgoingLead) -> dict[str, Any]:
 
 
 def _phone_link_summary(request: Request, tr: TenantResources) -> dict[str, Any]:
-    link = dict((tr.provider_status or {}).get("agent_phone_link") or {})
-    link_id = link.get("link_id")
-    status_val = link.get("status") or ("linked" if link_id else "not_linked")
+    """Call-forwarding view: the auto-provisioned Plivo DID the tenant forwards their
+    own number to, the number's status, and the (auto-configured) webhook URLs."""
+    from app.services.plivo_service import PlivoService
+
+    summary = PlivoService.phone_link_response(tr)
+    link_id = summary.get("link_id")
     host = request.url.hostname or "localhost"
     scheme_http = "https" if request.url.scheme == "https" else "http"
     scheme_ws = "wss" if request.url.scheme == "https" else "ws"
     port = f":{request.url.port}" if request.url.port else ""
-    inbound_webhook = (
-        f"{scheme_http}://{host}{port}/api/nokvo-one/agents/exotel/voice/{link_id}"
-        if link_id else None
+    if link_id:
+        summary["inbound_webhook_url"] = f"{scheme_http}://{host}{port}/api/nokvo-one/agents/plivo/voice/{link_id}"
+        summary["inbound_media_url"] = f"{scheme_ws}://{host}{port}/api/nokvo-one/agents/plivo/media/{link_id}"
+    did = summary.get("plivo_number")
+    summary["forwarding_instructions"] = (
+        f"Enable call-forwarding on your number to {did} so calls reach your agent."
+        if did else
+        "Your Plivo number is being provisioned (carrier verification) — a number to forward to will appear here shortly."
     )
-    inbound_media = (
-        f"{scheme_ws}://{host}{port}/api/nokvo-one/agents/exotel/media/{link_id}"
-        if link_id else None
-    )
-    return {
-        "link_id": link_id,
-        "status": status_val,
-        "exotel_webhook_url": inbound_webhook,
-        "exotel_media_url": inbound_media,
-    }
+    return summary
 
 
 @router.get("/phone-link")
@@ -778,12 +803,9 @@ async def set_phone_link(
 ):
     tr = await _tenant_for_user(db, user)
     provider_status = dict(tr.provider_status or {})
-    link = dict(provider_status.get("agent_phone_link") or {})
-    if payload.link_id:
-        link.update({"link_id": payload.link_id.strip(), "status": "linked"})
-    else:
-        link.update({"link_id": None, "status": "not_linked"})
-    provider_status["agent_phone_link"] = link
+    plivo_cfg = dict(provider_status.get("plivo") or {})
+    plivo_cfg["forward_from_number"] = (payload.forward_from_number or "").strip() or None
+    provider_status["plivo"] = plivo_cfg
     tr.provider_status = provider_status
     flag_modified(tr, "provider_status")
     db.add(tr)
@@ -1080,41 +1102,65 @@ async def receive_meta_leadgen_webhook(request: Request, db: AsyncSession = Depe
     return {"ok": True, "imported": imported, "errors": errors[:5]}
 
 
-# ────────────────────────── Exotel inbound ──────────────────────────
+# ────────────────────────── Plivo inbound ──────────────────────────
 
 
-@router.post("/exotel/voice/{link_id}", response_class=PlainTextResponse)
-async def exotel_inbound_webhook(
+def _plivo_stream_xml(media_url: str) -> str:
+    """Plivo answer XML: bidirectional <Stream> bridging the caller's audio to our
+    media WS (L16 @ the configured rate). Playback flows back via `playAudio`."""
+    rate = settings.PLIVO_DEFAULT_SAMPLE_RATE or 8000
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response>"
+        f'<Stream bidirectional="true" keepCallAlive="true" audioTrack="inbound" '
+        f'contentType="audio/x-l16;rate={rate}">{media_url}</Stream>'
+        "</Response>"
+    )
+
+
+@router.post("/plivo/voice/{link_id}", response_class=PlainTextResponse)
+async def plivo_inbound_webhook(
     link_id: str, request: Request, db: AsyncSession = Depends(deps.get_db)
 ):
     tr = await _tenant_by_link_id(db, link_id)
     if not tr:
         return PlainTextResponse(
-            "Nokvo One agent is not linked to this number.", status_code=404
+            "<Response><Hangup/></Response>", media_type="application/xml", status_code=404
         )
     host = request.url.hostname or "localhost"
     scheme = "wss" if request.url.scheme == "https" else "ws"
     port = f":{request.url.port}" if request.url.port else ""
-    media_url = f"{scheme}://{host}{port}/api/nokvo-one/agents/exotel/media/{link_id}"
-    return PlainTextResponse(media_url, media_type="text/plain")
+    media_url = f"{scheme}://{host}{port}/api/nokvo-one/agents/plivo/media/{link_id}"
+    return PlainTextResponse(_plivo_stream_xml(media_url), media_type="application/xml")
 
 
-@router.websocket("/exotel/media/{link_id}")
-async def exotel_inbound_media_websocket(websocket: WebSocket, link_id: str):
+@router.websocket("/plivo/media/{link_id}")
+async def plivo_inbound_media_websocket(websocket: WebSocket, link_id: str):
     async for db in deps.get_db():
         tr = await _tenant_by_link_id(db, link_id)
         if not tr:
             await websocket.close(code=1008)
             return
-        await ExotelBridgeService.run_session(websocket, tr, db=db)
+        await PlivoBridgeService.run_session(websocket, tr, db=db)
         return
 
 
-# ────────────────────────── Exotel outbound ──────────────────────────
+# ────────────────────────── Plivo outbound ──────────────────────────
 
 
-@router.post("/exotel/outbound-status/{call_link_id}")
-async def exotel_outbound_status(
+@router.post("/plivo/outbound-answer/{call_link_id}", response_class=PlainTextResponse)
+async def plivo_outbound_answer(call_link_id: str, request: Request):
+    """Plivo fetches this when the outbound call connects → returns the <Stream> XML
+    that bridges audio to the agent's outbound media WS."""
+    host = request.url.hostname or "localhost"
+    scheme = "wss" if request.url.scheme == "https" else "ws"
+    port = f":{request.url.port}" if request.url.port else ""
+    media_url = f"{scheme}://{host}{port}/api/nokvo-one/agents/plivo/outbound-media/{call_link_id}"
+    return PlainTextResponse(_plivo_stream_xml(media_url), media_type="application/xml")
+
+
+@router.post("/plivo/outbound-status/{call_link_id}")
+async def plivo_outbound_status(
     call_link_id: str, request: Request, db: AsyncSession = Depends(deps.get_db)
 ):
     campaign, contact = await OutboundCampaignService.get_by_call_link_id(call_link_id, db)
@@ -1148,8 +1194,8 @@ async def exotel_outbound_status(
     return {"ok": True, "call_link_id": call_link_id}
 
 
-@router.websocket("/exotel/outbound-media/{call_link_id}")
-async def exotel_outbound_media_websocket(websocket: WebSocket, call_link_id: str):
+@router.websocket("/plivo/outbound-media/{call_link_id}")
+async def plivo_outbound_media_websocket(websocket: WebSocket, call_link_id: str):
     async for db in deps.get_db():
         campaign, contact = await OutboundCampaignService.get_by_call_link_id(call_link_id, db)
         is_followup = bool(contact and contact.get("is_followup"))
@@ -1183,7 +1229,38 @@ async def exotel_outbound_media_websocket(websocket: WebSocket, call_link_id: st
             ((campaign.agent_config or {}).get("language") if campaign else "en")
             or "en"
         ).strip().lower() or "en"
-        adapter = ExotelWebSocketAdapter(websocket, language=campaign_language)
+        adapter = PlivoWebSocketAdapter(websocket, language=campaign_language)
+
+        # For follow-up calls, fetch the lead's prior handoff_note so the
+        # preamble can quote it verbatim. One DB read; follow-ups are
+        # low-frequency so caching isn't worth it.
+        #
+        # Outbound campaign leads live in OutgoingLead (dedicated column);
+        # inbound leads & site-visits live in nokvo_one_tool_records (note in
+        # the data JSONB). Check OutgoingLead first, then fall back to the
+        # tool_record, so a follow-up to either source reads its note back.
+        followup_handoff_note: str | None = None
+        if is_followup and contact.get("lead_id"):
+            try:
+                _lead_uuid = uuid.UUID(str(contact["lead_id"]))
+            except (TypeError, ValueError):
+                _lead_uuid = None
+            if _lead_uuid is not None:
+                from app.models.outgoing_lead import OutgoingLead as _OL
+
+                ho_res = await db.execute(select(_OL).where(_OL.id == _lead_uuid))
+                ho_lead = ho_res.scalars().first()
+                if ho_lead is not None and ho_lead.handoff_note:
+                    followup_handoff_note = str(ho_lead.handoff_note).strip() or None
+                if not followup_handoff_note:
+                    from app.models.nokvo_one_tool_record import NokvoOneToolRecord as _TR
+
+                    tr = await db.get(_TR, _lead_uuid)
+                    if tr is not None:
+                        _tr_note = (tr.data or {}).get("handoff_note")
+                        if _tr_note:
+                            followup_handoff_note = str(_tr_note).strip() or None
+
         campaign_context = {
             "campaign_id": str(campaign.id) if campaign else None,
             "goal": campaign.name if campaign else "Follow-up call",
@@ -1192,6 +1269,7 @@ async def exotel_outbound_media_websocket(websocket: WebSocket, call_link_id: st
             "is_followup": is_followup,
             "attempt_n": int(contact.get("_attempt_n") or 0) + 1 if is_followup else None,
             "source_call_id": contact.get("_source_call_id") if is_followup else None,
+            "handoff_note": followup_handoff_note,
             "opening_message": (
                 f"Start the follow-up call for {contact.get('name') or 'the recipient'}. "
                 "Acknowledge the prior conversation briefly before asking your first question."
@@ -1536,6 +1614,23 @@ async def followups_summary(
     )
 
 
+@router.get("/followups/pipeline")
+async def followups_pipeline(
+    user: OrganizationUser = Depends(_admin_dep()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Full Follow-Up Pipeline payload for the dedicated page: status counts,
+    the pending queue bucketed by due window, today's actionable queue (with
+    each lead's handoff note + overdue flag), a recent-called sample, and the
+    month's conversion ROI. One service call, scoped to the caller's tenant."""
+    from app.services.followup_scheduler_service import FollowupSchedulerService
+
+    tr = await _tenant_for_user(db, user)
+    return await FollowupSchedulerService.pipeline_for_tenant(
+        tenant_id=tr.tenant_id, db=db
+    )
+
+
 @router.get("/followups")
 async def list_followups_for_lead(
     lead_id: uuid.UUID,
@@ -1556,7 +1651,20 @@ async def list_followups_for_lead(
     if lead is None or lead.tenant_id != tr.tenant_id:
         raise HTTPException(status_code=404, detail="Lead not found")
     rows = await FollowupSchedulerService.for_lead(lead_id=lead_id, db=db)
-    return {"items": [_followup_response(r) for r in rows]}
+    # Envelope: include the lead's condensed handoff note alongside the
+    # follow-up rows so the LeadsView drawer can render the manager-readable
+    # summary above the schedule list in one round-trip.
+    return {
+        "items": [_followup_response(r) for r in rows],
+        "lead": {
+            "id": str(lead.id),
+            "handoff_note": lead.handoff_note,
+            "handoff_note_generated_at": (
+                lead.handoff_note_generated_at.isoformat()
+                if lead.handoff_note_generated_at else None
+            ),
+        },
+    }
 
 
 @router.post("/followups/{followup_id}/pause")

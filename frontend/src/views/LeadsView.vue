@@ -25,11 +25,48 @@ const {
   formatRelativeDate,
   // Follow-up agent
   leadFollowupsByLeadId,
+  leadHandoffByLeadId,
   loadFollowupsForLead,
   pauseFollowup,
   resumeFollowup,
   cancelFollowupsForLead,
 } = useDashboardState();
+
+function handoffNoteFor(leadId) {
+  if (!leadId) return null;
+  return leadHandoffByLeadId?.value?.[leadId] || null;
+}
+
+// Resolve the handoff note to show for a record row. Inbound leads &
+// site-visits carry the note on the record itself (data.handoff_note,
+// surfaced top-level by the API); outbound-classified records look it up by
+// their upstream OutgoingLead id. Prefer the record's own note.
+function recordHandoff(r) {
+  const own = r?.handoff_note || r?.data?.handoff_note;
+  if (own) {
+    return {
+      handoff_note: own,
+      handoff_note_generated_at:
+        r?.handoff_note_generated_at || r?.data?.handoff_note_generated_at || null,
+    };
+  }
+  return handoffNoteFor(leadDbId(r));
+}
+
+function handoffWhen(iso) {
+  if (!iso) return '';
+  try {
+    return new Date(iso).toLocaleString('en-IN', {
+      day: '2-digit',
+      month: 'short',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    });
+  } catch {
+    return '';
+  }
+}
 
 const fields = computed(() => schemaFor?.('leads') || []);
 const records = computed(() => filteredLeadRecords?.value || []);
@@ -251,10 +288,42 @@ async function toggleLeadFollowupPanel(leadId) {
                 <span class="rec__time n-mono">{{ formatRelativeDate(r.created_at) || '—' }}</span>
               </div>
             </li>
+            <!-- Inbound leads / site-visits carry the post-call handoff note on
+                 the record itself and have no follow-up panel to expand, so
+                 surface it inline (read-only) for manager review. -->
+            <li
+              v-if="!leadDbId(r) && recordHandoff(r)?.handoff_note"
+              class="leads__handoff-row"
+            >
+              <div class="leads__handoff-note">
+                <header>
+                  <span class="leads__handoff-cap">Call notes</span>
+                  <span class="leads__handoff-time">
+                    {{ handoffWhen(recordHandoff(r).handoff_note_generated_at) }}
+                  </span>
+                </header>
+                <blockquote>{{ recordHandoff(r).handoff_note }}</blockquote>
+              </div>
+            </li>
             <li
               v-if="leadDbId(r) && expandedLeadId === leadDbId(r)"
               class="leads__followup-panel"
             >
+              <!-- Handoff note: 3-sentence summary the post-call condenser
+                   wrote the moment the last call ended. Read-only, surfaces
+                   the same prose that the follow-up agent's preamble quotes. -->
+              <div
+                v-if="recordHandoff(r)?.handoff_note"
+                class="leads__handoff-note"
+              >
+                <header>
+                  <span class="leads__handoff-cap">Last call notes</span>
+                  <span class="leads__handoff-time">
+                    {{ handoffWhen(recordHandoff(r).handoff_note_generated_at) }}
+                  </span>
+                </header>
+                <blockquote>{{ recordHandoff(r).handoff_note }}</blockquote>
+              </div>
               <div v-if="!(followupsFor(leadDbId(r)).length)" class="leads__followup-empty">
                 No follow-ups on the books for this lead yet.
               </div>
@@ -424,5 +493,166 @@ async function toggleLeadFollowupPanel(leadId) {
 @media (max-width: 1100px) {
   .rec__row { grid-template-columns: 1fr; gap: 8px; padding: 16px 20px; }
   .rec__col--right { justify-items: flex-start; text-align: left; }
+}
+
+/* ─── Follow-up chip + drawer ───────────────────────── */
+.leads__followup-chip {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--n-border);
+  background: var(--n-surface);
+  font-family: var(--n-font-body);
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--n-text-2);
+  cursor: pointer;
+  max-width: 100%;
+  transition: background var(--n-t-fast) var(--n-ease),
+              border-color var(--n-t-fast) var(--n-ease);
+}
+.leads__followup-chip:hover {
+  background: var(--n-surface-2);
+  border-color: var(--n-border-strong);
+}
+.leads__followup-chip.is-active {
+  background: var(--n-brand-soft);
+  color: var(--n-brand-ink);
+  border-color: rgba(99, 102, 241, 0.22);
+}
+.leads__followup-chip.is-paused {
+  background: var(--n-warning-soft);
+  color: var(--n-warning);
+  border-color: rgba(217, 119, 6, 0.22);
+}
+.leads__followup-chip.is-exhausted {
+  background: var(--n-surface-3);
+  color: var(--n-text-3);
+  border-color: var(--n-border-strong);
+}
+.leads__followup-chip.is-empty {
+  color: var(--n-text-4);
+  font-family: var(--n-font-mono);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  cursor: default;
+}
+
+.leads__followup-panel {
+  display: grid;
+  gap: 10px;
+  padding: 12px 24px 16px;
+  background: var(--n-surface);
+  border-top: 1px solid var(--n-border-subtle);
+  border-bottom: 1px solid var(--n-border-subtle);
+  animation: leadsFollowupOpen 220ms var(--n-ease);
+}
+@keyframes leadsFollowupOpen {
+  from { opacity: 0; transform: translateY(-4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.leads__followup-empty {
+  font-size: 12.5px;
+  color: var(--n-text-3);
+  font-style: italic;
+  padding: 4px 0;
+}
+.leads__followup-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+.leads__followup-row {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 12px;
+  align-items: center;
+  padding: 8px 12px;
+  background: var(--n-bg);
+  border: 1px solid var(--n-border-subtle);
+  border-radius: var(--n-r-md);
+}
+.leads__followup-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--n-text-4);
+  flex-shrink: 0;
+}
+.leads__followup-dot.is-pending { background: var(--n-brand); box-shadow: 0 0 0 3px var(--n-brand-soft); }
+.leads__followup-dot.is-in_flight { background: var(--n-warning); box-shadow: 0 0 0 3px var(--n-warning-soft); }
+.leads__followup-dot.is-paused { background: var(--n-text-4); }
+.leads__followup-dot.is-completed { background: var(--n-success); box-shadow: 0 0 0 3px var(--n-success-soft); }
+.leads__followup-dot.is-exhausted { background: var(--n-danger); box-shadow: 0 0 0 3px var(--n-danger-soft); }
+.leads__followup-dot.is-cancelled { background: var(--n-text-4); }
+
+.leads__followup-meta { display: grid; gap: 2px; min-width: 0; }
+.leads__followup-meta strong {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--n-text);
+}
+.leads__followup-meta span {
+  font-family: var(--n-font-mono);
+  font-size: 11px;
+  color: var(--n-text-3);
+  letter-spacing: 0.02em;
+}
+.leads__followup-actions { display: flex; gap: 6px; }
+.leads__followup-foot {
+  display: flex;
+  justify-content: flex-end;
+  padding-top: 4px;
+}
+
+/* ─── Handoff note (post-call condenser output) ─── */
+/* Inline wrapper used for inbound leads/site-visits that have no follow-up
+   panel — surfaces the call notes directly under the record row. */
+.leads__handoff-row {
+  list-style: none;
+  padding: 0 20px 14px;
+}
+.leads__handoff-note {
+  display: grid;
+  gap: 6px;
+  padding: 12px 14px;
+  background: linear-gradient(180deg, var(--n-brand-soft) 0%, transparent 80%);
+  border: 1px solid rgba(99, 102, 241, 0.18);
+  border-radius: var(--n-r-md);
+}
+.leads__handoff-note header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.leads__handoff-cap {
+  font-family: var(--n-font-mono);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--n-brand-ink);
+  font-weight: 600;
+}
+.leads__handoff-time {
+  font-family: var(--n-font-mono);
+  font-size: 10.5px;
+  color: var(--n-text-3);
+  letter-spacing: 0.02em;
+}
+.leads__handoff-note blockquote {
+  margin: 0;
+  padding: 0;
+  font-size: 13.5px;
+  line-height: 1.55;
+  color: var(--n-text);
+  font-family: var(--n-font-display);
+  font-style: italic;
+  letter-spacing: -0.005em;
 }
 </style>

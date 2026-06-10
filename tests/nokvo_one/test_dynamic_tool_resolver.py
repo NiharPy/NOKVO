@@ -38,11 +38,14 @@ def test_real_estate_catalog_contains_leads_and_tickets_only():
     assert "appointments_create" not in keys
 
 
-def test_clinics_catalog_contains_all_three_tabs():
+def test_clinics_catalog_contains_appointments_and_leads():
+    # Clinics are Appointments + Leads (the generic "tickets" support tab was
+    # dropped for clinics — appointments are the primary record).
     keys = {t.key for t in resolve_catalog("clinics")}
-    for tab in ("leads", "tickets", "appointments"):
+    for tab in ("leads", "appointments"):
         for verb in ("create", "update", "get", "list", "search", "add_note", "set_status", "close"):
             assert f"{tab}_{verb}" in keys, f"missing {tab}_{verb}"
+    assert not any(k.startswith("tickets_") for k in keys), "clinics should not emit tickets tools"
 
 
 def test_cross_cutting_tools_present_in_every_catalog():
@@ -106,7 +109,8 @@ def test_catalog_as_groups_orders_tabs_then_general():
     groups = catalog_as_groups("clinics")
     labels = [g["label"] for g in groups]
     # Tab groups appear before General, in business-template declared order.
-    assert set(labels[:3]) == {"Leads", "Tickets", "Appointments"}
+    # Clinics: Appointments + Leads (Tickets dropped).
+    assert set(labels[:2]) == {"Leads", "Appointments"}
     assert labels[-1] == "General"
 
 

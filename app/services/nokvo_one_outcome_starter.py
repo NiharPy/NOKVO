@@ -64,17 +64,15 @@ OUTCOME_PACKS: dict[str, list[dict[str, Any]]] = {
         {
             "slug": "take_messages",
             "label": "Take messages and follow up",
-            "description": "Logs callbacks and creates support tickets for the team to follow up.",
+            "description": "Logs callbacks and escalations for the team to follow up.",
             "tool_keys": [
                 "schedule_callback",
-                "tickets_create",
-                "tickets_add_note",
                 "escalate_to_human",
                 "call_log_create",
             ],
             "prompt_fragment": (
-                "When the patient's request can't be resolved on the call, schedule a callback or create a "
-                "ticket so clinic staff can follow up. Always log the call summary."
+                "When the patient's request can't be resolved on the call, schedule a callback or escalate "
+                "to clinic staff so they can follow up. Always log the call summary."
             ),
             "default_on": True,
         },

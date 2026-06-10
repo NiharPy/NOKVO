@@ -36,7 +36,7 @@ from app.models.lead_followup_schedule import FollowupStatus, LeadFollowupSchedu
 from app.models.outbound_campaign import OutboundCampaign
 from app.models.outgoing_lead import LeadConsentStatus, OutgoingLead
 from app.models.tenant_resources import TenantResources
-from app.services.exotel_service import ExotelService
+from app.services.plivo_service import PlivoService
 from app.services.followup_scheduler_service import (
     FollowupSchedulerService,
     clamp_to_call_window,
@@ -148,18 +148,15 @@ async def _dispatch_one(row_id: uuid.UUID) -> None:
         call_link_id = str(uuid.uuid4())
         base = (settings.AGENT_PUBLIC_BASE_URL or "http://localhost:8000").rstrip("/")
         prefix = "/api/nokvo-one/agents"
-        ws_base = base.replace("https://", "wss://").replace("http://", "ws://")
-        stream_url = f"{ws_base}{prefix}/exotel/outbound-media/{call_link_id}"
-        status_callback = f"{base}{prefix}/exotel/outbound-status/{call_link_id}"
+        answer_url = f"{base}{prefix}/plivo/outbound-answer/{call_link_id}"
+        status_callback = f"{base}{prefix}/plivo/outbound-status/{call_link_id}"
 
         try:
-            await ExotelService.initiate_outbound_call(
+            await PlivoService.initiate_outbound_call(
                 tenant_res,
                 to_number=phone,
-                stream_url=stream_url,
+                answer_url=answer_url,
                 status_callback=status_callback,
-                custom_field=f"followup:{row.id}:{call_link_id}",
-                from_number=campaign.from_number if campaign else None,
             )
         except Exception as exc:
             logger.warning(

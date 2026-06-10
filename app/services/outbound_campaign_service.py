@@ -27,12 +27,9 @@ from app.core.config import settings
 from app.models.outgoing_lead import LeadCallStatus, OutboundCampaignContact, OutgoingLead
 from app.models.outbound_campaign import CampaignStatus, OutboundCampaign
 from app.models.tenant_resources import TenantResources
-from app.services.agent_knowledge_service import AGENT_KNOWLEDGE_SOURCE_TYPE, AgentKnowledgeService
-from app.services.exotel_service import ExotelService
+from app.services.plivo_service import PlivoService
 from app.services.agent_outbound_context import build_agent_config, invalidate as invalidate_outbound_context
 from app.services.outgoing_lead_service import OutgoingLeadService, lead_is_callable
-from app.services.qdrant_service import QdrantService
-from app.services.text_embedding_service import TextEmbeddingService
 
 
 # ---------------------------------------------------------------------------
@@ -127,50 +124,11 @@ class OutboundCampaignService:
         *,
         db: AsyncSession | None = None,
     ) -> int:
-        chunks = AgentKnowledgeService._chunk_text(doc_text)
-        if not chunks:
-            raise ValueError("No usable text was found in the campaign script document.")
-        texts = [chunk["text"] for chunk in chunks]
-        vectors = await TextEmbeddingService.embed_texts(texts)
-        points: list[dict[str, Any]] = []
-        for index, chunk in enumerate(chunks):
-            chunk_id = f"campaign:{campaign_id}:chunk:{index}"
-            points.append(
-                {
-                    "id": str(uuid.uuid5(uuid.NAMESPACE_URL, f"{tenant_res.tenant_id}:{chunk_id}")),
-                    "vector": vectors[index],
-                    "payload": {
-                        "organization_id": str(tenant_res.organization_id),
-                        "tenant_id": tenant_res.tenant_id,
-                        "source_type": AGENT_KNOWLEDGE_SOURCE_TYPE,
-                        "source_kind": "campaign_script_chunk",
-                        "resource_type": "campaign_script_chunk",
-                        "resource": f"campaigns/{campaign_id}/script/{index}",
-                        "document_id": f"campaign:{campaign_id}:script",
-                        "document_name": f"{campaign_name} Script",
-                        "document_type": "script",
-                        "campaign_id": str(campaign_id),
-                        "chunk_id": chunk_id,
-                        "chunk_index": index,
-                        "chunk_count": len(chunks),
-                        "text": chunk["text"],
-                        "status": "active",
-                        "document_status": "ok",
-                        "approval_status": "approved",
-                        "active": True,
-                        "language": "en",
-                        "source_title": f"{campaign_name} Script",
-                        "sensitivity": "normal",
-                    },
-                }
-            )
-        await QdrantService.delete_points_by_filter(
-            tenant_res,
-            {"source_type": AGENT_KNOWLEDGE_SOURCE_TYPE, "campaign_id": str(campaign_id)},
-            db=db,
-        )
-        await QdrantService.upsert_points(tenant_res, points, db=db)
-        return len(points)
+        # Campaign reference-text RAG is retired: the outbound agent runs on the
+        # campaign objectives/context, not semantic retrieval of an uploaded
+        # script. No-op — kept so callers and the stored ``script_indexed_points``
+        # metadata stay stable.
+        return 0
 
     # ------------------------------------------------------------------
     # CRUD
@@ -211,15 +169,14 @@ class OutboundCampaignService:
             pass
 
         # Resolve caller ID: provided → Exotel config → linked phone → global default.
-        exotel_cfg = dict((tenant_res.provider_status or {}).get("exotel") or {})
+        plivo_cfg = dict((tenant_res.provider_status or {}).get("plivo") or {})
         caller_id = (
             from_number
-            or exotel_cfg.get("from_number")
+            or plivo_cfg.get("number")
             or tenant_res.twilio_phone_number
-            or settings.EXOTEL_CALLER_ID
         )
         if not caller_id:
-            raise ValueError("No Exotel caller ID is configured. Link an Exotel number first.")
+            raise ValueError("No Plivo caller ID is configured. The tenant's Plivo number is still provisioning.")
 
         contacts = [
             {
@@ -309,15 +266,14 @@ class OutboundCampaignService:
             except Exception:
                 pass
 
-        exotel_cfg = dict((tenant_res.provider_status or {}).get("exotel") or {})
+        plivo_cfg = dict((tenant_res.provider_status or {}).get("plivo") or {})
         caller_id = (
             from_number
-            or exotel_cfg.get("from_number")
+            or plivo_cfg.get("number")
             or tenant_res.twilio_phone_number
-            or settings.EXOTEL_CALLER_ID
         )
         if not caller_id:
-            raise ValueError("No Exotel caller ID is configured. Link an Exotel number first.")
+            raise ValueError("No Plivo caller ID is configured. The tenant's Plivo number is still provisioning.")
 
         campaign_id = uuid.uuid4()
         if doc_text:
@@ -415,12 +371,11 @@ class OutboundCampaignService:
                 "during the call. Add one and try again."
             )
 
-        exotel_cfg = dict((tenant_res.provider_status or {}).get("exotel") or {})
+        plivo_cfg = dict((tenant_res.provider_status or {}).get("plivo") or {})
         caller_id = (
             from_number
-            or exotel_cfg.get("from_number")
+            or plivo_cfg.get("number")
             or tenant_res.twilio_phone_number
-            or settings.EXOTEL_CALLER_ID
             or None
         )
 
@@ -693,17 +648,15 @@ class OutboundCampaignService:
         # Fire all calls in parallel — don't await individually
         async def _call_one(contact: dict) -> None:
             link_id = contact["call_link_id"]
-            ws_base = base.replace("https://", "wss://").replace("http://", "ws://")
-            stream_url = f"{ws_base}{prefix}/exotel/outbound-media/{link_id}"
-            status_callback = f"{base}{prefix}/exotel/outbound-status/{link_id}"
+            # Plivo: pass an HTTP answer_url (returns <Stream> XML) — not a WS url.
+            answer_url = f"{base}{prefix}/plivo/outbound-answer/{link_id}"
+            status_callback = f"{base}{prefix}/plivo/outbound-status/{link_id}"
             try:
-                result = await ExotelService.initiate_outbound_call(
+                result = await PlivoService.initiate_outbound_call(
                     tenant_res,
                     to_number=contact["phone"],
-                    stream_url=stream_url,
+                    answer_url=answer_url,
                     status_callback=status_callback,
-                    custom_field=f"{campaign.id}:{link_id}",
-                    from_number=campaign.from_number,
                 )
                 call = result.get("call") if isinstance(result.get("call"), dict) else result
                 contact["call_id"] = call.get("sid") or call.get("id")

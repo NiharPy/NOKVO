@@ -8,8 +8,10 @@ sell my order"), and complaints whose phrasing is open-ended ("the rider
 was rude to me").
 
 This classifier closes that gap. One small Azure OpenAI call returns a
-structured intent + retrieval hint + sentiment. Capped at 800ms with a
-safe-default fallback so a slow or down classifier can never block a turn.
+structured intent + retrieval hint + sentiment. Capped at
+``NOKVO_INTENT_CLASSIFIER_TIMEOUT_MS`` (default 2500ms — measured call
+latency is ~1.5–2.4s) with a safe-default fallback so a slow or down
+classifier can never block a turn indefinitely.
 
 Outputs are CONSUMED by ``NokvoOneVoicePipeline._route_turn`` to decide:
   - Should we hit Qdrant? (needs_kb)
@@ -162,15 +164,37 @@ def _parse_response(text: str) -> ClassifiedIntent | None:
     )
 
 
+def _ls_traceable_chain(name: str):
+    """Static decorator that always wraps with langsmith.traceable.
+
+    The SDK's @traceable is itself a near-no-op when LANGSMITH_TRACING_V2 is
+    false (it checks the env var on each call), so we can decorate eagerly
+    at import time without worrying about init_tracer order.
+    """
+    try:
+        from langsmith.run_helpers import traceable
+
+        return traceable(name=name, run_type="chain")
+    except Exception:
+        return lambda fn: fn
+
+
 class LLMIntentClassifier:
     @staticmethod
+    @_ls_traceable_chain("intent_classifier")
     async def classify(
         text: str,
         *,
         tenant_res: TenantResources,
         history: list[dict[str, str]] | None = None,
-        timeout_ms: int = 800,
+        timeout_ms: int | None = None,
     ) -> ClassifiedIntent:
+        # Resolve the budget from config unless an explicit override is
+        # passed (tests / measurement harnesses pass one directly).
+        if timeout_ms is None:
+            from app.core.config import settings
+            timeout_ms = settings.NOKVO_INTENT_CLASSIFIER_TIMEOUT_MS
+
         cleaned = (text or "").strip()
         if not cleaned:
             return ClassifiedIntent(
@@ -205,7 +229,10 @@ class LLMIntentClassifier:
                         {"role": "system", "content": _CLASSIFIER_SYSTEM},
                         {"role": "user", "content": user_msg},
                     ],
-                    max_tokens=120,
+                    # Output is a tiny fixed-schema JSON (~55 tokens incl. the
+                    # ≤20-word reason). 64 bounds runaway generation without
+                    # risking truncation of the trailing "reason"/closing brace.
+                    max_tokens=64,
                 ),
                 timeout=timeout_ms / 1000,
             )

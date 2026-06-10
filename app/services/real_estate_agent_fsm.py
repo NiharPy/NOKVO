@@ -42,12 +42,17 @@ from typing import Any
 AGENT_MODE_QUERY = "query"
 AGENT_MODE_OBJECTION_HANDLING = "objection_handling"
 AGENT_MODE_SITE_VISIT = "site_visit"
+# ACTIVE enquiry-lead capture (the ``leads_create`` flow is running). Distinct
+# from AGENT_MODE_INBOUND_LEAD, which is the TERMINAL call-end classification
+# for a caller who showed interest but never entered a capture flow.
+AGENT_MODE_LEAD_CAPTURE = "lead_capture"
 AGENT_MODE_INBOUND_LEAD = "inbound_lead"
 
 ALL_MODES = (
     AGENT_MODE_QUERY,
     AGENT_MODE_OBJECTION_HANDLING,
     AGENT_MODE_SITE_VISIT,
+    AGENT_MODE_LEAD_CAPTURE,
     AGENT_MODE_INBOUND_LEAD,
 )
 
@@ -130,9 +135,15 @@ def current_mode(
     if tool_flow.get("deferred_for_kb"):
         return AGENT_MODE_QUERY
     flow_key = str(tool_flow.get("flow_key") or "")
-    if flow_key != "real_estate_site_visit":
-        return AGENT_MODE_QUERY
-    return AGENT_MODE_SITE_VISIT
+    if flow_key == "real_estate_site_visit":
+        return AGENT_MODE_SITE_VISIT
+    # An active ``leads_create`` flow means the caller is leaving their details
+    # for follow-up. Without this branch the mode fell through to QUERY, so the
+    # agent got the "answer questions" instruction and under-collected the
+    # admin-configured Lead Fields. LEAD_CAPTURE drives the slots deterministically.
+    if flow_key == "leads_create":
+        return AGENT_MODE_LEAD_CAPTURE
+    return AGENT_MODE_QUERY
 
 
 _DONT_INVENT_BLOCK = (
@@ -244,6 +255,34 @@ def mode_block_for_prompt(
             "- If you find yourself recapping the booking, you're going off-script — ask the next slot instead."
             + next_step
         )
+    if mode == AGENT_MODE_LEAD_CAPTURE:
+        next_step = ""
+        if pending_slot_label:
+            next_step = f"\nNext detail to capture: **{pending_slot_label}**."
+            if pending_slot_question:
+                next_step += (
+                    f' Reference question: "{pending_slot_question}". '
+                    "Paraphrase in your persona — never recite verbatim, never stack two asks."
+                )
+        else:
+            next_step = (
+                "\nAll REQUIRED details may be captured. Offer ONCE — \"Anything else "
+                "you'd like our team to note?\" — then let the system record the lead. "
+                "Do NOT keep interrogating for optional details the caller didn't volunteer."
+            )
+        return _with_dont_invent(
+            "# AGENT MODE — LEAD_CAPTURE\n"
+            "The caller is leaving their details so the team can follow up. Your only job this "
+            "turn is to capture the next REQUIRED detail the operator configured — ask ONE field, "
+            "in order, using the FIELD-COLLECTION SCRIPT's exact phrasing. If the caller asks a "
+            "side question, answer it in ONE short sentence and immediately re-anchor on the field.\n"
+            "# RULES — non-negotiable\n"
+            "- Ask only ONE field per turn. Required fields first; optional fields are OFFERED once "
+            "(\"anything else to note?\"), never interrogated one-by-one.\n"
+            "- The system writes the lead record itself. Do NOT say 'saved', 'created', or 'all set' — "
+            "collect details until the system fires its own confirmation."
+            + next_step
+        )
     if mode == AGENT_MODE_INBOUND_LEAD:
         return _with_dont_invent(
             "# AGENT MODE — INBOUND_LEAD\n"
@@ -285,6 +324,7 @@ def terminal_mode_for_call_end(
 __all__ = (
     "AGENT_MODE_QUERY",
     "AGENT_MODE_SITE_VISIT",
+    "AGENT_MODE_LEAD_CAPTURE",
     "AGENT_MODE_INBOUND_LEAD",
     "ALL_MODES",
     "enabled_for_business_type",

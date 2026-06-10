@@ -143,6 +143,15 @@ class OutgoingLead(Base):
     submitted_at = Column(DateTime(timezone=True), nullable=True)
     opt_out_at = Column(DateTime(timezone=True), nullable=True)
     call_status = Column(SAEnum(LeadCallStatus), nullable=False, default=LeadCallStatus.new)
+    # Post-call handoff note: a 3-sentence human-readable summary of the
+    # last call written by the global gpt-5.4-mini condenser the moment
+    # the call ends. Read by the follow-up agent's preamble so it opens
+    # with awareness of the prior conversation, and surfaced in the
+    # LeadsView so managers can scan call outcomes without opening
+    # transcripts. Nullable — short or failed calls leave this empty and
+    # the preamble falls back to structured-facts injection.
+    handoff_note = Column(Text, nullable=True)
+    handoff_note_generated_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 

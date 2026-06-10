@@ -150,6 +150,19 @@ def detect_language_switch(transcript: str) -> str | None:
     window_start = max(0, (found_at or 0) - 30)
     window_end = min(len(normalized), (found_at or 0) + 30)
     window = normalized[window_start:window_end]
+
+    # Descriptive mention, NOT a request: "I speak Telugu at home", "we know
+    # Hindi". These shouldn't flip the call's language. Only honour them if an
+    # explicit directive cue is also present (please / switch / "in <lang>").
+    if re.search(r"\b(?:i|we|they|he|she)\s+(?:can\s+)?(?:speak|spoke|know|knew|understand|understood|talk)\b", window):
+        directive = bool(
+            "please" in window
+            or re.search(r"\b(?:switch|change|prefer|continue\s+in)\b", window)
+            or re.search(rf"\bin\s+{re.escape(name)}\b", window)
+        )
+        if not directive:
+            return None
+
     if _NATIVE_SWITCH_RE.search(window):
         return found_code
     window_tokens = re.findall(r"[a-zA-Z]+", window)

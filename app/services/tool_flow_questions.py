@@ -71,6 +71,21 @@ def _kind_for_field(field: dict[str, Any]) -> str:
         return "project"
     if "property" in text and ("type" in text or "looking" in text):
         return "property_type"
+    if "service" in text:
+        return "service"
+    if "possession" in text or "ready to move" in text or "move-in" in text:
+        return "possession_timeline"
+    if "purpose" in text or "investment" in text or "end use" in text or "end-use" in text:
+        return "purpose"
+    if "financ" in text or "loan" in text or "mortgage" in text:
+        return "financing"
+    # datetime FIRST — a combined field (type=datetime, or a label mentioning
+    # both "date" and "time", e.g. "Date and Time") must NOT fall through to the
+    # date-only branch. If it does, the FSM treats it as date-only and bolts on a
+    # phantom canonical visit_time slot — the value lands under a key the admin
+    # never configured. (See _real_estate_visit_slots.)
+    if ftype == "datetime" or ("date" in text and "time" in text):
+        return "datetime"
     if "date" in text and ftype in {"date", "datetime", "text"}:
         return "date"
     if "time" in text or ftype == "datetime":
@@ -90,8 +105,13 @@ def _question_for_kind(kind: str, label: str, language: str) -> str:
             "location": "आप किस location या area में देख रहे हैं?",
             "property_type": "आप किस type की property देख रहे हैं?",
             "project": "आप किस project में interested हैं?",
+            "possession_timeline": "Possession कब तक चाहिए — ready-to-move या under-construction?",
+            "purpose": "यह investment के लिए है या self-use के लिए?",
+            "financing": "क्या आपको home loan की ज़रूरत होगी?",
             "date": "Preferred date क्या है?",
             "time": "Preferred time क्या है?",
+            "datetime": "Visit के लिए कौन सी date और time prefer करेंगे?",
+            "service": "आपको कौन सी service चाहिए?",
             "reason": f"{label} के बारे में थोड़ा बताइए.",
             "generic": f"कृपया {label} बताइए.",
         }.get(kind, f"कृपया {label} बताइए.")
@@ -104,8 +124,13 @@ def _question_for_kind(kind: str, label: str, language: str) -> str:
             "location": "ఏ location లేదా area లో చూస్తున్నారు?",
             "property_type": "ఏ type property చూస్తున్నారు?",
             "project": "ఏ project గురించి interested గా ఉన్నారు?",
+            "possession_timeline": "Possession ఎప్పటికి కావాలి — ready-to-move లేదా under-construction?",
+            "purpose": "ఇది investment కోసమా లేదా self-use కోసమా?",
+            "financing": "మీకు home loan అవసరమా?",
             "date": "Preferred date ఏది?",
             "time": "Preferred time ఏది?",
+            "datetime": "Visit కోసం ఏ date మరియు time prefer చేస్తారు?",
+            "service": "మీకు ఏ service కావాలి?",
             "reason": f"{label} గురించి short గా చెప్పండి.",
             "generic": f"{label} చెప్పండి.",
         }.get(kind, f"{label} చెప్పండి.")
@@ -117,8 +142,13 @@ def _question_for_kind(kind: str, label: str, language: str) -> str:
         "location": "Which location or area are you interested in?",
         "property_type": "What type of property are you looking for?",
         "project": "Which project are you interested in?",
+        "possession_timeline": "What possession timeline works for you — ready-to-move or under-construction?",
+        "purpose": "Is this for investment or your own use?",
+        "financing": "Will you need a home loan?",
         "date": "What date would you prefer?",
         "time": "What time would you prefer?",
+        "datetime": "What date and time would you prefer for the visit?",
+        "service": "Which service would you like to book?",
         "reason": f"Please share {label}.",
         "generic": f"Please share {label}.",
     }.get(kind, f"Please share {label}.")
@@ -153,100 +183,61 @@ def _lead_schema_fields(config: dict[str, Any] | None) -> list[dict[str, Any]]:
     return _writable_fields(((config or {}).get("schemas") or {}).get("leads") or [])
 
 
-def _real_estate_visit_slots(
-    site_visit_fields: list[dict[str, Any]] | None = None,
+def _selection_slots(
+    fields: list[dict[str, Any]] | None,
+    *,
+    categorical_keys: set[str],
 ) -> list[dict[str, Any]]:
-    """Build the slot list for the real-estate site-visit FSM, driven by the
-    admin's **Site Visit Fields** (the tickets schema) — NOT the lead schema.
-
-    A booking captures exactly what the admin configured on the site-visit
-    form. Name + phone come first, the configured conversational fields fill
-    the middle, project + date + time come last. Categorical/admin-only
-    fields (status, owner, priority, issue_type) are never asked; they get
-    server-side defaults. Each slot records ``source_field`` — the configured
-    field key — so the booking tool can store the captured value back under
-    that key and the Site Visits tab renders a populated cell.
+    """Strict, selection-driven slots: EXACTLY the admin's configured writable
+    fields, in schema order, minus system/admin-only ones. Nothing is force-added
+    — the agent asks only what the admin selected. Each slot binds to its
+    configured key (``source_field``) and carries a ``kind`` (from
+    :func:`_kind_for_field`) that drives question phrasing + answer parsing
+    (name/phone/date/time/datetime/budget/…). A combined date+time field stays one
+    slot; separate date/time fields stay two — whatever the admin configured.
     """
-    fields = _writable_fields(site_visit_fields or [])
-
-    def _field_of_kind(kind: str) -> dict[str, Any] | None:
-        for field in fields:
-            if _kind_for_field(field) == kind:
-                return field
-        return None
-
     slots: list[dict[str, Any]] = []
-    used_keys: set[str] = set()
-
-    # Name + phone first. Bind to the matching configured field when present
-    # (so the value lands under e.g. ``customer``), else canonical keys.
-    name_field = _field_of_kind("name")
-    name_key = str((name_field or {}).get("key") or "name")
-    slots.append(_slot_entry(name_key, _field_label(name_field) if name_field else "Name", "name", source_field=(name_field or {}).get("key")))
-    used_keys.add(name_key)
-
-    phone_field = _field_of_kind("phone")
-    phone_key = str((phone_field or {}).get("key") or "phone")
-    slots.append(_slot_entry(phone_key, _field_label(phone_field) if phone_field else "Phone", "phone", source_field=(phone_field or {}).get("key")))
-    used_keys.add(phone_key)
-
-    # Middle: EVERY other configured Site Visit Field, in schema order, so the
-    # agent asks the full ticket schema — not just a hardcoded subset. Only the
-    # system/admin-only fields (status, owner, …) are withheld; those get
-    # server-side defaults. name/phone/project/date/time are scaffolded
-    # separately (above and below) for a natural ask order. Each field keeps its
-    # admin-configured required flag — the FSM asks the required ones and the
-    # field-questions prompt surfaces the rest for the agent to ask too.
-    _categorical_keys = {"status", "assigned_to", "owner", "issue_type", "priority"}
-    for field in fields:
+    for field in _writable_fields(fields or []):
         key = str(field.get("key") or "")
-        if not key or key in used_keys or key in _categorical_keys:
-            continue
-        kind = _kind_for_field(field)
-        if kind in {"name", "phone", "date", "time", "project"}:
+        if not key or key in categorical_keys:
             continue
         slots.append(
             _slot_entry(
                 key,
                 _field_label(field),
-                kind,
+                _kind_for_field(field),
                 required=bool(field.get("required")),
                 source_field=key,
             )
         )
-        used_keys.add(key)
-
-    # Project — always asked. Bind to a configured project/"Property" field
-    # when present so the value renders in that column, else canonical.
-    project_field = _field_of_kind("project")
-    if project_field is None:
-        project_field = next(
-            (
-                f for f in fields
-                if str(f.get("key")) not in used_keys
-                and "property" in f"{f.get('key')} {_field_label(f)}".lower()
-            ),
-            None,
-        )
-    project_key = str((project_field or {}).get("key") or "project_name")
-    if project_key not in used_keys:
-        slots.append(_slot_entry(project_key, _field_label(project_field) if project_field else "Project", "project", required=True, source_field=(project_field or {}).get("key")))
-        used_keys.add(project_key)
-
-    # Date + time last. Bind to configured date/time fields when present.
-    date_field = _field_of_kind("date")
-    date_key = str((date_field or {}).get("key") or "visit_date")
-    if date_key not in used_keys:
-        slots.append(_slot_entry(date_key, _field_label(date_field) if date_field else "Visit Date", "date", source_field=(date_field or {}).get("key")))
-        used_keys.add(date_key)
-
-    time_field = _field_of_kind("time")
-    time_key = str((time_field or {}).get("key") or "visit_time")
-    if time_key not in used_keys:
-        slots.append(_slot_entry(time_key, _field_label(time_field) if time_field else "Visit Time", "time", source_field=(time_field or {}).get("key")))
-        used_keys.add(time_key)
-
     return slots
+
+
+def _real_estate_visit_slots(
+    site_visit_fields: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Site-visit slots = EXACTLY the admin's configured **Site Visit Fields**
+    (the tickets schema), in their order. Nothing is auto-added: if the admin's
+    form doesn't include a project/date/time field, the agent doesn't ask for it.
+    Categorical/admin-only fields (status, owner, priority, issue_type) are never
+    asked — they get server-side defaults.
+    """
+    return _selection_slots(
+        site_visit_fields,
+        categorical_keys={"status", "assigned_to", "owner", "issue_type", "priority"},
+    )
+
+
+def _clinic_appointment_slots(appointment_fields: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    """Appointment slots = EXACTLY the admin's configured **Appointment Fields**
+    (the clinic `appointments` schema), in their order. Nothing is auto-added. The
+    doctor is chosen by the assignment engine from the service mapping, so
+    doctor/department/status are never asked.
+    """
+    return _selection_slots(
+        appointment_fields,
+        categorical_keys={"status", "doctor", "department", "assigned_to", "owner", "priority"},
+    )
 
 
 def build_tool_flow_questions(
@@ -304,6 +295,19 @@ def build_tool_flow_questions(
             "tab": "tickets",
             "slots": _real_estate_visit_slots(site_visit_fields),
         }
+    if normalized_business_type == "clinics":
+        appointment_fields = _writable_fields(
+            ((resolved or {}).get("schemas") or {}).get("appointments") or []
+        )
+        flows["clinic_appointment"] = {
+            "flow": "clinic_appointment",
+            "tool_key": "book_appointment_with_lead_capture",
+            # A booking lands in the Appointments tab, captured per the admin's
+            # Appointment Fields; the tool routes to a doctor who provides the
+            # chosen service via the assignment engine.
+            "tab": "appointments",
+            "slots": _clinic_appointment_slots(appointment_fields),
+        }
     return {
         "version": TOOL_FLOW_QUESTIONS_VERSION,
         "schema_hash": schema_hash,
@@ -339,6 +343,7 @@ _RECORD_TAB_LABELS = {
     "leads_create": "lead",
     "appointments": "appointment",
     "real_estate_site_visit": "site visit",
+    "clinic_appointment": "appointment",
     "tickets": "ticket",
     "callbacks": "callback",
     "complaints": "complaint",
@@ -435,15 +440,19 @@ def format_field_questions_prompt(
     # Tabs (writable fields per record type). These cover ticket /
     # callback / custom tabs that aren't necessarily wrapped in a flow
     # but still need consistent phrasing when the agent collects info.
+    # A flow's record lands in its `tab`, so skip any tab a flow already
+    # covers (matched by the flow's tab, not just the flow key) — otherwise
+    # e.g. the real_estate_site_visit flow AND the "tickets" tab both emit the
+    # same field list (the duplicate `## ticket (...)` blocks).
+    _flow_tabs = {str(f.get("tab")) for f in flows.values() if isinstance(f, dict) and f.get("tab")}
     for tab_key, tab in tabs.items():
         if not isinstance(tab, dict):
             continue
         fields = tab.get("fields") or {}
         if not isinstance(fields, dict) or not fields:
             continue
-        # Skip tabs that are also present as flows — avoids duplication
-        # since the flow already lists those slots.
-        if tab_key in flows:
+        # Skip tabs already covered by a flow (by flow key OR the flow's tab).
+        if tab_key in flows or tab_key in _flow_tabs:
             continue
         record_label = _RECORD_TAB_LABELS.get(str(tab_key), str(tab.get("label") or tab_key))
         lines = [f"## {record_label} ({tab_key})"]
@@ -461,27 +470,13 @@ def format_field_questions_prompt(
         return ""
 
     header = (
-        "# FIELD-COLLECTION SCRIPT — MANDATORY for the records listed below\n"
-        "Operators configured these field lists. You MUST collect every line\n"
-        "marked `(required)` for the flow in progress BEFORE confirming or\n"
-        "closing the record — including any custom fields beyond the obvious\n"
-        "name / phone / date / time / project defaults. \"It feels complete\"\n"
-        "is NEVER a valid reason to skip a required field; the admin put it on\n"
-        "the form for a reason.\n\n"
-        "Hard rules:\n"
-        "1. Ask using the EXACT operator-configured phrasing shown in quotes.\n"
-        "   Do not paraphrase, translate freely, or invent your own wording.\n"
-        "2. Ask ONE field per turn, in the order listed below for that flow.\n"
-        "3. Optional fields may be skipped if the caller doesn't volunteer\n"
-        "   them, but always offer (\"Anything else you'd like noted?\") once\n"
-        "   the required set is complete.\n"
-        "4. PRE-CONFIRM CHECK: before you say anything like \"booked\",\n"
-        "   \"confirmed\", \"all set\", \"captured\", or \"thank you, our team\n"
-        "   will…\", silently verify that EVERY required field for the active\n"
-        "   flow has a captured value. If any required field is missing — even\n"
-        "   ONE — ask for it first. NEVER confirm a record with gaps.\n"
-        "5. If the caller asks a side question mid-collection, answer briefly\n"
-        "   then resume with: \"Coming back to your booking — \" followed by\n"
-        "   the next pending field's exact question."
+        "# FIELD-COLLECTION SCRIPT — collect these per record\n"
+        "Collect every `(required)` line for the active flow before confirming or\n"
+        "closing the record (custom fields included — never skip one).\n"
+        "1. Ask using the EXACT phrasing in quotes — don't paraphrase or translate.\n"
+        "2. One field per turn, in the listed order.\n"
+        "3. Optional fields: skip if not volunteered, but offer \"Anything else to note?\" once required are done.\n"
+        "4. Before any \"booked / confirmed / all set\", silently verify EVERY required field has a value; if one is missing, ask for it — never confirm with gaps.\n"
+        "5. Side question mid-collection: answer briefly, then \"Coming back to your booking — \" + the next field's exact question."
     )
     return header + "\n\n" + "\n\n".join(sections)

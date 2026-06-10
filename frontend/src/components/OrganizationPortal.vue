@@ -30,7 +30,9 @@ import {
 } from 'lucide-vue-next';
 import QrcodeVue from 'qrcode.vue';
 
-const API_BASE_URL = 'http://localhost:8000/api';
+import { API_BASE_URL as _CFG_API_BASE_URL } from '../config.js';
+
+const API_BASE_URL = _CFG_API_BASE_URL;
 const ORG_ACCESS_TOKEN_KEY = 'org_access_token';
 const ORG_REFRESH_TOKEN_KEY = 'org_refresh_token';
 const ORG_THEME_MODE_KEY = 'org_theme_mode';

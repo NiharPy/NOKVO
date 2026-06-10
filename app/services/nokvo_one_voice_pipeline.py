@@ -21,13 +21,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.models.organization import Organization
 from app.models.tenant_resources import TenantResources
-from app.services.agent_knowledge_service import (
-    AGENT_CHUNK_SOURCE_KIND,
-    AGENT_KNOWLEDGE_SOURCE_TYPE,
+from app.services.datetime_parse import DateTimeParseError
+from app.services.agent_config_keys import (
     AGENT_POLICY_CARDS_KEY,
     AGENT_SINGLE_PROMPT_CONFIG_KEY,
-    AgentKnowledgeService,
+    policy_version as _agent_policy_version,
 )
+# Document-RAG source-type tag (retrieval scope). Retained until the KB
+# document-RAG path is removed from the retrieval methods.
 from app.services.agent_outbound_context import (
     OutboundCampaignContext,
     compose_outbound_system_section,
@@ -88,13 +89,11 @@ from app.services.prosody import (
     strip_tone_tags,
     stream_prosody_chunks,
 )
-from app.services.qdrant_service import QdrantService
 from app.services.language_style import (
     outbound_fewshot as language_outbound_fewshot,
     style_guidance as language_style_guidance,
 )
 from app.services.sarvam_voice_service import SARVAM_LANGUAGE_OPTIONS, SarvamVoiceService
-from app.services.text_embedding_service import TextEmbeddingService
 from app.services.tool_flow_policy import evaluate_tool_flow_policy
 from app.services.tool_flow_questions import build_tool_flow_questions, format_field_questions_prompt
 from app.services.voice_turn_policy import (
@@ -188,15 +187,42 @@ _WEEKDAY_INDEX = {
     "saturday": 5,
     "sunday": 6,
 }
+_WEEKDAY_RE = re.compile(r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b")
+
+# Spoken ordinals → day-of-month, so "first of July" / "the twenty third" parse.
+_ORDINAL_WORDS: dict[str, int] = {
+    "first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "sixth": 6,
+    "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10, "eleventh": 11,
+    "twelfth": 12, "thirteenth": 13, "fourteenth": 14, "fifteenth": 15,
+    "sixteenth": 16, "seventeenth": 17, "eighteenth": 18, "nineteenth": 19,
+    "twentieth": 20, "twenty first": 21, "twenty second": 22, "twenty third": 23,
+    "twenty fourth": 24, "twenty fifth": 25, "twenty sixth": 26, "twenty seventh": 27,
+    "twenty eighth": 28, "twenty ninth": 29, "thirtieth": 30, "thirty first": 31,
+}
 
 
-class _AppointmentToolInputError(ValueError):
-    def __init__(self, slot: str, answer: str, *, clear_time: bool = False, clear_date: bool = False):
-        super().__init__(answer)
-        self.slot = slot
-        self.answer = answer
-        self.clear_time = clear_time
-        self.clear_date = clear_date
+def _next_day_of_month(day: int, today: "datetime.date"):
+    """Next calendar date with the given day-of-month, today or later."""
+    year, month = today.year, today.month
+    for _ in range(13):
+        try:
+            candidate = datetime(year, month, day, tzinfo=_APPOINTMENT_LOCAL_TZ).date()
+        except ValueError:
+            candidate = None
+        if candidate is not None and candidate >= today:
+            return candidate
+        month += 1
+        if month > 12:
+            month, year = 1, year + 1
+    return None
+
+
+# Canonical date/time parse error lives in app.services.datetime_parse; this
+# stays as a thin subclass so the appointment handler's existing
+# ``except _AppointmentToolInputError`` clauses keep working while the parser
+# logic is consolidated behind one module.
+class _AppointmentToolInputError(DateTimeParseError):
+    pass
 
 
 def _normalize(text: str) -> str:
@@ -328,43 +354,224 @@ class AzureGroundedLLM:
         return "\n".join(parts).strip()
 
     @staticmethod
+    async def _acquire_member(messages: list[dict[str, str]], max_tokens: int):
+        """Pick a shared LLM-pool member (replaces per-tenant key/endpoint).
+
+        Reserves the estimated tokens from the call's sticky home box (so every
+        turn hits the same deployment → prompt cache hits); if the whole pool is
+        momentarily saturated, soft-falls back to the same home box rather than
+        failing a live call. Returns ``(member, est_tokens)`` or ``(None, est)``
+        only when no pool member is configured at all.
+        """
+        from app.services.llm_pool import LLMPool, _sticky_start, _call_id_var
+
+        chars = sum(len(str(m.get("content") or "")) for m in messages)
+        est = max(1, chars // 4) + int(max_tokens)
+        member = await LLMPool.reserve(est)  # sticky home-preferred + failover
+        if member is None:
+            members = LLMPool.members()
+            if not members:
+                return None, est
+            member = members[_sticky_start(len(members), _call_id_var.get())]
+            logger.warning("NOKVO-LLM: pool saturated — soft fallback to %s", member.key_id)
+        return member, est
+
+    @staticmethod
+    def _member_request(member, messages, *, stream: bool = False, max_tokens: int = 180):
+        endpoint = member.endpoint.rstrip("/")
+        # Responses API endpoint (Azure AI Foundry v1 / `.../openai/responses`):
+        # the URL is already complete (carries its own api-version); the model +
+        # input go in the body. Output is parsed by `extract_text` (output_text /
+        # output[]) and streamed deltas by the `response.output_text.delta` handler
+        # in `stream`. (chat/completions params like stream_options don't apply.)
+        if "/responses" in endpoint:
+            # gpt-5 family: (1) rejects `temperature` (only default allowed), and
+            # (2) is a reasoning model — without minimal effort its reasoning
+            # tokens eat the whole budget and the visible reply comes back empty.
+            # `max_output_tokens` must cover reasoning + the answer, so give
+            # headroom (the FORMAT prompt keeps replies to 1-3 sentences anyway).
+            body: dict[str, Any] = {
+                "model": member.deployment,
+                "input": messages,
+                "reasoning": {"effort": settings.AZURE_OPENAI_REASONING_EFFORT},
+                "max_output_tokens": max(int(max_tokens), 512),
+            }
+            if stream:
+                body["stream"] = True
+            return endpoint, body
+
+        api_version = urllib_parse.quote(settings.AZURE_OPENAI_POOL_API_VERSION.strip())
+        deployment = urllib_parse.quote(member.deployment)
+        if "/openai/deployments/" in endpoint:
+            url = f"{endpoint}?api-version={api_version}" if "api-version=" not in endpoint else endpoint
+        else:
+            url = f"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version={api_version}"
+        body = {"messages": messages, "temperature": 0.2, "max_tokens": max_tokens}
+        if stream:
+            body["stream"] = True
+            # Emit a final usage chunk (incl. prompt_tokens_details.cached_tokens)
+            # so streamed turns report real + cached token counts for cost/caching
+            # measurement. The usage chunk has empty choices → no extra spoken token.
+            body["stream_options"] = {"include_usage": True}
+        return url, body
+
+    @staticmethod
     async def complete(tenant_res: TenantResources, messages: list[dict[str, str]], *, max_tokens: int = 180) -> str:
-        api_key = await AzureGroundedLLM.api_key(tenant_res)
-        url, body = AzureGroundedLLM.endpoint_and_body(tenant_res, messages, max_tokens=max_tokens)
+        # Lazy-import the tracer so a disabled config never pays the
+        # import cost on this hot path.
+        from app.services.langsmith_tracer import trace_llm, end_llm_span
+        from app.services.llm_pool import LLMPool
+        import time as _time
+
+        member, _pool_est = await AzureGroundedLLM._acquire_member(messages, max_tokens)
+        if member is None:
+            raise NokvoOneAgentRuntimeError("No LLM pool members configured for Nokvo One agent runtime.")
+        api_key = member.api_key
+        url, body = AzureGroundedLLM._member_request(member, messages, max_tokens=max_tokens)
+        # Deployment name lives in the URL after /openai/deployments/.
+        # Pull it out for the trace metadata so a developer can filter on
+        # "which deployment served this turn" from LangSmith.
+        try:
+            _dep_for_trace = (url.split("/openai/deployments/", 1)[1] or "").split("/", 1)[0]
+        except Exception:
+            _dep_for_trace = ""
+
         attempts = 4
         last_response = None
-        for attempt in range(attempts):
+        _t0 = _time.perf_counter()
+        attempt_count = 0
+        async with trace_llm(
+            name="azure_openai.complete",
+            model=_dep_for_trace or None,
+            messages=messages,
+            max_tokens=max_tokens,
+            tenant_id=str(getattr(tenant_res, "tenant_id", "")) or None,
+        ) as _llm_span:
+            for attempt in range(attempts):
+                attempt_count = attempt + 1
+                response = await AzureGroundedLLM.http().post(
+                    url,
+                    headers={"api-key": api_key, "Content-Type": "application/json"},
+                    json=body,
+                )
+                last_response = response
+                if response.status_code != 429:
+                    break
+                retry_after_hdr = response.headers.get("retry-after", "")
+                try:
+                    retry_after = float(retry_after_hdr) if retry_after_hdr else 0.0
+                except ValueError:
+                    retry_after = 0.0
+                if attempt < attempts - 1:
+                    wait_for = retry_after if retry_after > 0 else 0.6 * (2 ** attempt)
+                    wait_for = min(wait_for, 3.5)
+                    logger.warning(
+                        "NOKVO-LLM: 429 (complete) attempt %s/%s — sleeping %.2fs (retry_after=%r)",
+                        attempt + 1, attempts, wait_for, retry_after_hdr,
+                    )
+                    await asyncio.sleep(wait_for)
+                    continue
+                logger.warning(f"NOKVO-LLM: 429 (complete) — giving up after {attempt + 1} attempt(s); retry_after={retry_after_hdr!r}")
+                await LLMPool.cooldown(member)
+                end_llm_span(_llm_span, {
+                    "status": "rate_limited",
+                    "attempts": attempt_count,
+                    "latency_ms": int((_time.perf_counter() - _t0) * 1000),
+                })
+                raise NokvoOneAgentRateLimited(
+                    f"Azure OpenAI rate-limited (429): {response.text[:300]}",
+                    retry_after_seconds=retry_after or None,
+                )
+            response = last_response
+            if response.status_code >= 400:
+                end_llm_span(_llm_span, {
+                    "status": "error",
+                    "http_status": response.status_code,
+                    "attempts": attempt_count,
+                    "latency_ms": int((_time.perf_counter() - _t0) * 1000),
+                })
+                raise NokvoOneAgentRuntimeError(f"Azure OpenAI request failed ({response.status_code}): {response.text[:300]}")
+            payload = response.json()
+            text = AzureGroundedLLM.extract_text(payload)
+            usage = payload.get("usage") if isinstance(payload, dict) else None
+            await LLMPool.reconcile(member, _pool_est, int((usage or {}).get("total_tokens") or _pool_est))
+            end_llm_span(_llm_span, {
+                "response": text,
+                "status": "completed",
+                "attempts": attempt_count,
+                "latency_ms": int((_time.perf_counter() - _t0) * 1000),
+                "prompt_tokens": (usage or {}).get("prompt_tokens"),
+                "completion_tokens": (usage or {}).get("completion_tokens"),
+                "total_tokens": (usage or {}).get("total_tokens"),
+            })
+            return text
+
+    @staticmethod
+    async def complete_global(
+        messages: list[dict[str, str]], *, max_tokens: int = 200
+    ) -> str:
+        """Same as :meth:`complete`, but pinned to the GLOBAL deployment
+        (``settings.AZURE_OPENAI_GLOBAL_*``) regardless of tenant.
+
+        Use this for cheap background tasks that don't justify burning a
+        tenant's agent-deployment quota — the post-call condenser, future
+        bulk summary jobs, etc. The endpoint, deployment, API version, and
+        API key all come from the env-level global settings; tenant
+        provider_status / secret_refs are ignored.
+
+        Returns the model's text response. Raises on non-2xx (no rate
+        limit retry: this is for background work, callers handle failure
+        by skipping the artefact).
+        """
+        from app.services.llm_pool import LLMPool
+        member, _pool_est = await AzureGroundedLLM._acquire_member(messages, max_tokens)
+        if member is None:
+            raise NokvoOneAgentRuntimeError(
+                "No LLM pool members configured — complete_global() needs the "
+                "AZURE_OPENAI pool (or GLOBAL fallback) configured."
+            )
+        api_key = member.api_key
+        deployment = member.deployment
+        url, body = AzureGroundedLLM._member_request(member, messages, max_tokens=max_tokens)
+        from app.services.langsmith_tracer import trace_llm, end_llm_span
+        import time as _time
+
+        _t0 = _time.perf_counter()
+        async with trace_llm(
+            name="azure_openai.complete_global",
+            model=deployment,
+            messages=messages,
+            max_tokens=max_tokens,
+            deployment_kind="global",
+        ) as _llm_span:
             response = await AzureGroundedLLM.http().post(
                 url,
                 headers={"api-key": api_key, "Content-Type": "application/json"},
                 json=body,
             )
-            last_response = response
-            if response.status_code != 429:
-                break
-            retry_after_hdr = response.headers.get("retry-after", "")
-            try:
-                retry_after = float(retry_after_hdr) if retry_after_hdr else 0.0
-            except ValueError:
-                retry_after = 0.0
-            if attempt < attempts - 1:
-                wait_for = retry_after if retry_after > 0 else 0.6 * (2 ** attempt)
-                wait_for = min(wait_for, 3.5)
-                logger.warning(
-                    "NOKVO-LLM: 429 (complete) attempt %s/%s — sleeping %.2fs (retry_after=%r)",
-                    attempt + 1, attempts, wait_for, retry_after_hdr,
+            if response.status_code >= 400:
+                end_llm_span(_llm_span, {
+                    "status": "error",
+                    "http_status": response.status_code,
+                    "latency_ms": int((_time.perf_counter() - _t0) * 1000),
+                })
+                raise NokvoOneAgentRuntimeError(
+                    f"Azure OpenAI (global) request failed ({response.status_code}): "
+                    f"{response.text[:300]}"
                 )
-                await asyncio.sleep(wait_for)
-                continue
-            logger.warning(f"NOKVO-LLM: 429 (complete) — giving up after {attempt + 1} attempt(s); retry_after={retry_after_hdr!r}")
-            raise NokvoOneAgentRateLimited(
-                f"Azure OpenAI rate-limited (429): {response.text[:300]}",
-                retry_after_seconds=retry_after or None,
-            )
-        response = last_response
-        if response.status_code >= 400:
-            raise NokvoOneAgentRuntimeError(f"Azure OpenAI request failed ({response.status_code}): {response.text[:300]}")
-        return AzureGroundedLLM.extract_text(response.json())
+            payload = response.json()
+            text = AzureGroundedLLM.extract_text(payload)
+            usage = payload.get("usage") if isinstance(payload, dict) else None
+            await LLMPool.reconcile(member, _pool_est, int((usage or {}).get("total_tokens") or _pool_est))
+            end_llm_span(_llm_span, {
+                "response": text,
+                "status": "completed",
+                "latency_ms": int((_time.perf_counter() - _t0) * 1000),
+                "prompt_tokens": (usage or {}).get("prompt_tokens"),
+                "completion_tokens": (usage or {}).get("completion_tokens"),
+                "total_tokens": (usage or {}).get("total_tokens"),
+            })
+            return text
 
     @staticmethod
     async def stream_prosody(
@@ -394,6 +601,40 @@ class AzureGroundedLLM:
             yield chunk
 
     @staticmethod
+    async def complete_nano(messages: list[dict[str, str]], *, max_tokens: int = 120) -> str:
+        """Cheap, non-streaming completion on the gpt-4.1-nano POOL — for
+        background tasks like the in-call rolling summary. Round-robin across nano
+        keys for quota (no stickiness — summaries don't benefit from caching).
+        Falls back to the gpt-5-mini pool (``complete_global``) when no nano is
+        configured. No retry: callers treat failure as 'keep the prior artefact'."""
+        from app.services.llm_pool import LLMPool
+
+        if not LLMPool.members("nano"):
+            return await AzureGroundedLLM.complete_global(messages, max_tokens=max_tokens)
+        chars = sum(len(str(m.get("content") or "")) for m in messages)
+        est = max(1, chars // 4) + int(max_tokens)
+        member = await LLMPool.reserve(est, pool="nano", sticky=False)
+        if member is None:
+            import random as _random
+            members = LLMPool.members("nano")
+            member = members[_random.randrange(len(members))]  # all boxes capped → soft-fall
+        url, body = AzureGroundedLLM._member_request(member, messages, max_tokens=max_tokens)
+        try:
+            resp = await AzureGroundedLLM.http().post(
+                url, headers={"api-key": member.api_key, "Content-Type": "application/json"}, json=body,
+            )
+            if resp.status_code == 429:
+                await LLMPool.cooldown(member, pool="nano")
+            resp.raise_for_status()
+            payload = resp.json()
+            actual = int(((payload.get("usage") or {}).get("total_tokens")) or est)
+            await LLMPool.reconcile(member, est, actual, pool="nano")
+            return AzureGroundedLLM.extract_text(payload)
+        except Exception:
+            await LLMPool.reconcile(member, est, 0, pool="nano")
+            raise
+
+    @staticmethod
     async def stream(
         tenant_res: TenantResources,
         messages: list[dict[str, str]],
@@ -402,13 +643,25 @@ class AzureGroundedLLM:
         retry_attempts: int | None = None,
         max_retry_wait_s: float | None = None,
     ) -> AsyncIterator[str]:
-        api_key = await AzureGroundedLLM.api_key(tenant_res)
-        url, body = AzureGroundedLLM.endpoint_and_body(
-            tenant_res,
+        # Lazy-import so the disabled-tracing path costs nothing.
+        from app.services.langsmith_tracer import trace_llm, end_llm_span
+        import time as _time
+
+        member, _pool_est = await AzureGroundedLLM._acquire_member(messages, max_tokens)
+        if member is None:
+            raise NokvoOneAgentRuntimeError("No LLM pool members configured for Nokvo One agent runtime.")
+        api_key = member.api_key
+        url, body = AzureGroundedLLM._member_request(
+            member,
             messages,
             stream=True,
             max_tokens=max_tokens,
         )
+        try:
+            _dep_for_trace = (url.split("/openai/deployments/", 1)[1] or "").split("/", 1)[0]
+        except Exception:
+            _dep_for_trace = ""
+
         # Azure OpenAI per-tenant deployments often have low TPM/RPM. In
         # interactive testing the user fires several turns in quick succession
         # and trips the quota — the agent then says "Give me a second, I'm a
@@ -418,58 +671,126 @@ class AzureGroundedLLM:
         # doesn't tell us how long.
         attempts = max(1, int(retry_attempts or 4))
         retry_wait_cap = 3.5 if max_retry_wait_s is None else max(0.0, float(max_retry_wait_s))
-        for attempt in range(attempts):
-            async with AzureGroundedLLM.http().stream(
-                "POST",
-                url,
-                headers={"api-key": api_key, "Content-Type": "application/json"},
-                json=body,
-            ) as response:
-                if response.status_code == 429:
-                    retry_after_hdr = response.headers.get("retry-after", "")
-                    try:
-                        retry_after = float(retry_after_hdr) if retry_after_hdr else 0.0
-                    except ValueError:
-                        retry_after = 0.0
-                    body_text = (await response.aread()).decode("utf-8", errors="replace")[:300]
-                    if attempt < attempts - 1:
-                        wait_for = retry_after if retry_after > 0 else 0.6 * (2 ** attempt)
-                        wait_for = min(wait_for, retry_wait_cap)
-                        logger.warning(
-                            "NOKVO-LLM: 429 attempt %s/%s — sleeping %.2fs (retry_after=%r)",
-                            attempt + 1, attempts, wait_for, retry_after_hdr,
-                        )
-                        await asyncio.sleep(wait_for)
-                        continue
-                    logger.warning(f"NOKVO-LLM: 429 — giving up after {attempt + 1} attempt(s); retry_after={retry_after_hdr!r}")
-                    raise NokvoOneAgentRateLimited(
-                        f"Azure OpenAI rate-limited (429): {body_text}",
-                        retry_after_seconds=retry_after or None,
-                    )
-                if response.status_code >= 400:
-                    text = await response.aread()
-                    raise NokvoOneAgentRuntimeError(f"Azure OpenAI stream failed ({response.status_code}): {text[:300]!r}")
-                async for line in response.aiter_lines():
-                    if not line.startswith("data: "):
-                        continue
-                    raw = line[6:]
-                    if raw.strip() == "[DONE]":
-                        return
-                    try:
-                        event = json.loads(raw)
-                    except json.JSONDecodeError:
-                        continue
-                    if event.get("type") == "response.output_text.delta":
-                        token = event.get("delta") or ""
-                        if token:
-                            yield token
-                        continue
-                    choices = event.get("choices") or []
-                    if choices:
-                        token = ((choices[0].get("delta") or {}).get("content")) or ""
-                        if token:
-                            yield token
-                return  # successful stream — exit the retry loop
+
+        # Trace wrapper around the entire stream. Buffer every yielded token
+        # so the trace carries the full assembled response (or the partial
+        # one, when barge-in cancels mid-flight). The barge-in path is
+        # signposted with status="cancelled_barge_in" so a developer can
+        # search LangSmith for "why did the agent stop mid-sentence?".
+        _t0 = _time.perf_counter()
+        _buffer: list[str] = []
+        _usage: dict[str, Any] | None = None
+        async with trace_llm(
+            name="azure_openai.stream",
+            model=_dep_for_trace or None,
+            messages=messages,
+            max_tokens=max_tokens,
+            stream=True,
+            tenant_id=str(getattr(tenant_res, "tenant_id", "")) or None,
+        ) as _llm_span:
+            try:
+                for attempt in range(attempts):
+                    async with AzureGroundedLLM.http().stream(
+                        "POST",
+                        url,
+                        headers={"api-key": api_key, "Content-Type": "application/json"},
+                        json=body,
+                    ) as response:
+                        if response.status_code == 429:
+                            retry_after_hdr = response.headers.get("retry-after", "")
+                            try:
+                                retry_after = float(retry_after_hdr) if retry_after_hdr else 0.0
+                            except ValueError:
+                                retry_after = 0.0
+                            body_text = (await response.aread()).decode("utf-8", errors="replace")[:300]
+                            if attempt < attempts - 1:
+                                wait_for = retry_after if retry_after > 0 else 0.6 * (2 ** attempt)
+                                wait_for = min(wait_for, retry_wait_cap)
+                                logger.warning(
+                                    "NOKVO-LLM: 429 attempt %s/%s — sleeping %.2fs (retry_after=%r)",
+                                    attempt + 1, attempts, wait_for, retry_after_hdr,
+                                )
+                                await asyncio.sleep(wait_for)
+                                continue
+                            logger.warning(f"NOKVO-LLM: 429 — giving up after {attempt + 1} attempt(s); retry_after={retry_after_hdr!r}")
+                            end_llm_span(_llm_span, {
+                                "response": "".join(_buffer),
+                                "status": "rate_limited",
+                                "attempts": attempt + 1,
+                                "latency_ms": int((_time.perf_counter() - _t0) * 1000),
+                                "tokens_before_cancel": len(_buffer),
+                            })
+                            raise NokvoOneAgentRateLimited(
+                                f"Azure OpenAI rate-limited (429): {body_text}",
+                                retry_after_seconds=retry_after or None,
+                            )
+                        if response.status_code >= 400:
+                            text = await response.aread()
+                            end_llm_span(_llm_span, {
+                                "response": "".join(_buffer),
+                                "status": "error",
+                                "http_status": response.status_code,
+                                "latency_ms": int((_time.perf_counter() - _t0) * 1000),
+                            })
+                            raise NokvoOneAgentRuntimeError(f"Azure OpenAI stream failed ({response.status_code}): {text[:300]!r}")
+                        async for line in response.aiter_lines():
+                            if not line.startswith("data: "):
+                                continue
+                            raw = line[6:]
+                            if raw.strip() == "[DONE]":
+                                end_llm_span(_llm_span, {
+                                    "response": "".join(_buffer),
+                                    "status": "completed",
+                                    "tokens": len(_buffer),
+                                    "latency_ms": int((_time.perf_counter() - _t0) * 1000),
+                                    "prompt_tokens": (_usage or {}).get("prompt_tokens"),
+                                    "completion_tokens": (_usage or {}).get("completion_tokens"),
+                                    "total_tokens": (_usage or {}).get("total_tokens"),
+                                    "cached_tokens": ((_usage or {}).get("prompt_tokens_details") or {}).get("cached_tokens"),
+                                })
+                                return
+                            try:
+                                event = json.loads(raw)
+                            except json.JSONDecodeError:
+                                continue
+                            if event.get("usage"):
+                                _usage = event["usage"]  # final stream_options usage chunk
+                            if event.get("type") == "response.output_text.delta":
+                                token = event.get("delta") or ""
+                                if token:
+                                    _buffer.append(token)
+                                    yield token
+                                continue
+                            choices = event.get("choices") or []
+                            if choices:
+                                token = ((choices[0].get("delta") or {}).get("content")) or ""
+                                if token:
+                                    _buffer.append(token)
+                                    yield token
+                        end_llm_span(_llm_span, {
+                            "response": "".join(_buffer),
+                            "status": "completed",
+                            "tokens": len(_buffer),
+                            "latency_ms": int((_time.perf_counter() - _t0) * 1000),
+                            "prompt_tokens": (_usage or {}).get("prompt_tokens"),
+                            "completion_tokens": (_usage or {}).get("completion_tokens"),
+                            "total_tokens": (_usage or {}).get("total_tokens"),
+                            "cached_tokens": ((_usage or {}).get("prompt_tokens_details") or {}).get("cached_tokens"),
+                        })
+                        return  # successful stream — exit the retry loop
+            except (asyncio.CancelledError, GeneratorExit):
+                # Barge-in: the voice turn arbiter cancelled this stream
+                # because the caller started speaking. Stamp the partial
+                # response with a status so a developer can find "agent
+                # stopped mid-sentence" turns in LangSmith without spelunking
+                # logs. Re-raise so the arbiter still tears down TTS.
+                end_llm_span(_llm_span, {
+                    "response": "".join(_buffer),
+                    "status": "cancelled_barge_in",
+                    "tokens_before_cancel": len(_buffer),
+                    "latency_ms": int((_time.perf_counter() - _t0) * 1000),
+                })
+                raise
 
 
 class NokvoOneVoicePipeline:
@@ -795,17 +1116,80 @@ class NokvoOneVoicePipeline:
         english_text: str | None = None,
         dual_retrieval: bool = False,
     ) -> dict[str, Any]:
-        # Qdrant has been retired from the runtime pipeline. The agent now
-        # answers from: (a) the admin's single-prompt guidance, (b) the
-        # live real-estate project inventory, (c) conversational memory,
-        # and (d) the slot FSM's deterministic flow. Returning an empty
-        # chunks list short-circuits every downstream "no chunks → refuse"
-        # gate AND keeps the LLM path active because every call site also
-        # checks ``single_prompt_guidance`` / ``outbound_mode`` before
-        # refusing.
+        # Knowledge-Base document retrieval is retired: the agent answers from
+        # its vertical system prompt, not Qdrant/embedding retrieval. Returns an
+        # empty result; callers handle ``chunks == []`` by not grounding.
+        return {
+            "query": query,
+            "chunks": [],
+            "refusal": None,
+            "sensitive": bool(intent_result and intent_result.sensitive),
+            "min_score": 0.0,
+            "top_k": top_k or 0,
+        }
+        # --- retired (unreachable below) ---
+        # LangSmith retriever span. Currently this function returns an
+        # empty chunks list because Qdrant retrieval is retired from the
+        # runtime path (see comment below). The span still posts — the
+        # zero-chunk result is itself useful debugging signal ("retrieval
+        # is disabled, answers come from prompt + memory only"). When
+        # Qdrant is re-enabled the spans populate without further work.
+        try:
+            from langsmith.run_helpers import traceable, get_current_run_tree
+            _parent = get_current_run_tree()
+        except Exception:
+            _parent = None
+        if _parent is not None:
+            try:
+                _retr_span = _parent.create_child(
+                    name="retrieval",
+                    run_type="retriever",
+                    inputs={
+                        "query": query,
+                        "top_k": top_k,
+                        "campaign_id": campaign_id,
+                        "dual": dual_retrieval,
+                    },
+                )
+                _retr_span.post()
+            except Exception:
+                _retr_span = None
+        else:
+            _retr_span = None
+        # Qdrant / KB-document retrieval has been retired from the runtime
+        # pipeline. The agent now answers from: (a) the curated per-vertical
+        # system prompt + the org's BUSINESS FACTS (see
+        # app/services/vertical_prompts.py + agent_runtime_bundle), (b) the
+        # live real-estate project inventory, (c) conversational memory, and
+        # (d) the slot FSM's deterministic flow. Returning an empty chunks
+        # list short-circuits every downstream "no chunks → refuse" gate AND
+        # keeps the LLM path active because every call site also checks
+        # ``single_prompt_guidance`` (now always present) / ``outbound_mode``
+        # before refusing. (Policy-card synthetic chunks are injected by
+        # callers separately and are unaffected.)
         if not query.strip():
-            return {"query": query, "chunks": [], "refusal": "Empty query."}
-        return {"query": query, "chunks": [], "refusal": None}
+            _result = {"query": query, "chunks": [], "refusal": "Empty query."}
+            if _retr_span is not None:
+                try:
+                    _retr_span.add_outputs({"chunks": [], "chunk_count": 0, "status": "empty_query"})
+                    _retr_span.end()
+                    _retr_span.patch()
+                except Exception:
+                    pass
+            return _result
+        _result = {"query": query, "chunks": [], "refusal": None}
+        if _retr_span is not None:
+            try:
+                _retr_span.add_outputs({
+                    "chunks": [],
+                    "chunk_count": 0,
+                    "status": "qdrant_disabled",
+                })
+                _retr_span.end()
+                _retr_span.patch()
+            except Exception:
+                pass
+        return _result
         # Dual retrieval (code-switching path): when the call is actively
         # code-switching between two languages, embedding only the
         # "best" form of the query misses chunks indexed under the other
@@ -849,14 +1233,14 @@ class NokvoOneVoicePipeline:
         # consulted as soft signals AFTER retrieval — see _filter_unapproved
         # below.
         filters: dict[str, Any] = {
-            "source_type": AGENT_KNOWLEDGE_SOURCE_TYPE,
+            "source_type": "agent_knowledge",
         }
         if campaign_id:
             filters["campaign_id"] = campaign_id
         if sensitive and intent_result and intent_result.topic and intent_result.topic != "general":
             filters["topic"] = intent_result.topic
 
-        vector = await TextEmbeddingService.embed_text_for_tenant(tenant_res, query)
+        vector = None  # retired: embeddings/KB retrieval removed
         limit = max(1, min(effective_top_k, 12))
 
         # Score floor + soft approval check. We DON'T reject a chunk just
@@ -881,13 +1265,7 @@ class NokvoOneVoicePipeline:
 
         async def _search(label: str, payload_filters: dict[str, Any]) -> list[Any]:
             started = perf_counter()
-            points = await QdrantService.search_points(
-                tenant_res,
-                vector,
-                limit=limit,
-                payload_filters=payload_filters,
-                db=db,
-            )
+            points = []  # retired: Qdrant/KB retrieval removed
             # Debug-level so production stdout/log volume doesn't carry the
             # caller's query text or per-turn retrieval stats by default; ops
             # can flip the logger to DEBUG when actually investigating.
@@ -905,7 +1283,7 @@ class NokvoOneVoicePipeline:
         relaxed_task: asyncio.Task[list[Any]] | None = None
         minimal_task: asyncio.Task[list[Any]] | None = None
         relaxed_filters: dict[str, Any] | None = None
-        minimal_filters = {"source_type": AGENT_KNOWLEDGE_SOURCE_TYPE}
+        minimal_filters = {"source_type": "agent_knowledge"}
 
         if sensitive and "topic" in filters:
             relaxed_filters = dict(filters)
@@ -1131,10 +1509,13 @@ class NokvoOneVoicePipeline:
 
     @staticmethod
     def _single_prompt_guidance(tenant_res: TenantResources) -> str:
-        # Synchronous read straight off ``provider_status`` — used by
-        # branches that can't await (template router decisions). The async
-        # ``_voice_business_context`` path uses the cached bundle which
-        # contains the same string.
+        # Explicit-admin-override probe only. This gates whether to SUPPRESS
+        # the built-in FSMs (clinic appointments, etc.) — NOT whether the agent
+        # has a persona. The curated per-vertical persona is always present and
+        # is composed separately on the async bundle path
+        # (``agent_runtime_bundle._single_prompt_guidance``). Returning "" when
+        # no legacy override is configured (the normal case now) lets the
+        # built-in FSMs run.
         provider_status = dict(tenant_res.provider_status or {})
         config = provider_status.get(AGENT_SINGLE_PROMPT_CONFIG_KEY) or {}
         if not isinstance(config, dict) or not config.get("enabled"):
@@ -1176,6 +1557,31 @@ class NokvoOneVoicePipeline:
         except Exception:
             return "", []
         return projects_prompt_section(projects), projects
+
+    @staticmethod
+    async def _services_block_for_bundle(
+        db: AsyncSession | None,
+        bundle: "RuntimeBundle",
+    ) -> str:
+        """Authoritative clinic SERVICES catalog block (services + which doctors
+        + price/duration) for a clinic org, else "". Injected as its own system
+        section so the agent quotes real services/doctors and routes booking
+        service-first. Loaded per-call (uncached) so edits reflect immediately."""
+        if (bundle.organization_industry or "").lower() != "clinics":
+            return ""
+        organization_id = getattr(bundle.organization, "id", None)
+        if organization_id is None:
+            return ""
+        try:
+            from app.services.clinic_service_service import (
+                load_services_with_providers,
+                services_prompt_section,
+            )
+
+            services = await load_services_with_providers(db, organization_id)
+        except Exception:
+            return ""
+        return services_prompt_section(services)
 
     @staticmethod
     def _focus_project_summary(
@@ -1242,10 +1648,26 @@ class NokvoOneVoicePipeline:
             return today + timedelta(days=1)
         if "today" in raw:
             return today
-        for name, weekday in _WEEKDAY_INDEX.items():
-            if name in raw:
-                delta = (weekday - today.weekday()) % 7
-                return today + timedelta(days=delta)
+        # "in/after N days" → concrete offset.
+        rel_days = re.search(r"\b(?:in|after)\s+(\d{1,2})\s+days?\b", raw)
+        if rel_days:
+            n = int(rel_days.group(1))
+            if 0 < n <= 60:
+                return today + timedelta(days=n)
+        # "this/next weekend" → the upcoming Saturday.
+        if "weekend" in raw:
+            delta = (5 - today.weekday()) % 7
+            return today + timedelta(days=delta or 7)
+        # Weekday name — word-boundary match (so "mondayish" doesn't match) and
+        # ALWAYS the upcoming occurrence, never today (fixes "Monday"/"next
+        # Monday" resolving to today when today is that weekday).
+        weekday_match = _WEEKDAY_RE.search(raw)
+        if weekday_match:
+            target = _WEEKDAY_INDEX[weekday_match.group(1)]
+            delta = (target - today.weekday()) % 7
+            if delta == 0:
+                delta = 7
+            return today + timedelta(days=delta)
 
         numeric = re.search(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b", raw)
         if numeric:
@@ -1289,6 +1711,41 @@ class NokvoOneVoicePipeline:
                     ) from exc
                 return parsed if parsed >= today or year_token else parsed.replace(year=parsed.year + 1)
 
+        # Bare day-of-month with an ordinal suffix: "the 15th", "15th", "on the 3rd".
+        # (Requires the suffix so a stray "15" isn't mistaken for a date.)
+        bare_dom = re.search(r"\b(?:on\s+the\s+|the\s+)?(\d{1,2})(?:st|nd|rd|th)\b", raw)
+        if bare_dom:
+            cand = _next_day_of_month(int(bare_dom.group(1)), today)
+            if cand is not None:
+                return cand
+            raise _AppointmentToolInputError(
+                "preferred_date",
+                "That date does not look valid. Which date should I note?",
+                clear_date=True,
+            )
+
+        # Spoken word ordinals: "first of July", "the twenty third". Longest
+        # phrase first so "twenty first" beats "first".
+        for word in sorted(_ORDINAL_WORDS, key=len, reverse=True):
+            if re.search(rf"\b{word}\b", raw):
+                day = _ORDINAL_WORDS[word]
+                month_for_word = None
+                for mname, mnum in _MONTH_INDEX.items():
+                    if re.search(rf"\b{mname}\b", raw):
+                        month_for_word = mnum
+                        break
+                if month_for_word is not None:
+                    try:
+                        cand = datetime(today.year, month_for_word, day, tzinfo=_APPOINTMENT_LOCAL_TZ).date()
+                    except ValueError:
+                        cand = None
+                    if cand is not None:
+                        return cand if cand >= today else cand.replace(year=cand.year + 1)
+                cand = _next_day_of_month(day, today)
+                if cand is not None:
+                    return cand
+                break
+
         raise _AppointmentToolInputError(
             "preferred_date",
             "I need the appointment date clearly. Which date should I note?",
@@ -1300,6 +1757,44 @@ class NokvoOneVoicePipeline:
         raw = re.sub(r"\s+", " ", normalize_relative_datetime_text(str(value or "")).strip().lower())
         if not raw:
             raise _AppointmentToolInputError("preferred_time", "What time should I note for the appointment?")
+        # Midnight is out of booking hours — clarify instead of resolving it (it
+        # used to substring-match "night" and book 7 PM).
+        if re.search(r"\bmidnight\b", raw):
+            raise _AppointmentToolInputError(
+                "preferred_time",
+                "We don't book at midnight — what daytime works for you?",
+                clear_time=True,
+            )
+
+        def _daytime_hour(h: int) -> int | None:
+            """Map a 1–12 spoken hour to 24h assuming a daytime booking
+            (8–11 → AM, 12 → noon, 1–7 → PM). Returns None when ambiguous."""
+            if h == 12:
+                return 12
+            if 8 <= h <= 11:
+                return h
+            if 1 <= h <= 7:
+                return h + 12
+            return None
+
+        # Spoken fractions: "half past 4", "quarter past 4", "quarter to 5".
+        half = re.search(r"\bhalf\s*past\s+(\d{1,2})\b", raw)
+        if half:
+            hh = _daytime_hour(int(half.group(1)))
+            if hh is not None:
+                return time(hh, 30)
+        qpast = re.search(r"\bquarter\s*past\s+(\d{1,2})\b", raw)
+        if qpast:
+            hh = _daytime_hour(int(qpast.group(1)))
+            if hh is not None:
+                return time(hh, 15)
+        qto = re.search(r"\bquarter\s*to\s+(\d{1,2})\b", raw)
+        if qto:
+            base = int(qto.group(1)) - 1
+            hh = _daytime_hour(base if base >= 1 else 12)
+            if hh is not None:
+                return time(hh, 45)
+
         named_times = {
             "morning": time(9, 0),
             "afternoon": time(14, 0),
@@ -1308,7 +1803,7 @@ class NokvoOneVoicePipeline:
             "noon": time(12, 0),
         }
         for label, parsed in named_times.items():
-            if label in raw:
+            if re.search(rf"\b{label}\b", raw):
                 return parsed
         ampm = re.search(r"\b(\d{1,2})(?::([0-5]\d))?\s*(am|pm)\b", raw)
         if ampm:
@@ -1329,11 +1824,14 @@ class NokvoOneVoicePipeline:
         twenty_four = re.search(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", raw)
         if twenty_four:
             return time(int(twenty_four.group(1)), int(twenty_four.group(2)))
-        bare = re.fullmatch(r"(?:at\s+)?(\d{1,2})", raw)
+        bare = re.fullmatch(r"(?:at\s+)?(\d{1,2})(?:\s*ish)?", raw)
         if bare:
             hour = int(bare.group(1))
-            if 0 <= hour <= 23 and hour > 12:
+            if 13 <= hour <= 23:
                 return time(hour, 0)
+            inferred = _daytime_hour(hour)
+            if inferred is not None:
+                return time(inferred, 0)
             raise _AppointmentToolInputError(
                 "preferred_time",
                 f"Just to confirm, is that {hour} AM or {hour} PM?",
@@ -1736,6 +2234,12 @@ class NokvoOneVoicePipeline:
         if tool is None:
             return None
 
+        # Snapshot the FK primitive now (tenant_res is still fresh — nothing has
+        # committed/rolled back yet). The fresh-session retry below rolls back on
+        # failure, which expires tenant_res's attributes; re-reading them would
+        # trigger a sync ORM reload outside the greenlet (MissingGreenlet).
+        org_id = getattr(tenant_res, "organization_id")
+
         try:
             appointment_time = NokvoOneVoicePipeline._appointment_datetime_iso(appointment)
         except _AppointmentToolInputError as exc:
@@ -1759,6 +2263,12 @@ class NokvoOneVoicePipeline:
             "appointment_time": appointment_time,
             "reason": appointment["reason"],
         }
+        # Service-first routing (clinics): the captured service text is passed
+        # to the booking tool, which resolves it to the doctors who provide it
+        # and constrains assignment to them. Optional — omitted when not asked.
+        _svc = appointment.get("service")
+        if isinstance(_svc, str) and _svc.strip():
+            args["service"] = _svc.strip()[:200]
         # Confirmation / audit metadata is patched onto the created record
         # *after* execution (it'd be rejected by the tool's strict
         # additionalProperties:false schema if passed as args).
@@ -1786,7 +2296,7 @@ class NokvoOneVoicePipeline:
                     async with AsyncSessionLocal() as tool_db:
                         result = await PredefinedToolsService.execute(
                             tool_db,
-                            tenant_res.organization_id,
+                            org_id,
                             None,
                             tool,
                             args,
@@ -1796,7 +2306,7 @@ class NokvoOneVoicePipeline:
                 else:
                     result = await PredefinedToolsService.execute(
                         db,
-                        tenant_res.organization_id,
+                        org_id,
                         None,
                         tool,
                         args,
@@ -1832,7 +2342,7 @@ class NokvoOneVoicePipeline:
 
                 await ToolRetryService.enqueue(
                     db,
-                    organization_id=tenant_res.organization_id,
+                    organization_id=org_id,
                     tool_key=tool.key,
                     arguments=args,
                     context={
@@ -2223,6 +2733,10 @@ class NokvoOneVoicePipeline:
         canonical = {
             "date": visit_date.isoformat(),
             "time": visit_time.strftime("%I:%M %p").lstrip("0"),
+            # Combined "Date and Time" field (a single datetime slot) renders one
+            # human-readable cell. Mirrors the split date/time formatting above so
+            # the Site Visits tab shows the same values, just in one column.
+            "datetime": f"{visit_date.isoformat()} {visit_time.strftime('%I:%M %p').lstrip('0')}",
             "name": str(name_val),
             "phone": str(phone_val),
             "project": str(project_val) if project_val else None,
@@ -2282,6 +2796,9 @@ class NokvoOneVoicePipeline:
         pricing / brochure and then hang up. It is idempotent per call and
         deliberately requires a phone number because ``leads_create`` does.
         """
+        # Snapshot the FK primitive (see _maybe_execute_turn_policy_action) so a
+        # later commit/rollback can't force a sync ORM reload → MissingGreenlet.
+        org_id = getattr(tenant_res, "organization_id")
         if db is None or not call_id:
             return None
         state = await AgentSessionStore.get_state(tenant_res, call_id) or {}
@@ -2331,7 +2848,7 @@ class NokvoOneVoicePipeline:
             try:
                 sv_result = await PredefinedToolsService.execute(
                     db,
-                    tenant_res.organization_id,
+                    org_id,
                     None,
                     sv_tool,
                     site_visit_args,
@@ -2399,7 +2916,7 @@ class NokvoOneVoicePipeline:
             direct_data = {k: v for k, v in direct_data.items() if v not in (None, "")}
             record = NokvoOneToolRecord(
                 id=uuid.uuid4(),
-                organization_id=tenant_res.organization_id,
+                organization_id=org_id,
                 record_type="lead",
                 status="new",
                 data=direct_data,
@@ -2437,7 +2954,7 @@ class NokvoOneVoicePipeline:
             return None
         result = await PredefinedToolsService.execute(
             db,
-            tenant_res.organization_id,
+            org_id,
             None,
             tool,
             args,
@@ -2612,6 +3129,9 @@ class NokvoOneVoicePipeline:
         business_context: tuple[Organization, dict[str, Any], list[dict[str, Any]]] | None = None,
         language: str | None = None,
     ) -> dict[str, Any] | None:
+        # Snapshot the FK primitive (see _maybe_execute_turn_policy_action) so the
+        # fresh-session retry below can't force a sync ORM reload → MissingGreenlet.
+        org_id = getattr(tenant_res, "organization_id")
         if tool_flow.get("intent") != "tool_flow" or tool_flow.get("state_slot") != "complete":
             return None
         action = tool_flow.get("action") if isinstance(tool_flow.get("action"), dict) else None
@@ -2722,7 +3242,7 @@ class NokvoOneVoicePipeline:
                     async with AsyncSessionLocal() as tool_db:
                         result = await PredefinedToolsService.execute(
                             tool_db,
-                            tenant_res.organization_id,
+                            org_id,
                             None,
                             tool,
                             args,
@@ -2732,7 +3252,7 @@ class NokvoOneVoicePipeline:
                 else:
                     result = await PredefinedToolsService.execute(
                         db,
-                        tenant_res.organization_id,
+                        org_id,
                         None,
                         tool,
                         args,
@@ -2771,7 +3291,7 @@ class NokvoOneVoicePipeline:
 
                 await ToolRetryService.enqueue(
                     db,
-                    organization_id=tenant_res.organization_id,
+                    organization_id=org_id,
                     tool_key=tool.key,
                     arguments=args,
                     context={
@@ -2925,6 +3445,7 @@ class NokvoOneVoicePipeline:
         conversation_strategy_block: str | None = None,
         field_questions_prompt: str | None = None,
         projects_block: str | None = None,
+        services_block: str | None = None,
         tool_flow_state: dict[str, Any] | None = None,
         tool_flow_bundle: dict[str, Any] | None = None,
         turn_index: int | None = None,
@@ -2950,6 +3471,7 @@ class NokvoOneVoicePipeline:
             conversation_strategy_block=conversation_strategy_block,
             field_questions_prompt=field_questions_prompt,
             projects_block=projects_block,
+            services_block=services_block,
             tool_flow_state=tool_flow_state,
             tool_flow_bundle=tool_flow_bundle,
             turn_index=turn_index,
@@ -3030,6 +3552,9 @@ class NokvoOneVoicePipeline:
         that matches the contact_phone on an existing record for the org.
         ``challenged`` is True once we've already asked the caller to verify
         in this session, so we don't loop on the same challenge."""
+        # Snapshot the FK primitive (see _maybe_execute_turn_policy_action) so the
+        # query filter below can't force a sync ORM reload → MissingGreenlet.
+        org_id = getattr(tenant_res, "organization_id")
         if db is None or call_id is None:
             # Without DB/session we can't gate; default to permitting (the
             # legacy behaviour) so we don't break the existing flow.
@@ -3069,7 +3594,7 @@ class NokvoOneVoicePipeline:
 
         stmt = (
             select(NokvoOneToolRecord)
-            .where(NokvoOneToolRecord.organization_id == tenant_res.organization_id)
+            .where(NokvoOneToolRecord.organization_id == org_id)
             .order_by(NokvoOneToolRecord.created_at.desc())
             .limit(50)
         )
@@ -3492,6 +4017,7 @@ class NokvoOneVoicePipeline:
         bundle: RuntimeBundle = turn_cache["bundle"]
         single_prompt_guidance = bundle.single_prompt_guidance
         projects_block, active_projects = await NokvoOneVoicePipeline._projects_block_for_bundle(db, bundle)
+        services_block = await NokvoOneVoicePipeline._services_block_for_bundle(db, bundle)
         if route["route"] in {"template", "answer_card", "policy_card"}:
             answer = route["answer"]
             await NokvoOneVoicePipeline._apply_route_state(tenant_res, call_id, route)
@@ -3657,6 +4183,19 @@ class NokvoOneVoicePipeline:
             try:
                 from app.services.conversation_strategy import compose_strategy_block
 
+                # A record-capture flow (site visit / lead) owns field collection
+                # via the FIELD-COLLECTION SCRIPT (operator-configured fields).
+                # Tell the strategy layer to suppress its hardcoded "ask exactly
+                # X" Next-Best-Action directive so it doesn't compete with — and
+                # override — the configured schema.
+                _tf_for_strategy = (turn_cache.get("state") or {}).get("tool_flow") or {}
+                _capture_flow_active = bool(
+                    _tf_for_strategy.get("active")
+                    and not _tf_for_strategy.get("completed")
+                    and not _tf_for_strategy.get("deferred_for_kb")
+                    and str(_tf_for_strategy.get("flow_key") or "")
+                    in ("real_estate_site_visit", "leads_create")
+                )
                 strategy_block_v2 = compose_strategy_block(
                     conversational_memory,
                     business_type=bundle.organization_industry,
@@ -3666,6 +4205,7 @@ class NokvoOneVoicePipeline:
                         active_projects, conversational_memory
                     ),
                     company_name=company_name,
+                    capture_flow_active=_capture_flow_active,
                 )
             except Exception:
                 strategy_block_v2 = ""
@@ -3707,8 +4247,14 @@ class NokvoOneVoicePipeline:
             current = _fsm_current_mode(session_state, memory=conversational_memory)
             pending_label: str | None = None
             pending_question: str | None = None
-            if current == "site_visit" and tf_bundle is not None:
-                flow_def = ((tf_bundle.get("flows") or {}).get("real_estate_site_visit") or {})
+            # Both active capture modes drive a flow's slots; pick the flow that
+            # matches the mode so the prompt names the next pending field.
+            _mode_flow_key = {
+                "site_visit": "real_estate_site_visit",
+                "lead_capture": "leads_create",
+            }.get(current)
+            if _mode_flow_key and tf_bundle is not None:
+                flow_def = ((tf_bundle.get("flows") or {}).get(_mode_flow_key) or {})
                 pending_slot_key = str(tf_state.get("pending_slot") or "")
                 for slot in (flow_def.get("slots") or []):
                     if not isinstance(slot, dict):
@@ -3732,13 +4278,36 @@ class NokvoOneVoicePipeline:
                     memory=conversational_memory,
                 )
             ]
-            if current == "site_visit":
+            if _mode_flow_key:
                 booking_block = render_booking_flow_state(
                     tf_state, tf_bundle, language=language
                 )
                 if booking_block:
                     blocks.append(booking_block)
             agent_mode_block_inbound = "\n\n".join(b for b in blocks if b)
+
+        # Clinic mode block. Clinics use the voice_turn_policy appointment FSM
+        # (not tool_flow), so derive the clinic mode from appointment state +
+        # the latest utterance (triage detection). Persona/guardrail only —
+        # complementary to the slot engine.
+        if agent_mode_block_inbound is None and outbound_context is None and bundle is not None:
+            try:
+                from app.services.clinic_agent_fsm import (
+                    enabled_for_business_type as _clinic_enabled,
+                    current_mode as _clinic_mode,
+                    mode_block_for_prompt as _clinic_block,
+                )
+
+                if _clinic_enabled(bundle.organization_industry):
+                    _c_state = turn_cache.get("state") or {}
+                    _c_appt = _c_state.get("appointment") or {}
+                    _c_pending = str(_c_appt.get("pending_slot") or "").replace("_", " ").strip() or None
+                    agent_mode_block_inbound = _clinic_block(
+                        _clinic_mode(_c_state, latest_user_text=user_text),
+                        pending_slot_label=_c_pending,
+                    )
+            except Exception:
+                pass
 
         messages = NokvoOneVoicePipeline._messages(
             user_text,
@@ -3757,6 +4326,7 @@ class NokvoOneVoicePipeline:
             conversation_strategy_block=strategy_block_v2,
             field_questions_prompt=field_questions_prompt,
             projects_block=projects_block,
+            services_block=services_block,
             tool_flow_state=tf_state if outbound_context is not None else None,
             tool_flow_bundle=tf_bundle,
             turn_index=(len(history) // 2) + 1 if outbound_context is not None else None,
@@ -3907,6 +4477,7 @@ class NokvoOneVoicePipeline:
         bundle: RuntimeBundle = turn_cache["bundle"]
         single_prompt_guidance = bundle.single_prompt_guidance
         projects_block, active_projects = await NokvoOneVoicePipeline._projects_block_for_bundle(db, bundle)
+        services_block = await NokvoOneVoicePipeline._services_block_for_bundle(db, bundle)
         # Outbound is a different agent — *no* inbound short-circuits apply.
         # Template smalltalk ("Sure, go ahead." for a "Yes") is the worst
         # offender: it derails the outbound flow because the agent should be
@@ -4230,6 +4801,14 @@ class NokvoOneVoicePipeline:
             try:
                 from app.services.conversation_strategy import compose_strategy_block
 
+                _tf_for_strategy = (turn_cache.get("state") or {}).get("tool_flow") or {}
+                _capture_flow_active = bool(
+                    _tf_for_strategy.get("active")
+                    and not _tf_for_strategy.get("completed")
+                    and not _tf_for_strategy.get("deferred_for_kb")
+                    and str(_tf_for_strategy.get("flow_key") or "")
+                    in ("real_estate_site_visit", "leads_create")
+                )
                 strategy_block = compose_strategy_block(
                     conversational_memory,
                     business_type=bundle.organization_industry,
@@ -4239,6 +4818,7 @@ class NokvoOneVoicePipeline:
                         active_projects, conversational_memory
                     ),
                     company_name=company_name,
+                    capture_flow_active=_capture_flow_active,
                 )
             except Exception:
                 strategy_block = ""
@@ -4282,9 +4862,13 @@ class NokvoOneVoicePipeline:
             )
             pending_label: str | None = None
             pending_question: str | None = None
-            if current == "site_visit" and tf_bundle_for_msg is not None:
+            _mode_flow_key = {
+                "site_visit": "real_estate_site_visit",
+                "lead_capture": "leads_create",
+            }.get(current)
+            if _mode_flow_key and tf_bundle_for_msg is not None:
                 flow_def = (
-                    (tf_bundle_for_msg.get("flows") or {}).get("real_estate_site_visit") or {}
+                    (tf_bundle_for_msg.get("flows") or {}).get(_mode_flow_key) or {}
                 )
                 pending_slot_key = str(tf_state_for_msg.get("pending_slot") or "")
                 for slot in (flow_def.get("slots") or []):
@@ -4309,13 +4893,33 @@ class NokvoOneVoicePipeline:
                     memory=conversational_memory,
                 )
             ]
-            if current == "site_visit":
+            if _mode_flow_key:
                 booking_block = render_booking_flow_state(
                     tf_state_for_msg, tf_bundle_for_msg, language=language
                 )
                 if booking_block:
                     blocks.append(booking_block)
             agent_mode_block_inbound_streaming = "\n\n".join(b for b in blocks if b)
+
+        # Clinic mode block (streaming path) — mirror the non-streaming branch.
+        if agent_mode_block_inbound_streaming is None and not outbound_mode and bundle is not None:
+            try:
+                from app.services.clinic_agent_fsm import (
+                    enabled_for_business_type as _clinic_enabled,
+                    current_mode as _clinic_mode,
+                    mode_block_for_prompt as _clinic_block,
+                )
+
+                if _clinic_enabled(bundle.organization_industry):
+                    _c_state = turn_cache.get("state") or {}
+                    _c_appt = _c_state.get("appointment") or {}
+                    _c_pending = str(_c_appt.get("pending_slot") or "").replace("_", " ").strip() or None
+                    agent_mode_block_inbound_streaming = _clinic_block(
+                        _clinic_mode(_c_state, latest_user_text=query),
+                        pending_slot_label=_c_pending,
+                    )
+            except Exception:
+                pass
 
         messages = NokvoOneVoicePipeline._messages(
             user_text,
@@ -4332,6 +4936,7 @@ class NokvoOneVoicePipeline:
             conversation_strategy_block=strategy_block,
             field_questions_prompt=field_questions_prompt,
             projects_block=_projects_block_for_messages,
+            services_block=("" if outbound_mode else services_block),
             tool_flow_state=tf_state_for_msg if outbound_mode else None,
             tool_flow_bundle=tf_bundle_for_msg,
             turn_index=(len(history) // 2) + 1 if outbound_mode else None,
@@ -4554,7 +5159,7 @@ class NokvoOneVoicePipeline:
                 "sentence_level_tts": True,
                 "streamed_llm": True,
                 "qdrant_top_k": settings.AGENT_RETRIEVAL_TOP_K,
-                "policy_version": AgentKnowledgeService.policy_version(tenant_res),
+                "policy_version": _agent_policy_version(tenant_res),
             },
             "supported_indian_languages": SARVAM_LANGUAGE_OPTIONS,
             "stt": {

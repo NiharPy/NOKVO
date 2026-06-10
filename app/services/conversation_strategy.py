@@ -631,6 +631,8 @@ def _lead_section(
     lead: LeadAssessment,
     stage: str,
     memory: ConversationalMemory | None = None,
+    *,
+    capture_flow_active: bool = False,
 ) -> str:
     reason = "; ".join(lead.reasons) if lead.reasons else "—"
     lines = [
@@ -643,7 +645,19 @@ def _lead_section(
     # The closing / booked / at-risk postures already give the LLM a specific
     # next move (close, confirm, recover) so a redundant "ask name" directive
     # would compete with the posture itself.
-    if memory is not None and lead.tier in {"hot", "warm"} and stage in {"discovery", "qualification"}:
+    #
+    # Critically, SUPPRESS the hardcoded "ask exactly X" directive when a
+    # record-capture flow (site visit / lead) is active: that flow's
+    # FIELD-COLLECTION SCRIPT is the authoritative source of what to ask, using
+    # the operator's CONFIGURED fields. Letting this hardcoded priority list
+    # ("ask budget", "ask BHK") fire on top of it is the root cause of the agent
+    # ignoring the configured schema.
+    if (
+        not capture_flow_active
+        and memory is not None
+        and lead.tier in {"hot", "warm"}
+        and stage in {"discovery", "qualification"}
+    ):
         nba = _next_best_action(memory)
         if nba is not None:
             _, question = nba
@@ -692,6 +706,7 @@ def compose_strategy_block(
     discovery_question_override: str | None = None,
     sold_out_locations: list[str] | None = None,
     alternative_pitch: str | None = None,
+    capture_flow_active: bool = False,
 ) -> str:
     """Render the strategy directive block for this turn, or ``""`` when there
     is no actionable signal. Safe for ``business_type=None`` (emits only the
@@ -744,7 +759,7 @@ def compose_strategy_block(
                 sections.append(objection)
             lead = score_lead(memory, business_type=business_type)
             stage = journey_stage(memory, business_type=business_type)
-            sections.append(_lead_section(lead, stage, memory))
+            sections.append(_lead_section(lead, stage, memory, capture_flow_active=capture_flow_active))
             # Upsell / cross-sell rules — at most one fires. Suppressed on
             # recovery and at-risk leads (don't pile a pitch on someone we're
             # trying to calm down).

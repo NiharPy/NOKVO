@@ -243,43 +243,36 @@ const isCalling = computed(() => !['idle', 'error'].includes(voiceStatus.value))
     <section class="n-section n-rise" data-delay="2">
       <header class="n-section__head">
         <div>
-          <h2 class="n-section__title">Exotel phone link</h2>
-          <p class="n-section__sub">Set a stable link ID, then configure the URLs below in Exotel under your inbound number.</p>
+          <h2 class="n-section__title">Phone number (call forwarding)</h2>
+          <p class="n-section__sub">Forward your business number to your assigned Plivo number — incoming calls then reach your agent automatically.</p>
         </div>
-        <span v-if="phoneLink?.status === 'linked'" class="n-tag n-tag--success">
-          <span class="n-dot n-dot--success"></span> linked
+        <span v-if="phoneLink?.number_status === 'active'" class="n-tag n-tag--success">
+          <span class="n-dot n-dot--success"></span> active
         </span>
-        <span v-else class="n-tag">not linked</span>
+        <span v-else class="n-tag">provisioning</span>
       </header>
 
       <article class="n-card agent__phone">
+        <div class="agent__phone-urls">
+          <div class="agent__phone-url-row">
+            <div>
+              <span class="agent__phone-cap">Forward your calls to this number</span>
+              <strong class="n-mono">{{ phoneLink?.plivo_number || 'Provisioning — awaiting carrier verification' }}</strong>
+            </div>
+            <span class="n-tag n-tag--mono">PLIVO</span>
+          </div>
+        </div>
+        <p v-if="phoneLink?.forwarding_instructions" class="agent__phone-hint">{{ phoneLink.forwarding_instructions }}</p>
+
         <label class="n-field agent__phone-field">
-          <span class="n-field__label">Link ID <span class="n-field__sub">any unique string</span></span>
-          <input v-model="phoneLinkInput" type="text" class="n-input" placeholder="acme-india-line-1" :disabled="!isAdmin" />
+          <span class="n-field__label">Your number <span class="n-field__sub">the line you'll forward from</span></span>
+          <input v-model="phoneLinkInput" type="text" class="n-input" placeholder="+91 98765 43210" :disabled="!isAdmin" />
         </label>
         <div v-if="isAdmin" class="agent__phone-actions">
           <button type="button" class="n-btn n-btn--primary" :disabled="isSavingPhoneLink" @click="savePhoneLink">
             <CheckCircle2 :size="14" />
-            {{ isSavingPhoneLink ? 'Saving…' : 'Save link' }}
+            {{ isSavingPhoneLink ? 'Saving…' : 'Save number' }}
           </button>
-          <span v-if="phoneLink?.status === 'linked'" class="agent__phone-hint">Connected as <code>{{ phoneLink.link_id }}</code></span>
-        </div>
-
-        <div v-if="phoneLink?.exotel_webhook_url" class="agent__phone-urls">
-          <div class="agent__phone-url-row">
-            <div>
-              <span class="agent__phone-cap">Inbound webhook</span>
-              <strong class="n-mono n-truncate">{{ phoneLink.exotel_webhook_url }}</strong>
-            </div>
-            <span class="n-tag n-tag--mono">POST</span>
-          </div>
-          <div class="agent__phone-url-row">
-            <div>
-              <span class="agent__phone-cap">Media stream</span>
-              <strong class="n-mono n-truncate">{{ phoneLink.exotel_media_url }}</strong>
-            </div>
-            <span class="n-tag n-tag--mono">WSS</span>
-          </div>
         </div>
       </article>
     </section>

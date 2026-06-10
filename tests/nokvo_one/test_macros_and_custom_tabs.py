@@ -180,7 +180,7 @@ def test_custom_tab_emits_own_group():
     assert "Deliveries" in labels
     # Ordering: built-in tab groups first, then custom groups, then Macros, then General.
     deliveries_idx = labels.index("Deliveries")
-    assert deliveries_idx > labels.index("Tickets")
+    assert deliveries_idx > labels.index("Appointments")  # after the built-in clinic tab
     assert deliveries_idx < labels.index("Macros")
     assert deliveries_idx < labels.index("General")
 

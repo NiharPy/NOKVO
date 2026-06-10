@@ -495,6 +495,72 @@ def enabled_tabs_for(business_type: str | None) -> list[str]:
     return [t for t in (config.get("tabs") or []) if t in TAB_TO_RECORD_TYPE]
 
 
+# ─────────── Selectable field catalog ───────────
+# A curated palette of fields per business-type + record (tab) that the admin can
+# SELECT from (onboarding / Leads / Site-Visit pages). The chosen subset becomes the
+# tab's schema (saved via PATCH /business-template/schemas/{key}); the agent then
+# asks EXACTLY those fields. Each entry is a normal field dict {key, label, type,
+# required}; its `kind` (→ how the agent phrases the question, in tool_flow_questions)
+# is derived from key/label/type. Free-form custom fields are still allowed — this is
+# the suggested palette, not a hard whitelist.
+FIELD_CATALOG: dict[str, dict[str, list[dict[str, Any]]]] = {
+    "real_estate": {
+        "leads": [
+            {"key": "name", "label": "Customer Name", "type": "text", "required": True},
+            {"key": "phone", "label": "Phone", "type": "phone", "required": True},
+            {"key": "email", "label": "Email", "type": "email", "required": False},
+            {"key": "property_type", "label": "Looking For", "type": "select", "required": False},
+            {"key": "budget", "label": "Budget", "type": "currency", "required": False},
+            {"key": "location", "label": "Area", "type": "text", "required": False},
+            {"key": "possession_timeline", "label": "Possession Timeline", "type": "select", "required": False},
+            {"key": "purpose", "label": "Purpose", "type": "select", "required": False},
+            {"key": "financing", "label": "Financing Needed", "type": "select", "required": False},
+            {"key": "notes", "label": "Notes", "type": "text", "required": False},
+        ],
+        "tickets": [
+            {"key": "name", "label": "Customer Name", "type": "text", "required": True},
+            {"key": "phone", "label": "Phone", "type": "phone", "required": True},
+            {"key": "project_name", "label": "Project", "type": "text", "required": False},
+            {"key": "visit_date", "label": "Visit Date", "type": "date", "required": False},
+            {"key": "visit_time", "label": "Visit Time", "type": "time", "required": False},
+            {"key": "budget", "label": "Budget", "type": "currency", "required": False},
+            {"key": "property_type", "label": "Looking For", "type": "select", "required": False},
+            {"key": "location", "label": "Area", "type": "text", "required": False},
+            {"key": "notes", "label": "Notes", "type": "text", "required": False},
+        ],
+    },
+    "clinics": {
+        "appointments": [
+            {"key": "service", "label": "Service", "type": "select", "required": True},
+            {"key": "patient_name", "label": "Patient Name", "type": "text", "required": True},
+            {"key": "phone", "label": "Phone", "type": "phone", "required": True},
+            {"key": "appointment_time", "label": "Date & Time", "type": "datetime", "required": False},
+            {"key": "reason", "label": "Visit Reason", "type": "text", "required": False},
+            {"key": "notes", "label": "Notes", "type": "text", "required": False},
+        ],
+        "leads": [
+            {"key": "patient_name", "label": "Patient Name", "type": "text", "required": True},
+            {"key": "phone", "label": "Phone", "type": "phone", "required": True},
+            {"key": "care_need", "label": "Reason", "type": "text", "required": False},
+            {"key": "preferred_doctor", "label": "Doctor", "type": "text", "required": False},
+            {"key": "notes", "label": "Notes", "type": "text", "required": False},
+        ],
+    },
+}
+
+
+def field_catalog_for(business_type: str | None, schema_key: str) -> list[dict[str, Any]]:
+    """The selectable field palette for a business-type + record (tab). Falls back
+    to the default schema for that tab when no curated palette is defined, so every
+    vertical/tab still offers a sensible list to pick from."""
+    bt = normalize_business_type(business_type)
+    palette = (FIELD_CATALOG.get(bt or "") or {}).get(schema_key)
+    if palette:
+        return [dict(entry) for entry in palette]
+    config = business_type_config(bt)
+    return [dict(f) for f in ((config or {}).get("schemas") or {}).get(schema_key) or []]
+
+
 def business_template_prompt(value: str | None) -> str:
     config = business_type_config(value)
     if config is None:

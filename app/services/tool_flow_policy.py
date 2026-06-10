@@ -248,8 +248,62 @@ _LEAD_INTENT_RE = re.compile(
     r"संपर्क|जानकारी|डिटेल्स|दिलचस्पी|कीमत|रेट|ब्रोशर|कॉल\s*कर|फ़ोन\s*कर|चाहिए)",
     re.IGNORECASE,
 )
+# Clinic appointment-booking intent (starts the clinic_appointment flow).
+_APPOINTMENT_INTENT_RE = re.compile(
+    r"\b(?:book|schedule|make|fix|get|need|want|take)\b.{0,30}\b"
+    r"(?:appointment|appt|consultation|consult|checkup|check[\s-]?up|sitting|booking|slot)\b|"
+    r"\b(?:see|meet|consult|visit)\b.{0,20}\b(?:doctor|dr\.?|physician|specialist|dentist|consultant)\b|"
+    # Transliterated Hindi / Telugu.
+    r"appointment\s*(?:chahiye|kavali)|doctor\s*ko?\s*dikha|"
+    # Devanagari / Telugu script.
+    r"(?:अपॉइंटमेंट|अपॉइंटमेण्ट|डॉक्टर\s*को\s*दिखा|अपॉइंटमेंट\s*चाहिए|"
+    r"అపాయింట్‌మెంట్|డాక్టర్\s*ని\s*చూడ|అపాయింట్‌మెంట్\s*కావాలి)",
+    re.IGNORECASE,
+)
+_APPOINTMENT_OFFER_RE = re.compile(
+    r"\b(?:book|schedule|set\s+up|arrange)\b.{0,30}\b(?:appointment|consultation|slot|visit)\b|"
+    r"\bshall\s+i\s+(?:book|schedule)\b|\bwould\s+you\s+like\s+to\s+book\b",
+    re.IGNORECASE,
+)
 _EMAIL_RE = re.compile(r"\b[^@\s]+@[^@\s]+\.[^@\s]+\b")
 _NUMBER_RE = re.compile(r"(?:₹|rs\.?|inr)?\s*(\d+(?:[.,]\d+)?)", re.IGNORECASE)
+
+# Indian budget phrasing → rupees. "1.5 cr" -> 15000000, "50 lakhs" -> 5000000.
+_BUDGET_UNIT_RE = re.compile(
+    r"(?:₹|rs\.?|inr)?\s*(\d+(?:\.\d+)?|a|an|one)\s*(crores?|cr|lakhs?|lacs?|thousand|k)\b",
+    re.IGNORECASE,
+)
+_BUDGET_UNIT_MULT = {
+    "crore": 1e7, "crores": 1e7, "cr": 1e7,
+    "lakh": 1e5, "lakhs": 1e5, "lac": 1e5, "lacs": 1e5,
+    "thousand": 1e3, "k": 1e3,
+}
+
+
+def _parse_budget_amount(text: str):
+    """Normalise a spoken budget to rupees. Returns the MAX amount mentioned
+    (the affordability ceiling), else a bare number, else the raw text so a
+    vague answer like "not too much" is preserved rather than dropped."""
+    lowered = (text or "").lower().replace(",", "")
+    amounts: list[float] = []
+    for m in _BUDGET_UNIT_RE.finditer(lowered):
+        qty_raw, unit = m.group(1), m.group(2).lower()
+        try:
+            qty = 1.0 if qty_raw in ("a", "an", "one") else float(qty_raw)
+        except ValueError:
+            continue
+        mult = _BUDGET_UNIT_MULT.get(unit)
+        if mult:
+            amounts.append(qty * mult)
+    if amounts:
+        return max(amounts)
+    bare = _NUMBER_RE.search(lowered)
+    if bare:
+        try:
+            return float(bare.group(1))
+        except ValueError:
+            return text
+    return text
 
 # Free-text slot kinds where the user might inadvertently dictate a question
 # (e.g., "what services do you offer?") that we must NOT accept as the slot
@@ -261,6 +315,30 @@ _QUESTION_SHAPED_RE = re.compile(
     r"\b(what|where|when|why|how|can|could|would|will|do|does|did|is|are|tell|explain|list|share)\b\s+(?:you|i|me|us|the|your|me\s+about)|"
     r"\b(is\s+it\s+possible|could\s+you|can\s+you|would\s+you)\b|"
     r"(ఏమి|ఎక్కడ|ఎప్పుడు|ఎలా|చెప్పగలరా|క్या|कहाँ|कब|कैसे|बताइए|बताओ)",
+    re.IGNORECASE,
+)
+
+# Word-based question detection (everything in _QUESTION_SHAPED_RE EXCEPT the
+# bare trailing "?"). A hesitant name answer often ends with rising-intonation
+# "?", which isn't the caller asking a question — so for names we only bail on
+# a genuine question word, not a stray "?".
+_QUESTION_WORD_RE = re.compile(
+    r"\b(what|where|when|why|how|can|could|would|will|do|does|did|is|are|tell|explain|list|share)\b\s+(?:you|i|me|us|the|your|me\s+about)|"
+    r"\b(is\s+it\s+possible|could\s+you|can\s+you|would\s+you)\b|"
+    # Contraction questions: "what's the price", "how's the location", "where's…".
+    r"\b(?:what|how|where|when|who)'?s\b|"
+    r"(ఏమి|ఎక్కడ|ఎప్పుడు|ఎలా|చెప్పగలరా|క్या|कहाँ|कब|कैसे|बताइए|बताओ)",
+    re.IGNORECASE,
+)
+
+# A bare affirmation / negation / filler is NEVER a valid DATA-slot value
+# (the yes/no confirmation handshake is handled separately, before slot
+# extraction). Rejecting these stops a confirmation "yes" — or a stray "ok" —
+# from being stored as a name / project / reason and skipping the real prompt.
+_AFFIRMATION_ONLY_RE = re.compile(
+    r"^(?:(?:yes|yeah|yep|yup|ya|yah|yaa|sure|ok|okay|okey|fine|right|correct|"
+    r"exactly|absolutely|definitely|alright|no|nope|nah|negative|please|"
+    r"that'?s|thats|go|ahead|do)\b[\s,.!?]*)+$",
     re.IGNORECASE,
 )
 
@@ -284,6 +362,7 @@ _NAME_DISCOURSE_PREFIX_RE = re.compile(
     r"^(?:\s*(?:yeah|yes|yep|yup|ya|yah|yaa|no|nope|nah|ok|okay|fine|well|so|umm?|uhh?|hmm+|"
     r"oh|hi+|hello|hey|sure|right|alright|actually|see|look|listen|please|"
     r"you\s+know|i\s+mean|it'?s|its|that'?s|"
+    r"i\s+think|i\s+guess|i\s+believe|i\s+suppose|let\s+me\s+think|think|maybe|probably|"
     r"mr\.?|mrs\.?|ms\.?|dr\.?)\b[\s,\.]*)+",
     re.IGNORECASE,
 )
@@ -294,6 +373,8 @@ _NAME_LEADIN_RE = re.compile(
     r"(?:the\s+)?(?:my\s+)?name'?s|"
     r"(?:the\s+)?(?:my\s+)?name\s+(?:is|would\s+be)|"
     r"i\s+am|i'?m|this\s+is|myself|call\s+me|you\s+can\s+call\s+me|"
+    # Transliterated Hindi / Telugu lead-ins ("mera naam (hai)", "naa peru").
+    r"mera\s+naam(?:\s+hai)?|naam\s+hai|naam|naa\s+peru|naa\s+pesaru|naa\s+peeru|"
     r"నా\s+పేరు|పేరు|మీ\s+పేరు|मेरा\s+नाम|नाम"
     # An explicit separator (not \b): Indic combining vowel marks aren't
     # treated as word chars, so \b fails after e.g. "పేరు".
@@ -362,6 +443,10 @@ def _extract_person_name(raw: str) -> str | None:
     # "really" survive the strip and get title-cased to "Not Really".
     if _NAME_DECLINE_PHRASES_RE.search(value):
         return None
+    # A question is never a name — catches "what's your timing", "how much is
+    # it" even without a trailing "?" (which the slot-level guard keys on).
+    if _QUESTION_WORD_RE.search(value):
+        return None
     # Peel discourse fillers and a name lead-in, alternating until stable so
     # "well, you know, the name is Nihar" reduces to "Nihar".
     prev: str | None = None
@@ -370,7 +455,7 @@ def _extract_person_name(raw: str) -> str | None:
         value = _NAME_DISCOURSE_PREFIX_RE.sub("", value)
         value = _NAME_LEADIN_RE.sub("", value)
     value = _NAME_HONORIFIC_SUFFIX_RE.sub("", value)
-    value = value.strip(" ,.-।॥…・「」（）'\"")
+    value = value.strip(" ,.-।॥…・「」（）'\"?!")
     cleaned = _clean(value)
     if not cleaned:
         return None
@@ -489,6 +574,17 @@ def _last_assistant_offered_lead_capture(history: list[dict[str, str]]) -> bool:
     return False
 
 
+def _last_assistant_offered_appointment(history: list[dict[str, str]]) -> bool:
+    """True when a recent assistant turn offered to book an appointment, so a
+    bare "yes" starts the clinic_appointment flow."""
+    for turn in reversed((history or [])[-4:]):
+        if turn.get("role") != "assistant":
+            continue
+        if _APPOINTMENT_OFFER_RE.search(str(turn.get("content") or "")):
+            return True
+    return False
+
+
 def _question_for_slot(bundle: dict[str, Any], flow_key: str, slot_key: str, language: str | None) -> str:
     lang = _language(language)
     flow = ((bundle.get("flows") or {}).get(flow_key) or {})
@@ -527,6 +623,10 @@ def _extract_value(text: str, slot_key: str, kind: str) -> Any:
     value = _clean(text).strip(" ,.-")
     if not value:
         return None
+    # A bare affirmation/negation/filler is never a valid data-slot value — drop
+    # it so a confirmation token can't become the next slot's value.
+    if _AFFIRMATION_ONLY_RE.match(value):
+        return None
     if kind == "phone" or slot_key in {"phone", "mobile", "contact_phone"}:
         return normalize_phone_number(value, expected=True)
     if kind == "email" or slot_key == "email":
@@ -535,15 +635,28 @@ def _extract_value(text: str, slot_key: str, kind: str) -> Any:
     if kind in {"date", "time"} or slot_key in {"visit_date", "visit_time"}:
         entities = extract_turn_entities(value, expected_slot="preferred_date" if kind == "date" else "preferred_time")
         return entities.get("date_text") if kind == "date" else entities.get("time_text")
+    if kind == "datetime":
+        # A combined "Date and Time" field (one configured slot). The question
+        # asks for both, so a firm answer carries both ("tomorrow at 11"). We
+        # only fill when BOTH are present — matching the "a firm booking needs a
+        # date AND time" rule in _site_visit_args_from_call_state. A partial
+        # answer leaves the slot pending so the FSM re-asks (the combined
+        # question primes the caller to give both); the conversational-memory
+        # facts still accumulate, so the end-of-call safety net can upgrade an
+        # enquiry to a site visit if both later land.
+        entities = extract_turn_entities(value)
+        date_text = entities.get("date_text")
+        time_text = entities.get("time_text")
+        if date_text and time_text:
+            return f"{date_text} {time_text}"
+        return None
     if kind == "budget":
-        match = _NUMBER_RE.search(value.replace(",", ""))
-        if match:
-            try:
-                return float(match.group(1))
-            except ValueError:
-                return value
-        return value
-    if kind in _FREE_TEXT_SLOT_KINDS and _QUESTION_SHAPED_RE.search(value):
+        return _parse_budget_amount(value)
+    if (
+        kind in _FREE_TEXT_SLOT_KINDS
+        and _QUESTION_SHAPED_RE.search(value)
+        and not (kind == "name" and not _QUESTION_WORD_RE.search(value))
+    ):
         # The caller dictated a question instead of answering this slot. Don't
         # consume the text — let the route layer yield to RAG and resume the
         # slot on the next turn.
@@ -570,6 +683,10 @@ def _start_flow_key(text: str, business_type: str | None, history: list[dict[str
         _VISIT_INTENT_RE.search(text) or (_YES_RE.search(text) and _last_assistant_offered_visit(history))
     ):
         return "real_estate_site_visit"
+    if normalize_business_type(business_type) == "clinics" and (
+        _APPOINTMENT_INTENT_RE.search(text) or (_YES_RE.search(text) and _last_assistant_offered_appointment(history))
+    ):
+        return "clinic_appointment"
     # Lead-capture trigger. Either an explicit interest phrase from the lead
     # ("send me details", "I'm interested") OR a plain "yes/yeah" right after
     # the agent offered to share details / a brochure / a callback. Without
@@ -597,7 +714,64 @@ def _flow_action(flow_state: dict[str, Any]) -> dict[str, Any] | None:
             "flow_key": flow_key,
             "arguments": collected,
         }
+    if flow_key == "clinic_appointment":
+        return {
+            "tool_key": "book_appointment_with_lead_capture",
+            "flow_key": flow_key,
+            "arguments": _clinic_appointment_args(collected),
+        }
     return None
+
+
+def _clinic_appointment_args(collected: dict[str, Any]) -> dict[str, Any]:
+    """Map collected clinic slots → ``book_appointment_with_lead_capture`` args.
+
+    patient_name/phone/service/reason pass through; the date+time slot(s) are
+    parsed (via the canonical parser) and combined into an ISO ``appointment_time``
+    so the tool gets a clean timestamp. The tool then resolves the service to a
+    doctor + assigns the slot.
+    """
+    args: dict[str, Any] = {}
+    for src, dst in (("patient_name", "patient_name"), ("name", "patient_name"),
+                     ("phone", "phone"), ("service", "service"), ("reason", "reason")):
+        value = collected.get(src)
+        if value and dst not in args:
+            args[dst] = value
+
+    # Find a date + a time anywhere in the collected values (a combined datetime
+    # slot like "tomorrow 11 am", or separate date/time slots).
+    date_txt = time_txt = None
+    for value in collected.values():
+        if not isinstance(value, str):
+            continue
+        ent = extract_turn_entities(value)
+        date_txt = date_txt or ent.get("date_text")
+        time_txt = time_txt or ent.get("time_text")
+    iso = _combine_date_time_to_iso(date_txt, time_txt)
+    if iso:
+        args["appointment_time"] = iso
+    else:
+        # Fall back to the raw datetime text; the tool's own parser gets a shot.
+        raw = collected.get("appointment_time") or collected.get("appointment_date")
+        if raw:
+            args["appointment_time"] = str(raw)
+    return args
+
+
+def _combine_date_time_to_iso(date_txt: str | None, time_txt: str | None) -> str | None:
+    if not (date_txt and time_txt):
+        return None
+    try:
+        from datetime import datetime as _dt, timezone as _tz
+        from zoneinfo import ZoneInfo
+        from app.services.datetime_parse import parse_date, parse_time
+
+        local_tz = ZoneInfo("Asia/Kolkata")
+        d = parse_date(date_txt)
+        t = parse_time(time_txt)
+        return _dt.combine(d, t, tzinfo=local_tz).astimezone(_tz.utc).isoformat()
+    except Exception:
+        return None
 
 
 def evaluate_tool_flow_policy(

@@ -539,6 +539,166 @@ class FollowupSchedulerService:
         }
 
     @staticmethod
+    def _due_bucket(scheduled_at: datetime, now: datetime) -> str:
+        """Classify a pending row's ``scheduled_at`` into a queue bucket.
+
+        Overdue rows (in the past) fold into ``today`` — both demand attention
+        now. Pure function so the bucketing is unit-testable without a DB.
+        """
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_end = day_start + timedelta(days=1)
+        if scheduled_at < day_end:
+            return "today"  # incl. overdue
+        if scheduled_at < day_end + timedelta(days=1):
+            return "tomorrow"
+        if scheduled_at < day_start + timedelta(days=7):
+            return "this_week"
+        return "later"
+
+    @staticmethod
+    def _conversion_rate(converted: int, placed: int) -> float:
+        """converted / placed, guarded against divide-by-zero. Rounded to 4dp."""
+        return round(converted / placed, 4) if placed else 0.0
+
+    @staticmethod
+    async def pipeline_for_tenant(*, tenant_id: str, db: AsyncSession) -> dict:
+        """Full Follow-Up Pipeline payload for the dedicated page.
+
+        One owner for the funnel view: overall status counts, the pending
+        queue bucketed by due window (overdue + today folded together since
+        both need to go out now), today's actionable list joined to the lead
+        (name / phone / handoff note), a recent-called sample, and the
+        month's conversion ROI.
+
+        Conversion rate = converted / placed where ``placed`` = completed +
+        converted this month (calls actually dialled). ``converted`` rows are
+        the ones the conversion kill switch cancelled with
+        ``cancelled_reason='converted'``.
+        """
+        from sqlalchemy import func as sa_func
+
+        now = datetime.now(timezone.utc)
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_end = day_start + timedelta(days=1)
+        last_7d = now - timedelta(days=7)
+        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+        T = LeadFollowupSchedule
+
+        # ── Overall status counts ────────────────────────────────────
+        status_rows = (
+            await db.execute(
+                select(T.status, sa_func.count(T.id))
+                .where(T.tenant_id == tenant_id)
+                .group_by(T.status)
+            )
+        ).all()
+        counts_by_status = {str(s.value): int(c) for s, c in status_rows}
+        counts = {
+            "scheduled": counts_by_status.get("pending", 0),
+            "in_flight": counts_by_status.get("in_flight", 0),
+            "completed": counts_by_status.get("completed", 0),
+            "exhausted": counts_by_status.get("exhausted", 0),
+            "paused": counts_by_status.get("paused", 0),
+            "cancelled": counts_by_status.get("cancelled", 0),
+        }
+
+        # ── Pending queue, bucketed by due window ─────────────────────
+        # Overdue (scheduled_at < day_end and in the past) folds into "today"
+        # since both demand attention now. tomorrow / this_week / later split
+        # the rest of the pending backlog.
+        pending_due = (
+            await db.execute(
+                select(T.scheduled_at)
+                .where(T.tenant_id == tenant_id)
+                .where(T.status == FollowupStatus.pending)
+            )
+        ).scalars().all()
+        queue_buckets = {"today": 0, "tomorrow": 0, "this_week": 0, "later": 0}
+        for sched in pending_due:
+            if sched is None:
+                continue
+            queue_buckets[FollowupSchedulerService._due_bucket(sched, now)] += 1
+
+        # ── Today's actionable queue (today + overdue), with the lead ──
+        queue_rows = (
+            await db.execute(
+                select(T, OutgoingLead)
+                .join(OutgoingLead, OutgoingLead.id == T.lead_id)
+                .where(T.tenant_id == tenant_id)
+                .where(T.status == FollowupStatus.pending)
+                .where(T.scheduled_at < day_end)
+                .order_by(T.scheduled_at.asc())
+            )
+        ).all()
+        today_queue = [
+            {
+                "followup_id": str(row.id),
+                "lead_id": str(row.lead_id),
+                "name": lead.name,
+                "phone_e164": lead.phone_e164 or lead.phone_raw,
+                "scheduled_at": row.scheduled_at.isoformat() if row.scheduled_at else None,
+                "overdue": bool(row.scheduled_at and row.scheduled_at < now),
+                "reason": row.reason.value if row.reason else None,
+                "attempts": int(row.attempts or 0),
+                "campaign_id": str(row.campaign_id) if row.campaign_id else None,
+                "handoff_note": lead.handoff_note,
+                "handoff_note_generated_at": (
+                    lead.handoff_note_generated_at.isoformat()
+                    if lead.handoff_note_generated_at else None
+                ),
+            }
+            for row, lead in queue_rows
+        ]
+
+        # ── Called: completed in the last 7 days + exhausted (failed) ──
+        called_week = int(
+            (
+                await db.execute(
+                    select(sa_func.count(T.id))
+                    .where(T.tenant_id == tenant_id)
+                    .where(T.status == FollowupStatus.completed)
+                    .where(T.updated_at >= last_7d)
+                )
+            ).scalar()
+            or 0
+        )
+
+        # ── Conversion ROI for the current month ──────────────────────
+        converted = int(
+            (
+                await db.execute(
+                    select(sa_func.count(T.id))
+                    .where(T.tenant_id == tenant_id)
+                    .where(T.cancelled_reason == "converted")
+                    .where(T.updated_at >= month_start)
+                )
+            ).scalar()
+            or 0
+        )
+        completed_month = int(
+            (
+                await db.execute(
+                    select(sa_func.count(T.id))
+                    .where(T.tenant_id == tenant_id)
+                    .where(T.status == FollowupStatus.completed)
+                    .where(T.updated_at >= month_start)
+                )
+            ).scalar()
+            or 0
+        )
+        placed = converted + completed_month
+        rate = FollowupSchedulerService._conversion_rate(converted, placed)
+
+        return {
+            "counts": counts,
+            "queue_buckets": queue_buckets,
+            "today_queue": today_queue,
+            "called": {"this_week": called_week, "failed": counts["exhausted"]},
+            "conversion": {"converted": converted, "placed": placed, "rate": rate},
+        }
+
+    @staticmethod
     async def for_lead(
         *, lead_id: uuid.UUID, db: AsyncSession
     ) -> list[LeadFollowupSchedule]:

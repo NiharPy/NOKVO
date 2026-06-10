@@ -117,6 +117,45 @@ class Settings(BaseSettings):
     AZURE_OPENAI_GLOBAL_API_KEY: str = ""
     AZURE_OPENAI_GLOBAL_DEPLOYMENT: str = "gpt-5.4-mini"
     AZURE_OPENAI_GLOBAL_API_VERSION: str = "2024-10-21"
+
+    # ── LLM public pool ───────────────────────────────────────────────────────
+    # A shared pool of GPT-5-mini Azure OpenAI deployments used by ALL tenants
+    # (replaces per-tenant Azure OpenAI). A centralized per-key TPM budget in
+    # Redis picks a key with remaining capacity; an exhausted key is skipped
+    # until its 60s window refills. JSON list of
+    # {"key_id","endpoint","api_key","deployment","tpm"}.
+    AZURE_OPENAI_POOL_JSON: str = ""
+    AZURE_OPENAI_POOL_API_VERSION: str = "2024-10-21"
+    AZURE_OPENAI_POOL_MODEL: str = "gpt-5-mini"
+    LLM_POOL_WINDOW_SECONDS: int = 60
+    LLM_POOL_DEFAULT_TPM: int = 200000
+    # gpt-5 family is a REASONING model: with the default effort its reasoning
+    # tokens eat the whole max_output_tokens budget → empty visible reply. For a
+    # latency-sensitive voice agent we want minimal reasoning so the budget goes
+    # to the actual answer. (Responses API: reasoning.effort = minimal|low|medium|high.)
+    AZURE_OPENAI_REASONING_EFFORT: str = "minimal"
+
+    # ── In-call rolling summary (conversational awareness) ─────────────────────
+    # A dedicated gpt-4.1-nano deployment maintains a compact running summary of
+    # the call so the agent stays aware of the whole conversation, not just the
+    # last few turns. Runs async (off the latency path); if unset, the fold falls
+    # back to the gpt-5-mini pool. CONDENSE_WINDOW = turns kept verbatim before
+    # folding into the summary; SEND_WINDOW (> CONDENSE) = turns actually sent to
+    # the agent, a 2-turn buffer so an evicted turn stays verbatim until the
+    # async fold absorbs it (lossless under rapid-fire).
+    AZURE_OPENAI_NANO_ENDPOINT: str = ""
+    AZURE_OPENAI_NANO_API_KEY: str = ""
+    AZURE_OPENAI_NANO_DEPLOYMENT: str = "gpt-4-1-nano"
+    AZURE_OPENAI_NANO_API_VERSION: str = "2024-10-21"
+    # Optional pool of nano deployments (like AZURE_OPENAI_POOL_JSON) to spread the
+    # summary load across keys. The single AZURE_OPENAI_NANO_* above is appended as
+    # a box. JSON list of {"key_id","endpoint","api_key","deployment","tpm"}.
+    AZURE_OPENAI_NANO_POOL_JSON: str = ""
+    IN_CALL_SUMMARY_ENABLED: bool = True
+    IN_CALL_SUMMARY_CONDENSE_WINDOW: int = 6
+    IN_CALL_SUMMARY_SEND_WINDOW: int = 8
+    IN_CALL_SUMMARY_MAX_TOKENS: int = 120
+
     AZURE_OPENAI_AGENT_DEPLOYMENT: str = "gpt-4-1-mini"
     AZURE_OPENAI_AGENT_MODEL: str = "gpt-4.1-mini"
     AZURE_OPENAI_AGENT_API_VERSION: str = "2024-10-21"
@@ -210,13 +249,16 @@ class Settings(BaseSettings):
     SARVAM_TTS_SAMPLE_RATE: int = 24000
     SARVAM_TTS_AUDIO_CODEC: str = "wav"
     SARVAM_TTS_ENABLE_CACHED_RESPONSES: bool = False
-    EXOTEL_API_KEY: str = ""
-    EXOTEL_API_TOKEN: str = ""
-    EXOTEL_ACCOUNT_SID: str = ""
-    EXOTEL_SUBDOMAIN: str = "api.in.exotel.com"
-    EXOTEL_CALLER_ID: str = ""
-    EXOTEL_DEFAULT_SAMPLE_RATE: int = 8000
-    EXOTEL_STATUS_CALLBACK_EVENTS: str = "answered,terminal"
+    # Plivo telephony (the sole provider). The MASTER account creds; each tenant
+    # gets its own Plivo subaccount + DID + Application created via the API.
+    PLIVO_AUTH_ID: str = ""
+    PLIVO_AUTH_TOKEN: str = ""
+    PLIVO_API_BASE: str = "https://api.plivo.com/v1"
+    # Public base used to build Application answer_url / media WS (defaults to the
+    # request host when empty). e.g. https://api.nokvo.example
+    PLIVO_WEBHOOK_BASE_URL: str = ""
+    PLIVO_NUMBER_COUNTRY: str = "IN"
+    PLIVO_DEFAULT_SAMPLE_RATE: int = 8000
     TELNYX_API_KEY: str = ""
     TELNYX_BASE_URL: str = "https://api.telnyx.com/v2"
     TELNYX_APP_ID: str = ""
@@ -267,8 +309,13 @@ class Settings(BaseSettings):
     COST_PER_STT_MINUTE_USD: float = 0.0120
     COST_PER_TWILIO_MINUTE_USD: float = 0.0130
     COST_PER_TTS_1K_CHARS_USD: float = 0.0180
-    COST_PER_LLM_INPUT_1K_TOKENS_USD: float = 0.0030
-    COST_PER_LLM_OUTPUT_1K_TOKENS_USD: float = 0.0120
+    # GPT-5-mini list price (the shared pool model): $0.25/1M input, $2.00/1M
+    # output, cached input ~$0.025/1M. The previous $3.00 / $12.00 per-1M
+    # placeholders overstated LLM cost by ~8-12x. Confirm against the actual
+    # Azure invoice for the deployed model and adjust if a different tier.
+    COST_PER_LLM_INPUT_1K_TOKENS_USD: float = 0.00025
+    COST_PER_LLM_OUTPUT_1K_TOKENS_USD: float = 0.0020
+    COST_PER_LLM_CACHED_INPUT_1K_TOKENS_USD: float = 0.000025
     
     # Provider APIs
     QDRANT_URL: str = ":memory:"
@@ -306,6 +353,32 @@ class Settings(BaseSettings):
     # tenant can opt in via provider_status["agent_offer_sms_confirmation"] =
     # True once their SMS gateway is connected.
     NOKVO_AGENT_OFFER_SMS_CONFIRMATION: bool = False
+
+    # Tier-2 LLM intent classifier budget. Measured round-trip latency for
+    # the gpt-4.1-mini classifier call is ~1.5–2.4s; the previous 800ms cap
+    # timed out ~100% of the time, so every Tier-2 turn paid the wait and
+    # got a "classifier timeout" fallback. 2500ms captures the full
+    # distribution. Only Tier-2 (regex-miss) turns are affected.
+    NOKVO_INTENT_CLASSIFIER_TIMEOUT_MS: int = 2500
+
+    # LangSmith prompt observability. When LANGSMITH_API_KEY is unset the
+    # tracer module (``app/services/langsmith_tracer.py``) is a silent
+    # no-op everywhere — zero latency, no SDK calls on the hot path. When
+    # set, every LLM call (voice turns, intent classifier, outcome
+    # classifier, condenser) emits a trace into the named project. The
+    # *_V2 flag also gets exported as an env var by ``init_tracer()`` so
+    # the SDK's implicit hooks pick up the same toggle.
+    LANGSMITH_API_KEY: str = ""
+    LANGSMITH_PROJECT: str = "nokvo-one"
+    LANGSMITH_TRACING_V2: bool = False
+    # Blank → SDK defaults to LangSmith cloud (api.smith.langchain.com).
+    # Override for self-hosted deployments.
+    LANGSMITH_ENDPOINT: str = ""
+    # Workspace (tenant) id. Required when the API key is *org-scoped*: the
+    # SDK sends it as the X-Tenant-Id header on ingest, without which
+    # /runs/* writes 403 even though reads succeed. Blank is fine for a
+    # workspace-scoped key (the tenant is baked into the key).
+    LANGSMITH_WORKSPACE_ID: str = ""
 
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=True, extra="ignore")
 

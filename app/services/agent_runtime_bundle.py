@@ -36,7 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.organization import Organization
 from app.models.tenant_resources import TenantResources
-from app.services.agent_knowledge_service import (
+from app.services.agent_config_keys import (
     AGENT_POLICY_CARDS_KEY,
     AGENT_SINGLE_PROMPT_CONFIG_KEY,
 )
@@ -150,12 +150,33 @@ def _active_policy_cards(provider_status: dict[str, Any]) -> list[dict[str, Any]
     return out
 
 
-def _single_prompt_guidance(provider_status: dict[str, Any]) -> str:
-    config = provider_status.get(AGENT_SINGLE_PROMPT_CONFIG_KEY) or {}
-    if not isinstance(config, dict) or not config.get("enabled"):
-        return ""
-    prompt = str(config.get("prompt") or "").strip()
-    return prompt[:8000]
+def _single_prompt_guidance(
+    provider_status: dict[str, Any], organization_industry: str | None
+) -> str:
+    """Compose the agent's persona/guidance block.
+
+    Now = the product-curated per-vertical system prompt + the org's free-text
+    BUSINESS FACTS. This replaces the old admin-authored "single prompt": the
+    persona is fixed and excellent per industry; only the org's specifics
+    (hours, prices, services, staff) come from the operator.
+
+    Backfill: if ``business_facts`` is empty but a legacy single-prompt is on
+    file, fold that text in as facts so existing orgs don't lose org-specific
+    information when the persona switches over.
+    """
+    from app.services.vertical_prompts import system_prompt_for_vertical
+
+    parts: list[str] = [system_prompt_for_vertical(organization_industry)]
+
+    facts = str(provider_status.get("business_facts") or "").strip()
+    if not facts:
+        legacy = provider_status.get(AGENT_SINGLE_PROMPT_CONFIG_KEY) or {}
+        if isinstance(legacy, dict):
+            facts = str(legacy.get("prompt") or "").strip()
+    facts = facts[:4000]
+    if facts:
+        parts.append("# BUSINESS FACTS\n" + facts)
+    return "\n\n".join(parts)
 
 
 async def _load_organization(
@@ -275,7 +296,6 @@ async def get_bundle(
         overrides = dict(provider_status.get("business_template_schema_overrides") or {})
         custom_tabs = custom_tabs_from_overrides(provider_status)
         policy_cards = _active_policy_cards(provider_status)
-        guidance = _single_prompt_guidance(provider_status)
 
         # Materialise scalar attributes immediately so the cached bundle
         # never has to touch ORM machinery again. ``_load_organization``
@@ -293,6 +313,19 @@ async def get_bundle(
                 # to the no-business-context branch.
                 organization = None
 
+        # Persona = curated vertical prompt + org BUSINESS FACTS. Computed
+        # here (not above) because it now depends on the resolved industry.
+        guidance = _single_prompt_guidance(provider_status, org_industry)
+        # ``single_prompt_enabled`` means "admin EXPLICITLY opted out of the
+        # built-in FSMs via a legacy custom single-prompt" — it must stay
+        # decoupled from ``guidance`` (which is now always present as the
+        # curated persona). Otherwise the always-on persona would suppress the
+        # clinic appointment FSM etc. for every tenant. Normal case: False.
+        legacy_single_prompt = provider_status.get(AGENT_SINGLE_PROMPT_CONFIG_KEY) or {}
+        single_prompt_enabled = bool(
+            isinstance(legacy_single_prompt, dict) and legacy_single_prompt.get("enabled")
+        )
+
         bundle = RuntimeBundle(
             tenant_id=tenant_id,
             organization=organization,
@@ -302,7 +335,7 @@ async def get_bundle(
             custom_tabs=custom_tabs,
             policy_cards=policy_cards,
             single_prompt_guidance=guidance,
-            single_prompt_enabled=bool(guidance),
+            single_prompt_enabled=single_prompt_enabled,
             version_key=expected_version,
         )
         _cache[cache_key] = (now + _BUNDLE_TTL_SECONDS, bundle)

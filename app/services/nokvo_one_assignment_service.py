@@ -134,6 +134,7 @@ class NokvoOneAssignmentService:
         summary: str | None = None,
         metadata: dict[str, Any] | None = None,
         record_type: str = "request",
+        eligible_member_ids: list[uuid.UUID] | None = None,
     ) -> dict[str, Any]:
         request_type = request_type.strip().lower()
         allowed = allowed_request_types(organization.industry)
@@ -187,6 +188,16 @@ class NokvoOneAssignmentService:
             return result
 
         members = await NokvoOneAssignmentService._load_members(db, organization.id)
+        # Service-first routing (clinics): when the caller chose a service that
+        # has doctors mapped to it, the booking flow passes those doctor ids and
+        # we constrain the candidate pool to them (so we never book a doctor who
+        # doesn't provide the service). None / empty list = no constraint — an
+        # unmapped service, every other vertical, and back-compat all behave
+        # exactly as before. If none of the mapped doctors are bookable, the
+        # normal "no members matched" path fires and the agent defers.
+        if eligible_member_ids:
+            eligible = {str(m) for m in eligible_member_ids}
+            members = [m for m in members if str(m.id) in eligible]
         settings_by_member = await NokvoOneAssignmentService._load_assignment_settings(db, organization.id)
         records = await NokvoOneAssignmentService._load_request_records(db, organization.id)
         clinic_settings_by_member = await NokvoOneAssignmentService._load_clinic_settings(db, organization.id)
