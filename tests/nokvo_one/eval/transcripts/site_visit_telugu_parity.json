@@ -1,0 +1,31 @@
+{
+  "name": "site_visit_telugu_parity",
+  "description": "Multilingual parity: a Telugu site-visit request must drive the SAME slots-out as English — the site_visit flow starts, the phone pre-fills from ANI, and a Telugu-stated name is captured. Telugu/Hindi must match English in extraction + intent, not just prompt style.",
+  "business_type": "real_estate",
+  "outbound": false,
+  "company_name": "Raghava Constructions",
+  "focus_project": "Skyline Heights",
+  "caller_phone": "+917569672503",
+  "language": "te",
+  "turns": [
+    {"role": "user", "text": "site visit cheyali"},
+    {"role": "assistant", "text": "Tappakunda! Mee peru cheppandi?"},
+    {"role": "user", "text": "Naa peru Nihar"}
+  ],
+  "expected": [
+    {
+      "turn_index": 1,
+      "asserts": [
+        {"op": "equals", "field": "tool_flow_flow_key", "expected": "real_estate_site_visit"},
+        {"op": "equals", "field": "mode", "expected": "site_visit"},
+        {"op": "equals", "field": "collected.phone", "expected": "+917569672503"}
+      ]
+    },
+    {
+      "turn_index": 2,
+      "asserts": [
+        {"op": "equals", "field": "collected.name", "expected": "Nihar"}
+      ]
+    }
+  ]
+}

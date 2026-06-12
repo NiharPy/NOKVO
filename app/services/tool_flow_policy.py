@@ -171,6 +171,12 @@ def _infer_domain_slots(
 # wrong order ID).
 _CONFIRMATION_KINDS = {"phone", "email", "reference_number"}
 
+# Names on a telephony line mis-transcribe ("Nihar" → "Nikhil" → "Lord") and
+# re-confirming each fresh STT guess loops forever. Cap the read-backs: after this
+# many confirmation prompts, accept the best-effort name (flagged unconfirmed) and
+# move on — the auto-captured caller phone lets the team verify the spelling later.
+_MAX_NAME_CONFIRM_ATTEMPTS = 2
+
 # How many times we'll rigidly offer "same time on the next day" before giving
 # up on the shift and surfacing the next actually-available slot via the
 # scheduler. Caps the past-time loop: a caller who keeps naming times that have
@@ -248,6 +254,47 @@ _LEAD_INTENT_RE = re.compile(
     r"संपर्क|जानकारी|डिटेल्स|दिलचस्पी|कीमत|रेट|ब्रोशर|कॉल\s*कर|फ़ोन\s*कर|चाहिए)",
     re.IGNORECASE,
 )
+# Brochure-on-WhatsApp request → triggers the real-estate whatsapp_mode FSM. Kept
+# focused (explicit "brochure", or send/share/whatsapp + a document noun) so a
+# generic enquiry ("what's the price?") does NOT flip the agent into send mode.
+_BROCHURE_REQUEST_RE = re.compile(
+    r"\bbrochure\b"
+    r"|(?:send|share|whatsapp|forward|mail|e-?mail|text|drop)\b[^.?!]{0,40}"
+    r"\b(?:details?|info(?:rmation)?|floor\s*plan|price\s*list|pdf|document|catalogue?|catalog)\b"
+    r"|brochure\s+kavali|brochure\s+bhej(?:o|iye|na)?|ब्रोशर|బ్రోషర్",
+    re.IGNORECASE,
+)
+
+
+def detect_brochure_request(text: str | None) -> bool:
+    """True when the caller asks for the brochure / project details to be sent to
+    them (e.g. on WhatsApp). Drives the ``whatsapp_mode`` FSM trigger; the actual
+    send happens via the ``request_brochure`` tool."""
+    return bool(text and _BROCHURE_REQUEST_RE.search(str(text)))
+
+
+def brochure_intent_active(
+    text: str | None,
+    history: list[dict[str, str]] | None = None,
+    *,
+    lookback: int = 3,
+) -> bool:
+    """Sticky brochure intent. Stays True for a few turns after the caller first
+    asks for the brochure, so a follow-up like "yeah" or reading out a number
+    doesn't drop the agent out of whatsapp_mode mid-exchange. Once a brochure
+    send is logged (``request_brochure``), the agent's turn carries
+    ``brochure sent`` / ``on its way`` wording — but we key off the request side
+    only, capped by ``lookback`` recent USER turns so it self-expires."""
+    if detect_brochure_request(text):
+        return True
+    recent_user_turns = [
+        str(t.get("content") or "")
+        for t in (history or [])
+        if str(t.get("role") or "").lower() == "user"
+    ][-lookback:]
+    return any(detect_brochure_request(t) for t in recent_user_turns)
+
+
 # Clinic appointment-booking intent (starts the clinic_appointment flow).
 _APPOINTMENT_INTENT_RE = re.compile(
     r"\b(?:book|schedule|make|fix|get|need|want|take)\b.{0,30}\b"
@@ -395,6 +442,9 @@ _NAME_HONORIFIC_SUFFIX_RE = re.compile(
 _NAME_STOP_WORDS = {
     "yeah", "yes", "yep", "yup", "no", "nope", "nah", "not", "really",
     "ok", "okay", "well",
+    # Affirmation / discourse fillers (incl. transliterated Hindi "yes") — a
+    # caller saying "aha" / "haan" is acknowledging, not giving their name.
+    "aha", "ah", "aah", "huh", "uhhuh", "uh-huh", "haan", "han", "haa", "haa",
     "so", "um", "uh", "hmm", "oh", "hi", "hello", "hey", "sure", "right",
     "alright", "actually", "please", "thanks", "thank", "you", "your",
     "yours", "my", "me", "mine", "i", "im", "i'm", "i'd", "id", "we", "they",
@@ -689,11 +739,19 @@ def _start_flow_key(text: str, business_type: str | None, history: list[dict[str
         return "clinic_appointment"
     # Lead-capture trigger. Either an explicit interest phrase from the lead
     # ("send me details", "I'm interested") OR a plain "yes/yeah" right after
-    # the agent offered to share details / a brochure / a callback. Without
-    # the yes-after-offer branch, a soft "yeah" never started any flow and
-    # the LLM was free to keep chatting without capturing name/phone.
-    if _LEAD_INTENT_RE.search(text) or (
-        _YES_RE.search(text) and _last_assistant_offered_lead_capture(history)
+    # the agent offered to share details / a brochure / a callback.
+    #
+    # Real estate is EXCLUDED: it never runs a mid-call lead slot-fill. An
+    # enquiry just stays conversational (QUERY mode) and, if no site visit is
+    # booked, a lead is created automatically at end-of-call from the ANI +
+    # call summary (see maybe_create_real_estate_lead_from_call). Interrogating
+    # an enquiry caller for name/phone was the "going dumb" behaviour.
+    # Clinics are EXCLUDED for the same reason: clinics have no leads at all —
+    # every caller is captured in the Customer base automatically (ANI +
+    # post-call notes), so there is no leads_create flow to start.
+    if normalize_business_type(business_type) not in ("real_estate", "clinics") and (
+        _LEAD_INTENT_RE.search(text)
+        or (_YES_RE.search(text) and _last_assistant_offered_lead_capture(history))
     ):
         return "leads_create"
     return None
@@ -862,6 +920,29 @@ def evaluate_tool_flow_policy(
             pass
 
     flow_key = str(flow_state.get("flow_key") or "")
+
+    # ── ANI auto-fill: phone slot from the caller's number ─────────────────
+    # ``state['caller_phone']`` is the number we're talking to (from the call
+    # signaling, set at call start). Fill the phone slot directly so the agent
+    # never asks the caller to recite digits — telephony STT mangles spoken
+    # numbers. Only fills an EMPTY slot (a number the caller speaks/corrects still
+    # wins, via the extraction path), and skips the read-back since there's no STT
+    # error to guard against. The marker lives on flow_state, not collected, so it
+    # never leaks into the stored record.
+    _caller_phone = str((state.get("caller_phone") or "")).strip()
+    if _caller_phone:
+        _coll = dict(flow_state.get("collected") or {})
+        _flow_slots = ((bundle.get("flows") or {}).get(flow_key) or {}).get("slots") or []
+        _filled = False
+        for _s in _flow_slots:
+            if isinstance(_s, dict) and _s.get("kind") == "phone":
+                _pk = str(_s.get("key") or "")
+                if _pk and not _coll.get(_pk):
+                    _coll[_pk] = _caller_phone
+                    _filled = True
+        if _filled:
+            flow_state["collected"] = _coll
+            flow_state["phone_from_ani"] = True
 
     # ── 1) Availability-lookup intent ─────────────────────────────────────
     # When the caller asks "is X available?" / "when can you book me?" / "any
@@ -1053,76 +1134,83 @@ def evaluate_tool_flow_policy(
 
     # ── 3b) Caller answering name confirmation ─────────────────────────
     if flow_state.get("awaiting_name_confirmation"):
+        from app.services.flow_session import record_confirmation, append_audit_trail
         confirmation_key = str(flow_state.get("name_confirmation_slot") or "")
         flow_state["awaiting_name_confirmation"] = False
         flow_state.pop("name_confirmation_slot", None)
+        attempts = int(flow_state.get("name_confirm_attempts") or 1)
+
+        def _advance_past_name() -> None:
+            if str(flow_state.get("pending_slot") or "").endswith("_confirm"):
+                flow_state["pending_slot"] = None
+
         if _looks_affirmative(value):
-            from app.services.flow_session import record_confirmation, append_audit_trail
             collected_now = dict(flow_state.get("collected") or {})
             record_confirmation(flow_state, confirmation_key, collected_now.get(confirmation_key))
             append_audit_trail(flow_state, "name_confirmed", detail=collected_now.get(confirmation_key))
-            # Same advance-the-FSM fix as the id_confirmation path above.
-            if flow_state.get("pending_slot", "").endswith("_confirm"):
-                flow_state["pending_slot"] = None
-        elif _looks_negative(value):
-            # Look for an embedded correction first so "No, my name is
-            # Nihar" still moves the conversation forward. Strip the
-            # leading negation so the name extractor doesn't carry the
-            # "no" into the extracted value.
+            flow_state.pop("name_confirm_attempts", None)
+            _advance_past_name()
+            # fall through to the main slot logic (asks the next slot / completes)
+        else:
+            # Caller didn't say a clean "yes". Find their intended name — an
+            # embedded correction after "no, it's X", or a bare re-statement.
             stripped = re.sub(
                 r"^\s*(?:no|nope|nah|not\s+really|actually|wait|sorry)\b[\s,]*",
                 "",
                 value or "",
                 flags=re.IGNORECASE,
             )
-            embedded_correction = (
-                _extract_value(stripped, confirmation_key, "name")
-                if confirmation_key and stripped and stripped != value
-                else None
-            )
-            if embedded_correction:
-                collected = dict(flow_state.get("collected") or {})
-                collected[confirmation_key] = embedded_correction
-                flow_state["collected"] = collected
-                flow_state["awaiting_name_confirmation"] = True
-                flow_state["name_confirmation_slot"] = confirmation_key
-                return {
-                    "answer": _name_confirmation_prompt(embedded_correction, language),
-                    "intent": "tool_flow",
-                    "flow_key": flow_key,
-                    "state_patch": {"tool_flow": flow_state},
-                    "state_slot": f"{confirmation_key}_confirm",
-                    "reason": "name corrected, awaiting confirmation",
-                }
-            collected = dict(flow_state.get("collected") or {})
+            new_name = None
             if confirmation_key:
-                collected.pop(confirmation_key, None)
-            flow_state["collected"] = collected
-            flow_state["pending_slot"] = confirmation_key
-            return {
-                "answer": _question_for_slot(bundle, flow_key, confirmation_key, language),
-                "intent": "tool_flow",
-                "flow_key": flow_key,
-                "state_patch": {"tool_flow": flow_state},
-                "state_slot": confirmation_key,
-                "reason": "name confirmation rejected",
-            }
-        else:
-            replacement = _extract_value(value, confirmation_key, "name") if confirmation_key else None
-            if replacement:
+                new_name = (
+                    (_extract_value(stripped, confirmation_key, "name") if stripped and stripped != value else None)
+                    or _extract_value(value, confirmation_key, "name")
+                )
+            if new_name:
                 collected = dict(flow_state.get("collected") or {})
-                collected[confirmation_key] = replacement
+                collected[confirmation_key] = new_name
                 flow_state["collected"] = collected
+
+            if attempts >= _MAX_NAME_CONFIRM_ATTEMPTS:
+                # Stop the re-confirm loop: accept the best-effort name (flagged
+                # unconfirmed for the team to verify against the captured phone) and
+                # advance — telephony STT will never nail every name, and looping is
+                # far worse than a one-line "we'll double-check the spelling".
+                collected = dict(flow_state.get("collected") or {})
+                record_confirmation(flow_state, confirmation_key, collected.get(confirmation_key))
+                append_audit_trail(flow_state, "name_unconfirmed", detail=collected.get(confirmation_key))
+                flow_state.pop("name_confirm_attempts", None)
+                _advance_past_name()
+                # fall through to the main slot logic
+            elif new_name:
+                flow_state["name_confirm_attempts"] = attempts + 1
                 flow_state["awaiting_name_confirmation"] = True
                 flow_state["name_confirmation_slot"] = confirmation_key
                 return {
-                    "answer": _name_confirmation_prompt(replacement, language),
+                    "answer": _name_confirmation_prompt(new_name, language),
                     "intent": "tool_flow",
                     "flow_key": flow_key,
                     "state_patch": {"tool_flow": flow_state},
                     "state_slot": f"{confirmation_key}_confirm",
                     "reason": "name corrected, awaiting confirmation",
                 }
+            elif _looks_negative(value):
+                # "No" without a clear correction → re-ask the name (under the cap).
+                flow_state["name_confirm_attempts"] = attempts + 1
+                collected = dict(flow_state.get("collected") or {})
+                if confirmation_key:
+                    collected.pop(confirmation_key, None)
+                flow_state["collected"] = collected
+                flow_state["pending_slot"] = confirmation_key
+                return {
+                    "answer": _question_for_slot(bundle, flow_key, confirmation_key, language),
+                    "intent": "tool_flow",
+                    "flow_key": flow_key,
+                    "state_patch": {"tool_flow": flow_state},
+                    "state_slot": confirmation_key,
+                    "reason": "name confirmation rejected",
+                }
+            # else: ambiguous, no new name, not negative, under cap → fall through
 
     pending = str(flow_state.get("pending_slot") or "") or _next_slot(flow_state, bundle)
     collected = dict(flow_state.get("collected") or {})
@@ -1180,6 +1268,7 @@ def evaluate_tool_flow_policy(
                 prefix = _coming_back_prefix(language) if resumed_from_kb else ""
                 flow_state["awaiting_name_confirmation"] = True
                 flow_state["name_confirmation_slot"] = pending
+                flow_state["name_confirm_attempts"] = 1
                 flow_state["pending_slot"] = f"{pending}_confirm"
                 return {
                     "answer": prefix + _name_confirmation_prompt(extracted, language),

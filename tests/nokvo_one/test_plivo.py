@@ -73,8 +73,9 @@ def test_rent_number_raises_when_no_india_inventory(plivo_creds, monkeypatch):
         _run(PlivoService.rent_number(country="IN"))
 
 
-def test_missing_master_creds_raises():
-    # No monkeypatch → creds empty in test settings.
+def test_missing_master_creds_raises(monkeypatch):
+    monkeypatch.setattr(settings, "PLIVO_AUTH_ID", "")
+    monkeypatch.setattr(settings, "PLIVO_AUTH_TOKEN", "")
     with pytest.raises(PlivoError):
         _run(PlivoService.create_subaccount("acme"))
 
@@ -113,3 +114,301 @@ def test_inbound_answer_xml_is_bidirectional_stream():
     assert "<Stream" in xml and 'bidirectional="true"' in xml
     assert "wss://host/api/nokvo-one/agents/plivo/media/L1</Stream>" in xml
     assert "audio/x-l16" in xml
+
+
+def test_inbound_answer_xml_keeps_status_callback():
+    from app.api.nokvo_one_voice import _plivo_stream_xml
+    xml = _plivo_stream_xml(
+        "wss://host/api/nokvo-one/agents/plivo/media/L1",
+        "https://host/api/nokvo-one/agents/plivo/stream-status/L1",
+    )
+    assert 'statusCallbackUrl="https://host/api/nokvo-one/agents/plivo/stream-status/L1"' in xml
+    assert 'statusCallbackMethod="POST"' in xml
+
+
+# ── Public URL building (the inbound-connectivity fix) ──────────────────────
+
+
+def test_public_base_url_precedence(monkeypatch):
+    from app.services.public_url import public_base_url, ws_base_url
+
+    # 1. Explicit PLIVO_WEBHOOK_BASE_URL wins over everything.
+    monkeypatch.setattr(settings, "PLIVO_WEBHOOK_BASE_URL", "https://hooks.example/")
+    monkeypatch.setattr(settings, "AGENT_PUBLIC_BASE_URL", "https://agent.example")
+    assert public_base_url() == "https://hooks.example"
+    assert ws_base_url() == "wss://hooks.example"
+
+    # 2. AGENT_PUBLIC_BASE_URL when explicit is empty (and not the localhost default).
+    monkeypatch.setattr(settings, "PLIVO_WEBHOOK_BASE_URL", "")
+    assert public_base_url() == "https://agent.example"
+
+    # 3. Request-derived, honoring X-Forwarded-* (the proxy case: internal
+    # http request must still yield the public https/wss URL).
+    monkeypatch.setattr(settings, "AGENT_PUBLIC_BASE_URL", "http://localhost:8000")
+    request = SimpleNamespace(
+        headers={"x-forwarded-proto": "https", "x-forwarded-host": "pub.example"},
+        url=SimpleNamespace(scheme="http", hostname="10.0.0.5", port=8000),
+    )
+    assert public_base_url(request) == "https://pub.example"
+    assert ws_base_url(request) == "wss://pub.example"
+
+    # 4. No forwarded headers → the raw request URL.
+    bare = SimpleNamespace(
+        headers={},
+        url=SimpleNamespace(scheme="https", hostname="direct.example", port=None),
+    )
+    assert public_base_url(bare) == "https://direct.example"
+
+
+def test_validate_public_base_url_warnings(monkeypatch):
+    from app.services.public_url import validate_public_base_url
+
+    monkeypatch.setattr(settings, "PLIVO_WEBHOOK_BASE_URL", "")
+    monkeypatch.setattr(settings, "AGENT_PUBLIC_BASE_URL", "http://localhost:8000")
+    warnings = validate_public_base_url()
+    assert any("PLIVO_WEBHOOK_BASE_URL is not set" in w for w in warnings)
+    assert any("localhost" in w for w in warnings)
+
+    monkeypatch.setattr(settings, "PLIVO_WEBHOOK_BASE_URL", "http://insecure.example")
+    assert any("plain http" in w for w in validate_public_base_url())
+
+    monkeypatch.setattr(settings, "PLIVO_WEBHOOK_BASE_URL", "https://a.example")
+    monkeypatch.setattr(settings, "AGENT_PUBLIC_BASE_URL", "https://b.example")
+    assert any("disagree" in w for w in validate_public_base_url())
+
+    monkeypatch.setattr(settings, "AGENT_PUBLIC_BASE_URL", "https://a.example")
+    assert validate_public_base_url() == []
+
+
+# ── Application update + webhook re-sync ────────────────────────────────────
+
+
+def test_update_application_posts_answer_url(plivo_creds, monkeypatch):
+    calls = []
+
+    def handler(method, url, body):
+        calls.append((method, url, body))
+        return {}
+
+    _mock_request(monkeypatch, handler)
+    _run(PlivoService.update_application("APP9", answer_url="https://new.example/api/nokvo-one/agents/plivo/voice/L1"))
+    assert len(calls) == 1
+    method, url, body = calls[0]
+    assert method == "POST"
+    assert url.endswith("/Application/APP9/")
+    assert body["answer_url"].endswith("/plivo/voice/L1")
+    assert body["answer_method"] == "POST"
+
+
+def test_update_application_noop_without_urls(plivo_creds, monkeypatch):
+    calls = []
+    _mock_request(monkeypatch, lambda m, u, b: calls.append((m, u, b)) or {})
+    _run(PlivoService.update_application("APP9"))
+    assert calls == []
+
+
+def test_needs_webhook_resync_matrix():
+    base = "https://new.example"
+    expected = PlivoService.expected_answer_url("L1", base)
+    assert expected == "https://new.example/api/nokvo-one/agents/plivo/voice/L1"
+    # Stale URL → needs resync.
+    assert PlivoService.needs_webhook_resync(
+        {"application_id": "A", "link_id": "L1", "answer_url": "https://old.example/api/nokvo-one/agents/plivo/voice/L1"},
+        base,
+    )
+    # Already in sync → no.
+    assert not PlivoService.needs_webhook_resync(
+        {"application_id": "A", "link_id": "L1", "answer_url": expected}, base
+    )
+    # Nothing to sync (no application / no link / no base) → no.
+    assert not PlivoService.needs_webhook_resync({}, base)
+    assert not PlivoService.needs_webhook_resync({"application_id": "A"}, base)
+    assert not PlivoService.needs_webhook_resync(
+        {"application_id": "A", "link_id": "L1", "answer_url": "x"}, ""
+    )
+
+
+class _FakeDb:
+    def __init__(self):
+        self.added = []
+        self.commits = 0
+
+    def add(self, obj):
+        self.added.append(obj)
+
+    async def commit(self):
+        self.commits += 1
+
+
+def test_resync_tenant_webhook_updates_plivo_and_store(plivo_creds, monkeypatch):
+    calls = []
+
+    def handler(method, url, body):
+        calls.append((method, url, body))
+        return {}
+
+    _mock_request(monkeypatch, handler)
+    tr = SimpleNamespace(
+        tenant_id="t-1",
+        provider_status={
+            "plivo": {
+                "application_id": "APP1",
+                "link_id": "L1",
+                "answer_url": "https://old.example/api/nokvo-one/agents/plivo/voice/L1",
+            }
+        },
+    )
+    db = _FakeDb()
+    result = _run(PlivoService.resync_tenant_webhook(tr, db, base="https://new.example"))
+    assert result["updated"] is True
+    assert calls and calls[0][1].endswith("/Application/APP1/")
+    assert tr.provider_status["plivo"]["answer_url"] == (
+        "https://new.example/api/nokvo-one/agents/plivo/voice/L1"
+    )
+    assert db.commits == 1
+
+
+def test_resync_tenant_webhook_skips_in_sync(plivo_creds, monkeypatch):
+    calls = []
+    _mock_request(monkeypatch, lambda m, u, b: calls.append(1) or {})
+    expected = PlivoService.expected_answer_url("L1", "https://same.example")
+    tr = SimpleNamespace(
+        tenant_id="t-1",
+        provider_status={"plivo": {"application_id": "APP1", "link_id": "L1", "answer_url": expected}},
+    )
+    db = _FakeDb()
+    result = _run(PlivoService.resync_tenant_webhook(tr, db, base="https://same.example"))
+    assert result["updated"] is False and result["reason"] == "in_sync"
+    assert calls == [] and db.commits == 0
+
+
+# ── Plivo webhook signature validation (X-Plivo-Signature-V2) ───────────────
+
+
+def _v2_signature(token: str, url: str, nonce: str) -> str:
+    import base64
+    import hashlib
+    import hmac
+
+    return base64.b64encode(
+        hmac.new(token.encode(), (url + nonce).encode(), hashlib.sha256).digest()
+    ).decode()
+
+
+def test_verify_plivo_signature_known_vector():
+    from app.api.nokvo_one_voice import _verify_plivo_signature
+
+    url = "https://hooks.example/api/nokvo-one/agents/plivo/voice/L1"
+    nonce = "12345"
+    sig = _v2_signature("secret", url, nonce)
+    assert _verify_plivo_signature(url, nonce, sig, ["secret"]) == "master"
+    # Second (tenant) token also matches when the first doesn't.
+    assert _verify_plivo_signature(url, nonce, sig, ["wrong", "secret"]) == "tenant"
+    # Comma-separated rotation list.
+    assert _verify_plivo_signature(url, nonce, f"garbage,{sig}", ["secret"]) == "master"
+    # Mismatch / missing inputs → None.
+    assert _verify_plivo_signature(url, nonce, "bad", ["secret"]) is None
+    assert _verify_plivo_signature(url, "", sig, ["secret"]) is None
+    assert _verify_plivo_signature(url, nonce, "", ["secret"]) is None
+
+
+def test_check_plivo_signature_modes(monkeypatch):
+    from app.api import nokvo_one_voice as mod
+
+    url_path = "/api/nokvo-one/agents/plivo/voice/L1"
+    base = "https://hooks.example"
+    monkeypatch.setattr(settings, "PLIVO_WEBHOOK_BASE_URL", base)
+    monkeypatch.setattr(settings, "PLIVO_AUTH_TOKEN", "secret")
+    good_sig = _v2_signature("secret", base + url_path, "n-1")
+
+    def _req(sig, nonce):
+        return SimpleNamespace(
+            headers={"x-plivo-signature-v2": sig, "x-plivo-signature-v2-nonce": nonce},
+            url=SimpleNamespace(scheme="http", hostname="internal", port=8000, path=url_path, query=""),
+        )
+
+    monkeypatch.setattr(settings, "PLIVO_VALIDATE_SIGNATURES", "enforce")
+    assert _run(mod._check_plivo_signature(_req(good_sig, "n-1"))) is True
+    assert _run(mod._check_plivo_signature(_req("forged", "n-1"))) is False
+
+    # warn mode: mismatch logs but allows.
+    monkeypatch.setattr(settings, "PLIVO_VALIDATE_SIGNATURES", "warn")
+    assert _run(mod._check_plivo_signature(_req("forged", "n-1"))) is True
+
+    # off / no token: always allow.
+    monkeypatch.setattr(settings, "PLIVO_VALIDATE_SIGNATURES", "off")
+    assert _run(mod._check_plivo_signature(_req("forged", "n-1"))) is True
+    monkeypatch.setattr(settings, "PLIVO_VALIDATE_SIGNATURES", "enforce")
+    monkeypatch.setattr(settings, "PLIVO_AUTH_TOKEN", "")
+    assert _run(mod._check_plivo_signature(_req("forged", "n-1"))) is True
+
+
+# ── Outbound-status hardening ────────────────────────────────────────────────
+
+
+def test_outbound_status_survives_unparseable_payload(monkeypatch):
+    """Both form() and json() raising must not NameError — the handler still
+    parses to {} and proceeds (here: down the not-found/deferred path)."""
+    from app.api import nokvo_one_voice as mod
+
+    monkeypatch.setattr(settings, "PLIVO_VALIDATE_SIGNATURES", "off")
+
+    async def _no_rows(call_link_id, db):
+        return None, None
+
+    monkeypatch.setattr(
+        mod.OutboundCampaignService, "get_by_call_link_id", staticmethod(_no_rows)
+    )
+
+    async def _no_sleep(_s):
+        return None
+
+    monkeypatch.setattr(mod.asyncio, "sleep", _no_sleep)
+
+    class _BadRequest:
+        headers = {}
+        url = SimpleNamespace(scheme="https", hostname="x", port=None, path="/p", query="")
+
+        async def form(self):
+            raise RuntimeError("bad form")
+
+        async def json(self):
+            raise RuntimeError("bad json")
+
+    result = _run(mod.plivo_outbound_status("missing-link", _BadRequest(), db=None))
+    assert result["ok"] is True
+    assert result.get("deferred") is True
+
+
+# ── In-flight reconciliation ─────────────────────────────────────────────────
+
+
+def test_is_webhook_timed_out_boundaries():
+    from datetime import datetime, timedelta, timezone
+
+    from app.models.lead_followup_schedule import FollowupStatus
+    from app.services.followup_scheduler_service import FollowupSchedulerService as S
+
+    now = datetime(2026, 6, 13, 12, 0, tzinfo=timezone.utc)
+    row = SimpleNamespace(
+        status=FollowupStatus.in_flight,
+        updated_at=now - timedelta(minutes=31),
+        created_at=None,
+    )
+    assert S.is_webhook_timed_out(row, now, 30) is True
+    row.updated_at = now - timedelta(minutes=29)
+    assert S.is_webhook_timed_out(row, now, 30) is False
+    # Non-in_flight rows never time out.
+    row.status = FollowupStatus.pending
+    row.updated_at = now - timedelta(days=2)
+    assert S.is_webhook_timed_out(row, now, 30) is False
+    # No timestamps at all → treat as timed out (can't prove freshness).
+    stale = SimpleNamespace(status=FollowupStatus.in_flight, updated_at=None, created_at=None)
+    assert S.is_webhook_timed_out(stale, now, 30) is True
+    # Naive timestamps are coerced to UTC, not crashed on.
+    naive = SimpleNamespace(
+        status=FollowupStatus.in_flight,
+        updated_at=(now - timedelta(minutes=40)).replace(tzinfo=None),
+        created_at=None,
+    )
+    assert S.is_webhook_timed_out(naive, now, 30) is True

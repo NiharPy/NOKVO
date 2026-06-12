@@ -41,13 +41,23 @@ def _ulaw_encode(samples: np.ndarray) -> bytes:
 
 
 def _resample(samples: np.ndarray, from_rate: int, to_rate: int) -> np.ndarray:
-    """Linear-interpolation resampling of int16 samples."""
+    """Linear-interpolation resampling of int16 samples.
+
+    When DOWNSAMPLING we first apply a short moving-average low-pass — bare
+    linear interpolation has no anti-alias filter, so high-frequency content
+    folds back into the band and muddies the result. Upsampling and the
+    equal-rate fast path are untouched (numpy-only, no scipy)."""
     if from_rate == to_rate or len(samples) == 0:
         return samples
+    work = samples.astype(np.float32)
+    if from_rate > to_rate:
+        win = max(2, int(round(from_rate / to_rate)))
+        kernel = np.ones(win, dtype=np.float32) / win
+        work = np.convolve(work, kernel, mode="same")
     n_out = max(1, int(len(samples) * to_rate / from_rate))
     x_in = np.arange(len(samples), dtype=np.float32)
     x_out = np.linspace(0, len(samples) - 1, n_out, dtype=np.float32)
-    return np.interp(x_out, x_in, samples.astype(np.float32)).astype(np.int16)
+    return np.interp(x_out, x_in, work).astype(np.int16)
 
 
 def _parse_tts_audio(audio_bytes: bytes) -> tuple[np.ndarray, int]:

@@ -432,13 +432,16 @@ def _discovery_agenda_section(
     question = (discovery_question_override or "").strip() or _DEFAULT_DISCOVERY_QUESTION
     return (
         "# COLD OPEN — YOU LEAD THIS TURN\n"
-        "This is the start of the call. You must take control of the conversation — the caller "
-        "expects you to host them, not the other way around.\n"
-        f"- Greet briefly + warmly. Say you are {expert_line}.\n"
-        f"- Immediately ask ONE open-ended discovery question: \"{question}\"\n"
-        "- BANNED openers: 'How can I help you?', 'How may I assist you?', 'What can I do for you?'. "
-        "These hand the floor back; you need to keep it.\n"
-        "- BANNED on this turn: pitching features, listing amenities, naming prices. Discovery first."
+        "This is the start of the call. Take control — the caller expects you to host them.\n"
+        f"- Greet briefly + warmly, once. Say you are {expert_line}.\n"
+        "- IF the caller asked a DIRECT question (what projects/properties you have, prices, "
+        "locations, configurations, possession): ANSWER IT FIRST from the PROJECT INVENTORY — "
+        "name the project(s) with 1-2 key facts each (location, configs, price) — THEN ask one "
+        "discovery question. Answering what they asked is NOT optional; never reply to a direct "
+        "question with only a counter-question.\n"
+        f"- IF the caller was vague/just greeting: lead with one open discovery question, e.g. \"{question}\"\n"
+        "- BANNED openers: 'How can I help you?', 'How may I assist you?'. These hand the floor back.\n"
+        "- Don't dump the whole brochure — name what's relevant, keep it to a couple of sentences."
     )
 
 
@@ -707,6 +710,7 @@ def compose_strategy_block(
     sold_out_locations: list[str] | None = None,
     alternative_pitch: str | None = None,
     capture_flow_active: bool = False,
+    is_first_turn: bool = True,
 ) -> str:
     """Render the strategy directive block for this turn, or ``""`` when there
     is no actionable signal. Safe for ``business_type=None`` (emits only the
@@ -738,7 +742,7 @@ def compose_strategy_block(
         # passive turn 1. When there's no sales signal yet AND we're not in
         # recovery mode, lead with the discovery-agenda directive so the
         # LLM names the project and asks one specific question.
-        if not _has_sales_signal(memory) and not recovery:
+        if not _has_sales_signal(memory) and not recovery and is_first_turn:
             sections.append(
                 _discovery_agenda_section(
                     focus_project=focus_project,

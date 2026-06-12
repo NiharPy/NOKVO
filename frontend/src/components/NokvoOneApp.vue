@@ -135,6 +135,11 @@ const _emptyProjectDraft = () => ({
   builder_name: '',
   brochure_url: '',
   contact_phone: '',
+  // WhatsApp pre-set messages (Meta-approved template names). Location is
+  // auto-sent on a site-visit booking; brochure is sent from whatsapp_mode.
+  wa_location_template: '',
+  wa_location_maps_url: '',
+  wa_brochure_template: '',
 });
 
 const projects = ref([]);
@@ -143,7 +148,8 @@ const projectDraft = ref(_emptyProjectDraft());
 const isSavingProject = ref(false);
 const isDeletingProjectId = ref(null);
 const realEstateFieldsEditor = ref({
-  leads: [],
+  // Leads are fixed to name + phone + call notes — only the Site Visit (tickets)
+  // schema is configurable during onboarding.
   tickets: [],
   isSaving: false,
 });
@@ -769,6 +775,11 @@ const toggleThemeMode = () => {
 const switchPage = (page) => {
   if (page === 'appointments' && !showAppointmentsTab.value) return;
   if (page === 'tickets' && !showTicketsTab.value) return;
+  // Clinics have no Leads tab (callers land in the Customer base instead),
+  // and the Customer base only exists for clinics. Swallow deep-links /
+  // programmatic navigation to the wrong surface.
+  if (page === 'leads' && isClinicTemplate.value) return;
+  if (page === 'customers' && !isClinicTemplate.value) return;
   // Nokvo Connect is feature-flagged. When disabled, swallow any attempt to
   // navigate to its landing pages (nav button is already hidden, but this
   // catches deep-links / programmatic calls) so the user can't reach a
@@ -1263,6 +1274,9 @@ const connectNotificationsSocket = () => {
 const loadTabRecords = async (tab) => {
   if (!tab) return;
   if (tab === 'appointments' && !showAppointmentsTab.value) return;
+  // Clinics have no leads tab — single guard so every call site (mount,
+  // timetable, WS refresh) skips the request instead of surfacing an error.
+  if (tab === 'leads' && isClinicTemplate.value) return;
   tabRecordsLoading.value = { ...tabRecordsLoading.value, [tab]: true };
   try {
     const { data } = await api.get(`/agents/records/tab/${tab}`, {
@@ -1516,6 +1530,9 @@ const _projectDraftFromRecord = (project) => ({
   builder_name: project.builder_name || '',
   brochure_url: project.brochure_url || '',
   contact_phone: project.contact_phone || '',
+  wa_location_template: project.whatsapp?.location?.template || '',
+  wa_location_maps_url: project.whatsapp?.location?.maps_url || '',
+  wa_brochure_template: project.whatsapp?.brochure?.template || '',
 });
 
 const _projectPayloadFromDraft = (draft) => {
@@ -1533,6 +1550,18 @@ const _projectPayloadFromDraft = (draft) => {
     const text = String(value).trim();
     return text.length ? text : null;
   };
+  // Assemble the per-project WhatsApp config (Meta-approved templates). Only
+  // include a sub-block when its template name is set, so an unconfigured
+  // project sends nothing.
+  const whatsapp = {};
+  const locTemplate = trimmed(draft.wa_location_template);
+  if (locTemplate) {
+    whatsapp.location = { template: locTemplate, language: 'en', maps_url: trimmed(draft.wa_location_maps_url) || '' };
+  }
+  const brocTemplate = trimmed(draft.wa_brochure_template);
+  if (brocTemplate) {
+    whatsapp.brochure = { template: brocTemplate, language: 'en' };
+  }
   return {
     name: (draft.name || '').trim(),
     location: trimmed(draft.location),
@@ -1548,6 +1577,7 @@ const _projectPayloadFromDraft = (draft) => {
     builder_name: trimmed(draft.builder_name),
     brochure_url: trimmed(draft.brochure_url),
     contact_phone: trimmed(draft.contact_phone),
+    whatsapp,
   };
 };
 
@@ -1635,7 +1665,7 @@ const beginRealEstateWizard = async () => {
 const refreshRealEstateFieldsEditor = () => {
   const cloneSchema = (key) => schemaFor(key).map((field) => ({ ...field }));
   realEstateFieldsEditor.value = {
-    leads: cloneSchema('leads'),
+    // Only the Site Visit (tickets) schema is configurable; leads are fixed.
     tickets: cloneSchema('tickets'),
     isSaving: false,
   };
@@ -1663,13 +1693,13 @@ const advanceRealEstateStep = async () => {
           type: field.type || 'text',
           required: !!field.required,
         }));
-      const leads = sanitize(realEstateFieldsEditor.value.leads);
+      // Leads are fixed to name + phone + call notes — only persist the Site
+      // Visit (tickets) schema during onboarding.
       const tickets = sanitize(realEstateFieldsEditor.value.tickets);
-      const [leadsRes] = await Promise.all([
-        api.patch('/business-template/schemas/leads', { fields: leads }, { headers: authHeader() }),
-        api.patch('/business-template/schemas/tickets', { fields: tickets }, { headers: authHeader() }),
-      ]);
-      organizationBusinessTemplate.value = leadsRes.data;
+      const ticketsRes = await api.patch(
+        '/business-template/schemas/tickets', { fields: tickets }, { headers: authHeader() },
+      );
+      organizationBusinessTemplate.value = ticketsRes.data;
     } catch (err) {
       errorMsg.value = extractErrorMessage(err, 'Could not save field schemas.');
       realEstateFieldsEditor.value.isSaving = false;
@@ -5466,6 +5496,7 @@ provideDashboardState({
   businessTypeLabel,
   ticketsTabLabel,
   isRealEstateTemplate,
+  isClinicTemplate,
   ticketFieldTitle,
   ticketTitleLabel,
   ticketSingularLabel,
@@ -6139,7 +6170,7 @@ provideDashboardState({
             <strong>Default workspace fields</strong>
             <div class="schema-preview-grid">
               <span
-                v-for="field in (businessTypeOptions.find((option) => option.value === selectedBusinessType)?.schemas?.leads || []).slice(0, 4)"
+                v-for="field in (businessTypeOptions.find((option) => option.value === selectedBusinessType)?.schemas?.tickets || []).slice(0, 4)"
                 :key="field.key"
               >
                 {{ field.label }}
@@ -6359,24 +6390,9 @@ provideDashboardState({
               <button type="button" class="ghost-button" @click="addRealEstateField('tickets')">+ Add site-visit field</button>
             </div>
 
-            <div class="re-fields-block">
-              <h4>Lead fields</h4>
-              <p class="login-help compact">
-                Captured when the inbound agent qualifies a property inquiry.
-              </p>
-              <div v-for="(field, index) in realEstateFieldsEditor.leads" :key="`lead-${index}`" class="re-field-row">
-                <input v-model="field.label" type="text" placeholder="Field label" />
-                <input v-model="field.key" type="text" placeholder="snake_case_key" />
-                <select v-model="field.type">
-                  <option v-for="type in fieldTypes" :key="type" :value="type">{{ type }}</option>
-                </select>
-                <label class="re-field-required">
-                  <input v-model="field.required" type="checkbox" /> required
-                </label>
-                <button type="button" class="ghost-button compact danger" @click="removeRealEstateField('leads', index)">×</button>
-              </div>
-              <button type="button" class="ghost-button" @click="addRealEstateField('leads')">+ Add lead field</button>
-            </div>
+            <p class="login-help compact">
+              Leads are captured automatically as name + phone + call notes — no fields to configure.
+            </p>
 
             <div class="mfa-actions">
               <button type="button" class="ghost-button" :disabled="realEstateFieldsEditor.isSaving" @click="goBackRealEstateStep">← Back</button>
@@ -6724,9 +6740,19 @@ provideDashboardState({
                 <FileText :size="14" />
                 <span>{{ ticketsTabLabel }}</span>
               </button>
-              <button type="button" class="n-shell-nav__item" :class="{ 'is-active': currentPage === 'leads' }" @click="switchPage('leads')">
+              <button v-if="!isClinicTemplate" type="button" class="n-shell-nav__item" :class="{ 'is-active': currentPage === 'leads' }" @click="switchPage('leads')">
                 <UserPlus :size="14" />
                 <span>Leads</span>
+              </button>
+              <button
+                v-if="isClinicTemplate"
+                type="button"
+                class="n-shell-nav__item"
+                :class="{ 'is-active': currentPage === 'customers' }"
+                @click="switchPage('customers')"
+              >
+                <Users :size="14" />
+                <span>Customer base</span>
               </button>
               <button type="button" class="n-shell-nav__item" :class="{ 'is-active': currentPage === 'followups' }" @click="switchPage('followups')">
                 <Repeat :size="14" />

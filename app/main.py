@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from pathlib import Path
 
@@ -45,6 +46,7 @@ from app.api import (
     nokvo_one_members,
     nokvo_one_agents,
     nokvo_one_billing,
+    nokvo_one_customers,
     nokvo_one_outcomes,
     nokvo_one_projects,
     nokvo_one_requests,
@@ -64,6 +66,7 @@ app.include_router(nokvo_one_members.router, prefix="/api/nokvo-one/members", ta
 app.include_router(nokvo_one_agents.router, prefix="/api/nokvo-one/agents", tags=["nokvo-one-agents"])
 app.include_router(nokvo_one_projects.router, prefix="/api/nokvo-one/projects", tags=["nokvo-one-projects"])
 app.include_router(nokvo_one_services.router, prefix="/api/nokvo-one/services", tags=["nokvo-one-services"])
+app.include_router(nokvo_one_customers.router, prefix="/api/nokvo-one/customers", tags=["nokvo-one-customers"])
 app.include_router(
     nokvo_one_voice.router,
     prefix="/api/nokvo-one/agents",
@@ -99,9 +102,89 @@ if _AMBIENCE_DIR.exists():
     app.mount("/assets/audio", StaticFiles(directory=str(_AMBIENCE_DIR)), name="audio_assets")
 
 
+@app.get("/health/live")
+async def health_live():
+    """Pure liveness — the process is up and serving. No dependency I/O, so an
+    LB probe never flaps on a Redis/Qdrant blip and cycles the pod."""
+    return {"status": "ok"}
+
+
+# Per-dependency timeout (seconds). Kept short so /health stays fast even when a
+# backend is hung — a slow check is itself a failure signal.
+_HEALTH_CHECK_TIMEOUT = 2.0
+
+
+async def _check_redis() -> dict:
+    import time as _time
+    from app.services.llm_pool import LLMPool  # reuse the shared pool client
+    t0 = _time.monotonic()
+    client = LLMPool.client()
+    await asyncio.wait_for(client.ping(), timeout=_HEALTH_CHECK_TIMEOUT)
+    return {"ok": True, "latency_ms": round((_time.monotonic() - t0) * 1000, 1)}
+
+
+async def _check_postgres() -> dict:
+    import time as _time
+    from sqlalchemy import text
+    from app.db.session import AsyncSessionLocal
+    t0 = _time.monotonic()
+
+    async def _ping():
+        async with AsyncSessionLocal() as session:
+            await session.execute(text("SELECT 1"))
+
+    await asyncio.wait_for(_ping(), timeout=_HEALTH_CHECK_TIMEOUT)
+    return {"ok": True, "latency_ms": round((_time.monotonic() - t0) * 1000, 1)}
+
+
+async def _check_qdrant() -> dict:
+    import time as _time
+    from app.services.qdrant_service import QdrantService
+    t0 = _time.monotonic()
+    # QdrantClient is synchronous → run in a thread so it can't block the loop.
+    await asyncio.wait_for(
+        asyncio.to_thread(lambda: QdrantService._client().get_collections()),
+        timeout=_HEALTH_CHECK_TIMEOUT,
+    )
+    return {"ok": True, "latency_ms": round((_time.monotonic() - t0) * 1000, 1)}
+
+
 @app.get("/health")
 async def health_check():
-    return {"status": "ok"}
+    """Deep readiness check. Pings every backing service in parallel so a silent
+    dependency outage can't masquerade as a healthy service.
+
+    Redis and Postgres are on the request path → if either is down we return
+    **503** (not ready for traffic). Qdrant backs a retired RAG path, so its
+    failure is reported as ``degraded`` but does NOT fail the whole service."""
+    redis_res, pg_res, qdrant_res = await asyncio.gather(
+        _check_redis(), _check_postgres(), _check_qdrant(), return_exceptions=True
+    )
+
+    def _normalize(result) -> dict:
+        if isinstance(result, BaseException):
+            return {"ok": False, "error": f"{type(result).__name__}: {result}"}
+        return result
+
+    checks = {
+        "redis": _normalize(redis_res),
+        "postgres": _normalize(pg_res),
+        "qdrant": _normalize(qdrant_res),
+    }
+
+    critical_ok = checks["redis"]["ok"] and checks["postgres"]["ok"]
+    if not critical_ok:
+        status = "unhealthy"
+    elif not checks["qdrant"]["ok"]:
+        status = "degraded"
+    else:
+        status = "ok"
+
+    body = {"status": status, "checks": checks}
+    if not critical_ok:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=503, content=body)
+    return body
 
 
 # In-process retry-queue scheduler: drains pending_tool_retries on a 2-minute
@@ -125,6 +208,10 @@ from app.services.followup_scheduler import (  # noqa: E402
 # Prompt-observability seam. ``init_tracer`` reads the LangSmith config
 # and sets up the SDK (or no-ops cleanly when LANGSMITH_API_KEY is unset).
 from app.services.langsmith_tracer import init_tracer  # noqa: E402
+# OpenTelemetry trace-id correlation. ``init_otel`` sets up the SDK (or no-ops
+# when OTEL_ENABLED is false); ``install_log_correlation`` stamps the per-call
+# trace id onto every application log line.
+from app.services.otel_tracer import init_otel, install_log_correlation  # noqa: E402
 
 
 @app.on_event("startup")
@@ -132,9 +219,34 @@ async def _start_retry_scheduler() -> None:
     # Tracing first so any startup-side LLM call (rare, but possible if a
     # scheduler kicks one off in its first tick) is observed too.
     init_tracer()
+    init_otel()
+    # Runs after uvicorn has installed its log handlers so the trace field is
+    # injected into the real formatters (idempotent if called again).
+    install_log_correlation()
     start_scheduler()
     start_lead_sync_scheduler()
     start_followup_scheduler()
+    # Public-URL sanity: a wrong/unset PLIVO_WEBHOOK_BASE_URL is the #1 cause
+    # of "inbound calls don't connect" (Plivo can't reach the webhook or the
+    # media WS). Loud ERROR logs, never fatal — provisioning degrades anyway.
+    try:
+        import logging as _logging
+
+        from app.services.public_url import validate_public_base_url
+
+        for warning in validate_public_base_url():
+            _logging.getLogger("app.startup").error("PUBLIC-URL: %s", warning)
+    except Exception:
+        pass
+    # Webhook re-sync check: count tenants whose Plivo Application answer_url
+    # no longer matches the current base URL (stale after a URL change). Log
+    # only by default; mutate Plivo only when PLIVO_WEBHOOK_AUTOSYNC is on.
+    try:
+        from app.services.plivo_service import PlivoService
+
+        asyncio.get_event_loop().create_task(PlivoService.startup_webhook_sync_check())
+    except Exception:
+        pass
 
 
 @app.on_event("shutdown")

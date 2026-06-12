@@ -259,3 +259,74 @@ def test_safety_net_creates_lead_for_enquiry(monkeypatch) -> None:
     assert result["tool"] == "leads_create"
     assert "leads_create" in calls
     assert "qualify_lead_and_schedule_visit" not in calls
+
+
+def test_lead_args_are_minimal_name_and_phone_only() -> None:
+    """A lead is name + phone only. Even when the call captured BHK / budget /
+    area, those must NOT leak into the lead args — that context lives in the
+    post-call call notes (data.handoff_note), not as structured lead fields."""
+    args = NokvoOneVoicePipeline._lead_args_from_call_memory(
+        memory={
+            "name": "Nihar",
+            "phone": "+917569672503",
+            "bhk": "2BHK",
+            "budget": "50 lakhs",
+            "location_preference": "Gachibowli",
+        },
+        campaign_context={"from_phone": "+917569672503"},
+        outbound_context=None,
+    )
+    assert set(args.keys()) <= {"name", "phone"}
+    assert args.get("name") == "Nihar"
+    assert "property_type" not in args
+    assert "budget" not in args
+    assert "location" not in args
+
+
+def test_inbound_with_no_interest_keywords_still_creates_lead(monkeypatch) -> None:
+    """Lead overhaul: ANY inbound real-estate call that didn't book a site visit
+    becomes a lead (ANI + summary), even with no buying-interest keywords — we no
+    longer require a positive interest signal."""
+    cm = ConversationalMemory()
+    cm.facts[FACT_PHONE] = _fact(FACT_PHONE, "7569672503")
+    state = {"memory": cm.to_state_blob(), "tool_flow": {}, "call_surface": "voice_inbound"}
+    # Plain chatter — no property/pricing/BHK keywords at all.
+    history = [
+        {"role": "user", "content": "Hi, is this the builder office?"},
+        {"role": "assistant", "content": "Yes it is — how can I help?"},
+        {"role": "user", "content": "Okay, I was just checking. Thanks."},
+    ]
+    merged: dict = {}
+    calls = _patch_session(monkeypatch, state=state, history=history, merged=merged)
+
+    result = _run(
+        NokvoOneVoicePipeline.maybe_create_real_estate_lead_from_call(
+            _Tenant(), _FakeDB2(), "call-chatter",
+            campaign_context={"from_phone": "7569672503"},
+        )
+    )
+    assert result is not None
+    assert "leads_create" in calls
+    assert "qualify_lead_and_schedule_visit" not in calls
+
+
+def test_inbound_explicit_opt_out_does_not_create_lead(monkeypatch) -> None:
+    """Compliance guard: an explicit 'wrong number / don't call' caller must NOT
+    become a follow-up-eligible lead, even under the always-create rule."""
+    cm = ConversationalMemory()
+    cm.facts[FACT_PHONE] = _fact(FACT_PHONE, "7569672503")
+    state = {"memory": cm.to_state_blob(), "tool_flow": {}, "call_surface": "voice_inbound"}
+    history = [
+        {"role": "user", "content": "Who is this? This is the wrong number, don't call me again."},
+    ]
+    merged: dict = {}
+    calls = _patch_session(monkeypatch, state=state, history=history, merged=merged)
+
+    result = _run(
+        NokvoOneVoicePipeline.maybe_create_real_estate_lead_from_call(
+            _Tenant(), _FakeDB2(), "call-optout",
+            campaign_context={"from_phone": "7569672503"},
+        )
+    )
+    assert result is None
+    assert "leads_create" not in calls

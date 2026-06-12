@@ -1433,8 +1433,10 @@ def test_auto_creates_real_estate_lead_from_outbound_details_on_hangup(monkeypat
     assert calls and calls[0]["tool"] == "leads_create"
     assert calls[0]["arguments"]["name"] == "Nihar"
     assert calls[0]["arguments"]["phone"] == "7569672503"
-    assert calls[0]["arguments"]["property_type"] == "4 BHK"
-    assert calls[0]["arguments"]["budget"] == 1.2
+    # A lead is now name + phone + call notes only — structured facts (BHK,
+    # budget) are NOT captured as lead fields anymore.
+    assert "property_type" not in calls[0]["arguments"]
+    assert "budget" not in calls[0]["arguments"]
     assert merged_state and merged_state[0]["auto_lead_created"] is True
 
 
@@ -1505,7 +1507,11 @@ def test_auto_creates_real_estate_lead_from_inbound_inquiry_on_hangup(monkeypatc
     assert calls and calls[0]["tool"] == "leads_create"
     assert calls[0]["arguments"]["name"] == "Property inquiry"
     assert calls[0]["arguments"]["phone"] == "7569672503"
-    assert metadata_patches and metadata_patches[0]["requested_info"] == "RERA number"
+    # Structured facts (requested_info, etc.) are no longer stored on the lead —
+    # the call notes carry that context. The metadata patch only routes the lead
+    # (uncategorized inbound bucket).
+    assert metadata_patches and metadata_patches[0].get("uncategorized") is True
+    assert "requested_info" not in metadata_patches[0]
     assert merged_state and merged_state[0]["auto_lead_created"] is True
 
 

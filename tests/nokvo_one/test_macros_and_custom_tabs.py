@@ -222,7 +222,9 @@ def _run(coro):
     return asyncio.new_event_loop().run_until_complete(coro)
 
 
-def test_clinics_macro_writes_lead_and_appointment():
+def test_clinics_macro_writes_appointment_only_no_lead():
+    """Clinics have no leads: the booking macro writes ONE appointment record
+    (linked to the Customer base via related_customer_id) and never a lead."""
     db = _FakeDB()
     tool = MACRO_CATALOG["clinics"][0]
     args = {
@@ -240,11 +242,17 @@ def test_clinics_macro_writes_lead_and_appointment():
         )
     )
     assert result["ok"] is True
-    assert "lead_id" in result and "appointment_id" in result
+    assert "lead_id" not in result
+    assert "appointment_id" in result
+    # "id" points at the appointment so the flow layer / condenser target it.
+    assert result["id"] == result["appointment_id"]
     record_types = sorted(
         getattr(o, "record_type", None) for o in db.added if getattr(o, "record_type", None)
     )
-    assert "lead" in record_types and "appointment" in record_types
+    assert "lead" not in record_types and "appointment" in record_types
+    appt = next(o for o in db.added if getattr(o, "record_type", None) == "appointment")
+    assert "related_customer_id" in appt.data
+    assert "related_lead_id" not in appt.data
 
 
 def test_real_estate_macro_writes_site_visit_ticket_and_callback():

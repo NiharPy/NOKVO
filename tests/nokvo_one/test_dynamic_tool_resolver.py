@@ -38,14 +38,14 @@ def test_real_estate_catalog_contains_leads_and_tickets_only():
     assert "appointments_create" not in keys
 
 
-def test_clinics_catalog_contains_appointments_and_leads():
-    # Clinics are Appointments + Leads (the generic "tickets" support tab was
-    # dropped for clinics — appointments are the primary record).
+def test_clinics_catalog_contains_appointments_and_tickets_no_leads():
+    # Clinics are Tickets + Appointments. There is NO leads tab — every
+    # caller is captured in the Customer base instead, so no leads tools.
     keys = {t.key for t in resolve_catalog("clinics")}
-    for tab in ("leads", "appointments"):
+    for tab in ("tickets", "appointments"):
         for verb in ("create", "update", "get", "list", "search", "add_note", "set_status", "close"):
             assert f"{tab}_{verb}" in keys, f"missing {tab}_{verb}"
-    assert not any(k.startswith("tickets_") for k in keys), "clinics should not emit tickets tools"
+    assert not any(k.startswith("leads_") for k in keys), "clinics should not emit leads tools"
 
 
 def test_cross_cutting_tools_present_in_every_catalog():
@@ -73,18 +73,20 @@ def test_leads_create_schema_has_required_phone_for_real_estate():
 
 
 def test_schema_override_extends_field_schema():
+    # Use ecommerce as the fixture vertical — clinics no longer have a leads
+    # tab, so the override mechanics are exercised on a vertical that does.
     overrides = {
         "leads": [
             {"key": "name", "label": "Customer Name", "type": "text", "required": True},
             {"key": "phone", "label": "Phone", "type": "phone", "required": True},
-            {"key": "insurance_provider", "label": "Insurance", "type": "text", "required": True},
+            {"key": "loyalty_tier", "label": "Loyalty Tier", "type": "text", "required": True},
             {"key": "status", "label": "Status", "type": "select", "required": True},
         ]
     }
-    index = resolve_index("clinics", overrides)
+    index = resolve_index("ecommerce", overrides)
     create_schema = index["leads_create"].input_schema
-    assert "insurance_provider" in create_schema["properties"]
-    assert "insurance_provider" in create_schema["required"]
+    assert "loyalty_tier" in create_schema["properties"]
+    assert "loyalty_tier" in create_schema["required"]
 
 
 def test_set_status_uses_business_specific_enum():
@@ -109,8 +111,8 @@ def test_catalog_as_groups_orders_tabs_then_general():
     groups = catalog_as_groups("clinics")
     labels = [g["label"] for g in groups]
     # Tab groups appear before General, in business-template declared order.
-    # Clinics: Appointments + Leads (Tickets dropped).
-    assert set(labels[:2]) == {"Leads", "Appointments"}
+    # Clinics: Tickets + Appointments (no Leads — Customer base instead).
+    assert set(labels[:2]) == {"Tickets", "Appointments"}
     assert labels[-1] == "General"
 
 

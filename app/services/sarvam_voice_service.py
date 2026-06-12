@@ -390,10 +390,12 @@ class SarvamVoiceService:
         prosody_body: dict[str, Any] = {}
         if pace is not None:
             prosody_body["pace"] = max(0.3, min(3.0, float(pace)))
-        if pitch is not None:
-            prosody_body["pitch"] = max(-0.75, min(0.75, float(pitch)))
-        if loudness is not None:
-            prosody_body["loudness"] = max(0.1, min(3.0, float(loudness)))
+        # Bulbul V3 supports ONLY pace — it rejects pitch/loudness with a 400.
+        if model != "bulbul:v3":
+            if pitch is not None:
+                prosody_body["pitch"] = max(-0.75, min(0.75, float(pitch)))
+            if loudness is not None:
+                prosody_body["loudness"] = max(0.1, min(3.0, float(loudness)))
         body.update(prosody_body)
         client = SarvamVoiceService.http_client()
         response = await client.post(
@@ -477,10 +479,12 @@ class SarvamVoiceService:
         prosody_body: dict[str, Any] = {}
         if pace is not None:
             prosody_body["pace"] = max(0.3, min(3.0, float(pace)))
-        if pitch is not None:
-            prosody_body["pitch"] = max(-0.75, min(0.75, float(pitch)))
-        if loudness is not None:
-            prosody_body["loudness"] = max(0.1, min(3.0, float(loudness)))
+        # Bulbul V3 supports ONLY pace — it rejects pitch/loudness with a 400.
+        if model != "bulbul:v3":
+            if pitch is not None:
+                prosody_body["pitch"] = max(-0.75, min(0.75, float(pitch)))
+            if loudness is not None:
+                prosody_body["loudness"] = max(0.1, min(3.0, float(loudness)))
         body.update(prosody_body)
 
         sample_rate = int(provider_status.get("tts_sample_rate") or settings.SARVAM_TTS_SAMPLE_RATE)
@@ -522,6 +526,11 @@ class SarvamVoiceService:
                         payload = json.loads(line)
                     except (ValueError, TypeError):
                         continue
+                    # A streamed line can be a bare JSON scalar (e.g. a number
+                    # or "[DONE]"-like token) — guard so ``.get`` never hits an
+                    # int/str ('int' object has no attribute 'get').
+                    if not isinstance(payload, dict):
+                        continue
                     audios = payload.get("audios") or []
                     for audio_b64 in audios:
                         if not audio_b64:
@@ -539,7 +548,7 @@ class SarvamVoiceService:
                 if tail and tail != "[DONE]":
                     try:
                         payload = json.loads(tail)
-                        for audio_b64 in payload.get("audios") or []:
+                        for audio_b64 in (payload.get("audios") or []) if isinstance(payload, dict) else []:
                             if audio_b64:
                                 yield {
                                     "audio_base64": audio_b64,

@@ -86,9 +86,119 @@ class PlivoService:
         return str(app_id)
 
     @classmethod
+    async def update_application(
+        cls, app_id: str, *, answer_url: str | None = None, hangup_url: str | None = None
+    ) -> None:
+        """Re-point an existing Application's webhooks. The answer_url is set
+        once at provisioning; when the public base URL changes (domain move,
+        tunnel rotation) every tenant's Application goes stale and inbound
+        calls stop connecting — this is the repair path."""
+        auth = cls._master_auth()
+        body: dict[str, Any] = {}
+        if answer_url:
+            body["answer_url"] = answer_url
+            body["answer_method"] = "POST"
+        if hangup_url:
+            body["hangup_url"] = hangup_url
+            body["hangup_method"] = "POST"
+        if not body:
+            return
+        await cls._request("POST", f"{cls._base(auth[0])}/Application/{app_id}/", auth=auth, json_body=body)
+
+    @classmethod
     async def delete_application(cls, app_id: str) -> None:
         auth = cls._master_auth()
         await cls._request("DELETE", f"{cls._base(auth[0])}/Application/{app_id}/", auth=auth)
+
+    # ── webhook re-sync ──────────────────────────────────────────────────────────
+    @staticmethod
+    def expected_answer_url(link_id: str, base: str) -> str:
+        """The answer_url a tenant's Application SHOULD carry for ``base``."""
+        return f"{base.rstrip('/')}/api/nokvo-one/agents/plivo/voice/{link_id}"
+
+    @classmethod
+    def needs_webhook_resync(cls, plivo_cfg: dict | None, base: str) -> bool:
+        """True when the stored Application answer_url doesn't match what the
+        current public base URL implies. False when there's nothing to sync
+        (no application / no link_id / no base)."""
+        cfg = plivo_cfg or {}
+        if not cfg.get("application_id") or not cfg.get("link_id") or not base:
+            return False
+        expected = cls.expected_answer_url(str(cfg["link_id"]), base)
+        return (cfg.get("answer_url") or "") != expected
+
+    @classmethod
+    async def resync_tenant_webhook(cls, tenant_res: TenantResources, db, *, base: str) -> dict:
+        """Update one tenant's Plivo Application answer_url to match ``base``
+        and persist the new URL into provider_status.plivo."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        cfg = cls._plivo_config(tenant_res)
+        if not cfg.get("application_id") or not cfg.get("link_id"):
+            return {"tenant_id": tenant_res.tenant_id, "updated": False, "reason": "no_application"}
+        expected = cls.expected_answer_url(str(cfg["link_id"]), base)
+        if (cfg.get("answer_url") or "") == expected:
+            return {"tenant_id": tenant_res.tenant_id, "updated": False, "reason": "in_sync"}
+        await cls.update_application(str(cfg["application_id"]), answer_url=expected)
+        provider_status = dict(tenant_res.provider_status or {})
+        plivo_cfg = dict(provider_status.get("plivo") or {})
+        plivo_cfg["answer_url"] = expected
+        provider_status["plivo"] = plivo_cfg
+        tenant_res.provider_status = provider_status
+        try:
+            flag_modified(tenant_res, "provider_status")
+        except Exception:
+            pass  # non-ORM stand-ins (tests) have no instrumentation
+        db.add(tenant_res)
+        await db.commit()
+        return {"tenant_id": tenant_res.tenant_id, "updated": True, "answer_url": expected}
+
+    @classmethod
+    async def startup_webhook_sync_check(cls) -> None:
+        """Startup pass: count tenants with stale Application answer_urls and
+        log loudly. Mutates Plivo only when PLIVO_WEBHOOK_AUTOSYNC is enabled
+        (default off — tunnel rotation + multi-instance makes silent
+        auto-mutation risky; the superadmin resync endpoint is the primary
+        repair path). Best-effort: any failure is logged, never fatal."""
+        import logging
+
+        log = logging.getLogger(__name__)
+        try:
+            from sqlalchemy import select
+
+            from app.db.session import AsyncSessionLocal
+            from app.services.public_url import public_base_url
+
+            base = public_base_url()
+            if not base or "localhost" in base:
+                return
+            async with AsyncSessionLocal() as db:
+                rows = (await db.execute(select(TenantResources))).scalars().all()
+                stale = [
+                    tr for tr in rows
+                    if cls.needs_webhook_resync((tr.provider_status or {}).get("plivo"), base)
+                ]
+                if not stale:
+                    return
+                if not settings.PLIVO_WEBHOOK_AUTOSYNC:
+                    log.error(
+                        "PLIVO-WEBHOOKS: %d tenant(s) have a STALE Plivo Application answer_url "
+                        "(base is now %s) — inbound calls for them will NOT connect. Run "
+                        "POST /superadmin/tenants/plivo/resync-webhooks (or set "
+                        "PLIVO_WEBHOOK_AUTOSYNC=true).",
+                        len(stale), base,
+                    )
+                    return
+                for tr in stale:
+                    try:
+                        result = await cls.resync_tenant_webhook(tr, db, base=base)
+                        log.warning("PLIVO-WEBHOOKS: autosync %s", result)
+                    except Exception:
+                        log.exception(
+                            "PLIVO-WEBHOOKS: autosync failed for tenant %s", tr.tenant_id
+                        )
+        except Exception:
+            log.exception("PLIVO-WEBHOOKS: startup sync check failed")
 
     # ── numbers (DIDs) ───────────────────────────────────────────────────────────
     @classmethod

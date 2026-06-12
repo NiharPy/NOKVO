@@ -41,8 +41,11 @@ AGENT_MODE_SALE = "sale"
 AGENT_MODE_OBJECTION_HANDLING = "objection_handling"
 AGENT_MODE_SITE_VISIT = "site_visit"
 AGENT_MODE_OUTBOUND_LEAD = "outbound_lead"
+# Caller asked for the brochure on WhatsApp (also reachable on follow-up calls,
+# which run on this outbound FSM). Confirm number → system sends pre-set template.
+AGENT_MODE_WHATSAPP = "whatsapp"
 
-ALL_MODES = (AGENT_MODE_SALE, AGENT_MODE_OBJECTION_HANDLING, AGENT_MODE_SITE_VISIT, AGENT_MODE_OUTBOUND_LEAD)
+ALL_MODES = (AGENT_MODE_SALE, AGENT_MODE_OBJECTION_HANDLING, AGENT_MODE_SITE_VISIT, AGENT_MODE_OUTBOUND_LEAD, AGENT_MODE_WHATSAPP)
 
 
 # Campaign-objective codes. Adding a code is a backwards-compatible
@@ -176,6 +179,11 @@ def current_mode(
         return AGENT_MODE_OBJECTION_HANDLING
 
     tool_flow = ((state or {}).get("tool_flow") or {})
+    # Brochure-on-WhatsApp request → focused WHATSAPP mode, unless a booking/lead
+    # slot-fill is actively running (finish that first).
+    _flow_running = bool(tool_flow.get("active")) and not tool_flow.get("completed")
+    if (tool_flow.get("whatsapp_intent") or {}).get("kind") == "brochure" and not _flow_running:
+        return AGENT_MODE_WHATSAPP
     if not tool_flow.get("active") or tool_flow.get("completed"):
         return AGENT_MODE_SALE
     if tool_flow.get("deferred_for_kb"):
@@ -303,6 +311,23 @@ def mode_block_for_prompt(
             + objective_hint
         )
 
+    if mode == AGENT_MODE_WHATSAPP:
+        return _with_dont_invent(
+            "# AGENT MODE — WHATSAPP\n"
+            "The lead wants the project brochure on WhatsApp. To send it you need NOTHING from them "
+            "except the number they're already on — the system has it.\n"
+            "- Do NOT ask for their name. Do NOT ask for their email. Do NOT ask for or read back "
+            "their phone number — you ALREADY have it (the number on this call).\n"
+            "- Do NOT offer to email anything. WhatsApp only.\n"
+            "- Simply tell them the brochure is on its way to their WhatsApp — one warm sentence — "
+            "and let the system send the pre-set brochure message. Do NOT read the link aloud or "
+            "claim you sent it yourself.\n"
+            "- The only thing worth asking is WHICH project (when ambiguous). Never collect personal "
+            "details for a brochure, and do NOT create a lead just to send one.\n"
+            "- After confirming it's on the way, steer back toward booking a site visit."
+            + objective_hint
+        )
+
     # Default — sale mode.
     return _with_dont_invent(
         "# AGENT MODE — SALE\n"
@@ -363,6 +388,7 @@ __all__ = (
     "AGENT_MODE_OBJECTION_HANDLING",
     "AGENT_MODE_SITE_VISIT",
     "AGENT_MODE_OUTBOUND_LEAD",
+    "AGENT_MODE_WHATSAPP",
     "ALL_MODES",
     "OBJECTIVE_SITE_VISIT",
     "OBJECTIVE_LEAD",

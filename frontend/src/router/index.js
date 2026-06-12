@@ -12,6 +12,7 @@ import SuperAdminDashboard from '../components/SuperAdminDashboard.vue';
 const DashboardView = () => import('../views/DashboardView.vue');
 const TicketsView = () => import('../views/TicketsView.vue');
 const LeadsView = () => import('../views/LeadsView.vue');
+const CustomerBaseView = () => import('../views/CustomerBaseView.vue');
 const FollowUpPipeline = () => import('../views/FollowUpPipeline.vue');
 const AppointmentsView = () => import('../views/AppointmentsView.vue');
 const ProjectsView = () => import('../views/ProjectsView.vue');
@@ -28,6 +29,7 @@ const dashboardChildren = [
   { path: 'home', component: DashboardView, name: 'dash-home', meta: { pageKey: 'dashboard' } },
   { path: 'tickets', component: TicketsView, name: 'dash-tickets', meta: { pageKey: 'tickets' } },
   { path: 'leads', component: LeadsView, name: 'dash-leads', meta: { pageKey: 'leads' } },
+  { path: 'customers', component: CustomerBaseView, name: 'dash-customers', meta: { pageKey: 'customers' } },
   { path: 'followups', component: FollowUpPipeline, name: 'dash-followups', meta: { pageKey: 'followups' } },
   { path: 'appointments', component: AppointmentsView, name: 'dash-appointments', meta: { pageKey: 'appointments' } },
   { path: 'projects', component: ProjectsView, name: 'dash-projects', meta: { pageKey: 'projects' } },

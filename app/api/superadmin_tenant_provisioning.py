@@ -817,3 +817,63 @@ async def suspend_nokvo_one_org(
     db.add(org)
     await db.commit()
     return {"id": str(org.id), "status": org.status}
+
+
+@router.post("/plivo/resync-webhooks")
+async def resync_plivo_webhooks(
+    dry_run: bool = False,
+    db: AsyncSession = Depends(get_db),
+    current_user: SuperAdminUser = Depends(RequireRole(["founder", "engineering"])),
+):
+    """Re-point every tenant's Plivo Application answer_url at the CURRENT
+    public base URL (PLIVO_WEBHOOK_BASE_URL). The answer_url is set once at
+    provisioning; after a domain/tunnel change every Application is stale and
+    inbound calls stop connecting — this is the repair path.
+
+    ``?dry_run=true`` reports which tenants WOULD be updated without touching
+    Plivo or the database.
+    """
+    from app.services.plivo_service import PlivoService
+    from app.services.public_url import public_base_url
+
+    base = public_base_url()
+    if not base or "localhost" in base:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Public base URL '{base}' is not externally reachable — set PLIVO_WEBHOOK_BASE_URL first.",
+        )
+
+    rows = (await db.execute(select(TenantResources))).scalars().all()
+    checked = 0
+    updated: list[dict] = []
+    failed: list[dict] = []
+    skipped = 0
+    for tr in rows:
+        plivo_cfg = (tr.provider_status or {}).get("plivo") or {}
+        if not plivo_cfg.get("application_id"):
+            skipped += 1
+            continue
+        checked += 1
+        if not PlivoService.needs_webhook_resync(plivo_cfg, base):
+            continue
+        if dry_run:
+            updated.append({
+                "tenant_id": tr.tenant_id,
+                "updated": False,
+                "dry_run": True,
+                "answer_url_stored": plivo_cfg.get("answer_url"),
+                "answer_url_expected": PlivoService.expected_answer_url(str(plivo_cfg.get("link_id")), base),
+            })
+            continue
+        try:
+            updated.append(await PlivoService.resync_tenant_webhook(tr, db, base=base))
+        except Exception as exc:  # noqa: BLE001 — report per-tenant, keep going
+            failed.append({"tenant_id": tr.tenant_id, "error": str(exc)[:300]})
+    return {
+        "base_url": base,
+        "dry_run": dry_run,
+        "checked": checked,
+        "skipped_no_application": skipped,
+        "updated": updated,
+        "failed": failed,
+    }

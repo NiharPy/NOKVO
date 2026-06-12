@@ -1012,23 +1012,32 @@ class PredefinedToolsService:
         elif spoken_service:
             service_name = spoken_service
 
-        lead = NokvoOneToolRecord(
-            id=uuid.uuid4(),
-            organization_id=org_id,
-            created_by_user_id=user_id,
-            record_type="lead",
-            status="scheduled",
-            data={
-                "patient_name": args["patient_name"],
-                "phone": args["phone"],
-                "email": args.get("email"),
-                "care_need": args["reason"],
-                "preferred_doctor": args.get("preferred_doctor"),
-                "source": args.get("source"),
-            },
-            contact_phone=args["phone"],
-            contact_email=args.get("email"),
-        )
+        # Clinics have no leads: instead of a lead record, ensure the caller
+        # exists in the Customer base (no counter bump — call-end teardown
+        # owns those) and link the appointment via related_customer_id so the
+        # Customer profile shows appointment history.
+        customer_id: uuid.UUID | None = None
+        try:
+            from app.models.tenant_resources import TenantResources
+            from app.services.customer_base_service import ensure_customer
+
+            tenant_id_row = await db.execute(
+                select(TenantResources.tenant_id).where(
+                    TenantResources.organization_id == org_id
+                )
+            )
+            macro_tenant_id = tenant_id_row.scalars().first()
+            if macro_tenant_id:
+                customer_id = await ensure_customer(
+                    db,
+                    tenant_id=macro_tenant_id,
+                    phone=str(args["phone"]),
+                    name=args.get("patient_name"),
+                    commit=False,
+                )
+        except Exception:
+            logger.exception("NOKVO-TOOLS: customer link for appointment failed")
+
         appt = NokvoOneToolRecord(
             id=uuid.uuid4(),
             organization_id=org_id,
@@ -1044,12 +1053,11 @@ class PredefinedToolsService:
                 "department": args.get("department"),
                 "appointment_time": args["appointment_time"],
                 "reason": args["reason"],
-                "related_lead_id": str(lead.id),
+                "related_customer_id": str(customer_id) if customer_id else None,
             },
             contact_phone=args["phone"],
             contact_email=args.get("email"),
         )
-        db.add(lead)
         db.add(appt)
         await db.flush()
         appointment_at = _parse_tool_datetime(args["appointment_time"], field_name="appointment_time")
@@ -1068,7 +1076,7 @@ class PredefinedToolsService:
                 "appointment_time": args["appointment_time"],
                 "appointment_start": appointment_at.isoformat(),
                 "reason": args["reason"],
-                "related_lead_id": str(lead.id),
+                "related_customer_id": str(customer_id) if customer_id else None,
                 "assignment_source": tool.key,
                 "service": service_name,
             },
@@ -1077,7 +1085,11 @@ class PredefinedToolsService:
         scheduled_time = (assignment or {}).get("scheduled_time")
         return {
             "ok": True,
-            "lead_id": str(lead.id),
+            # "id" = the appointment record (the macro's primary artifact) so
+            # the flow layer's created_record_id and the post-call condenser
+            # target the appointment now that no lead row is written.
+            "id": str(appt.id),
+            "customer_id": str(customer_id) if customer_id else None,
             "appointment_id": str(appt.id),
             "appointment_status": appt.status,
             "assignment": assignment,
@@ -1194,6 +1206,43 @@ class PredefinedToolsService:
             },
         )
         scheduled_visit = (assignment or {}).get("scheduled_time") or args.get("visit_at")
+
+        # Auto-send the project LOCATION on WhatsApp — but ONLY here, on a
+        # confirmed site-visit booking. Best-effort: a WhatsApp/Plivo failure
+        # must never fail the booking. No-op unless the project has a configured
+        # location template and WhatsApp is enabled for the tenant.
+        location_whatsapp_sent = False
+        if matched is not None and args.get("phone"):
+            try:
+                from app.services.real_estate_project_service import project_whatsapp_location
+                from app.services.whatsapp_service import WhatsAppService
+
+                loc_cfg = project_whatsapp_location(matched)
+                if loc_cfg is not None:
+                    send_res = await WhatsAppService.send_for_org(
+                        db,
+                        org_id,
+                        to_number=args["phone"],
+                        template_name=loc_cfg["template"],
+                        language=loc_cfg["language"],
+                        body_params=loc_cfg["body_params"],
+                        media_url=loc_cfg["media_url"],
+                    )
+                    location_whatsapp_sent = bool(send_res.get("ok"))
+                    if location_whatsapp_sent:
+                        # Audit marker on the site-visit record so the Site
+                        # Visits tab can show "location sent".
+                        from sqlalchemy.orm.attributes import flag_modified
+
+                        data = dict(site_visit.data or {})
+                        data["location_sent"] = True
+                        data["location_sent_at"] = datetime.now(timezone.utc).isoformat()
+                        site_visit.data = data
+                        flag_modified(site_visit, "data")
+                        await db.flush()
+            except Exception:
+                logger.debug("NOKVO-WA: booking location send failed", exc_info=True)
+
         return {
             "ok": True,
             "id": str(site_visit.id),
@@ -1210,6 +1259,7 @@ class PredefinedToolsService:
             "assignment_status": assignment.get("assignment_status") if assignment else None,
             "project_id": project_id_str,
             "project_name": project_name_str,
+            "location_whatsapp_sent": location_whatsapp_sent,
         }
 
     @staticmethod
@@ -1284,12 +1334,40 @@ class PredefinedToolsService:
         if brochure_url:
             data["brochure_url"] = brochure_url
 
+        # Try to ACTUALLY send the brochure on WhatsApp using the project's
+        # pre-set (approved) template. Best-effort: on no-config / failure we
+        # fall back to the existing "queue for the team" behaviour so nothing
+        # regresses where WhatsApp isn't set up.
+        whatsapp_sent = False
+        if matched is not None and channel == "whatsapp" and args.get("phone"):
+            try:
+                from app.services.real_estate_project_service import project_whatsapp_brochure
+                from app.services.whatsapp_service import WhatsAppService
+
+                broc_cfg = project_whatsapp_brochure(matched)
+                if broc_cfg is not None:
+                    send_res = await WhatsAppService.send_for_org(
+                        db,
+                        org_id,
+                        to_number=args["phone"],
+                        template_name=broc_cfg["template"],
+                        language=broc_cfg["language"],
+                        body_params=broc_cfg["body_params"],
+                        media_url=broc_cfg["media_url"],
+                    )
+                    whatsapp_sent = bool(send_res.get("ok"))
+            except Exception:
+                logger.debug("NOKVO-WA: brochure send failed", exc_info=True)
+
+        # When the brochure was actually delivered, the record is a sent log,
+        # not a pending team task.
+        data["dispatch"] = "sent_whatsapp" if whatsapp_sent else "queued_for_team"
         record = NokvoOneToolRecord(
             id=uuid.uuid4(),
             organization_id=org_id,
             created_by_user_id=user_id,
             record_type="callback",
-            status="scheduled",
+            status="completed" if whatsapp_sent else "scheduled",
             data=data,
             contact_phone=args["phone"],
         )
@@ -1302,7 +1380,8 @@ class PredefinedToolsService:
             "project_name": project_name_str,
             "brochure_on_file": bool(brochure_url),
             "channel": channel,
-            "dispatch": "queued_for_team",
+            "sent": whatsapp_sent,
+            "dispatch": "sent_whatsapp" if whatsapp_sent else "queued_for_team",
         }
 
     @staticmethod
@@ -1647,7 +1726,7 @@ async def _record_invocation(
     result: dict[str, Any],
 ) -> None:
     result_record_id: uuid.UUID | None = None
-    for key in ("id", "lead_id", "ticket_id", "callback_id", "call_log_id", "draft_id", "escalation_id"):
+    for key in ("id", "lead_id", "appointment_id", "ticket_id", "callback_id", "call_log_id", "draft_id", "escalation_id"):
         if isinstance(result.get(key), str):
             try:
                 result_record_id = uuid.UUID(result[key])

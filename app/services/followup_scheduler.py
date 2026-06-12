@@ -67,6 +67,13 @@ async def _drain_once() -> None:
         ) as is_leader:
             if not is_leader:
                 return
+            # Reconcile rows whose status webhook never arrived BEFORE the
+            # drain so a stuck lead/customer can be re-scheduled by the admin
+            # instead of sitting in_flight forever.
+            try:
+                await _reconcile_in_flight()
+            except Exception:
+                logger.exception("Follow-up in-flight reconciliation failed")
             async with AsyncSessionLocal() as db:
                 rows = await FollowupSchedulerService.next_due(
                     limit=FOLLOWUP_DRAIN_LIMIT, db=db
@@ -89,6 +96,82 @@ async def _drain_once() -> None:
         logger.exception("Follow-up drain pass failed")
 
 
+async def _reconcile_in_flight() -> None:
+    """Close out in_flight rows whose status webhook never arrived.
+
+    Two paths per timed-out row:
+      1. The webhook arrived but raced row creation — `plivo_outbound_status`
+         stashed it under ``plivo:orphan-status:{call_link_id}``. Replay it
+         through the normal handler so the row completes properly.
+      2. Nothing arrived → mark the row failed with reason="webhook_timeout"
+         so the chip reads honestly and the admin can re-schedule.
+    """
+    from datetime import datetime, timezone
+
+    from app.models.lead_followup_schedule import FollowupStatus as FS
+
+    timeout_minutes = int(settings.FOLLOWUP_INFLIGHT_TIMEOUT_MINUTES or 30)
+    now = datetime.now(timezone.utc)
+    async with AsyncSessionLocal() as db:
+        rows = (
+            (
+                await db.execute(
+                    select(LeadFollowupSchedule)
+                    .where(LeadFollowupSchedule.status == FS.in_flight)
+                    .limit(50)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        stale = [
+            row for row in rows
+            if FollowupSchedulerService.is_webhook_timed_out(row, now, timeout_minutes)
+        ]
+        if not stale:
+            return
+        for row in stale:
+            orphan_payload = None
+            if row.placed_call_id:
+                try:
+                    from app.services.agent_session_store import AgentSessionStore
+
+                    raw = await AgentSessionStore.client().get(
+                        f"plivo:orphan-status:{row.placed_call_id}"
+                    )
+                    if raw:
+                        import json as _json
+
+                        orphan_payload = _json.loads(raw)
+                except Exception:
+                    orphan_payload = None
+            if orphan_payload is not None:
+                try:
+                    from app.services.outbound_campaign_service import OutboundCampaignService
+
+                    campaign, contact = await OutboundCampaignService.get_by_call_link_id(
+                        row.placed_call_id, db
+                    )
+                    if contact is not None:
+                        await OutboundCampaignService.handle_call_status(
+                            campaign, row.placed_call_id, "call.hangup", orphan_payload, db,
+                            followup_contact=contact if contact.get("is_followup") else None,
+                        )
+                        logger.info(
+                            "Follow-up %s reconciled from orphan status event", row.id
+                        )
+                        continue
+                except Exception:
+                    logger.exception("Orphan-status replay failed for row %s", row.id)
+            await FollowupSchedulerService.mark_failed(
+                row=row, reason="webhook_timeout", db=db
+            )
+            logger.warning(
+                "Follow-up %s stuck in_flight > %sm with no status webhook — marked failed",
+                row.id, timeout_minutes,
+            )
+
+
 async def _dispatch_one(row_id: uuid.UUID) -> None:
     """Place exactly one follow-up call. Re-loads the row + lead + campaign
     so any state change between enqueue and now (opt-out flip, manual
@@ -99,11 +182,29 @@ async def _dispatch_one(row_id: uuid.UUID) -> None:
         if row is None or row.status != FollowupStatus.pending:
             return
 
-        # Re-load lead and verify caps.
-        lead = await db.get(OutgoingLead, row.lead_id)
-        if lead is None or lead.consent_status == LeadConsentStatus.revoked:
+        # Re-load the target and verify caps. Two target styles: a lead
+        # (real-estate campaign path) or a customer (clinic manual path).
+        lead = None
+        customer = None
+        if row.lead_id is not None:
+            lead = await db.get(OutgoingLead, row.lead_id)
+            if lead is None or lead.consent_status == LeadConsentStatus.revoked:
+                await FollowupSchedulerService.mark_failed(
+                    row=row, reason="lead_revoked_or_missing", db=db
+                )
+                return
+        elif row.customer_id is not None:
+            from app.models.customer_base import CustomerBase
+
+            customer = await db.get(CustomerBase, row.customer_id)
+            if customer is None or customer.opt_out:
+                await FollowupSchedulerService.mark_failed(
+                    row=row, reason="customer_opted_out_or_missing", db=db
+                )
+                return
+        else:
             await FollowupSchedulerService.mark_failed(
-                row=row, reason="lead_revoked_or_missing", db=db
+                row=row, reason="no_target", db=db
             )
             return
 
@@ -136,7 +237,10 @@ async def _dispatch_one(row_id: uuid.UUID) -> None:
             return
 
         # Pick a callable phone number.
-        phone = lead.phone_e164 or lead.phone_raw
+        if lead is not None:
+            phone = lead.phone_e164 or lead.phone_raw
+        else:
+            phone = customer.phone_e164
         if not phone:
             await FollowupSchedulerService.mark_failed(
                 row=row, reason="lead_phone_missing", db=db
@@ -146,7 +250,9 @@ async def _dispatch_one(row_id: uuid.UUID) -> None:
         # Generate a fresh call_link_id and place the call. The webhook
         # extension (task 36) resolves this id back to this row.
         call_link_id = str(uuid.uuid4())
-        base = (settings.AGENT_PUBLIC_BASE_URL or "http://localhost:8000").rstrip("/")
+        from app.services.public_url import public_base_url
+
+        base = public_base_url()
         prefix = "/api/nokvo-one/agents"
         answer_url = f"{base}{prefix}/plivo/outbound-answer/{call_link_id}"
         status_callback = f"{base}{prefix}/plivo/outbound-status/{call_link_id}"
@@ -171,8 +277,10 @@ async def _dispatch_one(row_id: uuid.UUID) -> None:
             row=row, placed_call_id=call_link_id, db=db
         )
         logger.info(
-            "Follow-up call placed: row=%s lead=%s attempt=%s",
-            row.id, lead.id, row.attempts,
+            "Follow-up call placed: row=%s target=%s attempt=%s",
+            row.id,
+            f"lead:{lead.id}" if lead is not None else f"customer:{customer.id}",
+            row.attempts,
         )
 
 

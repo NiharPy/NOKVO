@@ -207,7 +207,10 @@ class Settings(BaseSettings):
     AZURE_TENANT_ID: str = ""
     AZURE_CLIENT_ID: str = ""
     AZURE_CLIENT_SECRET: str = ""
-    ALLOW_AZURE_CLIENT_SECRET_FALLBACK: bool = True
+    # Secure-by-default: never silently fall back to a long-lived client secret when
+    # managed identity is unavailable. Set True explicitly only in a local/dev env
+    # that genuinely needs the secret fallback.
+    ALLOW_AZURE_CLIENT_SECRET_FALLBACK: bool = False
     AZURE_PREFER_MANAGED_IDENTITY: bool = False
     AZURE_SHARED_STORAGE_ACCOUNT: str = ""
     AZURE_SHARED_STORAGE_CONTAINER: str = "nokvo-tenants"
@@ -258,7 +261,30 @@ class Settings(BaseSettings):
     # request host when empty). e.g. https://api.nokvo.example
     PLIVO_WEBHOOK_BASE_URL: str = ""
     PLIVO_NUMBER_COUNTRY: str = "IN"
-    PLIVO_DEFAULT_SAMPLE_RATE: int = 8000
+    # X-Plivo-Signature-V2 validation on the Plivo webhook endpoints.
+    # off | warn | enforce. Default "warn": log mismatches (with which token
+    # matched) without rejecting, so the first real call confirms whether
+    # Plivo signs with the master or subaccount token before we enforce.
+    # Auto-off when PLIVO_AUTH_TOKEN is unset.
+    PLIVO_VALIDATE_SIGNATURES: str = "warn"
+    # Startup auto-repair of stale Application answer_urls. Default off —
+    # the superadmin resync endpoint is the deliberate repair path; silent
+    # mutation on boot is risky with rotating tunnels / multiple instances.
+    PLIVO_WEBHOOK_AUTOSYNC: bool = False
+    # A follow-up row stuck in_flight (status webhook never arrived) is
+    # failed by the reconciliation sweep after this many minutes.
+    FOLLOWUP_INFLIGHT_TIMEOUT_MINUTES: int = 30
+    # Request 16 kHz from Plivo's <Stream> (its highest L16 rate): preserves HD/VoLTE
+    # audio when present, and matches Sarvam STT's native 16 kHz input so there's no
+    # lossy 8k→16k upsample. Better recognition, especially for spoken digits.
+    PLIVO_DEFAULT_SAMPLE_RATE: int = 16000
+    # WhatsApp (Plivo WhatsApp Business API). Off by default → every send is a
+    # no-op until an operator enables it. The PRODUCTION sender number is per
+    # tenant (``provider_status.plivo.whatsapp_number``, bound to that tenant's
+    # subaccount/WABA); PLIVO_WHATSAPP_FROM is ONLY a fallback for local/master
+    # testing and must never be relied on as a shared multi-tenant sender.
+    PLIVO_WHATSAPP_ENABLED: bool = False
+    PLIVO_WHATSAPP_FROM: str = ""
     TELNYX_API_KEY: str = ""
     TELNYX_BASE_URL: str = "https://api.telnyx.com/v2"
     TELNYX_APP_ID: str = ""
@@ -286,7 +312,16 @@ class Settings(BaseSettings):
     AGENT_LLM_STREAM_TOTAL_MS: int = 6000 # Max total LLM stream wait
     AGENT_TOPIC_CONTINUITY_OVERLAP: float = 0.35  # Word overlap to reuse last chunks
     AGENT_MAX_FIRST_SENTENCE_CHARS: int = 110     # Force TTS dispatch after this many chars
-    VOICE_EOU_DEBOUNCE_MS: int = 900      # Silence before firing a streaming-STT turn
+    # Inbound automatic gain control before STT. Forwarded telephony audio is
+    # quiet/variable-level; AGC boosts it toward a target so Sarvam STT resolves
+    # speech cleanly. Disable instantly via env if it ever regresses latency.
+    VOICE_STT_AGC_ENABLED: bool = True
+    VOICE_STT_AGC_TARGET_DBFS: float = -20.0
+    # RNNoise speech denoise on the caller→STT path (pyrnnoise). Best-effort:
+    # when the library is missing or fails to import, the feature disables
+    # itself with one warning and audio passes through untouched.
+    VOICE_STT_DENOISE_ENABLED: bool = True
+    VOICE_EOU_DEBOUNCE_MS: int = 1200     # Silence before firing a streaming-STT turn (longer = fewer mid-sentence cuts on telephony pauses)
     VOICE_EOU_CONTINUATION_BONUS_MS: int = 1100  # Extra wait when speech likely continues
     VOICE_FIRST_SENTENCE_TIMEOUT_MS: int = 1800  # Speak a short hold if LLM has not yielded. The
     # typical first-sentence latency for the GPT-4 family ~900-1200ms, so the older 900ms threshold
@@ -379,6 +414,17 @@ class Settings(BaseSettings):
     # /runs/* writes 403 even though reads succeed. Blank is fine for a
     # workspace-scoped key (the tenant is baked into the key).
     LANGSMITH_WORKSPACE_ID: str = ""
+
+    # ── OpenTelemetry trace-id correlation (voice hot path) ────────────────
+    # Off by default. When enabled, a real per-call trace id is generated and
+    # stamped on every log line + persisted on call_costs + cross-linked into
+    # the LangSmith run. The exporter is separate: "none" generates ids without
+    # shipping spans (no collector needed), "console" prints them, "otlp" ships
+    # to OTEL_EXPORTER_OTLP_ENDPOINT.
+    OTEL_ENABLED: bool = False
+    OTEL_EXPORTER: str = "none"  # none | console | otlp
+    OTEL_EXPORTER_OTLP_ENDPOINT: str = ""
+    OTEL_SERVICE_NAME: str = "nokvo-one"
 
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=True, extra="ignore")
 

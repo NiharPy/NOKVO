@@ -30,10 +30,15 @@ def _common_patches(blob=None, qdrant=None, redis=None):
     )
     qdrant = qdrant or AsyncMock(return_value="qd")
     redis = redis or AsyncMock(return_value="ns")
+    from app.core.config import settings as _settings
     return [
         patch("app.services.nokvo_one_provisioning_service.AzureBlobService.provision_blob_storage", blob),
         patch("app.services.nokvo_one_provisioning_service.QdrantService.provision_collection", qdrant),
         patch("app.services.nokvo_one_provisioning_service.RedisTenantService.provision_redis", redis),
+        # Force the Plivo telephony step to degrade to a pending slot (NO real Plivo
+        # API calls during tests — otherwise it creates real subaccounts).
+        patch.object(_settings, "PLIVO_AUTH_ID", ""),
+        patch.object(_settings, "PLIVO_WEBHOOK_BASE_URL", ""),
     ]
 
 

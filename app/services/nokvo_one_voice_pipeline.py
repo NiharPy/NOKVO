@@ -2571,6 +2571,30 @@ class NokvoOneVoicePipeline:
             return None
 
     @staticmethod
+    @staticmethod
+    def _real_estate_opt_out(
+        *,
+        memory: dict[str, Any],
+        history: list[dict[str, str]],
+    ) -> bool:
+        """True when the caller explicitly opted out — wrong number / do-not-call
+        / not interested. Such callers must NEVER become a follow-up-eligible
+        lead (DND/TRAI). Checks both the extracted objection and recent caller
+        utterances."""
+        blob = str(memory.get("objection") or "").lower()
+        user_text = " ".join(
+            str(turn.get("content") or "")
+            for turn in (history or [])[-12:]
+            if turn.get("role") == "user"
+        ).lower()
+        return bool(
+            re.search(
+                r"\b(not interested|don'?t call|do not call|do-not-call|remove me|"
+                r"wrong number|stop calling|take me off|unsubscribe)\b",
+                f"{blob} {user_text}",
+            )
+        )
+
     def _real_estate_interest_signal(
         *,
         memory: dict[str, Any],
@@ -2639,21 +2663,13 @@ class NokvoOneVoicePipeline:
             or "Property inquiry"
         )
         phone = NokvoOneVoicePipeline._phone_from_call_context(memory, campaign_context)
+        # A lead is name + phone only. The rest of the conversation (BHK, budget,
+        # area, intent) is captured in the post-call "call notes"
+        # (data.handoff_note), not as structured lead fields.
         args: dict[str, Any] = {
             "name": str(name).strip()[:200] or "Property inquiry",
             "phone": phone,
         }
-        if memory.get("bhk"):
-            args["property_type"] = str(memory["bhk"])
-        elif outbound_context and outbound_context.pitch_summary:
-            bhk_match = re.search(r"\b([1-6]\s*BHK)\b", outbound_context.pitch_summary, re.IGNORECASE)
-            if bhk_match:
-                args["property_type"] = bhk_match.group(1).upper().replace(" ", " ")
-        budget = NokvoOneVoicePipeline._budget_number(memory.get("budget"))
-        if budget is not None:
-            args["budget"] = budget
-        if memory.get("location_preference"):
-            args["location"] = str(memory["location_preference"])
         return {key: value for key, value in args.items() if value not in (None, "")}
 
     @staticmethod
@@ -2819,7 +2835,18 @@ class NokvoOneVoicePipeline:
             history,
         )
         call_surface = str(state.get("call_surface") or "")
-        if not NokvoOneVoicePipeline._real_estate_interest_signal(
+        # Lead overhaul: ANY inbound real-estate call that didn't book a site
+        # visit becomes a lead (ANI + call summary + name-if-known). We no longer
+        # require a positive "interest" signal — the caller engaging at all is
+        # enough. The ONE hard exclusion is an explicit opt-out (wrong number /
+        # do-not-call / not interested): turning that into a follow-up-eligible
+        # lead would be a DND/TRAI violation.
+        if NokvoOneVoicePipeline._real_estate_opt_out(memory=memory, history=history):
+            return None
+        # Outbound keeps its engagement gate (don't lead-ify a call where only
+        # the opener ran — the outbound outcome classifier owns those). Inbound
+        # always proceeds.
+        if call_surface == "voice_outbound" and not NokvoOneVoicePipeline._real_estate_interest_signal(
             memory=memory,
             history=history,
             call_surface=call_surface,
@@ -2896,6 +2923,11 @@ class NokvoOneVoicePipeline:
         if not args.get("phone") and call_surface == "voice_inbound":
             from app.models.nokvo_one_tool_record import NokvoOneToolRecord
 
+            # A lead is intentionally minimal: name + phone + the post-call
+            # "call notes" (data.handoff_note, written by the condenser at end of
+            # call). We deliberately do NOT persist structured facts (budget,
+            # purpose, timeline, objection, property type, location) — the notes
+            # carry that context in prose. Only name + routing markers here.
             direct_data: dict[str, Any] = {
                 "source": "voice_inbound",
                 "auto_created_from_call": True,
@@ -2904,14 +2936,6 @@ class NokvoOneVoicePipeline:
                 "no_phone": True,
                 "call_id": call_id,
                 "name": str(args.get("name") or "Property inquiry"),
-                "requested_info": memory.get("requested_info"),
-                "purpose": memory.get("purpose"),
-                "timeline": memory.get("timeline"),
-                "visit_preference": memory.get("visit_preference"),
-                "objection": memory.get("objection"),
-                "budget_label": memory.get("budget"),
-                "property_type": args.get("property_type"),
-                "location": args.get("location"),
             }
             direct_data = {k: v for k, v in direct_data.items() if v not in (None, "")}
             record = NokvoOneToolRecord(
@@ -2963,36 +2987,6 @@ class NokvoOneVoicePipeline:
         await db.commit()
         lead_id = result.get("id") or result.get("lead_id")
 
-        # An abandoned site-visit booking leaves partial slots in tool_flow.
-        # Carry the project + any partial date/time into the lead so a warm
-        # prospect (who started booking) isn't indistinguishable from a cold
-        # enquiry. Project also falls back to conversational memory.
-        collected = dict(tool_flow.get("collected") or {})
-
-        def _first_collected(predicate) -> Any:
-            for key, value in collected.items():
-                if value in (None, "") or not predicate(key):
-                    continue
-                return value
-            return None
-
-        project_hint = _first_collected(lambda k: "project" in k.lower()) or collected.get("property_id")
-        if not project_hint:
-            try:
-                from app.services.conversational_memory import (
-                    ConversationalMemory as _CM,
-                    FACT_PROPERTY as _FACT_PROPERTY,
-                )
-
-                _mem = _CM.from_state_blob((state or {}).get("memory") or {})
-                _fact = _mem.facts.get(_FACT_PROPERTY)
-                project_hint = _fact.value if _fact else None
-            except Exception:
-                project_hint = None
-        partial_visit_date = _first_collected(lambda k: "date" in k.lower())
-        partial_visit_time = _first_collected(lambda k: "time" in k.lower())
-        booking_abandoned = bool(project_hint or partial_visit_date or partial_visit_time)
-
         # Inbound real-estate FSM terminal state. Caller showed interest
         # (asked questions, mentioned BHK/budget/location, maybe even
         # started a booking but didn't confirm) and hung up. By spec, the
@@ -3003,20 +2997,15 @@ class NokvoOneVoicePipeline:
         # their own outcome classifier that decides interested vs
         # partial vs not_interested for tab routing.
         is_inbound = (call_surface == "voice_inbound")
+        # A lead is name + phone + post-call notes only. We keep routing markers
+        # (source / uncategorized / agent_mode_final / campaign linkage) but
+        # deliberately drop the structured facts (budget, purpose, timeline,
+        # objection, project, partial visit slots) — that context now lives in
+        # the prose "call notes" the condenser writes after the call ends.
         metadata = {
             "source": call_surface or "voice_call",
             "auto_created_from_call": True,
-            "requested_info": memory.get("requested_info"),
-            "purpose": memory.get("purpose"),
-            "timeline": memory.get("timeline"),
-            "visit_preference": memory.get("visit_preference"),
-            "objection": memory.get("objection"),
-            "budget_label": memory.get("budget"),
             "campaign_id": (campaign_context or {}).get("campaign_id"),
-            "project_name": project_hint,
-            "partial_visit_date": partial_visit_date,
-            "partial_visit_time": partial_visit_time,
-            "booking_abandoned": True if booking_abandoned else None,
             # FSM terminal mode marker. The frontend Uncategorized tab
             # filters on ``data.uncategorized === true``; setting it here
             # is what routes the row off the campaign tab and into the
@@ -3451,6 +3440,7 @@ class NokvoOneVoicePipeline:
         turn_index: int | None = None,
         agent_mode_block: str | None = None,
         conversational_memory: Any = None,
+        business_type: str | None = None,
     ) -> list[dict[str, str]]:
         # Body extracted to app.services.pipeline.message_composer.compose_rag_messages.
         # This wrapper preserves the class-method API surface so legacy callers
@@ -3477,6 +3467,7 @@ class NokvoOneVoicePipeline:
             turn_index=turn_index,
             agent_mode_block=agent_mode_block,
             conversational_memory=conversational_memory,
+            business_type=business_type,
         )
 
 
@@ -3679,12 +3670,26 @@ class NokvoOneVoicePipeline:
                     )
             return original_answer, CLARIFY_RESET, state
 
+        # The vagueness heuristic fired, but if the agent still produced a
+        # SUBSTANTIVE reply this turn (e.g. the LLM actually answered / listed
+        # projects), the turn wasn't a failure — keep that answer and reset the
+        # counter. We must never throw a real answer away and replace it with a
+        # generic options menu; that's the agent "going dumb" mid-answer.
+        produced_non_answer = refused or len((original_answer or "").split()) < 4
+        if not produced_non_answer:
+            if state.consecutive_vague_turns:
+                state.reset()
+                if call_id:
+                    await AgentSessionStore.merge_state(
+                        tenant_res, call_id, {"clarification": state.to_dict()}
+                    )
+            return original_answer, CLARIFY_RESET, state
+
         state.bump(user_text)
         action = state.action()
         # NUDGE: leave the existing ``original_answer`` (open-question /
-        # refusal). OFFER_OPTIONS + ESCALATE override the answer so the
-        # caller hears something concrete instead of the third "sorry,
-        # I missed that" in a row.
+        # refusal). OFFER_OPTIONS + ESCALATE override the answer so the caller
+        # hears something concrete instead of the third "sorry, I missed that".
         answer = original_answer
         if action in (CLARIFY_OFFER_OPTIONS, CLARIFY_ESCALATE):
             answer = clarification_prompt(action, language)
@@ -4206,6 +4211,9 @@ class NokvoOneVoicePipeline:
                     ),
                     company_name=company_name,
                     capture_flow_active=_capture_flow_active,
+                    # Cold-open greeting+discovery agenda only on the genuine first
+                    # turn (no prior agent reply) — else it re-greets every turn.
+                    is_first_turn=not any((t or {}).get("role") == "assistant" for t in (history or [])),
                 )
             except Exception:
                 strategy_block_v2 = ""
@@ -4244,6 +4252,14 @@ class NokvoOneVoicePipeline:
         agent_mode_block_inbound: str | None = None
         if _fsm_active_inbound:
             session_state = turn_cache.get("state") or {}
+            # Brochure-on-WhatsApp request → stay in whatsapp_mode across the short
+            # exchange (sticky over recent turns) so a follow-up "yeah" / number
+            # readout doesn't drop back into lead-collection.
+            from app.services.tool_flow_policy import brochure_intent_active as _brochure_active
+            if _brochure_active(user_text, turn_cache.get("history")):
+                _tf_wa = dict(session_state.get("tool_flow") or {})
+                _tf_wa["whatsapp_intent"] = {"kind": "brochure"}
+                session_state = {**session_state, "tool_flow": _tf_wa}
             current = _fsm_current_mode(session_state, memory=conversational_memory)
             pending_label: str | None = None
             pending_question: str | None = None
@@ -4284,6 +4300,16 @@ class NokvoOneVoicePipeline:
                 )
                 if booking_block:
                     blocks.append(booking_block)
+            # In whatsapp_mode, surface the caller's own number (ANI) so the agent
+            # passes it straight to the brochure tool instead of asking for it.
+            if current == "whatsapp":
+                _cp = str((session_state.get("caller_phone") or "")).strip()
+                if _cp:
+                    blocks.append(
+                        "# CALLER'S WHATSAPP NUMBER (already known — do not ask)\n"
+                        f"Send the brochure to {_cp} — the number they're calling from. "
+                        "Pass this exact number to the brochure tool."
+                    )
             agent_mode_block_inbound = "\n\n".join(b for b in blocks if b)
 
         # Clinic mode block. Clinics use the voice_turn_policy appointment FSM
@@ -4332,6 +4358,7 @@ class NokvoOneVoicePipeline:
             turn_index=(len(history) // 2) + 1 if outbound_context is not None else None,
             agent_mode_block=agent_mode_block_inbound,
             conversational_memory=conversational_memory,
+            business_type=bundle.organization_industry if bundle is not None else None,
         )
         timeout = max(0.8, (latency_budget_ms or settings.AGENT_LLM_TIMEOUT_MS) / 1000)
         llm_error = None
@@ -4819,6 +4846,7 @@ class NokvoOneVoicePipeline:
                     ),
                     company_name=company_name,
                     capture_flow_active=_capture_flow_active,
+                    is_first_turn=not any((t or {}).get("role") == "assistant" for t in (history or [])),
                 )
             except Exception:
                 strategy_block = ""
@@ -4857,9 +4885,13 @@ class NokvoOneVoicePipeline:
 
         agent_mode_block_inbound_streaming: str | None = None
         if _fsm_active_inbound_streaming:
-            current = _fsm_current_mode(
-                turn_cache.get("state") or {}, memory=conversational_memory
-            )
+            _ss_stream = turn_cache.get("state") or {}
+            from app.services.tool_flow_policy import brochure_intent_active as _brochure_active
+            if _brochure_active(user_text, turn_cache.get("history")):
+                _tf_wa = dict(_ss_stream.get("tool_flow") or {})
+                _tf_wa["whatsapp_intent"] = {"kind": "brochure"}
+                _ss_stream = {**_ss_stream, "tool_flow": _tf_wa}
+            current = _fsm_current_mode(_ss_stream, memory=conversational_memory)
             pending_label: str | None = None
             pending_question: str | None = None
             _mode_flow_key = {
@@ -4899,6 +4931,14 @@ class NokvoOneVoicePipeline:
                 )
                 if booking_block:
                     blocks.append(booking_block)
+            if current == "whatsapp":
+                _cp = str((_ss_stream.get("caller_phone") or "")).strip()
+                if _cp:
+                    blocks.append(
+                        "# CALLER'S WHATSAPP NUMBER (already known — do not ask)\n"
+                        f"Send the brochure to {_cp} — the number they're calling from. "
+                        "Pass this exact number to the brochure tool."
+                    )
             agent_mode_block_inbound_streaming = "\n\n".join(b for b in blocks if b)
 
         # Clinic mode block (streaming path) — mirror the non-streaming branch.
@@ -4942,6 +4982,7 @@ class NokvoOneVoicePipeline:
             turn_index=(len(history) // 2) + 1 if outbound_mode else None,
             agent_mode_block=agent_mode_block_inbound_streaming,
             conversational_memory=conversational_memory,
+            business_type=bundle.organization_industry if bundle is not None else None,
         )
         # Prosody-aware streaming: the LLM is asked to wrap each sentence in a
         # [tone]…[/tone] tag. The parser strips the tags and emits one chunk

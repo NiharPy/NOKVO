@@ -40,8 +40,30 @@ def test_visit_paraphrases_start_site_visit(text):
         "tell me about your projects",
     ],
 )
-def test_enquiry_paraphrases_start_lead(text):
-    assert _start_flow_key(text, "real_estate", []) == "leads_create"
+def test_real_estate_enquiry_does_not_start_a_lead_flow(text):
+    # Real estate no longer runs a mid-call lead slot-fill — an enquiry stays
+    # conversational (no flow). The lead is created automatically at end-of-call
+    # from the ANI + call summary instead of interrogating the caller.
+    assert _start_flow_key(text, "real_estate", []) is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["just send me the brochure", "can you share more details", "I want a quote"],
+)
+def test_other_vertical_enquiry_still_starts_lead_flow(text):
+    # Verticals with a leads tab keep the leads_create flow.
+    assert _start_flow_key(text, "ecommerce", []) == "leads_create"
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["just send me the brochure", "can you share more details", "I want a quote"],
+)
+def test_clinic_enquiry_does_not_start_a_lead_flow(text):
+    # Clinics have no leads at all — every caller is captured in the Customer
+    # base automatically (ANI + post-call notes), so no leads_create flow.
+    assert _start_flow_key(text, "clinics", []) is None
 
 
 def test_visit_intent_wins_over_lead_when_both_present():

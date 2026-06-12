@@ -106,7 +106,14 @@ def test_visit_intent_hi_te(text):
     ],
 )
 def test_enquiry_intent_hi_te(text):
-    assert _start_flow_key(text, "real_estate", []) == "leads_create"
+    # Real estate no longer starts a mid-call lead flow for an enquiry in ANY
+    # language — it stays conversational and the lead is created end-of-call from
+    # the ANI + call summary. (Multilingual parity: same as English.)
+    assert _start_flow_key(text, "real_estate", []) is None
+    # Clinics have no leads at all (Customer base instead) — parity in hi/te.
+    assert _start_flow_key(text, "clinics", []) is None
+    # Verticals with a leads tab keep the leads_create flow in hi/te too.
+    assert _start_flow_key(text, "ecommerce", []) == "leads_create"
 
 
 def test_visit_beats_lead_in_hi_te():

@@ -557,6 +557,9 @@ class RealEstateProjectBase(BaseModel):
     builder_name: Optional[str] = Field(default=None, max_length=200)
     brochure_url: Optional[str] = Field(default=None, max_length=1000)
     contact_phone: Optional[str] = Field(default=None, max_length=40)
+    # Per-project WhatsApp pre-set message config (Meta-approved templates):
+    #   {"location": {"template","language","maps_url"}, "brochure": {"template","language"}}
+    whatsapp: dict[str, Any] = Field(default_factory=dict)
     extra: dict[str, Any] = Field(default_factory=dict)
     status: Optional[str] = Field(default="active", max_length=40)
 
@@ -600,6 +603,7 @@ class RealEstateProjectUpdateRequest(BaseModel):
     builder_name: Optional[str] = Field(default=None, max_length=200)
     brochure_url: Optional[str] = Field(default=None, max_length=1000)
     contact_phone: Optional[str] = Field(default=None, max_length=40)
+    whatsapp: Optional[dict[str, Any]] = None
     extra: Optional[dict[str, Any]] = None
     status: Optional[str] = Field(default=None, max_length=40)
 
@@ -621,6 +625,7 @@ class RealEstateProjectResponse(BaseModel):
     builder_name: Optional[str]
     brochure_url: Optional[str]
     contact_phone: Optional[str]
+    whatsapp: dict[str, Any] = Field(default_factory=dict)
     extra: dict[str, Any] = Field(default_factory=dict)
     status: str
     created_at: datetime

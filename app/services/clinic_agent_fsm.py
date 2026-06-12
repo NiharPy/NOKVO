@@ -17,8 +17,10 @@ Modes:
   * ``triage_escalation``   – URGENT/EMERGENCY symptoms detected. Safety mode:
                               no diagnosis, no advice, no normal booking —
                               direct to emergency care / clinic staff.
-  * ``lead_capture``        – caller interested but not booking; capture details
-                              for a callback.
+
+Interested-but-not-booking callers need no mode: every clinic caller is
+captured in the Customer base automatically (ANI + post-call notes), so the
+agent just answers and offers to book — it never interrogates for details.
 
 Only the FINAL mode is persisted (``agent_mode_final``) for telemetry; mid-call
 modes are computed on demand via :func:`current_mode`.
@@ -33,14 +35,12 @@ AGENT_MODE_QUERY = "query"
 AGENT_MODE_APPOINTMENT_BOOKING = "appointment_booking"
 AGENT_MODE_SERVICE_INQUIRY = "service_inquiry"
 AGENT_MODE_TRIAGE_ESCALATION = "triage_escalation"
-AGENT_MODE_LEAD_CAPTURE = "lead_capture"
 
 ALL_MODES = (
     AGENT_MODE_QUERY,
     AGENT_MODE_APPOINTMENT_BOOKING,
     AGENT_MODE_SERVICE_INQUIRY,
     AGENT_MODE_TRIAGE_ESCALATION,
-    AGENT_MODE_LEAD_CAPTURE,
 )
 
 
@@ -81,8 +81,7 @@ def current_mode(
 
     Triage takes absolute precedence (patient safety). Otherwise: an active
     appointment flow → booking; an explicit service question → service_inquiry;
-    else query. ``lead_capture`` is the call-end terminal label (set by the
-    safety net), not a mid-call computed mode here.
+    else query.
     """
     if detect_urgent_symptoms(latest_user_text):
         return AGENT_MODE_TRIAGE_ESCALATION
@@ -144,12 +143,6 @@ def mode_block_for_prompt(
             "Answer from the SERVICES list only (never invent a service, price, or doctor). "
             "After answering, warmly offer to book it.\n\n" + _DONT_DIAGNOSE
         )
-    if mode == AGENT_MODE_LEAD_CAPTURE:
-        return (
-            "# AGENT MODE — LEAD_CAPTURE\n"
-            "The caller is interested but not booking now. Capture their name, phone, and "
-            "what they need so the team can follow up. Don't push.\n\n" + _DONT_DIAGNOSE
-        )
     return (
         "# AGENT MODE — QUERY\n"
         "Answer the caller's clinic / service / doctor / timing question from the SERVICES "
@@ -163,7 +156,6 @@ __all__ = (
     "AGENT_MODE_APPOINTMENT_BOOKING",
     "AGENT_MODE_SERVICE_INQUIRY",
     "AGENT_MODE_TRIAGE_ESCALATION",
-    "AGENT_MODE_LEAD_CAPTURE",
     "ALL_MODES",
     "enabled_for_business_type",
     "detect_urgent_symptoms",

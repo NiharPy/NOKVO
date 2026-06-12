@@ -21,6 +21,7 @@ from sqlalchemy import (
     Index,
     Integer,
     String,
+    Text,
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.sql import func
@@ -77,10 +78,20 @@ class LeadFollowupSchedule(Base):
         String, ForeignKey("tenant_resources.tenant_id"), nullable=False, index=True
     )
 
+    # Target: exactly one of lead_id / customer_id (DB CHECK enforces at least
+    # one). Leads are the real-estate campaign path; customers are the clinic
+    # manual-followup path (admin-commanded from the Customer base).
     lead_id = Column(
         UUID(as_uuid=True),
         ForeignKey("outgoing_leads.id"),
-        nullable=False,
+        nullable=True,
+        index=True,
+    )
+
+    customer_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("customer_base.id"),
+        nullable=True,
         index=True,
     )
 
@@ -104,6 +115,11 @@ class LeadFollowupSchedule(Base):
     scheduled_at = Column(DateTime(timezone=True), nullable=False, index=True)
 
     reason = Column(SAEnum(FollowupReason), nullable=False)
+
+    # Admin's typed purpose for a manual follow-up ("remind about tomorrow's
+    # appointment"). Rendered into the outbound system prompt as the REASON
+    # FOR THIS CALL block, and shown on the follow-up chip.
+    note = Column(Text, nullable=True)
 
     # How many follow-up calls have been placed for this lead+campaign pair
     # BEFORE this row. The scheduler increments and re-checks max_attempts
@@ -140,4 +156,6 @@ class LeadFollowupSchedule(Base):
         Index("ix_followup_due", "status", "scheduled_at"),
         # Per-lead summary + chip: SELECT WHERE lead_id=... AND status IN (...)
         Index("ix_followup_lead", "lead_id", "status"),
+        # Per-customer chip on the Customer base list.
+        Index("ix_followup_customer", "customer_id", "status"),
     )

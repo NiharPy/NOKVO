@@ -87,6 +87,13 @@ def replay(fixture: dict[str, Any]) -> ReplayResult:
     business_type = fixture.get("business_type") or "real_estate"
     is_outbound = bool(fixture.get("outbound"))
     objectives = list(fixture.get("objectives") or [])
+    # Optional top-level fixture knobs:
+    #  - ``caller_phone``: seeds the ANI so the phone slot can auto-fill (the
+    #    telephony "don't make the caller recite digits" path).
+    #  - ``language``: drives extraction/question language (en|hi|te) so a
+    #    multilingual fixture asserts the same slots-out as English.
+    fixture_caller_phone = fixture.get("caller_phone")
+    fixture_language = str(fixture.get("language") or "en")
     result = ReplayResult()
 
     turn_index = 0
@@ -104,15 +111,20 @@ def replay(fixture: dict[str, Any]) -> ReplayResult:
                 business_type=business_type,
             )
             # Evaluate the tool_flow policy with the running state.
+            policy_state = {
+                "tool_flow": dict(result.tool_flow_state),
+                "memory": result.memory.to_state_blob(),
+            }
+            # Seed the caller's number so the phone slot pre-fills from ANI,
+            # exactly as the live pipeline does (see _merge_call_context).
+            if fixture_caller_phone:
+                policy_state["caller_phone"] = fixture_caller_phone
             tool_flow = evaluate_tool_flow_policy(
                 text,
                 business_type=business_type,
                 history=result.turn_history,
-                state={
-                    "tool_flow": dict(result.tool_flow_state),
-                    "memory": result.memory.to_state_blob(),
-                },
-                language="en",
+                state=policy_state,
+                language=fixture_language,
             )
             # Persist the FSM's state_patch into our running tool_flow blob
             # exactly the way the pipeline would via _apply_route_state.
@@ -150,6 +162,9 @@ def replay(fixture: dict[str, Any]) -> ReplayResult:
                     "mode": mode,
                     "tool_flow_active": bool(result.tool_flow_state.get("active")),
                     "tool_flow_flow_key": result.tool_flow_state.get("flow_key"),
+                    # The filled slots so far — what "expected-slots-out"
+                    # assertions target via dotted fields (e.g. collected.name).
+                    "collected": dict(result.tool_flow_state.get("collected") or {}),
                     "tool_flow_state_slot": (tool_flow or {}).get("state_slot")
                     if isinstance(tool_flow, dict)
                     else None,
@@ -179,7 +194,15 @@ def check_assertion(per_turn: dict[str, Any], assertion: dict[str, Any]) -> tupl
     op = str(assertion.get("op") or "equals").lower()
     field = str(assertion.get("field") or "")
     expected = assertion.get("expected")
-    actual = per_turn.get(field)
+    # Dotted fields resolve into nested dicts, e.g. ``collected.name`` →
+    # per_turn["collected"]["name"]. Missing keys yield None (not a KeyError)
+    # so ``is_none`` can assert a slot was NOT filled.
+    if "." in field:
+        head, _, tail = field.partition(".")
+        container = per_turn.get(head)
+        actual = container.get(tail) if isinstance(container, dict) else None
+    else:
+        actual = per_turn.get(field)
     if op == "equals":
         ok = actual == expected
         return ok, f"{field}: expected {expected!r}, got {actual!r}"

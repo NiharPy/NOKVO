@@ -54,6 +54,7 @@ def compose_rag_messages(
     turn_index: int | None = None,
     agent_mode_block: str | None = None,
     conversational_memory: Any = None,
+    business_type: str | None = None,
 ) -> list[dict[str, str]]:
     """RAG path message builder.
 
@@ -76,6 +77,18 @@ def compose_rag_messages(
         if remaining <= 0:
             break
 
+    # Brochure-on-WhatsApp request on an outbound / follow-up call → flip into
+    # whatsapp_mode for this turn (the outbound FSM reads tool_flow.whatsapp_intent).
+    _tool_flow_state = tool_flow_state
+    if outbound_context is not None:
+        try:
+            from app.services.tool_flow_policy import brochure_intent_active
+
+            if brochure_intent_active(query, history):
+                _tool_flow_state = {**(tool_flow_state or {}), "whatsapp_intent": {"kind": "brochure"}}
+        except Exception:
+            _tool_flow_state = tool_flow_state
+
     # Outbound campaign system fragment. When the campaign config has an
     # explicit agent_prompt + objectives we drop in a full proactive-mode
     # block; otherwise we fall back to the legacy one-liner.
@@ -83,11 +96,13 @@ def compose_rag_messages(
         outbound_context,
         covered_objectives=covered_objectives,
         outbound_memory=outbound_memory,
-        tool_flow_state=tool_flow_state,
+        tool_flow_state=_tool_flow_state,
         tool_flow_bundle=tool_flow_bundle,
         language=language,
         turn_index=turn_index,
         conversational_memory=conversational_memory,
+        business_type=business_type,
+        latest_user_text=query,
     )
     if outbound_section:
         campaign_rule = (

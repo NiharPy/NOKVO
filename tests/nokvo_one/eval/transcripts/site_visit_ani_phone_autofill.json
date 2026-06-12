@@ -1,0 +1,24 @@
+{
+  "name": "site_visit_ani_phone_autofill",
+  "description": "Golden path: a site-visit request with the caller's number known from signaling (ANI). The site_visit flow starts, and the phone slot is pre-filled from the ANI so the agent never asks the caller to recite digits — the next slot it asks for is the name, not the phone.",
+  "business_type": "real_estate",
+  "outbound": false,
+  "company_name": "Raghava Constructions",
+  "focus_project": "Skyline Heights",
+  "caller_phone": "+917569672503",
+  "turns": [
+    {"role": "user", "text": "I want to schedule a site visit"}
+  ],
+  "expected": [
+    {
+      "turn_index": 1,
+      "asserts": [
+        {"op": "equals", "field": "tool_flow_flow_key", "expected": "real_estate_site_visit"},
+        {"op": "equals", "field": "mode", "expected": "site_visit"},
+        {"op": "equals", "field": "tool_flow_active", "expected": true},
+        {"op": "equals", "field": "collected.phone", "expected": "+917569672503"},
+        {"op": "equals", "field": "tool_flow_state_slot", "expected": "name"}
+      ]
+    }
+  ]
+}

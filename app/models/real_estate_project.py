@@ -42,6 +42,12 @@ class RealEstateProject(Base):
     builder_name = Column(String(200), nullable=True)
     brochure_url = Column(String(1000), nullable=True)
     contact_phone = Column(String(40), nullable=True)
+    # Per-project WhatsApp message config (Meta-approved templates). Shape:
+    #   {"location": {"template": "<name>", "language": "en", "maps_url": "..."},
+    #    "brochure": {"template": "<name>", "language": "en"}}
+    # The location message auto-sends on a site-visit booking; the brochure
+    # message sends from whatsapp_mode. Empty/unset → nothing is sent.
+    whatsapp = Column(JSONB, nullable=False, server_default="{}")
     extra = Column(JSONB, nullable=False, server_default="{}")
     status = Column(String(40), nullable=False, server_default="active")
     created_by_user_id = Column(

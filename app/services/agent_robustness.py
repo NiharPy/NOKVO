@@ -234,6 +234,197 @@ class AudioQualityProbe:
         return QUALITY_OK, "clean"
 
 
+class AudioEnhancer:
+    """Stateful, per-call inbound audio conditioner for STT.
+
+    Forwarded telephony audio reaches us quiet and variable-level (caller →
+    carrier → forward → Plivo → us), and STT garbles quiet/uneven speech. This
+    conditions each PCM chunk before STT:
+
+    * **~100 Hz high-pass** — a one-pole biquad with persistent state across
+      chunks. Carrier networks nominally high-pass ~300 Hz, but forwarded /
+      VoLTE legs leak low-frequency rumble and handling noise that wastes AGC
+      headroom; killing it below the voice band costs nothing audible.
+    * **DC-offset removal** — subtract the chunk mean. Belt-and-braces after
+      the high-pass (a chunk-mean step is cheap and keeps the old invariant).
+    * **Smoothed AGC** — track a running RMS and apply a gain that moves the
+      signal toward a target level (``target_dbfs``). The gain is attack/release
+      smoothed so it never *pumps* between chunks. Near-silent chunks (below
+      the probe's silence floor) are left alone so we don't amplify pure line
+      noise, and a slow noise-floor tracker shrinks the allowed gain on
+      hiss-only lines (poor SNR → boosting just makes louder hiss).
+    * **Soft-knee limiter** — linear below the knee, tanh-shaped compression
+      above it, hard ceiling at full scale. A loud burst lands smoothly
+      instead of square-clipping (which STT reads as distortion).
+
+    numpy is imported lazily inside :meth:`process` so this module stays
+    dependency-free at import time — it runs in the Plivo bridge where numpy is
+    already loaded. One instance per call; not thread-safe by design.
+    """
+
+    FULL_SCALE = AudioQualityProbe.SAMPLE_FULL_SCALE  # 32767.0
+    SILENCE_RMS = AudioQualityProbe.SILENT_FRAME_RMS  # normalized ~-50 dBFS
+    MAX_GAIN = 8.0   # never boost more than +18 dB (avoid blowing up noise)
+    MIN_GAIN = 0.5   # let a hot line come down a little, but not silence it
+    HIGHPASS_HZ = 100.0       # below the voice band; kills rumble/handling noise
+    LIMITER_KNEE = 0.5        # fraction of full scale where soft compression starts
+    # Noise-floor tracking: floor*gain must stay under SILENCE_RMS * this
+    # factor — i.e. amplified line noise may not rise far above the silence
+    # threshold the probe / EOU logic treats as "quiet".
+    NOISE_HEADROOM = 4.0
+
+    def __init__(
+        self,
+        *,
+        target_dbfs: float = -20.0,
+        attack: float = 0.5,
+        release: float = 0.08,
+        sample_rate: int = 16000,
+    ) -> None:
+        # Target RMS as a fraction of full scale (0..1).
+        self._target_rms = float(10.0 ** (target_dbfs / 20.0))
+        self._attack = float(attack)    # gain moving UP (toward louder) — quick
+        self._release = float(release)  # gain moving DOWN — slow, avoids pumping
+        self._gain = 1.0
+        self._last_rms = 0.0
+        self._chunks = 0
+        # High-pass one-pole coefficient + persistent filter state. A first-
+        # order HPF at ~100 Hz: y[n] = a*(y[n-1] + x[n] - x[n-1]).
+        import math
+        rc = 1.0 / (2.0 * math.pi * self.HIGHPASS_HZ)
+        dt = 1.0 / max(8000, int(sample_rate))
+        self._hp_a = rc / (rc + dt)
+        self._hp_prev_x = 0.0
+        self._hp_prev_y = 0.0
+        # Noise-floor estimate (normalized RMS), learned ONLY from near-silent
+        # chunks — i.e. the line's resting level between words. 0.0 until a
+        # quiet gap has been observed; speech/tone chunks never update it.
+        self._noise_floor = 0.0
+
+    @property
+    def last_rms(self) -> float:
+        """Normalised RMS (0..1) of the most recent processed chunk."""
+        return self._last_rms
+
+    @property
+    def gain(self) -> float:
+        return self._gain
+
+    def process(self, pcm: bytes) -> bytes:
+        """Condition one buffer of signed 16-bit LE mono PCM. Returns the
+        enhanced bytes (same length). Best-effort: any failure returns the
+        input unchanged so a DSP glitch never drops caller audio."""
+        if not pcm:
+            return pcm
+        try:
+            import numpy as np
+
+            x = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
+            if x.size == 0:
+                return pcm
+            # ~100 Hz high-pass (state carried across chunks) — rumble eats
+            # AGC headroom and skews the RMS tracker. First-order recursive
+            # HPF y[n] = a*(y[n-1] + x[n] - x[n-1]); the scalar loop costs
+            # well under 0.5 ms per typical 20 ms chunk (no scipy in repo).
+            diffs = np.empty_like(x)
+            diffs[0] = x[0] - self._hp_prev_x
+            diffs[1:] = x[1:] - x[:-1]
+            yacc = self._hp_prev_y
+            out = np.empty(x.size, dtype=np.float64)
+            ad = float(self._hp_a)
+            d64 = diffs.astype(np.float64)
+            for i in range(x.size):
+                yacc = ad * (yacc + d64[i])
+                out[i] = yacc
+            self._hp_prev_x = float(x[-1])
+            self._hp_prev_y = float(yacc)
+            x = out.astype(np.float32)
+            # DC-offset removal (belt-and-braces after the HPF).
+            x = x - float(x.mean())
+            rms = float(np.sqrt(np.mean((x / self.FULL_SCALE) ** 2))) if x.size else 0.0
+            self._last_rms = rms
+            self._chunks += 1
+            # Noise-floor tracker: learn the line's resting level from
+            # near-silent chunks only (the gaps between words) — a steady
+            # speech tone must never be mistaken for noise.
+            if rms <= self.SILENCE_RMS * 3.0:
+                self._noise_floor = (
+                    rms if self._noise_floor == 0.0 else 0.8 * self._noise_floor + 0.2 * rms
+                )
+            # Only chase the target when there's real signal — never amplify
+            # pure line noise / silence.
+            if rms > self.SILENCE_RMS:
+                desired = self._target_rms / max(rms, 1e-6)
+                desired = min(self.MAX_GAIN, max(self.MIN_GAIN, desired))
+                # Adaptive cap: amplified line noise must stay near the
+                # silence threshold. Only binds when the measured between-
+                # words floor is itself above the silence threshold (a hissy
+                # line) — boosting that just serves STT louder hiss.
+                if self._noise_floor > self.SILENCE_RMS:
+                    noise_cap = (self.SILENCE_RMS * self.NOISE_HEADROOM) / self._noise_floor
+                    desired = min(desired, max(1.0, noise_cap))
+                coef = self._attack if desired > self._gain else self._release
+                self._gain = (1.0 - coef) * self._gain + coef * desired
+            y = x * self._gain
+            # Soft-knee limiter: linear below the knee, tanh compression
+            # above, hard ceiling at full scale. No square-clip distortion.
+            knee = self.LIMITER_KNEE * self.FULL_SCALE
+            span = self.FULL_SCALE - knee
+            mag = np.abs(y)
+            over = mag > knee
+            if bool(over.any()):
+                compressed = knee + span * np.tanh((mag[over] - knee) / span)
+                y = y.copy()
+                y[over] = np.sign(y[over]) * compressed
+            y = np.clip(y, -self.FULL_SCALE, self.FULL_SCALE)
+            return y.astype(np.int16).tobytes()
+        except Exception:
+            return pcm
+
+
+def trim_leading_silence(
+    pcm: bytes,
+    *,
+    sample_rate: int = 16000,
+    preroll_ms: int = 100,
+    floor: float | None = None,
+) -> bytes:
+    """Drop leading sub-floor audio from a PCM16 mono buffer, keeping
+    ``preroll_ms`` of context before the first voiced frame.
+
+    Leading dead air costs STT accuracy on short utterances (the model
+    anchors on noise) and wastes upload bytes. Pure helper, best-effort:
+    any failure returns the input unchanged. Never trims everything — if no
+    voiced frame is found the buffer is returned as-is (the quality probe
+    owns the "all silence" verdict).
+    """
+    if not pcm or len(pcm) < 4:
+        return pcm
+    try:
+        import numpy as np
+
+        silence_floor = float(floor if floor is not None else AudioQualityProbe.SILENT_FRAME_RMS)
+        usable = len(pcm) - (len(pcm) % 2)
+        x = np.frombuffer(pcm[:usable], dtype=np.int16).astype(np.float32)
+        frame = max(1, int(sample_rate * 0.02))  # 20 ms frames
+        n_frames = x.size // frame
+        if n_frames < 2:
+            return pcm
+        frames = x[: n_frames * frame].reshape(n_frames, frame)
+        rms = np.sqrt(np.mean((frames / AudioQualityProbe.SAMPLE_FULL_SCALE) ** 2, axis=1))
+        voiced = np.nonzero(rms > silence_floor)[0]
+        if voiced.size == 0:
+            return pcm
+        first = int(voiced[0])
+        preroll_frames = max(0, int(round(preroll_ms / 20.0)))
+        start_frame = max(0, first - preroll_frames)
+        if start_frame == 0:
+            return pcm
+        return pcm[start_frame * frame * 2:]
+    except Exception:
+        return pcm
+
+
 # Pre-canned multilingual "I missed that, could you repeat" prompts. Kept
 # inside the robustness module so the recovery layer doesn't have to reach
 # back into the pipeline for refusal strings — the stream service can
@@ -416,12 +607,15 @@ _CLARIFY_NUDGE = {
     "te": "క్షమించండి, అర్థం కాలేదు — ఏ విషయంలో సహాయం కావాలో చెప్పగలరా?",
     "bn": "মাফ করবেন, বুঝতে পারিনি — কী ব্যাপারে সাহায্য চান বলবেন?",
 }
+# Vertical-neutral options. The previous wording ("bookings, cancellations,
+# refunds") read like a generic support bot and is wrong for real-estate /
+# clinic / sales agents. "details, pricing, or book" is universal and on-brand.
 _CLARIFY_OPTIONS = {
-    "en": "I can help with bookings, cancellations, refunds, or general questions — which one is it?",
-    "hi": "मैं बुकिंग, रद्द करने, रिफंड या सामान्य सवालों में मदद कर सकता हूँ — किसमें मदद चाहिए?",
-    "ta": "நான் முன்பதிவு, ரத்து, பணத் திருப்பம், அல்லது பொதுவான கேள்விகளில் உதவ முடியும் — எதில் உதவி வேண்டும்?",
-    "te": "నేను బుకింగ్, క్యాన్సిల్, రిఫండ్, లేదా సాధారణ ప్రశ్నలలో సహాయం చేయగలను — ఏది కావాలి?",
-    "bn": "আমি বুকিং, ক্যান্সেল, রিফান্ড বা সাধারণ প্রশ্নে সাহায্য করতে পারি — কোনটা?",
+    "en": "Happy to help — would you like details, pricing, or to book something?",
+    "hi": "मैं मदद के लिए हूँ — क्या आपको जानकारी, कीमत, या कुछ बुक करना है?",
+    "ta": "உதவ தயார் — உங்களுக்கு விவரங்கள், விலை, அல்லது ஏதாவது பதிவு செய்ய வேண்டுமா?",
+    "te": "సహాయం చేయడానికి సిద్ధం — మీకు వివరాలు, ధర, లేదా ఏదైనా బుక్ చేయాలా?",
+    "bn": "সাহায্য করতে প্রস্তুত — আপনি কি তথ্য, দাম, নাকি কিছু বুক করতে চান?",
 }
 _CLARIFY_ESCALATE = {
     "en": "I'm having trouble understanding — let me connect you with a person who can help.",

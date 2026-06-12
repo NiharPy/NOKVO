@@ -6,3 +6,6 @@ __pycache__/
 *.log
 frontend/node_modules/
 frontend/dist/
+
+# Stray debug log from the old Exotel bridge (now removed)
+exotel_debug.log

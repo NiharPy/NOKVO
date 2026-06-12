@@ -515,14 +515,20 @@ def test_opener_personalises_from_lead_enquiry():
     assert "enquired about" in text
 
 
-def test_opener_returning_lead_references_prior_call():
+def test_opener_returning_lead_defers_to_call_notes():
+    # A returning (follow-up) lead gets a warm, notes-deferring greeting — it
+    # names the lead and references the prior conversation, but does NOT try to
+    # reconstruct enquiry specifics (bhk/location). The LLM states those from
+    # the call notes on turn 2.
     text = generate_outbound_opener_text(
         _opener_context(),
         language="en",
         known_facts={"name": "Asha", "bhk": "2 BHK", "returning": True},
     )
     assert "Asha" in text
-    assert "last time" in text.lower()
+    assert "follow up on our last conversation" in text.lower()
+    # The bhk specifics must NOT appear in the deterministic opener anymore.
+    assert "2 BHK" not in text
 
 
 def test_opener_falls_back_to_pitch_when_nothing_known():
@@ -541,3 +547,57 @@ def test_opener_personalises_in_hindi_and_telugu():
         _opener_context(), language="te", known_facts={"name": "Asha", "location": "Gachibowli"}
     )
     assert "Asha" in te and "Gachibowli" in te
+
+
+# ── Follow-up preamble: call notes are the single source of prior-call context ──
+
+
+def _followup_context() -> OutboundCampaignContext:
+    return OutboundCampaignContext(
+        campaign_id=str(uuid.uuid4()),
+        name="RE follow-up",
+        goal="Re-engage and book a site visit",
+        agent_prompt="",
+        objectives=["Book site visit"],
+        exit_conditions=[],
+        tone="warm",
+        doc_text=None,
+        caller_name="Riya",
+        company_name="Raghava",
+        pitch_summary="our new project",
+    )
+
+
+def test_followup_preamble_quotes_call_notes_when_present():
+    note = "Asha wanted a 2 BHK near Gachibowli. She hesitated on the price. We promised to share a payment plan."
+    section = compose_outbound_system_section(
+        _followup_context(),
+        outbound_memory={"followup": {"is_followup": True, "attempt_n": 2, "handoff_note": note}},
+    )
+    assert "FOLLOW-UP CALL" in section
+    assert note in section  # the prose note is quoted verbatim
+    assert "referencing these notes" in section
+
+
+def test_followup_preamble_minimal_when_no_note_no_structured_dump():
+    # When the condenser produced no note, the preamble must NOT reconstruct a
+    # structured objections/commitments/preferences dump — just a minimal warm
+    # acknowledgement (plus the cheap prior-promise field when present).
+    section = compose_outbound_system_section(
+        _followup_context(),
+        outbound_memory={
+            "followup": {
+                "is_followup": True,
+                "attempt_n": 1,
+                "handoff_note": "",
+                "prior_promise": "call me tomorrow at 5pm",
+            }
+        },
+    )
+    assert "FOLLOW-UP CALL" in section
+    assert "spoke with this person recently" in section
+    assert "call me tomorrow at 5pm" in section  # prior promise surfaced
+    # The retired structured-dump lines must be gone.
+    assert "Objections:" not in section
+    assert "Commitments:" not in section
+    assert "Preferences:" not in section

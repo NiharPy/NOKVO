@@ -335,3 +335,48 @@ def filter_projects(
                 continue
         out.append(project)
     return out
+
+
+# ─────────── WhatsApp pre-set message resolvers ───────────
+# Per-project Meta-approved template config lives in ``project.whatsapp``. The
+# template's variable positions are defined by the admin when they register the
+# template with Meta; we use a FIXED convention so the values line up:
+#   Location template: {{1}} = project name, {{2}} = maps link.
+#   Brochure template: {{1}} = project name; the brochure URL is the document
+#                      header (media) param.
+# Both return ``None`` when no template is configured → caller sends nothing.
+
+
+def project_whatsapp_location(project: RealEstateProject) -> dict[str, Any] | None:
+    """Resolved location-message send config, or ``None`` if not configured.
+
+    Sent automatically when a site visit is booked for this project."""
+    cfg = (getattr(project, "whatsapp", None) or {}).get("location") or {}
+    template = str(cfg.get("template") or "").strip()
+    if not template:
+        return None
+    maps_url = str(cfg.get("maps_url") or "").strip()
+    return {
+        "template": template,
+        "language": str(cfg.get("language") or "en").strip() or "en",
+        # {{1}} project name, {{2}} maps link (falls back to the display location).
+        "body_params": [project.name, maps_url or (project.location or "")],
+        "media_url": None,
+    }
+
+
+def project_whatsapp_brochure(project: RealEstateProject) -> dict[str, Any] | None:
+    """Resolved brochure-message send config, or ``None`` if not configured.
+
+    Sent from whatsapp_mode when the caller asks for the brochure."""
+    cfg = (getattr(project, "whatsapp", None) or {}).get("brochure") or {}
+    template = str(cfg.get("template") or "").strip()
+    if not template:
+        return None
+    return {
+        "template": template,
+        "language": str(cfg.get("language") or "en").strip() or "en",
+        # {{1}} project name; the brochure URL rides as the document header.
+        "body_params": [project.name],
+        "media_url": (project.brochure_url or None),
+    }

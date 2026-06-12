@@ -47,6 +47,9 @@ AGENT_MODE_SITE_VISIT = "site_visit"
 # for a caller who showed interest but never entered a capture flow.
 AGENT_MODE_LEAD_CAPTURE = "lead_capture"
 AGENT_MODE_INBOUND_LEAD = "inbound_lead"
+# The caller asked for the project brochure on WhatsApp. A short, focused mode:
+# confirm the number, send the pre-set brochure template, confirm it's on the way.
+AGENT_MODE_WHATSAPP = "whatsapp"
 
 ALL_MODES = (
     AGENT_MODE_QUERY,
@@ -54,6 +57,7 @@ ALL_MODES = (
     AGENT_MODE_SITE_VISIT,
     AGENT_MODE_LEAD_CAPTURE,
     AGENT_MODE_INBOUND_LEAD,
+    AGENT_MODE_WHATSAPP,
 )
 
 
@@ -128,6 +132,12 @@ def current_mode(
     if memory is not None and _has_live_objection(memory):
         return AGENT_MODE_OBJECTION_HANDLING
     tool_flow = ((state or {}).get("tool_flow") or {})
+    # Brochure-on-WhatsApp request → a short, focused WHATSAPP mode. Honoured
+    # unless a booking/lead slot-fill is actively mid-flow (don't abandon a
+    # booking to send a PDF — finish the booking, then the brochure).
+    _flow_running = bool(tool_flow.get("active")) and not tool_flow.get("completed")
+    if (tool_flow.get("whatsapp_intent") or {}).get("kind") == "brochure" and not _flow_running:
+        return AGENT_MODE_WHATSAPP
     if not tool_flow.get("active"):
         return AGENT_MODE_QUERY
     if tool_flow.get("completed"):
@@ -137,12 +147,10 @@ def current_mode(
     flow_key = str(tool_flow.get("flow_key") or "")
     if flow_key == "real_estate_site_visit":
         return AGENT_MODE_SITE_VISIT
-    # An active ``leads_create`` flow means the caller is leaving their details
-    # for follow-up. Without this branch the mode fell through to QUERY, so the
-    # agent got the "answer questions" instruction and under-collected the
-    # admin-configured Lead Fields. LEAD_CAPTURE drives the slots deterministically.
-    if flow_key == "leads_create":
-        return AGENT_MODE_LEAD_CAPTURE
+    # NOTE: real estate no longer runs a mid-call ``leads_create`` slot-fill
+    # (see tool_flow_policy._start_flow_key) — an enquiry stays in QUERY and the
+    # lead is created automatically at end-of-call from the ANI + call summary.
+    # So an enquiry resolves to QUERY here; we never interrogate for lead fields.
     return AGENT_MODE_QUERY
 
 
@@ -283,6 +291,22 @@ def mode_block_for_prompt(
             "collect details until the system fires its own confirmation."
             + next_step
         )
+    if mode == AGENT_MODE_WHATSAPP:
+        return _with_dont_invent(
+            "# AGENT MODE — WHATSAPP\n"
+            "The caller wants the project brochure on WhatsApp. To send it you need NOTHING from "
+            "them except the number they're already calling from — the system has it.\n"
+            "- Do NOT ask for their name. Do NOT ask for their email. Do NOT ask for or read back "
+            "their phone number — you ALREADY have it (the number they're calling from).\n"
+            "- Do NOT offer to email anything. WhatsApp only.\n"
+            "- Simply tell them the brochure is on its way to their WhatsApp — one warm sentence — "
+            "and let the system send the pre-set brochure message. Do NOT read the link aloud or "
+            "claim you sent it yourself.\n"
+            "- If they're already engaged, the only thing worth asking is WHICH project (when it's "
+            "ambiguous). Never collect personal details for a brochure.\n"
+            "- This is NOT a lead capture — do NOT create a lead just to send a brochure.\n"
+            "- After confirming it's on the way, steer gently toward booking a site visit."
+        )
     if mode == AGENT_MODE_INBOUND_LEAD:
         return _with_dont_invent(
             "# AGENT MODE — INBOUND_LEAD\n"
@@ -294,7 +318,13 @@ def mode_block_for_prompt(
         "You're in question-answering mode. Answer the caller's project / company question from the "
         "PROJECT INVENTORY (or the admin prompt for non-project facts). After each answer, finish with "
         "ONE warm follow-up question that nudges toward a site visit — never lecture, never list more "
-        "than one feature per turn."
+        "than one feature per turn.\n"
+        "# CAPTURING THE CALLER (no interrogation)\n"
+        "- Do NOT collect 'lead details'. Their number is already on file and our team gets a call "
+        "summary automatically — you never need to ask for a phone number or quiz them on budget/area.\n"
+        "- If the call is winding down and you don't already know their name, you MAY ask ONCE, warmly, "
+        "for their name for our team's records (\"and may I have your name?\"). If they decline or it's "
+        "unclear, let it go — never insist, never re-confirm, never ask twice."
     )
 
 
@@ -326,6 +356,7 @@ __all__ = (
     "AGENT_MODE_SITE_VISIT",
     "AGENT_MODE_LEAD_CAPTURE",
     "AGENT_MODE_INBOUND_LEAD",
+    "AGENT_MODE_WHATSAPP",
     "ALL_MODES",
     "enabled_for_business_type",
     "current_mode",

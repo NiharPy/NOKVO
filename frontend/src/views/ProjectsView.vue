@@ -106,6 +106,27 @@ const list = computed(() => projects?.value || []);
             <input v-model="projectDraft.brochure_url" class="n-input" type="url" placeholder="https://…" />
           </label>
 
+          <div class="n-field proj__col-2">
+            <span class="n-field__label">WhatsApp messages (Meta-approved templates)</span>
+            <p class="proj__wa-hint">
+              The location message is auto-sent when a site visit is booked; the brochure
+              message sends when a caller asks for it. Each must be the name of a WhatsApp
+              template already approved on your WhatsApp Business account — plain text won't deliver.
+            </p>
+          </div>
+          <label class="n-field">
+            <span class="n-field__label">Location template name</span>
+            <input v-model="projectDraft.wa_location_template" class="n-input" type="text" placeholder="site_visit_location" />
+          </label>
+          <label class="n-field">
+            <span class="n-field__label">Location map link</span>
+            <input v-model="projectDraft.wa_location_maps_url" class="n-input" type="url" placeholder="https://maps.app.goo.gl/…" />
+          </label>
+          <label class="n-field proj__col-2">
+            <span class="n-field__label">Brochure template name</span>
+            <input v-model="projectDraft.wa_brochure_template" class="n-input" type="text" placeholder="project_brochure" />
+          </label>
+
           <div class="proj__form-foot">
             <button
               v-if="projectDraft.id"

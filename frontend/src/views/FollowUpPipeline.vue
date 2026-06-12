@@ -21,14 +21,23 @@ const {
   cancelFollowupsForLead,
   scheduleManualFollowup,
   phoneHref,
+  isClinicTemplate,
 } = useDashboardState();
 
 const refreshing = ref(false);
 
+// Clinics never auto-schedule: every follow-up is admin-commanded from the
+// Customer base, so this page shows manual rows only and points scheduling
+// at the Customer base instead of the lead picker.
+const clinicMode = computed(() => !!isClinicTemplate?.value);
+
 const pipeline = computed(() => followupPipeline?.value || null);
 const counts = computed(() => pipeline.value?.counts || {});
 const buckets = computed(() => pipeline.value?.queue_buckets || {});
-const queue = computed(() => pipeline.value?.today_queue || []);
+const queue = computed(() => {
+  const rows = pipeline.value?.today_queue || [];
+  return clinicMode.value ? rows.filter((r) => r.reason === 'manual') : rows;
+});
 const called = computed(() => pipeline.value?.called || {});
 const conversion = computed(() => pipeline.value?.conversion || { converted: 0, placed: 0, rate: 0 });
 
@@ -82,7 +91,19 @@ async function onPause(item) {
   await loadFollowupPipeline();
 }
 async function onCancel(item) {
-  await cancelFollowupsForLead(item.lead_id);
+  if (item.customer_id) {
+    // Customer-targeted row (clinic manual path) — cancel via the customers
+    // endpoint; the lead cancel endpoint requires a lead_id these rows lack.
+    const { api } = await import('../composables/useApiClients.js');
+    const { authHeader } = await import('../composables/useAuthSession.js');
+    try {
+      await api.delete(`/customers/${item.customer_id}/followups`, { headers: authHeader() });
+    } catch {
+      /* surfaced by the pipeline reload below */
+    }
+  } else {
+    await cancelFollowupsForLead(item.lead_id);
+  }
   await loadFollowupPipeline();
 }
 
@@ -137,7 +158,9 @@ async function submitManual() {
           </p>
         </div>
         <div class="fu__head-actions">
-          <button type="button" class="n-btn n-btn--brand n-btn--sm" @click="openManual">
+          <!-- Clinics schedule follow-ups from the Customer base (per-customer,
+               with a purpose note) — the lead picker doesn't apply. -->
+          <button v-if="!clinicMode" type="button" class="n-btn n-btn--brand n-btn--sm" @click="openManual">
             <CalendarPlus :size="13" />
             Add follow-up
           </button>
@@ -215,6 +238,11 @@ async function submitManual() {
               <span class="fu__attempt">attempt {{ (item.attempts || 0) + 1 }}</span>
             </div>
           </div>
+
+          <blockquote v-if="item.note" class="fu__note">
+            <span class="fu__note-cap">Purpose</span>
+            {{ item.note }}
+          </blockquote>
 
           <blockquote v-if="item.handoff_note" class="fu__note">
             <span class="fu__note-cap">Last call notes</span>

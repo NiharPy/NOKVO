@@ -31,6 +31,7 @@ from app.models.member_assignment import (
     NokvoOneAssignmentAuditLog,
     OrganizationMemberAssignmentSettings,
 )
+from app.models.customer_base import CustomerBase
 from app.models.connect_api_key import OrganizationApiKey
 from app.models.connect_session import ConnectSession
 from app.models.call_cost import CallCost
@@ -72,4 +73,5 @@ __all__ = [
     "FollowupReason",
     "FollowupStatus",
     "LeadFollowupSchedule",
+    "CustomerBase",
 ]

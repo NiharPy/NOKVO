@@ -524,6 +524,8 @@ def compose_outbound_system_section(
     language: str | None = None,
     turn_index: int | None = None,
     conversational_memory: Any = None,
+    business_type: str | None = None,
+    latest_user_text: str | None = None,
 ) -> str:
     """Build the system-prompt fragment for an outbound turn.
 
@@ -549,15 +551,14 @@ def compose_outbound_system_section(
     parts: list[str] = []
 
     # ── Follow-up preamble ──────────────────────────────────────────────
-    # Two flavours, in priority order:
-    #   1. Handoff note — a 3-sentence human-readable summary written by the
-    #      post-call condenser (``call_condenser_service``) immediately after
-    #      the prior call ended. Small models read prose much better than
-    #      structured JSON; managers also read it directly in the leads tab.
-    #   2. Structured fallback — when no handoff note exists (call too short,
-    #      condenser failed, or this is a campaign that doesn't have the
-    #      condenser enabled), surface raw objections / commitments /
-    #      preferences from ConversationalMemory. The original behaviour.
+    # The call notes are the single source of prior-call context. The
+    # post-call condenser (``call_condenser_service``) writes a 3-sentence
+    # ``handoff_note`` onto the lead the moment the prior call ends — small
+    # models read that prose far better than a structured slot dump, and
+    # managers read the same note in the leads tab. When a note is present we
+    # quote it; when it isn't (call too short / condenser failed), we fall
+    # back to a MINIMAL acknowledgement rather than reconstructing
+    # objections / commitments / preferences from memory.
     #
     # Source: ``outbound_memory['followup']`` — seeded once at session start
     # from the WebSocket handler's ``campaign_context``. Carries
@@ -567,6 +568,19 @@ def compose_outbound_system_section(
     if followup and followup.get("is_followup"):
         attempt_n = int(followup.get("attempt_n") or 1)
         handoff_note = str(followup.get("handoff_note") or "").strip()
+
+        # Admin-commanded follow-up (clinic Customer base path): the admin's
+        # typed purpose is this call's agenda — render it ABOVE the prior-call
+        # notes so the model treats it as the primary objective.
+        admin_note = str(followup.get("admin_note") or "").strip()
+        if admin_note:
+            parts.append(
+                "═══ REASON FOR THIS CALL — admin instruction ═══\n"
+                f"The clinic admin asked you to: {admin_note}\n"
+                "This is the purpose of the call. Deliver it warmly in your first "
+                "substantive turn — do not bury it behind small talk.\n"
+                "═══════════════════════════════════════════════"
+            )
 
         if handoff_note:
             # The model reads prose 10× better than structured slots, so
@@ -583,48 +597,22 @@ def compose_outbound_system_section(
                 "══════════════════════"
             )
         else:
-            # Structured fallback. Use raw signals from conversational
-            # memory so the LLM still has SOME prior context even when
-            # the condenser couldn't produce a note.
+            # No note (rare). Don't reconstruct a structured memory dump —
+            # just a minimal acknowledgement so the agent opens warm instead
+            # of cold. The prior promise (the reason this call was scheduled)
+            # is a single cheap field worth surfacing when present.
             prior_promise = str(followup.get("prior_promise") or "").strip()
-            prior_objections: list[str] = []
-            prior_commitments: list[str] = []
-            prior_preferences: list[str] = []
-            if conversational_memory is not None:
-                for obj in (getattr(conversational_memory, "objections", []) or [])[-5:]:
-                    code = str((obj or {}).get("code") or "")
-                    text = str((obj or {}).get("text") or "")
-                    if code:
-                        prior_objections.append(f"{code}" + (f" ({text[:80]})" if text else ""))
-                for c in (getattr(conversational_memory, "commitments", []) or [])[-5:]:
-                    code = str((c or {}).get("code") or "")
-                    if code:
-                        prior_commitments.append(code)
-                for p in (getattr(conversational_memory, "preferences", []) or [])[-5:]:
-                    k = str((p or {}).get("key") or "")
-                    v = str((p or {}).get("value") or "")
-                    if k and v:
-                        prior_preferences.append(f"{k}={v}")
-
-            objections_line = ", ".join(prior_objections) if prior_objections else "—"
-            commitments_line = ", ".join(prior_commitments) if prior_commitments else "—"
-            preferences_line = ", ".join(prior_preferences) if prior_preferences else "—"
-            promise_line = prior_promise or "—"
-
+            promise_clause = (
+                f" They had asked to be called back: {prior_promise}."
+                if prior_promise
+                else ""
+            )
             parts.append(
                 "═══ FOLLOW-UP CALL ═══\n"
-                f"This is attempt {attempt_n}. The customer's previous call ended recently.\n"
-                f"What they said last time:\n"
-                f"  - Promise to be called back: {promise_line}\n"
-                f"  - Objections: {objections_line}\n"
-                f"  - Commitments: {commitments_line}\n"
-                f"  - Preferences: {preferences_line}\n"
-                "Open by acknowledging the prior conversation — DO NOT restart with "
-                "\"Is this a good time to talk?\". Examples that work:\n"
-                "  - \"Hi {name}, calling back as we discussed about {pitch}…\"\n"
-                "  - \"Hi {name}, you'd asked to call back around now — got a minute?\"\n"
-                "If the customer's previous turn raised an objection, address it FIRST, "
-                "then resume where the previous call ended.\n"
+                f"This is attempt {attempt_n}. You spoke with this person recently.{promise_clause}\n"
+                "Open warmly, referencing the prior conversation — DO NOT restart "
+                "cold with \"Is this a good time to talk?\". If they raise an "
+                "objection, address it FIRST, then resume where you left off.\n"
                 "══════════════════════"
             )
 
@@ -643,30 +631,42 @@ def compose_outbound_system_section(
         )
     parts.append(_OUTBOUND_UNIVERSAL_TURN_RULES)
 
-    # Real-estate outbound FSM mode block. Tells the LLM whether it's in
-    # ``sale`` (default proactive seller), ``site_visit`` (the lead said
-    # yes — drive the booking), or ``outbound_lead`` (capturing org lead
-    # fields). The block carries the don't-invent-caller-preferences
-    # guardrail so the LLM doesn't attribute project facts to the lead.
-    # Empty for non-real-estate orgs so other industries keep their
-    # existing behaviour.
-    try:
-        from app.services.real_estate_outbound_agent_fsm import (
-            current_mode as _outbound_mode,
-            enabled_for_business_type as _outbound_fsm_enabled,
-            mode_block_for_prompt as _outbound_mode_block,
-        )
-    except Exception:
-        _outbound_mode = None  # type: ignore[assignment]
-        _outbound_fsm_enabled = None  # type: ignore[assignment]
-        _outbound_mode_block = None  # type: ignore[assignment]
+    # Outbound FSM mode block, branched on the org's business type:
+    #   * clinics       → clinic outbound FSM (follow-up / booking / triage —
+    #                     with the no-diagnosis guardrail).
+    #   * anything else → real-estate outbound FSM (``sale`` / ``site_visit``
+    #                     / ``outbound_lead``), preserving the legacy
+    #                     always-render behaviour for callers that don't pass
+    #                     ``business_type`` (outbound campaigns are
+    #                     real-estate-only in practice).
+    _bt = str(business_type or "").strip().lower()
+    if _bt == "clinics":
+        try:
+            from app.services.clinic_outbound_agent_fsm import (
+                current_mode as _clinic_outbound_mode,
+                mode_block_for_prompt as _clinic_outbound_block,
+            )
 
-    business_type_hint = ""
-    # The compose function doesn't take business_type directly — read it from
-    # the outbound context's pitch summary as a best-effort hint, OR just
-    # always render the block (it's only loaded for real-estate campaigns
-    # in practice, but be defensive). Calling code can suppress by leaving
-    # tool_flow_state empty and not setting the mode block fallback.
+            _c_state = {"tool_flow": tool_flow_state or {}}
+            parts.append(
+                _clinic_outbound_block(
+                    _clinic_outbound_mode(_c_state, latest_user_text=latest_user_text)
+                )
+            )
+        except Exception:
+            pass
+        _outbound_mode = None  # type: ignore[assignment]
+        _outbound_mode_block = None  # type: ignore[assignment]
+    else:
+        try:
+            from app.services.real_estate_outbound_agent_fsm import (
+                current_mode as _outbound_mode,
+                mode_block_for_prompt as _outbound_mode_block,
+            )
+        except Exception:
+            _outbound_mode = None  # type: ignore[assignment]
+            _outbound_mode_block = None  # type: ignore[assignment]
+
     if _outbound_mode is not None and _outbound_mode_block is not None:
         _state_for_mode = {"tool_flow": tool_flow_state or {}}
         _mode = _outbound_mode(
@@ -837,6 +837,13 @@ def generate_outbound_opener_text(
             if company
             else f"Hello{name_part}, nenu {caller} maatalaadutunna."
         )
+        if returning:
+            # Follow-up: defer specifics to the LLM (it has the call notes).
+            return (
+                f"[warm]{intro_te}[/warm] "
+                "[neutral]Mana last conversation gurinchi follow up cheyadaniki call chesthunna.[/neutral] "
+                "[question]Ippudu okka minute maatalaadagalara?[/question]"
+            )
         if enquiry:
             reason = (
                 f"Last time meeru {enquiry} gurinchi adigaru"
@@ -866,6 +873,13 @@ def generate_outbound_opener_text(
             if company
             else f"Namaste{name_part}, main {caller} bol raha hoon."
         )
+        if returning:
+            # Follow-up: defer specifics to the LLM (it has the call notes).
+            return (
+                f"[warm]{intro_hi}[/warm] "
+                "[neutral]Hamari pichhli baat-cheet ke follow up ke liye call kiya hai.[/neutral] "
+                "[question]Kya abhi ek minute baat kar sakte hain?[/question]"
+            )
         if enquiry:
             reason = (
                 f"Pichhli baar humne {enquiry} ke baare mein baat ki thi"
@@ -894,6 +908,13 @@ def generate_outbound_opener_text(
         if company
         else f"Hi{name_part}, this is {caller}."
     )
+    if returning:
+        # Follow-up: defer specifics to the LLM (it has the call notes).
+        return (
+            f"[warm]{intro}[/warm] "
+            "[neutral]I'm calling to follow up on our last conversation.[/neutral] "
+            "[question]Is now a good time to talk for a minute?[/question]"
+        )
     if enquiry:
         reason = (
             f"we'd spoken about {enquiry} last time"

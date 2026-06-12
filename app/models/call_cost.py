@@ -76,6 +76,10 @@ class CallCost(Base):
     started_at = Column(DateTime(timezone=True), nullable=False)
     ended_at = Column(DateTime(timezone=True), nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    # W3C OpenTelemetry trace id (32-hex) for this call, when OTel is enabled.
+    # Nullable: rows from before this column / calls with OTel off keep NULL.
+    # Indexed so support can pivot "this call → its logs/LangSmith" by trace id.
+    trace_id = Column(String, nullable=True, index=True)
 
     __table_args__ = (
         UniqueConstraint("call_id", name="uq_call_costs_call_id"),

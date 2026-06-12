@@ -30,6 +30,18 @@ const records = computed(() => tabRecords?.value?.tickets || []);
 const isLoading = computed(() => !!tabRecordsLoading?.value?.tickets);
 const fields = computed(() => schemaFor?.('tickets') || []);
 
+// Each site visit carries the post-call "call notes" — a 3-sentence summary the
+// condenser writes onto the record (data.handoff_note) the moment the call ends.
+// Surface it read-only under each row for manager review.
+function recordHandoff(r) {
+  const note = r?.handoff_note || r?.data?.handoff_note;
+  if (!note) return null;
+  return {
+    note,
+    at: r?.handoff_note_generated_at || r?.data?.handoff_note_generated_at || null,
+  };
+}
+
 function statusTone(s) {
   const k = (s || 'open').toLowerCase();
   if (['done', 'closed', 'resolved', 'completed'].includes(k)) return 'n-tag--success';
@@ -119,37 +131,51 @@ function statusTone(s) {
         </div>
 
         <ul v-else class="rec__list">
-          <li v-for="r in records" :key="r.id" class="rec__row">
-            <div class="rec__id">
-              <strong class="n-truncate">{{ ticketRecordTitle(r) }}</strong>
-              <span class="rec__sub n-truncate">{{ ticketRecordSubtitle(r) }}</span>
-              <a
-                v-if="phoneHref(recordPhone(r))"
-                class="rec__phone"
-                :href="phoneHref(recordPhone(r))"
-                @click.stop
-              >
-                <PhoneCall :size="11" />
-                {{ recordPhone(r) }}
-              </a>
-            </div>
-            <div class="rec__col">
-              <span class="rec__cap">Priority</span>
-              <strong>{{ ticketRecordPriority(r) }}</strong>
-            </div>
-            <div class="rec__col">
-              <span class="rec__cap">Owner</span>
-              <strong>{{ ticketRecordOwner(r) }}</strong>
-            </div>
-            <div class="rec__col">
-              <span class="rec__cap">Status</span>
-              <span class="n-tag" :class="statusTone(r.status)">{{ r.status || 'open' }}</span>
-            </div>
-            <div class="rec__col rec__col--right">
-              <span class="rec__cap">Created</span>
-              <span class="rec__time n-mono">{{ formatRelativeDate(r.created_at) || '—' }}</span>
-            </div>
-          </li>
+          <template v-for="r in records" :key="r.id">
+            <li class="rec__row">
+              <div class="rec__id">
+                <strong class="n-truncate">{{ ticketRecordTitle(r) }}</strong>
+                <span class="rec__sub n-truncate">{{ ticketRecordSubtitle(r) }}</span>
+                <a
+                  v-if="phoneHref(recordPhone(r))"
+                  class="rec__phone"
+                  :href="phoneHref(recordPhone(r))"
+                  @click.stop
+                >
+                  <PhoneCall :size="11" />
+                  {{ recordPhone(r) }}
+                </a>
+              </div>
+              <div class="rec__col">
+                <span class="rec__cap">Priority</span>
+                <strong>{{ ticketRecordPriority(r) }}</strong>
+              </div>
+              <div class="rec__col">
+                <span class="rec__cap">Owner</span>
+                <strong>{{ ticketRecordOwner(r) }}</strong>
+              </div>
+              <div class="rec__col">
+                <span class="rec__cap">Status</span>
+                <span class="n-tag" :class="statusTone(r.status)">{{ r.status || 'open' }}</span>
+              </div>
+              <div class="rec__col rec__col--right">
+                <span class="rec__cap">Created</span>
+                <span class="rec__time n-mono">{{ formatRelativeDate(r.created_at) || '—' }}</span>
+              </div>
+            </li>
+            <!-- Post-call notes for this site visit (read-only). -->
+            <li v-if="recordHandoff(r)" class="tickets__handoff-row">
+              <div class="tickets__handoff-note">
+                <header>
+                  <span class="tickets__handoff-cap">Call notes</span>
+                  <span class="tickets__handoff-time">
+                    {{ formatRelativeDate(recordHandoff(r).at) || '' }}
+                  </span>
+                </header>
+                <blockquote>{{ recordHandoff(r).note }}</blockquote>
+              </div>
+            </li>
+          </template>
         </ul>
       </article>
     </section>
@@ -294,5 +320,49 @@ function statusTone(s) {
 @media (max-width: 1100px) {
   .rec__row { grid-template-columns: 1fr; gap: 8px; padding: 16px 20px; }
   .rec__col--right { justify-items: flex-start; text-align: left; }
+}
+
+/* Post-call notes block (mirrors LeadsView's leads__handoff-*). */
+.tickets__handoff-row {
+  list-style: none;
+  padding: 0 20px 14px;
+}
+.tickets__handoff-note {
+  display: grid;
+  gap: 6px;
+  padding: 12px 14px;
+  background: linear-gradient(180deg, var(--n-brand-soft) 0%, transparent 80%);
+  border: 1px solid rgba(99, 102, 241, 0.18);
+  border-radius: var(--n-r-md);
+}
+.tickets__handoff-note header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.tickets__handoff-cap {
+  font-family: var(--n-font-mono);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--n-brand-ink);
+  font-weight: 600;
+}
+.tickets__handoff-time {
+  font-family: var(--n-font-mono);
+  font-size: 10.5px;
+  color: var(--n-text-3);
+  letter-spacing: 0.02em;
+}
+.tickets__handoff-note blockquote {
+  margin: 0;
+  padding: 0;
+  font-size: 13.5px;
+  line-height: 1.55;
+  color: var(--n-text);
+  font-family: var(--n-font-display);
+  font-style: italic;
+  letter-spacing: -0.005em;
 }
 </style>

@@ -1,14 +1,10 @@
 <script setup>
 import { computed, ref } from 'vue';
-import { PauseCircle, PhoneCall, PlayCircle, Repeat, RefreshCw, Settings2, XCircle } from 'lucide-vue-next';
+import { PauseCircle, PhoneCall, PlayCircle, Repeat, RefreshCw, XCircle } from 'lucide-vue-next';
 import { useDashboardState } from '../composables/useDashboardState.js';
 
 const {
   businessTypeLabel,
-  schemaFor,
-  startFieldEdit,
-  fieldTypeIcon,
-  fieldTypeLabel,
   tabRecordsLoading,
   loadTabRecords,
   filteredLeadRecords,
@@ -18,8 +14,6 @@ const {
   UNCATEGORIZED_TAB_ID,
   leadRecordTitle,
   leadRecordSubtitle,
-  leadRecordBudget,
-  leadRecordLocation,
   recordPhone,
   phoneHref,
   formatRelativeDate,
@@ -68,7 +62,6 @@ function handoffWhen(iso) {
   }
 }
 
-const fields = computed(() => schemaFor?.('leads') || []);
 const records = computed(() => filteredLeadRecords?.value || []);
 const isLoading = computed(() => !!tabRecordsLoading?.value?.leads);
 const tabs = computed(() => leadCampaignTabs?.value || []);
@@ -172,40 +165,6 @@ async function toggleLeadFollowupPanel(leadId) {
       </div>
     </header>
 
-    <!-- Schema -->
-    <section class="n-section n-rise" data-delay="1">
-      <header class="n-section__head">
-        <div>
-          <h2 class="n-section__title">Lead fields</h2>
-          <p class="n-section__sub">These fields shape customer intake, follow-up, and agent-created leads.</p>
-        </div>
-        <div class="rec__schema-actions">
-          <span class="n-tag n-tag--mono">{{ fields.length }} fields</span>
-          <button type="button" class="n-btn n-btn--ghost n-btn--sm" @click="startFieldEdit('leads', 'Lead Fields')">
-            <Settings2 :size="13" />
-            Edit fields
-          </button>
-        </div>
-      </header>
-
-      <div class="rec__schema-grid">
-        <article
-          v-for="f in fields"
-          :key="f.key"
-          class="rec__schema-tile"
-          :class="{ 'is-required': f.required }"
-        >
-          <span class="rec__schema-icon">
-            <component :is="fieldTypeIcon(f.type)" :size="14" />
-          </span>
-          <div class="rec__schema-body">
-            <strong>{{ f.label }}</strong>
-            <span>{{ fieldTypeLabel(f.type) }}<em v-if="f.required"> · required</em></span>
-          </div>
-        </article>
-      </div>
-    </section>
-
     <!-- Records + campaign tabs -->
     <section class="n-section n-rise" data-delay="2">
       <header class="n-section__head">
@@ -259,14 +218,6 @@ async function toggleLeadFollowupPanel(leadId) {
                 </a>
               </div>
               <div class="rec__col">
-                <span class="rec__cap">Budget</span>
-                <strong>{{ leadRecordBudget(r) }}</strong>
-              </div>
-              <div class="rec__col">
-                <span class="rec__cap">Location</span>
-                <strong>{{ leadRecordLocation(r) }}</strong>
-              </div>
-              <div class="rec__col">
                 <span class="rec__cap">Follow-up</span>
                 <button
                   v-if="leadDbId(r)"
@@ -288,11 +239,12 @@ async function toggleLeadFollowupPanel(leadId) {
                 <span class="rec__time n-mono">{{ formatRelativeDate(r.created_at) || '—' }}</span>
               </div>
             </li>
-            <!-- Inbound leads / site-visits carry the post-call handoff note on
-                 the record itself and have no follow-up panel to expand, so
-                 surface it inline (read-only) for manager review. -->
+            <!-- Every lead is name + number + CALL NOTES. The post-call
+                 condenser writes a 3-sentence summary onto the record
+                 (data.handoff_note); surface it inline (read-only) for every
+                 row — agent-created and outbound-classified alike. -->
             <li
-              v-if="!leadDbId(r) && recordHandoff(r)?.handoff_note"
+              v-if="recordHandoff(r)?.handoff_note"
               class="leads__handoff-row"
             >
               <div class="leads__handoff-note">
@@ -309,21 +261,6 @@ async function toggleLeadFollowupPanel(leadId) {
               v-if="leadDbId(r) && expandedLeadId === leadDbId(r)"
               class="leads__followup-panel"
             >
-              <!-- Handoff note: 3-sentence summary the post-call condenser
-                   wrote the moment the last call ended. Read-only, surfaces
-                   the same prose that the follow-up agent's preamble quotes. -->
-              <div
-                v-if="recordHandoff(r)?.handoff_note"
-                class="leads__handoff-note"
-              >
-                <header>
-                  <span class="leads__handoff-cap">Last call notes</span>
-                  <span class="leads__handoff-time">
-                    {{ handoffWhen(recordHandoff(r).handoff_note_generated_at) }}
-                  </span>
-                </header>
-                <blockquote>{{ recordHandoff(r).handoff_note }}</blockquote>
-              </div>
               <div v-if="!(followupsFor(leadDbId(r)).length)" class="leads__followup-empty">
                 No follow-ups on the books for this lead yet.
               </div>

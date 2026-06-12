@@ -189,6 +189,16 @@ class FollowupSchedulerService:
         cue = cue or FollowupCue()
         rules = effective_followup_rules(campaign)
 
+        # Kill switch #0: clinics never auto-schedule. Follow-ups for clinic
+        # tenants are admin-commanded only (Customer base → Call now /
+        # Schedule, reason='manual', inserted directly by the API — never
+        # through this decision tree). Single choke point: every current and
+        # future call site inherits the gate.
+        if await FollowupSchedulerService._tenant_is_clinic(
+            tenant_id=lead.tenant_id, db=db
+        ):
+            return None
+
         # Kill switch #1: feature toggle.
         if not rules.get("enabled", True):
             return None
@@ -253,6 +263,46 @@ class FollowupSchedulerService:
         await db.commit()
         await db.refresh(row)
         return row
+
+    @staticmethod
+    def is_webhook_timed_out(row, now: datetime, timeout_minutes: int) -> bool:
+        """True when an in_flight row's status webhook never arrived within
+        the window. Uses updated_at (touched by mark_in_flight) so re-clamped
+        rows don't false-positive; rows with no timestamp count as timed out."""
+        if getattr(row, "status", None) != FollowupStatus.in_flight:
+            return False
+        stamp = getattr(row, "updated_at", None) or getattr(row, "created_at", None)
+        if stamp is None:
+            return True
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        return (now - stamp) > timedelta(minutes=int(timeout_minutes))
+
+    @staticmethod
+    async def _tenant_is_clinic(*, tenant_id: str, db: AsyncSession) -> bool:
+        """True when the tenant's organization is the clinics vertical.
+
+        Clinics never auto-schedule follow-ups (admin-commanded only).
+        Best-effort: resolution failure returns False so other verticals
+        keep their existing behaviour.
+        """
+        try:
+            from app.models.organization import Organization
+            from app.models.tenant_resources import TenantResources
+
+            result = await db.execute(
+                select(Organization.industry)
+                .join(
+                    TenantResources,
+                    TenantResources.organization_id == Organization.id,
+                )
+                .where(TenantResources.tenant_id == tenant_id)
+            )
+            industry = result.scalars().first()
+            return str(industry or "").strip().lower() == "clinics"
+        except Exception:
+            logger.debug("FOLLOWUP: business_type resolve failed", exc_info=True)
+            return False
 
     @staticmethod
     def _decide_scheduled_at(
@@ -620,11 +670,17 @@ class FollowupSchedulerService:
                 continue
             queue_buckets[FollowupSchedulerService._due_bucket(sched, now)] += 1
 
-        # ── Today's actionable queue (today + overdue), with the lead ──
+        # ── Today's actionable queue (today + overdue), with the target ──
+        # Outer joins: a row targets EITHER a lead (campaign path) or a
+        # customer (clinic manual path); inner-joining OutgoingLead would
+        # silently drop customer rows from the page.
+        from app.models.customer_base import CustomerBase
+
         queue_rows = (
             await db.execute(
-                select(T, OutgoingLead)
-                .join(OutgoingLead, OutgoingLead.id == T.lead_id)
+                select(T, OutgoingLead, CustomerBase)
+                .outerjoin(OutgoingLead, OutgoingLead.id == T.lead_id)
+                .outerjoin(CustomerBase, CustomerBase.id == T.customer_id)
                 .where(T.tenant_id == tenant_id)
                 .where(T.status == FollowupStatus.pending)
                 .where(T.scheduled_at < day_end)
@@ -634,21 +690,31 @@ class FollowupSchedulerService:
         today_queue = [
             {
                 "followup_id": str(row.id),
-                "lead_id": str(row.lead_id),
-                "name": lead.name,
-                "phone_e164": lead.phone_e164 or lead.phone_raw,
+                "lead_id": str(row.lead_id) if row.lead_id else None,
+                "customer_id": str(row.customer_id) if row.customer_id else None,
+                "name": (lead.name if lead else None) or (customer.name if customer else None),
+                "phone_e164": (
+                    (lead.phone_e164 or lead.phone_raw)
+                    if lead
+                    else (customer.phone_e164 if customer else None)
+                ),
                 "scheduled_at": row.scheduled_at.isoformat() if row.scheduled_at else None,
                 "overdue": bool(row.scheduled_at and row.scheduled_at < now),
                 "reason": row.reason.value if row.reason else None,
+                "note": row.note,
                 "attempts": int(row.attempts or 0),
                 "campaign_id": str(row.campaign_id) if row.campaign_id else None,
-                "handoff_note": lead.handoff_note,
+                "handoff_note": (
+                    lead.handoff_note
+                    if lead
+                    else (customer.last_call_summary if customer else None)
+                ),
                 "handoff_note_generated_at": (
                     lead.handoff_note_generated_at.isoformat()
-                    if lead.handoff_note_generated_at else None
+                    if lead and lead.handoff_note_generated_at else None
                 ),
             }
-            for row, lead in queue_rows
+            for row, lead, customer in queue_rows
         ]
 
         # ── Called: completed in the last 7 days + exhausted (failed) ──

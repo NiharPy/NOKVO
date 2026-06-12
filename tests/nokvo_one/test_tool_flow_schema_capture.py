@@ -19,7 +19,73 @@ from app.services.tool_flow_questions import (
     build_tool_flow_questions,
 )
 from app.services.nokvo_one_business_templates import field_catalog_for
-from app.services.tool_flow_policy import _extract_value
+from app.services.tool_flow_policy import _extract_value, evaluate_tool_flow_policy
+
+
+def test_caller_phone_auto_fills_phone_slot_from_ani():
+    # The caller's number (from call signaling) pre-fills the phone slot so the
+    # agent never asks the caller to recite digits (telephony STT mangles them).
+    res = evaluate_tool_flow_policy(
+        "I want to schedule a site visit",
+        business_type="real_estate",
+        state={"caller_phone": "+917569672503"},
+    )
+    assert res is not None
+    tf = (res.get("state_patch") or {}).get("tool_flow") or {}
+    assert tf.get("collected", {}).get("phone") == "+917569672503"
+    assert tf.get("phone_from_ani") is True
+    # The next slot it asks for is NOT the phone (it's already filled).
+    assert res.get("state_slot") != "phone"
+
+
+def test_name_confirmation_loop_is_capped():
+    # Telephony STT garbles names and re-confirming each fresh guess used to loop
+    # forever ("Nihar"→"Nikhil"→"Nh"→"Lord"). After 2 prompts it must accept the
+    # best-effort name and advance instead of confirming a 3rd time.
+    bt = "real_estate"
+    st = {"caller_phone": "+917569672503"}
+    r = evaluate_tool_flow_policy("I want to schedule a site visit", business_type=bt, state=st)
+    st["tool_flow"] = (r.get("state_patch") or {}).get("tool_flow") or {}
+    # Answer the name slot → confirmation begins.
+    r = evaluate_tool_flow_policy("Nihar", business_type=bt, state=st)
+    st["tool_flow"] = (r.get("state_patch") or {}).get("tool_flow") or {}
+    assert str(r.get("state_slot") or "").endswith("_confirm")
+    # 1st non-confirmation (caller repeats) → one more confirm (still capped).
+    r = evaluate_tool_flow_policy("Nikhil", business_type=bt, state=st)
+    st["tool_flow"] = (r.get("state_patch") or {}).get("tool_flow") or {}
+    assert str(r.get("state_slot") or "").endswith("_confirm")
+    # 2nd non-confirmation → cap reached → accept best-effort + advance (NOT a confirm).
+    r = evaluate_tool_flow_policy("Nihar", business_type=bt, state=st)
+    tf = (r.get("state_patch") or {}).get("tool_flow") or {}
+    assert not str(r.get("state_slot") or "").endswith("_confirm"), f"name confirm looped: {r.get('state_slot')}"
+    assert tf.get("collected", {}).get("name")  # a best-effort name was kept
+    assert not tf.get("awaiting_name_confirmation")
+
+
+def test_name_confirmation_accepts_clean_yes():
+    bt = "real_estate"
+    st = {"caller_phone": "+917569672503"}
+    r = evaluate_tool_flow_policy("I want to schedule a site visit", business_type=bt, state=st)
+    st["tool_flow"] = (r.get("state_patch") or {}).get("tool_flow") or {}
+    r = evaluate_tool_flow_policy("Nihar", business_type=bt, state=st)
+    st["tool_flow"] = (r.get("state_patch") or {}).get("tool_flow") or {}
+    r = evaluate_tool_flow_policy("yes", business_type=bt, state=st)
+    tf = (r.get("state_patch") or {}).get("tool_flow") or {}
+    assert not tf.get("awaiting_name_confirmation")
+    assert tf.get("collected", {}).get("name")
+
+
+def test_no_caller_phone_still_asks_for_phone():
+    # Mic tester / no ANI → phone slot stays empty and is collected normally.
+    res = evaluate_tool_flow_policy(
+        "I want to schedule a site visit",
+        business_type="real_estate",
+        state={},
+    )
+    assert res is not None
+    tf = (res.get("state_patch") or {}).get("tool_flow") or {}
+    assert not tf.get("collected", {}).get("phone")
+    assert not tf.get("phone_from_ani")
 from app.services.real_estate_agent_fsm import (
     AGENT_MODE_LEAD_CAPTURE,
     AGENT_MODE_QUERY,
@@ -66,7 +132,10 @@ def test_field_catalog_offers_real_estate_palette():
     tickets = {f["key"] for f in field_catalog_for("real_estate", "tickets")}
     leads = {f["key"] for f in field_catalog_for("real_estate", "leads")}
     assert {"name", "phone", "project_name", "visit_date", "visit_time", "budget"} <= tickets
-    assert {"name", "phone", "budget", "possession_timeline", "purpose", "financing"} <= leads
+    # Leads are intentionally NOT configurable — fixed to name + phone (the rest of
+    # the conversation lives in the post-call call notes). The catalog falls back
+    # to the trimmed config schema, so the leads palette is exactly {name, phone}.
+    assert leads == {"name", "phone"}
     # Unknown vertical/tab falls back to the default schema (never empty for a real tab).
     assert field_catalog_for("clinics", "appointments")
 
@@ -117,9 +186,12 @@ def test_extract_value_datetime_requires_both_date_and_time():
 # ── A2: lead_capture mode ───────────────────────────────────────────────────
 
 
-def test_active_leads_create_flow_derives_lead_capture_mode():
+def test_real_estate_enquiry_stays_query_never_lead_capture():
+    # Real estate no longer interrogates for lead fields mid-call. Even a stale
+    # leads_create flag resolves to QUERY (the lead is created end-of-call from
+    # ANI + summary). The agent just answers questions and nudges to a visit.
     st = {"tool_flow": {"active": True, "flow_key": "leads_create"}}
-    assert current_mode(st) == AGENT_MODE_LEAD_CAPTURE
+    assert current_mode(st) == AGENT_MODE_QUERY
 
 
 def test_site_visit_and_query_modes_unchanged():

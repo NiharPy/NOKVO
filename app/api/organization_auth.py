@@ -1818,7 +1818,9 @@ async def link_agent_phone_number(
 ):
     tenant_res = await _get_tenant_resources_for_org(db, current_user.organization_id)
     try:
-        public_base_url = settings.AGENT_PUBLIC_BASE_URL or str(request.base_url).rstrip("/")
+        from app.services.public_url import public_base_url as _pub
+
+        public_base_url = _pub(request)
         link = await PlivoService.link_agent_phone_number(
             tenant_res,
             db,
@@ -1953,7 +1955,9 @@ async def launch_agent_campaign(
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
     try:
-        base_url = settings.AGENT_PUBLIC_BASE_URL or str(request.base_url).rstrip("/")
+        from app.services.public_url import public_base_url as _pub
+
+        base_url = _pub(request)
         campaign = await OutboundCampaignService.launch_campaign(campaign, db, public_base_url=base_url)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc

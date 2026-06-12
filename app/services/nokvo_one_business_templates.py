@@ -30,11 +30,9 @@ STATUS_VOCABULARIES: dict[str, dict[str, dict[str, Any]]] = {
         },
     },
     "clinics": {
-        "leads": {
-            "initial": "new",
-            "all": ["new", "contacted", "qualified", "scheduled", "no_show", "lost"],
-            "forward": ["new", "contacted", "qualified", "scheduled"],
-        },
+        # NOTE: clinics have NO leads tab — every inbound caller lands in the
+        # Customer base (customer_base table) instead, and follow-ups are
+        # admin-commanded from there.
         "tickets": {
             "initial": "open",
             "all": ["open", "in_progress", "waiting_on_patient", "resolved", "closed", "escalated"],
@@ -217,15 +215,12 @@ BUSINESS_TYPE_CONFIGS: dict[str, dict[str, Any]] = {
             {"value": "general_query", "label": "General Query"},
         ],
         "schemas": {
-            # Lead Fields — captured for an ENQUIRY (no site visit). Buyer
-            # qualification: who they are and what they're looking for.
+            # Lead Fields — an ENQUIRY (no site visit) captures ONLY the caller's
+            # name + phone; everything else about the conversation lives in the
+            # post-call "call notes" (data.handoff_note) written by the condenser.
             "leads": [
-                {"key": "name", "label": "Customer Name", "type": "text", "required": True},
-                {"key": "phone", "label": "Phone", "type": "phone", "required": True},
-                {"key": "property_type", "label": "Looking For", "type": "select", "required": False},
-                {"key": "budget", "label": "Budget", "type": "currency", "required": False},
-                {"key": "location", "label": "Area", "type": "text", "required": False},
-                {"key": "status", "label": "Status", "type": "select", "required": True},
+                {"key": "name", "label": "Customer Name", "type": "text", "required": False},
+                {"key": "phone", "label": "Phone", "type": "phone", "required": False},
             ],
             # Site Visit Fields — captured when BOOKING a site visit. The
             # booking tool stores values under these keys so the Site Visits
@@ -242,16 +237,17 @@ BUSINESS_TYPE_CONFIGS: dict[str, dict[str, Any]] = {
         "prompt": (
             "Business Type: Real Estate. Two outcomes only: (1) book a SITE VISIT (capture name, phone, "
             "project, and a date/time) which goes to the Site Visits tab; or (2) if the caller only "
-            "enquires about details and does not book a visit, capture a LEAD (name, phone, what they're "
-            "looking for, budget, area) which goes to the Leads tab. Answer property questions from the "
-            "project inventory."
+            "enquires about details and does not book a visit, capture a LEAD (just their name and phone) "
+            "which goes to the Leads tab. Do not interrogate enquiry callers for budget or area — answer "
+            "their property questions from the project inventory and capture only name + phone."
         ),
     },
     "clinics": {
         "value": "clinics",
         "label": "Clinics",
         "member_label": "Doctors / Staff",
-        "tabs": ["tickets", "leads", "appointments"],
+        # No "leads" tab: clinic callers are captured in the Customer base.
+        "tabs": ["tickets", "appointments"],
         "request_types": [
             {"value": "appointment", "label": "Appointment"},
             {"value": "follow_up", "label": "Follow-up"},
@@ -269,14 +265,8 @@ BUSINESS_TYPE_CONFIGS: dict[str, dict[str, Any]] = {
             {"value": "emergency_escalation", "label": "Emergency Escalation"},
         ],
         "schemas": {
-            "leads": [
-                {"key": "patient_name", "label": "Patient Name", "type": "text", "required": True},
-                {"key": "phone", "label": "Phone", "type": "phone", "required": True},
-                {"key": "care_need", "label": "Reason", "type": "text", "required": True},
-                {"key": "preferred_doctor", "label": "Doctor", "type": "text", "required": False},
-                {"key": "source", "label": "Source", "type": "select", "required": False},
-                {"key": "status", "label": "Status", "type": "select", "required": True},
-            ],
+            # No "leads" schema: interested-but-not-booking callers are already
+            # in the Customer base (number + post-call notes) automatically.
             "tickets": [
                 {"key": "patient_name", "label": "Patient Name", "type": "text", "required": True},
                 {"key": "ticket_type", "label": "Request Type", "type": "select", "required": True},
@@ -285,6 +275,9 @@ BUSINESS_TYPE_CONFIGS: dict[str, dict[str, Any]] = {
                 {"key": "status", "label": "Status", "type": "select", "required": True},
             ],
             "appointments": [
+                # NOTE: no "service" slot by default — the booking flow resolves
+                # the service from the free-text reason (find_service_match), and
+                # admins can add an explicit Service field from FIELD_CATALOG.
                 {"key": "patient_name", "label": "Patient Name", "type": "text", "required": True},
                 {"key": "phone", "label": "Phone", "type": "phone", "required": True},
                 {"key": "doctor", "label": "Doctor", "type": "text", "required": False},
@@ -295,8 +288,10 @@ BUSINESS_TYPE_CONFIGS: dict[str, dict[str, Any]] = {
             ],
         },
         "prompt": (
-            "Business Type: Clinics. Support appointments, appointment intake, clinic lead capture, patient support "
-            "tickets, doctor or department routing, and reminders. Do not provide diagnosis, treatment, "
+            "Business Type: Clinics. Support appointments, appointment intake, patient support "
+            "tickets, doctor or department routing, and reminders. Every caller is recorded in the "
+            "clinic's customer base automatically — do not interrogate non-booking callers for "
+            "details; answer their questions and offer to book. Do not provide diagnosis, treatment, "
             "or emergency medical advice; escalate urgent symptoms, medical uncertainty, billing disputes, "
             "or privacy-sensitive requests to clinic staff."
         ),
@@ -505,18 +500,9 @@ def enabled_tabs_for(business_type: str | None) -> list[str]:
 # the suggested palette, not a hard whitelist.
 FIELD_CATALOG: dict[str, dict[str, list[dict[str, Any]]]] = {
     "real_estate": {
-        "leads": [
-            {"key": "name", "label": "Customer Name", "type": "text", "required": True},
-            {"key": "phone", "label": "Phone", "type": "phone", "required": True},
-            {"key": "email", "label": "Email", "type": "email", "required": False},
-            {"key": "property_type", "label": "Looking For", "type": "select", "required": False},
-            {"key": "budget", "label": "Budget", "type": "currency", "required": False},
-            {"key": "location", "label": "Area", "type": "text", "required": False},
-            {"key": "possession_timeline", "label": "Possession Timeline", "type": "select", "required": False},
-            {"key": "purpose", "label": "Purpose", "type": "select", "required": False},
-            {"key": "financing", "label": "Financing Needed", "type": "select", "required": False},
-            {"key": "notes", "label": "Notes", "type": "text", "required": False},
-        ],
+        # NOTE: leads are intentionally NOT configurable — an enquiry lead is
+        # fixed to name + phone + post-call notes (see BUSINESS_TYPE_CONFIGS).
+        # Only the site-visit (tickets) schema is admin-selectable.
         "tickets": [
             {"key": "name", "label": "Customer Name", "type": "text", "required": True},
             {"key": "phone", "label": "Phone", "type": "phone", "required": True},
@@ -538,13 +524,7 @@ FIELD_CATALOG: dict[str, dict[str, list[dict[str, Any]]]] = {
             {"key": "reason", "label": "Visit Reason", "type": "text", "required": False},
             {"key": "notes", "label": "Notes", "type": "text", "required": False},
         ],
-        "leads": [
-            {"key": "patient_name", "label": "Patient Name", "type": "text", "required": True},
-            {"key": "phone", "label": "Phone", "type": "phone", "required": True},
-            {"key": "care_need", "label": "Reason", "type": "text", "required": False},
-            {"key": "preferred_doctor", "label": "Doctor", "type": "text", "required": False},
-            {"key": "notes", "label": "Notes", "type": "text", "required": False},
-        ],
+        # clinics have no leads — callers land in the Customer base instead.
     },
 }
 

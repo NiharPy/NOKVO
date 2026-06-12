@@ -274,6 +274,11 @@ const isCalling = computed(() => !['idle', 'error'].includes(voiceStatus.value))
             {{ isSavingPhoneLink ? 'Saving…' : 'Save number' }}
           </button>
         </div>
+
+        <ol v-if="phoneLink?.forwarding_steps?.length" class="agent__phone-steps">
+          <li class="agent__phone-cap">Set up call forwarding (one time, on your phone):</li>
+          <li v-for="(step, i) in phoneLink.forwarding_steps" :key="i">{{ step }}</li>
+        </ol>
       </article>
     </section>
 

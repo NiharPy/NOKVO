@@ -15,20 +15,25 @@ from app.services.clinic_agent_fsm import (
 )
 
 
-# ── Tabs: Appointments + Leads, no Tickets ──────────────────────────────────
+# ── Tabs: Appointments + Tickets, no Leads ──────────────────────────────────
 
 
-def test_clinic_tabs_are_appointments_and_leads_no_tickets():
+def test_clinic_tabs_have_appointments_but_no_leads():
+    # Clinics have no leads tab: every caller lands in the Customer base
+    # instead, and follow-ups are admin-commanded from there.
     tabs = enabled_tabs_for("clinics")
     assert "appointments" in tabs
-    assert "leads" in tabs
-    assert "tickets" not in tabs
+    assert "leads" not in tabs
 
 
-def test_clinic_appointments_schema_has_service_field():
-    cfg = business_type_config("clinics")
-    appt_keys = [f["key"] for f in cfg["schemas"]["appointments"]]
-    assert "service" in appt_keys
+def test_clinic_appointments_service_field_is_selectable():
+    # "service" is intentionally NOT in the default appointments schema (the
+    # flow resolves it from the free-text reason); it lives in the admin's
+    # selectable field palette instead.
+    from app.services.nokvo_one_business_templates import field_catalog_for
+
+    palette_keys = [f["key"] for f in field_catalog_for("clinics", "appointments")]
+    assert "service" in palette_keys
 
 
 # ── Service matching (drives service-first routing) ─────────────────────────

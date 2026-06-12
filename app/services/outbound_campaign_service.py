@@ -881,6 +881,8 @@ class OutboundCampaignService:
                         opted_out=False,
                         converted=converted_outcome,
                     )
+                    # Clinic tenants are gated inside enqueue_after_call
+                    # (kill switch #0): clinics never auto-schedule.
                     await FollowupSchedulerService.enqueue_after_call(
                         lead=lead,
                         campaign=campaign,
@@ -915,6 +917,30 @@ class OutboundCampaignService:
                     except Exception:
                         logger.exception(
                             "NOKVO-CAMPAIGN: failed to mark follow-up row complete"
+                        )
+                # Customer-targeted follow-up: bump the customer's call
+                # counters (inbound calls do this at WS teardown; outbound
+                # customer calls land here via the status webhook).
+                if target.get("customer_id"):
+                    try:
+                        from datetime import datetime as _dt, timezone as _tz
+
+                        from app.models.customer_base import CustomerBase
+
+                        cust = await db.get(
+                            CustomerBase, uuid.UUID(str(target["customer_id"]))
+                        )
+                        if cust is not None:
+                            cust.last_call_at = _dt.now(_tz.utc)
+                            cust.call_count = int(cust.call_count or 0) + 1
+                            cust.last_call_id = str(
+                                target.get("call_id") or call_link_id
+                            )
+                            db.add(cust)
+                            await db.commit()
+                    except Exception:
+                        logger.exception(
+                            "NOKVO-CAMPAIGN: failed to bump customer counters"
                         )
             else:
                 await db.commit()
@@ -1056,11 +1082,6 @@ class OutboundCampaignService:
         if followup is None:
             return None, None
 
-        lead_res = await db.execute(
-            select(OutgoingLead).where(OutgoingLead.id == followup.lead_id)
-        )
-        lead = lead_res.scalars().first()
-
         campaign = None
         if followup.campaign_id is not None:
             cr_res = await db.execute(
@@ -1069,6 +1090,33 @@ class OutboundCampaignService:
                 )
             )
             campaign = cr_res.scalars().first()
+
+        # Customer-targeted follow-up (clinic manual path): synthesize the
+        # contact from the CustomerBase row. No lead_id — downstream code
+        # keys lead-only behavior (consent, auto-followup enqueue) on it.
+        if followup.customer_id is not None and followup.lead_id is None:
+            from app.models.customer_base import CustomerBase
+
+            customer = await db.get(CustomerBase, followup.customer_id)
+            synthetic_contact = {
+                "call_link_id": call_link_id,
+                "customer_id": str(followup.customer_id),
+                "tenant_id": followup.tenant_id,
+                "phone": customer.phone_e164 if customer else None,
+                "name": (customer.name if customer else None) or "",
+                "status": "calling",
+                "is_followup": True,
+                "_followup_id": str(followup.id),
+                "_source_call_id": followup.source_call_id,
+                "_attempt_n": int(followup.attempts or 0),
+                "_admin_note": followup.note or "",
+            }
+            return campaign, synthetic_contact
+
+        lead_res = await db.execute(
+            select(OutgoingLead).where(OutgoingLead.id == followup.lead_id)
+        )
+        lead = lead_res.scalars().first()
 
         synthetic_contact = {
             "call_link_id": call_link_id,

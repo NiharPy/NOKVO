@@ -26,6 +26,7 @@ Tenant isolation is enforced via TenantResources lookups for every path:
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import json
@@ -760,26 +761,55 @@ def _lead_response(lead: OutgoingLead) -> dict[str, Any]:
     }
 
 
-def _phone_link_summary(request: Request, tr: TenantResources) -> dict[str, Any]:
+async def _phone_link_summary(request: Request, tr: TenantResources) -> dict[str, Any]:
     """Call-forwarding view: the auto-provisioned Plivo DID the tenant forwards their
-    own number to, the number's status, and the (auto-configured) webhook URLs."""
+    own number to, the number's status, the (auto-configured) webhook URLs, and a
+    webhook_health block answering "is Plivo actually reaching us"."""
     from app.services.plivo_service import PlivoService
+    from app.services.public_url import public_base_url, ws_base_url
 
     summary = PlivoService.phone_link_response(tr)
     link_id = summary.get("link_id")
-    host = request.url.hostname or "localhost"
-    scheme_http = "https" if request.url.scheme == "https" else "http"
-    scheme_ws = "wss" if request.url.scheme == "https" else "ws"
-    port = f":{request.url.port}" if request.url.port else ""
+    base_http = public_base_url(request)
+    base_ws = ws_base_url(request)
     if link_id:
-        summary["inbound_webhook_url"] = f"{scheme_http}://{host}{port}/api/nokvo-one/agents/plivo/voice/{link_id}"
-        summary["inbound_media_url"] = f"{scheme_ws}://{host}{port}/api/nokvo-one/agents/plivo/media/{link_id}"
+        summary["inbound_webhook_url"] = f"{base_http}/api/nokvo-one/agents/plivo/voice/{link_id}"
+        summary["inbound_media_url"] = f"{base_ws}/api/nokvo-one/agents/plivo/media/{link_id}"
+        # Webhook health: stored vs expected answer_url (catches a stale Plivo
+        # Application after a base-URL change) + the latest webhook/stream
+        # breadcrumbs recorded by the handlers.
+        plivo_cfg = dict((tr.provider_status or {}).get("plivo") or {})
+        stored = plivo_cfg.get("answer_url")
+        expected = PlivoService.expected_answer_url(str(link_id), base_http)
+        summary["webhook_health"] = {
+            "answer_url_stored": stored,
+            "answer_url_expected": expected,
+            "in_sync": bool(stored) and stored == expected,
+            "last_inbound_webhook": await _read_webhook_event(str(link_id), "voice"),
+            "last_stream_event": await _read_webhook_event(str(link_id), "stream"),
+            "last_stream_error": await _read_webhook_event(str(link_id), "stream_error"),
+        }
     did = summary.get("plivo_number")
-    summary["forwarding_instructions"] = (
-        f"Enable call-forwarding on your number to {did} so calls reach your agent."
-        if did else
-        "Your Plivo number is being provisioned (carrier verification) — a number to forward to will appear here shortly."
-    )
+    if did:
+        did_intl = did if str(did).startswith("+") else f"+{did}"
+        summary["forwarding_instructions"] = (
+            f"Forward your business number to {did_intl} so incoming calls reach your AI agent."
+        )
+        # Standard GSM call-forwarding codes. Use the international (+) format —
+        # carriers often reject the bare number with 'Setting Registration Failed'.
+        summary["forwarding_steps"] = [
+            "On iPhone, prefer: Settings → Phone → Call Forwarding → turn ON → enter the number below.",
+            f"Or dial to forward ALL calls: **21*{did_intl}#  then press call.",
+            f"Or forward only when busy / unanswered / off: **004*{did_intl}#  then press call.",
+            "Turn it off any time: ##21# (all) or ##004# (conditional), then press call.",
+            "If you see 'Setting Registration Failed': call-forwarding isn't enabled on your SIM — ask your carrier to activate it (often off by default on prepaid/Jio).",
+            "Test: call your business number from another phone — the agent should answer.",
+        ]
+    else:
+        summary["forwarding_instructions"] = (
+            "Your Plivo number is being provisioned (carrier verification) — a number to forward to will appear here shortly."
+        )
+        summary["forwarding_steps"] = []
     return summary
 
 
@@ -790,7 +820,7 @@ async def get_phone_link(
     db: AsyncSession = Depends(deps.get_db),
 ):
     tr = await _tenant_for_user(db, user)
-    return _phone_link_summary(request, tr)
+    return await _phone_link_summary(request, tr)
 
 
 @router.post("/phone-link")
@@ -811,7 +841,7 @@ async def set_phone_link(
     db.add(tr)
     await db.commit()
     await db.refresh(tr)
-    return _phone_link_summary(request, tr)
+    return await _phone_link_summary(request, tr)
 
 
 # ────────────────────────── Lead sources and consented leads ──────────────────────────
@@ -1105,17 +1135,118 @@ async def receive_meta_leadgen_webhook(request: Request, db: AsyncSession = Depe
 # ────────────────────────── Plivo inbound ──────────────────────────
 
 
-def _plivo_stream_xml(media_url: str) -> str:
+def _plivo_stream_xml(media_url: str, status_url: str | None = None) -> str:
     """Plivo answer XML: bidirectional <Stream> bridging the caller's audio to our
-    media WS (L16 @ the configured rate). Playback flows back via `playAudio`."""
+    media WS (L16 @ the configured rate). Playback flows back via `playAudio`.
+    `statusCallbackUrl` makes Plivo POST stream lifecycle/errors so we can diagnose."""
     rate = settings.PLIVO_DEFAULT_SAMPLE_RATE or 8000
+    status_attr = (
+        f' statusCallbackUrl="{status_url}" statusCallbackMethod="POST"' if status_url else ""
+    )
+    # No <?xml?> declaration — matches Plivo's documented example exactly.
     return (
-        '<?xml version="1.0" encoding="UTF-8"?>'
         "<Response>"
         f'<Stream bidirectional="true" keepCallAlive="true" audioTrack="inbound" '
-        f'contentType="audio/x-l16;rate={rate}">{media_url}</Stream>'
+        f'contentType="audio/x-l16;rate={rate}"{status_attr}>{media_url}</Stream>'
         "</Response>"
     )
+
+
+# ── Plivo webhook signature validation (X-Plivo-Signature-V2) ──────────
+# V2 scheme: base64(HMAC-SHA256(auth_token, full_url + nonce)). The URL Plivo
+# signed is the PUBLIC one it called — reconstruct it via public_url, never
+# request.url (which is the internal host behind a proxy). Mode is
+# PLIVO_VALIDATE_SIGNATURES: off | warn | enforce (default warn so the first
+# real call confirms whether the master or subaccount token signs).
+
+
+def _verify_plivo_signature(url: str, nonce: str, signature: str, tokens: list[str]) -> str | None:
+    """Return the index-label of the token that validates ('master'/'tenant'),
+    or None when nothing matches. Constant-time comparison per candidate."""
+    if not nonce or not signature:
+        return None
+    labels = ("master", "tenant")
+    for i, token in enumerate(tokens):
+        if not token:
+            continue
+        expected = base64.b64encode(
+            hmac.new(token.encode("utf-8"), (url + nonce).encode("utf-8"), hashlib.sha256).digest()
+        ).decode("utf-8")
+        # Plivo may send several comma-separated signatures during token rotation.
+        for candidate in signature.split(","):
+            if hmac.compare_digest(expected, candidate.strip()):
+                return labels[i] if i < len(labels) else str(i)
+    return None
+
+
+async def _check_plivo_signature(request: Request, *, tenant_token: str | None = None) -> bool:
+    """Validate per PLIVO_VALIDATE_SIGNATURES. Returns True when the request
+    may proceed (valid, warn-mode mismatch, or validation disabled)."""
+    mode = (settings.PLIVO_VALIDATE_SIGNATURES or "off").strip().lower()
+    if mode not in ("warn", "enforce") or not settings.PLIVO_AUTH_TOKEN:
+        return True
+    from app.services.public_url import public_base_url
+
+    signature = request.headers.get("x-plivo-signature-v2") or ""
+    nonce = request.headers.get("x-plivo-signature-v2-nonce") or ""
+    path_qs = request.url.path + (f"?{request.url.query}" if request.url.query else "")
+    public_url = f"{public_base_url(request)}{path_qs}"
+    matched = _verify_plivo_signature(
+        public_url, nonce, signature, [settings.PLIVO_AUTH_TOKEN, tenant_token or ""]
+    )
+    if matched:
+        logger.debug("PLIVO-SIG ok (%s token) %s", matched, request.url.path)
+        return True
+    logger.warning(
+        "PLIVO-SIG %s: signature mismatch path=%s nonce=%s sig_present=%s",
+        mode, request.url.path, bool(nonce), bool(signature),
+    )
+    return mode != "enforce"
+
+
+# ── Webhook observability ──────────────────────────────────────────────
+# Best-effort Redis breadcrumbs (TTL 7 days) so /phone-link can answer the
+# two diagnostic questions for "inbound calls don't connect": did Plivo's
+# voice webhook reach us, and did the media <Stream> then connect or error.
+_WEBHOOK_EVENT_TTL_S = 7 * 24 * 3600
+
+
+def _webhook_event_key(link_id: str, kind: str) -> str:
+    return f"plivo:wh:{link_id}:{kind}"
+
+
+def _record_webhook_event(link_id: str, kind: str, data: dict) -> None:
+    """Fire-and-forget: never blocks or fails the webhook response."""
+    import asyncio as _asyncio
+    from datetime import datetime as _dt, timezone as _tz
+
+    async def _write() -> None:
+        try:
+            from app.services.agent_session_store import AgentSessionStore
+
+            client = AgentSessionStore.client()
+            payload = {"ts": _dt.now(_tz.utc).isoformat(), **data}
+            await client.set(
+                _webhook_event_key(link_id, kind), json.dumps(payload)[:2000],
+                ex=_WEBHOOK_EVENT_TTL_S,
+            )
+        except Exception:
+            logger.debug("PLIVO webhook event record failed", exc_info=True)
+
+    try:
+        _asyncio.get_running_loop().create_task(_write())
+    except RuntimeError:
+        pass
+
+
+async def _read_webhook_event(link_id: str, kind: str) -> dict | None:
+    try:
+        from app.services.agent_session_store import AgentSessionStore
+
+        raw = await AgentSessionStore.client().get(_webhook_event_key(link_id, kind))
+        return json.loads(raw) if raw else None
+    except Exception:
+        return None
 
 
 @router.post("/plivo/voice/{link_id}", response_class=PlainTextResponse)
@@ -1127,21 +1258,82 @@ async def plivo_inbound_webhook(
         return PlainTextResponse(
             "<Response><Hangup/></Response>", media_type="application/xml", status_code=404
         )
-    host = request.url.hostname or "localhost"
-    scheme = "wss" if request.url.scheme == "https" else "ws"
-    port = f":{request.url.port}" if request.url.port else ""
-    media_url = f"{scheme}://{host}{port}/api/nokvo-one/agents/plivo/media/{link_id}"
-    return PlainTextResponse(_plivo_stream_xml(media_url), media_type="application/xml")
+    _tenant_token = None
+    try:
+        from app.services.plivo_service import PlivoService as _PS
+
+        _tenant_token = _PS._subaccount_token(_PS._plivo_config(tr))
+    except Exception:
+        _tenant_token = None
+    if not await _check_plivo_signature(request, tenant_token=_tenant_token):
+        return PlainTextResponse(
+            "<Response><Hangup/></Response>", media_type="application/xml", status_code=403
+        )
+    # The caller's number (ANI) — Plivo posts it as `From`. We pass it to the media
+    # WS so the agent can auto-fill the phone slot instead of asking the caller to
+    # recite digits (which telephony STT mangles).
+    from urllib.parse import quote
+    try:
+        form = dict(await request.form())
+    except Exception:
+        form = {}
+    from_number = str(form.get("From") or form.get("from") or "").strip()
+    # URLs must be PUBLIC — behind a TLS-terminating proxy request.url says
+    # http://internal-host, which yields ws:// media URLs Plivo can't open
+    # (call answers → dead air). public_url prefers PLIVO_WEBHOOK_BASE_URL.
+    from app.services.public_url import public_base_url, ws_base_url
+
+    media_url = f"{ws_base_url(request)}/api/nokvo-one/agents/plivo/media/{link_id}"
+    if from_number:
+        media_url = f"{media_url}?caller={quote(from_number)}"
+    status_url = f"{public_base_url(request)}/api/nokvo-one/agents/plivo/stream-status/{link_id}"
+    xml = _plivo_stream_xml(media_url, status_url)
+    logger.info("PLIVO-INBOUND voice webhook link_id=%s from=%s xml=%s", link_id, from_number, xml)
+    _record_webhook_event(link_id, "voice", {"from": from_number})
+    return PlainTextResponse(xml, media_type="text/xml")
+
+
+@router.post("/plivo/stream-status/{link_id}")
+async def plivo_stream_status(link_id: str, request: Request):
+    """Plivo posts <Stream> lifecycle events (connected / error / disconnected) here.
+
+    A stream error here is THE diagnostic for "call answers then dead air" —
+    log it loudly and persist it so /phone-link's webhook_health surfaces it."""
+    if not await _check_plivo_signature(request):
+        raise HTTPException(status_code=403, detail="Plivo signature verification failed")
+    try:
+        payload = dict(await request.form())
+    except Exception:
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+    event = str(
+        payload.get("Event") or payload.get("event") or payload.get("Status") or payload.get("status") or ""
+    ).lower()
+    is_error = any(token in event for token in ("error", "fail")) or bool(
+        payload.get("ErrorCode") or payload.get("error")
+    )
+    if is_error:
+        logger.error("PLIVO-STREAM-STATUS error link_id=%s payload=%s", link_id, payload)
+        _record_webhook_event(link_id, "stream_error", {"event": event, "payload": str(payload)[:800]})
+    else:
+        logger.info("PLIVO-STREAM-STATUS link_id=%s payload=%s", link_id, payload)
+    _record_webhook_event(link_id, "stream", {"event": event or "unknown"})
+    return {"ok": True}
 
 
 @router.websocket("/plivo/media/{link_id}")
 async def plivo_inbound_media_websocket(websocket: WebSocket, link_id: str):
+    caller_phone = websocket.query_params.get("caller") or None
+    print(f"PLIVO-MEDIA ws connect link_id={link_id} caller={caller_phone}", flush=True)
     async for db in deps.get_db():
         tr = await _tenant_by_link_id(db, link_id)
         if not tr:
+            print(f"PLIVO-MEDIA no tenant for link_id={link_id} → closing", flush=True)
             await websocket.close(code=1008)
             return
-        await PlivoBridgeService.run_session(websocket, tr, db=db)
+        await PlivoBridgeService.run_session(websocket, tr, db=db, caller_phone=caller_phone)
         return
 
 
@@ -1152,10 +1344,13 @@ async def plivo_inbound_media_websocket(websocket: WebSocket, link_id: str):
 async def plivo_outbound_answer(call_link_id: str, request: Request):
     """Plivo fetches this when the outbound call connects → returns the <Stream> XML
     that bridges audio to the agent's outbound media WS."""
-    host = request.url.hostname or "localhost"
-    scheme = "wss" if request.url.scheme == "https" else "ws"
-    port = f":{request.url.port}" if request.url.port else ""
-    media_url = f"{scheme}://{host}{port}/api/nokvo-one/agents/plivo/outbound-media/{call_link_id}"
+    from app.services.public_url import ws_base_url
+
+    if not await _check_plivo_signature(request):
+        return PlainTextResponse(
+            "<Response><Hangup/></Response>", media_type="application/xml", status_code=403
+        )
+    media_url = f"{ws_base_url(request)}/api/nokvo-one/agents/plivo/outbound-media/{call_link_id}"
     return PlainTextResponse(_plivo_stream_xml(media_url), media_type="application/xml")
 
 
@@ -1163,14 +1358,43 @@ async def plivo_outbound_answer(call_link_id: str, request: Request):
 async def plivo_outbound_status(
     call_link_id: str, request: Request, db: AsyncSession = Depends(deps.get_db)
 ):
-    campaign, contact = await OutboundCampaignService.get_by_call_link_id(call_link_id, db)
-    is_followup = bool(contact and contact.get("is_followup"))
-    if not campaign and not is_followup:
-        return {"ok": False, "reason": "campaign_not_found"}
+    if not await _check_plivo_signature(request):
+        raise HTTPException(status_code=403, detail="Plivo signature verification failed")
+    # Parse the payload FIRST (with a hard {} fallback — a malformed body must
+    # never NameError) so it can be stashed even when the row isn't found yet.
     try:
         payload = dict(await request.form())
     except Exception:
-        payload = await request.json()
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+    campaign, contact = await OutboundCampaignService.get_by_call_link_id(call_link_id, db)
+    is_followup = bool(contact and contact.get("is_followup"))
+    if not campaign and not is_followup:
+        # The webhook can race the call-placement commit (Plivo posts status
+        # before mark_in_flight lands). One short retry, then stash the event
+        # for the reconciliation sweep and return 200 — a non-200 here means
+        # the event is lost forever.
+        await asyncio.sleep(2.0)
+        campaign, contact = await OutboundCampaignService.get_by_call_link_id(call_link_id, db)
+        is_followup = bool(contact and contact.get("is_followup"))
+        if not campaign and not is_followup:
+            try:
+                from app.services.agent_session_store import AgentSessionStore
+
+                await AgentSessionStore.client().set(
+                    f"plivo:orphan-status:{call_link_id}",
+                    json.dumps(payload)[:4000],
+                    ex=900,
+                )
+            except Exception:
+                logger.debug("PLIVO orphan-status stash failed", exc_info=True)
+            logger.warning(
+                "PLIVO-OUTBOUND-STATUS: no campaign/followup for call_link_id=%s — deferred",
+                call_link_id,
+            )
+            return {"ok": True, "deferred": True, "call_link_id": call_link_id}
     event_type = str(
         payload.get("Status")
         or payload.get("status")
@@ -1214,6 +1438,17 @@ async def plivo_outbound_media_websocket(websocket: WebSocket, call_link_id: str
             )
             lead = lead_res.scalars().first()
             tenant_id = lead.tenant_id if lead else None
+        # Customer-targeted follow-up (clinic manual path): the synthetic
+        # contact carries tenant_id directly; fall back to the customer row.
+        if tenant_id is None and contact.get("tenant_id"):
+            tenant_id = str(contact["tenant_id"])
+        if tenant_id is None and contact.get("customer_id"):
+            from app.models.customer_base import CustomerBase as _CB
+            try:
+                _cust = await db.get(_CB, uuid.UUID(str(contact["customer_id"])))
+            except (TypeError, ValueError):
+                _cust = None
+            tenant_id = _cust.tenant_id if _cust else None
         if not tenant_id:
             await websocket.close(code=1008)
             return
@@ -1260,6 +1495,19 @@ async def plivo_outbound_media_websocket(websocket: WebSocket, call_link_id: str
                         _tr_note = (tr.data or {}).get("handoff_note")
                         if _tr_note:
                             followup_handoff_note = str(_tr_note).strip() or None
+        elif is_followup and contact.get("customer_id"):
+            # Customer follow-up: the prior-call summary lives on the
+            # CustomerBase row (written by the condenser at every call end).
+            from app.models.customer_base import CustomerBase as _CB
+
+            try:
+                _cust_uuid = uuid.UUID(str(contact["customer_id"]))
+            except (TypeError, ValueError):
+                _cust_uuid = None
+            if _cust_uuid is not None:
+                _cust_row = await db.get(_CB, _cust_uuid)
+                if _cust_row is not None and _cust_row.last_call_summary:
+                    followup_handoff_note = str(_cust_row.last_call_summary).strip() or None
 
         campaign_context = {
             "campaign_id": str(campaign.id) if campaign else None,
@@ -1270,6 +1518,10 @@ async def plivo_outbound_media_websocket(websocket: WebSocket, call_link_id: str
             "attempt_n": int(contact.get("_attempt_n") or 0) + 1 if is_followup else None,
             "source_call_id": contact.get("_source_call_id") if is_followup else None,
             "handoff_note": followup_handoff_note,
+            # Admin's typed purpose for a manual customer follow-up — rendered
+            # as the REASON FOR THIS CALL block in the outbound prompt.
+            "admin_note": (contact.get("_admin_note") or "").strip() or None,
+            "customer_id": contact.get("customer_id"),
             "opening_message": (
                 f"Start the follow-up call for {contact.get('name') or 'the recipient'}. "
                 "Acknowledge the prior conversation briefly before asking your first question."
@@ -1280,14 +1532,17 @@ async def plivo_outbound_media_websocket(websocket: WebSocket, call_link_id: str
                 )
             ),
         }
-        await NokvoOneVoiceStreamService.run_session(
-            adapter,
-            tr,
-            db=db,
-            language=campaign_language,
-            call_id=call_link_id,
-            campaign_context=campaign_context,
-        )
+        try:
+            await NokvoOneVoiceStreamService.run_session(
+                adapter,
+                tr,
+                db=db,
+                language=campaign_language,
+                call_id=call_link_id,
+                campaign_context=campaign_context,
+            )
+        finally:
+            adapter.close_audio()
         return
 
 
@@ -1506,7 +1761,9 @@ async def launch_campaign(
     campaign = await OutboundCampaignService.get_campaign(campaign_id, tr, db)
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
-    public_base = f"{request.url.scheme}://{request.url.netloc}"
+    from app.services.public_url import public_base_url as _pub
+
+    public_base = _pub(request)
     try:
         campaign = await OutboundCampaignService.launch_campaign(
             campaign,
@@ -1584,11 +1841,13 @@ def _followup_response(row) -> dict:
     return {
         "id": str(row.id),
         "tenant_id": row.tenant_id,
-        "lead_id": str(row.lead_id),
+        "lead_id": str(row.lead_id) if row.lead_id else None,
+        "customer_id": str(getattr(row, "customer_id", None)) if getattr(row, "customer_id", None) else None,
         "campaign_id": str(row.campaign_id) if row.campaign_id else None,
         "source_call_id": row.source_call_id,
         "scheduled_at": row.scheduled_at.isoformat() if row.scheduled_at else None,
         "reason": row.reason.value if row.reason else None,
+        "note": getattr(row, "note", None),
         "attempts": int(row.attempts or 0),
         "status": row.status.value if row.status else None,
         "placed_call_id": row.placed_call_id,

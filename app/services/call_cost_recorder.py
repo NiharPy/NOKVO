@@ -63,6 +63,7 @@ async def record_call_cost(
     ended_at: datetime,
     kind: str = "inbound",
     campaign_id: Any = None,
+    trace_id: str | None = None,
 ) -> CallCost | None:
     """Insert a single CallCost row for a completed session.
 
@@ -118,6 +119,7 @@ async def record_call_cost(
             rate_per_second=RUPEES_PER_SECOND.quantize(Decimal("0.000001")),
             started_at=started_at,
             ended_at=ended_at,
+            trace_id=trace_id,
             created_at=datetime.now(timezone.utc),
         )
         .on_conflict_do_nothing(index_elements=["call_id"])

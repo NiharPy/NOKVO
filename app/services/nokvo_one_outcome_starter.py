@@ -39,8 +39,6 @@ OUTCOME_PACKS: dict[str, list[dict[str, Any]]] = {
                 "appointments_create",
                 "appointments_set_status",
                 "appointments_search",
-                "leads_create",
-                "leads_add_note",
                 "book_appointment_with_lead_capture",
             ],
             "prompt_fragment": (

@@ -755,7 +755,10 @@ class NokvoOneVoiceStreamService:
         # One node per user turn. Inner classifier / retrieval / LLM
         # spans auto-attach as children via tracing_context.
         from app.services.langsmith_tracer import trace_turn as _ls_trace_turn
-        async with _ls_trace_turn(
+        # OTel turn span (LLM → TTS → response). Attaches to the call span via
+        # the contextvar the parent task snapshotted. No-op when OTel is off.
+        from app.services.otel_tracer import trace_stage as _otel_trace_stage
+        async with _otel_trace_stage("turn", turn_id=turn_id, source=source), _ls_trace_turn(
             turn_id=turn_id,
             user_text=cleaned,
             mode=source,
@@ -934,6 +937,24 @@ class NokvoOneVoiceStreamService:
             # ``campaign_context.contact.phone``; inbound webhooks stash
             # ``from_phone``. Failures are silent — a cold call is the
             # default and always works.
+            if turn_index == 0:
+                # Persist the caller's number (ANI / campaign contact) into session
+                # state so the booking slot engine can auto-fill the phone slot —
+                # no spoken-digit capture (which telephony STT garbles). Runs even
+                # when memory already has facts, so the phone is always available.
+                try:
+                    _cp = None
+                    _contact0 = (campaign_context or {}).get("contact")
+                    if isinstance(_contact0, dict):
+                        _cp = _contact0.get("phone") or _contact0.get("phone_e164")
+                    _cp = _cp or (campaign_context or {}).get("from_phone")
+                    if _cp and call_id:
+                        from app.services.voice_turn_policy import normalize_phone_number as _norm_ph
+                        await AgentSessionStore.merge_state(
+                            tenant_res, call_id, {"caller_phone": _norm_ph(str(_cp)) or str(_cp)}
+                        )
+                except Exception:
+                    logger.debug("NOKVO: persist caller_phone failed", exc_info=True)
             if turn_index == 0 and not conv_memory.facts:
                 caller_phone = None
                 try:
@@ -1013,6 +1034,12 @@ class NokvoOneVoiceStreamService:
                             # via bootstrap; not present here on first turn, so
                             # we leave it blank for the WS-handler-seeded path.
                             "prior_promise": "",
+                            # Admin's typed purpose for a manual customer
+                            # follow-up (clinic path). Rendered as the REASON
+                            # FOR THIS CALL block by the composer.
+                            "admin_note": str(
+                                campaign_context.get("admin_note") or ""
+                            ).strip(),
                         }
                     prompt_outbound_memory = update_outbound_memory(
                         stored_outbound_memory,
@@ -1307,6 +1334,12 @@ class NokvoOneVoiceStreamService:
                             "clip_ratio": round(quality.clip_ratio, 4),
                             "silence_ratio": round(quality.silence_ratio, 4),
                             "duration_ms": quality.duration_ms,
+                            # Conditioning-chain telemetry (when the adapter
+                            # carries the enhancer/denoiser): what gain the
+                            # AGC settled at and how speech-like RNNoise
+                            # judged the most recent frames.
+                            "agc_gain": round(float(getattr(getattr(websocket, "_enhancer", None), "gain", 0.0) or 0.0), 3),
+                            "speech_prob": round(float(getattr(getattr(websocket, "_denoiser", None), "last_speech_prob", 0.0) or 0.0), 3),
                         }
                     )
                 except Exception:
@@ -1321,6 +1354,16 @@ class NokvoOneVoiceStreamService:
                         websocket, tenant_res, language=recover_lang,
                     )
                     return
+                # Trim leading dead air (keep ~100 ms pre-roll) before STT —
+                # the model anchors better when the clip starts at speech.
+                try:
+                    from app.services.agent_robustness import trim_leading_silence
+
+                    trimmed = trim_leading_silence(pcm, sample_rate=pcm_sample_rate)
+                    if len(trimmed) < len(pcm):
+                        audio_bytes = _pcm16le_to_wav(trimmed, sample_rate=pcm_sample_rate)
+                except Exception:
+                    pass
 
         # Run native + translate STT concurrently. Cap each so a slow Sarvam
         # response can't blow the first-sentence latency budget.
@@ -1658,12 +1701,33 @@ class NokvoOneVoiceStreamService:
             "is_followup": bool(isinstance(campaign_context, dict) and (campaign_context or {}).get("is_followup")),
             "outbound": outbound_context_override is not None or bool(isinstance(campaign_context, dict) and (campaign_context or {}).get("campaign_id")),
         }
-        async with _ls_trace_call(
+        # ── OpenTelemetry root span for this call ────────────────────
+        # Outermost so its W3C trace id is active when the LangSmith run
+        # opens (cross-linked via otel_trace_id) and so every log line
+        # emitted during the call carries [trace=<id>] via the logging
+        # filter. No-op when OTEL_ENABLED is false.
+        from app.services.otel_tracer import trace_call_span, current_trace_id
+        _caller_phone_for_trace = (campaign_context or {}).get("from_phone")
+        _call_kind_for_trace = "outbound" if _ls_call_meta.get("outbound") else "inbound"
+        async with trace_call_span(
+            call_id=call_id,
+            tenant_id=tenant_id_str,
+            caller_phone=_caller_phone_for_trace,
+            kind=_call_kind_for_trace,
+        ), _ls_trace_call(
             call_id=call_id,
             tenant_id=tenant_id_str,
             organization_id=organization_id_uuid,
+            otel_trace_id=(current_trace_id() or None),
             **_ls_call_meta,
         ) as _ls_call_run:
+            # The single anchor line support greps for: phone+time → trace_id.
+            _otel_trace_id = current_trace_id() or None
+            logger.info(
+                "NOKVO-CALL-START call_id=%s tenant=%s kind=%s caller=%s trace_id=%s",
+                call_id, tenant_id_str, _call_kind_for_trace,
+                _caller_phone_for_trace or "-", _otel_trace_id or "-",
+            )
             company_name = await NokvoOneVoiceStreamService._company_name(db, tenant_res)
             current_turn: asyncio.Task | None = None
             # Mutable state shared with the in-flight _run_text_turn so the dispatcher
@@ -1697,6 +1761,35 @@ class NokvoOneVoiceStreamService:
                     # Pipeline still works without the proactive config —
                     # it falls back to the legacy goal-only behaviour.
                     logger.warning(f"NOKVO-OUTBOUND: load_outbound_context failed: {exc!r}")
+                    outbound_context = None
+            elif (
+                outbound_context is None
+                and isinstance(campaign_context, dict)
+                and campaign_context.get("is_followup")
+                and campaign_context.get("customer_id")
+            ):
+                # Customer-targeted manual follow-up (clinic path): no
+                # campaign row exists — synthesize the proactive context from
+                # the admin's note + the clinic services catalog. Gated to
+                # clinics; other verticals fall back to legacy goal-only.
+                try:
+                    _bt_for_outbound = await _resolve_business_type(db, tenant_res)
+                    if _bt_for_outbound == "clinics":
+                        from app.services.clinic_outbound_context import (
+                            build_clinic_followup_context,
+                        )
+
+                        outbound_context = await build_clinic_followup_context(
+                            db,
+                            organization_id=organization_id_uuid,
+                            admin_note=campaign_context.get("admin_note"),
+                            customer_name=(campaign_context.get("contact") or {}).get("name"),
+                            company_name=company_name,
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        f"NOKVO-OUTBOUND: clinic followup context build failed: {exc!r}"
+                    )
                     outbound_context = None
             proactive_watchdog: ProactiveSilenceWatchdog | None = None
 
@@ -1881,6 +1974,8 @@ class NokvoOneVoiceStreamService:
                                 "silence_ratio": round(quality.silence_ratio, 4),
                                 "duration_ms": quality.duration_ms,
                                 "source": "stream_pcm",
+                                "agc_gain": round(float(getattr(getattr(websocket, "_enhancer", None), "gain", 0.0) or 0.0), 3),
+                                "speech_prob": round(float(getattr(getattr(websocket, "_denoiser", None), "last_speech_prob", 0.0) or 0.0), 3),
                             }
                         )
                     except Exception:
@@ -1979,7 +2074,13 @@ class NokvoOneVoiceStreamService:
                     and not _outbound_skip_translate
                     and not NokvoOneVoicePipeline.should_skip_translate_for_native_query(text)
                 ):
-                    translate_audio = bytes(utterance_audio)
+                    # Trim leading dead air (keep ~100 ms pre-roll) — STT
+                    # anchors better when the clip starts near the speech.
+                    from app.services.agent_robustness import trim_leading_silence
+
+                    translate_audio = trim_leading_silence(
+                        bytes(utterance_audio), sample_rate=sample_rate
+                    )
                 utterance_audio.clear()
 
                 await _drain_turn(current_turn)
@@ -2482,6 +2583,7 @@ class NokvoOneVoiceStreamService:
                         ended_at=datetime.now(timezone.utc),
                         kind=cost_kind,
                         campaign_id=cost_campaign_id,
+                        trace_id=_otel_trace_id,
                     )
                 except Exception:
                     logger.exception("NOKVO-VOICE: failed to record call cost")
@@ -2510,6 +2612,45 @@ class NokvoOneVoiceStreamService:
                 except Exception:
                     logger.exception("NOKVO-MEMORY: promote_to_caller_memory failed at session end")
 
+                # ── Customer base upsert (inbound calls, all tenants) ─────
+                # One row per (tenant, caller number): new callers insert,
+                # repeat callers bump last_call_at/call_count. Name is
+                # fill-only (COALESCE in the service) — a misheard STT name
+                # must never overwrite one already on file. Outbound calls
+                # are excluded here; customer-targeted follow-ups bump their
+                # counters in the campaign status webhook instead.
+                try:
+                    _cb_outbound = locals().get("outbound_context")
+                    _cb_phone = None
+                    _cb_contact = None
+                    if isinstance(final_campaign_context, dict):
+                        _cb_phone = final_campaign_context.get("from_phone")
+                        # Outbound calls (campaign or follow-up) always carry a
+                        # contact dict; inbound never does. Gate on both so an
+                        # outbound follow-up without a campaign context isn't
+                        # miscounted as an inbound call.
+                        _cb_contact = final_campaign_context.get("contact")
+                    if _cb_outbound is None and not _cb_contact and _cb_phone:
+                        from app.services.customer_base_service import (
+                            upsert_customer_from_call,
+                        )
+
+                        _cb_name = None
+                        try:
+                            if final_memory.has("name"):
+                                _cb_name = final_memory.get("name")
+                        except Exception:
+                            _cb_name = None
+                        await upsert_customer_from_call(
+                            db,
+                            tenant_id=tenant_id_str,
+                            phone=str(_cb_phone),
+                            name=_cb_name,
+                            call_id=str(call_id),
+                        )
+                except Exception:
+                    logger.exception("NOKVO-CUSTOMER: customer_base upsert failed at session end")
+
                 # ── Post-call handoff note (fire-and-forget) ──────────────
                 # One cheap LLM call against the global gpt-5.4-mini deployment
                 # produces a 3-sentence summary the next follow-up call's
@@ -2529,9 +2670,16 @@ class NokvoOneVoiceStreamService:
                 if (
                     outbound_ctx is not None
                     and isinstance(contact_for_followup, dict)
-                    and contact_for_followup.get("lead_id")
+                    and (
+                        contact_for_followup.get("lead_id")
+                        or contact_for_followup.get("customer_id")
+                    )
                 ):
                     _lead_id_raw = contact_for_followup.get("lead_id")
+                    # Customer-targeted follow-up (clinic manual path): the note
+                    # goes to CustomerBase.last_call_summary, not a lead row.
+                    _customer_id_raw = contact_for_followup.get("customer_id")
+                    _customer_tenant_id = tenant_id_str
                     _lead_name = (contact_for_followup.get("name") or "").strip() or None
                     _campaign_name = None
                     if isinstance(final_campaign_context, dict):
@@ -2574,6 +2722,29 @@ class NokvoOneVoiceStreamService:
                                 timeout_s=8.0,
                             )
                             if not note:
+                                return
+                            if _customer_id_raw and not _lead_id_raw:
+                                try:
+                                    customer_uuid = uuid.UUID(str(_customer_id_raw))
+                                except (TypeError, ValueError):
+                                    return
+                                from app.services.customer_base_service import (
+                                    record_call_summary,
+                                )
+
+                                async with AsyncSessionLocal() as bg_db:
+                                    written = await record_call_summary(
+                                        bg_db,
+                                        tenant_id=_customer_tenant_id,
+                                        summary=note,
+                                        customer_id=customer_uuid,
+                                        call_id=str(_bg_call_id),
+                                    )
+                                if written:
+                                    logger.info(
+                                        "NOKVO-CONDENSE: call summary written for customer %s (%d chars)",
+                                        customer_uuid, len(note),
+                                    )
                                 return
                             try:
                                 lead_uuid = uuid.UUID(str(_lead_id_raw))
@@ -2632,7 +2803,11 @@ class NokvoOneVoiceStreamService:
                         _inbound_record_ids.append(str(_tf_created))
                     # De-dup, preserve order (a record may be referenced twice).
                     _inbound_record_ids = list(dict.fromkeys(_inbound_record_ids))
-                    if _inbound_record_ids:
+                    # Run when the call created records OR when we know the
+                    # caller's number — non-booking callers still get their
+                    # summary onto the Customer base row so a later manual
+                    # follow-up opens with context.
+                    if _inbound_record_ids or _cb_phone:
                         _bg_tenant_res_in = tenant_res
                         _bg_call_id_in = call_id
                         _bg_call_run_in = _ls_call_run
@@ -2643,7 +2818,10 @@ class NokvoOneVoiceStreamService:
                             _bg_lead_name_in = None
 
                         async def _condense_and_persist_inbound(
-                            record_ids=_inbound_record_ids, lead_name=_bg_lead_name_in
+                            record_ids=_inbound_record_ids,
+                            lead_name=_bg_lead_name_in,
+                            cb_phone=_cb_phone,
+                            cb_tenant_id=tenant_id_str,
                         ):
                             try:
                                 from app.services.call_condenser_service import condense_call
@@ -2694,6 +2872,27 @@ class NokvoOneVoiceStreamService:
                                         "NOKVO-CONDENSE: inbound handoff note written to %d record(s) for call %s (%d chars)",
                                         written, _bg_call_id_in, len(note),
                                     )
+                                    # Same note onto the caller's Customer base
+                                    # row (best-effort — the row was upserted at
+                                    # teardown just before this task started).
+                                    if cb_phone:
+                                        try:
+                                            from app.services.customer_base_service import (
+                                                record_call_summary,
+                                            )
+
+                                            async with AsyncSessionLocal() as bg_db2:
+                                                await record_call_summary(
+                                                    bg_db2,
+                                                    tenant_id=cb_tenant_id,
+                                                    summary=note,
+                                                    phone=str(cb_phone),
+                                                    call_id=str(_bg_call_id_in),
+                                                )
+                                        except Exception:
+                                            logger.exception(
+                                                "NOKVO-CONDENSE: customer summary write failed"
+                                            )
                                 finally:
                                     try:
                                         if _ls_tcm is not None:

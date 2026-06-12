@@ -11,6 +11,7 @@ export const pageKeyToRouteName = {
   dashboard: 'dash-home',
   tickets: 'dash-tickets',
   leads: 'dash-leads',
+  customers: 'dash-customers',
   followups: 'dash-followups',
   appointments: 'dash-appointments',
   projects: 'dash-projects',
