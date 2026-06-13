@@ -374,6 +374,108 @@ def _latency_guard_text(language: str | None) -> str:
     }.get(language or "en", "One moment, I'm checking that.")
 
 
+# ── End-of-utterance completeness tiering ────────────────────────────────────
+# Adaptive endpointing: vary the silence debounce by how COMPLETE the caller's
+# utterance looks, so the common "answering the agent" turn fires fast (~450ms)
+# while trailing-off speech still waits long enough not to get cut off mid-
+# thought. Pure + side-effect-free so it is unit-testable in isolation. A false
+# "fast" is the quality risk, so the logic biases toward the slower tiers.
+
+# Trailing words that almost always precede MORE speech → wait the longest.
+_EOU_CONTINUATION_TAIL_WORDS = {
+    "a", "an", "and", "but", "or", "to", "of", "in", "on", "at", "by", "for",
+    "with", "if", "when", "while", "because", "so", "that", "the", "this",
+    "these", "those", "i", "he", "she", "we", "they", "it", "you", "my",
+    "your", "his", "her", "our", "their", "is", "are", "was", "were", "be",
+    "been", "being", "have", "has", "had", "do", "does", "did", "would",
+    "could", "should", "will", "shall", "may", "might", "uh", "um", "uhm",
+    "hmm", "like", "as", "from", "than", "then", "where", "why", "how",
+}
+# Sentence-FINAL discourse particles (Indian English / Hinglish). These mark
+# completion, NOT continuation ("two BHK na" is a finished answer), so strip
+# them before judging and never treat them as continuation cues. "to"/"toh" is
+# deliberately EXCLUDED — English infinitive "I want to" must stay continuation.
+_EOU_DISCOURSE_PARTICLES = {
+    "na", "naa", "haan", "han", "haa", "matlab", "bas", "only", "ya", "yaa",
+    "re", "da", "ra",
+}
+# Short yes/no/acknowledgement answers (incl. a few Hinglish) → complete.
+_EOU_YESNO_WORDS = {
+    "yes", "yeah", "yep", "yup", "ya", "no", "nope", "nah", "sure", "ok", "okay",
+    "correct", "right", "exactly", "fine", "done", "perfect", "alright", "haan",
+    "han", "theek", "sari", "sare", "avunu", "thanks", "thank",
+}
+# Time/day tokens + the small connectors allowed inside a pure time answer.
+_EOU_TIME_WORDS = {
+    "morning", "afternoon", "evening", "noon", "midnight", "tonight", "tomorrow",
+    "today", "yesterday", "monday", "tuesday", "wednesday", "thursday", "friday",
+    "saturday", "sunday", "weekend", "weekday", "oclock", "o'clock", "am", "pm",
+    "sharp", "anytime",
+}
+_EOU_TIME_CONNECTORS = {
+    "at", "on", "by", "around", "this", "next", "the", "in", "a", "of", "and",
+    "to", "after", "before",
+}
+_EOU_NUMBER_CONTEXT_WORDS = {"number", "phone", "mobile", "contact", "whatsapp"}
+
+
+def _eou_token_is_timeish(tok: str) -> bool:
+    if tok in _EOU_TIME_WORDS or tok in _EOU_TIME_CONNECTORS:
+        return True
+    if tok.isdigit():
+        return True
+    if ":" in tok and tok.replace(":", "").isdigit():
+        return True
+    return False
+
+
+def _eou_completeness_tier(text: str) -> str:
+    """Return ``"fast"`` | ``"neutral"`` | ``"continuation"`` for the EOU wait.
+
+    Only HIGH-confidence-complete utterances get ``"fast"``; anything ambiguous
+    falls to ``"neutral"``; trailing-off speech stays ``"continuation"``.
+    """
+    low = (text or "").strip().lower()
+    if not low:
+        return "neutral"
+    # A real '?' is a reliable completion signal (STT adds it for question
+    # intonation). A trailing '.' is NOT (STT inserts it on any pause), so we
+    # never fast-fire on '.' alone.
+    ended_question = low.rstrip(" .,!;:'\"`").endswith("?") or "؟" in low
+    words = [w.strip(".,!?;:'\"`।॥") for w in low.split()]
+    words = [w for w in words if w]
+    if not words:
+        return "neutral"
+    # Strip trailing Hinglish discourse particles ("two BHK na" → "two BHK").
+    while len(words) > 1 and words[-1] in _EOU_DISCOURSE_PARTICLES:
+        words.pop()
+    last = words[-1]
+    # 1) Clear question → complete regardless of the trailing word.
+    if ended_question:
+        return "fast"
+    # 2) Mid-number dictation ("my number is 98…") → the rest is coming.
+    if last.isdigit() and len(last) < 10 and any(w in _EOU_NUMBER_CONTEXT_WORDS for w in words):
+        return "continuation"
+    # 3) Trails off on a function word / filler → wait the longest.
+    if last in _EOU_CONTINUATION_TAIL_WORDS:
+        return "continuation"
+    # 4) Short yes/no/acknowledgement answer.
+    if len(words) <= 3 and (words[0] in _EOU_YESNO_WORDS or last in _EOU_YESNO_WORDS):
+        return "fast"
+    # 5) A PURE time/day answer ("10 AM", "tomorrow at 4", "Saturday morning") —
+    #    but NOT a declarative that merely mentions a day ("Saturday works",
+    #    where "works" is not time-ish → falls through to neutral).
+    if (
+        len(words) <= 6
+        and all(_eou_token_is_timeish(w) for w in words)
+        and any(w not in _EOU_TIME_CONNECTORS for w in words)  # ≥1 real time token, not just connectors
+    ):
+        return "fast"
+    # 6) Everything else (declaratives, noun phrases) → neutral: leaves room for
+    #    a self-correction ("…actually Sunday") to land and restart the timer.
+    return "neutral"
+
+
 class NokvoOneVoiceStreamService:
     @staticmethod
     async def _company_name(db: AsyncSession | None, tenant_res: TenantResources) -> str:
@@ -1863,18 +1965,13 @@ class NokvoOneVoiceStreamService:
             # with no new speech — i.e., the user actually finished their thought.
             EOU_DEBOUNCE_MS = max(500, int(settings.VOICE_EOU_DEBOUNCE_MS))
             EOU_CONTINUATION_BONUS_MS = max(0, int(settings.VOICE_EOU_CONTINUATION_BONUS_MS))
-            # Trailing words that almost always precede more speech. Bumping the
-            # debounce when the buffer ends in one of these saves us from cutting
-            # off thoughts like "Basically he asked me to" / "you guys would be".
-            _CONTINUATION_TAIL_WORDS = {
-                "a", "an", "and", "but", "or", "to", "of", "in", "on", "at", "by", "for",
-                "with", "if", "when", "while", "because", "so", "that", "the", "this",
-                "these", "those", "i", "he", "she", "we", "they", "it", "you", "my",
-                "your", "his", "her", "our", "their", "is", "are", "was", "were", "be",
-                "been", "being", "have", "has", "had", "do", "does", "did", "would",
-                "could", "should", "will", "shall", "may", "might", "uh", "um", "uhm",
-                "hmm", "like", "as", "from", "than", "then", "where", "why", "how",
-            }
+            # Adaptive endpointing tiers (see module-level _eou_completeness_tier):
+            # fire fast on high-confidence-complete utterances, a moderate wait on
+            # ambiguous declaratives, and keep DEBOUNCE+BONUS for trailing-off
+            # speech. The continuation word list now lives at module level
+            # (_EOU_CONTINUATION_TAIL_WORDS) so the classifier is unit-testable.
+            EOU_COMPLETE_MS = max(200, int(settings.VOICE_EOU_COMPLETE_MS))
+            EOU_NEUTRAL_MS = max(400, int(settings.VOICE_EOU_NEUTRAL_MS))
             utterance_segments: list[str] = []
             utterance_language: list[str] = [language]
             eou_timer_task: asyncio.Task | None = None
@@ -2171,27 +2268,39 @@ class NokvoOneVoiceStreamService:
                     eou_timer_task.cancel()
                 eou_timer_task = None
 
-            def _eou_delay_ms() -> int:
-                """Base debounce + a bonus when the buffer trails off on a
-                function word (continuation cue)."""
+            def _eou_decision() -> tuple[str, int]:
+                """Adaptive end-of-utterance wait → ``(tier, delay_ms)``. Fire fast
+                on high-confidence-complete utterances (questions, time/yes-no
+                answers), a moderate wait on ambiguous declaratives, and keep the
+                long DEBOUNCE+BONUS wait when speech trails off — cutting latency
+                without cutting callers off. See module-level _eou_completeness_tier."""
                 if not utterance_segments:
-                    return EOU_DEBOUNCE_MS
-                tail = utterance_segments[-1].strip().lower()
-                # Strip trailing punctuation if any sneaks through.
-                tail = tail.rstrip(".,!?;:'\"`")
-                last_word = tail.split()[-1] if tail else ""
-                if last_word in _CONTINUATION_TAIL_WORDS:
-                    return EOU_DEBOUNCE_MS + EOU_CONTINUATION_BONUS_MS
-                return EOU_DEBOUNCE_MS
+                    return "neutral", EOU_NEUTRAL_MS
+                full = " ".join(s for s in utterance_segments if s).strip()
+                tier = _eou_completeness_tier(full)
+                if tier == "continuation":
+                    return tier, EOU_DEBOUNCE_MS + EOU_CONTINUATION_BONUS_MS
+                if tier == "fast":
+                    return tier, EOU_COMPLETE_MS
+                return "neutral", EOU_NEUTRAL_MS
 
             def _restart_eou_timer() -> None:
                 nonlocal eou_timer_task
                 _cancel_eou_timer()
-                delay_ms = _eou_delay_ms()
+                tier, delay_ms = _eou_decision()
 
                 async def _timer() -> None:
                     try:
                         await asyncio.sleep(delay_ms / 1000)
+                        # Latency telemetry: the EOU wait is the dominant pre-turn
+                        # cost and is invisible to LangSmith (which spans only the
+                        # turn itself). Log the chosen tier + delay so the sub-1s
+                        # budget is attributable per turn — alongside LangSmith's
+                        # LLM / retrieval / TTS latencies and the turn's
+                        # first_sentence_ms / total_ms.
+                        logger.info(
+                            "NOKVO-LATENCY-EOU: fired tier=%s delay_ms=%d", tier, delay_ms
+                        )
                         await _fire_turn()
                     except asyncio.CancelledError:
                         pass

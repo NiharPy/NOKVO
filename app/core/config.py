@@ -321,8 +321,14 @@ class Settings(BaseSettings):
     # when the library is missing or fails to import, the feature disables
     # itself with one warning and audio passes through untouched.
     VOICE_STT_DENOISE_ENABLED: bool = True
-    VOICE_EOU_DEBOUNCE_MS: int = 1200     # Silence before firing a streaming-STT turn (longer = fewer mid-sentence cuts on telephony pauses)
+    VOICE_EOU_DEBOUNCE_MS: int = 1200     # Trailing-off speech: silence before firing (continuation tier; + bonus below)
     VOICE_EOU_CONTINUATION_BONUS_MS: int = 1100  # Extra wait when speech likely continues
+    # Adaptive endpointing (see _eou_completeness_tier). Most turns answer the
+    # agent (question / time / yes-no) → fire fast; ambiguous declaratives wait a
+    # moderate amount; only trailing-off speech keeps the long DEBOUNCE+BONUS.
+    # Start conservative; tighten COMPLETE only as the cut-off guardrail allows.
+    VOICE_EOU_COMPLETE_MS: int = 450      # High-confidence-complete utterance → fire fast
+    VOICE_EOU_NEUTRAL_MS: int = 700       # Ambiguous declarative → moderate wait (room for self-correction)
     VOICE_FIRST_SENTENCE_TIMEOUT_MS: int = 1800  # Speak a short hold if LLM has not yielded. The
     # typical first-sentence latency for the GPT-4 family ~900-1200ms, so the older 900ms threshold
     # caused the "one moment, I'm checking that" filler to fire on nearly every turn. 1800ms keeps

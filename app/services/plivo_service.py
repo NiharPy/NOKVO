@@ -362,3 +362,93 @@ class PlivoService:
             "answer_url": cfg.get("answer_url"),
             "latency_target_ms": 800,
         }
+
+    # ── WhatsApp sender connect (per-tenant WABA sender) ─────────────────────────
+    # Voice DIDs are auto-provisioned; a WhatsApp sender is NOT — the number must
+    # first be onboarded to a WhatsApp Business Account in Plivo/Meta. These let a
+    # tenant connect that already-onboarded number so WhatsAppService._resolve_sender
+    # picks it up (auth still resolves to the tenant's subaccount, exactly like voice).
+    @staticmethod
+    def _normalize_whatsapp_number(raw: str | None) -> str | None:
+        """Trim formatting to a bare sender. Keeps a leading '+' when given;
+        returns None when there aren't enough digits to be a phone number."""
+        s = (raw or "").strip()
+        if not s:
+            return None
+        plus = s.startswith("+")
+        digits = "".join(ch for ch in s if ch.isdigit())
+        if len(digits) < 8:
+            return None
+        return ("+" + digits) if plus else digits
+
+    @staticmethod
+    def whatsapp_link_response(tenant_res: TenantResources) -> dict:
+        """Connection status for the tenant's WhatsApp sender. ``ready_to_send``
+        is the honest end-to-end gate: a number is connected AND the feature
+        switch (PLIVO_WHATSAPP_ENABLED) is on. Per-project brochure/location
+        templates must still be Meta-approved before anything delivers."""
+        cfg = PlivoService._plivo_config(tenant_res)
+        number = cfg.get("whatsapp_number")
+        connected = bool(number)
+        enabled = bool(settings.PLIVO_WHATSAPP_ENABLED)
+        return {
+            "provider": "plivo",
+            "whatsapp_number": number,
+            "status": cfg.get("whatsapp_status") or ("connected" if connected else "not_connected"),
+            "connected": connected,
+            "feature_enabled": enabled,          # global master switch
+            "ready_to_send": connected and enabled,
+            "uses_subaccount": bool(cfg.get("subaccount_auth_id")),
+            "connected_at": cfg.get("whatsapp_connected_at"),
+        }
+
+    @classmethod
+    async def connect_whatsapp_number(cls, tenant_res, db, *, whatsapp_number: str) -> dict:
+        """Connect (or update) the tenant's WhatsApp Business sender number.
+
+        Records WHICH number our sends originate from; authenticates as the
+        tenant's subaccount when present (else master), mirroring voice. The
+        number must already be WABA-onboarded in Plivo/Meta — this does not
+        provision it. Idempotent."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        number = cls._normalize_whatsapp_number(whatsapp_number)
+        if not number:
+            raise PlivoError("A valid WhatsApp sender number is required.")
+        ps = dict(tenant_res.provider_status or {})
+        cfg = dict(ps.get("plivo") or {})
+        cfg["whatsapp_number"] = number
+        cfg["whatsapp_status"] = "connected"
+        cfg["whatsapp_connected_at"] = datetime.now(timezone.utc).isoformat()
+        ps["plivo"] = cfg
+        tenant_res.provider_status = ps
+        try:
+            flag_modified(tenant_res, "provider_status")
+        except Exception:
+            pass  # non-ORM stand-ins (tests) have no instrumentation
+        db.add(tenant_res)
+        await db.commit()
+        await db.refresh(tenant_res)
+        return cls.whatsapp_link_response(tenant_res)
+
+    @classmethod
+    async def disconnect_whatsapp_number(cls, tenant_res, db) -> dict:
+        """Disconnect the tenant's WhatsApp sender — sends then skip
+        (``no_whatsapp_sender``); never borrows another tenant's sender."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        ps = dict(tenant_res.provider_status or {})
+        cfg = dict(ps.get("plivo") or {})
+        cfg.pop("whatsapp_number", None)
+        cfg["whatsapp_status"] = "not_connected"
+        cfg["whatsapp_disconnected_at"] = datetime.now(timezone.utc).isoformat()
+        ps["plivo"] = cfg
+        tenant_res.provider_status = ps
+        try:
+            flag_modified(tenant_res, "provider_status")
+        except Exception:
+            pass
+        db.add(tenant_res)
+        await db.commit()
+        await db.refresh(tenant_res)
+        return cls.whatsapp_link_response(tenant_res)

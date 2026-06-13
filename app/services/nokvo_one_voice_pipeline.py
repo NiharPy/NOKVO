@@ -2797,6 +2797,178 @@ class NokvoOneVoicePipeline:
         return args
 
     @staticmethod
+    async def _send_brochure_and_location_to_caller(
+        db: AsyncSession,
+        org_id: Any,
+        tenant_res: TenantResources,
+        call_id: str,
+        state: dict[str, Any],
+    ) -> None:
+        """At call end, push the project brochure + location to the caller's
+        WhatsApp (their ANI). This is the inbound-real-estate replacement for the
+        old name/phone interrogation — the number is the one they're calling from,
+        so nothing is asked. Idempotent per call (``brochure_wa_sent`` /
+        ``location_sent`` flags); best-effort — callers wrap it so a WhatsApp
+        failure never affects the lead."""
+        ani = str((state or {}).get("caller_phone") or "").strip()
+        if not ani:
+            return
+        already_brochure = bool(state.get("brochure_wa_sent"))
+        already_location = bool(state.get("location_sent"))
+        if already_brochure and already_location:
+            return
+        from app.services.real_estate_project_service import (
+            find_project_match,
+            load_active_projects,
+            project_whatsapp_brochure,
+            project_whatsapp_location,
+        )
+        from app.services.whatsapp_service import WhatsAppService
+
+        projects = await load_active_projects(db, org_id)
+        if not projects:
+            return
+        # Resolve which project to send: the one the caller discussed (memory
+        # FACT_PROPERTY), else the sole active project. Never guess across many —
+        # the QUERY prompt asks which project before promising when there's >1.
+        captured = None
+        try:
+            from app.services.conversational_memory import (
+                ConversationalMemory as _CM,
+                FACT_PROPERTY as _FACT_PROPERTY,
+            )
+
+            captured = _CM.from_state_blob((state or {}).get("memory") or {}).get(_FACT_PROPERTY)
+        except Exception:
+            captured = None
+        matched = find_project_match(
+            projects, project_name=str(captured) if captured else None
+        )
+        if matched is None and len(projects) == 1:
+            matched = projects[0]
+        if matched is None:
+            return
+
+        sent_flags: dict[str, Any] = {}
+        if not already_brochure:
+            broc = project_whatsapp_brochure(matched)
+            if broc is not None:
+                res = await WhatsAppService.send_for_org(
+                    db,
+                    org_id,
+                    to_number=ani,
+                    template_name=broc["template"],
+                    language=broc["language"],
+                    body_params=broc["body_params"],
+                    media_url=broc["media_url"],
+                )
+                if res.get("ok"):
+                    sent_flags["brochure_wa_sent"] = True
+        if not already_location:
+            loc = project_whatsapp_location(matched)
+            if loc is not None:
+                res = await WhatsAppService.send_for_org(
+                    db,
+                    org_id,
+                    to_number=ani,
+                    template_name=loc["template"],
+                    language=loc["language"],
+                    body_params=loc["body_params"],
+                    media_url=loc["media_url"],
+                )
+                if res.get("ok"):
+                    sent_flags["location_sent"] = True
+        if sent_flags:
+            await AgentSessionStore.merge_state(tenant_res, call_id, sent_flags)
+
+    @staticmethod
+    async def _create_inbound_site_visit(
+        db: AsyncSession,
+        org_id: Any,
+        tenant_res: TenantResources,
+        call_id: str,
+        *,
+        state: dict[str, Any],
+        memory: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Create a minimal inbound site-visit TICKET when the caller agreed to
+        come — ANI + name (if captured) only. NO structured date/time/project
+        fields: the date/time the agent clarified rides in the post-call note
+        (the condenser writes ``data.handoff_note`` onto ``auto_site_visit_id``).
+        Mirrors the phoneless-lead direct write; best-effort."""
+        from app.models.nokvo_one_tool_record import NokvoOneToolRecord
+        from app.services.nokvo_one_business_templates import STATUS_VOCABULARIES
+
+        ani = str((state or {}).get("caller_phone") or "").strip() or None
+        name = str((memory or {}).get("name") or "").strip() or None
+        if not name:
+            # Fall back to the durable captured name (ConversationalMemory
+            # FACT_NAME) — the same source the structured booking path reads.
+            try:
+                from app.services.conversational_memory import (
+                    ConversationalMemory as _CM,
+                    FACT_NAME as _FACT_NAME,
+                )
+
+                name = str(
+                    _CM.from_state_blob((state or {}).get("memory") or {}).get(_FACT_NAME) or ""
+                ).strip() or None
+            except Exception:
+                name = None
+        status = (
+            (STATUS_VOCABULARIES.get("real_estate", {}).get("tickets") or {}).get("initial")
+            or "open"
+        )
+        data: dict[str, Any] = {
+            "source": "voice_inbound",
+            "auto_created_from_call": True,
+            "request_type": "site_visit",
+            "issue_type": "site_visit",
+            "agent_mode_final": "site_visit",
+            "call_id": call_id,
+        }
+        if name:
+            data["name"] = name
+        if ani:
+            data["phone"] = ani
+        record = NokvoOneToolRecord(
+            id=uuid.uuid4(),
+            organization_id=org_id,
+            record_type="ticket",
+            status=status,
+            data=data,
+            contact_phone=ani,
+        )
+        try:
+            db.add(record)
+            await db.commit()
+        except Exception:
+            logger.exception("NOKVO-SITE-VISIT: failed to persist inbound site visit")
+            try:
+                await db.rollback()
+            except Exception:
+                pass
+            return None
+        # auto_lead_created=True keeps the function idempotent and stops a
+        # duplicate lead; auto_site_visit_id is what the post-call condenser
+        # loop attaches the call note (with the clarified date/time) to.
+        await AgentSessionStore.merge_state(
+            tenant_res,
+            call_id,
+            {
+                "auto_lead_created": True,
+                "auto_site_visit_created": True,
+                "auto_site_visit_id": str(record.id),
+                "agent_mode_final": "site_visit",
+            },
+        )
+        return {
+            "tool": "site_visit_create_minimal",
+            "arguments": data,
+            "result": {"ok": True, "id": str(record.id)},
+        }
+
+    @staticmethod
     async def maybe_create_real_estate_lead_from_call(
         tenant_res: TenantResources,
         db: AsyncSession | None,
@@ -2854,61 +3026,96 @@ class NokvoOneVoicePipeline:
         ):
             return None
 
+        # End-of-call WhatsApp push (inbound real-estate). Replaces the old
+        # in-call lead/site-visit interrogation: send the project brochure +
+        # location to the caller's own number (the ANI we already have). Placed
+        # after the opt-out gate so we never message someone who opted out;
+        # bounded + best-effort so a slow/failed WABA never delays or breaks the
+        # lead creation below. Idempotent via state flags.
+        if call_surface == "voice_inbound":
+            try:
+                await asyncio.wait_for(
+                    NokvoOneVoicePipeline._send_brochure_and_location_to_caller(
+                        db, org_id, tenant_res, call_id, state
+                    ),
+                    timeout=25,
+                )
+            except Exception:
+                logger.debug(
+                    "NOKVO-WA: end-of-call brochure/location send failed", exc_info=True
+                )
+
         catalog = resolve_index(organization.industry, overrides, custom_tabs)
 
-        # A clear site-visit booking (firm date + time + name + phone) must
-        # create a SITE VISIT, not a lead — leads are for ENQUIRY / vague calls
-        # only. The deterministic flow normally creates the visit; this catches
-        # calls where it didn't fire (e.g. the LLM conducted the booking) and
-        # would otherwise mis-file the booking as a lead.
-        site_visit_args = NokvoOneVoicePipeline._site_visit_args_from_call_state(
-            state=state,
-            organization=organization,
-            overrides=overrides,
-            custom_tabs=custom_tabs,
-            memory=memory,
-            campaign_context=campaign_context,
-        )
-        sv_tool = catalog.get("qualify_lead_and_schedule_visit") if site_visit_args else None
-        if site_visit_args and sv_tool is not None:
-            sv_result = None
-            try:
-                sv_result = await PredefinedToolsService.execute(
-                    db,
-                    org_id,
-                    None,
-                    sv_tool,
-                    site_visit_args,
-                    session_id=f"{call_id}:auto_real_estate_site_visit",
+        if call_surface == "voice_inbound":
+            # INBOUND: a site visit is created the moment the caller agrees to
+            # come — no field interrogation. The record is just ANI + name (if
+            # captured); the date/time the agent clarified rides in the post-call
+            # note (condenser → data.handoff_note on auto_site_visit_id). We do
+            # NOT run the structured date/time path for inbound, so a clarified
+            # date/time never gets persisted as fields.
+            from app.services.tool_flow_policy import caller_agreed_to_site_visit
+
+            if caller_agreed_to_site_visit(history):
+                sv = await NokvoOneVoicePipeline._create_inbound_site_visit(
+                    db, org_id, tenant_res, call_id, state=state, memory=memory,
                 )
-                await db.commit()
-            except Exception:
-                if db is not None:
-                    try:
-                        await db.rollback()
-                    except Exception:
-                        pass
+                if sv is not None:
+                    return sv
+            # No visit agreement → capture as a lead below.
+        else:
+            # OUTBOUND: a firm booking (date + time + name + phone) the
+            # deterministic flow didn't capture must still file as a SITE VISIT,
+            # not a lead. Outbound keeps the structured visit_at it needs to
+            # schedule / assign the visit.
+            site_visit_args = NokvoOneVoicePipeline._site_visit_args_from_call_state(
+                state=state,
+                organization=organization,
+                overrides=overrides,
+                custom_tabs=custom_tabs,
+                memory=memory,
+                campaign_context=campaign_context,
+            )
+            sv_tool = catalog.get("qualify_lead_and_schedule_visit") if site_visit_args else None
+            if site_visit_args and sv_tool is not None:
                 sv_result = None
-            if sv_result and sv_result.get("ok"):
-                await AgentSessionStore.merge_state(
-                    tenant_res,
-                    call_id,
-                    {
-                        "auto_lead_created": True,
-                        "auto_site_visit_created": True,
-                        "auto_site_visit_id": sv_result.get("ticket_id") or sv_result.get("id"),
-                        # FSM terminal mode marker. Booking landed — call
-                        # ended in site_visit, not inbound_lead.
-                        "agent_mode_final": "site_visit",
-                    },
-                )
-                return {
-                    "tool": "qualify_lead_and_schedule_visit",
-                    "arguments": site_visit_args,
-                    "result": sv_result,
-                }
-            # Site-visit creation unavailable or failed — fall through to lead
-            # so the prospect is still captured.
+                try:
+                    sv_result = await PredefinedToolsService.execute(
+                        db,
+                        org_id,
+                        None,
+                        sv_tool,
+                        site_visit_args,
+                        session_id=f"{call_id}:auto_real_estate_site_visit",
+                    )
+                    await db.commit()
+                except Exception:
+                    if db is not None:
+                        try:
+                            await db.rollback()
+                        except Exception:
+                            pass
+                    sv_result = None
+                if sv_result and sv_result.get("ok"):
+                    await AgentSessionStore.merge_state(
+                        tenant_res,
+                        call_id,
+                        {
+                            "auto_lead_created": True,
+                            "auto_site_visit_created": True,
+                            "auto_site_visit_id": sv_result.get("ticket_id") or sv_result.get("id"),
+                            # FSM terminal mode marker. Booking landed — call
+                            # ended in site_visit, not inbound_lead.
+                            "agent_mode_final": "site_visit",
+                        },
+                    )
+                    return {
+                        "tool": "qualify_lead_and_schedule_visit",
+                        "arguments": site_visit_args,
+                        "result": sv_result,
+                    }
+                # Site-visit creation unavailable or failed — fall through to lead
+                # so the prospect is still captured.
 
         args = NokvoOneVoicePipeline._lead_args_from_call_memory(
             memory=memory,

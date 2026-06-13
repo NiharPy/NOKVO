@@ -167,3 +167,223 @@ def test_active_booking_flow_is_not_interrupted_by_brochure_intent():
     }}
     assert inb_fsm.current_mode(st) == inb_fsm.AGENT_MODE_SITE_VISIT
     assert outb_fsm.current_mode(st, ["site_visit"]) == outb_fsm.AGENT_MODE_SITE_VISIT
+
+
+# ── end-of-call brochure + location auto-send (inbound real-estate) ──────────
+
+
+def test_end_of_call_sends_brochure_and_location_to_ani(monkeypatch):
+    """At teardown, BOTH the brochure and the project location go to the
+    caller's own number (the ANI), and the idempotency flags are recorded."""
+    from app.services.nokvo_one_voice_pipeline import NokvoOneVoicePipeline
+    import app.services.real_estate_project_service as rps
+
+    proj = _project(
+        brochure={"template": "broc_tpl"},
+        location={"template": "loc_tpl", "maps_url": "https://maps/x"},
+    )
+
+    async def fake_load(db, org_id):
+        return [proj]
+    monkeypatch.setattr(rps, "load_active_projects", fake_load)
+
+    sent: list[tuple] = []
+
+    async def fake_send(db, org_id, *, to_number, template_name, language, body_params, media_url):
+        sent.append((template_name, to_number, media_url))
+        return {"ok": True}
+    monkeypatch.setattr(WhatsAppService, "send_for_org", fake_send)
+
+    flags: dict = {}
+
+    async def fake_merge(tenant_res, call_id, patch, **kw):
+        flags.update(patch)
+        return patch
+    monkeypatch.setattr(
+        "app.services.agent_session_store.AgentSessionStore.merge_state", fake_merge
+    )
+
+    state = {"caller_phone": "+919999999999", "memory": {}}
+    _run(NokvoOneVoicePipeline._send_brochure_and_location_to_caller(
+        db=None, org_id="org-1", tenant_res=SimpleNamespace(), call_id="call-1", state=state,
+    ))
+
+    assert len(sent) == 2
+    assert {s[0] for s in sent} == {"broc_tpl", "loc_tpl"}
+    assert all(s[1] == "+919999999999" for s in sent)  # ANI is the recipient
+    # The brochure rides its PDF as the document header.
+    broc = next(s for s in sent if s[0] == "broc_tpl")
+    assert broc[2] == "https://x/brochure.pdf"
+    assert flags == {"brochure_wa_sent": True, "location_sent": True}
+
+
+def test_end_of_call_skips_when_already_sent(monkeypatch):
+    """Idempotent: if both flags are set, nothing is re-sent (no double-send
+    with the explicit mid-call request_brochure path)."""
+    from app.services.nokvo_one_voice_pipeline import NokvoOneVoicePipeline
+
+    called: list[int] = []
+
+    async def fake_send(*a, **k):
+        called.append(1)
+        return {"ok": True}
+    monkeypatch.setattr(WhatsAppService, "send_for_org", fake_send)
+
+    state = {
+        "caller_phone": "+919999999999", "memory": {},
+        "brochure_wa_sent": True, "location_sent": True,
+    }
+    _run(NokvoOneVoicePipeline._send_brochure_and_location_to_caller(
+        db=None, org_id="o", tenant_res=SimpleNamespace(), call_id="c", state=state,
+    ))
+    assert called == []
+
+
+def test_end_of_call_skips_when_no_caller_phone(monkeypatch):
+    """No ANI → nothing to send."""
+    from app.services.nokvo_one_voice_pipeline import NokvoOneVoicePipeline
+
+    called: list[int] = []
+
+    async def fake_send(*a, **k):
+        called.append(1)
+        return {"ok": True}
+    monkeypatch.setattr(WhatsAppService, "send_for_org", fake_send)
+
+    _run(NokvoOneVoicePipeline._send_brochure_and_location_to_caller(
+        db=None, org_id="o", tenant_res=SimpleNamespace(), call_id="c", state={"memory": {}},
+    ))
+    assert called == []
+
+
+# ── inbound site-visit slot-fill is OFF (the interrogation fix) ──────────────
+
+
+def test_inbound_real_estate_does_not_start_site_visit_flow():
+    """Inbound real-estate visit intent must NOT start the slot-fill that used
+    to interrogate for name/phone — the call stays conversational (QUERY)."""
+    from app.services.tool_flow_policy import evaluate_tool_flow_policy
+    from app.services.tool_flow_questions import ensure_tool_flow_questions
+
+    provider_status, _ = ensure_tool_flow_questions({}, "real_estate")
+    result = evaluate_tool_flow_policy(
+        "I want to visit the property",
+        business_type="real_estate",
+        provider_status=provider_status,
+        history=[],
+        state={"call_surface": "voice_inbound"},
+        language="en",
+    )
+    assert result is None
+
+
+def test_outbound_real_estate_still_starts_site_visit_flow():
+    """Outbound campaigns whose objective is a site visit must STILL book live."""
+    from app.services.tool_flow_policy import evaluate_tool_flow_policy
+    from app.services.tool_flow_questions import ensure_tool_flow_questions
+
+    provider_status, _ = ensure_tool_flow_questions({}, "real_estate")
+    result = evaluate_tool_flow_policy(
+        "I want to visit the property",
+        business_type="real_estate",
+        provider_status=provider_status,
+        history=[],
+        state={"call_surface": "voice_outbound"},
+        language="en",
+        allowed_flow_keys=["real_estate_site_visit"],
+    )
+    assert result is not None
+    assert result.get("flow_key") == "real_estate_site_visit"
+
+
+# ── prompt guardrails (timing + disambiguation) ─────────────────────────────
+
+
+def test_query_block_offers_whatsapp_after_hangup_and_disambiguates():
+    block = inb_fsm.mode_block_for_prompt(inb_fsm.AGENT_MODE_QUERY).lower()
+    assert "whatsapp" in block
+    assert "hang up" in block            # post-disconnect timing (Flaw 1)
+    assert "which" in block              # ask which project first (Flaw 3)
+    assert "never ask for a phone" in block  # no interrogation
+
+
+def test_whatsapp_block_defers_delivery_to_after_call():
+    block = inb_fsm.mode_block_for_prompt(inb_fsm.AGENT_MODE_WHATSAPP).lower()
+    assert "when the call ends" in block or "hang up" in block
+    assert "already sent" in block       # forbids claiming an immediate send
+
+
+# ── connect-your-WhatsApp-number flow (PlivoService) ────────────────────────
+
+
+class _FakeDB:
+    def add(self, obj):  # sync, like SQLAlchemy's Session.add
+        pass
+
+    async def commit(self):
+        pass
+
+    async def refresh(self, obj):
+        pass
+
+
+def test_connect_whatsapp_number_stores_sender_and_reports_ready(monkeypatch):
+    from app.services.plivo_service import PlivoService
+    monkeypatch.setattr(settings, "PLIVO_WHATSAPP_ENABLED", True)
+
+    tr = SimpleNamespace(provider_status={"plivo": {"number": "918031321315"}})
+    res = _run(PlivoService.connect_whatsapp_number(
+        tr, _FakeDB(), whatsapp_number=" +91 80 3132 1315 ",
+    ))
+    # Normalised + stored on the tenant's own plivo config.
+    assert res["whatsapp_number"] == "+918031321315"
+    assert res["connected"] is True
+    assert res["ready_to_send"] is True            # connected AND feature enabled
+    assert tr.provider_status["plivo"]["whatsapp_number"] == "+918031321315"
+    assert tr.provider_status["plivo"]["whatsapp_status"] == "connected"
+    # Voice config is untouched.
+    assert tr.provider_status["plivo"]["number"] == "918031321315"
+
+
+def test_connect_not_ready_when_feature_disabled(monkeypatch):
+    from app.services.plivo_service import PlivoService
+    monkeypatch.setattr(settings, "PLIVO_WHATSAPP_ENABLED", False)
+
+    tr = SimpleNamespace(provider_status={})
+    res = _run(PlivoService.connect_whatsapp_number(
+        tr, _FakeDB(), whatsapp_number="918031321315",
+    ))
+    assert res["connected"] is True
+    assert res["feature_enabled"] is False
+    assert res["ready_to_send"] is False           # master switch still off
+
+
+def test_connect_rejects_invalid_number():
+    from app.services.plivo_service import PlivoError, PlivoService
+
+    tr = SimpleNamespace(provider_status={})
+    with pytest.raises(PlivoError):
+        _run(PlivoService.connect_whatsapp_number(tr, _FakeDB(), whatsapp_number="abc"))
+
+
+def test_disconnect_whatsapp_number_clears_sender(monkeypatch):
+    from app.services.plivo_service import PlivoService
+    monkeypatch.setattr(settings, "PLIVO_WHATSAPP_ENABLED", True)
+
+    tr = SimpleNamespace(provider_status={"plivo": {
+        "whatsapp_number": "918031321315", "number": "918031321315",
+    }})
+    res = _run(PlivoService.disconnect_whatsapp_number(tr, _FakeDB()))
+    assert res["connected"] is False
+    assert res["ready_to_send"] is False
+    assert "whatsapp_number" not in tr.provider_status["plivo"]
+    assert tr.provider_status["plivo"]["number"] == "918031321315"  # voice intact
+
+
+def test_whatsapp_link_response_not_connected(monkeypatch):
+    from app.services.plivo_service import PlivoService
+    monkeypatch.setattr(settings, "PLIVO_WHATSAPP_ENABLED", True)
+    res = PlivoService.whatsapp_link_response(SimpleNamespace(provider_status={}))
+    assert res["connected"] is False
+    assert res["whatsapp_number"] is None
+    assert res["ready_to_send"] is False           # nothing to send from

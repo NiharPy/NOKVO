@@ -48,9 +48,11 @@ from app.services.fast_intent_router import (
 from app.services.llm_intent_classifier import (
     INTENT_CANCELLATION_REQUEST as LLM_INTENT_CANCEL,
     INTENT_ESCALATION as LLM_INTENT_ESCALATION,
+    INTENT_KB_QUESTION as LLM_INTENT_KB,
     INTENT_OUT_OF_SCOPE as LLM_INTENT_OUT_OF_SCOPE,
     INTENT_REFUND_ELIGIBILITY as LLM_INTENT_REFUND,
     INTENT_SMALLTALK as LLM_INTENT_SMALLTALK,
+    ClassifiedIntent,
     LLMIntentClassifier,
 )
 from app.services.policy_decision_engine import (
@@ -790,6 +792,16 @@ async def route_turn(
     if business_context is not None:
         prior_tool_flow = dict((state_for_turn or {}).get("tool_flow") or {})
         _prior_in_tool_flow_for_gate = bool(prior_tool_flow.get("active")) and not bool(prior_tool_flow.get("completed"))
+    # When the agent's previous turn asked the caller something (a question or a
+    # decision like "what time?", "send it to WhatsApp?", "may I have your
+    # name?"), a short reply is an ANSWER, not vague filler. Real-estate inbound
+    # now runs WITHOUT a tool_flow (site visits are conversational), so this is
+    # the case ``_prior_in_tool_flow_for_gate`` no longer covers — without it the
+    # agent ate answers like "10 AM" / "Yeah, sure" with "Mm-hm, go on." and the
+    # caller had to repeat themselves. Defer to the LLM so it handles the answer.
+    _agent_just_asked = helpers._assistant_asked_for_user_decision(
+        helpers._last_assistant_text(history_for_turn)
+    )
     if (
         intent_result.intent == INTENT_UNKNOWN_GENERAL
         and len(user_text.split()) < settings.AGENT_RAG_MIN_QUERY_WORDS
@@ -801,6 +813,7 @@ async def route_turn(
         # and the agent looped on the same question. Defer to the LLM
         # so it can either capture the value or ask for clarification.
         and not _prior_in_tool_flow_for_gate
+        and not _agent_just_asked
     ):
         nudge = {
             "hi": "हाँ, बताइए।",
@@ -845,11 +858,28 @@ async def route_turn(
         if english_text and english_text.strip() and english_text.strip() != user_text.strip()
         else user_text
     )
-    classified = await LLMIntentClassifier.classify(
-        classifier_text,
-        tenant_res=tenant_res,
-        history=history,
-    )
+    # The Tier-2 LLM classify (up to NOKVO_INTENT_CLASSIFIER_TIMEOUT_MS, default
+    # 2.5s) only earns its latency on tenants with POLICY CARDS — its job here is
+    # to catch cancellation/refund intents the regex missed and route them to the
+    # policy engine. KB-only verticals (real-estate, clinics) have no policy
+    # cards, so it adds seconds for no benefit: skip the LLM call and treat the
+    # turn as a KB question. RAG (already prefetching above) answers it; an
+    # off-topic ask deflects via empty retrieval. The classifier's sensitive
+    # paths below are no-ops without policy cards anyway.
+    if helpers._active_policy_cards(tenant_res):
+        classified = await LLMIntentClassifier.classify(
+            classifier_text,
+            tenant_res=tenant_res,
+            history=history,
+        )
+    else:
+        classified = ClassifiedIntent(
+            intent=LLM_INTENT_KB,
+            needs_kb=True,
+            sensitive=False,
+            sentiment="neutral",
+            reason="kb-only vertical: Tier-2 classify skipped for latency",
+        )
 
     # Promote LLM-detected sensitive intents into Tier-1-style routing so
     # downstream code paths see consistent intent constants. For each

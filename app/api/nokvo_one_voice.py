@@ -655,6 +655,13 @@ class PhoneLinkConfigRequest(BaseModel):
     forward_from_number: str | None = None
 
 
+class WhatsAppLinkRequest(BaseModel):
+    # The tenant's WhatsApp Business (WABA) sender number, already onboarded in
+    # Plivo/Meta. Stored as provider_status.plivo.whatsapp_number; the brochure +
+    # location confirmation templates send from it.
+    whatsapp_number: str
+
+
 class LeadOauthStartRequest(BaseModel):
     provider: str = Field(pattern="^(meta_ads|google_ads|google_forms)$")
     mode: str = "ads"
@@ -842,6 +849,54 @@ async def set_phone_link(
     await db.commit()
     await db.refresh(tr)
     return await _phone_link_summary(request, tr)
+
+
+# ────────────────────────── WhatsApp sender connect ──────────────────────────
+# Lets a tenant connect the WhatsApp Business number they've onboarded in
+# Plivo/Meta so the brochure + location confirmation messages send from it.
+# The send path (WhatsAppService) already resolves this number; this is the
+# missing "connect" step (the WhatsApp analog of /phone-link for voice).
+
+
+@router.get("/whatsapp-link")
+async def get_whatsapp_link(
+    user: OrganizationUser = Depends(_viewer_dep()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    from app.services.plivo_service import PlivoService
+
+    tr = await _tenant_for_user(db, user)
+    return PlivoService.whatsapp_link_response(tr)
+
+
+@router.post("/whatsapp-link")
+async def connect_whatsapp_link(
+    payload: WhatsAppLinkRequest,
+    user: OrganizationUser = Depends(_admin_dep()),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    from app.services.plivo_service import PlivoError, PlivoService
+
+    tr = await _tenant_for_user(db, user)
+    try:
+        return await PlivoService.connect_whatsapp_number(
+            tr, db, whatsapp_number=payload.whatsapp_number
+        )
+    except PlivoError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.delete("/whatsapp-link")
+async def disconnect_whatsapp_link(
+    user: OrganizationUser = Depends(_admin_dep()),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    from app.services.plivo_service import PlivoService
+
+    tr = await _tenant_for_user(db, user)
+    return await PlivoService.disconnect_whatsapp_number(tr, db)
 
 
 # ────────────────────────── Lead sources and consented leads ──────────────────────────

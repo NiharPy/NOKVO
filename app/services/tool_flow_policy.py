@@ -593,6 +593,25 @@ def _last_assistant_offered_visit(history: list[dict[str, str]]) -> bool:
     return False
 
 
+def caller_agreed_to_site_visit(history: list[dict[str, str]]) -> bool:
+    """True when a caller turn signals intent to come for a site visit — an
+    explicit visit phrase, or a yes/affirmation right after the agent offered a
+    visit. Same matchers the (inbound-disabled) flow-start used, so the
+    end-of-call hook can create a minimal site visit from the same signal."""
+    turns = history or []
+    for idx, turn in enumerate(turns):
+        if turn.get("role") != "user":
+            continue
+        text = str(turn.get("content") or "")
+        if not text.strip():
+            continue
+        if _VISIT_INTENT_RE.search(text):
+            return True
+        if _YES_RE.search(text) and _last_assistant_offered_visit(turns[:idx]):
+            return True
+    return False
+
+
 # Phrases the agent uses when it offers to share more info / details / brochure
 # / a callback. When the lead replies "yeah" to one of these, we should start
 # the leads_create flow so the slot-filling kicks in (name/phone first).
@@ -884,6 +903,19 @@ def evaluate_tool_flow_policy(
     if not flow_state.get("active"):
         flow_key = _start_flow_key(value, business_type, history)
         if not flow_key or flow_key not in (bundle.get("flows") or {}):
+            return None
+        # Inbound real-estate no longer books a site visit live. The agent stays
+        # conversational (QUERY mode) and the brochure + project location are sent
+        # to the caller's WhatsApp at call end (maybe_create_real_estate_lead_from_call),
+        # so we never start the site-visit slot-fill that used to interrogate an
+        # inbound caller for name/phone — the phone is the ANI we already have.
+        # Gated on the explicit inbound surface (set at call start in
+        # nokvo_one_voice_stream_service); outbound campaigns keep this flow.
+        if (
+            str((state or {}).get("call_surface") or "") == "voice_inbound"
+            and normalize_business_type(business_type) == "real_estate"
+            and flow_key == "real_estate_site_visit"
+        ):
             return None
         # Outbound campaign objective gate. If the operator selected only
         # "Book a site visit" for this campaign, ``leads_create`` must NOT

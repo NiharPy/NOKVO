@@ -167,6 +167,12 @@ class _Tenant:
 
 
 class _FakeDB2:
+    def __init__(self) -> None:
+        self.added: list = []
+
+    def add(self, obj) -> None:
+        self.added.append(obj)
+
     async def commit(self) -> None:
         pass
 
@@ -210,30 +216,45 @@ def _patch_session(monkeypatch, *, state: dict, history: list[dict], merged: dic
     return calls
 
 
-def test_safety_net_books_site_visit_ticket_for_firm_booking(monkeypatch) -> None:
-    """The exact reported bug: a firm booking at call-end must create a Site
-    Visit (qualify_lead_and_schedule_visit → ticket), NOT a lead."""
+def test_inbound_visit_agreement_creates_minimal_site_visit_not_lead(monkeypatch) -> None:
+    """Inbound overhaul: when the caller agrees to a visit, the safety net files a
+    MINIMAL Site Visit ticket (ANI + name; the date/time live in the call note),
+    NOT a lead and NOT the old structured qualify_lead_and_schedule_visit ticket.
+    Even though a firm date/time was captured in memory, it is NOT saved as fields."""
     cm = ConversationalMemory()
     cm.facts[FACT_NAME] = _fact(FACT_NAME, "Nihar")
     cm.facts[FACT_PHONE] = _fact(FACT_PHONE, "7569672503")
     cm.facts[FACT_VISIT_DATE] = _fact(FACT_VISIT_DATE, "tomorrow")
     cm.facts[FACT_VISIT_TIME] = _fact(FACT_VISIT_TIME, "11 AM")
     cm.facts[FACT_PROPERTY] = _fact(FACT_PROPERTY, "Skyline Heights")
-    state = {"memory": cm.to_state_blob(), "tool_flow": {}, "call_surface": "voice_inbound"}
+    state = {
+        "memory": cm.to_state_blob(),
+        "tool_flow": {},
+        "call_surface": "voice_inbound",
+        "caller_phone": "+917569672503",
+    }
     history = [{"role": "user", "content": "Could you arrange a site visit tomorrow at 11 AM?"}]
     merged: dict = {}
     calls = _patch_session(monkeypatch, state=state, history=history, merged=merged)
 
+    db = _FakeDB2()
     result = _run(
         NokvoOneVoicePipeline.maybe_create_real_estate_lead_from_call(
-            _Tenant(), _FakeDB2(), "call-firm"
+            _Tenant(), db, "call-firm"
         )
     )
     assert result is not None
-    assert result["tool"] == "qualify_lead_and_schedule_visit"
-    assert "qualify_lead_and_schedule_visit" in calls
-    assert "leads_create" not in calls
+    assert result["tool"] == "site_visit_create_minimal"
+    assert "qualify_lead_and_schedule_visit" not in calls   # no structured booking
+    assert "leads_create" not in calls                       # and not a lead
     assert merged.get("auto_site_visit_created") is True
+    assert merged.get("auto_site_visit_id")
+    # Minimal record: ANI + captured name, NO structured date/time/project fields.
+    ticket = next(r for r in db.added if getattr(r, "record_type", None) == "ticket")
+    assert ticket.contact_phone == "+917569672503"
+    assert ticket.data.get("name") == "Nihar"
+    for k in ("visit_date", "visit_time", "project_name"):
+        assert k not in ticket.data
 
 
 def test_safety_net_creates_lead_for_enquiry(monkeypatch) -> None:
