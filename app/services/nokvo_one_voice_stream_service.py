@@ -381,16 +381,33 @@ def _latency_guard_text(language: str | None) -> str:
 # thought. Pure + side-effect-free so it is unit-testable in isolation. A false
 # "fast" is the quality risk, so the logic biases toward the slower tiers.
 
-# Trailing words that almost always precede MORE speech → wait the longest.
-_EOU_CONTINUATION_TAIL_WORDS = {
-    "a", "an", "and", "but", "or", "to", "of", "in", "on", "at", "by", "for",
-    "with", "if", "when", "while", "because", "so", "that", "the", "this",
-    "these", "those", "i", "he", "she", "we", "they", "it", "you", "my",
-    "your", "his", "her", "our", "their", "is", "are", "was", "were", "be",
-    "been", "being", "have", "has", "had", "do", "does", "did", "would",
-    "could", "should", "will", "shall", "may", "might", "uh", "um", "uhm",
-    "hmm", "like", "as", "from", "than", "then", "where", "why", "how",
+# STRONG continuation cues: function words / fillers that almost never end a
+# complete utterance — they REQUIRE a following word, so always wait the longest.
+_EOU_STRONG_CONTINUATION = {
+    "a", "an", "the", "and", "but", "or", "because", "than", "as", "if", "while",
+    "when", "to", "of", "for", "with", "from", "at", "by", "in", "on",
+    "uh", "um", "uhm",
 }
+# WEAK continuation cues: auxiliaries / pronouns / determiners that OFTEN end a
+# COMPLETE utterance after real content ("…you guys have", "I'd like that") but
+# also trail off in a short fragment ("I have", "do you"). They force the long
+# wait only when the utterance is a SHORT fragment; after substantial content
+# they're treated as complete (neutral). This is the fix for the scan finding
+# where "…projects you guys have" / "thank you" over-waited at 2300ms.
+_EOU_WEAK_CONTINUATION = {
+    "this", "these", "those", "that", "my", "your", "his", "her", "our", "their",
+    "i", "he", "she", "we", "they", "it", "you",
+    "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
+    "do", "does", "did", "will", "would", "shall", "should", "can", "could",
+    "may", "might", "so", "then", "where", "why", "how", "like", "hmm",
+}
+_EOU_WEAK_FRAGMENT_MAXWORDS = 4
+# Closing phrases — complete by definition; never make the caller wait on these.
+_EOU_CLOSER_TAILS = (
+    "thank you so much", "thank you", "no thank you", "no thanks", "thanks",
+    "bye", "goodbye", "good bye", "that's it", "thats it", "that's all",
+    "thats all", "nothing else", "that'll be all", "thatll be all",
+)
 # Sentence-FINAL discourse particles (Indian English / Hinglish). These mark
 # completion, NOT continuation ("two BHK na" is a finished answer), so strip
 # them before judging and never treat them as continuation cues. "to"/"toh" is
@@ -453,16 +470,26 @@ def _eou_completeness_tier(text: str) -> str:
     # 1) Clear question → complete regardless of the trailing word.
     if ended_question:
         return "fast"
-    # 2) Mid-number dictation ("my number is 98…") → the rest is coming.
+    # 2) A closing phrase ("thank you", "that's all") → complete; never wait.
+    norm = " ".join(words)
+    if any(norm == c or norm.endswith(" " + c) for c in _EOU_CLOSER_TAILS):
+        return "fast"
+    # 3) Mid-number dictation ("my number is 98…") → the rest is coming.
     if last.isdigit() and len(last) < 10 and any(w in _EOU_NUMBER_CONTEXT_WORDS for w in words):
         return "continuation"
-    # 3) Trails off on a function word / filler → wait the longest.
-    if last in _EOU_CONTINUATION_TAIL_WORDS:
+    # 4) Trails off on a STRONG continuation word / filler → wait the longest.
+    if last in _EOU_STRONG_CONTINUATION:
         return "continuation"
-    # 4) Short yes/no/acknowledgement answer.
+    # 5) WEAK tail (auxiliary / pronoun / determiner): after substantial content
+    #    it's usually COMPLETE ("…you guys have") → neutral; only a SHORT fragment
+    #    ("I have", "do you") is genuinely trailing off → continuation. (Fix for
+    #    the scan finding: complete utterances over-waiting at 2300ms.)
+    if last in _EOU_WEAK_CONTINUATION:
+        return "continuation" if len(words) <= _EOU_WEAK_FRAGMENT_MAXWORDS else "neutral"
+    # 6) Short yes/no/acknowledgement answer.
     if len(words) <= 3 and (words[0] in _EOU_YESNO_WORDS or last in _EOU_YESNO_WORDS):
         return "fast"
-    # 5) A PURE time/day answer ("10 AM", "tomorrow at 4", "Saturday morning") —
+    # 7) A PURE time/day answer ("10 AM", "tomorrow at 4", "Saturday morning") —
     #    but NOT a declarative that merely mentions a day ("Saturday works",
     #    where "works" is not time-ish → falls through to neutral).
     if (
@@ -471,7 +498,7 @@ def _eou_completeness_tier(text: str) -> str:
         and any(w not in _EOU_TIME_CONNECTORS for w in words)  # ≥1 real time token, not just connectors
     ):
         return "fast"
-    # 6) Everything else (declaratives, noun phrases) → neutral: leaves room for
+    # 8) Everything else (declaratives, noun phrases) → neutral: leaves room for
     #    a self-correction ("…actually Sunday") to land and restart the timer.
     return "neutral"
 
@@ -1372,6 +1399,12 @@ class NokvoOneVoiceStreamService:
                         "intent": (final_payload or {}).get("intent"),
                         "refused": bool((final_payload or {}).get("refused")),
                         "captured_facts": conv_memory.snapshot(),
+                        # Latency (closes the scan gap): time to first agent audio
+                        # and the full turn, so caller→first-audio is exact in the
+                        # trace instead of estimated. EOU tier is in the
+                        # NOKVO-LATENCY-EOU log line for the same turn.
+                        "first_sentence_ms": first_sentence_ms,
+                        "total_ms": int((perf_counter() - started) * 1000),
                     })
                 except Exception:
                     logger.debug("NOKVO-LANGSMITH: turn outcome attach failed", exc_info=True)
@@ -2925,12 +2958,16 @@ class NokvoOneVoiceStreamService:
                             _bg_lead_name_in = _fm_in.get("name") if _fm_in.has("name") else None
                         except Exception:
                             _bg_lead_name_in = None
+                        # The site-visit ticket (if this call booked one) gets handed to
+                        # RE_agent_scheduler once its note is written below.
+                        _site_visit_id_in = _final_state.get("auto_site_visit_id")
 
                         async def _condense_and_persist_inbound(
                             record_ids=_inbound_record_ids,
                             lead_name=_bg_lead_name_in,
                             cb_phone=_cb_phone,
                             cb_tenant_id=tenant_id_str,
+                            site_visit_id=_site_visit_id_in,
                         ):
                             try:
                                 from app.services.call_condenser_service import condense_call
@@ -2981,6 +3018,23 @@ class NokvoOneVoiceStreamService:
                                         "NOKVO-CONDENSE: inbound handoff note written to %d record(s) for call %s (%d chars)",
                                         written, _bg_call_id_in, len(note),
                                     )
+                                    # RE_agent_scheduler: turn the freshly-noted site-visit
+                                    # ticket into a filled, agent-assigned ticket (LLM extract
+                                    # the note → fill the Site Visit Fields → assign the
+                                    # nearest-free agent). Best-effort, off the call path; fresh
+                                    # session so it never perturbs the note write above.
+                                    if site_visit_id:
+                                        try:
+                                            from app.services.re_agent_scheduler import REAgentScheduler
+
+                                            async with AsyncSessionLocal() as sched_db:
+                                                await REAgentScheduler.schedule_for_site_visit(
+                                                    sched_db, _bg_tenant_res_in, site_visit_id
+                                                )
+                                        except Exception:
+                                            logger.exception(
+                                                "NOKVO-RE-SCHED: inbound agent scheduling failed"
+                                            )
                                     # Same note onto the caller's Customer base
                                     # row (best-effort — the row was upserted at
                                     # teardown just before this task started).

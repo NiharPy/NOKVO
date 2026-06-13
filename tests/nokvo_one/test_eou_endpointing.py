@@ -31,6 +31,9 @@ from app.services.nokvo_one_voice_stream_service import _eou_completeness_tier a
     "haan",                     # Hinglish affirmation
     "what is the price of the 3 BHK?",   # real question mark = reliable complete
     "where is it?",             # '?' overrides the trailing function word "it"
+    "thank you",                # closer
+    "Alright, thank you.",      # closer (scan finding T8 — was over-waited)
+    "thanks",                   # closer
 ])
 def test_fast_tier(text):
     assert tier(text) == "fast", text
@@ -41,6 +44,9 @@ def test_fast_tier(text):
     "two BHK na",               # particle stripped → "two BHK" (not a 2300ms wait)
     "Skyline Heights",          # noun phrase
     "the price is reasonable",  # declarative ending on a content word
+    # Scan finding T1: a COMPLETE utterance ending in a weak aux ("have") after
+    # substantial content must NOT over-wait at 2300ms — it's neutral, not continuation.
+    "Yeah, I just wanted to know about all the projects that you guys have",
 ]
 )
 def test_neutral_tier(text):
@@ -54,6 +60,8 @@ def test_neutral_tier(text):
     "um",                       # filler
     "my number is 98",          # mid-number dictation (context word present)
     "my phone is 7569",         # mid-number dictation
+    "I have",                   # SHORT weak-tail fragment → still waits (safe)
+    "do you",                   # SHORT weak-tail fragment → still waits (safe)
 ])
 def test_continuation_tier(text):
     assert tier(text) == "continuation", text

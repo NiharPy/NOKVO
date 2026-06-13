@@ -23,6 +23,7 @@ model and stealing attention from content):
     neutral   facts, policies, statements — DEFAULT
     excited   good news, enthusiasm
     question  direct questions
+    thinking  hesitations / thinking aloud ("um…", "well…") — slightly slower
 
 Ported from agent_lab/voice-rag-agent/orchestrator/app/llm/prosody.py.
 """
@@ -48,6 +49,10 @@ _PROSODY: dict[str, Prosody] = {
     "neutral":  Prosody(pace=1.0,  pitch= 0.0,  loudness=1.0),
     "excited":  Prosody(pace=1.08, pitch= 0.10, loudness=1.0),
     "question": Prosody(pace=0.97, pitch= 0.05, loudness=1.0),
+    # Hesitation / thinking-aloud: a slightly slower pace gives the natural
+    # drawn-out feel of a soft filler ("um…", "well…") without letter-repetition
+    # (Bulbul has no elongation markup; pace + a trailing comma/… is the lever).
+    "thinking": Prosody(pace=0.90, pitch= 0.0,  loudness=1.0),
 }
 
 DEFAULT_TONE = "neutral"
