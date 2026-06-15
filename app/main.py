@@ -51,6 +51,7 @@ from app.api import (
     nokvo_one_projects,
     nokvo_one_requests,
     nokvo_one_services,
+    nokvo_one_transcripts,
     nokvo_one_voice,
     connect_admin,
     connect_public,
@@ -62,6 +63,7 @@ app.include_router(superadmin_tenant_provisioning.router, prefix="/superadmin/te
 app.include_router(nokvo_one_auth.router, prefix="/api/nokvo-one", tags=["nokvo-one"])
 app.include_router(nokvo_one_requests.router, prefix="/api/nokvo-one", tags=["nokvo-one-requests"])
 app.include_router(nokvo_one_outcomes.router, prefix="/api/nokvo-one", tags=["nokvo-one-outcomes"])
+app.include_router(nokvo_one_transcripts.router, prefix="/api/nokvo-one", tags=["nokvo-one-transcripts"])
 app.include_router(nokvo_one_members.router, prefix="/api/nokvo-one/members", tags=["nokvo-one-members"])
 app.include_router(nokvo_one_agents.router, prefix="/api/nokvo-one/agents", tags=["nokvo-one-agents"])
 app.include_router(nokvo_one_projects.router, prefix="/api/nokvo-one/projects", tags=["nokvo-one-projects"])
@@ -245,6 +247,14 @@ async def _start_retry_scheduler() -> None:
         from app.services.plivo_service import PlivoService
 
         asyncio.get_event_loop().create_task(PlivoService.startup_webhook_sync_check())
+    except Exception:
+        pass
+    # Transcript retention: a daily sweep deleting transcripts older than the
+    # rolling 1-month window (lazy purge on the list endpoint is the backstop).
+    try:
+        from app.services.transcript_service import TranscriptService
+
+        asyncio.create_task(TranscriptService.run_forever())
     except Exception:
         pass
 

@@ -2797,33 +2797,28 @@ class NokvoOneVoicePipeline:
         return args
 
     @staticmethod
-    async def _send_brochure_and_location_to_caller(
+    async def _send_brochure_and_location_sms(
         db: AsyncSession,
         org_id: Any,
         tenant_res: TenantResources,
         call_id: str,
         state: dict[str, Any],
     ) -> None:
-        """At call end, push the project brochure + location to the caller's
-        WhatsApp (their ANI). This is the inbound-real-estate replacement for the
-        old name/phone interrogation — the number is the one they're calling from,
-        so nothing is asked. Idempotent per call (``brochure_wa_sent`` /
-        ``location_sent`` flags); best-effort — callers wrap it so a WhatsApp
-        failure never affects the lead."""
+        """At call end, text the caller (their ANI) the project's brochure +
+        location links in ONE SMS. This is the inbound-real-estate delivery channel
+        while WhatsApp is off — the number is the one they're calling from, so
+        nothing is asked. Idempotent per call (``sms_sent``); best-effort — callers
+        wrap it so an SMS failure never affects the lead."""
         ani = str((state or {}).get("caller_phone") or "").strip()
         if not ani:
             return
-        already_brochure = bool(state.get("brochure_wa_sent"))
-        already_location = bool(state.get("location_sent"))
-        if already_brochure and already_location:
+        if state.get("sms_sent"):
             return
         from app.services.real_estate_project_service import (
             find_project_match,
             load_active_projects,
-            project_whatsapp_brochure,
-            project_whatsapp_location,
         )
-        from app.services.whatsapp_service import WhatsAppService
+        from app.services.sms_service import SmsService
 
         projects = await load_active_projects(db, org_id)
         if not projects:
@@ -2849,37 +2844,25 @@ class NokvoOneVoicePipeline:
         if matched is None:
             return
 
-        sent_flags: dict[str, Any] = {}
-        if not already_brochure:
-            broc = project_whatsapp_brochure(matched)
-            if broc is not None:
-                res = await WhatsAppService.send_for_org(
-                    db,
-                    org_id,
-                    to_number=ani,
-                    template_name=broc["template"],
-                    language=broc["language"],
-                    body_params=broc["body_params"],
-                    media_url=broc["media_url"],
-                )
-                if res.get("ok"):
-                    sent_flags["brochure_wa_sent"] = True
-        if not already_location:
-            loc = project_whatsapp_location(matched)
-            if loc is not None:
-                res = await WhatsAppService.send_for_org(
-                    db,
-                    org_id,
-                    to_number=ani,
-                    template_name=loc["template"],
-                    language=loc["language"],
-                    body_params=loc["body_params"],
-                    media_url=loc["media_url"],
-                )
-                if res.get("ok"):
-                    sent_flags["location_sent"] = True
-        if sent_flags:
-            await AgentSessionStore.merge_state(tenant_res, call_id, sent_flags)
+        # The two links: brochure (a column) + location maps URL (lives in the
+        # project's whatsapp.location config — reused as the SMS map link).
+        brochure_url = str(getattr(matched, "brochure_url", None) or "").strip()
+        wa_cfg = getattr(matched, "whatsapp", None) or {}
+        maps_url = str(((wa_cfg.get("location") or {}).get("maps_url")) or "").strip()
+        if not brochure_url and not maps_url:
+            return  # nothing to send
+
+        name = getattr(matched, "name", None) or "your enquiry"
+        parts = [f"Hi! Details for {name}:"]
+        if brochure_url:
+            parts.append(f"Brochure: {brochure_url}")
+        if maps_url:
+            parts.append(f"Location: {maps_url}")
+        text = " ".join(parts)
+
+        res = await SmsService.send_for_org(db, org_id, to_number=ani, text=text)
+        if res.get("ok"):
+            await AgentSessionStore.merge_state(tenant_res, call_id, {"sms_sent": True})
 
     @staticmethod
     async def _create_inbound_site_visit(
@@ -3026,23 +3009,23 @@ class NokvoOneVoicePipeline:
         ):
             return None
 
-        # End-of-call WhatsApp push (inbound real-estate). Replaces the old
-        # in-call lead/site-visit interrogation: send the project brochure +
-        # location to the caller's own number (the ANI we already have). Placed
-        # after the opt-out gate so we never message someone who opted out;
-        # bounded + best-effort so a slow/failed WABA never delays or breaks the
-        # lead creation below. Idempotent via state flags.
+        # End-of-call SMS push (inbound real-estate). Replaces the old in-call
+        # lead/site-visit interrogation: text the project brochure + location links
+        # to the caller's own number (the ANI we already have). Placed after the
+        # opt-out gate so we never message someone who opted out; bounded +
+        # best-effort so a slow/failed send never delays or breaks the lead
+        # creation below. Idempotent via the sms_sent state flag.
         if call_surface == "voice_inbound":
             try:
                 await asyncio.wait_for(
-                    NokvoOneVoicePipeline._send_brochure_and_location_to_caller(
+                    NokvoOneVoicePipeline._send_brochure_and_location_sms(
                         db, org_id, tenant_res, call_id, state
                     ),
                     timeout=25,
                 )
             except Exception:
                 logger.debug(
-                    "NOKVO-WA: end-of-call brochure/location send failed", exc_info=True
+                    "NOKVO-SMS: end-of-call brochure/location send failed", exc_info=True
                 )
 
         catalog = resolve_index(organization.industry, overrides, custom_tabs)

@@ -74,6 +74,11 @@ class Settings(BaseSettings):
     SMTP_FROM_NAME: str = "Nokvo"
     SMTP_USE_TLS: bool = True
 
+    # Concierge WhatsApp onboarding — where the "client requested WhatsApp setup"
+    # alert is emailed (ops inbox). When unset, no alert is sent (the request is
+    # still visible in the superadmin console's WhatsApp requests queue).
+    WHATSAPP_ONBOARDING_ALERT_EMAIL: str = ""
+
     # Google OAuth
     GOOGLE_OAUTH_CLIENT_ID: str = ""
     GOOGLE_OAUTH_CLIENT_SECRET: str = ""
@@ -285,6 +290,13 @@ class Settings(BaseSettings):
     # testing and must never be relied on as a shared multi-tenant sender.
     PLIVO_WHATSAPP_ENABLED: bool = False
     PLIVO_WHATSAPP_FROM: str = ""
+
+    # SMS delivery (Plivo Messaging) — the active brochure+location channel while
+    # WhatsApp is off. Per-tenant sender is provider_status.plivo.sms_number;
+    # PLIVO_SMS_FROM is a local/master test fallback only. India A2P needs DLT
+    # (registered sender header + content templates) for delivery to +91 numbers.
+    PLIVO_SMS_ENABLED: bool = True
+    PLIVO_SMS_FROM: str = ""
     TELNYX_API_KEY: str = ""
     TELNYX_BASE_URL: str = "https://api.telnyx.com/v2"
     TELNYX_APP_ID: str = ""

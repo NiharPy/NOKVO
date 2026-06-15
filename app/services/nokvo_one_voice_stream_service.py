@@ -799,6 +799,26 @@ class NokvoOneVoiceStreamService:
         history = await AgentSessionStore.get_history(tenant_res, call_id)
         if not history:
             return
+        # Persist the transcript for the Transcripts page (best-effort; the store
+        # swallows its own errors so a transcript failure never affects the call
+        # log below). A rolling 1-month retention purges it later.
+        try:
+            from app.services.transcript_service import TranscriptService
+
+            _contact = (campaign_context or {}).get("contact") or {}
+            _phone = _contact.get("phone") if isinstance(_contact, dict) else None
+            await TranscriptService.store(
+                db,
+                organization_id=tenant_res.organization_id,
+                tenant_id=tenant_res.tenant_id,
+                call_id=call_id,
+                history=history,
+                duration_seconds=duration_seconds,
+                kind="outbound" if campaign_context else "inbound",
+                caller_phone=str(_phone) if _phone else None,
+            )
+        except Exception:
+            logger.debug("NOKVO-TRANSCRIPT: teardown persist failed", exc_info=True)
         lines: list[str] = []
         for item in history[-16:]:
             role = str(item.get("role") or "turn").strip() or "turn"

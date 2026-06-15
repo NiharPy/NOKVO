@@ -1,6 +1,6 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue';
-import { ArrowUpRight, KeyRound, Plug, Save, Shield, Webhook } from 'lucide-vue-next';
+import { ArrowUpRight, CheckCircle2, Clock, KeyRound, MessageCircle, Plug, Save, Shield, Webhook } from 'lucide-vue-next';
 import { useRouter } from 'vue-router';
 import { useDashboardState } from '../composables/useDashboardState.js';
 
@@ -10,6 +10,12 @@ const {
   businessFacts,
   loadBusinessFacts,
   saveBusinessFacts,
+  whatsappLink,
+  whatsappForm,
+  isRequestingWhatsapp,
+  loadWhatsAppLink,
+  requestWhatsApp,
+  cancelWhatsApp,
 } = useDashboardState();
 
 // ── Business facts ────────────────────────────────────────────────────────
@@ -27,6 +33,7 @@ onMounted(async () => {
   } else {
     factsDraft.value = businessFacts?.value || '';
   }
+  if (typeof loadWhatsAppLink === 'function') loadWhatsAppLink();
 });
 
 const factsDirty = computed(() => (factsDraft.value || '') !== (businessFacts?.value || ''));
@@ -41,6 +48,18 @@ async function onSaveFacts() {
   } finally {
     factsSaving.value = false;
   }
+}
+
+// ── WhatsApp onboarding (concierge — the client never sees Plivo) ───────────
+const waStep = computed(() => whatsappLink?.value?.onboarding_step || 'not_requested');
+const waFormValid = computed(() => {
+  const f = whatsappForm?.value || {};
+  return (f.business_name || '').trim().length > 0
+    && (f.contact_number || '').replace(/\D/g, '').length >= 8;
+});
+async function onRequestWhatsApp() {
+  if (!waFormValid.value || isRequestingWhatsapp?.value) return;
+  if (typeof requestWhatsApp === 'function') await requestWhatsApp();
 }
 
 const sections = computed(() => [
@@ -134,7 +153,85 @@ const sections = computed(() => [
       </div>
     </section>
 
-    <section class="n-section n-rise" data-delay="2">
+    <section v-if="whatsappLink?.feature_enabled" class="n-section n-rise" data-delay="2">
+      <header class="n-section__head">
+        <div>
+          <h2 class="n-section__title">WhatsApp</h2>
+          <p class="n-section__sub">
+            Send brochures and site-visit locations to callers automatically over WhatsApp.
+            Enable it once — we handle the setup for you.
+          </p>
+        </div>
+      </header>
+
+      <div class="adv__wa n-card">
+        <template v-if="waStep === 'not_requested'">
+          <div class="adv__wa-head">
+            <div class="adv__wa-icon"><MessageCircle :size="18" /></div>
+            <div class="adv__wa-copy">
+              <strong>Enable WhatsApp</strong>
+              <span>Tell us your business name and the number you want messages to come from. Our team handles the rest — you’ll be live, usually within a business day.</span>
+            </div>
+          </div>
+          <div class="adv__wa-form">
+            <label class="n-field">
+              <span class="n-field__label">Business name</span>
+              <input v-model="whatsappForm.business_name" class="n-input" type="text" placeholder="Skyline Realty" />
+            </label>
+            <label class="n-field">
+              <span class="n-field__label">WhatsApp number</span>
+              <input v-model="whatsappForm.contact_number" class="n-input" type="tel" placeholder="+91 98765 43210" />
+            </label>
+            <label class="n-field">
+              <span class="n-field__label">Display name <span class="n-field__sub">optional</span></span>
+              <input v-model="whatsappForm.display_name" class="n-input" type="text" placeholder="Skyline" />
+            </label>
+          </div>
+          <div class="adv__wa-foot">
+            <button type="button" class="n-btn n-btn--brand n-btn--sm" :disabled="!waFormValid || isRequestingWhatsapp" @click="onRequestWhatsApp">
+              <MessageCircle :size="13" />
+              {{ isRequestingWhatsapp ? 'Requesting…' : 'Enable WhatsApp' }}
+            </button>
+          </div>
+        </template>
+
+        <template v-else-if="waStep === 'setting_up'">
+          <div class="adv__wa-head">
+            <div class="adv__wa-icon adv__wa-icon--pending"><Clock :size="18" /></div>
+            <div class="adv__wa-copy">
+              <strong>Setting up…</strong>
+              <span>
+                We’re connecting WhatsApp for
+                <em>{{ whatsappLink?.onboarding?.business_name }}</em><template v-if="whatsappLink?.onboarding?.contact_number"> ({{ whatsappLink.onboarding.contact_number }})</template>.
+                This usually takes up to one business day — we’ll email you when it’s live.
+              </span>
+            </div>
+          </div>
+          <div class="adv__wa-foot">
+            <button type="button" class="n-btn n-btn--ghost n-btn--sm" @click="cancelWhatsApp">Cancel request</button>
+          </div>
+        </template>
+
+        <template v-else>
+          <div class="adv__wa-head">
+            <div class="adv__wa-icon adv__wa-icon--ok"><CheckCircle2 :size="18" /></div>
+            <div class="adv__wa-copy">
+              <strong>WhatsApp: Ready ✓</strong>
+              <span>
+                Connected<template v-if="whatsappLink?.whatsapp_number"> · {{ whatsappLink.whatsapp_number }}</template>.
+                Brochures and site-visit locations now send automatically.
+                <em v-if="whatsappLink && whatsappLink.ready_to_send === false"> Activation pending — contact support.</em>
+              </span>
+            </div>
+          </div>
+          <div class="adv__wa-foot">
+            <button type="button" class="n-btn n-btn--ghost n-btn--sm" @click="cancelWhatsApp">Disconnect</button>
+          </div>
+        </template>
+      </div>
+    </section>
+
+    <section class="n-section n-rise" data-delay="3">
       <div class="adv__grid">
         <button
           v-for="(s, i) in sections"
@@ -198,6 +295,27 @@ const sections = computed(() => [
   color: var(--n-text-3);
 }
 .adv__facts-meta em { color: var(--n-brand-ink); font-style: normal; }
+
+.adv__wa { padding: 16px; display: grid; gap: 14px; }
+.adv__wa-head { display: flex; gap: 14px; align-items: flex-start; }
+.adv__wa-icon {
+  width: 42px; height: 42px; border-radius: 12px; flex-shrink: 0;
+  background: var(--n-brand-soft); color: var(--n-brand);
+  display: grid; place-items: center;
+}
+.adv__wa-icon--ok { background: rgba(22, 163, 74, 0.12); color: #16a34a; }
+.adv__wa-icon--pending { background: var(--n-surface-2); color: var(--n-text-3); }
+.adv__wa-copy { display: grid; gap: 4px; min-width: 0; }
+.adv__wa-copy strong {
+  font-family: var(--n-font-display); font-size: 15px; font-weight: 600;
+  color: var(--n-text); letter-spacing: -0.01em;
+}
+.adv__wa-copy span { font-size: 12.5px; color: var(--n-text-3); line-height: 1.5; }
+.adv__wa-copy em { font-style: normal; color: var(--n-brand-ink); }
+.adv__wa-form { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.adv__wa-form .n-field:first-child { grid-column: 1 / -1; }
+.adv__wa-foot { display: flex; justify-content: flex-end; gap: 8px; }
+@media (max-width: 640px) { .adv__wa-form { grid-template-columns: 1fr; } }
 
 .adv__grid {
   display: grid;

@@ -391,6 +391,18 @@ class PlivoService:
         number = cfg.get("whatsapp_number")
         connected = bool(number)
         enabled = bool(settings.PLIVO_WHATSAPP_ENABLED)
+        onboarding = dict(cfg.get("whatsapp_onboarding") or {})
+        if connected:
+            onboarding_step = "connected"
+        elif onboarding.get("step") == "requested":
+            onboarding_step = "setting_up"
+        else:
+            onboarding_step = "not_requested"
+        next_step = {
+            "not_requested": "request",
+            "setting_up": "awaiting_setup",
+            "connected": "ready",
+        }[onboarding_step]
         return {
             "provider": "plivo",
             "whatsapp_number": number,
@@ -400,16 +412,30 @@ class PlivoService:
             "ready_to_send": connected and enabled,
             "uses_subaccount": bool(cfg.get("subaccount_auth_id")),
             "connected_at": cfg.get("whatsapp_connected_at"),
+            # Concierge onboarding state — the client UI shows
+            # not_requested → setting_up → connected from these (never sees Plivo).
+            "onboarding_step": onboarding_step,
+            "next_step": next_step,
+            "onboarding": {
+                "business_name": onboarding.get("business_name"),
+                "contact_number": onboarding.get("contact_number"),
+                "display_name": onboarding.get("display_name"),
+                "requested_at": onboarding.get("requested_at"),
+            } if onboarding else None,
         }
 
     @classmethod
-    async def connect_whatsapp_number(cls, tenant_res, db, *, whatsapp_number: str) -> dict:
+    async def connect_whatsapp_number(
+        cls, tenant_res, db, *, whatsapp_number: str,
+        waba_id: str | None = None, phone_number_id: str | None = None,
+    ) -> dict:
         """Connect (or update) the tenant's WhatsApp Business sender number.
 
         Records WHICH number our sends originate from; authenticates as the
         tenant's subaccount when present (else master), mirroring voice. The
         number must already be WABA-onboarded in Plivo/Meta — this does not
-        provision it. Idempotent."""
+        provision it. In the concierge model this is the operator's fulfilment
+        call (after they onboard the number in the Plivo Console). Idempotent."""
         from sqlalchemy.orm.attributes import flag_modified
 
         number = cls._normalize_whatsapp_number(whatsapp_number)
@@ -420,6 +446,16 @@ class PlivoService:
         cfg["whatsapp_number"] = number
         cfg["whatsapp_status"] = "connected"
         cfg["whatsapp_connected_at"] = datetime.now(timezone.utc).isoformat()
+        if waba_id:
+            cfg["waba_id"] = str(waba_id).strip()
+        if phone_number_id:
+            cfg["phone_number_id"] = str(phone_number_id).strip()
+        # If this fulfils a concierge request, mark it done so it clears the queue.
+        ob = dict(cfg.get("whatsapp_onboarding") or {})
+        if ob:
+            ob["step"] = "connected"
+            ob["connected_at"] = cfg["whatsapp_connected_at"]
+            cfg["whatsapp_onboarding"] = ob
         ps["plivo"] = cfg
         tenant_res.provider_status = ps
         try:
@@ -432,6 +468,80 @@ class PlivoService:
         return cls.whatsapp_link_response(tenant_res)
 
     @classmethod
+    async def request_whatsapp_setup(
+        cls, tenant_res, db, *, business_name: str, contact_number: str,
+        display_name: str | None = None, requested_by: str | None = None,
+    ) -> dict:
+        """Concierge onboarding: the client requests WhatsApp and never sees Plivo.
+
+        Records the request on the tenant (step ``requested``) and alerts ops by
+        email. The operator then onboards the number in the Plivo Console and
+        records the connected sender via ``connect_whatsapp_number`` (which flips
+        the step to ``connected``). Best-effort email — a mail failure must not
+        fail the client's request."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        biz = (business_name or "").strip()
+        contact = cls._normalize_whatsapp_number(contact_number)
+        if not biz:
+            raise PlivoError("Business name is required.")
+        if not contact:
+            raise PlivoError("A valid WhatsApp number is required.")
+        ps = dict(tenant_res.provider_status or {})
+        cfg = dict(ps.get("plivo") or {})
+        onboarding = {
+            "step": "requested",
+            "business_name": biz,
+            "contact_number": contact,
+            "display_name": (display_name or "").strip() or None,
+            "requested_at": datetime.now(timezone.utc).isoformat(),
+            "requested_by": (requested_by or "").strip() or None,
+        }
+        cfg["whatsapp_onboarding"] = onboarding
+        cfg["whatsapp_status"] = "setting_up"
+        ps["plivo"] = cfg
+        tenant_res.provider_status = ps
+        try:
+            flag_modified(tenant_res, "provider_status")
+        except Exception:
+            pass
+        db.add(tenant_res)
+        await db.commit()
+        await db.refresh(tenant_res)
+        await cls._notify_ops_whatsapp_request(tenant_res, onboarding)
+        return cls.whatsapp_link_response(tenant_res)
+
+    @staticmethod
+    async def _notify_ops_whatsapp_request(tenant_res, onboarding: dict) -> None:
+        """Email the ops inbox that a tenant requested WhatsApp setup. Best-effort
+        — never raises. No-op when WHATSAPP_ONBOARDING_ALERT_EMAIL is unset (the
+        request is still visible in the superadmin requests queue)."""
+        to_email = (settings.WHATSAPP_ONBOARDING_ALERT_EMAIL or "").strip()
+        if not to_email:
+            return
+        try:
+            from app.services.email_service import EmailService
+
+            biz = onboarding.get("business_name") or "—"
+            num = onboarding.get("contact_number") or "—"
+            disp = onboarding.get("display_name") or "—"
+            org_id = getattr(tenant_res, "organization_id", None)
+            tenant_id = getattr(tenant_res, "tenant_id", None)
+            text = (
+                "A client requested WhatsApp setup (concierge onboarding).\n\n"
+                f"Business name : {biz}\n"
+                f"Number        : {num}\n"
+                f"Display name  : {disp}\n"
+                f"Organization  : {org_id}\n"
+                f"Tenant        : {tenant_id}\n\n"
+                "Next: onboard this number to a WABA in the Plivo Console, then record "
+                "it in the superadmin console (WhatsApp setup requests → Mark connected)."
+            )
+            await EmailService.send(to_email, f"[NOKVO] WhatsApp setup requested — {biz}", text)
+        except Exception:
+            pass
+
+    @classmethod
     async def disconnect_whatsapp_number(cls, tenant_res, db) -> dict:
         """Disconnect the tenant's WhatsApp sender — sends then skip
         (``no_whatsapp_sender``); never borrows another tenant's sender."""
@@ -440,6 +550,7 @@ class PlivoService:
         ps = dict(tenant_res.provider_status or {})
         cfg = dict(ps.get("plivo") or {})
         cfg.pop("whatsapp_number", None)
+        cfg.pop("whatsapp_onboarding", None)  # back to not_requested (also cancels a pending request)
         cfg["whatsapp_status"] = "not_connected"
         cfg["whatsapp_disconnected_at"] = datetime.now(timezone.utc).isoformat()
         ps["plivo"] = cfg

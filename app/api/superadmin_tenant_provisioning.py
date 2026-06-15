@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Request
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 from app.api.deps import RequireRole
 from app.core.email_policy import extract_email_domain, normalize_email, validate_work_email
 from app.models.user import SuperAdminUser
@@ -188,6 +189,99 @@ async def list_tenants(
             "total_cost_usd": round(sum(item["total_cost_usd"] for item in items), 2),
         },
     }
+
+
+# ── Concierge WhatsApp onboarding (operator fulfilment) ──────────────────────
+# Clients request WhatsApp setup from their portal and never see Plivo. The
+# operator onboards the number in the Plivo Console, then records the connected
+# sender here, which flips the client's portal to "Ready".
+
+class WhatsAppConnectPayload(BaseModel):
+    whatsapp_number: str
+    waba_id: str | None = None
+    phone_number_id: str | None = None
+
+
+def _whatsapp_request_item(org: Organization, tenant: TenantResources | None) -> dict | None:
+    cfg = ((tenant.provider_status if tenant else None) or {}).get("plivo") or {}
+    ob = cfg.get("whatsapp_onboarding") or {}
+    if ob.get("step") != "requested":
+        return None
+    return {
+        "organization_id": str(org.id),
+        "organization_name": org.name,
+        "tenant_id": tenant.tenant_id if tenant else None,
+        "business_name": ob.get("business_name"),
+        "contact_number": ob.get("contact_number"),
+        "display_name": ob.get("display_name"),
+        "requested_at": ob.get("requested_at"),
+        "requested_by": ob.get("requested_by"),
+    }
+
+
+@router.get("/whatsapp/requests")
+async def list_whatsapp_requests(
+    db: AsyncSession = Depends(get_db),
+    current_user: SuperAdminUser = Depends(RequireRole(["founder", "engineering"]))
+):
+    """Pending concierge WhatsApp setup requests (onboarding step == requested)."""
+    org_rows = await db.execute(select(Organization).order_by(Organization.created_at.desc()))
+    organizations = org_rows.scalars().all()
+    tenant_rows = await db.execute(select(TenantResources))
+    tenant_map = {str(row.organization_id): row for row in tenant_rows.scalars().all()}
+    items = [
+        item for org in organizations
+        if (item := _whatsapp_request_item(org, tenant_map.get(str(org.id)))) is not None
+    ]
+    return {"requests": items, "count": len(items)}
+
+
+@router.post("/{organization_id}/whatsapp/connect")
+async def connect_whatsapp_for_tenant(
+    organization_id: UUID,
+    payload: WhatsAppConnectPayload,
+    db: AsyncSession = Depends(get_db),
+    current_user: SuperAdminUser = Depends(RequireRole(["founder", "engineering"]))
+):
+    """Operator fulfilment: record the WABA sender onboarded for this tenant in the
+    Plivo Console. Flips the client's onboarding to ``connected`` and best-effort
+    emails them that WhatsApp is ready."""
+    from app.services.plivo_service import PlivoError, PlivoService
+
+    tenant_res_query = await db.execute(
+        select(TenantResources).where(TenantResources.organization_id == organization_id)
+    )
+    tenant = tenant_res_query.scalars().first()
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found for organization")
+    try:
+        result = await PlivoService.connect_whatsapp_number(
+            tenant, db,
+            whatsapp_number=payload.whatsapp_number,
+            waba_id=payload.waba_id,
+            phone_number_id=payload.phone_number_id,
+        )
+    except PlivoError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # Best-effort: tell the client WhatsApp is live (never fail the connect on mail).
+    try:
+        org_row = await db.execute(select(Organization).where(Organization.id == organization_id))
+        org = org_row.scalars().first()
+        to_email = (getattr(org, "admin_email", None) or "") if org else ""
+        if to_email:
+            from app.services.email_service import EmailService
+
+            await EmailService.send(
+                to_email,
+                "Your WhatsApp is ready on Nokvo",
+                "Good news — WhatsApp is now connected for your account. Brochure and "
+                "location messages will be sent automatically from your WhatsApp number.",
+            )
+    except Exception:
+        pass
+
+    return {"organization_id": str(organization_id), "whatsapp": result}
 
 
 @router.post("/{organization_id}/usage-events")

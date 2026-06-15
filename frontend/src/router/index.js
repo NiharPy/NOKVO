@@ -23,6 +23,7 @@ const MyTimetableView = () => import('../views/MyTimetableView.vue');
 const OrganizationHealthView = () => import('../views/OrganizationHealthView.vue');
 const NokvoConnectView = () => import('../views/NokvoConnectView.vue');
 const AdvancedSettingsView = () => import('../views/AdvancedSettingsView.vue');
+const TranscriptsView = () => import('../views/TranscriptsView.vue');
 
 const dashboardChildren = [
   { path: '', redirect: { name: 'dash-home' } },
@@ -31,6 +32,7 @@ const dashboardChildren = [
   { path: 'leads', component: LeadsView, name: 'dash-leads', meta: { pageKey: 'leads' } },
   { path: 'customers', component: CustomerBaseView, name: 'dash-customers', meta: { pageKey: 'customers' } },
   { path: 'followups', component: FollowUpPipeline, name: 'dash-followups', meta: { pageKey: 'followups' } },
+  { path: 'transcripts', component: TranscriptsView, name: 'dash-transcripts', meta: { pageKey: 'transcripts' } },
   { path: 'appointments', component: AppointmentsView, name: 'dash-appointments', meta: { pageKey: 'appointments' } },
   { path: 'projects', component: ProjectsView, name: 'dash-projects', meta: { pageKey: 'projects' } },
   { path: 'services', component: ServicesView, name: 'dash-services', meta: { pageKey: 'services' } },

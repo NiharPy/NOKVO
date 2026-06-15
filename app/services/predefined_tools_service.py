@@ -1227,6 +1227,7 @@ class PredefinedToolsService:
                         language=loc_cfg["language"],
                         body_params=loc_cfg["body_params"],
                         media_url=loc_cfg["media_url"],
+                        sender_override=loc_cfg.get("sender"),
                     )
                     location_whatsapp_sent = bool(send_res.get("ok"))
                     if location_whatsapp_sent:
@@ -1354,6 +1355,7 @@ class PredefinedToolsService:
                         language=broc_cfg["language"],
                         body_params=broc_cfg["body_params"],
                         media_url=broc_cfg["media_url"],
+                        sender_override=broc_cfg.get("sender"),
                     )
                     whatsapp_sent = bool(send_res.get("ok"))
             except Exception:

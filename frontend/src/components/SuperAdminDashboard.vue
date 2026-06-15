@@ -31,6 +31,9 @@ const language = ref('en-IN');
 const planType = ref('pilot');
 const productTier = ref('nokvo_prime');
 const nokvoOnePending = ref([]);
+const whatsappRequests = ref([]);
+const whatsappNumberInput = ref({});   // keyed by organization_id
+const whatsappBusyOrg = ref('');
 const storesPii = ref(true);
 const recordCalls = ref(true);
 const createResourceGroup = ref(true);
@@ -274,8 +277,53 @@ const approveNokvoOne = async (orgId, enableCalling) => {
   }
 };
 
+// ── Concierge WhatsApp onboarding (operator fulfilment) ─────────────────────
+const loadWhatsappRequests = async () => {
+  const token = localStorage.getItem(SUPERADMIN_ACCESS_TOKEN_KEY);
+  if (!token) return;
+  try {
+    const res = await fetch(`${SUPERADMIN_API_BASE}/tenants/whatsapp/requests`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return;
+    const data = await res.json();
+    whatsappRequests.value = data.requests || [];
+    // Seed each input with the number the client asked for.
+    for (const r of whatsappRequests.value) {
+      if (whatsappNumberInput.value[r.organization_id] === undefined) {
+        whatsappNumberInput.value[r.organization_id] = r.contact_number || '';
+      }
+    }
+  } catch (_) {
+    // best effort
+  }
+};
+
+const connectWhatsapp = async (orgId) => {
+  const token = localStorage.getItem(SUPERADMIN_ACCESS_TOKEN_KEY);
+  if (!token) return;
+  const number = (whatsappNumberInput.value[orgId] || '').trim();
+  if (!number) return;
+  whatsappBusyOrg.value = orgId;
+  try {
+    const res = await fetch(
+      `${SUPERADMIN_API_BASE}/tenants/${orgId}/whatsapp/connect`,
+      {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ whatsapp_number: number }),
+      },
+    );
+    if (res.ok) {
+      await loadWhatsappRequests();
+    }
+  } finally {
+    whatsappBusyOrg.value = '';
+  }
+};
+
 onMounted(async () => {
-  await Promise.all([loadOrganizations(), loadNokvoOnePending()]);
+  await Promise.all([loadOrganizations(), loadNokvoOnePending(), loadWhatsappRequests()]);
 });
 
 watch(() => props.homeSignal, () => {
@@ -443,6 +491,46 @@ watch(() => props.homeSignal, () => {
                 </button>
                 <button class="create-org-btn" @click="approveNokvoOne(org.id, true)">
                   APPROVE + ENABLE CALLING
+                </button>
+              </div>
+            </article>
+          </div>
+        </section>
+
+        <section v-if="whatsappRequests.length" class="orgs-panel top-panel nokvo-one-panel">
+          <div class="orgs-panel-header">
+            <div>
+              <span class="stage-eyebrow">WHATSAPP — SETUP REQUESTS</span>
+              <h3>Clients awaiting WhatsApp onboarding</h3>
+              <p class="orgs-summary">{{ whatsappRequests.length }} request(s) — onboard the number in the Plivo Console, then record it here</p>
+            </div>
+            <button class="create-org-btn" @click="loadWhatsappRequests">REFRESH</button>
+          </div>
+          <div class="org-cards">
+            <article v-for="req in whatsappRequests" :key="req.organization_id" class="org-card">
+              <div class="org-card-header">
+                <h4>{{ req.business_name || req.organization_name }}</h4>
+                <span class="status-badge" data-status="requested">requested</span>
+              </div>
+              <p class="org-meta">
+                {{ req.organization_name }}<template v-if="req.contact_number"> · {{ req.contact_number }}</template><template v-if="req.display_name"> · “{{ req.display_name }}”</template>
+              </p>
+              <p class="org-meta" v-if="req.requested_at">
+                Requested {{ req.requested_at }}<template v-if="req.requested_by"> by {{ req.requested_by }}</template>
+              </p>
+              <div class="org-actions wa-connect-row">
+                <input
+                  v-model="whatsappNumberInput[req.organization_id]"
+                  class="wa-connect-input"
+                  type="tel"
+                  placeholder="Connected WABA number"
+                />
+                <button
+                  class="create-org-btn"
+                  :disabled="whatsappBusyOrg === req.organization_id"
+                  @click="connectWhatsapp(req.organization_id)"
+                >
+                  {{ whatsappBusyOrg === req.organization_id ? 'CONNECTING…' : 'MARK CONNECTED' }}
                 </button>
               </div>
             </article>
@@ -901,6 +989,28 @@ watch(() => props.homeSignal, () => {
   gap: 0.75rem;
   flex-wrap: wrap;
   justify-content: flex-end;
+}
+
+.wa-connect-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+.wa-connect-input {
+  flex: 1 1 180px;
+  min-width: 160px;
+  background: rgba(15, 23, 42, 0.6);
+  border: 1px solid rgba(59, 130, 246, 0.28);
+  color: var(--text-primary);
+  padding: 0.7rem 0.8rem;
+  font-size: 0.8rem;
+  border-radius: 6px;
+  font-family: inherit;
+}
+.wa-connect-input:focus {
+  outline: none;
+  border-color: rgba(59, 130, 246, 0.6);
 }
 
 .create-org-btn {

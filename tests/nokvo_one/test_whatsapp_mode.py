@@ -150,7 +150,8 @@ def test_whatsapp_block_forbids_name_email_and_lead():
 def test_inbound_fsm_enters_whatsapp_mode_on_intent():
     st = {"tool_flow": {"whatsapp_intent": {"kind": "brochure"}}}
     assert inb_fsm.current_mode(st) == inb_fsm.AGENT_MODE_WHATSAPP
-    assert "WHATSAPP" in inb_fsm.mode_block_for_prompt(inb_fsm.AGENT_MODE_WHATSAPP)
+    # The mode now promises an SMS/text (WhatsApp delivery is disabled).
+    assert "text" in inb_fsm.mode_block_for_prompt(inb_fsm.AGENT_MODE_WHATSAPP).lower()
 
 
 def test_outbound_fsm_enters_whatsapp_mode_on_intent():
@@ -172,10 +173,11 @@ def test_active_booking_flow_is_not_interrupted_by_brochure_intent():
 # ── end-of-call brochure + location auto-send (inbound real-estate) ──────────
 
 
-def test_end_of_call_sends_brochure_and_location_to_ani(monkeypatch):
-    """At teardown, BOTH the brochure and the project location go to the
-    caller's own number (the ANI), and the idempotency flags are recorded."""
+def test_end_of_call_texts_brochure_and_location_links(monkeypatch):
+    """At teardown, ONE SMS with the brochure + location links goes to the
+    caller's own number (the ANI), and the sms_sent flag is recorded."""
     from app.services.nokvo_one_voice_pipeline import NokvoOneVoicePipeline
+    from app.services.sms_service import SmsService
     import app.services.real_estate_project_service as rps
 
     proj = _project(
@@ -187,12 +189,12 @@ def test_end_of_call_sends_brochure_and_location_to_ani(monkeypatch):
         return [proj]
     monkeypatch.setattr(rps, "load_active_projects", fake_load)
 
-    sent: list[tuple] = []
+    sent: list[dict] = []
 
-    async def fake_send(db, org_id, *, to_number, template_name, language, body_params, media_url):
-        sent.append((template_name, to_number, media_url))
+    async def fake_send(db, org_id, *, to_number, text, sender_override=None):
+        sent.append({"to": to_number, "text": text})
         return {"ok": True}
-    monkeypatch.setattr(WhatsAppService, "send_for_org", fake_send)
+    monkeypatch.setattr(SmsService, "send_for_org", fake_send)
 
     flags: dict = {}
 
@@ -204,36 +206,32 @@ def test_end_of_call_sends_brochure_and_location_to_ani(monkeypatch):
     )
 
     state = {"caller_phone": "+919999999999", "memory": {}}
-    _run(NokvoOneVoicePipeline._send_brochure_and_location_to_caller(
+    _run(NokvoOneVoicePipeline._send_brochure_and_location_sms(
         db=None, org_id="org-1", tenant_res=SimpleNamespace(), call_id="call-1", state=state,
     ))
 
-    assert len(sent) == 2
-    assert {s[0] for s in sent} == {"broc_tpl", "loc_tpl"}
-    assert all(s[1] == "+919999999999" for s in sent)  # ANI is the recipient
-    # The brochure rides its PDF as the document header.
-    broc = next(s for s in sent if s[0] == "broc_tpl")
-    assert broc[2] == "https://x/brochure.pdf"
-    assert flags == {"brochure_wa_sent": True, "location_sent": True}
+    assert len(sent) == 1                                   # ONE SMS, both links
+    assert sent[0]["to"] == "+919999999999"                 # ANI is the recipient
+    assert "https://x/brochure.pdf" in sent[0]["text"]      # brochure link
+    assert "https://maps/x" in sent[0]["text"]              # location link
+    assert "Skyline Heights" in sent[0]["text"]
+    assert flags == {"sms_sent": True}
 
 
 def test_end_of_call_skips_when_already_sent(monkeypatch):
-    """Idempotent: if both flags are set, nothing is re-sent (no double-send
-    with the explicit mid-call request_brochure path)."""
+    """Idempotent: if sms_sent is set, nothing is re-sent."""
     from app.services.nokvo_one_voice_pipeline import NokvoOneVoicePipeline
+    from app.services.sms_service import SmsService
 
     called: list[int] = []
 
     async def fake_send(*a, **k):
         called.append(1)
         return {"ok": True}
-    monkeypatch.setattr(WhatsAppService, "send_for_org", fake_send)
+    monkeypatch.setattr(SmsService, "send_for_org", fake_send)
 
-    state = {
-        "caller_phone": "+919999999999", "memory": {},
-        "brochure_wa_sent": True, "location_sent": True,
-    }
-    _run(NokvoOneVoicePipeline._send_brochure_and_location_to_caller(
+    state = {"caller_phone": "+919999999999", "memory": {}, "sms_sent": True}
+    _run(NokvoOneVoicePipeline._send_brochure_and_location_sms(
         db=None, org_id="o", tenant_res=SimpleNamespace(), call_id="c", state=state,
     ))
     assert called == []
@@ -242,15 +240,16 @@ def test_end_of_call_skips_when_already_sent(monkeypatch):
 def test_end_of_call_skips_when_no_caller_phone(monkeypatch):
     """No ANI → nothing to send."""
     from app.services.nokvo_one_voice_pipeline import NokvoOneVoicePipeline
+    from app.services.sms_service import SmsService
 
     called: list[int] = []
 
     async def fake_send(*a, **k):
         called.append(1)
         return {"ok": True}
-    monkeypatch.setattr(WhatsAppService, "send_for_org", fake_send)
+    monkeypatch.setattr(SmsService, "send_for_org", fake_send)
 
-    _run(NokvoOneVoicePipeline._send_brochure_and_location_to_caller(
+    _run(NokvoOneVoicePipeline._send_brochure_and_location_sms(
         db=None, org_id="o", tenant_res=SimpleNamespace(), call_id="c", state={"memory": {}},
     ))
     assert called == []
@@ -299,9 +298,9 @@ def test_outbound_real_estate_still_starts_site_visit_flow():
 # ── prompt guardrails (timing + disambiguation) ─────────────────────────────
 
 
-def test_query_block_offers_whatsapp_after_hangup_and_disambiguates():
+def test_query_block_offers_to_text_after_hangup_and_disambiguates():
     block = inb_fsm.mode_block_for_prompt(inb_fsm.AGENT_MODE_QUERY).lower()
-    assert "whatsapp" in block
+    assert "text" in block               # SMS delivery (WhatsApp disabled)
     assert "hang up" in block            # post-disconnect timing (Flaw 1)
     assert "which" in block              # ask which project first (Flaw 3)
     assert "never ask for a phone" in block  # no interrogation
@@ -387,3 +386,56 @@ def test_whatsapp_link_response_not_connected(monkeypatch):
     assert res["connected"] is False
     assert res["whatsapp_number"] is None
     assert res["ready_to_send"] is False           # nothing to send from
+
+
+# ── per-PROJECT WhatsApp sender (overrides the tenant number) ────────────────
+
+
+def test_resolvers_surface_project_sender_number():
+    p = _project(
+        sender_number="+91PROJECT",
+        brochure={"template": "b"},
+        location={"template": "l", "maps_url": "https://maps/x"},
+    )
+    assert project_whatsapp_brochure(p)["sender"] == "+91PROJECT"
+    assert project_whatsapp_location(p)["sender"] == "+91PROJECT"
+    # No per-project number configured → None (falls back to the tenant sender).
+    assert project_whatsapp_brochure(_project(brochure={"template": "b"}))["sender"] is None
+
+
+def _capture_src(monkeypatch):
+    """Patch the Plivo REST + auth so a send is captured, not performed."""
+    captured: dict = {}
+
+    async def fake_request(method, url, *, auth, json_body=None):
+        captured["body"] = json_body
+        return {"message_uuid": "m1"}
+
+    monkeypatch.setattr("app.services.plivo_service.PlivoService._request", fake_request)
+    monkeypatch.setattr("app.services.plivo_service.PlivoService._master_auth", lambda: ("aid", "atok"))
+    return captured
+
+
+def test_send_template_prefers_project_sender_override(monkeypatch):
+    monkeypatch.setattr(settings, "PLIVO_WHATSAPP_ENABLED", True)
+    captured = _capture_src(monkeypatch)
+    res = _run(WhatsAppService.send_template(
+        tenant_res=_tenant({"whatsapp_number": "+91TENANT"}),
+        to_number="+919999999999",
+        template_name="project_brochure",
+        sender_override="+91PROJECT",
+    ))
+    assert res["ok"] is True
+    assert captured["body"]["src"] == "+91PROJECT"   # the project's number wins
+
+
+def test_send_template_falls_back_to_tenant_when_no_override(monkeypatch):
+    monkeypatch.setattr(settings, "PLIVO_WHATSAPP_ENABLED", True)
+    captured = _capture_src(monkeypatch)
+    res = _run(WhatsAppService.send_template(
+        tenant_res=_tenant({"whatsapp_number": "+91TENANT"}),
+        to_number="+919999999999",
+        template_name="project_brochure",
+    ))
+    assert res["ok"] is True
+    assert captured["body"]["src"] == "+91TENANT"    # tenant sender when no project override

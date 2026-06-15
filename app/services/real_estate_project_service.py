@@ -362,6 +362,9 @@ def project_whatsapp_location(project: RealEstateProject) -> dict[str, Any] | No
         # {{1}} project name, {{2}} maps link (falls back to the display location).
         "body_params": [project.name, maps_url or (project.location or "")],
         "media_url": None,
+        # Per-project WhatsApp sender — overrides the tenant WABA number when set,
+        # so this project's location goes out from its own number.
+        "sender": str((getattr(project, "whatsapp", None) or {}).get("sender_number") or "").strip() or None,
     }
 
 
@@ -379,4 +382,6 @@ def project_whatsapp_brochure(project: RealEstateProject) -> dict[str, Any] | No
         # {{1}} project name; the brochure URL rides as the document header.
         "body_params": [project.name],
         "media_url": (project.brochure_url or None),
+        # Per-project WhatsApp sender — overrides the tenant WABA number when set.
+        "sender": str((getattr(project, "whatsapp", None) or {}).get("sender_number") or "").strip() or None,
     }

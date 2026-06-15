@@ -114,6 +114,11 @@ const list = computed(() => projects?.value || []);
               template already approved on your WhatsApp Business account — plain text won't deliver.
             </p>
           </div>
+          <label class="n-field proj__col-2">
+            <span class="n-field__label">WhatsApp number (sender)</span>
+            <input v-model="projectDraft.wa_sender_number" class="n-input" type="tel" placeholder="+91 98765 43210" />
+            <span class="proj__wa-hint">The brochure &amp; location for this project send FROM this WhatsApp Business number (overrides the account default).</span>
+          </label>
           <label class="n-field">
             <span class="n-field__label">Location template name</span>
             <input v-model="projectDraft.wa_location_template" class="n-input" type="text" placeholder="site_visit_location" />

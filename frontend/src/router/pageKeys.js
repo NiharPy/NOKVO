@@ -13,6 +13,7 @@ export const pageKeyToRouteName = {
   leads: 'dash-leads',
   customers: 'dash-customers',
   followups: 'dash-followups',
+  transcripts: 'dash-transcripts',
   appointments: 'dash-appointments',
   projects: 'dash-projects',
   services: 'dash-services',

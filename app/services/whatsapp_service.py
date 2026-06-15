@@ -66,6 +66,7 @@ class WhatsAppService:
         language: str = "en",
         body_params: list[str] | None = None,
         media_url: str | None = None,
+        sender_override: str | None = None,
     ) -> dict[str, Any]:
         """Send an approved WhatsApp template to ``to_number``. Returns
         ``{ok: bool, ...}``; ``skipped`` when the feature is off / unconfigured."""
@@ -75,9 +76,13 @@ class WhatsAppService:
             return {"ok": False, "skipped": True, "reason": "missing_recipient_or_template"}
 
         cfg = PlivoService._plivo_config(tenant_res)
-        sender = cls._resolve_sender(cfg)
+        # Precedence: a per-PROJECT sender (sender_override) wins over the tenant's
+        # WABA number, which wins over the test-only global fallback. So a project
+        # configured with its own WhatsApp number sends its brochure/location from
+        # that number.
+        sender = (sender_override or "").strip() or cls._resolve_sender(cfg)
         if not sender:
-            # No per-tenant WABA number (and no test fallback) → never borrow
+            # No project/tenant WABA number (and no test fallback) → never borrow
             # another tenant's sender; just skip.
             return {"ok": False, "skipped": True, "reason": "no_whatsapp_sender"}
 
@@ -131,6 +136,7 @@ class WhatsAppService:
         language: str = "en",
         body_params: list[str] | None = None,
         media_url: str | None = None,
+        sender_override: str | None = None,
     ) -> dict[str, Any]:
         """Convenience for tool handlers that only carry ``db`` + ``organization_id``:
         resolve the tenant, then send. Best-effort — never raises."""
@@ -155,4 +161,5 @@ class WhatsAppService:
             language=language,
             body_params=body_params,
             media_url=media_url,
+            sender_override=sender_override,
         )

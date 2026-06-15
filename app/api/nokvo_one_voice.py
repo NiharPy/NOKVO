@@ -662,6 +662,14 @@ class WhatsAppLinkRequest(BaseModel):
     whatsapp_number: str
 
 
+class WhatsAppSetupRequest(BaseModel):
+    # Concierge onboarding: the client requests WhatsApp setup and never sees
+    # Plivo/Meta. The operator fulfils it (Plivo Console) and records the sender.
+    business_name: str
+    contact_number: str            # the number they want as their WhatsApp sender
+    display_name: str | None = None
+
+
 class LeadOauthStartRequest(BaseModel):
     provider: str = Field(pattern="^(meta_ads|google_ads|google_forms)$")
     mode: str = "ads"
@@ -867,6 +875,31 @@ async def get_whatsapp_link(
 
     tr = await _tenant_for_user(db, user)
     return PlivoService.whatsapp_link_response(tr)
+
+
+@router.post("/whatsapp-link/request")
+async def request_whatsapp_link_setup(
+    payload: WhatsAppSetupRequest,
+    user: OrganizationUser = Depends(_admin_dep()),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Concierge onboarding entry point — the client requests WhatsApp setup.
+    Stores the request + alerts ops; the operator fulfils it out-of-band. The
+    client never sees Plivo."""
+    from app.services.plivo_service import PlivoError, PlivoService
+
+    tr = await _tenant_for_user(db, user)
+    try:
+        return await PlivoService.request_whatsapp_setup(
+            tr, db,
+            business_name=payload.business_name,
+            contact_number=payload.contact_number,
+            display_name=payload.display_name,
+            requested_by=getattr(user, "email", None),
+        )
+    except PlivoError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/whatsapp-link")

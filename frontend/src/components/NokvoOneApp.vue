@@ -48,6 +48,7 @@ import {
   Wallet,
   Wrench,
   XCircle,
+  ScrollText,
 } from 'lucide-vue-next';
 
 import {
@@ -140,6 +141,8 @@ const _emptyProjectDraft = () => ({
   wa_location_template: '',
   wa_location_maps_url: '',
   wa_brochure_template: '',
+  // Per-project WhatsApp Business sender — brochure + location send from this number.
+  wa_sender_number: '',
 });
 
 const projects = ref([]);
@@ -337,6 +340,14 @@ const isLoadingNotifications = ref(false);
 const notificationsSocket = ref(null);
 const phoneLink = ref(null);
 const phoneLinkInput = ref('');
+// Concierge WhatsApp onboarding (the client never sees Plivo): the portal shows
+// not_requested → setting_up → connected; the operator fulfils it out-of-band.
+const whatsappLink = ref(null);
+const whatsappForm = ref({ business_name: '', contact_number: '', display_name: '' });
+const isRequestingWhatsapp = ref(false);
+// Transcripts page: the call list (from CallCost + has_transcript) for this org.
+const transcripts = ref([]);
+const transcriptsLoading = ref(false);
 const isSavingPhoneLink = ref(false);
 const campaigns = ref([]);
 // Campaign-objective codes. Source of truth for the multi-select dropdown
@@ -828,6 +839,9 @@ const switchPage = (page) => {
   if (page === 'outgoing_agent') {
     loadOutgoingAgentWorkspace();
     loadCampaigns();
+  }
+  if (page === 'transcripts') {
+    loadTranscripts();
   }
   if (['leads', 'tickets', 'appointments'].includes(page)) {
     loadTabRecords(page);
@@ -1533,6 +1547,7 @@ const _projectDraftFromRecord = (project) => ({
   wa_location_template: project.whatsapp?.location?.template || '',
   wa_location_maps_url: project.whatsapp?.location?.maps_url || '',
   wa_brochure_template: project.whatsapp?.brochure?.template || '',
+  wa_sender_number: project.whatsapp?.sender_number || '',
 });
 
 const _projectPayloadFromDraft = (draft) => {
@@ -1561,6 +1576,12 @@ const _projectPayloadFromDraft = (draft) => {
   const brocTemplate = trimmed(draft.wa_brochure_template);
   if (brocTemplate) {
     whatsapp.brochure = { template: brocTemplate, language: 'en' };
+  }
+  // Per-project WhatsApp sender: the brochure + location go out FROM this number
+  // (overrides the tenant default). Stored independently of the template names.
+  const waSender = trimmed(draft.wa_sender_number);
+  if (waSender) {
+    whatsapp.sender_number = waSender;
   }
   return {
     name: (draft.name || '').trim(),
@@ -4013,6 +4034,89 @@ const savePhoneLink = async () => {
   }
 };
 
+const loadWhatsAppLink = async () => {
+  try {
+    const { data } = await agentsApi.get('/whatsapp-link', { headers: authHeader() });
+    whatsappLink.value = data;
+  } catch (err) {
+    whatsappLink.value = null;
+  }
+};
+
+const requestWhatsApp = async () => {
+  isRequestingWhatsapp.value = true;
+  try {
+    const { data } = await agentsApi.post(
+      '/whatsapp-link/request',
+      {
+        business_name: (whatsappForm.value.business_name || '').trim(),
+        contact_number: (whatsappForm.value.contact_number || '').trim(),
+        display_name: (whatsappForm.value.display_name || '').trim() || null,
+      },
+      { headers: authHeader() },
+    );
+    whatsappLink.value = data;
+  } catch (err) {
+    if (await handleMfaProtectedError(err)) return;
+    errorMsg.value = extractErrorMessage(err, 'Failed to request WhatsApp setup.');
+  } finally {
+    isRequestingWhatsapp.value = false;
+  }
+};
+
+const cancelWhatsApp = async () => {
+  try {
+    const { data } = await agentsApi.delete('/whatsapp-link', { headers: authHeader() });
+    whatsappLink.value = data;
+  } catch (err) {
+    if (await handleMfaProtectedError(err)) return;
+    errorMsg.value = extractErrorMessage(err, 'Failed to cancel WhatsApp setup.');
+  }
+};
+
+const loadTranscripts = async () => {
+  transcriptsLoading.value = true;
+  try {
+    const { data } = await api.get('/transcripts', { headers: authHeader() });
+    transcripts.value = data?.transcripts || [];
+  } catch (err) {
+    transcripts.value = [];
+  } finally {
+    transcriptsLoading.value = false;
+  }
+};
+
+const loadTranscript = async (callId) => {
+  try {
+    const { data } = await api.get(`/transcripts/${encodeURIComponent(callId)}`, { headers: authHeader() });
+    return data;
+  } catch (err) {
+    errorMsg.value = extractErrorMessage(err, 'Failed to load transcript.');
+    return null;
+  }
+};
+
+const downloadTranscript = async (callId) => {
+  // The .txt endpoint needs the Bearer header, so a plain <a href> won't do —
+  // fetch as a blob, then click a synthetic link.
+  try {
+    const res = await api.get(`/transcripts/${encodeURIComponent(callId)}/download`, {
+      headers: authHeader(),
+      responseType: 'blob',
+    });
+    const url = window.URL.createObjectURL(new Blob([res.data], { type: 'text/plain' }));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `transcript_${callId}.txt`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    window.URL.revokeObjectURL(url);
+  } catch (err) {
+    errorMsg.value = extractErrorMessage(err, 'Failed to download transcript.');
+  }
+};
+
 const loadCampaigns = async () => {
   try {
     const { data } = await agentsApi.get('/campaigns', { headers: authHeader() });
@@ -5603,6 +5707,17 @@ provideDashboardState({
   isSavingPhoneLink,
   savePhoneLink,
   phoneLink,
+  whatsappLink,
+  whatsappForm,
+  isRequestingWhatsapp,
+  loadWhatsAppLink,
+  requestWhatsApp,
+  cancelWhatsApp,
+  transcripts,
+  transcriptsLoading,
+  loadTranscripts,
+  loadTranscript,
+  downloadTranscript,
   emailDrafts,
   loadEmailDrafts,
   discardDraft,
@@ -6757,6 +6872,10 @@ provideDashboardState({
               <button type="button" class="n-shell-nav__item" :class="{ 'is-active': currentPage === 'followups' }" @click="switchPage('followups')">
                 <Repeat :size="14" />
                 <span>Follow-ups</span>
+              </button>
+              <button type="button" class="n-shell-nav__item" :class="{ 'is-active': currentPage === 'transcripts' }" @click="switchPage('transcripts')">
+                <ScrollText :size="14" />
+                <span>Transcripts</span>
               </button>
               <button
                 v-if="isRealEstateTemplate"

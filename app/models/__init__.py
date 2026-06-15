@@ -35,6 +35,7 @@ from app.models.customer_base import CustomerBase
 from app.models.connect_api_key import OrganizationApiKey
 from app.models.connect_session import ConnectSession
 from app.models.call_cost import CallCost
+from app.models.call_transcript import CallTranscript
 from app.models.notification import Notification
 from app.models.real_estate_project import RealEstateProject
 
@@ -68,6 +69,7 @@ __all__ = [
     "OrganizationApiKey",
     "ConnectSession",
     "CallCost",
+    "CallTranscript",
     "Notification",
     "RealEstateProject",
     "FollowupReason",
