@@ -203,11 +203,11 @@ _ANY_NATIVE_SCRIPT_RE = re.compile(
 _LATIN_LETTER_RE = re.compile(r"[A-Za-z]")
 
 # Minimum word counts before a *spoken* (not explicitly requested) language
-# change is honoured. Switching to a native language is script-confirmed, so a
-# couple of words suffice. Switching to English is riskier — Indian-language
-# callers pepper English loanwords / courtesies ("ok", "thank you") mid-call —
-# so demand a longer run before flipping the whole call to English.
-_MIN_WORDS_TO_NATIVE = 2
+# change is honoured. Even with the dominance check below, a single mis-detected
+# native word shouldn't flip the call, so demand a short RUN of native words
+# (3). Switching to English is riskier — Indian-language callers pepper English
+# loanwords / courtesies ("ok", "thank you") mid-call — so demand a longer run.
+_MIN_WORDS_TO_NATIVE = 3
 _MIN_WORDS_TO_ENGLISH = 4
 
 
@@ -215,7 +215,10 @@ def script_matches_language(text: str, language: str | None) -> bool:
     """True when ``text`` is written in the script we'd expect for ``language``.
 
     English ⇒ Latin letters present and no Indian-script run. An Indian
-    language ⇒ that language's own script appears in the text.
+    language ⇒ that language's own script must DOMINATE the utterance, not
+    merely appear: a single code-switched native word inside an otherwise
+    English sentence ("I would कुछ") must NOT read as a switch to that
+    language — that was flipping whole calls to Hindi on one loanword.
     """
     code = (language or "").strip().lower()[:2]
     if not text or not code:
@@ -223,7 +226,17 @@ def script_matches_language(text: str, language: str | None) -> bool:
     if code == "en":
         return bool(_LATIN_LETTER_RE.search(text)) and not _ANY_NATIVE_SCRIPT_RE.search(text)
     pat = _LANG_SCRIPT_RE.get(code)
-    return bool(pat.search(text)) if pat else False
+    if pat is None:
+        return False
+    # Compare native-script word-tokens against Latin word-tokens. The native
+    # language must carry at least as many word-tokens as English does, so a
+    # mostly-English code-switched turn (the common false-positive) is rejected.
+    tokens = re.findall(r"\S+", text)
+    native_tokens = sum(1 for tok in tokens if pat.search(tok))
+    latin_tokens = sum(1 for tok in tokens if _LATIN_LETTER_RE.search(tok))
+    if native_tokens == 0:
+        return False
+    return native_tokens >= latin_tokens
 
 
 def detect_spoken_language_switch(

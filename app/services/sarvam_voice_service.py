@@ -4,6 +4,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+import asyncio
 import base64
 import json
 import re
@@ -566,6 +567,10 @@ class SarvamVoiceService:
             "text": str(transcript).strip(),
             "is_final": bool(is_final and transcript),
             "language": SarvamVoiceService.normalize_language(language_code),
+            # Per-segment language confidence — lets detect_spoken_language_switch
+            # reject low-confidence flips. Carried through from the raw payload.
+            "language_probability": data.get("language_probability")
+            or payload.get("language_probability"),
             "raw": payload,
         }
 
@@ -810,21 +815,40 @@ class SarvamVoiceService:
         )
         audio_format = settings.SARVAM_TTS_AUDIO_CODEC
         used_streaming = False
+        fell_back = False
+        # ``result`` is only populated on the REST path; default it so a clean
+        # streaming success doesn't NameError on the merged return below.
+        result: dict[str, Any] = {}
+        # Per-sentence FIRST-audio deadline. The serial TTS pump means one slow
+        # sentence stalls every sentence after it, and the streaming endpoint
+        # otherwise relies only on httpx's 30s timeout — so a degraded stream can
+        # hang the whole turn for seconds. Bound the wait for FIRST audio; once
+        # audio is flowing we don't interrupt the sentence.
+        _first_audio_deadline_s = max(
+            0.1, settings.VOICE_TTS_STREAM_FIRST_AUDIO_DEADLINE_MS / 1000
+        )
 
         # Try the streaming endpoint first — push each chunk to the WS as it
         # arrives so the caller hears the start of the sentence ~150-300ms
-        # earlier than the REST path. Fall back to REST on any streaming
-        # error so a Sarvam streaming blip never silences the turn.
+        # earlier than the REST path. Fall back to REST on any streaming error,
+        # OR if first audio doesn't arrive within the deadline (degraded stream).
+        _stream_gen = SarvamVoiceService.synthesize_streaming(
+            tenant_res,
+            text,
+            language=language,
+            pace=pace,
+            pitch=pitch,
+            loudness=loudness,
+            enable_cached_responses=enable_cached_responses,
+        )
         try:
-            async for chunk in SarvamVoiceService.synthesize_streaming(
-                tenant_res,
-                text,
-                language=language,
-                pace=pace,
-                pitch=pitch,
-                loudness=loudness,
-                enable_cached_responses=enable_cached_responses,
-            ):
+            while True:
+                if first_audio_ms is None:
+                    chunk = await asyncio.wait_for(
+                        _stream_gen.__anext__(), timeout=_first_audio_deadline_s
+                    )
+                else:
+                    chunk = await _stream_gen.__anext__()
                 used_streaming = True
                 audio = chunk.get("audio_base64")
                 if not audio:
@@ -861,11 +885,32 @@ class SarvamVoiceService:
                     chunks_sent += 1
                 except Exception:
                     pass
-        except Exception as exc:
-            logger.warning(
-                "NOKVO-TTS: Sarvam streaming TTS failed (%s); falling back to REST",
-                exc,
-            )
+        except StopAsyncIteration:
+            pass
+        except BaseException as exc:
+            # Deadline exceeded (degraded stream) OR a streaming-side error —
+            # in either case abandon streaming and let the REST fallback try.
+            if isinstance(exc, asyncio.TimeoutError):
+                logger.warning(
+                    "NOKVO-TTS: Sarvam streaming first-audio exceeded %dms deadline; REST fallback",
+                    settings.VOICE_TTS_STREAM_FIRST_AUDIO_DEADLINE_MS,
+                )
+            elif isinstance(exc, asyncio.CancelledError):
+                # Real cancellation (barge-in) — close the stream and re-raise.
+                try:
+                    await _stream_gen.aclose()
+                except Exception:
+                    pass
+                raise
+            else:
+                logger.warning(
+                    "NOKVO-TTS: Sarvam streaming TTS failed (%s); falling back to REST", exc
+                )
+            try:
+                await _stream_gen.aclose()
+            except Exception:
+                pass
+            fell_back = True
             used_streaming = False
             chunks_sent = 0
             first_audio_ms = None
@@ -949,4 +994,15 @@ class SarvamVoiceService:
             )
         except Exception:
             pass
+        # Per-sentence TTS latency — previously a blind spot (TTS isn't traced to
+        # LangSmith), which hid multi-second stalls behind a healthy LLM. mode =
+        # which path actually produced audio; fell_back flags a streaming→REST
+        # switch (deadline or error). This is what makes a TTS stall attributable.
+        total_ms = int((perf_counter() - started) * 1000)
+        logger.info(
+            "NOKVO-TTS-LATENCY: purpose=%s lang=%s mode=%s fell_back=%s "
+            "first_audio_ms=%s total_ms=%d chars=%d chunks=%d",
+            purpose, language or "-", "stream" if used_streaming else "rest",
+            fell_back, first_audio_ms, total_ms, len(text or ""), chunks_sent,
+        )
         return {"stream_id": stream_id, "first_audio_ms": first_audio_ms, **result}

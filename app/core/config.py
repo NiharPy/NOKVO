@@ -357,6 +357,13 @@ class Settings(BaseSettings):
     FILLER_TRIGGER_MS: int = 400          # Play filler only if the real answer is not ready quickly
     TTS_SEGMENT_IDLE_DONE_MS: int = 750   # Treat a TTS segment as done after audio goes idle
     TTS_SEGMENT_FIRST_AUDIO_TIMEOUT_MS: int = 2500
+    # Per-sentence Sarvam STREAMING first-audio deadline (NOKVO One voice path).
+    # Sarvam streaming first-audio is normally ~80-180ms; if no audio frame has
+    # arrived within this deadline the stream is degraded — abandon it and fall
+    # back to REST immediately rather than letting one slow sentence stall the
+    # whole turn for seconds behind the serial TTS pump. Only bounds FIRST audio;
+    # once audio is flowing the rest of the sentence streams uninterrupted.
+    VOICE_TTS_STREAM_FIRST_AUDIO_DEADLINE_MS: int = 1200
     AGENT_LLM_STREAM_TOTAL_MS: int = 6000 # Max total LLM stream wait
     AGENT_TOPIC_CONTINUITY_OVERLAP: float = 0.35  # Word overlap to reuse last chunks
     AGENT_MAX_FIRST_SENTENCE_CHARS: int = 110     # Force TTS dispatch after this many chars
@@ -392,6 +399,12 @@ class Settings(BaseSettings):
     VOICE_LATENCY_BUDGET_MS: int = 1000           # The hard eos→first-audio budget
     VOICE_LATENCY_GUARD_FLOOR_MS: int = 120       # Min wait before firing the filler (give the real LLM a chance)
     VOICE_LATENCY_GUARD_TTS_MARGIN_MS: int = 120  # Reserve for TTS dispatch→audible-audio
+    # Grace window peeked AFTER the budget elapses, BEFORE committing a filler.
+    # The single ordered TTS pump plays a filler fully before the real content,
+    # so a filler fired a beat before the real answer just delays that answer by
+    # its own ~1s of playback. If a real sentence lands within this window we
+    # skip the filler and speak the content directly.
+    VOICE_LATENCY_GUARD_CONTENT_GRACE_MS: int = 150
     VOICE_FIRST_SENTENCE_TIMEOUT_MS: int = 750    # Ceiling for the filler wait when no eos anchor exists
     VOICE_LLM_STREAM_RETRY_ATTEMPTS: int = 2
     VOICE_LLM_STREAM_MAX_RETRY_WAIT_MS: int = 350

@@ -363,6 +363,20 @@ def test_salient_renders_in_prompt_block() -> None:
     assert "shellfish" in block
 
 
+def test_prior_call_salient_note_is_marked_in_prompt_block() -> None:
+    # Regression (LangSmith call e058…): a restored prior-call note rendered bare
+    # made the agent assert "tomorrow is already noted from our earlier note".
+    # Prior-call notes must be tagged so the LLM confirms rather than asserts.
+    m = ConversationalMemory()
+    m._accept_salient({"code": "note", "text": "wants to visit tomorrow", "from_prior_call": True})
+    m._accept_salient({"code": "note", "text": "asked about pricing", "from_prior_call": False})
+    block = m.compose_prompt_block(business_type="real_estate")
+    assert "wants to visit tomorrow (from a prior call)" in block
+    # A current-call note must NOT carry the prior-call marker.
+    assert "asked about pricing (from a prior call)" not in block
+    assert "asked about pricing" in block
+
+
 def test_salient_notes_survive_state_blob_roundtrip() -> None:
     m = ConversationalMemory()
     m.merge_text("I'm allergic to dust", turn_index=1)

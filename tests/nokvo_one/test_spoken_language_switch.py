@@ -72,3 +72,13 @@ def test_switch_between_two_native_languages():
     assert (
         detect_spoken_language_switch("నాకు ఆ details కావాలి", "te", "hi") == "te"
     )
+
+
+def test_single_codeswitched_native_word_does_not_flip_english_call():
+    # Regression (LangSmith call e058…): an English caller dropped ONE Hindi word
+    # ("कुछ" = "something") and Sarvam labelled the segment hi — the whole call
+    # flipped to Hindi. The native script must DOMINATE, not merely appear.
+    assert not script_matches_language("I would कुछ", "hi")
+    assert detect_spoken_language_switch("I would कुछ", "hi", "en") is None
+    # Mostly-English turn with a couple of native words still stays English.
+    assert detect_spoken_language_switch("send me the project कुछ details", "hi", "en") is None

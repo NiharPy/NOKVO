@@ -161,6 +161,112 @@ def test_nokvo_streaming_eou_uses_sub_second_latency_budget(monkeypatch):
     assert websocket.accepted is True
 
 
+class _BurstSTT:
+    """Yields two finals; the second only AFTER turn 1 has been dispatched, so
+    turn 1 is still in-flight (pre-speech) when turn 2 fires — the burst that
+    silently dropped turns in the LangSmith call."""
+
+    def __init__(self, turn1_dispatched: asyncio.Event) -> None:
+        self.closed = False
+        self._turn1 = turn1_dispatched
+
+    async def __aiter__(self):
+        yield json.dumps({"text": "at around 2 PM", "is_final": True})
+        try:
+            await asyncio.wait_for(self._turn1.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            pass
+        yield json.dumps({"text": "Alright, thank you.", "is_final": True})
+        while not self.closed:
+            await asyncio.sleep(0.5)
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _BurstWebSocket:
+    def __init__(self, done: asyncio.Event) -> None:
+        self.accepted = False
+        self.sent: list[dict] = []
+        self._done = done
+        self._fed = 0
+
+    async def accept(self) -> None:
+        self.accepted = True
+
+    async def send_json(self, payload: dict) -> None:
+        self.sent.append(payload)
+
+    async def receive(self) -> dict:
+        if self._fed < 2:
+            self._fed += 1
+            return {"bytes": b"pcm"}
+        await asyncio.wait_for(self._done.wait(), timeout=3.0)
+        return {"type": "websocket.disconnect"}
+
+
+def test_pre_speech_turn_is_folded_not_dropped(monkeypatch):
+    """Carry-forward (Fix #2): when a fresh utterance fires while the previous
+    turn is still pre-speech, the previous turn's text must be FOLDED into the
+    new turn, not silently dropped on drain."""
+    async def scenario() -> list[str]:
+        turn1_dispatched = asyncio.Event()
+        done = asyncio.Event()
+        calls: list[str] = []
+
+        async def noop(*args, **kwargs):
+            return None
+
+        async def fake_run_text_turn(websocket, tenant_res, text, **kwargs):
+            calls.append(text)
+            if len(calls) == 1:
+                turn1_dispatched.set()
+                # Stay in-flight & pre-speech (never marks turn_state speaking)
+                # until the carry-forward path drains/cancels us.
+                await asyncio.sleep(5)
+            else:
+                done.set()
+
+        async def fake_connect_stt(*args, **kwargs):
+            return _BurstSTT(turn1_dispatched)
+
+        async def fake_company_name(*args, **kwargs):
+            return "Raghava Constructions"
+
+        monkeypatch.setattr(settings, "VOICE_EOU_COMPLETE_MS", 200)
+        monkeypatch.setattr(settings, "VOICE_EOU_NEUTRAL_MS", 400)
+        monkeypatch.setattr(settings, "VOICE_EOU_DEBOUNCE_MS", 500)
+        monkeypatch.setattr(settings, "VOICE_EOU_CONTINUATION_BONUS_MS", 0)
+        monkeypatch.setattr(settings, "AGENT_TRANSLATE_FOR_RETRIEVAL_ENABLED", False)
+        monkeypatch.setattr(NokvoOneVoiceStreamService, "_company_name", staticmethod(fake_company_name))
+        monkeypatch.setattr(NokvoOneVoiceStreamService, "_emit_runtime_status", staticmethod(noop))
+        monkeypatch.setattr(NokvoOneVoiceStreamService, "_play_opener", staticmethod(noop))
+        monkeypatch.setattr(NokvoOneVoiceStreamService, "_log_voice_call", staticmethod(noop))
+        monkeypatch.setattr(NokvoOneVoiceStreamService, "_run_text_turn", staticmethod(fake_run_text_turn))
+        monkeypatch.setattr("app.services.nokvo_one_voice_stream_service.AgentSessionStore.set_state", noop)
+        monkeypatch.setattr(SarvamVoiceService, "connect_stt", staticmethod(fake_connect_stt))
+        monkeypatch.setattr(SarvamVoiceService, "send_stt_audio", staticmethod(noop))
+        monkeypatch.setattr(SarvamVoiceService, "parse_stt_message", staticmethod(lambda raw: json.loads(raw)))
+
+        websocket = _BurstWebSocket(done)
+        tenant_res = SimpleNamespace(tenant_id="tenant-test", organization_id="org-test", provider_status={})
+        await asyncio.wait_for(
+            NokvoOneVoiceStreamService.run_session(
+                websocket,
+                tenant_res,
+                campaign_context={"opening_message": "Hello"},
+            ),
+            timeout=4.0,
+        )
+        return calls
+
+    calls = _run(scenario())
+    assert calls[0] == "at around 2 PM"
+    # Turn 2 carries BOTH utterances — the first wasn't dropped.
+    assert "at around 2 PM" in calls[1]
+    assert "Alright, thank you." in calls[1]
+
+
 class _CollectingWebSocket:
     def __init__(self) -> None:
         self.sent: list[dict] = []
@@ -192,6 +298,7 @@ def test_text_turn_emits_latency_guard_before_slow_llm_sentence(monkeypatch):
         return {}
 
     monkeypatch.setattr(settings, "VOICE_FIRST_SENTENCE_TIMEOUT_MS", 50)
+    monkeypatch.setattr(settings, "VOICE_LATENCY_GUARD_CONTENT_GRACE_MS", 0)  # exercise the filler path
     monkeypatch.setattr(NokvoOneVoicePipeline, "stream_answer_sentences", staticmethod(fake_stream_answer_sentences))
     monkeypatch.setattr(SarvamVoiceService, "stream_sentence_tts", staticmethod(fake_tts))
     monkeypatch.setattr("app.services.nokvo_one_voice_stream_service.AgentSessionStore.append_turn", noop)
@@ -216,6 +323,63 @@ def test_text_turn_emits_latency_guard_before_slow_llm_sentence(monkeypatch):
     assert sentences[1]["sentence"] == "The real answer is ready."
     final = next(event for event in websocket.sent if event.get("type") == "agent_answer")
     assert final["answer"] == "The real answer is ready."
+
+
+def test_grace_peek_skips_filler_when_content_is_imminent(monkeypatch, caplog):
+    """#2: if the real answer lands within the grace window just past the budget,
+    the filler is SKIPPED — content shouldn't queue behind ~1s of filler audio in
+    the single TTS pump. Also asserts the #1 content-latency record is emitted."""
+    async def fake_stream_answer_sentences(*args, **kwargs):
+        await asyncio.sleep(0.08)  # past the 40ms budget, well within the 400ms grace
+        yield {"type": "sentence", "text": "Skyline Heights is in Tukkuguda.", "tone": "neutral"}
+        yield {
+            "type": "final",
+            "answer": "Skyline Heights is in Tukkuguda.",
+            "refused": False,
+            "chunks": [],
+            "citations": [],
+            "runtime": {"mode": "test"},
+        }
+
+    async def fake_tts(*args, **kwargs):
+        return {"audios": ["audio"], "first_audio_ms": 1}
+
+    async def noop(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(settings, "VOICE_FIRST_SENTENCE_TIMEOUT_MS", 40)
+    monkeypatch.setattr(settings, "VOICE_LATENCY_GUARD_FLOOR_MS", 20)
+    monkeypatch.setattr(settings, "VOICE_LATENCY_GUARD_CONTENT_GRACE_MS", 400)
+    monkeypatch.setattr(NokvoOneVoicePipeline, "stream_answer_sentences", staticmethod(fake_stream_answer_sentences))
+    monkeypatch.setattr(SarvamVoiceService, "stream_sentence_tts", staticmethod(fake_tts))
+    monkeypatch.setattr("app.services.nokvo_one_voice_stream_service.AgentSessionStore.append_turn", noop)
+
+    websocket = _CollectingWebSocket()
+    tenant_res = SimpleNamespace(tenant_id="tenant-test", organization_id="org-test", provider_status={})
+
+    with caplog.at_level(logging.INFO, logger=_LATENCY_LOGGER):
+        _run(
+            NokvoOneVoiceStreamService._run_text_turn(
+                websocket,
+                tenant_res,
+                "Where is Skyline Heights",
+                language="en",
+                call_id="call-grace-peek",
+                company_name="Raghava Constructions",
+                eou_fired_at=perf_counter(),
+                eou_tier="neutral",
+            )
+        )
+
+    sentences = [event for event in websocket.sent if event.get("type") == "agent_sentence"]
+    # No filler — content was imminent and spoken directly.
+    assert all(s.get("source") != "latency_guard" for s in sentences)
+    assert sentences[0]["sentence"] == "Skyline Heights is in Tukkuguda."
+    # #1: the content-latency record fires, with no preceding filler.
+    content = next(
+        rec.getMessage() for rec in caplog.records if "NOKVO-LATENCY-CONTENT" in rec.getMessage()
+    )
+    assert "filler_preceded=False" in content
 
 
 def test_outbound_text_turn_emits_localized_bridge_filler(monkeypatch):
@@ -259,6 +423,7 @@ def test_outbound_text_turn_emits_localized_bridge_filler(monkeypatch):
     )
 
     monkeypatch.setattr(settings, "VOICE_FIRST_SENTENCE_TIMEOUT_MS", 20)
+    monkeypatch.setattr(settings, "VOICE_LATENCY_GUARD_CONTENT_GRACE_MS", 0)  # exercise the bridge-filler path
     monkeypatch.setattr(NokvoOneVoicePipeline, "stream_answer_sentences", staticmethod(fake_stream_answer_sentences))
     monkeypatch.setattr(SarvamVoiceService, "stream_sentence_tts", staticmethod(fake_tts))
     monkeypatch.setattr("app.services.nokvo_one_voice_stream_service.AgentSessionStore.append_turn", noop)
@@ -362,6 +527,9 @@ def test_eos_to_first_audio_under_budget_all_languages_both_directions(
     # "just now", so eos→first_audio ≈ the guard wait, comfortably sub-budget.
     monkeypatch.setattr(settings, "VOICE_FIRST_SENTENCE_TIMEOUT_MS", 60)
     monkeypatch.setattr(settings, "VOICE_LATENCY_GUARD_FLOOR_MS", 20)
+    # Grace 0 here so the slow path deterministically exercises the FILLER; the
+    # grace-peek skip path has its own test below.
+    monkeypatch.setattr(settings, "VOICE_LATENCY_GUARD_CONTENT_GRACE_MS", 0)
     monkeypatch.setattr(NokvoOneVoicePipeline, "stream_answer_sentences", staticmethod(fake_stream_answer_sentences))
     monkeypatch.setattr(SarvamVoiceService, "stream_sentence_tts", staticmethod(fake_tts))
     monkeypatch.setattr("app.services.nokvo_one_voice_stream_service.AgentSessionStore.append_turn", noop)

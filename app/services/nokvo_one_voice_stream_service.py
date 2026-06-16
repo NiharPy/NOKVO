@@ -1186,12 +1186,21 @@ class NokvoOneVoiceStreamService:
                 else "inbound"
             )
             _latency_emitted = False
+            _first_audio_perf_val: float | None = None
+            _first_audio_source: str | None = None
+            _content_latency_emitted = False
+
+            def _eos_elapsed_ms(at_perf: float) -> int:
+                anchor = eou_fired_at if eou_fired_at is not None else started
+                return int((at_perf - anchor) * 1000)
 
             def _emit_latency_record(*, source: str, cache_hit: bool, first_audio_perf: float) -> None:
-                nonlocal _latency_emitted
+                nonlocal _latency_emitted, _first_audio_perf_val, _first_audio_source
                 if _latency_emitted:
                     return
                 _latency_emitted = True
+                _first_audio_perf_val = first_audio_perf
+                _first_audio_source = source
                 eou_fire_to_audio_ms = int((first_audio_perf - started) * 1000)
                 if eou_fired_at is not None:
                     eos_to_audio_ms = int((first_audio_perf - eou_fired_at) * 1000)
@@ -1206,6 +1215,33 @@ class NokvoOneVoiceStreamService:
                     "eos_to_first_audio_ms=%d within_budget=%s",
                     language, direction, eou_tier or "-", source, cache_hit,
                     eos_to_eou_fire_ms, eou_fire_to_audio_ms, eos_to_audio_ms, within_budget,
+                )
+
+            def _emit_content_latency_record(*, first_content_perf: float, cache_hit: bool) -> None:
+                """Time-to-first-*content* audio — the first REAL (non-filler)
+                sentence. When a filler covered the wait, eos→first_audio (above)
+                stays sub-budget but the caller still waits this long to hear the
+                actual answer; the filler→content gap is the dead air they
+                perceive. Emitted once, separately, so a slow real answer can't
+                hide behind a fast filler."""
+                nonlocal _content_latency_emitted
+                if _content_latency_emitted:
+                    return
+                _content_latency_emitted = True
+                filler_preceded = _first_audio_source == "filler"
+                gap_ms = (
+                    int((first_content_perf - _first_audio_perf_val) * 1000)
+                    if (filler_preceded and _first_audio_perf_val is not None)
+                    else 0
+                )
+                eos_to_content_ms = _eos_elapsed_ms(first_content_perf)
+                logger.info(
+                    "NOKVO-LATENCY-CONTENT: language=%s direction=%s tier=%s "
+                    "cache_hit=%s filler_preceded=%s eos_to_first_content_audio_ms=%d "
+                    "filler_to_content_gap_ms=%d within_budget=%s",
+                    language, direction, eou_tier or "-", cache_hit, filler_preceded,
+                    eos_to_content_ms, gap_ms,
+                    eos_to_content_ms < settings.VOICE_LATENCY_BUDGET_MS,
                 )
 
             # Decouple LLM stream consumption from TTS roundtrips: the pump
@@ -1430,14 +1466,21 @@ class NokvoOneVoiceStreamService:
                     sentence = str(event.get("text") or "").strip()
                     if not sentence:
                         return
+                    _sentence_perf = perf_counter()
                     if first_sentence_ms is None:
-                        _first_audio_perf = perf_counter()
-                        first_sentence_ms = int((_first_audio_perf - started) * 1000)
+                        first_sentence_ms = int((_sentence_perf - started) * 1000)
                         _emit_latency_record(
                             source="real",
                             cache_hit=bool(event.get("cache_hit")),
-                            first_audio_perf=_first_audio_perf,
+                            first_audio_perf=_sentence_perf,
                         )
+                    # First REAL content sentence — recorded even when a filler
+                    # already fired first_audio, so the filler→content gap (the
+                    # dead air the caller hears) is visible. One-shot internally.
+                    _emit_content_latency_record(
+                        first_content_perf=_sentence_perf,
+                        cache_hit=bool(event.get("cache_hit")),
+                    )
                     tone = str(event.get("tone") or DEFAULT_TONE)
                     answer_parts.append(sentence)
                     await websocket.send_json(
@@ -1508,6 +1551,29 @@ class NokvoOneVoiceStreamService:
                         event = await asyncio.wait_for(event_queue.get(), timeout=timeout_s)
                     except asyncio.TimeoutError:
                         if latency_guard_sent:
+                            continue
+                        # Grace peek before committing the filler. The real answer
+                        # may be just past the budget; firing a filler now queues
+                        # its ~1s of playback AHEAD of the real content in the
+                        # single TTS pump and delays it. Wait one short window for
+                        # a real sentence — if it lands, speak it and skip the
+                        # filler (content arrives sooner than filler+content).
+                        try:
+                            event = await asyncio.wait_for(
+                                event_queue.get(),
+                                timeout=max(
+                                    0.0,
+                                    settings.VOICE_LATENCY_GUARD_CONTENT_GRACE_MS / 1000,
+                                ),
+                            )
+                        except asyncio.TimeoutError:
+                            pass  # truly nothing yet — fall through and fire the filler
+                        else:
+                            if event is stream_done:
+                                break
+                            if isinstance(event, Exception):
+                                raise event
+                            await _handle_stream_event(event)
                             continue
                         latency_guard_sent = True
                         _first_audio_perf = perf_counter()
@@ -2283,6 +2349,12 @@ class NokvoOneVoiceStreamService:
             # spent (see _run_text_turn). ``eou_last_tier`` tags the latency record.
             eou_anchor: list[float | None] = [None]
             eou_last_tier: list[str] = ["neutral"]
+            # Text of the most recently dispatched turn. If the caller fires a
+            # fresh utterance before that turn has begun speaking, draining it
+            # would silently drop the caller's words — so _fire_turn folds this
+            # text into the next turn instead (carry-forward). Holds the FINAL
+            # (possibly already-folded) text so a burst accumulates correctly.
+            last_turn_text: list[str | None] = [None]
             # Sticky language lock: when the user explicitly asks to switch
             # ("speak in Telugu", "Hindi please") we lock that choice for the
             # rest of the session. Without this, Sarvam's per-segment language
@@ -2290,6 +2362,10 @@ class NokvoOneVoiceStreamService:
             # code-switched utterances.
             session_locked_language: list[str | None] = [None]
             utterance_language_detected: list[bool] = [False]
+            # Per-utterance STT language confidence (Sarvam language_probability),
+            # threaded into detect_spoken_language_switch so a low-confidence
+            # label can't flip the call's reply language.
+            utterance_language_conf: list[float | None] = [None]
             inbound_opener_played: list[bool] = [False]
             inbound_opener_task: asyncio.Task | None = None
 
@@ -2446,7 +2522,10 @@ class NokvoOneVoiceStreamService:
                 spoken_switch = None
                 if not requested and session_locked_language[0]:
                     spoken_switch = detect_spoken_language_switch(
-                        text, utterance_language[0], session_locked_language[0]
+                        text,
+                        utterance_language[0],
+                        session_locked_language[0],
+                        confidence=utterance_language_conf[0],
                     )
                 if requested or spoken_switch:
                     normalized = SarvamVoiceService.normalize_language(requested or spoken_switch)
@@ -2497,9 +2576,28 @@ class NokvoOneVoiceStreamService:
                     )
                 utterance_audio.clear()
 
+                # Carry-forward fold: the previous turn is still in flight and
+                # hasn't begun speaking, yet the caller already started a fresh
+                # utterance. Draining it below cancels it and its text is lost —
+                # which is how quick consecutive replies ("at around 2 PM",
+                # "Alright, thank you.") got NO response. Fold the unspoken text
+                # into this turn so the agent still hears it. A genuine barge-in
+                # (turn already SPEAKING) is excluded by the `speaking` guard —
+                # there the caller is deliberately interrupting.
+                if (
+                    current_turn is not None
+                    and not current_turn.done()
+                    and not (turn_state or {}).get("speaking")
+                    and last_turn_text[0]
+                ):
+                    prior = last_turn_text[0].strip()
+                    if prior and prior.lower() not in text.lower():
+                        text = f"{prior} {text}".strip()
+
                 await _drain_turn(current_turn)
                 turn_state = {"speaking": False}
                 new_state = turn_state
+                last_turn_text[0] = text
 
                 if translate_audio:
                     # Kick the translate call with a hard timeout. We'd rather
@@ -2691,6 +2789,7 @@ class NokvoOneVoiceStreamService:
                             raw_segment_language = parsed.get("language")
                             if raw_segment_language:
                                 utterance_language_detected[0] = True
+                                utterance_language_conf[0] = parsed.get("language_probability")
                             utterance_language[0] = SarvamVoiceService.normalize_language(
                                 raw_segment_language or utterance_language[0]
                             )

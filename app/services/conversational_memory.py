@@ -2162,7 +2162,14 @@ class ConversationalMemory:
         for note in self.salient_notes[-8:]:
             text = str(note.get("text") or "").strip()
             if text:
-                salient_lines.append(f"  - {text}")
+                # Mark prior-call notes the same way facts are (line above): a
+                # restored note ("wants to visit tomorrow") rendered bare reads as
+                # a CURRENT booking, so the agent asserts "already noted from our
+                # earlier note" — and a relative date from a past call is stale.
+                if note.get("from_prior_call"):
+                    salient_lines.append(f"  - {text} (from a prior call)")
+                else:
+                    salient_lines.append(f"  - {text}")
 
         summary_text = (self.rolling_summary or "").strip()
         if not lines and not salient_lines and not summary_text:
@@ -2185,7 +2192,10 @@ class ConversationalMemory:
             "Build your next reply around what is known; if a fact contradicts what they just said, "
             "briefly acknowledge the correction ('Ah, my mistake') and update accordingly. "
             "Facts marked '(from a prior call)' come from an earlier conversation — reference them "
-            "naturally to show continuity, but confirm rather than assume if acting on them.\n"
+            "naturally to show continuity, but confirm rather than assume if acting on them. "
+            "NEVER state a '(from a prior call)' detail as if it were settled THIS call — do not say "
+            "it's 'already noted', 'on file', or booked. Any date/time from a prior call is stale "
+            "(a past 'tomorrow' is not today's tomorrow): ask the caller fresh instead of repeating it.\n"
         )
         block = header
         if lines:
