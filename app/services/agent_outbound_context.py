@@ -514,6 +514,17 @@ on THIS call is to confirm the time and end gracefully.
 - The whole call is bounded by this campaign. Nothing outside it is authoritative for what you tell the prospect."""
 
 
+# Small models routinely grab the agent's OWN name and use it to address the
+# prospect (observed in production: "Thanks, Riya — noted that it's for self-use."
+# where Riya is the rep, not the lead). This block hard-separates the two
+# identities. Always rendered; formatted with the rep's name.
+_OUTBOUND_NAME_GUARDRAIL = """# WHO IS WHO — never confuse yourself with the prospect
+- YOUR name is {caller_name}. {caller_name} is the rep making this call — that's YOU. It is NEVER the prospect's name.
+- You do NOT know the prospect's name unless THEY say it on this call (or it appears in the lead notes above). Do not guess it, do not borrow it from the brief, and NEVER address them as "{caller_name}" — that is you talking to yourself.
+- Until they give their name, just speak to them directly as "you" — a warm reply needs no name at all.
+- The instant they tell you their name, use it (correctly) from then on."""
+
+
 def compose_outbound_system_section(
     context: OutboundCampaignContext | None,
     *,
@@ -616,20 +627,40 @@ def compose_outbound_system_section(
                 "══════════════════════"
             )
 
-    # If the operator provided a custom agent_prompt, prefer it but still
-    # append the hard rules so AI-disclosure / "no twice = end" stay locked.
+    # A custom agent_prompt is the campaign's PERSONA + KNOWLEDGE, not its
+    # delivery rules. Customers tend to paste a rigid "1. Introduction
+    # 2. Qualification 3. Pitch…" call-flow, which makes the agent sound like a
+    # form-filling telemarketer (observed in production). So we NO LONGER let a
+    # custom prompt replace the human-delivery template — we layer it as
+    # reference knowledge and ALWAYS render the tuned delivery scaffolding
+    # (turn structure, opener variety, few-shot, name guardrail) on top, with
+    # an explicit note that HOW-you-talk rules outrank any scripted sequence.
     if context.agent_prompt and context.agent_prompt != DEFAULT_AGENT_PROMPT:
-        parts.append("# OUTBOUND CAMPAIGN — CUSTOM PERSONA")
-        parts.append(context.agent_prompt)
-    else:
         parts.append(
-            _OUTBOUND_BASE_TEMPLATE.format(
-                caller_name=context.caller_name or "Riya",
-                company_name=context.company_name or "the company",
-                objective_description=context.objective_description,
-            )
+            "# OUTBOUND CAMPAIGN — CUSTOM PERSONA & KNOWLEDGE\n"
+            "The block below is your product knowledge, persona, and tone reference. "
+            "Use its FACTS and its VOICE. But if it contains a numbered call flow or "
+            "step-by-step script, do NOT recite it in order like a checklist — that "
+            "sounds robotic. HOW you actually talk (one beat per turn, listen first, "
+            "vary your openers) is governed by the DELIVERY RULES below; those win "
+            "over any scripted sequence here."
         )
+        parts.append(context.agent_prompt)
+    # The base template carries the human-delivery scaffolding (turn structure,
+    # banned openers, banned standalone replies, no-stacking, few-shot). It is
+    # rendered in BOTH branches now — for a custom persona it reinforces tone
+    # and supplies the behavioural anchors the operator's script lacks.
+    parts.append(
+        _OUTBOUND_BASE_TEMPLATE.format(
+            caller_name=context.caller_name or "Riya",
+            company_name=context.company_name or "the company",
+            objective_description=context.objective_description,
+        )
+    )
     parts.append(_OUTBOUND_UNIVERSAL_TURN_RULES)
+    parts.append(
+        _OUTBOUND_NAME_GUARDRAIL.format(caller_name=context.caller_name or "Riya")
+    )
 
     # Outbound FSM mode block, branched on the org's business type:
     #   * clinics       → clinic outbound FSM (follow-up / booking / triage —
@@ -792,10 +823,10 @@ def _opener_enquiry_phrase(facts: dict[str, Any], code: str) -> str:
         return ""
     if code == "te":
         unit = f"{bhk} options" if bhk else "options"
-        return f"{unit} {location} lo" if location else unit
+        return f"{unit} {location} లో" if location else unit
     if code == "hi":
         unit = f"{bhk} options" if bhk else "options"
-        return f"{location} mein {unit}" if location else unit
+        return f"{location} में {unit}" if location else unit
     unit = f"{bhk} options" if bhk else "your requirement"
     return f"{unit} in {location}" if location else unit
 
@@ -833,73 +864,73 @@ def generate_outbound_opener_text(
     if code == "te":
         name_part = f" {lead_name}" if lead_name else ""
         intro_te = (
-            f"Hello{name_part}, nenu {caller}, {company} nundi maatalaadutunna."
+            f"Hello{name_part}, నేను {caller}, {company} నుండి మాట్లాడుతున్నా."
             if company
-            else f"Hello{name_part}, nenu {caller} maatalaadutunna."
+            else f"Hello{name_part}, నేను {caller} మాట్లాడుతున్నా."
         )
         if returning:
             # Follow-up: defer specifics to the LLM (it has the call notes).
             return (
                 f"[warm]{intro_te}[/warm] "
-                "[neutral]Mana last conversation gurinchi follow up cheyadaniki call chesthunna.[/neutral] "
-                "[question]Ippudu okka minute maatalaadagalara?[/question]"
+                "[neutral]మన last conversation గురించి follow up చేయడానికి call చేస్తున్నా.[/neutral] "
+                "[question]ఇప్పుడు ఒక్క minute మాట్లాడగలరా?[/question]"
             )
         if enquiry:
             reason = (
-                f"Last time meeru {enquiry} gurinchi adigaru"
+                f"Last time మీరు {enquiry} గురించి అడిగారు"
                 if returning
-                else f"Meeru {enquiry} gurinchi enquiry chesaru"
+                else f"మీరు {enquiry} గురించి enquiry చేశారు"
             )
             return (
                 f"[warm]{intro_te}[/warm] "
                 f"[neutral]{reason}.[/neutral] "
-                "[question]Ippudu okka minute maatalaadagalara?[/question]"
+                "[question]ఇప్పుడు ఒక్క minute మాట్లాడగలరా?[/question]"
             )
         if pitch:
             return (
                 f"[warm]{intro_te}[/warm] "
-                f"[neutral]{pitch} gurinchi call chesthunna.[/neutral] "
-                "[question]Ippudu okka minute maatalaadagalara?[/question]"
+                f"[neutral]{pitch} గురించి call చేస్తున్నా.[/neutral] "
+                "[question]ఇప్పుడు ఒక్క minute మాట్లాడగలరా?[/question]"
             )
         return (
             f"[warm]{intro_te}[/warm] "
-            "[question]Ippudu okka minute maatalaadagalara?[/question]"
+            "[question]ఇప్పుడు ఒక్క minute మాట్లాడగలరా?[/question]"
         )
 
     if code == "hi":
         name_part = f" {lead_name}" if lead_name else ""
         intro_hi = (
-            f"Namaste{name_part}, main {caller} bol raha hoon, {company} se."
+            f"नमस्ते{name_part}, मैं {caller} बोल रहा हूँ, {company} से."
             if company
-            else f"Namaste{name_part}, main {caller} bol raha hoon."
+            else f"नमस्ते{name_part}, मैं {caller} बोल रहा हूँ."
         )
         if returning:
             # Follow-up: defer specifics to the LLM (it has the call notes).
             return (
                 f"[warm]{intro_hi}[/warm] "
-                "[neutral]Hamari pichhli baat-cheet ke follow up ke liye call kiya hai.[/neutral] "
-                "[question]Kya abhi ek minute baat kar sakte hain?[/question]"
+                "[neutral]हमारी पिछली बात-चीत के follow up के लिए call किया है.[/neutral] "
+                "[question]क्या अभी एक minute बात कर सकते हैं?[/question]"
             )
         if enquiry:
             reason = (
-                f"Pichhli baar humne {enquiry} ke baare mein baat ki thi"
+                f"पिछली बार हमने {enquiry} के बारे में बात की थी"
                 if returning
-                else f"Aapne {enquiry} ke baare mein enquiry ki thi"
+                else f"आपने {enquiry} के बारे में enquiry की थी"
             )
             return (
                 f"[warm]{intro_hi}[/warm] "
                 f"[neutral]{reason}.[/neutral] "
-                "[question]Kya abhi ek minute baat kar sakte hain?[/question]"
+                "[question]क्या अभी एक minute बात कर सकते हैं?[/question]"
             )
         if pitch:
             return (
                 f"[warm]{intro_hi}[/warm] "
-                f"[neutral]{pitch} ke liye call kiya hai.[/neutral] "
-                "[question]Kya abhi ek minute baat kar sakte hain?[/question]"
+                f"[neutral]{pitch} के लिए call किया है.[/neutral] "
+                "[question]क्या अभी एक minute बात कर सकते हैं?[/question]"
             )
         return (
             f"[warm]{intro_hi}[/warm] "
-            "[question]Kya abhi ek minute baat kar sakte hain?[/question]"
+            "[question]क्या अभी एक minute बात कर सकते हैं?[/question]"
         )
 
     name_part = f" {lead_name}" if lead_name else ""
@@ -1318,8 +1349,12 @@ def render_booking_flow_state(
 
 
 PROACTIVE_NUDGE_PROMPT = (
-    "(no caller response — do not monologue. Give one brief nudge tied to the "
-    "last question, ask only the next outstanding objective, or wrap politely)"
+    "(no caller response — they went quiet. React like a real person would, not "
+    "a script: do NOT repeat your last question word-for-word. Do ONE of these in "
+    "one short, warm line — a soft connectivity check (\"Hi, are you still there?\"), "
+    "a gentler re-phrase of the last question that lowers the friction, or a tiny "
+    "reason-to-care hook from the brief. If they've now gone quiet twice, stop "
+    "pushing and offer to follow up at a better time, then wrap politely.)"
 )
 
 

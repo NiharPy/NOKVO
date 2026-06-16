@@ -1128,6 +1128,11 @@ class OutboundCampaignService:
             "_followup_id": str(followup.id),
             "_source_call_id": followup.source_call_id,
             "_attempt_n": int(followup.attempts or 0),
+            # The captured callback reason (e.g. "call back Tue 4pm re: 3BHK
+            # pricing") set by LeadFollowupNoteScheduler. Surfaces as
+            # ``admin_note`` in the follow-up call's prompt alongside the lead's
+            # handoff_note (the customer branch already carries this).
+            "_admin_note": followup.note or "",
         }
         return campaign, synthetic_contact
 

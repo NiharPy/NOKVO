@@ -7061,10 +7061,6 @@ provideDashboardState({
         </div>
 
         <div class="field-modal-actions">
-          <button type="button" class="ghost-button compact" @click="outgoingTab = 'forms'; closeLeadOAuthNotice()">
-            <FileText :size="15" />
-            Use Nokvo form
-          </button>
           <button type="button" class="primary-button compact" @click="continuePendingLeadOAuth">
             {{ pendingLeadOAuth.actionLabel }}
           </button>

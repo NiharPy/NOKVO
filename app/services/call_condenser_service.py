@@ -2,8 +2,9 @@
 
 Runs as a fire-and-forget background task at the very end of every outbound
 call (see ``app/services/nokvo_one_voice_stream_service.py``, right after
-``promote_to_caller_memory``). One cheap LLM call against the global
-``gpt-5.4-mini`` deployment produces a short, human-readable summary that
+``promote_to_caller_memory``). One cheap LLM call against the gpt-4.1-nano
+pool (``complete_nano``; falls back to the gpt-5-mini pool when no nano
+deployment is configured) produces a short, human-readable summary that
 the next follow-up call's preamble can quote verbatim — and that a clinic
 manager can scan in the leads tab without opening transcripts.
 
@@ -119,7 +120,7 @@ async def condense_call(
     """Produce a 3-sentence handoff note for the lead.
 
     :param tenant_res: TenantResources, used to scope the Redis history
-        lookup. The LLM itself runs against the global deployment, so
+        lookup. The LLM itself runs against the shared nano pool, so
         ``tenant_res`` does NOT pick the model.
     :param call_id: The just-ended call's ID. We read its history from
         Redis if ``transcript`` is not supplied.
@@ -165,8 +166,12 @@ async def condense_call(
     from app.services.nokvo_one_voice_pipeline import AzureGroundedLLM
 
     try:
+        # Summaries run on the cheap gpt-4.1-nano pool (round-robin, no
+        # stickiness) — a 3-sentence note doesn't justify the gpt-5-mini pool.
+        # complete_nano transparently falls back to the mini pool when no nano
+        # deployment is configured.
         raw = await asyncio.wait_for(
-            AzureGroundedLLM.complete_global(
+            AzureGroundedLLM.complete_nano(
                 [
                     {"role": "system", "content": _SYSTEM_PROMPT},
                     {"role": "user", "content": user_msg},

@@ -169,3 +169,92 @@ def detect_language_switch(transcript: str) -> str | None:
     if any(tok in _SWITCH_TOKENS for tok in window_tokens):
         return found_code
     return None
+
+
+# ── Spoken-language switch (caller simply STARTS speaking another language) ──
+#
+# ``detect_language_switch`` above handles an explicit request ("speak in
+# Telugu"). This second detector handles the other half of the requirement:
+# the caller doesn't ask, they just switch the language they're speaking, and
+# the agent must follow for the rest of the call. It reads Sarvam's per-turn
+# STT language label, but corroborates it against the script actually present
+# in the transcript so a code-switched / loanword-heavy turn doesn't flap the
+# reply language.
+
+# Per-language script blocks. Sarvam returns native script for an
+# Indian-language utterance, so the script present in a transcript confirms
+# (or refutes) the STT language label. Devanagari is shared by Hindi/Marathi.
+_LANG_SCRIPT_RE: dict[str, "re.Pattern[str]"] = {
+    "hi": re.compile(r"[ऀ-ॿ]"),   # Devanagari
+    "mr": re.compile(r"[ऀ-ॿ]"),
+    "bn": re.compile(r"[ঀ-৿]"),   # Bengali
+    "pa": re.compile(r"[਀-੿]"),   # Gurmukhi
+    "gu": re.compile(r"[઀-૿]"),   # Gujarati
+    "or": re.compile(r"[଀-୿]"),   # Odia
+    "ta": re.compile(r"[஀-௿]"),   # Tamil
+    "te": re.compile(r"[ఀ-౿]"),   # Telugu
+    "kn": re.compile(r"[ಀ-೿]"),   # Kannada
+    "ml": re.compile(r"[ഀ-ൿ]"),   # Malayalam
+    "ur": re.compile(r"[؀-ۿ]"),   # Arabic (Urdu)
+}
+_ANY_NATIVE_SCRIPT_RE = re.compile(
+    "|".join(dict.fromkeys(p.pattern for p in _LANG_SCRIPT_RE.values()))
+)
+_LATIN_LETTER_RE = re.compile(r"[A-Za-z]")
+
+# Minimum word counts before a *spoken* (not explicitly requested) language
+# change is honoured. Switching to a native language is script-confirmed, so a
+# couple of words suffice. Switching to English is riskier — Indian-language
+# callers pepper English loanwords / courtesies ("ok", "thank you") mid-call —
+# so demand a longer run before flipping the whole call to English.
+_MIN_WORDS_TO_NATIVE = 2
+_MIN_WORDS_TO_ENGLISH = 4
+
+
+def script_matches_language(text: str, language: str | None) -> bool:
+    """True when ``text`` is written in the script we'd expect for ``language``.
+
+    English ⇒ Latin letters present and no Indian-script run. An Indian
+    language ⇒ that language's own script appears in the text.
+    """
+    code = (language or "").strip().lower()[:2]
+    if not text or not code:
+        return False
+    if code == "en":
+        return bool(_LATIN_LETTER_RE.search(text)) and not _ANY_NATIVE_SCRIPT_RE.search(text)
+    pat = _LANG_SCRIPT_RE.get(code)
+    return bool(pat.search(text)) if pat else False
+
+
+def detect_spoken_language_switch(
+    transcript: str,
+    detected_language: str | None,
+    current_language: str | None,
+    *,
+    confidence: float | None = None,
+    min_confidence: float = 0.6,
+) -> str | None:
+    """Return a new two-letter code when the caller has clearly STARTED
+    SPEAKING a language other than the one currently in use, else ``None``.
+
+    Conservative on purpose — a false switch mid-call is jarring:
+      * the STT language label must differ from the current language,
+      * the script present in the transcript must corroborate that label
+        (blocks a loanword-heavy native sentence from reading as English and
+        an English sentence from flipping to a native language),
+      * the utterance must clear a word-count floor (short acks / numbers /
+        single loanwords misdetect),
+      * any provided detection confidence must clear ``min_confidence``.
+    """
+    detected = (detected_language or "").strip().lower()[:2]
+    current = (current_language or "").strip().lower()[:2]
+    if not detected or not current or detected == current:
+        return None
+    if confidence is not None and confidence < min_confidence:
+        return None
+    if not script_matches_language(transcript, detected):
+        return None
+    floor = _MIN_WORDS_TO_ENGLISH if detected == "en" else _MIN_WORDS_TO_NATIVE
+    if len((transcript or "").split()) < floor:
+        return None
+    return detected

@@ -6,6 +6,7 @@ logger = logging.getLogger(__name__)
 
 import base64
 import json
+import re
 from time import perf_counter
 from typing import Any, AsyncIterator
 from urllib import parse as urllib_parse
@@ -17,6 +18,177 @@ from websockets.asyncio.client import connect
 from app.core.config import settings
 from app.models.tenant_resources import TenantResources
 from app.services.azure_keyvault_service import AzureKeyVaultService
+
+
+# ── TTS text normalization (numbers + stray transliteration) ─────────────────
+# Two jobs, applied ONLY to the synthesized audio text (the on-screen transcript
+# keeps "₹2.45Cr"/digits for the UI):
+#   1. Speak EVERY number in English. bulbul:v3 preprocessing otherwise reads
+#      digits in the voice's own language (Telugu "మూడు" for 3), and reads "₹"
+#      as "rupees" split across the decimal ("2 rupees 45 rupees"). We convert
+#      money, times, phones, decimals and plain integers to English words.
+#   2. Repair recurring transliterated / wrong-script loanwords the model emits
+#      ("వాట్సాప్" → WhatsApp) which the native TTS otherwise mispronounces.
+# Words "point"/"rupees"/"crore"/"lakh" + the English number words are natural
+# code-switches in te/hi/en.
+
+_ONES = [
+    "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+    "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen",
+    "seventeen", "eighteen", "nineteen",
+]
+_TENS = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"]
+
+
+def _int_to_words(n: int) -> str:
+    """0–9999 → English words ("five hundred", "twenty six"). Larger falls back
+    to digit-by-digit so we never silently drop magnitude."""
+    if n < 0:
+        return "minus " + _int_to_words(-n)
+    if n < 20:
+        return _ONES[n]
+    if n < 100:
+        t, o = divmod(n, 10)
+        return _TENS[t] + ("" if o == 0 else " " + _ONES[o])
+    if n < 1000:
+        h, r = divmod(n, 100)
+        return _ONES[h] + " hundred" + ("" if r == 0 else " " + _int_to_words(r))
+    if n < 10000:
+        th, r = divmod(n, 1000)
+        return _ONES[th] + " thousand" + ("" if r == 0 else " " + _int_to_words(r))
+    return _digits_to_words(str(n))
+
+
+def _digits_to_words(s: str) -> str:
+    """Spell each digit ("7503" → "seven five zero three"). For phone numbers."""
+    return " ".join(_ONES[int(c)] for c in s if c.isdigit())
+
+
+def _year_to_words(y: int) -> str:
+    """1900–2099 → spoken year ("twenty twenty six", "two thousand five")."""
+    if 2000 <= y <= 2009:
+        return "two thousand" + ("" if y == 2000 else " " + _ONES[y - 2000])
+    hi, lo = divmod(y, 100)
+    if lo == 0:
+        return _int_to_words(hi) + " hundred"
+    if lo < 10:
+        return _int_to_words(hi) + " oh " + _ONES[lo]
+    return _int_to_words(hi) + " " + _int_to_words(lo)
+
+
+def _spoken_number(num: str) -> str:
+    """"2.45" → "two point four five"; "500" → "five hundred". Commas stripped."""
+    num = num.replace(",", "")
+    if "." in num:
+        whole, frac = num.split(".", 1)
+        whole_w = _int_to_words(int(whole)) if whole.isdigit() else whole
+        return whole_w + " point " + " ".join(_ONES[int(c)] for c in frac if c.isdigit())
+    return _int_to_words(int(num)) if num.isdigit() else num
+
+
+_AMOUNT_UNIT_MAP = {
+    "cr": "crore", "crore": "crore", "crores": "crore",
+    "l": "lakh", "lakh": "lakh", "lakhs": "lakh", "lac": "lakh", "lacs": "lakh",
+    "k": "thousand", "thousand": "thousand",
+}
+# ₹ / Rs / INR amount, with an optional crore/lakh/k suffix.
+_TTS_CURRENCY_RE = re.compile(
+    r"(?:₹|\bRs\.?|\bINR)\s*([\d,]+(?:\.\d+)?)(?:\s*(crores?|cr|lakhs?|lacs?|l|k|thousand)\b)?",
+    re.IGNORECASE,
+)
+# A decimal number directly followed by crore/lakh but WITHOUT a currency mark.
+_TTS_NUM_UNIT_RE = re.compile(
+    r"\b(\d[\d,]*\.\d+)\s*(crores?|cr|lakhs?|lacs?)\b",
+    re.IGNORECASE,
+)
+# Clock time: "11:00 AM", "9 AM", "12 PM", "11:30 pm".
+_TTS_TIME_RE = re.compile(r"(?<![\d:])(\d{1,2})(?::([0-5]\d))?\s*([AaPp]\.?[Mm]\.?)")
+# Phone / long digit run (≥6 digits, allowing +91, spaces, dashes).
+_TTS_PHONE_RE = re.compile(r"(?<!\d)(\+?\d[\d\s-]{5,}\d)(?!\d)")
+# Bare decimal ("2.45"). Dotted, so it never matches colon times.
+_TTS_BARE_DECIMAL_RE = re.compile(r"(?<![\d.])(\d+)\.(\d+)(?![\d.])")
+# Standalone integer — LAST pass. Not flanked by a letter/digit, so "B2B",
+# "Web3" and joined ids like "3BHK" are left alone; "3 BHK" / "500" convert.
+_TTS_INT_RE = re.compile(r"(?<![A-Za-z0-9])(\d{1,4})(?![A-Za-z0-9])")
+_HAS_DIGIT_RE = re.compile(r"\d")
+
+# Recurring transliterated / wrong-script loanwords → Latin. DISTINCT,
+# multi-syllable words only (short ambiguous ones like "నోట్" are left to the
+# prompt rule to avoid corrupting a longer genuine word). Devanagari + Telugu.
+_TRANSLIT_FIX = {
+    "వాట్సాప్": "WhatsApp", "వాట్సప్": "WhatsApp",
+    "హ్యాంగ్ అప్": "hang up", "హ్యాంగప్": "hang up",
+    "బ్రోచర్": "brochure",
+    "బెటర్": "better",
+    "व्हाट्सएप": "WhatsApp", "टीम": "team",
+}
+# Indic letter blocks (Telugu + Devanagari) — used as boundaries so a mapped
+# word isn't replaced when it's a substring inside a longer native word.
+_INDIC = "ఀ-౿ऀ-ॿ"
+_TRANSLIT_RES = [
+    (re.compile(rf"(?<![{_INDIC}]){re.escape(k)}(?![{_INDIC}])"), v)
+    for k, v in _TRANSLIT_FIX.items()
+]
+
+
+def normalize_text_for_tts(text: str) -> str:
+    """Rewrite numbers to English words + repair transliterated loanwords, for
+    the synthesized audio only (never the displayed transcript)."""
+    if not text:
+        return text
+
+    # Transliteration repair runs regardless of digits (operates on words).
+    for pat, repl in _TRANSLIT_RES:
+        text = pat.sub(repl, text)
+
+    if not _HAS_DIGIT_RE.search(text):
+        return text
+
+    # Collapse a decimal the model spaced out ("₹2. 45Cr" → "₹2.45Cr").
+    text = re.sub(r"(\d)\s*\.\s*(\d)", r"\1.\2", text)
+
+    def _currency(m: "re.Match[str]") -> str:
+        spoken = _spoken_number(m.group(1))
+        unit = _AMOUNT_UNIT_MAP.get((m.group(2) or "").lower(), "")
+        return " ".join(p for p in (spoken, unit, "rupees") if p)
+
+    def _num_unit(m: "re.Match[str]") -> str:
+        unit = _AMOUNT_UNIT_MAP.get(m.group(2).lower(), "")
+        return f"{_spoken_number(m.group(1))} {unit}".strip()
+
+    def _time(m: "re.Match[str]") -> str:
+        h = int(m.group(1))
+        if not (1 <= h <= 12):
+            return m.group(0)  # not a clock hour — leave for the integer pass
+        ap = m.group(3).upper().replace(".", "")
+        out = _int_to_words(h)
+        if m.group(2) and int(m.group(2)) != 0:
+            out += " " + _int_to_words(int(m.group(2)))
+        return f"{out} {ap}"
+
+    def _phone(m: "re.Match[str]") -> str:
+        digits = re.sub(r"\D", "", m.group(1))
+        return _digits_to_words(digits) if len(digits) >= 6 else m.group(0)
+
+    def _bare_decimal(m: "re.Match[str]") -> str:
+        return f"{_int_to_words(int(m.group(1)))} point " + " ".join(
+            _ONES[int(c)] for c in m.group(2)
+        )
+
+    def _standalone_int(m: "re.Match[str]") -> str:
+        tok = m.group(1)
+        n = int(tok)
+        if len(tok) == 4 and 1900 <= n <= 2099:
+            return _year_to_words(n)
+        return _int_to_words(n)
+
+    text = _TTS_CURRENCY_RE.sub(_currency, text)
+    text = _TTS_NUM_UNIT_RE.sub(_num_unit, text)
+    text = _TTS_TIME_RE.sub(_time, text)
+    text = _TTS_PHONE_RE.sub(_phone, text)
+    text = _TTS_BARE_DECIMAL_RE.sub(_bare_decimal, text)
+    text = _TTS_INT_RE.sub(_standalone_int, text)
+    return text
 
 
 SARVAM_LANGUAGE_OPTIONS = [
@@ -82,6 +254,51 @@ class SarvamVoiceService:
             if item["code"] == code:
                 return f"{item['label']} ({item['native_label']})"
         return "English"
+
+    @staticmethod
+    def tts_speaker_for(
+        language: str | None, provider_status: dict[str, Any] | None = None
+    ) -> str:
+        """Pick the TTS speaker for a language.
+
+        Precedence: tenant override (``provider_status``) → per-language native
+        default (``settings.SARVAM_TTS_SPEAKER_<LANG>``) → global
+        ``SARVAM_TTS_SPEAKER``.
+
+        A single global speaker makes Telugu speak in the Hindi-leaning default
+        voice; the per-language defaults let each language use a native-sounding
+        speaker. Returns the global default when nothing per-language is set, so
+        behaviour is unchanged until the overrides are populated (and a bad id
+        degrades to the default at synthesis time — see :meth:`synthesize`).
+        """
+        ps = provider_status or {}
+        override = ps.get("sarvam_tts_speaker") or ps.get("tts_voice")
+        if override:
+            return str(override)
+        code = SarvamVoiceService.normalize_language(language)
+        per_lang_tenant = ps.get(f"sarvam_tts_speaker_{code}")
+        if per_lang_tenant:
+            return str(per_lang_tenant)
+        env_default = getattr(settings, f"SARVAM_TTS_SPEAKER_{code.upper()}", "") or ""
+        if env_default:
+            return str(env_default)
+        return settings.SARVAM_TTS_SPEAKER
+
+    @staticmethod
+    def pace_for(language: str | None, pace: float | None) -> float | None:
+        """Apply the per-language pace multiplier (``SARVAM_TTS_PACE_<LANG>``).
+
+        The bulbul:v3 Telugu voice is slow at pace 1.0, so Telugu is sped up.
+        The factor applies even when the turn carries no explicit ``pace`` —
+        we set the factor as the baseline so EVERY Telugu chunk speeds up, not
+        just the tone-tagged first one. Returns the (possibly clamped) pace, or
+        ``None`` when there's nothing to change (factor 1.0 and no input pace)."""
+        code = SarvamVoiceService.normalize_language(language)
+        factor = float(getattr(settings, f"SARVAM_TTS_PACE_{code.upper()}", 1.0) or 1.0)
+        if factor == 1.0:
+            return pace
+        base = 1.0 if pace is None else float(pace)
+        return max(0.3, min(3.0, base * factor))
 
     @staticmethod
     async def api_key(tenant_res: TenantResources | None = None, role: str | None = None) -> str:
@@ -365,6 +582,7 @@ class SarvamVoiceService:
     ) -> dict[str, Any]:
         if not text.strip():
             return {"audios": [], "audio_format": settings.SARVAM_TTS_AUDIO_CODEC}
+        text = normalize_text_for_tts(text)
         provider_status = dict(tenant_res.provider_status or {})
         api_key = await SarvamVoiceService.api_key(tenant_res, "tts")
         endpoint = provider_status.get("sarvam_tts_rest_url") or provider_status.get("tts_rest_endpoint") or settings.SARVAM_TTS_REST_URL
@@ -372,7 +590,7 @@ class SarvamVoiceService:
         body: dict[str, Any] = {
             "text": text[:3500],
             "target_language_code": SarvamVoiceService.to_bcp47(language),
-            "speaker": provider_status.get("sarvam_tts_speaker") or provider_status.get("tts_voice") or settings.SARVAM_TTS_SPEAKER,
+            "speaker": SarvamVoiceService.tts_speaker_for(language, provider_status),
             "model": model,
             "speech_sample_rate": int(provider_status.get("tts_sample_rate") or settings.SARVAM_TTS_SAMPLE_RATE),
             "enable_cached_responses": (
@@ -388,6 +606,7 @@ class SarvamVoiceService:
         # bulbul versions / non-bulbul models may not accept these params,
         # so we add them and gracefully retry without them on 400.
         prosody_body: dict[str, Any] = {}
+        pace = SarvamVoiceService.pace_for(language, pace)
         if pace is not None:
             prosody_body["pace"] = max(0.3, min(3.0, float(pace)))
         # Bulbul V3 supports ONLY pace — it rejects pitch/loudness with a 400.
@@ -404,13 +623,17 @@ class SarvamVoiceService:
             json=body,
             timeout=httpx.Timeout(30.0),
         )
-        # Retry once without prosody params if the server rejects the
-        # request — saves the entire turn from going silent when a
-        # tenant is on a model that doesn't support pace/pitch/loudness.
-        if response.status_code >= 400 and prosody_body:
+        # Retry once on a 4xx: strip prosody params (older models reject
+        # pace/pitch/loudness) AND reset to the global default speaker. A bad
+        # per-language speaker id (a mis-configured SARVAM_TTS_SPEAKER_<LANG>)
+        # must degrade to the default voice, never to silence — so the
+        # per-language map is safe to A/B by ear. One retry covers both modes.
+        default_speaker = settings.SARVAM_TTS_SPEAKER
+        if response.status_code >= 400 and (prosody_body or body.get("speaker") != default_speaker):
             first_err = response.text[:300]
-            logger.warning(f"NOKVO-TTS: Sarvam rejected prosody params ({response.status_code}): {first_err!r}; retrying without prosody")
+            logger.warning(f"NOKVO-TTS: Sarvam rejected request ({response.status_code}): {first_err!r}; retrying with default speaker / no prosody")
             retry_body = {k: v for k, v in body.items() if k not in prosody_body}
+            retry_body["speaker"] = default_speaker
             response = await client.post(
                 endpoint,
                 headers={"api-subscription-key": api_key, "Content-Type": "application/json"},
@@ -455,6 +678,7 @@ class SarvamVoiceService:
         """
         if not text.strip():
             return
+        text = normalize_text_for_tts(text)
         provider_status = dict(tenant_res.provider_status or {})
         api_key = await SarvamVoiceService.api_key(tenant_res, "tts")
         stream_endpoint = (
@@ -465,7 +689,7 @@ class SarvamVoiceService:
         body: dict[str, Any] = {
             "text": text[:3500],
             "target_language_code": SarvamVoiceService.to_bcp47(language),
-            "speaker": provider_status.get("sarvam_tts_speaker") or provider_status.get("tts_voice") or settings.SARVAM_TTS_SPEAKER,
+            "speaker": SarvamVoiceService.tts_speaker_for(language, provider_status),
             "model": model,
             "speech_sample_rate": int(provider_status.get("tts_sample_rate") or settings.SARVAM_TTS_SAMPLE_RATE),
             "enable_cached_responses": (
@@ -477,6 +701,7 @@ class SarvamVoiceService:
         if model == "bulbul:v3":
             body["temperature"] = float(provider_status.get("sarvam_tts_temperature") or 0.6)
         prosody_body: dict[str, Any] = {}
+        pace = SarvamVoiceService.pace_for(language, pace)
         if pace is not None:
             prosody_body["pace"] = max(0.3, min(3.0, float(pace)))
         # Bulbul V3 supports ONLY pace — it rejects pitch/loudness with a 400.

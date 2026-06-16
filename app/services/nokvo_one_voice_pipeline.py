@@ -89,10 +89,6 @@ from app.services.prosody import (
     strip_tone_tags,
     stream_prosody_chunks,
 )
-from app.services.language_style import (
-    outbound_fewshot as language_outbound_fewshot,
-    style_guidance as language_style_guidance,
-)
 from app.services.sarvam_voice_service import SARVAM_LANGUAGE_OPTIONS, SarvamVoiceService
 from app.services.tool_flow_policy import evaluate_tool_flow_policy
 from app.services.tool_flow_questions import build_tool_flow_questions, format_field_questions_prompt
@@ -102,7 +98,11 @@ from app.services.voice_turn_policy import (
 )
 
 
-_SENTENCE_RE = re.compile(r"(?<=[.!?।])\s+")
+# A "." only ends a sentence when NOT preceded by a digit, so a decimal amount
+# ("₹2.45Cr", or a model-spaced "₹2. 45Cr") is never split mid-number. ! ? ।
+# always end. The terminator is captured (group-less) so _first_sentence keeps
+# slicing through match.start()+1 (the char before the whitespace).
+_SENTENCE_RE = re.compile(r"(?:(?<!\d)\.|[!?।])\s+")
 _SMALLTALK_RE = re.compile(
     r"^(hi|hello|hey|namaste|namaskar|thanks?|thank you|okay|ok|bye|goodbye|good morning|good evening)[\s!.?]*$",
     re.IGNORECASE,
@@ -2865,6 +2865,54 @@ class NokvoOneVoicePipeline:
             await AgentSessionStore.merge_state(tenant_res, call_id, {"sms_sent": True})
 
     @staticmethod
+    def _deterministic_call_note(
+        *,
+        kind: str,
+        name: str | None,
+        ani: str | None,
+        memory: dict[str, Any],
+        history: list[dict[str, str]],
+    ) -> str:
+        """Plain-prose fallback call note built deterministically from captured
+        facts, written SYNCHRONOUSLY at record creation so a flaky post-call LLM
+        condenser can never leave the record noteless. The background condenser
+        overwrites this with a richer summary when it succeeds. Shaped so
+        ``REAgentScheduler``'s extractor can still read the visit date/time."""
+        from app.services.voice_turn_policy import extract_datetime_phrase
+
+        mem = memory or {}
+        parts: list[str] = [
+            "Caller agreed to a site visit."
+            if kind == "site_visit"
+            else "Caller enquired about properties."
+        ]
+        # Visit date/time — scan recent caller turns, normalising hi/te relative
+        # tokens so a Telugu "రేపు 10" still yields "tomorrow 10 AM".
+        when = ""
+        for turn in reversed((history or [])[-12:]):
+            if turn.get("role") != "user":
+                continue
+            when = extract_datetime_phrase(str(turn.get("content") or ""))
+            if when:
+                break
+        if when:
+            parts.append(f"Proposed visit time: {when}.")
+        if mem.get("bhk"):
+            parts.append(f"Configuration: {mem['bhk']}.")
+        if mem.get("location_preference"):
+            parts.append(f"Preferred area: {mem['location_preference']}.")
+        if mem.get("purpose"):
+            parts.append(f"Purpose: {mem['purpose']}.")
+        if mem.get("budget"):
+            parts.append(f"Budget: {mem['budget']}.")
+        if mem.get("requested_info"):
+            parts.append(f"Asked for: {mem['requested_info']}.")
+        who = [bit for bit in (f"Name: {name}" if name else "", f"Phone: {ani}" if ani else "") if bit]
+        if who:
+            parts.append("; ".join(who) + ".")
+        return " ".join(parts)
+
+    @staticmethod
     async def _create_inbound_site_visit(
         db: AsyncSession,
         org_id: Any,
@@ -2873,11 +2921,14 @@ class NokvoOneVoicePipeline:
         *,
         state: dict[str, Any],
         memory: dict[str, Any],
+        history: list[dict[str, str]] | None = None,
     ) -> dict[str, Any] | None:
         """Create a minimal inbound site-visit TICKET when the caller agreed to
         come — ANI + name (if captured) only. NO structured date/time/project
-        fields: the date/time the agent clarified rides in the post-call note
-        (the condenser writes ``data.handoff_note`` onto ``auto_site_visit_id``).
+        fields: the date/time the agent clarified rides in the post-call note.
+        We write a DETERMINISTIC ``data.handoff_note`` here synchronously (so the
+        record is never noteless if the post-call LLM condenser fails); the
+        condenser later overwrites it with a richer summary when it succeeds.
         Mirrors the phoneless-lead direct write; best-effort."""
         from app.models.nokvo_one_tool_record import NokvoOneToolRecord
         from app.services.nokvo_one_business_templates import STATUS_VOCABULARIES
@@ -2914,6 +2965,14 @@ class NokvoOneVoicePipeline:
             data["name"] = name
         if ani:
             data["phone"] = ani
+        # Deterministic note up front — guarantees the ticket always carries a
+        # readable note (with the visit date/time for RE_agent_scheduler) even
+        # if the post-call condenser returns None.
+        data["handoff_note"] = NokvoOneVoicePipeline._deterministic_call_note(
+            kind="site_visit", name=name, ani=ani, memory=memory, history=history or [],
+        )
+        data["handoff_note_generated_at"] = datetime.now(timezone.utc).isoformat()
+        data["handoff_note_source"] = "deterministic"
         record = NokvoOneToolRecord(
             id=uuid.uuid4(),
             organization_id=org_id,
@@ -3041,7 +3100,7 @@ class NokvoOneVoicePipeline:
 
             if caller_agreed_to_site_visit(history):
                 sv = await NokvoOneVoicePipeline._create_inbound_site_visit(
-                    db, org_id, tenant_res, call_id, state=state, memory=memory,
+                    db, org_id, tenant_res, call_id, state=state, memory=memory, history=history,
                 )
                 if sv is not None:
                     return sv
@@ -3127,6 +3186,13 @@ class NokvoOneVoicePipeline:
                 "call_id": call_id,
                 "name": str(args.get("name") or "Property inquiry"),
             }
+            # Deterministic note up front so the lead is never noteless if the
+            # post-call condenser fails (it overwrites this on success).
+            direct_data["handoff_note"] = NokvoOneVoicePipeline._deterministic_call_note(
+                kind="lead", name=args.get("name"), ani=None, memory=memory, history=history,
+            )
+            direct_data["handoff_note_generated_at"] = datetime.now(timezone.utc).isoformat()
+            direct_data["handoff_note_source"] = "deterministic"
             direct_data = {k: v for k, v in direct_data.items() if v not in (None, "")}
             record = NokvoOneToolRecord(
                 id=uuid.uuid4(),

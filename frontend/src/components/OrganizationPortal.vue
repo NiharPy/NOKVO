@@ -3280,7 +3280,7 @@ onBeforeUnmount(() => {
               <div class="agent-runtime-strip">
                 <span><Radio :size="15" /> STT {{ agentRuntimeStatus?.stt?.model || 'saaras:v3' }}</span>
                 <span>LLM {{ agentRuntimeStatus?.llm?.model || 'gpt-4.1-mini' }}</span>
-                <span>TTS {{ agentRuntimeStatus?.tts?.voice || 'shubh' }}</span>
+                <span>TTS {{ agentRuntimeStatus?.tts?.voice || 'ritu' }}</span>
               </div>
 
               <div class="db-form-block agent-language-control">

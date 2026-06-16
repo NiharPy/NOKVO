@@ -222,9 +222,12 @@ class LLMIntentClassifier:
         from app.services.nokvo_one_voice_pipeline import AzureGroundedLLM, NokvoOneAgentRuntimeError
 
         try:
+            # Intent classification is an auxiliary task (not the agent's spoken
+            # reply), so it runs on the cheap gpt-4.1-nano pool — only the agent
+            # itself uses gpt-5-mini. complete_nano falls back to the mini pool
+            # when no nano deployment is configured.
             raw = await asyncio.wait_for(
-                AzureGroundedLLM.complete(
-                    tenant_res,
+                AzureGroundedLLM.complete_nano(
                     [
                         {"role": "system", "content": _CLASSIFIER_SYSTEM},
                         {"role": "user", "content": user_msg},

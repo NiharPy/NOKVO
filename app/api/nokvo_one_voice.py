@@ -499,6 +499,59 @@ async def outbound_voice_tester_websocket(websocket: WebSocket):
         return
 
 
+async def _write_call_note_to_record(
+    *,
+    tenant_res: TenantResources,
+    call_id: str,
+    record_id: Any,
+    campaign: OutboundCampaign | None,
+) -> None:
+    """Run the condenser once and write ``data.handoff_note`` onto a
+    ``nokvo_one_tool_records`` row (the outbound tester's site-visit / lead).
+
+    The two shared teardown condensers skip the outbound-tester path — the
+    OutgoingLead-contact one needs a contact a tester doesn't have, and the
+    tool-record one is gated to inbound — so without this the tester's records
+    are left note-less. Best-effort: own session, bounded, never raises out.
+    """
+    try:
+        rec_uuid = record_id if isinstance(record_id, uuid.UUID) else uuid.UUID(str(record_id))
+    except (TypeError, ValueError):
+        return
+    try:
+        from datetime import datetime as _dt, timezone as _tz
+
+        from app.db.session import AsyncSessionLocal
+        from app.models.nokvo_one_tool_record import NokvoOneToolRecord
+        from app.services.call_condenser_service import condense_call
+
+        note = await condense_call(
+            tenant_res=tenant_res,
+            call_id=call_id,
+            campaign_name=campaign.name if campaign is not None else None,
+            timeout_s=8.0,
+        )
+        if not note:
+            return
+        async with AsyncSessionLocal() as note_db:
+            rec = await note_db.get(NokvoOneToolRecord, rec_uuid)
+            if rec is None:
+                return
+            data = dict(rec.data or {})
+            data["handoff_note"] = note
+            data["handoff_note_generated_at"] = _dt.now(_tz.utc).isoformat()
+            rec.data = data
+            flag_modified(rec, "data")
+            note_db.add(rec)
+            await note_db.commit()
+        logger.info(
+            "NOKVO-OUTBOUND-TESTER: handoff note written to record %s (%d chars)",
+            rec_uuid, len(note),
+        )
+    except Exception:
+        logger.exception("NOKVO-OUTBOUND-TESTER: handoff note write failed")
+
+
 async def _classify_and_persist_tester_outcome(
     websocket: WebSocket,
     *,
@@ -579,8 +632,30 @@ async def _classify_and_persist_tester_outcome(
         campaign_goal=campaign_goal,
     )
 
-    lead_id: str | None = None
-    if outcome.outcome != OUTCOME_NOT_INTERESTED:
+    # Did the WS teardown (maybe_create_real_estate_lead_from_call, which runs
+    # BEFORE this hook) already file a record for this call? A booked SITE VISIT
+    # must stay site-visit-ONLY, and an already-captured LEAD must not be
+    # duplicated. We still classify + send the banner, and below we make sure
+    # that record carries the post-call note.
+    pre_state: dict[str, Any] = {}
+    try:
+        pre_state = await AgentSessionStore.get_state(tenant_res, call_id) or {}
+    except Exception:
+        pre_state = {}
+    existing_site_visit_id = pre_state.get("auto_site_visit_id")
+    existing_lead_id = pre_state.get("auto_lead_id")
+
+    lead_id: str | None = str(existing_lead_id) if existing_lead_id else None
+    site_visit_id: str | None = str(existing_site_visit_id) if existing_site_visit_id else None
+    # The single record this call is really about — gets the post-call note (Fix B).
+    note_target_id: Any = existing_site_visit_id or existing_lead_id
+
+    if existing_site_visit_id or existing_lead_id:
+        logger.info(
+            "NOKVO-OUTBOUND-TESTER: teardown already filed a %s for call %s — not duplicating",
+            "site visit" if existing_site_visit_id else "lead", call_id,
+        )
+    elif outcome.outcome != OUTCOME_NOT_INTERESTED:
         try:
             # Best-effort: lift name + phone from the transcript via the
             # conversational memory promoted into the session blob. We
@@ -625,6 +700,7 @@ async def _classify_and_persist_tester_outcome(
             db.add(record)
             await db.commit()
             lead_id = str(record.id)
+            note_target_id = record.id
         except Exception:
             logger.exception("NOKVO-OUTBOUND-TESTER: failed to persist outcome lead")
 
@@ -635,6 +711,9 @@ async def _classify_and_persist_tester_outcome(
                 "outcome": outcome.outcome,
                 "reason": outcome.reason,
                 "lead_id": lead_id,
+                # Present when the prospect booked a visit — the banner is then a
+                # site-visit confirmation, not a lead capture.
+                "site_visit_id": site_visit_id,
                 "uncategorized": outcome.is_uncategorized,
                 "campaign_id": str(campaign.id) if campaign is not None else None,
                 "campaign_name": campaign.name if campaign is not None else None,
@@ -644,6 +723,18 @@ async def _classify_and_persist_tester_outcome(
         # WS already closed by client — outcome is still persisted, the
         # frontend can fall back to refreshing the Leads page to see it.
         pass
+
+    # Fix B: make sure the record this call produced (the booked site visit, or
+    # the lead) carries the post-call note. The shared teardown condensers skip
+    # the outbound-tester path, so it would otherwise be note-less. Best-effort,
+    # bounded; the banner is already sent so this only adds teardown latency.
+    if note_target_id is not None:
+        await _write_call_note_to_record(
+            tenant_res=tenant_res,
+            call_id=call_id,
+            record_id=note_target_id,
+            campaign=campaign,
+        )
 
 
 # ────────────────────────── Phone link configuration ──────────────────────────
@@ -671,7 +762,7 @@ class WhatsAppSetupRequest(BaseModel):
 
 
 class LeadOauthStartRequest(BaseModel):
-    provider: str = Field(pattern="^(meta_ads|google_ads|google_forms)$")
+    provider: str = Field(pattern="^meta_ads$")
     mode: str = "ads"
 
 

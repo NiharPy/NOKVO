@@ -70,7 +70,10 @@ def known_tones() -> list[str]:
 _TAG_OPEN = re.compile(r"\[([a-z]+)\]")
 _TAG_CLOSE = re.compile(r"\[/([a-z]+)\]")
 # End of a sentence (period/!/?/danda) followed by whitespace or EOS.
-_SENTENCE_END = re.compile(r"[.!?।]\s+|[.!?।]$")
+# A "." only terminates when NOT preceded by a digit, so a decimal — even one
+# the model spaced out, e.g. "₹2. 45Cr" — is never split across TTS chunks
+# (which made the Telugu voice read "₹2." as "rendu rupailu"). ! ? । always end.
+_SENTENCE_END = re.compile(r"(?:(?<!\d)\.|[!?।])(?:\s+|$)")
 
 
 @dataclass(slots=True)

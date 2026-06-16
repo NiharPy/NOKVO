@@ -248,6 +248,14 @@ class FollowupSchedulerService:
         if await FollowupSchedulerService._lead_is_paused(lead_id=lead.id, db=db):
             return None
 
+        # Kill switch #6: a summary-extracted callback promise already owns this
+        # lead's single pending follow-up (LeadFollowupNoteScheduler ran post-
+        # condenser). The note-derived time is authoritative, so don't stack a
+        # disposition-rule row on top — keeps exactly one pending row regardless
+        # of whether this webhook enqueue or the note scheduler ran first.
+        if await FollowupSchedulerService._has_pending_promise(lead_id=lead.id, db=db):
+            return None
+
         row = LeadFollowupSchedule(
             id=uuid.uuid4(),
             tenant_id=lead.tenant_id,
@@ -256,6 +264,122 @@ class FollowupSchedulerService:
             source_call_id=source_call_id,
             scheduled_at=scheduled_at,
             reason=reason,
+            attempts=attempts_so_far,
+            status=FollowupStatus.pending,
+        )
+        db.add(row)
+        await db.commit()
+        await db.refresh(row)
+        return row
+
+    @staticmethod
+    async def upsert_promise_from_note(
+        *,
+        db: AsyncSession,
+        promised_at: datetime,
+        note: str | None,
+        source_call_id: str | None,
+        lead_id: uuid.UUID | None = None,
+        customer_id: uuid.UUID | None = None,
+        campaign: OutboundCampaign | None = None,
+    ) -> Optional[LeadFollowupSchedule]:
+        """Schedule (or refine) a SINGLE promise-extracted follow-up from a
+        post-call note (the LeadFollowupNoteScheduler path).
+
+        Promise-from-summary is authoritative: if the lead/customer already has
+        a pending row (created by the disposition-rule webhook enqueue or the
+        in-call regex), this OVERRIDES it in place — updating the time, marking
+        ``reason=promise_extracted``, and attaching the note — rather than
+        stacking a second row. When there's no pending row, it inserts one.
+
+        Gated by the same kill switches as :meth:`enqueue_after_call` (clinic,
+        opt-out, paused, max-attempts). Returns the row, or None when gated.
+        Targets exactly one of ``lead_id`` (outbound) / ``customer_id``
+        (inbound-via-CustomerBase).
+        """
+        # ── Resolve + validate the target; pull tenant_id + consent. ──────────
+        tenant_id: str | None = None
+        if lead_id is not None:
+            lead = await db.get(OutgoingLead, lead_id)
+            if lead is None or lead.consent_status == LeadConsentStatus.revoked:
+                return None
+            tenant_id = lead.tenant_id
+        elif customer_id is not None:
+            from app.models.customer_base import CustomerBase
+
+            customer = await db.get(CustomerBase, customer_id)
+            if customer is None or bool(getattr(customer, "opt_out", False)):
+                return None
+            tenant_id = customer.tenant_id
+        else:
+            return None
+
+        # Kill switch #0: clinics never auto-schedule (admin-commanded only).
+        if tenant_id and await FollowupSchedulerService._tenant_is_clinic(
+            tenant_id=tenant_id, db=db
+        ):
+            return None
+
+        rules = effective_followup_rules(campaign)
+        if not rules.get("enabled", True):
+            return None
+
+        # Normalise + clamp the promised time (reuse the past-promise +5min
+        # guard from the disposition decision tree).
+        now = datetime.now(timezone.utc)
+        if promised_at.tzinfo is None:
+            promised_at = promised_at.replace(tzinfo=timezone.utc)
+        if promised_at < now:
+            promised_at = now + timedelta(minutes=5)
+        scheduled_at = clamp_to_call_window(promised_at, rules)
+
+        # Paused → admin took over; don't touch (leads only — customers have no
+        # pause mechanism in this flow).
+        if lead_id is not None and await FollowupSchedulerService._lead_is_paused(
+            lead_id=lead_id, db=db
+        ):
+            return None
+
+        note_clean = (note or "").strip()[:2000] or None
+
+        # Refine an existing pending row in place (single-pending invariant).
+        existing = await FollowupSchedulerService._pending_row_for_target(
+            lead_id=lead_id, customer_id=customer_id, db=db
+        )
+        if existing is not None:
+            existing.scheduled_at = scheduled_at
+            existing.reason = FollowupReason.promise_extracted
+            if note_clean:
+                existing.note = note_clean
+            if source_call_id:
+                existing.source_call_id = source_call_id
+            if campaign is not None and existing.campaign_id is None:
+                existing.campaign_id = campaign.id
+            db.add(existing)
+            await db.commit()
+            await db.refresh(existing)
+            return existing
+
+        # No pending row → insert, honouring the per-lead max-attempts cap.
+        attempts_so_far = await FollowupSchedulerService._attempts_for_target(
+            lead_id=lead_id,
+            customer_id=customer_id,
+            campaign_id=campaign.id if campaign else None,
+            db=db,
+        )
+        if attempts_so_far >= int(rules.get("max_attempts_per_lead", 3)):
+            return None
+
+        row = LeadFollowupSchedule(
+            id=uuid.uuid4(),
+            tenant_id=tenant_id,
+            lead_id=lead_id,
+            customer_id=customer_id,
+            campaign_id=campaign.id if campaign else None,
+            source_call_id=source_call_id,
+            scheduled_at=scheduled_at,
+            reason=FollowupReason.promise_extracted,
+            note=note_clean,
             attempts=attempts_so_far,
             status=FollowupStatus.pending,
         )
@@ -410,6 +534,77 @@ class FollowupSchedulerService:
         )
         res = await db.execute(stmt)
         return res.scalar() is not None
+
+    @staticmethod
+    async def _has_pending_promise(*, lead_id: uuid.UUID, db: AsyncSession) -> bool:
+        """True when the lead already has a pending ``promise_extracted`` row —
+        i.e. a summary/in-call callback time owns its single follow-up slot."""
+        stmt = (
+            select(LeadFollowupSchedule.id)
+            .where(LeadFollowupSchedule.lead_id == lead_id)
+            .where(LeadFollowupSchedule.status == FollowupStatus.pending)
+            .where(LeadFollowupSchedule.reason == FollowupReason.promise_extracted)
+            .limit(1)
+        )
+        res = await db.execute(stmt)
+        return res.scalar() is not None
+
+    @staticmethod
+    async def _pending_row_for_target(
+        *,
+        lead_id: uuid.UUID | None,
+        customer_id: uuid.UUID | None,
+        db: AsyncSession,
+    ) -> Optional[LeadFollowupSchedule]:
+        """The single most-recent pending row for a lead OR customer target.
+        Used to refine in place so a promise never stacks a second row."""
+        stmt = select(LeadFollowupSchedule).where(
+            LeadFollowupSchedule.status == FollowupStatus.pending
+        )
+        if lead_id is not None:
+            stmt = stmt.where(LeadFollowupSchedule.lead_id == lead_id)
+        elif customer_id is not None:
+            stmt = stmt.where(LeadFollowupSchedule.customer_id == customer_id)
+        else:
+            return None
+        stmt = stmt.order_by(LeadFollowupSchedule.created_at.desc()).limit(1)
+        res = await db.execute(stmt)
+        return res.scalars().first()
+
+    @staticmethod
+    async def _attempts_for_target(
+        *,
+        lead_id: uuid.UUID | None,
+        customer_id: uuid.UUID | None,
+        campaign_id: uuid.UUID | None,
+        db: AsyncSession,
+    ) -> int:
+        """Attempts already logged for a lead OR customer target (mirrors
+        :meth:`_attempts_for_lead` but generalised to the customer path)."""
+        if lead_id is not None:
+            return await FollowupSchedulerService._attempts_for_lead(
+                lead_id=lead_id, campaign_id=campaign_id, db=db
+            )
+        from sqlalchemy import func as sa_func
+
+        if customer_id is None:
+            return 0
+        stmt = (
+            select(sa_func.count(LeadFollowupSchedule.id))
+            .where(LeadFollowupSchedule.customer_id == customer_id)
+            .where(
+                LeadFollowupSchedule.status.in_(
+                    [
+                        FollowupStatus.pending,
+                        FollowupStatus.in_flight,
+                        FollowupStatus.completed,
+                        FollowupStatus.exhausted,
+                    ]
+                )
+            )
+        )
+        res = await db.execute(stmt)
+        return int(res.scalar() or 0)
 
     @staticmethod
     async def next_due(

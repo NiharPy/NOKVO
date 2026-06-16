@@ -88,7 +88,6 @@ const callableLeads = computed(() => (outgoingLeads?.value || []).filter((l) => 
 const tabs = [
   { id: 'campaigns', label: 'Campaigns', icon: PhoneCall },
   { id: 'leads', label: 'Consented leads', icon: Users },
-  { id: 'forms', label: 'Forms', icon: FileText },
   { id: 'tester', label: 'Tester', icon: Mic },
 ];
 
@@ -160,8 +159,8 @@ function campaignStatusTone(s) {
       <article class="n-card outbound__sources">
         <header class="outbound__card-head">
           <div>
-            <h2 class="outbound__card-title">Ad &amp; form connections</h2>
-            <p class="outbound__card-sub">OAuth connects sources; leads still need consent fields or form-level call consent before campaigns can use them.</p>
+            <h2 class="outbound__card-title">Ad connections</h2>
+            <p class="outbound__card-sub">Connect Meta (Facebook / Instagram) Lead Ads. Leads still need consent before campaigns can use them.</p>
           </div>
         </header>
 
@@ -204,98 +203,6 @@ function campaignStatusTone(s) {
             <strong>Instagram Ads</strong>
             <span>Lead Ads via Meta</span>
           </button>
-          <button
-            type="button"
-            class="outbound__provider"
-            aria-label="Connect Google Ads"
-            @click="requestLeadOAuth('google_ads')"
-          >
-            <span class="outbound__provider-icon outbound__provider-icon--g">
-              <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
-                <path fill="#FBBC04" d="M3.96 11.92 9.46 2.4a3.42 3.42 0 0 1 4.66-1.25 3.42 3.42 0 0 1 1.25 4.66l-5.5 9.52A3.42 3.42 0 0 1 5.21 16.6a3.42 3.42 0 0 1-1.25-4.68z"/>
-                <path fill="#4285F4" d="M20.04 22h-2.1l-6.2-10.74 3.4-1.96L21.3 19.4a1.71 1.71 0 0 1-.62 2.34c-.27.16-.43.26-.64.26z"/>
-                <circle fill="#34A853" cx="5.43" cy="18.57" r="3.43"/>
-              </svg>
-            </span>
-            <strong>Google Ads</strong>
-            <span>Customer Match</span>
-          </button>
-          <button
-            type="button"
-            class="outbound__provider"
-            aria-label="Connect Google Forms"
-            @click="requestLeadOAuth('google_forms')"
-          >
-            <span class="outbound__provider-icon outbound__provider-icon--gf">
-              <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
-                <path fill="#673AB7" d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6z"/>
-                <path fill="#9575CD" d="M14 2v6h6l-6-6z"/>
-                <path fill="#FFFFFF" d="M7.7 11.3 8.85 12.4l1.8-1.85.7.7-2.5 2.55-1.85-1.85.7-.7zm4.05.3h4.5v1.1h-4.5v-1.1zm-4.05 3.05L8.85 15.7l1.8-1.85.7.7-2.5 2.55-1.85-1.85.7-.7zm4.05.4h4.5v1.1h-4.5v-1.1z"/>
-              </svg>
-            </span>
-            <strong>Google Forms</strong>
-            <span>Form responses</span>
-          </button>
-        </div>
-      </article>
-
-      <article class="n-card outbound__nokvo-form">
-        <header class="outbound__card-head">
-          <div>
-            <h2 class="outbound__card-title">Create Nokvo form</h2>
-            <p class="outbound__card-sub">Public lead form with required call-consent. Name and phone are added automatically.</p>
-          </div>
-        </header>
-
-        <div class="outbound__form-body">
-          <label class="n-field">
-            <span class="n-field__label">Form name</span>
-            <input v-model="nokvoLeadForm.name" type="text" class="n-input" placeholder="Site visit enquiry" />
-          </label>
-          <label class="n-field">
-            <span class="n-field__label">Call-consent text</span>
-            <input v-model="nokvoLeadForm.consent_text" type="text" class="n-input" />
-          </label>
-
-          <div class="outbound__custom-fields">
-            <div class="outbound__custom-fields-head">
-              <strong>Custom fields</strong>
-              <button type="button" class="n-btn n-btn--quiet n-btn--sm" @click="addNokvoFormField">
-                <Plus :size="13" /> Add field
-              </button>
-            </div>
-            <p v-if="!nokvoLeadForm.fields.length" class="outbound__inline-empty">
-              No custom fields yet. Name, Phone, and the consent checkbox are always included.
-            </p>
-            <div v-for="(f, idx) in nokvoLeadForm.fields" :key="idx" class="outbound__custom-field">
-              <input v-model="f.label" type="text" class="n-input" placeholder="Field label (e.g. Email)" />
-              <select v-model="f.type" class="n-select">
-                <option v-for="opt in NOKVO_FORM_FIELD_TYPES" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
-              </select>
-              <label class="outbound__custom-required">
-                <input type="checkbox" v-model="f.required" />
-                <span>required</span>
-              </label>
-              <button type="button" class="n-btn n-btn--quiet n-btn--sm" @click="removeNokvoFormField(idx)" aria-label="Remove field">
-                <Trash2 :size="13" />
-              </button>
-            </div>
-          </div>
-
-          <div class="outbound__form-foot">
-            <button type="button" class="n-btn n-btn--primary" @click="createNokvoLeadForm">
-              <Plus :size="13" />
-              Create form link
-            </button>
-          </div>
-
-          <div v-if="lastNokvoFormLink" class="outbound__form-link">
-            <span class="outbound__form-link-cap">Share with leads</span>
-            <code class="n-truncate">{{ lastNokvoFormLink }}</code>
-            <button type="button" class="n-btn n-btn--ghost n-btn--sm" @click="copyNokvoFormLink">
-              <Copy :size="13" /> Copy
-            </button>
-          </div>
         </div>
       </article>
     </section>
@@ -316,35 +223,8 @@ function campaignStatusTone(s) {
         </button>
       </nav>
 
-      <!-- Forms -->
-      <article v-if="outgoingTab === 'forms'" class="n-card outbound__forms">
-        <header class="outbound__list-head">
-          <div>
-            <strong>Registered forms</strong>
-            <p>Only active forms with consent mapping can produce callable leads.</p>
-          </div>
-          <span class="n-tag n-tag--mono">{{ leadForms.length }}</span>
-        </header>
-        <div v-if="!leadForms.length" class="outbound__empty">No forms registered yet.</div>
-        <ul v-else class="outbound__form-list">
-          <li v-for="f in leadForms" :key="f.id" class="outbound__form-row">
-            <div class="outbound__form-icon">
-              <FileText :size="14" />
-            </div>
-            <div class="outbound__form-body-row">
-              <strong>{{ f.name }}</strong>
-              <span class="n-mono">{{ f.provider }} · {{ f.status }}<template v-if="f.provider_form_id"> · {{ f.provider_form_id }}</template></span>
-              <p v-if="f.public_url" class="outbound__form-url">{{ f.public_url }}</p>
-            </div>
-            <span class="n-tag" :class="f.consent_field_key || f.default_call_consent ? 'n-tag--success' : 'n-tag--warning'">
-              {{ f.consent_field_key || f.default_call_consent ? 'Consent mapped' : 'Needs consent map' }}
-            </span>
-          </li>
-        </ul>
-      </article>
-
       <!-- Leads tab -->
-      <article v-else-if="outgoingTab === 'leads'" class="n-card outbound__forms">
+      <article v-if="outgoingTab === 'leads'" class="n-card outbound__forms">
         <header class="outbound__list-head">
           <div>
             <strong>Consented leads</strong>

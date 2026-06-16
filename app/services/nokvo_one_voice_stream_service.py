@@ -122,7 +122,10 @@ from app.services.conversational_memory import (
     promote_to_caller_memory,
     save_memory,
 )
-from app.services.language_intent import detect_language_switch
+from app.services.language_intent import (
+    detect_language_switch,
+    detect_spoken_language_switch,
+)
 from app.services.nokvo_one_voice_pipeline import NokvoOneVoicePipeline
 from app.services.predefined_tools_service import PredefinedToolsService, get_tool
 from app.services.prosody import DEFAULT_TONE, ProsodyChunk, prosody_for, stream_prosody_chunks
@@ -372,6 +375,40 @@ def _latency_guard_text(language: str | None) -> str:
         "gu": "એક ક્ષણ, હું જોઈ રહ્યો છું.",
         "pa": "ਇੱਕ ਪਲ, ਮੈਂ ਵੇਖ ਰਿਹਾ ਹਾਂ।",
     }.get(language or "en", "One moment, I'm checking that.")
+
+
+def _site_visit_confirm_text(language: str | None, when: str = "") -> str:
+    """Deterministic, per-language confirmation for the moment a caller agrees
+    to a site visit and gives a date/time. Replaces free-generated Telugu/Hindi
+    (which the LLM corrupts) with a clean templated line. ``when`` (e.g.
+    ``"tomorrow 10 AM"``) stays in English/digits per the native-script rule;
+    Telugu/Hindi are hand-tuned, other languages fall back to English."""
+    lang = (language or "en")[:2]
+    if when:
+        return {
+            "te": f"సరే అండి, {when} కి note చేసుకున్నాను. మా team confirm చేసి SMS పంపిస్తారు.",
+            "hi": f"ठीक है जी, {when} के लिए note कर लिया. हमारी team confirm करके SMS भेज देगी.",
+        }.get(lang, f"Perfect, noted for {when}. Our team will confirm and send you an SMS shortly.")
+    return {
+        "te": "సరే అండి, note చేసుకున్నాను. మా team confirm చేసి SMS పంపిస్తారు.",
+        "hi": "ठीक है जी, note कर लिया. हमारी team confirm करके SMS भेज देगी.",
+    }.get(lang, "Perfect, noted. Our team will confirm and send you an SMS shortly.")
+
+
+def _is_site_visit_confirmation_turn(text: str, history: list[dict[str, str]]) -> bool:
+    """Conservative trigger for the templated booking confirmation: the caller
+    just stated a date/time, isn't asking a question, and visit intent was
+    established earlier in the call. Narrow on purpose — when it doesn't fire,
+    the normal LLM path runs."""
+    from app.services.tool_flow_policy import caller_agreed_to_site_visit
+    from app.services.voice_turn_policy import text_has_datetime, text_is_question
+
+    if not text or text_is_question(text):
+        return False
+    if not text_has_datetime(text):
+        return False
+    convo = list(history or []) + [{"role": "user", "content": text}]
+    return caller_agreed_to_site_visit(convo)
 
 
 # ── End-of-utterance completeness tiering ────────────────────────────────────
@@ -1010,6 +1047,81 @@ class NokvoOneVoiceStreamService:
                 )
                 return
 
+            # Site-visit booking confirmation (inbound real-estate). When the
+            # caller has agreed to a visit and just gave a date/time, confirm
+            # with a deterministic per-language template instead of letting the
+            # LLM free-generate it — the booking turn is exactly where Telugu /
+            # Hindi free-gen corrupts. Narrowly gated; falls through to the LLM
+            # path when it doesn't apply.
+            if source != "proactive_silence" and outbound_context is None:
+                try:
+                    _bt_confirm = await _resolve_business_type(db, tenant_res)
+                except Exception:
+                    _bt_confirm = None
+                if _bt_confirm == "real_estate":
+                    _confirm_history = await AgentSessionStore.get_history(tenant_res, call_id)
+                    if _is_site_visit_confirmation_turn(cleaned, _confirm_history):
+                        from app.services.voice_turn_policy import extract_datetime_phrase
+
+                        confirm = _site_visit_confirm_text(language, extract_datetime_phrase(cleaned))
+                        await websocket.send_json(
+                            {"type": "stt_finished", "text": cleaned, "turn_id": turn_id, "source": source}
+                        )
+                        await websocket.send_json(
+                            {
+                                "type": "agent_sentence",
+                                "turn_id": turn_id,
+                                "sentence": confirm,
+                                "tone": "warm",
+                                "first_sentence_ms": int((perf_counter() - started) * 1000),
+                                "cache_hit": False,
+                                "source": "site_visit_confirmation",
+                            }
+                        )
+                        prosody = prosody_for("warm")
+                        _mark_speaking()
+                        try:
+                            await SarvamVoiceService.stream_sentence_tts(
+                                websocket,
+                                tenant_res,
+                                confirm,
+                                language=language,
+                                purpose="site_visit_confirmation",
+                                pace=prosody.pace,
+                                pitch=prosody.pitch,
+                                loudness=prosody.loudness,
+                            )
+                        except Exception:
+                            pass
+                        await AgentSessionStore.append_turn(tenant_res, call_id, cleaned, confirm)
+                        try:
+                            from app.services.in_call_summary_service import maybe_update as _summary_update
+                            asyncio.create_task(_summary_update(tenant_res, call_id, language=language))
+                        except Exception:
+                            pass
+                        await websocket.send_json(
+                            {
+                                "type": "agent_answer",
+                                "turn_id": turn_id,
+                                "answer": confirm,
+                                "refused": False,
+                                "citations": [],
+                                "chunks": [],
+                                "runtime": {"mode": "site_visit_confirmation"},
+                                "intent": {"type": "site_visit_confirmation", "should_retrieve": False},
+                            }
+                        )
+                        await websocket.send_json(
+                            {
+                                "type": "turn_complete",
+                                "turn_id": turn_id,
+                                "total_ms": int((perf_counter() - started) * 1000),
+                                "context_source": "site_visit_confirmation",
+                                "filler_played": False,
+                            }
+                        )
+                        return
+
             # Proactive-silence turns synthesize a "(no caller response — ...)"
             # prompt that the LLM consumes as guidance. It is internal scaffolding,
             # NOT something the caller actually said — don't render it as a user
@@ -1541,7 +1653,7 @@ class NokvoOneVoiceStreamService:
                         filename=filename,
                         content_type=content_type,
                     ),
-                    timeout=1.5,
+                    timeout=max(0.2, settings.AGENT_TRANSLATE_TIMEOUT_MS / 1000),
                 )
                 return str(result.get("transcript") or "").strip()
             except asyncio.TimeoutError:
@@ -1669,10 +1781,22 @@ class NokvoOneVoiceStreamService:
         ):
             await _drain_turn(prev_turn)
 
-        # Resolve reply language with the same precedence as the streaming path.
+        # Resolve reply language with the same precedence as the streaming path:
+        #   1) explicit switch request ("speak in Telugu")
+        #   2) the caller simply STARTED speaking another language — follow it
+        #   3) previously-locked session language (sticky)
+        #   4) first detection → lock
         requested = detect_language_switch(transcript)
-        if requested:
-            normalized = SarvamVoiceService.normalize_language(requested)
+        spoken_switch = None
+        if not requested and session_locked_language[0]:
+            spoken_switch = detect_spoken_language_switch(
+                transcript,
+                detected_lang,
+                session_locked_language[0],
+                confidence=native_result.get("language_probability"),
+            )
+        if requested or spoken_switch:
+            normalized = SarvamVoiceService.normalize_language(requested or spoken_switch)
             if normalized != session_locked_language[0]:
                 session_locked_language[0] = normalized
                 await websocket.send_json({"type": "language_locked", "language": normalized})
@@ -1689,7 +1813,7 @@ class NokvoOneVoiceStreamService:
         # Track the language history for code-switch awareness.
         if robustness is not None:
             robustness.language_state.observe(detected_lang, transcript)
-            if requested:
+            if requested or spoken_switch:
                 robustness.language_state.lock(turn_language)
 
         await NokvoOneVoiceStreamService._run_text_turn(
@@ -2183,11 +2307,18 @@ class NokvoOneVoiceStreamService:
 
                 # Resolve the reply language. Priority:
                 #   1) Explicit switch request in THIS turn ("speak in Telugu")
-                #   2) Previously-locked session language (sticky)
-                #   3) Sarvam's per-segment STT language detection
+                #   2) The caller simply STARTED speaking another language than
+                #      the one locked — follow it for the rest of the call
+                #   3) Previously-locked session language (sticky)
+                #   4) Sarvam's per-segment STT language detection (first lock)
                 requested = detect_language_switch(text)
-                if requested:
-                    normalized = SarvamVoiceService.normalize_language(requested)
+                spoken_switch = None
+                if not requested and session_locked_language[0]:
+                    spoken_switch = detect_spoken_language_switch(
+                        text, utterance_language[0], session_locked_language[0]
+                    )
+                if requested or spoken_switch:
+                    normalized = SarvamVoiceService.normalize_language(requested or spoken_switch)
                     if normalized != session_locked_language[0]:
                         session_locked_language[0] = normalized
                         await websocket.send_json({"type": "language_locked", "language": normalized})
@@ -2239,10 +2370,10 @@ class NokvoOneVoiceStreamService:
 
                 if translate_audio:
                     # Kick the translate call with a hard timeout. We'd rather
-                    # use the native transcript than wait 3-4s for translate to
+                    # use the native transcript than wait for translate to
                     # finish — first-sentence latency on a phone call has to stay
-                    # under ~2s for the agent to feel responsive.
-                    TRANSLATE_TIMEOUT_S = 1.5
+                    # low, and translate only sharpens cross-lingual retrieval.
+                    TRANSLATE_TIMEOUT_S = max(0.2, settings.AGENT_TRANSLATE_TIMEOUT_MS / 1000)
 
                     async def _run_with_translate() -> None:
                         english = ""
@@ -2364,9 +2495,14 @@ class NokvoOneVoiceStreamService:
                 nonlocal stt_ws, stt_reader_task
                 if stt_ws is not None:
                     return
+                # Auto-detect by default so the caller can switch languages
+                # mid-call (Sarvam reports the spoken language per segment, and
+                # detect_spoken_language_switch follows it). Pinning to the
+                # seeded ``language`` would transcribe any other language as
+                # garbage and lock the reply language forever.
                 stt_ws = await SarvamVoiceService.connect_stt(
                     tenant_res,
-                    language=language,
+                    language=None if settings.SARVAM_STT_AUTO_DETECT_LANGUAGE else language,
                     sample_rate=sample_rate,
                 )
 
@@ -2654,7 +2790,11 @@ class NokvoOneVoiceStreamService:
                                 stt = await SarvamVoiceService.transcribe_rest(
                                     tenant_res,
                                     bytes(audio_buffer),
-                                    language=language,
+                                    language=(
+                                        None
+                                        if settings.SARVAM_STT_AUTO_DETECT_LANGUAGE
+                                        else language
+                                    ),
                                 )
                                 text = stt.get("transcript") or ""
                                 if text:
@@ -2912,6 +3052,7 @@ class NokvoOneVoiceStreamService:
                                 lead_uuid = uuid.UUID(str(_lead_id_raw))
                             except (TypeError, ValueError):
                                 return
+                            _lead_campaign_id = None
                             async with AsyncSessionLocal() as bg_db:
                                 lead = await bg_db.get(OutgoingLead, lead_uuid)
                                 if lead is not None:
@@ -2919,9 +3060,39 @@ class NokvoOneVoiceStreamService:
                                     lead.handoff_note_generated_at = datetime.now(timezone.utc)
                                     bg_db.add(lead)
                                     await bg_db.commit()
+                                    _lead_campaign_id = lead.campaign_id
                                     logger.info(
                                         "NOKVO-CONDENSE: handoff note written for lead %s (%d chars)",
                                         lead_uuid, len(note),
+                                    )
+                            # Lead → Follow-up agent: read the note for a callback
+                            # time the prospect asked for and configure the
+                            # follow-up callback (campaign-linked). Best-effort,
+                            # fresh session; mirrors the RE_scheduler hook above.
+                            if lead is not None:
+                                try:
+                                    from app.services.lead_followup_note_scheduler import (
+                                        LeadFollowupNoteScheduler,
+                                    )
+                                    from app.models.outbound_campaign import OutboundCampaign
+
+                                    async with AsyncSessionLocal() as fu_db:
+                                        _camp = (
+                                            await fu_db.get(OutboundCampaign, _lead_campaign_id)
+                                            if _lead_campaign_id
+                                            else None
+                                        )
+                                        await LeadFollowupNoteScheduler.schedule_from_note(
+                                            fu_db,
+                                            tenant_res=_bg_tenant_res,
+                                            note=note,
+                                            source_call_id=str(_bg_call_id),
+                                            lead_id=lead_uuid,
+                                            campaign=_camp,
+                                        )
+                                except Exception:
+                                    logger.exception(
+                                        "NOKVO-LEAD-FOLLOWUP: outbound scheduling failed"
                                     )
                         except Exception:
                             logger.exception("NOKVO-CONDENSE: background task failed")
@@ -3010,38 +3181,52 @@ class NokvoOneVoiceStreamService:
                                         lead_name=lead_name,
                                         timeout_s=8.0,
                                     )
-                                    if not note:
-                                        return
-                                    now_iso = datetime.now(timezone.utc).isoformat()
-                                    written = 0
-                                    async with AsyncSessionLocal() as bg_db:
-                                        for rid in record_ids:
-                                            try:
-                                                rec_uuid = uuid.UUID(str(rid))
-                                            except (TypeError, ValueError):
-                                                continue
-                                            rec = await bg_db.get(NokvoOneToolRecord, rec_uuid)
-                                            if rec is None:
-                                                continue
-                                            data = dict(rec.data or {})
-                                            data["handoff_note"] = note
-                                            data["handoff_note_generated_at"] = now_iso
-                                            # Reassign + flag_modified so SQLAlchemy
-                                            # persists the JSONB change (in-place
-                                            # mutation alone is not tracked).
-                                            rec.data = data
-                                            flag_modified(rec, "data")
-                                            bg_db.add(rec)
-                                            written += 1
-                                        await bg_db.commit()
-                                    logger.info(
-                                        "NOKVO-CONDENSE: inbound handoff note written to %d record(s) for call %s (%d chars)",
-                                        written, _bg_call_id_in, len(note),
-                                    )
-                                    # RE_agent_scheduler: turn the freshly-noted site-visit
-                                    # ticket into a filled, agent-assigned ticket (LLM extract
+                                    # Enrich the records with the LLM note when we
+                                    # got one. When condense fails, the records keep
+                                    # the deterministic note written at creation — so
+                                    # downstream (RE_agent_scheduler) still has input.
+                                    if note:
+                                        now_iso = datetime.now(timezone.utc).isoformat()
+                                        written = 0
+                                        async with AsyncSessionLocal() as bg_db:
+                                            for rid in record_ids:
+                                                try:
+                                                    rec_uuid = uuid.UUID(str(rid))
+                                                except (TypeError, ValueError):
+                                                    continue
+                                                rec = await bg_db.get(NokvoOneToolRecord, rec_uuid)
+                                                if rec is None:
+                                                    continue
+                                                data = dict(rec.data or {})
+                                                data["handoff_note"] = note
+                                                data["handoff_note_generated_at"] = now_iso
+                                                data["handoff_note_source"] = "condenser"
+                                                # Reassign + flag_modified so SQLAlchemy
+                                                # persists the JSONB change (in-place
+                                                # mutation alone is not tracked).
+                                                rec.data = data
+                                                flag_modified(rec, "data")
+                                                bg_db.add(rec)
+                                                written += 1
+                                            await bg_db.commit()
+                                        logger.info(
+                                            "NOKVO-CONDENSE: inbound handoff note written to %d record(s) for call %s (%d chars)",
+                                            written, _bg_call_id_in, len(note),
+                                        )
+                                    else:
+                                        logger.info(
+                                            "NOKVO-CONDENSE: inbound condenser returned no note for call %s "
+                                            "(record(s) keep their deterministic note)",
+                                            _bg_call_id_in,
+                                        )
+
+                                    # RE_agent_scheduler: turn the site-visit ticket
+                                    # into a filled, agent-assigned ticket (LLM extract
                                     # the note → fill the Site Visit Fields → assign the
-                                    # nearest-free agent). Best-effort, off the call path; fresh
+                                    # nearest-free agent). Runs REGARDLESS of whether the
+                                    # condenser succeeded — it reads the ticket's current
+                                    # handoff_note, which is never empty (deterministic
+                                    # note is written at creation). Best-effort, fresh
                                     # session so it never perturbs the note write above.
                                     if site_visit_id:
                                         try:
@@ -3055,10 +3240,14 @@ class NokvoOneVoiceStreamService:
                                             logger.exception(
                                                 "NOKVO-RE-SCHED: inbound agent scheduling failed"
                                             )
-                                    # Same note onto the caller's Customer base
-                                    # row (best-effort — the row was upserted at
-                                    # teardown just before this task started).
-                                    if cb_phone:
+
+                                    # Customer-base summary + Follow-up agent need the
+                                    # LLM prose, so they only run when condense produced
+                                    # a note. (The site-visit scheduler above does not.)
+                                    if note and cb_phone:
+                                        # Same note onto the caller's Customer base
+                                        # row (best-effort — the row was upserted at
+                                        # teardown just before this task started).
                                         try:
                                             from app.services.customer_base_service import (
                                                 record_call_summary,
@@ -3075,6 +3264,29 @@ class NokvoOneVoiceStreamService:
                                         except Exception:
                                             logger.exception(
                                                 "NOKVO-CONDENSE: customer summary write failed"
+                                            )
+                                        # Inbound caller → Follow-up agent: if the
+                                        # note shows the caller asked for a callback
+                                        # time, schedule it against their Customer
+                                        # base row (campaign-less). Best-effort,
+                                        # fresh session; mirrors RE_scheduler.
+                                        try:
+                                            from app.services.lead_followup_note_scheduler import (
+                                                LeadFollowupNoteScheduler,
+                                            )
+
+                                            async with AsyncSessionLocal() as fu_db:
+                                                await LeadFollowupNoteScheduler.schedule_from_note(
+                                                    fu_db,
+                                                    tenant_res=_bg_tenant_res_in,
+                                                    note=note,
+                                                    source_call_id=str(_bg_call_id_in),
+                                                    customer_phone=str(cb_phone),
+                                                    campaign=None,
+                                                )
+                                        except Exception:
+                                            logger.exception(
+                                                "NOKVO-LEAD-FOLLOWUP: inbound scheduling failed"
                                             )
                                 finally:
                                     try:

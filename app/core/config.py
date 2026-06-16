@@ -249,11 +249,35 @@ class Settings(BaseSettings):
     SARVAM_STT_MODE: str = "transcribe"
     SARVAM_STT_SAMPLE_RATE: int = 16000
     SARVAM_STT_AUDIO_ENCODING: str = "audio/wav"
+    # When True, the streaming STT connects in auto-detect mode (language-code
+    # "unknown") so Sarvam reports the actual spoken language each segment and
+    # the agent can follow a caller who simply starts speaking another language
+    # mid-call. When False, the STT is pinned to the call's initial language —
+    # marginally better single-language accuracy, but it CANNOT detect a switch
+    # (a Telugu speaker on an English-seeded call gets transcribed as garbled
+    # English forever). The blob/VAD path already auto-detects unconditionally.
+    SARVAM_STT_AUTO_DETECT_LANGUAGE: bool = True
     SARVAM_TTS_REST_URL: str = "https://api.sarvam.ai/text-to-speech"
     SARVAM_TTS_STREAM_URL: str = "https://api.sarvam.ai/text-to-speech/stream"
     SARVAM_TTS_WEBSOCKET_URL: str = "wss://api.sarvam.ai/text-to-speech/ws"
     SARVAM_TTS_MODEL: str = "bulbul:v3"
-    SARVAM_TTS_SPEAKER: str = "shubh"
+    SARVAM_TTS_SPEAKER: str = "ritu"
+    # Per-language native speaker overrides (bulbul:v3). Empty = use
+    # SARVAM_TTS_SPEAKER for every language (current behaviour). Populate with a
+    # voice from Sarvam's bulbul:v3 catalog that sounds native for the language —
+    # e.g. a Telugu-native speaker for `te` so Telugu calls don't speak in the
+    # Hindi-leaning default voice. A bad/unknown id falls back to the default
+    # speaker at synthesis time, so these are safe to A/B by ear.
+    SARVAM_TTS_SPEAKER_TE: str = ""
+    SARVAM_TTS_SPEAKER_HI: str = ""
+    SARVAM_TTS_SPEAKER_EN: str = ""
+    # Per-language pace multiplier on top of the per-tone prosody pace. The
+    # bulbul:v3 Telugu voice renders noticeably slower than English at pace 1.0,
+    # so we speed Telugu up by default. Applied even when a turn carries no
+    # explicit pace, so every Telugu chunk gets the bump. 1.0 = no change.
+    SARVAM_TTS_PACE_TE: float = 1.1
+    SARVAM_TTS_PACE_HI: float = 1.0
+    SARVAM_TTS_PACE_EN: float = 1.0
     SARVAM_TTS_SAMPLE_RATE: int = 24000
     SARVAM_TTS_AUDIO_CODEC: str = "wav"
     SARVAM_TTS_ENABLE_CACHED_RESPONSES: bool = False
@@ -310,6 +334,11 @@ class Settings(BaseSettings):
     AGENT_RAG_DEBUG: bool = False
     AGENT_RAG_MIN_QUERY_WORDS: int = 3
     AGENT_TRANSLATE_FOR_RETRIEVAL_ENABLED: bool = True
+    # Hard cap on the cross-lingual translate-STT call that blocks a non-English
+    # turn before the LLM starts. Sarvam translate usually returns in 0.5-0.8s;
+    # 800ms caps the stall so Telugu/Hindi first-audio latency stays low (we fall
+    # back to the native transcript for retrieval when it times out).
+    AGENT_TRANSLATE_TIMEOUT_MS: int = 800
     # Per-call conversation memory. Set to 10 min so a 7-min call always has
     # full history available even with no agent activity for a stretch
     # (caller on hold, on-screen confirmation, etc.). Refreshed on every

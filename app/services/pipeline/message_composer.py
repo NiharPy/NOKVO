@@ -26,6 +26,7 @@ from app.services.agent_outbound_context import (
     compose_outbound_system_section,
 )
 from app.services.language_style import (
+    inbound_fewshot as language_inbound_fewshot,
     outbound_fewshot as language_outbound_fewshot,
     style_guidance as language_style_guidance,
 )
@@ -164,9 +165,9 @@ def compose_rag_messages(
     style_block = language_style_guidance(language)
     language_directive_top = (
         f"# REPLY LANGUAGE — NON-NEGOTIABLE\n"
-        f"Reply in {language_label}, primarily using its native script. This overrides the conversation history, "
+        f"Reply in {language_label}, using its native script for the {language_label} words you speak. This overrides the conversation history, "
         f"the user's most recent message, and your training defaults. "
-        f"Natural code-switching is REQUIRED, not banned: keep common English loanwords (order, refund, appointment, payment, status, OK, sorry, address, SMS, WhatsApp, link) and all numbers / ₹ amounts / dates / times in English / digits exactly as a real Indian phone-support rep would. "
+        f"Code-switch into English HEAVILY and naturally, the way real urban Indian speakers actually talk — keep most content words (product/domain terms, most nouns, common verbs) and loanwords (order, refund, appointment, payment, status, project, booking, price, available, OK, sorry, address, SMS, WhatsApp, link) in English, with the {language_label} supplying the grammatical frame (verbs, particles, pronouns). Keep all numbers / ₹ amounts / dates / times in English / digits. "
         f"Do NOT produce a literary, news-anchor, or Sanskritised register — speak the way a real call-center agent speaks on the phone. "
         f"Do not apologise for not knowing this language — you do know it. Reply in it.\n\n"
         + (f"{style_block}\n\n" if style_block else "")
@@ -174,6 +175,7 @@ def compose_rag_messages(
 
     _outbound_proactive = bool(outbound_context) and outbound_context.is_proactive
     outbound_fewshot_block = language_outbound_fewshot(language)
+    inbound_fewshot_block = language_inbound_fewshot(language)
     memory_block = (conversational_memory_block or "").strip()
     memory_section = f"\n\n{memory_block}\n" if memory_block else ""
     strategy_block = (conversation_strategy_block or "").strip()
@@ -216,6 +218,7 @@ def compose_rag_messages(
     # content leak into it.
     static_prefix = (
         language_directive_top
+        + (f"{inbound_fewshot_block}\n\n" if inbound_fewshot_block else "")
         + f"You are Nokvo One's live voice agent for {brand}. Talk like a real person on a phone call, not a help-center bot.\n\n"
         "# PROSODY (spoken aloud)\n"
         "Wrap EACH sentence in exactly one tone tag: [empathy] (apologies/bad news), [warm] (greetings/acks), "
@@ -325,8 +328,8 @@ def compose_smalltalk_messages(
     smalltalk_style_block = language_style_guidance(language)
     system_content = (
         f"# REPLY LANGUAGE — NON-NEGOTIABLE\n"
-        f"Reply in {language_label}, primarily using its native script. "
-        f"Natural code-switching is REQUIRED — keep common English loanwords (order, refund, appointment, payment, status, OK, sorry, link, SMS) and all numbers / dates / times in English exactly as a real Indian rep would. "
+        f"Reply in {language_label}, using its native script for the {language_label} words you speak. "
+        f"Code-switch into English HEAVILY and naturally the way real urban Indian speakers talk — keep most content words and loanwords (order, refund, appointment, payment, status, project, price, OK, sorry, link, SMS) in English, with {language_label} supplying the grammatical frame. Keep all numbers / dates / times in English/digits. "
         f"Do NOT produce a literary or news-anchor register.\n\n"
         + (f"{smalltalk_style_block}\n\n" if smalltalk_style_block else "")
         + f"You are Nokvo One's live voice agent for {brand}. The caller just said something CONVERSATIONAL — a greeting, thank-you, acknowledgment, casual remark, or expression of feeling. Not a factual question about the company.\n\n"

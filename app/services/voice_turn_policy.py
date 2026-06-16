@@ -151,6 +151,62 @@ _QUESTION_RE = re.compile(
     r"(ఏమి|ఎక్కడ|ఎప్పుడు|ఎలా|చెప్పగలరా|ఫీజు|టైమింగ్|అడ్రస్|क्या|कहाँ|कब|कैसे|फीस|टाइमिंग|पता)",
     re.IGNORECASE,
 )
+
+
+# Clock hour stated with a unit word that the English _TIME_RE misses:
+# "10 o'clock", Telugu "10 గంటలకి/గంటలకు/గంటకి", Hindi "10 बजे". Captures the
+# bare hour so the downstream parser/extractor gets a concrete time.
+_CLOCK_HOUR_RE = re.compile(
+    r"\b(\d{1,2})\s*(?:o['’]?\s*clock|గంట(?:ల)?(?:కి|కు|క)?|బజే|बजे|बजकर)",
+    re.IGNORECASE,
+)
+
+
+def _clock_hour_time(norm_text: str) -> str:
+    """Return ``"H:00"`` for an hour stated with a clock-unit word, else ""."""
+    m = _CLOCK_HOUR_RE.search(norm_text)
+    if not m:
+        return ""
+    h = int(m.group(1))
+    return f"{h}:00" if 0 <= h <= 23 else ""
+
+
+def text_has_datetime(text: str | None) -> bool:
+    """True when the (hi/te/en) text states a date or time. Normalises Telugu /
+    Hindi relative tokens first so ``రేపు`` / ``kal`` count as ``tomorrow``."""
+    norm = normalize_relative_datetime_text(text or "")
+    return bool(_DATE_RE.search(norm) or _TIME_RE.search(norm) or _CLOCK_HOUR_RE.search(norm))
+
+
+def extract_datetime_phrase(text: str | None) -> str:
+    """Best-effort canonical date/time phrase for echoing back (e.g.
+    ``"tomorrow 10 AM"``). Empty when nothing strong matches. Kept in
+    English/digits so it slots cleanly into a native-script confirmation line."""
+    norm = normalize_relative_datetime_text(text or "")
+    parts: list[str] = []
+    d = _DATE_RE.search(norm)
+    if d:
+        parts.append(d.group(0).strip())
+    t = _TIME_RE.search(norm)
+    if t:
+        parts.append(t.group(0).strip())
+    else:
+        # No am/pm/colon time — fall back to a clock-hour word ("10 గంటలకి").
+        clock = _clock_hour_time(norm)
+        if clock:
+            parts.append(clock)
+    return " ".join(p for p in parts if p).strip()
+
+
+def text_is_question(text: str | None) -> bool:
+    """True when the utterance reads as a question (so a confirmation
+    short-circuit doesn't hijack a turn where the caller also asked something)."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    if t.endswith("?"):
+        return True
+    return bool(_QUESTION_RE.search(t))
 _CORRECTION_MARKER_RE = re.compile(
     r"\b("
     r"not|actually|correction|correct|wrong|misheard|misheard\s+me|"

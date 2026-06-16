@@ -42,7 +42,7 @@ def _ticket(**data) -> SimpleNamespace:
 
 
 def _patch(monkeypatch, *, llm_out, projects=None, assignment=None, calls=None):
-    async def fake_complete_global(messages, **kw):
+    async def fake_complete_nano(messages, **kw):
         if calls is not None:
             calls.append("llm")
         return llm_out
@@ -55,9 +55,10 @@ def _patch(monkeypatch, *, llm_out, projects=None, assignment=None, calls=None):
             calls.append(("assign", kw.get("requested_time"), kw.get("request_type")))
         return assignment
 
+    # The extractor runs on the gpt-4.1-nano pool (complete_nano).
     monkeypatch.setattr(
-        "app.services.nokvo_one_voice_pipeline.AzureGroundedLLM.complete_global",
-        fake_complete_global,
+        "app.services.nokvo_one_voice_pipeline.AzureGroundedLLM.complete_nano",
+        fake_complete_nano,
     )
     monkeypatch.setattr(
         "app.services.real_estate_project_service.load_active_projects", fake_load_projects

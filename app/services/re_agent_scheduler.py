@@ -193,7 +193,9 @@ class REAgentScheduler:
         try:
             from app.services.nokvo_one_voice_pipeline import AzureGroundedLLM
 
-            raw = await AzureGroundedLLM.complete_global(
+            # Auxiliary extraction (not the agent's spoken reply) → gpt-4.1-nano
+            # pool; falls back to the mini pool when no nano is configured.
+            raw = await AzureGroundedLLM.complete_nano(
                 [
                     {"role": "system", "content": _EXTRACT_SYSTEM},
                     {"role": "user", "content": f"Current date: {today}\n\nCall note:\n{note}"},

@@ -85,7 +85,7 @@ def test_hindi_system_prompt_includes_native_register_and_code_switching():
     prompt = _system_prompt("hi")
     assert "HINDI STYLE" in prompt
     assert "Do not mix languages" not in prompt
-    assert "code-switching" in prompt.lower()
+    assert "code-switch" in prompt.lower() or "code-switching" in prompt.lower()
 
 
 def test_english_system_prompt_skips_indic_style_block():
@@ -156,12 +156,14 @@ def test_generate_outbound_opener_text_localises_te_hi():
     hi = generate_outbound_opener_text(ctx, language="hi")
     # English opener is the canonical "Hi, this is …" line.
     assert "Hi, this is Riya" in en
-    # Telugu opener uses transliterated Telugu — natural for code-switched
-    # phone openers — and keeps the company name in English mid-line.
-    assert "nenu Riya" in te.lower() or "nenu riya" in te.lower()
+    # Telugu opener is written in Telugu script (so the Telugu TTS voice
+    # pronounces it correctly) and keeps the caller/company name in English
+    # mid-line. "నేను" = "I am", "మాట్లాడుతున్నా" = "am speaking".
+    assert "నేను Riya" in te
+    assert "మాట్లాడుతున్నా" in te
     assert "Raghava Skyline" in te
-    # Hindi opener starts with "Namaste" + transliterated Hindi cadence.
-    assert "Namaste" in hi
+    # Hindi opener starts with Devanagari "नमस्ते" + Devanagari cadence.
+    assert "नमस्ते" in hi
     assert "Raghava Skyline" in hi
     # All three carry the prosody tags so stream_prosody_chunks can render.
     for opener in (en, te, hi):
