@@ -363,18 +363,49 @@ def _quick_ack_text(language: str | None) -> str:
     }.get(language or "en", "Yes, I'm here.")
 
 
-def _latency_guard_text(language: str | None) -> str:
-    return {
-        "hi": "एक पल, मैं देख रहा हूँ।",
-        "ta": "ஒரு நிமிடம், பார்த்துக்கிறேன்.",
-        "te": "ఒక్క క్షణం, చూస్తున్నాను.",
-        "bn": "একটু সময় দিন, আমি দেখছি।",
-        "kn": "ಒಂದು ಕ್ಷಣ, ನೋಡುತ್ತಿದ್ದೇನೆ.",
-        "ml": "ഒരു നിമിഷം, ഞാൻ നോക്കുകയാണ്.",
-        "mr": "एक क्षण, मी पाहतोय.",
-        "gu": "એક ક્ષણ, હું જોઈ રહ્યો છું.",
-        "pa": "ਇੱਕ ਪਲ, ਮੈਂ ਵੇਖ ਰਿਹਾ ਹਾਂ।",
-    }.get(language or "en", "One moment, I'm checking that.")
+# Inbound latency filler: a reassuring "one moment, checking" hold. On a support
+# call this reads as the agent looking something up — natural and expected.
+# Native script per language (Sarvam TTS mispronounces romanised Indic text).
+_LATENCY_GUARD_INBOUND = {
+    "hi": "एक पल, मैं देख रहा हूँ।",
+    "ta": "ஒரு நிமிடம், பார்த்துக்கிறேன்.",
+    "te": "ఒక్క క్షణం, చూస్తున్నాను.",
+    "bn": "একটু সময় দিন, আমি দেখছি।",
+    "kn": "ಒಂದು ಕ್ಷಣ, ನೋಡುತ್ತಿದ್ದೇನೆ.",
+    "ml": "ഒരു നിമിഷം, ഞാൻ നോക്കുകയാണ്.",
+    "mr": "एक क्षण, मी पाहतोय.",
+    "gu": "એક ક્ષણ, હું જોઈ રહ્યો છું.",
+    "pa": "ਇੱਕ ਪਲ, ਮੈਂ ਵੇਖ ਰਿਹਾ ਹਾਂ।",
+    "ur": "ایک لمحہ، میں دیکھ رہا ہوں۔",
+    "od": "ଟିକେ ଅପେକ୍ଷା କରନ୍ତୁ, ମୁଁ ଦେଖୁଛି।",
+}
+# Outbound latency bridge: NOT a hold. On an outbound sales call "please hold /
+# one moment" reads as a stalled call-center queue and gets the prospect to hang
+# up. Instead a short, natural thinking-aloud token ("Mhm…", "I see,") so it
+# sounds like a human gathering a thought, not a system stalling.
+_LATENCY_GUARD_OUTBOUND = {
+    "hi": "जी, बस एक सेकंड…",
+    "ta": "ம்ம், சரி…",
+    "te": "ఊఁ, అలాగే…",
+    "bn": "হুম, আচ্ছা…",
+    "kn": "ಹ್ಮ್, ಸರಿ…",
+    "ml": "ഹ്മ്, ശരി…",
+    "mr": "हम्म, बरं…",
+    "gu": "હમ્મ, સારું…",
+    "pa": "ਹਾਂ ਜੀ, ਬੱਸ…",
+    "ur": "جی، بس ایک سیکنڈ…",
+    "od": "ହଁ, ଠିକ୍ ଅଛି…",
+}
+
+
+def _latency_guard_text(language: str | None, direction: str = "inbound") -> str:
+    """Localized sub-1s filler. ``direction`` selects the phrase register:
+    inbound uses the reassuring "one moment, checking" hold; outbound uses a
+    short conversational bridge so it sounds like a person thinking, not a queue.
+    All 12 supported languages are covered; unknown → English."""
+    table = _LATENCY_GUARD_OUTBOUND if direction == "outbound" else _LATENCY_GUARD_INBOUND
+    default = "Just a moment…" if direction == "outbound" else "One moment, I'm checking that."
+    return table.get(language or "en", default)
 
 
 def _site_visit_confirm_text(language: str | None, when: str = "") -> str:
@@ -925,7 +956,15 @@ class NokvoOneVoiceStreamService:
         language_state: LanguageState | None = None,
         outbound_context: OutboundCampaignContext | None = None,
         after_turn=None,
+        eou_fired_at: float | None = None,
+        eou_tier: str | None = None,
     ) -> None:
+        # ``eou_fired_at`` is a ``perf_counter()`` reading anchored at the
+        # caller's end-of-speech (the EOU silence-countdown start). When present
+        # it lets the latency guard size its wait against the strict sub-1s
+        # budget — see the guard loop below. ``None`` on manual / proactive
+        # turns, which fall back to the fixed VOICE_FIRST_SENTENCE_TIMEOUT_MS
+        # ceiling.
         cleaned = " ".join((text or "").split())
         if not cleaned:
             return
@@ -1135,6 +1174,40 @@ class NokvoOneVoiceStreamService:
             answer_parts: list[str] = []
             final_payload: dict[str, Any] | None = None
             first_sentence_ms: int | None = None
+            # ── Sub-1s latency record (WS5) ──────────────────────────────────
+            # ONE structured per-turn record anchored at end-of-speech, emitted
+            # the instant first audio (real OR filler) is dispatched. This is the
+            # signal that proves "strictly sub-1s" in prod, broken down so a
+            # regression is attributable: eos→eou_fire is the EOU silence wait,
+            # eou_fire→first_audio is the turn's compute (route+LLM+TTS dispatch).
+            direction = (
+                "outbound"
+                if (outbound_context is not None and getattr(outbound_context, "is_proactive", False))
+                else "inbound"
+            )
+            _latency_emitted = False
+
+            def _emit_latency_record(*, source: str, cache_hit: bool, first_audio_perf: float) -> None:
+                nonlocal _latency_emitted
+                if _latency_emitted:
+                    return
+                _latency_emitted = True
+                eou_fire_to_audio_ms = int((first_audio_perf - started) * 1000)
+                if eou_fired_at is not None:
+                    eos_to_audio_ms = int((first_audio_perf - eou_fired_at) * 1000)
+                    eos_to_eou_fire_ms = int((started - eou_fired_at) * 1000)
+                else:
+                    eos_to_audio_ms = eou_fire_to_audio_ms
+                    eos_to_eou_fire_ms = 0
+                within_budget = eos_to_audio_ms < settings.VOICE_LATENCY_BUDGET_MS
+                logger.info(
+                    "NOKVO-LATENCY-TURN: language=%s direction=%s tier=%s source=%s "
+                    "cache_hit=%s eos_to_eou_fire_ms=%d eou_fire_to_first_audio_ms=%d "
+                    "eos_to_first_audio_ms=%d within_budget=%s",
+                    language, direction, eou_tier or "-", source, cache_hit,
+                    eos_to_eou_fire_ms, eou_fire_to_audio_ms, eos_to_audio_ms, within_budget,
+                )
+
             # Decouple LLM stream consumption from TTS roundtrips: the pump
             # owns the Sarvam calls so the LLM token loop never blocks waiting
             # on TTS, and adjacent sentences are batched into a single REST
@@ -1358,7 +1431,13 @@ class NokvoOneVoiceStreamService:
                     if not sentence:
                         return
                     if first_sentence_ms is None:
-                        first_sentence_ms = int((perf_counter() - started) * 1000)
+                        _first_audio_perf = perf_counter()
+                        first_sentence_ms = int((_first_audio_perf - started) * 1000)
+                        _emit_latency_record(
+                            source="real",
+                            cache_hit=bool(event.get("cache_hit")),
+                            first_audio_perf=_first_audio_perf,
+                        )
                     tone = str(event.get("tone") or DEFAULT_TONE)
                     answer_parts.append(sentence)
                     await websocket.send_json(
@@ -1376,16 +1455,17 @@ class NokvoOneVoiceStreamService:
                     final_payload = event
 
             latency_guard_sent = False
-            # The spoken latency guard is useful for inbound support because it
-            # reassures the caller during retrieval. On outbound calls it sounds
-            # like an extra agent turn ("one moment...") and can stack in front of
-            # the actual sales reply, which prevents natural interruption.
-            # Also disabled mid-booking (tool_flow active): slot-fill turns are
-            # small LLM calls that finish well under the threshold, and the filler
-            # makes the booking conversation feel robotic ("one moment, I'm
-            # checking that. Got it, Nihar. What phone number…").
+            # The spoken latency guard guarantees SOME audio lands within the
+            # sub-1s budget when the real LLM answer is slow (an audible hold/
+            # bridge counts). It runs on BOTH directions now — inbound speaks a
+            # reassuring "one moment" hold, outbound a short thinking-aloud bridge
+            # (direction-selected in _latency_guard_text). Still disabled mid-
+            # booking (tool_flow active) on either direction: slot-fill turns are
+            # tiny LLM calls that finish well under budget, and the filler makes
+            # the booking exchange feel robotic ("one moment… Got it, Nihar. What
+            # phone number…").
             _tool_flow_active_for_guard = False
-            if outbound_context is None and call_id:
+            if call_id:
                 try:
                     _guard_state = await AgentSessionStore.get_state(tenant_res, call_id) or {}
                     _tf_for_guard = _guard_state.get("tool_flow") or {}
@@ -1394,36 +1474,63 @@ class NokvoOneVoiceStreamService:
                     )
                 except Exception:
                     _tool_flow_active_for_guard = False
-            latency_guard_enabled = (
-                outbound_context is None and not _tool_flow_active_for_guard
-            )
+            latency_guard_enabled = not _tool_flow_active_for_guard
+
+            def _guard_timeout_s() -> float | None:
+                """Dynamic guard wait. When end-of-speech is known, size the wait
+                so the filler fires early enough that eos→audio stays under the
+                budget: budget − (time already spent since eos) − a TTS-dispatch
+                margin, clamped to [floor, ceiling]. Without an eos anchor (manual/
+                proactive turns) fall back to the fixed ceiling. Returns ``None``
+                once the real answer has landed or the guard is disabled, so the
+                loop then waits indefinitely on the real stream."""
+                if first_sentence_ms is not None or not latency_guard_enabled:
+                    return None
+                ceiling_ms = settings.VOICE_FIRST_SENTENCE_TIMEOUT_MS
+                if eou_fired_at is None:
+                    return max(0.05, ceiling_ms / 1000)
+                elapsed_ms = (perf_counter() - eou_fired_at) * 1000
+                budget_left_ms = (
+                    settings.VOICE_LATENCY_BUDGET_MS
+                    - elapsed_ms
+                    - settings.VOICE_LATENCY_GUARD_TTS_MARGIN_MS
+                )
+                timeout_ms = max(
+                    settings.VOICE_LATENCY_GUARD_FLOOR_MS,
+                    min(ceiling_ms, budget_left_ms),
+                )
+                return max(0.02, timeout_ms / 1000)
+
             try:
                 while True:
-                    timeout_s = (
-                        max(0.05, settings.VOICE_FIRST_SENTENCE_TIMEOUT_MS / 1000)
-                        if first_sentence_ms is None and latency_guard_enabled
-                        else None
-                    )
+                    timeout_s = _guard_timeout_s()
                     try:
                         event = await asyncio.wait_for(event_queue.get(), timeout=timeout_s)
                     except asyncio.TimeoutError:
                         if latency_guard_sent:
                             continue
                         latency_guard_sent = True
-                        first_sentence_ms = int((perf_counter() - started) * 1000)
-                        guard_sentence = _latency_guard_text(language)
+                        _first_audio_perf = perf_counter()
+                        first_sentence_ms = int((_first_audio_perf - started) * 1000)
+                        guard_tone = "thinking" if direction == "outbound" else "warm"
+                        guard_sentence = _latency_guard_text(language, direction)
+                        _emit_latency_record(
+                            source="filler",
+                            cache_hit=False,
+                            first_audio_perf=_first_audio_perf,
+                        )
                         await websocket.send_json(
                             {
                                 "type": "agent_sentence",
                                 "turn_id": turn_id,
                                 "sentence": guard_sentence,
-                                "tone": "warm",
+                                "tone": guard_tone,
                                 "first_sentence_ms": first_sentence_ms,
                                 "cache_hit": False,
                                 "source": "latency_guard",
                             }
                         )
-                        await tts_pump.submit(guard_sentence, "warm", cacheable_tts=True)
+                        await tts_pump.submit(guard_sentence, guard_tone, cacheable_tts=True)
                         continue
                     if event is stream_done:
                         break
@@ -2118,6 +2225,22 @@ class NokvoOneVoiceStreamService:
                     timeout_seconds=outbound_context.silence_timeout_seconds,
                     on_fire=_fire_proactive_nudge,
                 )
+            # WS2: one-shot, fire-and-forget prompt-cache prime. Warm the static
+            # system prefix for this call's language NOW (concurrently with the
+            # greeting + caller's first utterance) so turn 1 hits the provider
+            # cache too — biggest TTFT win on Hindi/Telugu's longer prefixes. The
+            # task inherits the set_call_id() context above, so it reserves the
+            # same sticky pool box the real turns use. Best-effort: own DB session,
+            # all errors swallowed inside.
+            asyncio.create_task(
+                NokvoOneVoicePipeline.prime_prefix_cache(
+                    tenant_res,
+                    language=language,
+                    call_id=call_id,
+                    company_name=company_name,
+                    outbound_context=outbound_context,
+                )
+            )
             stt_ws: Any = None
             stt_reader_task: asyncio.Task | None = None
             audio_buffer = bytearray()
@@ -2152,6 +2275,14 @@ class NokvoOneVoiceStreamService:
             utterance_segments: list[str] = []
             utterance_language: list[str] = [language]
             eou_timer_task: asyncio.Task | None = None
+            # End-of-speech anchor for the sub-1s budget. Set on every EOU-timer
+            # (re)start — i.e. each time the caller's silence-countdown begins —
+            # so the LAST value before the timer actually fires is the true end
+            # of caller speech. Threaded into the turn so the latency guard can
+            # size its wait from how much of the budget the EOU silence already
+            # spent (see _run_text_turn). ``eou_last_tier`` tags the latency record.
+            eou_anchor: list[float | None] = [None]
+            eou_last_tier: list[str] = ["neutral"]
             # Sticky language lock: when the user explicitly asks to switch
             # ("speak in Telugu", "Hindi please") we lock that choice for the
             # rest of the session. Without this, Sarvam's per-segment language
@@ -2333,17 +2464,19 @@ class NokvoOneVoiceStreamService:
                     turn_language = utterance_language[0]
                 utterance_language_detected[0] = False
 
-                # Cross-lingual retrieval: when enabled AND the utterance isn't already
-                # English, dispatch a parallel translate-STT call on the per-utterance
-                # audio. The LLM gets the native transcript (preserves caller's exact
-                # words); the embedding query uses the English translation (matches an
-                # English doc corpus, ~4× better cosine recall in practice).
+                # Cross-lingual retrieval translate-STT. RETIRED by default: the
+                # only consumer was Qdrant/KB retrieval, which now always returns
+                # empty (KB_RETIREMENT_REMAINING.md), so this whole branch was up
+                # to 800ms of dead serial latency before the LLM on every non-
+                # English inbound turn. Gated behind AGENT_TRANSLATE_FOR_RETRIEVAL_ENABLED
+                # (default False) — with it off, translate_audio stays None and we
+                # call _run_text_turn(retrieval_text=None) directly below. The flag
+                # + plumbing are kept so retrieval can be re-armed without a code
+                # change if it ever returns.
                 retrieval_text: str | None = None
                 translate_audio: bytes | None = None
-                # Outbound mode does not consult Qdrant retrieval; English
-                # translation is therefore wasted work (and adds up to 1.5s of
-                # turn latency). Inbound keeps the translate path so cross-
-                # lingual recall against the tenant KB still works.
+                # Outbound mode never consulted retrieval either; the translate is
+                # equally wasted there.
                 _outbound_skip_translate = bool(
                     outbound_context
                     and outbound_context.is_proactive
@@ -2420,6 +2553,8 @@ class NokvoOneVoiceStreamService:
                             language_state=robustness.language_state,
                             outbound_context=outbound_context,
                             after_turn=_arm_proactive_watchdog,
+                            eou_fired_at=eou_anchor[0],
+                            eou_tier=eou_last_tier[0],
                         )
 
                     current_turn = asyncio.create_task(_run_with_translate())
@@ -2442,6 +2577,8 @@ class NokvoOneVoiceStreamService:
                             language_state=robustness.language_state,
                             outbound_context=outbound_context,
                             after_turn=_arm_proactive_watchdog,
+                            eou_fired_at=eou_anchor[0],
+                            eou_tier=eou_last_tier[0],
                         )
                     )
                     robustness.arbiter.begin(turn_id="stream-direct", task=current_turn)
@@ -2472,6 +2609,12 @@ class NokvoOneVoiceStreamService:
                 nonlocal eou_timer_task
                 _cancel_eou_timer()
                 tier, delay_ms = _eou_decision()
+                # Anchor the sub-1s clock at THIS moment: the caller just spoke
+                # (a new/continued segment restarted the debounce), so the start
+                # of this silence-wait is the latest candidate end-of-speech. The
+                # value standing when the timer survives to fire is the true eos.
+                eou_anchor[0] = perf_counter()
+                eou_last_tier[0] = tier
 
                 async def _timer() -> None:
                     try:

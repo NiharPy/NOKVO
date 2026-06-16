@@ -4130,6 +4130,79 @@ class NokvoOneVoicePipeline:
         return bundle
 
     @staticmethod
+    async def prime_prefix_cache(
+        tenant_res: TenantResources,
+        *,
+        language: str,
+        call_id: str | None,
+        company_name: str | None = None,
+        outbound_context: "OutboundCampaignContext | None" = None,
+    ) -> None:
+        """Warm the provider prompt cache for this call's STATIC PREFIX (WS2).
+
+        The inbound system prompt is split into a byte-identical static prefix
+        (tenant + per-language style/few-shots) and a per-turn dynamic suffix;
+        the provider caches the prefix, cutting first-token latency on every
+        turn AFTER the first. The sticky LLM-pool routing (set_call_id) keeps a
+        call pinned to one deployment, so once warm it stays warm — but the
+        FIRST turn in each language still pays full TTFT on the +500-1000 prompt
+        tokens Hindi/Telugu carry. This fires a tiny (max_tokens=1) fire-and-
+        forget completion at call start with exactly that prefix so turn 1 also
+        hits cache.
+
+        Fully best-effort: opens its OWN short-lived DB session (never the
+        call's shared session — that isn't concurrency-safe) and swallows every
+        error. Runs under the caller's set_call_id context so it reserves the
+        same sticky home box the real turns will use.
+        """
+        try:
+            from app.db.session import AsyncSessionLocal
+            from app.services.llm_pool import LLMPoolClient
+
+            language = SarvamVoiceService.normalize_language(language)
+            outbound_mode = bool(outbound_context) and getattr(outbound_context, "is_proactive", False)
+            async with AsyncSessionLocal() as db:
+                turn_cache = await NokvoOneVoicePipeline._prime_turn_cache(db, tenant_res, call_id)
+                bundle = turn_cache.get("bundle")
+                single_prompt_guidance = bundle.single_prompt_guidance if bundle is not None else None
+                business_type = bundle.organization_industry if bundle is not None else None
+                projects_block = ""
+                services_block = ""
+                if bundle is not None and not outbound_mode:
+                    projects_block, _ = await NokvoOneVoicePipeline._projects_block_for_bundle(db, bundle)
+                    services_block = await NokvoOneVoicePipeline._services_block_for_bundle(db, bundle)
+                # Build the messages exactly as the first real turn would, then
+                # warm ONLY the static prefix (messages[0]) — the provider cache
+                # matches on the longest common token prefix, which is precisely
+                # that system block. The dynamic suffix/history differ per turn
+                # and aren't worth priming.
+                messages = NokvoOneVoicePipeline._messages(
+                    ".",
+                    [],
+                    language=language,
+                    history=[],
+                    company_name=company_name,
+                    single_prompt_guidance=single_prompt_guidance,
+                    outbound_context=outbound_context,
+                    projects_block=projects_block,
+                    services_block=services_block,
+                    business_type=business_type,
+                )
+            static_prefix = (messages[0] or {}).get("content") if messages else None
+            if not static_prefix:
+                return
+            await LLMPoolClient.chat(
+                [
+                    {"role": "system", "content": static_prefix},
+                    {"role": "user", "content": "."},
+                ],
+                max_tokens=1,
+                temperature=0.0,
+            )
+        except Exception:
+            logger.debug("prime_prefix_cache: best-effort warm failed", exc_info=True)
+
+    @staticmethod
     async def _prime_turn_cache(
         db: AsyncSession | None,
         tenant_res: TenantResources,

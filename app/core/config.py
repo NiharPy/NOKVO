@@ -333,11 +333,18 @@ class Settings(BaseSettings):
     AGENT_RETRIEVAL_TOP_K_SENSITIVE: int = 8
     AGENT_RAG_DEBUG: bool = False
     AGENT_RAG_MIN_QUERY_WORDS: int = 3
-    AGENT_TRANSLATE_FOR_RETRIEVAL_ENABLED: bool = True
+    # Cross-lingual translate-STT for retrieval. DISABLED by default: its only
+    # consumer was Qdrant/KB retrieval, which is now retired (always returns
+    # empty — see KB_RETIREMENT_REMAINING.md), so the up-to-800ms translate call
+    # before the LLM on every non-English inbound turn was pure dead latency.
+    # Left as a flag (not deleted) so retrieval can be re-armed if it ever
+    # returns; the `retrieval_text` plumbing downstream stays intact + harmless.
+    AGENT_TRANSLATE_FOR_RETRIEVAL_ENABLED: bool = False
     # Hard cap on the cross-lingual translate-STT call that blocks a non-English
-    # turn before the LLM starts. Sarvam translate usually returns in 0.5-0.8s;
-    # 800ms caps the stall so Telugu/Hindi first-audio latency stays low (we fall
-    # back to the native transcript for retrieval when it times out).
+    # turn before the LLM starts (only used when the flag above is re-enabled).
+    # Sarvam translate usually returns in 0.5-0.8s; 800ms caps the stall so
+    # Telugu/Hindi first-audio latency stays low (we fall back to the native
+    # transcript for retrieval when it times out).
     AGENT_TRANSLATE_TIMEOUT_MS: int = 800
     # Per-call conversation memory. Set to 10 min so a 7-min call always has
     # full history available even with no agent activity for a stretch
@@ -368,12 +375,24 @@ class Settings(BaseSettings):
     # agent (question / time / yes-no) → fire fast; ambiguous declaratives wait a
     # moderate amount; only trailing-off speech keeps the long DEBOUNCE+BONUS.
     # Start conservative; tighten COMPLETE only as the cut-off guardrail allows.
-    VOICE_EOU_COMPLETE_MS: int = 450      # High-confidence-complete utterance → fire fast
-    VOICE_EOU_NEUTRAL_MS: int = 700       # Ambiguous declarative → moderate wait (room for self-correction)
-    VOICE_FIRST_SENTENCE_TIMEOUT_MS: int = 1800  # Speak a short hold if LLM has not yielded. The
-    # typical first-sentence latency for the GPT-4 family ~900-1200ms, so the older 900ms threshold
-    # caused the "one moment, I'm checking that" filler to fire on nearly every turn. 1800ms keeps
-    # the safety net for truly slow turns without polluting normal-pace ones.
+    VOICE_EOU_COMPLETE_MS: int = 400      # High-confidence-complete utterance → fire fast
+    VOICE_EOU_NEUTRAL_MS: int = 650       # Ambiguous declarative → moderate wait (650ms FLOOR: below
+    # this, Indian-telephony jitter risks clipping callers mid-utterance; the dynamic latency guard
+    # below absorbs the difference — the filler just fires ~250ms later and we still land sub-1s.)
+    # ── Sub-1s latency guard ──────────────────────────────────────────────────
+    # End-of-caller-speech → first agent audio is held strictly under
+    # VOICE_LATENCY_BUDGET_MS on fast/neutral turns. If the real LLM answer has
+    # not yielded its first sentence in time, a short LOCALIZED filler/bridge is
+    # spoken so SOME audio lands within budget (an audible hold counts). The
+    # guard's wait is computed dynamically from how much of the budget the EOU
+    # silence-wait already consumed (see _run_text_turn), so it fires early
+    # enough to keep eos→audio < budget. VOICE_FIRST_SENTENCE_TIMEOUT_MS is the
+    # CEILING used only when no end-of-speech anchor is available (e.g. manual /
+    # proactive turns).
+    VOICE_LATENCY_BUDGET_MS: int = 1000           # The hard eos→first-audio budget
+    VOICE_LATENCY_GUARD_FLOOR_MS: int = 120       # Min wait before firing the filler (give the real LLM a chance)
+    VOICE_LATENCY_GUARD_TTS_MARGIN_MS: int = 120  # Reserve for TTS dispatch→audible-audio
+    VOICE_FIRST_SENTENCE_TIMEOUT_MS: int = 750    # Ceiling for the filler wait when no eos anchor exists
     VOICE_LLM_STREAM_RETRY_ATTEMPTS: int = 2
     VOICE_LLM_STREAM_MAX_RETRY_WAIT_MS: int = 350
 

@@ -2,14 +2,26 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import re
+from time import perf_counter
 from types import SimpleNamespace
+
+import pytest
 
 from app.core.config import settings
 from app.services.agent_outbound_context import OutboundCampaignContext
 from app.services.agent_voice_stream_service import AgentVoiceStreamService, WarmSonioxTTSStream
 from app.services.nokvo_one_voice_pipeline import NokvoOneVoicePipeline
-from app.services.nokvo_one_voice_stream_service import NokvoOneVoiceStreamService
+from app.services.nokvo_one_voice_stream_service import (
+    NokvoOneVoiceStreamService,
+    _latency_guard_text,
+)
 from app.services.sarvam_voice_service import SarvamVoiceService
+
+# Every language NOKVO One supports — the sub-1s budget must hold on all of them.
+_ALL_LANGUAGES = ["en", "hi", "ta", "te", "bn", "kn", "ml", "mr", "gu", "pa", "ur", "od"]
+_LATENCY_LOGGER = "app.services.nokvo_one_voice_stream_service"
 
 
 def _run(coro):
@@ -206,7 +218,11 @@ def test_text_turn_emits_latency_guard_before_slow_llm_sentence(monkeypatch):
     assert final["answer"] == "The real answer is ready."
 
 
-def test_outbound_text_turn_does_not_emit_latency_guard(monkeypatch):
+def test_outbound_text_turn_emits_localized_bridge_filler(monkeypatch):
+    # WS3: outbound now gets the latency backstop too — but as a short
+    # conversational BRIDGE ("Just a moment…"/native), not the inbound "one
+    # moment, I'm checking that" hold that reads as a stalled queue on a sales
+    # call. The bridge still keeps SOME audio within the sub-1s budget.
     async def fake_stream_answer_sentences(*args, **kwargs):
         await asyncio.sleep(0.08)
         yield {"type": "sentence", "text": "Great, is this for self-use or investment?", "tone": "question"}
@@ -258,12 +274,130 @@ def test_outbound_text_turn_does_not_emit_latency_guard(monkeypatch):
             tenant_res,
             "Yeah",
             language="en",
-            call_id="call-outbound-no-guard",
+            call_id="call-outbound-bridge",
             company_name="Raghava Constructions",
             outbound_context=outbound_context,
         )
     )
 
     sentences = [event for event in websocket.sent if event.get("type") == "agent_sentence"]
-    assert sentences[0].get("source") != "latency_guard"
-    assert sentences[0]["sentence"] == "Great, is this for self-use or investment?"
+    # The bridge fires first (LLM is slower than the 20ms ceiling)…
+    assert sentences[0]["source"] == "latency_guard"
+    # …and it's the OUTBOUND bridge register, not the inbound hold.
+    assert sentences[0]["sentence"] == _latency_guard_text("en", "outbound")
+    assert sentences[0]["sentence"] != _latency_guard_text("en", "inbound")
+    # The real answer still follows.
+    assert sentences[1]["sentence"] == "Great, is this for self-use or investment?"
+
+
+def _parse_latency_record(caplog) -> dict:
+    """Pull the single NOKVO-LATENCY-TURN record (WS5) out of captured logs."""
+    for rec in caplog.records:
+        msg = rec.getMessage()
+        if "NOKVO-LATENCY-TURN" in msg:
+            return {
+                "raw": msg,
+                "eos_to_first_audio_ms": int(re.search(r"eos_to_first_audio_ms=(\d+)", msg).group(1)),
+                "source": re.search(r"source=(\w+)", msg).group(1),
+                "direction": re.search(r"direction=(\w+)", msg).group(1),
+                "language": re.search(r"language=(\w+)", msg).group(1),
+                "within_budget": re.search(r"within_budget=(\w+)", msg).group(1) == "True",
+            }
+    raise AssertionError("no NOKVO-LATENCY-TURN record emitted")
+
+
+def _make_outbound_context() -> OutboundCampaignContext:
+    return OutboundCampaignContext(
+        campaign_id="campaign-matrix",
+        name="Matrix Towers",
+        goal="Book a site visit",
+        agent_prompt="",
+        objectives=["Book site visit"],
+        exit_conditions=["Not interested"],
+        tone="warm",
+        doc_text=None,
+        caller_name="Riya",
+        company_name="Matrix Constructions",
+        pitch_summary="Matrix Towers in Kokapet",
+    )
+
+
+@pytest.mark.parametrize("language", _ALL_LANGUAGES)
+@pytest.mark.parametrize("direction", ["inbound", "outbound"])
+@pytest.mark.parametrize("llm_path", ["fast", "slow"])
+def test_eos_to_first_audio_under_budget_all_languages_both_directions(
+    monkeypatch, caplog, language, direction, llm_path
+):
+    """The whole matrix: 12 languages × {inbound, outbound} × {fast LLM, slow
+    LLM}. With the end-of-speech anchor threaded in, eos→first_audio must stay
+    under VOICE_LATENCY_BUDGET_MS — served by the REAL answer on the fast path
+    and by the localized FILLER/bridge on the slow path."""
+    is_slow = llm_path == "slow"
+
+    async def fake_stream_answer_sentences(*args, **kwargs):
+        # Slow LLM: take longer than the guard ceiling so the filler wins.
+        # Fast LLM: yield almost immediately so the real answer wins.
+        await asyncio.sleep(0.09 if is_slow else 0.005)
+        yield {"type": "sentence", "text": "Here is the real answer.", "tone": "neutral"}
+        yield {
+            "type": "final",
+            "answer": "Here is the real answer.",
+            "refused": False,
+            "chunks": [],
+            "citations": [],
+            "runtime": {"mode": "test"},
+        }
+
+    async def fake_tts(*args, **kwargs):
+        return {"audios": ["audio"], "first_audio_ms": 1}
+
+    async def noop(*args, **kwargs):
+        return None
+
+    async def empty_state(*args, **kwargs):
+        return {}
+
+    # Small ceiling keeps the slow-path filler fast & deterministic; the dynamic
+    # budget math (floor/margin) is unit-checked separately. The eos anchor is
+    # "just now", so eos→first_audio ≈ the guard wait, comfortably sub-budget.
+    monkeypatch.setattr(settings, "VOICE_FIRST_SENTENCE_TIMEOUT_MS", 60)
+    monkeypatch.setattr(settings, "VOICE_LATENCY_GUARD_FLOOR_MS", 20)
+    monkeypatch.setattr(NokvoOneVoicePipeline, "stream_answer_sentences", staticmethod(fake_stream_answer_sentences))
+    monkeypatch.setattr(SarvamVoiceService, "stream_sentence_tts", staticmethod(fake_tts))
+    monkeypatch.setattr("app.services.nokvo_one_voice_stream_service.AgentSessionStore.append_turn", noop)
+    monkeypatch.setattr("app.services.nokvo_one_voice_stream_service.AgentSessionStore.get_state", empty_state)
+    monkeypatch.setattr("app.services.nokvo_one_voice_stream_service.AgentSessionStore.merge_state", empty_state)
+
+    outbound_context = _make_outbound_context() if direction == "outbound" else None
+    websocket = _CollectingWebSocket()
+    tenant_res = SimpleNamespace(tenant_id="tenant-test", organization_id="org-test", provider_status={})
+
+    with caplog.at_level(logging.INFO, logger=_LATENCY_LOGGER):
+        _run(
+            NokvoOneVoiceStreamService._run_text_turn(
+                websocket,
+                tenant_res,
+                "Yes please tell me",
+                language=language,
+                call_id=f"call-{language}-{direction}-{llm_path}",
+                company_name="Matrix Constructions",
+                outbound_context=outbound_context,
+                eou_fired_at=perf_counter(),
+                eou_tier="neutral",
+            )
+        )
+
+    record = _parse_latency_record(caplog)
+    assert record["language"] == SarvamVoiceService.normalize_language(language)
+    assert record["direction"] == direction
+    # The hard guarantee: end-of-speech → first audio is strictly sub-1s.
+    assert record["eos_to_first_audio_ms"] < settings.VOICE_LATENCY_BUDGET_MS
+    assert record["within_budget"] is True
+    # Right source for the path: real answer when the LLM is quick, localized
+    # filler/bridge when it's slow.
+    assert record["source"] == ("filler" if is_slow else "real")
+
+    sentences = [event for event in websocket.sent if event.get("type") == "agent_sentence"]
+    if is_slow:
+        assert sentences[0]["source"] == "latency_guard"
+        assert sentences[0]["sentence"] == _latency_guard_text(language, direction)
