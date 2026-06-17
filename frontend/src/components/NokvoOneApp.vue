@@ -1653,6 +1653,32 @@ const saveProject = async () => {
   }
 };
 
+const isAnalyzingBrochure = ref(false);
+
+// Brochure Analyzer: upload a brochure (PDF/DOCX/TXT) → a nano-pool LLM extracts
+// the project fields and PREFILLS the form for review. The admin verifies, then
+// the normal Save creates the project (description capped at 700 tokens server-
+// side). The analyzer never creates the project itself.
+const analyzeBrochure = async (file) => {
+  if (!file) return;
+  isAnalyzingBrochure.value = true;
+  errorMsg.value = '';
+  try {
+    const form = new FormData();
+    form.append('file', file);
+    const { data } = await api.post('/projects/analyze-brochure', form, {
+      headers: { ...authHeader(), 'Content-Type': 'multipart/form-data' },
+    });
+    // Prefill for review. Force a create (no id) — the analyzer returns none.
+    projectDraft.value = { ..._projectDraftFromRecord(data || {}), id: undefined };
+    infoMsg.value = 'Brochure analyzed — review the prefilled fields, then Save.';
+  } catch (err) {
+    errorMsg.value = extractErrorMessage(err, 'Could not analyze the brochure.');
+  } finally {
+    isAnalyzingBrochure.value = false;
+  }
+};
+
 const deleteProject = async (project) => {
   if (!project?.id) return;
   if (!window.confirm(`Remove project "${project.name}"? This cannot be undone.`)) return;
@@ -5649,6 +5675,8 @@ provideDashboardState({
   saveProject,
   startNewProject,
   isSavingProject,
+  analyzeBrochure,
+  isAnalyzingBrochure,
   projects,
   isLoadingProjects,
   startEditProject,

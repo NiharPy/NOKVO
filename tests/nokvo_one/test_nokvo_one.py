@@ -19,6 +19,7 @@ from app.models.member_assignment import (
     ClinicMemberScheduleSettings,
     MemberBlockedSlot,
     NokvoOneAssignmentAuditLog,
+    OrganizationAssignmentDefaults,
     OrganizationMemberAssignmentSettings,
 )
 from app.models.nokvo_one_tool_record import NokvoOneToolRecord
@@ -363,13 +364,14 @@ def _org_and_user(industry=None):
 
 
 class _FakeAssignmentDB:
-    def __init__(self, organization, members, settings, records=None, clinic_settings=None, blocked_slots=None):
+    def __init__(self, organization, members, settings, records=None, clinic_settings=None, blocked_slots=None, org_defaults=None):
         self.organization = organization
         self.members = members
         self.settings = settings
         self.records = records or []
         self.clinic_settings = clinic_settings or []
         self.blocked_slots = blocked_slots or []
+        self.org_defaults = org_defaults
         self.audits = []
         self.flushed = False
         self.committed = False
@@ -392,7 +394,9 @@ class _FakeAssignmentDB:
 
     async def execute(self, stmt):
         text = str(stmt).lower()
-        if "organization_member_assignment_settings" in text:
+        if "organization_assignment_defaults" in text:
+            rows = [self.org_defaults] if self.org_defaults is not None else []
+        elif "organization_member_assignment_settings" in text:
             rows = self.settings
         elif "clinic_member_schedule_settings" in text:
             rows = self.clinic_settings
@@ -593,6 +597,100 @@ def test_assignment_prefers_other_member_same_time_over_first_member_next_time()
     assert result["selected_member_id"] == b.id
     assert result["scheduled_time"] == datetime(2026, 5, 16, 10, 0, tzinfo=timezone.utc)
     assert result["time_adjusted"] is False
+
+
+def _no_hours_settings(org_id, member_id, request_types=None):
+    """An assignable member who has NOT set their own working hours."""
+    return OrganizationMemberAssignmentSettings(
+        id=uuid.uuid4(),
+        organization_id=org_id,
+        member_id=member_id,
+        is_assignable=True,
+        working_days=[],
+        start_time=None,
+        end_time=None,
+        timezone="UTC",
+        request_types=request_types or ["property_inquiry"],
+        max_active_requests=3,
+        max_requests_per_day=None,
+        max_requests_per_hour=6,
+    )
+
+
+def _org_defaults(org_id, working_days=None, start=time(9, 0), end=time(18, 0)):
+    return OrganizationAssignmentDefaults(
+        id=uuid.uuid4(),
+        organization_id=org_id,
+        working_days=working_days or ["sat"],
+        start_time=start,
+        end_time=end,
+        timezone="UTC",
+    )
+
+
+def test_member_inherits_org_default_working_hours():
+    # A member with NO working hours of their own is schedulable WITHIN the
+    # org-wide default window (Sat 09:00-18:00).
+    organization, _ = _org_and_user(industry="real_estate")
+    a = _member(organization.id, "AgentA")
+    db = _FakeAssignmentDB(
+        organization,
+        [a],
+        [_no_hours_settings(organization.id, a.id)],
+        org_defaults=_org_defaults(organization.id),
+    )
+    result = _run(
+        NokvoOneAssignmentService.assign_request(
+            db, organization, request_type="property_inquiry",
+            requested_time=datetime(2026, 5, 16, 11, 0, tzinfo=timezone.utc),  # Sat, in-window
+        )
+    )
+    assert result["assignment_status"] == "assigned"
+    assert result["selected_member_id"] == a.id
+    assert result["scheduled_time"] == datetime(2026, 5, 16, 11, 0, tzinfo=timezone.utc)
+    assert result["time_adjusted"] is False
+
+
+def test_member_without_hours_or_org_defaults_is_not_schedulable():
+    # No member hours AND no org defaults → no working window → not schedulable.
+    organization, _ = _org_and_user(industry="real_estate")
+    a = _member(organization.id, "AgentA")
+    db = _FakeAssignmentDB(
+        organization,
+        [a],
+        [_no_hours_settings(organization.id, a.id)],
+        org_defaults=None,
+    )
+    result = _run(
+        NokvoOneAssignmentService.assign_request(
+            db, organization, request_type="property_inquiry",
+            requested_time=datetime(2026, 5, 16, 11, 0, tzinfo=timezone.utc),
+        )
+    )
+    assert result["assignment_status"] == "no_available_member"
+    assert result["selected_member_id"] is None
+
+
+def test_member_own_hours_override_org_defaults():
+    # Member's OWN hours (Sat 09:00-12:00) win over the wider org default
+    # (Sat 09:00-18:00): a 14:00 request is outside the member window and gets
+    # shifted, proving org defaults don't widen a member who set their own.
+    organization, _ = _org_and_user(industry="real_estate")
+    a = _member(organization.id, "AgentA")
+    db = _FakeAssignmentDB(
+        organization,
+        [a],
+        [_settings(organization.id, a.id, start=time(9, 0), end=time(12, 0))],
+        org_defaults=_org_defaults(organization.id, start=time(9, 0), end=time(18, 0)),
+    )
+    result = _run(
+        NokvoOneAssignmentService.assign_request(
+            db, organization, request_type="property_inquiry",
+            requested_time=datetime(2026, 5, 16, 14, 0, tzinfo=timezone.utc),  # past member's 12:00
+        )
+    )
+    assert result["assignment_status"] == "assigned"
+    assert result["time_adjusted"] is True  # shifted out of the 14:00 the org default would allow
 
 
 def test_assignment_returns_no_available_when_all_members_skipped():

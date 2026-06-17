@@ -40,6 +40,31 @@ class OrganizationMemberAssignmentSettings(Base):
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
+class OrganizationAssignmentDefaults(Base):
+    """Org-wide default working hours. A member whose own
+    ``OrganizationMemberAssignmentSettings`` leaves working_days / start_time /
+    end_time unset INHERITS these, so an admin can set the team's hours once
+    instead of per member. Assignability stays per-member (these defaults only
+    supply the schedule window, never make a member assignable)."""
+
+    __tablename__ = "organization_assignment_defaults"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    working_days = Column(JSONB, nullable=False, server_default="[]", default=list)
+    start_time = Column(Time(timezone=False), nullable=True)
+    end_time = Column(Time(timezone=False), nullable=True)
+    timezone = Column(String, nullable=False, server_default="Asia/Kolkata", default="Asia/Kolkata")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
 class ClinicMemberScheduleSettings(Base):
     __tablename__ = "clinic_member_schedule_settings"
 

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -21,6 +21,15 @@ from app.schemas.nokvo_one import (
     RealEstateProjectResponse,
     RealEstateProjectUpdateRequest,
 )
+from app.services.brochure_analyzer_service import analyze_brochure_text
+from app.services.document_text import extract_document_text
+from app.services.real_estate_project_service import (
+    PROJECT_DESCRIPTION_TOKEN_CAP,
+    cap_text_to_tokens,
+)
+
+_BROCHURE_EXTENSIONS = {"pdf", "docx", "doc", "txt"}
+_MAX_BROCHURE_BYTES = 20 * 1024 * 1024  # 20 MB
 
 
 router = APIRouter()
@@ -115,7 +124,9 @@ async def create_project(
         price_display=payload.price_display,
         configurations=payload.configurations,
         amenities=payload.amenities,
-        description=payload.description,
+        # Hard cap the description at 700 tokens at creation, regardless of source
+        # (manual entry or a Brochure-Analyzer prefill).
+        description=cap_text_to_tokens(payload.description, PROJECT_DESCRIPTION_TOKEN_CAP),
         possession_date=payload.possession_date,
         builder_name=payload.builder_name,
         brochure_url=payload.brochure_url,
@@ -129,6 +140,46 @@ async def create_project(
     await db.commit()
     await db.refresh(project)
     return _serialize(project)
+
+
+@router.post("/analyze-brochure")
+async def analyze_brochure_endpoint(
+    file: UploadFile = File(...),
+    user: OrganizationUser = Depends(_admin_dep()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Extract project fields from an uploaded brochure (PDF/DOCX/TXT) using a
+    nano-pool LLM. Returns the extracted fields to PREFILL the Add-Project form
+    for admin review — it does NOT create the project (the existing Save does).
+    The description is already capped at 700 tokens in the response."""
+    await _ensure_real_estate(db, user.organization_id)
+    filename = file.filename or "brochure"
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    if ext not in _BROCHURE_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Upload a PDF, DOCX, or TXT brochure.")
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="The uploaded file is empty.")
+    if len(content) > _MAX_BROCHURE_BYTES:
+        raise HTTPException(status_code=400, detail="Brochure is too large (max 20 MB).")
+    # Two stages with DISTINCT errors: (1) could we read any text at all, and
+    # (2) could the model pull project fields from it.
+    text = extract_document_text(filename, content)
+    if len((text or "").strip()) < 25:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Couldn't read any text from this file. If it's a scanned or image-only "
+                "PDF, upload a text-based PDF (or fill the form in manually)."
+            ),
+        )
+    fields = await analyze_brochure_text(text)
+    if not fields:
+        raise HTTPException(
+            status_code=422,
+            detail="Read the brochure but couldn't pull structured project details. Please fill the form in manually.",
+        )
+    return fields
 
 
 @router.patch("/{project_id}", response_model=RealEstateProjectResponse)
@@ -150,6 +201,8 @@ async def update_project(
         raise HTTPException(status_code=404, detail="Project not found")
 
     updates = payload.model_dump(exclude_unset=True)
+    if updates.get("description"):
+        updates["description"] = cap_text_to_tokens(updates["description"], PROJECT_DESCRIPTION_TOKEN_CAP)
     for field, value in updates.items():
         setattr(project, field, value)
     db.add(project)

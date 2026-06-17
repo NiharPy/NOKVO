@@ -14,6 +14,7 @@ from app.models.member_assignment import (
     ClinicMemberScheduleSettings,
     MemberBlockedSlot,
     NokvoOneAssignmentAuditLog,
+    OrganizationAssignmentDefaults,
     OrganizationBlockedSlot,
     OrganizationMemberAssignmentSettings,
 )
@@ -76,6 +77,57 @@ def _parse_time(value: str | time | None) -> time | None:
 
 def _local_day(value: datetime, tz: ZoneInfo) -> str:
     return DAY_INDEX[value.astimezone(tz).weekday()]
+
+
+@dataclass(frozen=True)
+class _EffectiveAssignmentSettings:
+    """A member's assignment settings with working hours resolved against the
+    org-wide defaults (member values win; org defaults fill the gaps). Quacks
+    like ``OrganizationMemberAssignmentSettings`` for the read-only attributes
+    the slot finder + window helpers use, so the rest of the engine is unchanged
+    and the real ORM row is never mutated. Only the SCHEDULE WINDOW is inherited
+    — assignability / request_types / capacity stay per-member."""
+
+    working_days: list[str]
+    start_time: time | None
+    end_time: time | None
+    timezone: str
+    request_types: list[str]
+    is_assignable: bool
+    max_active_requests: int | None
+    max_requests_per_day: int | None
+    max_requests_per_hour: int | None
+    appointment_duration_minutes: int
+
+
+def _effective_settings(
+    settings: OrganizationMemberAssignmentSettings,
+    org_defaults: OrganizationAssignmentDefaults | None,
+) -> _EffectiveAssignmentSettings:
+    working_days = list(settings.working_days or [])
+    start_time = settings.start_time
+    end_time = settings.end_time
+    timezone_name = settings.timezone
+    if org_defaults is not None:
+        if not working_days:
+            working_days = list(org_defaults.working_days or [])
+        if start_time is None:
+            start_time = org_defaults.start_time
+        if end_time is None:
+            end_time = org_defaults.end_time
+        timezone_name = settings.timezone or org_defaults.timezone
+    return _EffectiveAssignmentSettings(
+        working_days=working_days,
+        start_time=start_time,
+        end_time=end_time,
+        timezone=timezone_name,
+        request_types=list(settings.request_types or []),
+        is_assignable=bool(settings.is_assignable),
+        max_active_requests=settings.max_active_requests,
+        max_requests_per_day=settings.max_requests_per_day,
+        max_requests_per_hour=settings.max_requests_per_hour,
+        appointment_duration_minutes=settings.appointment_duration_minutes,
+    )
 
 
 def _within_working_window(settings: OrganizationMemberAssignmentSettings, requested_at: datetime) -> bool:
@@ -199,6 +251,7 @@ class NokvoOneAssignmentService:
             eligible = {str(m) for m in eligible_member_ids}
             members = [m for m in members if str(m.id) in eligible]
         settings_by_member = await NokvoOneAssignmentService._load_assignment_settings(db, organization.id)
+        org_defaults = await NokvoOneAssignmentService._load_org_defaults(db, organization.id)
         records = await NokvoOneAssignmentService._load_request_records(db, organization.id)
         clinic_settings_by_member = await NokvoOneAssignmentService._load_clinic_settings(db, organization.id)
         blocked_slots_by_member = await NokvoOneAssignmentService._load_blocked_slots(db, organization.id)
@@ -243,10 +296,13 @@ class NokvoOneAssignmentService:
 
             member_blocks = list(blocked_slots_by_member.get(member.id, []))
             member_blocks.extend(blocked_slots_by_member.get("_org_wide", []))  # type: ignore[arg-type]
+            # Resolve the SCHEDULE WINDOW against org-wide defaults: a member who
+            # hasn't set their own working_days/start/end inherits the team's.
+            effective_settings = _effective_settings(settings, org_defaults)
             slot_result = NokvoOneAssignmentService._find_next_available_slot(
                 member_id=member.id,
                 requested_at=requested_at,
-                settings=settings,
+                settings=effective_settings,
                 clinic_settings=clinic_settings if organization.industry == "clinics" else None,
                 blocked_slots=member_blocks,
                 records=records,
@@ -445,6 +501,19 @@ class NokvoOneAssignmentService:
             )
         )
         return {item.member_id: item for item in res.scalars().all()}
+
+    @staticmethod
+    async def _load_org_defaults(
+        db: AsyncSession, organization_id: uuid.UUID
+    ) -> OrganizationAssignmentDefaults | None:
+        """Org-wide default working hours that members inherit when their own
+        are unset. ``None`` when the org hasn't set any."""
+        res = await db.execute(
+            select(OrganizationAssignmentDefaults).where(
+                OrganizationAssignmentDefaults.organization_id == organization_id
+            )
+        )
+        return res.scalars().first()
 
     @staticmethod
     async def _load_clinic_settings(

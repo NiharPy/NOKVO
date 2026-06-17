@@ -52,6 +52,19 @@ def test_extract_datetime_phrase():
     assert extract_datetime_phrase("మీ projects చెప్పండి") == ""
 
 
+def test_extract_datetime_phrase_keeps_meridiem_with_periods():
+    # Regression: caller said "Is tomorrow 5 p.m. possible?" but the note read
+    # only "tomorrow" — the time was dropped because _TIME_RE matched "pm" but
+    # not the period form "p.m." STT emits, and ":MM" XOR "am/pm".
+    assert "5 p.m." in extract_datetime_phrase("Is tomorrow 5 p.m. possible?")
+    assert extract_datetime_phrase("Is tomorrow 5 p.m. possible?").startswith("tomorrow")
+    assert "p.m." in extract_datetime_phrase("tomorrow at 5:00 p.m.")
+    assert "a.m." in extract_datetime_phrase("is 4 a.m. okay")
+    # No false time on descriptive numerals.
+    assert extract_datetime_phrase("5 amazing apartments") == ""
+    assert extract_datetime_phrase("3 BHK with 5 amenities") == ""
+
+
 def test_text_is_question():
     assert text_is_question("Site visit ఎంత cost అవుతుంది?")
     assert text_is_question("what time works?")
@@ -138,6 +151,28 @@ def test_deterministic_note_site_visit_includes_datetime_and_contact():
     assert "Gachibowli" in note
     assert "Nihar" in note
     assert "+919876543210" in note
+
+
+def test_deterministic_note_captures_project():
+    # The note must name the project (the key routing fact for the sales team) —
+    # from the explicit `project` arg, or the captured "property" memory fact.
+    note_arg = NokvoOneVoicePipeline._deterministic_call_note(
+        kind="site_visit", name="Nihar", ani=None, memory={}, history=[],
+        project="Skyline Heights",
+    )
+    assert "Project: Skyline Heights." in note_arg
+
+    note_mem = NokvoOneVoicePipeline._deterministic_call_note(
+        kind="lead", name="Asha", ani=None,
+        memory={"property": "Raghava Skyline"}, history=[],
+    )
+    assert "Project: Raghava Skyline." in note_mem
+
+    # No project known → no Project line (and note still valid).
+    note_none = NokvoOneVoicePipeline._deterministic_call_note(
+        kind="site_visit", name=None, ani=None, memory={}, history=[],
+    )
+    assert "Project:" not in note_none
 
 
 def test_deterministic_note_lead_kind():

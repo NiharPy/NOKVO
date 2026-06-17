@@ -828,18 +828,33 @@ class SarvamVoiceService:
             0.1, settings.VOICE_TTS_STREAM_FIRST_AUDIO_DEADLINE_MS / 1000
         )
 
+        # Streaming TTS is GATED OFF by default (SARVAM_TTS_STREAMING_ENABLED).
+        # The HTTP /text-to-speech/stream endpoint returns ZERO audio chunks for
+        # this account/model (verified by direct probe) while still taking ~2s —
+        # pure wasted latency, since every sentence fell through to REST anyway.
+        # When disabled we hand the loop an empty generator so REST runs at once.
+        # The streaming loop + its first-audio watchdog stay intact for when a
+        # working stream path (Sarvam's WebSocket API) is wired up.
+        async def _no_stream() -> AsyncIterator[dict[str, Any]]:
+            return
+            yield  # pragma: no cover — makes this an (empty) async generator
+
         # Try the streaming endpoint first — push each chunk to the WS as it
         # arrives so the caller hears the start of the sentence ~150-300ms
         # earlier than the REST path. Fall back to REST on any streaming error,
         # OR if first audio doesn't arrive within the deadline (degraded stream).
-        _stream_gen = SarvamVoiceService.synthesize_streaming(
-            tenant_res,
-            text,
-            language=language,
-            pace=pace,
-            pitch=pitch,
-            loudness=loudness,
-            enable_cached_responses=enable_cached_responses,
+        _stream_gen = (
+            SarvamVoiceService.synthesize_streaming(
+                tenant_res,
+                text,
+                language=language,
+                pace=pace,
+                pitch=pitch,
+                loudness=loudness,
+                enable_cached_responses=enable_cached_responses,
+            )
+            if settings.SARVAM_TTS_STREAMING_ENABLED
+            else _no_stream()
         )
         try:
             while True:

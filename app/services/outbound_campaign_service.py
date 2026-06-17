@@ -62,30 +62,13 @@ def _parse_excel(content: bytes) -> list[dict[str, str]]:
 
 
 def _parse_document(filename: str, content: bytes) -> str:
-    """Extract plain text from PDF, DOCX, or TXT file."""
-    ext = filename.rsplit(".", 1)[-1].lower()
-    if ext == "txt":
-        return content.decode("utf-8", errors="replace")
-    if ext == "pdf":
-        try:
-            import pypdf
-            reader = pypdf.PdfReader(io.BytesIO(content))
-            return "\n".join(page.extract_text() or "" for page in reader.pages)
-        except ImportError:
-            pass
-        try:
-            import pdfminer.high_level as pm
-            return pm.extract_text(io.BytesIO(content))
-        except ImportError:
-            return content.decode("utf-8", errors="replace")
-    if ext in ("docx", "doc"):
-        try:
-            import docx
-            doc = docx.Document(io.BytesIO(content))
-            return "\n".join(p.text for p in doc.paragraphs)
-        except ImportError:
-            return content.decode("utf-8", errors="replace")
-    return content.decode("utf-8", errors="replace")
+    """Extract plain text from a PDF, DOCX, or TXT file.
+
+    Thin alias kept for the existing call sites; the implementation now lives in
+    the shared ``document_text`` util (also used by the Brochure Analyzer)."""
+    from app.services.document_text import extract_document_text
+
+    return extract_document_text(filename, content)
 
 
 # ---------------------------------------------------------------------------

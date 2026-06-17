@@ -135,7 +135,14 @@ _NAME_EXCLUSION_RE = re.compile(
     re.IGNORECASE,
 )
 _TIME_RE = re.compile(
-    r"\b(?:[01]?\d|2[0-3])(?::[0-5]\d|\s*(?:am|pm))\b|\b(?:morning|afternoon|evening|night|noon)\b",
+    # Hour (+ optional :MM) followed by a meridiem — tolerant of the periods/
+    # spaces STT emits ("5 p.m.", "5 pm", "5:00 p.m.", "4 a. m."). The trailing
+    # (?![a-z]) stops "5 amazing" / "5 amenities" reading as a time. Keeping the
+    # meridiem WITH the minutes (the old regex matched ":MM" XOR "am/pm", so
+    # "5:00 pm" lost its "pm") matters for the deterministic call note.
+    r"\b(?:[01]?\d|2[0-3])(?::[0-5]\d)?\s*[ap]\.?\s?m\.?(?![a-z])|"
+    r"\b(?:[01]?\d|2[0-3]):[0-5]\d\b|"
+    r"\b(?:morning|afternoon|evening|night|noon)\b",
     re.IGNORECASE,
 )
 _BARE_TIME_RE = re.compile(r"\b(?:[1-9]|1[0-2])\b")

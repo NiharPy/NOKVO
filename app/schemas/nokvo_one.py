@@ -379,6 +379,45 @@ class NokvoOneAssignmentSettingsUpdateRequest(BaseModel):
         return cleaned
 
 
+class NokvoOneAssignmentDefaultsResponse(BaseModel):
+    organization_id: UUID
+    working_days: list[str] = Field(default_factory=list)
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+    timezone: str = "Asia/Kolkata"
+    working_hours_summary: str = "Not set"
+
+
+class NokvoOneAssignmentDefaultsUpdateRequest(BaseModel):
+    """Org-wide default working hours members inherit when their own are unset."""
+
+    working_days: list[str] = Field(default_factory=list, max_length=7)
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+    timezone: str = Field(default="Asia/Kolkata", min_length=1, max_length=80)
+
+    @field_validator("timezone")
+    @classmethod
+    def _validate_timezone(cls, value: str) -> str:
+        value = (value or "Asia/Kolkata").strip()
+        if value in {"IST", "Asia/Kolkata"}:
+            return "Asia/Kolkata"
+        raise ValueError("Only IST is supported")
+
+    @field_validator("working_days")
+    @classmethod
+    def _validate_working_days(cls, value: list[str]) -> list[str]:
+        allowed = {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}
+        cleaned: list[str] = []
+        for item in value:
+            day = item.strip().lower()[:3]
+            if day not in allowed:
+                raise ValueError("working_days must contain mon, tue, wed, thu, fri, sat, or sun")
+            if day not in cleaned:
+                cleaned.append(day)
+        return cleaned
+
+
 class NokvoOneClinicScheduleSettingsResponse(BaseModel):
     id: Optional[UUID] = None
     organization_id: UUID

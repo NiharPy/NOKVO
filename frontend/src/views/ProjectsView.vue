@@ -1,6 +1,6 @@
 <script setup>
-import { computed } from 'vue';
-import { Building2, MapPin, Plus, Save, Trash2, XCircle } from 'lucide-vue-next';
+import { computed, ref } from 'vue';
+import { Building2, MapPin, Plus, Save, Sparkles, Trash2, Upload, XCircle } from 'lucide-vue-next';
 import { useDashboardState } from '../composables/useDashboardState.js';
 
 const {
@@ -8,6 +8,8 @@ const {
   saveProject,
   startNewProject,
   isSavingProject,
+  analyzeBrochure,
+  isAnalyzingBrochure,
   projects,
   isLoadingProjects,
   startEditProject,
@@ -16,6 +18,18 @@ const {
 } = useDashboardState();
 
 const list = computed(() => projects?.value || []);
+
+const brochureInput = ref(null);
+const brochureName = ref('');
+
+const onBrochurePick = async (event) => {
+  const file = event?.target?.files?.[0];
+  if (!file) return;
+  brochureName.value = file.name;
+  await analyzeBrochure(file);
+  // Reset so picking the same file again re-triggers @change.
+  if (brochureInput.value) brochureInput.value.value = '';
+};
 </script>
 
 <template>
@@ -47,6 +61,34 @@ const list = computed(() => projects?.value || []);
             <p class="n-section__sub">All fields are optional except the project name.</p>
           </div>
         </header>
+
+        <!-- Brochure Analyzer -->
+        <div class="proj__analyzer">
+          <div class="proj__analyzer-icon">
+            <Sparkles :size="15" />
+          </div>
+          <div class="proj__analyzer-body">
+            <strong>Brochure Analyzer</strong>
+            <span>Upload a brochure (PDF, DOCX, or TXT) and we'll prefill the fields below for you to review, then Save.</span>
+            <span v-if="brochureName" class="proj__analyzer-file">{{ brochureName }}</span>
+          </div>
+          <input
+            ref="brochureInput"
+            type="file"
+            accept=".pdf,.docx,.txt"
+            class="proj__analyzer-input"
+            @change="onBrochurePick"
+          />
+          <button
+            type="button"
+            class="n-btn n-btn--ghost n-btn--sm"
+            :disabled="isAnalyzingBrochure"
+            @click="brochureInput?.click()"
+          >
+            <Upload :size="14" />
+            {{ isAnalyzingBrochure ? 'Analyzing…' : 'Analyze brochure' }}
+          </button>
+        </div>
 
         <form class="proj__form-grid" @submit.prevent="saveProject">
           <label class="n-field proj__col-2">
@@ -226,6 +268,29 @@ const list = computed(() => projects?.value || []);
   display: grid; place-items: center; flex-shrink: 0;
 }
 .proj__form-title { font-size: 17px; letter-spacing: -0.01em; }
+
+.proj__analyzer {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 16px 24px 0;
+  padding: 14px 16px;
+  border: 1px dashed var(--n-border);
+  border-radius: 12px;
+  background: var(--n-brand-soft);
+}
+.proj__analyzer-icon {
+  width: 30px; height: 30px;
+  border-radius: 8px;
+  background: var(--n-brand);
+  color: #fff;
+  display: grid; place-items: center; flex-shrink: 0;
+}
+.proj__analyzer-body { display: grid; gap: 2px; min-width: 0; flex: 1; }
+.proj__analyzer-body strong { font-size: 13.5px; color: var(--n-text); }
+.proj__analyzer-body span { font-size: 12px; color: var(--n-text-3); }
+.proj__analyzer-file { color: var(--n-brand) !important; font-weight: 500; }
+.proj__analyzer-input { display: none; }
 
 .proj__form-grid {
   display: grid;

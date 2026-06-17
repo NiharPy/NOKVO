@@ -260,6 +260,13 @@ class Settings(BaseSettings):
     SARVAM_TTS_REST_URL: str = "https://api.sarvam.ai/text-to-speech"
     SARVAM_TTS_STREAM_URL: str = "https://api.sarvam.ai/text-to-speech/stream"
     SARVAM_TTS_WEBSOCKET_URL: str = "wss://api.sarvam.ai/text-to-speech/ws"
+    # HTTP streaming TTS (/text-to-speech/stream) is OFF by default: a direct
+    # probe showed it returns ZERO audio chunks for this account/model while
+    # still taking ~2s, so it was pure wasted latency on every sentence (each
+    # then fell through to REST anyway). With it off we go straight to REST.
+    # Re-enable only once a working streaming path (Sarvam's WebSocket API,
+    # SARVAM_TTS_WEBSOCKET_URL) is wired into synthesize_streaming.
+    SARVAM_TTS_STREAMING_ENABLED: bool = False
     SARVAM_TTS_MODEL: str = "bulbul:v3"
     SARVAM_TTS_SPEAKER: str = "ritu"
     # Per-language native speaker overrides (bulbul:v3). Empty = use

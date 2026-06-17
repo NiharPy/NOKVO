@@ -20,11 +20,14 @@ from app.models.member_invitation import MemberInvitation
 from app.models.member_assignment import (
     ClinicMemberScheduleSettings,
     MemberBlockedSlot,
+    OrganizationAssignmentDefaults,
     OrganizationMemberAssignmentSettings,
 )
 from app.models.organization import Organization
 from app.models.organization_user import OrganizationUser
 from app.schemas.nokvo_one import (
+    NokvoOneAssignmentDefaultsResponse,
+    NokvoOneAssignmentDefaultsUpdateRequest,
     NokvoOneAssignmentSettingsResponse,
     NokvoOneAssignmentSettingsUpdateRequest,
     NokvoOneBlockedSlotCreateRequest,
@@ -229,6 +232,66 @@ async def list_assignment_settings(
         )
         for member in members
     ]
+
+
+def _assignment_defaults_response(
+    org_id: uuid.UUID, defaults: OrganizationAssignmentDefaults | None
+) -> NokvoOneAssignmentDefaultsResponse:
+    days = list(defaults.working_days or []) if defaults else []
+    start = defaults.start_time.strftime("%H:%M") if defaults and defaults.start_time else None
+    end = defaults.end_time.strftime("%H:%M") if defaults and defaults.end_time else None
+    summary = f"{start} - {end} ({', '.join(days)})" if (start and end and days) else "Not set"
+    return NokvoOneAssignmentDefaultsResponse(
+        organization_id=org_id,
+        working_days=days,
+        start_time=start,
+        end_time=end,
+        timezone=(defaults.timezone if defaults else None) or "Asia/Kolkata",
+        working_hours_summary=summary,
+    )
+
+
+@router.get("/assignment-defaults", response_model=NokvoOneAssignmentDefaultsResponse)
+async def get_assignment_defaults(
+    user: OrganizationUser = Depends(
+        deps.RequireNokvoOneOrganization(allowed_statuses=["pending_approval", "active"])
+    ),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Org-wide default working hours. Members whose own hours are unset inherit
+    these when the scheduler picks a slot."""
+    defaults = await NokvoOneAssignmentService._load_org_defaults(db, user.organization_id)
+    return _assignment_defaults_response(user.organization_id, defaults)
+
+
+@router.put("/assignment-defaults", response_model=NokvoOneAssignmentDefaultsResponse)
+async def update_assignment_defaults(
+    payload: NokvoOneAssignmentDefaultsUpdateRequest,
+    user: OrganizationUser = Depends(
+        deps.RequireNokvoOneOrganization(
+            allowed_statuses=["pending_approval", "active"],
+            allowed_roles=["admin", "manager"],
+        )
+    ),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    organization = await _get_organization(db, user.organization_id)
+    res = await db.execute(
+        select(OrganizationAssignmentDefaults).where(
+            OrganizationAssignmentDefaults.organization_id == organization.id
+        )
+    )
+    defaults = res.scalars().first()
+    if defaults is None:
+        defaults = OrganizationAssignmentDefaults(id=uuid.uuid4(), organization_id=organization.id)
+    defaults.working_days = payload.working_days
+    defaults.start_time = _parse_time(payload.start_time)
+    defaults.end_time = _parse_time(payload.end_time)
+    defaults.timezone = _assignment_timezone()
+    db.add(defaults)
+    await db.commit()
+    await db.refresh(defaults)
+    return _assignment_defaults_response(organization.id, defaults)
 
 
 # ─────────── Member self-service ───────────

@@ -29,6 +29,7 @@ from app.models.member_assignment import (
     ClinicMemberScheduleSettings,
     MemberBlockedSlot,
     NokvoOneAssignmentAuditLog,
+    OrganizationAssignmentDefaults,
     OrganizationMemberAssignmentSettings,
 )
 from app.models.customer_base import CustomerBase
@@ -62,6 +63,7 @@ __all__ = [
     "LeadCaptureForm",
     "OutgoingLead",
     "OutboundCampaignContact",
+    "OrganizationAssignmentDefaults",
     "OrganizationMemberAssignmentSettings",
     "ClinicMemberScheduleSettings",
     "MemberBlockedSlot",

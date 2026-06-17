@@ -18,6 +18,52 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.real_estate_project import RealEstateProject
 
 
+PROJECT_DESCRIPTION_TOKEN_CAP = 700
+
+_TOKEN_ENCODING = None
+
+
+def _token_encoding():
+    """Lazily resolve a tiktoken encoding (cached). ``None`` when tiktoken is
+    unavailable, so callers fall back to a char-based estimate."""
+    global _TOKEN_ENCODING
+    if _TOKEN_ENCODING is not None:
+        return _TOKEN_ENCODING or None
+    try:
+        import tiktoken
+
+        try:
+            _TOKEN_ENCODING = tiktoken.get_encoding("o200k_base")
+        except Exception:
+            _TOKEN_ENCODING = tiktoken.get_encoding("cl100k_base")
+    except Exception:
+        _TOKEN_ENCODING = False  # sentinel: tried, unavailable
+        return None
+    return _TOKEN_ENCODING
+
+
+def cap_text_to_tokens(text: str | None, max_tokens: int = PROJECT_DESCRIPTION_TOKEN_CAP) -> str | None:
+    """Truncate ``text`` to at most ``max_tokens`` tokens, preserving the start.
+
+    Uses tiktoken when present (modern o200k_base, else cl100k_base); falls back
+    to a conservative ~4-chars/token estimate. Returns the input unchanged when
+    it's already within budget. Single source of truth for the project
+    description cap."""
+    if not text:
+        return text
+    enc = _token_encoding()
+    if enc is not None:
+        tokens = enc.encode(text)
+        if len(tokens) <= max_tokens:
+            return text
+        return enc.decode(tokens[:max_tokens]).strip()
+    # tiktoken unavailable — approximate at ~4 chars/token.
+    char_cap = max_tokens * 4
+    if len(text) <= char_cap:
+        return text
+    return text[:char_cap].rstrip()
+
+
 async def load_active_projects(
     db: AsyncSession | None,
     organization_id: uuid.UUID | str | None,

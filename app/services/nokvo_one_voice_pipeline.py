@@ -2865,6 +2865,27 @@ class NokvoOneVoicePipeline:
             await AgentSessionStore.merge_state(tenant_res, call_id, {"sms_sent": True})
 
     @staticmethod
+    def _captured_project(state: dict[str, Any] | None, memory: dict[str, Any] | None) -> str | None:
+        """Project the caller is talking about, for the call note. Prefers the
+        outbound-memory dict, then the durable ConversationalMemory
+        FACT_PROPERTY (set by single-project auto-fill or a matched project
+        name) — the same state blob the name fallback reads."""
+        proj = str((memory or {}).get("property") or "").strip()
+        if proj:
+            return proj
+        try:
+            from app.services.conversational_memory import (
+                ConversationalMemory as _CM,
+                FACT_PROPERTY as _FACT_PROPERTY,
+            )
+
+            return str(
+                _CM.from_state_blob((state or {}).get("memory") or {}).get(_FACT_PROPERTY) or ""
+            ).strip() or None
+        except Exception:
+            return None
+
+    @staticmethod
     def _deterministic_call_note(
         *,
         kind: str,
@@ -2872,6 +2893,7 @@ class NokvoOneVoicePipeline:
         ani: str | None,
         memory: dict[str, Any],
         history: list[dict[str, str]],
+        project: str | None = None,
     ) -> str:
         """Plain-prose fallback call note built deterministically from captured
         facts, written SYNCHRONOUSLY at record creation so a flaky post-call LLM
@@ -2886,6 +2908,12 @@ class NokvoOneVoicePipeline:
             if kind == "site_visit"
             else "Caller enquired about properties."
         ]
+        # Which project the visit/enquiry is about — the single most useful
+        # routing fact for the sales team. Resolved from the captured property
+        # fact (conversational memory FACT_PROPERTY / outbound memory).
+        proj = str(project or mem.get("property") or "").strip()
+        if proj:
+            parts.append(f"Project: {proj}.")
         # Visit date/time — scan recent caller turns, normalising hi/te relative
         # tokens so a Telugu "రేపు 10" still yields "tomorrow 10 AM".
         when = ""
@@ -2970,6 +2998,7 @@ class NokvoOneVoicePipeline:
         # if the post-call condenser returns None.
         data["handoff_note"] = NokvoOneVoicePipeline._deterministic_call_note(
             kind="site_visit", name=name, ani=ani, memory=memory, history=history or [],
+            project=NokvoOneVoicePipeline._captured_project(state, memory),
         )
         data["handoff_note_generated_at"] = datetime.now(timezone.utc).isoformat()
         data["handoff_note_source"] = "deterministic"
@@ -3190,6 +3219,7 @@ class NokvoOneVoicePipeline:
             # post-call condenser fails (it overwrites this on success).
             direct_data["handoff_note"] = NokvoOneVoicePipeline._deterministic_call_note(
                 kind="lead", name=args.get("name"), ani=None, memory=memory, history=history,
+                project=NokvoOneVoicePipeline._captured_project(state, memory),
             )
             direct_data["handoff_note_generated_at"] = datetime.now(timezone.utc).isoformat()
             direct_data["handoff_note_source"] = "deterministic"
