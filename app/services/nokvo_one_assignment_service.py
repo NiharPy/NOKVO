@@ -143,6 +143,82 @@ def _within_working_window(settings: OrganizationMemberAssignmentSettings, reque
     return local_t >= settings.start_time or local_t <= settings.end_time
 
 
+def suggest_within_working_hours(window: Any, requested_at: datetime) -> datetime | None:
+    """Nearest valid datetime (UTC) inside ``window``'s working days/hours for a
+    ``requested_at`` that falls outside it. ``window`` only needs ``working_days``,
+    ``start_time``, ``end_time`` (and ``timezone``) — so the org-wide
+    ``OrganizationAssignmentDefaults`` row works here directly.
+
+    All clock arithmetic is done in the window's local timezone (built from the
+    local date + the configured ``start``/``end`` time), then converted back to
+    UTC, so advancing to the next working day can never land on the wrong day.
+    Returns ``None`` when the window has no usable hours (nothing to suggest).
+    """
+    working_days = set(window.working_days or [])
+    start_t: time | None = window.start_time
+    end_t: time | None = window.end_time
+    if not working_days or start_t is None or end_t is None:
+        return None
+
+    tz = _coerce_zoneinfo(getattr(window, "timezone", None))
+    local_dt = _aware_utc(requested_at).astimezone(tz)
+    local_day = DAY_INDEX[local_dt.weekday()]
+    local_t = local_dt.time().replace(tzinfo=None)
+
+    def _at(day_dt: datetime, clock: time) -> datetime:
+        return datetime.combine(day_dt.date(), clock, tzinfo=tz).astimezone(timezone.utc)
+
+    if local_day in working_days:
+        # Same working day: clamp to the open boundary the caller missed —
+        # before open → open time; after close → close time (closest valid slot).
+        if local_t < start_t:
+            return _at(local_dt, start_t)
+        if local_t > end_t:
+            return _at(local_dt, end_t)
+        # Already inside the window — nothing to suggest.
+        return None
+
+    # Not a working day: jump to the next working day's opening time.
+    for offset in range(1, 8):
+        candidate = local_dt + timedelta(days=offset)
+        if DAY_INDEX[candidate.weekday()] in working_days:
+            return _at(candidate, start_t)
+    return None
+
+
+_DAY_LABELS = {
+    "mon": "Mon",
+    "tue": "Tue",
+    "wed": "Wed",
+    "thu": "Thu",
+    "fri": "Fri",
+    "sat": "Sat",
+    "sun": "Sun",
+}
+
+
+def working_hours_prompt_line(window: Any) -> str:
+    """One-line instruction stating the org's site-visit working window, for
+    injection into the agent prompt. Empty string when no hours are configured.
+    Accepts the ``OrganizationAssignmentDefaults`` row (or anything with
+    ``working_days``/``start_time``/``end_time``)."""
+    if window is None:
+        return ""
+    start_t = getattr(window, "start_time", None)
+    end_t = getattr(window, "end_time", None)
+    days = list(getattr(window, "working_days", None) or [])
+    if start_t is None or end_t is None or not days:
+        return ""
+    start = start_t.strftime("%I:%M %p").lstrip("0")
+    end = end_t.strftime("%I:%M %p").lstrip("0")
+    day_str = ", ".join(_DAY_LABELS.get(d, d) for d in days)
+    return (
+        f"Site visits can only be booked between {start} and {end} on {day_str}. "
+        "If the caller asks for a time outside this window, tell them it is not "
+        "possible and offer the closest valid time inside the window."
+    )
+
+
 def _same_local_day(left: datetime | None, right_day: date, tz: ZoneInfo) -> bool:
     if left is None:
         return False
@@ -514,6 +590,37 @@ class NokvoOneAssignmentService:
             )
         )
         return res.scalars().first()
+
+    @staticmethod
+    async def resolve_org_working_window(
+        db: AsyncSession, organization_id: uuid.UUID
+    ) -> Any | None:
+        """The effective site-visit working window for an org, as an object with
+        ``working_days``/``start_time``/``end_time``/``timezone``.
+
+        Prefers the org-wide defaults (the intended single source). Falls back to
+        an existing per-member assignment window when org-wide hours haven't been
+        configured yet — so an org that only set the older per-member hours still
+        gets out-of-hours enforcement instead of silently allowing any time.
+        Returns ``None`` when no usable hours exist anywhere."""
+        defaults = await NokvoOneAssignmentService._load_org_defaults(db, organization_id)
+        if (
+            defaults is not None
+            and defaults.start_time is not None
+            and defaults.end_time is not None
+            and defaults.working_days
+        ):
+            return defaults
+        settings_map = await NokvoOneAssignmentService._load_assignment_settings(db, organization_id)
+        for s in settings_map.values():
+            if (
+                getattr(s, "is_assignable", False)
+                and s.start_time is not None
+                and s.end_time is not None
+                and s.working_days
+            ):
+                return s
+        return None
 
     @staticmethod
     async def _load_clinic_settings(

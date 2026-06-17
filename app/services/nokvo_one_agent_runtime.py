@@ -53,6 +53,7 @@ def _build_system_prompt(
     *,
     native_tool_calling: bool = False,
     projects_section: str | None = None,
+    working_hours_section: str | None = None,
 ) -> str:
     sections: list[str] = [
         _section(
@@ -75,6 +76,9 @@ def _build_system_prompt(
 
     if projects_section:
         sections.append(_section("Real-estate projects:", projects_section))
+
+    if working_hours_section:
+        sections.append(_section("Site-visit working hours:", working_hours_section))
 
     sections.append(
         _section(
@@ -504,14 +508,21 @@ class NokvoOneAgentRuntime:
                 enabled_keys.add(tool.key)
 
         projects_section = ""
+        working_hours_section = ""
         if (business_type or "").lower() == "real_estate":
             from app.services.real_estate_project_service import (
                 load_active_projects,
                 projects_prompt_section,
             )
+            from app.services.nokvo_one_assignment_service import (
+                NokvoOneAssignmentService,
+                working_hours_prompt_line,
+            )
 
             projects = await load_active_projects(db, organization_id)
             projects_section = projects_prompt_section(projects)
+            org_defaults = await NokvoOneAssignmentService.resolve_org_working_window(db, organization_id)
+            working_hours_section = working_hours_prompt_line(org_defaults)
             # Constrain project fields the model sees to real project names.
             # Execution still uses the lenient ``catalog_index`` below.
             enabled = _with_project_choices(enabled, projects)
@@ -523,6 +534,7 @@ class NokvoOneAgentRuntime:
             business_type,
             native_tool_calling=native_tool_calling,
             projects_section=projects_section,
+            working_hours_section=working_hours_section,
         )
         messages = [
             {"role": "system", "content": system_prompt},
@@ -556,6 +568,7 @@ class NokvoOneAgentRuntime:
                 business_type,
                 native_tool_calling=False,
                 projects_section=projects_section,
+                working_hours_section=working_hours_section,
             )
             messages = [
                 {"role": "system", "content": system_prompt},

@@ -1184,28 +1184,13 @@ class PredefinedToolsService:
         db.add(site_visit)
         db.add(callback)
         await db.flush()
-        # visit_at is optional now (the admin may not collect a date) — when absent
-        # the callback is unscheduled and the assignment picks the next available slot.
-        visit_at = _parse_tool_datetime(args["visit_at"], field_name="visit_at") if args.get("visit_at") else None
-        assignment = await _assign_existing_record(
-            db,
-            org_id,
-            callback,
-            request_type="site_visit",
-            requested_time=visit_at,
-            summary=_assignment_summary_for(record_data, fallback="Real-estate site visit"),
-            metadata={
-                "contact_name": args.get("name"),
-                "contact_phone": args.get("phone"),
-                "visit_at": args.get("visit_at"),
-                "callback_at": args.get("visit_at"),
-                "related_ticket_id": str(site_visit.id),
-                "assignment_source": tool.key,
-                "project_id": project_id_str,
-                "project_name": project_name_str,
-            },
-        )
-        scheduled_visit = (assignment or {}).get("scheduled_time") or args.get("visit_at")
+        # Site visits are NOT auto-assigned. They land in the Site Visits pool
+        # unassigned (no assigned_agent_id); members claim the ones they want
+        # from the dashboard, which allots that visit to them. The out-of-hours
+        # working-window check now happens up front in the voice pipeline, so a
+        # booked visit is always inside the org's hours.
+        assignment = None
+        scheduled_visit = args.get("visit_at")
 
         # Auto-send the project LOCATION on WhatsApp — but ONLY here, on a
         # confirmed site-visit booking. Best-effort: a WhatsApp/Plivo failure
@@ -1257,7 +1242,10 @@ class PredefinedToolsService:
             "time_adjusted": bool((assignment or {}).get("time_adjusted")),
             "assignment": assignment,
             "assigned_member_name": assignment.get("selected_member_name") if assignment else None,
-            "assignment_status": assignment.get("assignment_status") if assignment else None,
+            # Site visits go to the claim pool unassigned — no member is allotted
+            # at creation. ``unassigned`` tells the voice confirmation to use the
+            # "our team will pick it up" wording.
+            "assignment_status": assignment.get("assignment_status") if assignment else "unassigned",
             "project_id": project_id_str,
             "project_name": project_name_str,
             "location_whatsapp_sent": location_whatsapp_sent,

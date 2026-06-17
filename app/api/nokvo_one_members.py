@@ -408,6 +408,113 @@ async def list_my_assigned_records(
     return out
 
 
+def _serialize_record(r) -> dict:
+    return {
+        "id": str(r.id),
+        "record_type": r.record_type,
+        "status": r.status,
+        "data": r.data or {},
+        "contact_phone": r.contact_phone,
+        "contact_email": r.contact_email,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+        "updated_at": r.updated_at.isoformat() if r.updated_at else None,
+    }
+
+
+# Site-visit claim pool. Real-estate site visits are no longer auto-assigned —
+# they land here unassigned (no ``assigned_agent_id``) and any member can claim
+# one, which allots it to them. ``/me/`` so a member can only act as themselves.
+_SITE_VISIT_TERMINAL_STATUSES = {"resolved", "closed"}
+
+
+@router.get("/me/claimable-site-visits")
+async def list_claimable_site_visits(
+    limit: int = 200,
+    user: OrganizationUser = Depends(
+        deps.RequireNokvoOneOrganization(allowed_statuses=["pending_approval", "active"])
+    ),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Unclaimed site visits (the pool): real-estate ``ticket`` records with no
+    assigned agent and a non-terminal status. Any member may claim from here."""
+    from app.models.nokvo_one_tool_record import NokvoOneToolRecord
+
+    organization = await _get_organization(db, user.organization_id)
+    if organization.industry != "real_estate":
+        raise HTTPException(status_code=404, detail="Site-visit claiming is only available for real estate")
+
+    max_limit = min(max(int(limit or 200), 1), 500)
+    res = await db.execute(
+        select(NokvoOneToolRecord)
+        .where(
+            NokvoOneToolRecord.organization_id == user.organization_id,
+            NokvoOneToolRecord.record_type == "ticket",
+        )
+        .order_by(NokvoOneToolRecord.created_at.desc())
+        .limit(max_limit)
+    )
+    out: list[dict] = []
+    for r in res.scalars().all():
+        data = r.data or {}
+        if str(data.get("assigned_agent_id") or "").strip():
+            continue  # already claimed
+        if (r.status or "").strip().lower() in _SITE_VISIT_TERMINAL_STATUSES:
+            continue
+        out.append(_serialize_record(r))
+    return out
+
+
+@router.post("/me/site-visits/{record_id}/claim")
+async def claim_site_visit(
+    record_id: uuid.UUID,
+    user: OrganizationUser = Depends(
+        deps.RequireNokvoOneOrganization(allowed_statuses=["pending_approval", "active"])
+    ),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Claim a site visit from the pool — allots it to the calling member.
+
+    The select uses ``with_for_update()`` so two members claiming the same
+    visit at once serialize: the first commits the assignment, the second
+    re-reads it as already-claimed and gets a 409.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+    from app.models.nokvo_one_tool_record import NokvoOneToolRecord
+
+    res = await db.execute(
+        select(NokvoOneToolRecord)
+        .where(
+            NokvoOneToolRecord.id == record_id,
+            NokvoOneToolRecord.organization_id == user.organization_id,
+            NokvoOneToolRecord.record_type == "ticket",
+        )
+        .with_for_update()
+    )
+    record = res.scalars().first()
+    if record is None:
+        raise HTTPException(status_code=404, detail="Site visit not found")
+
+    data = dict(record.data or {})
+    if str(data.get("assigned_agent_id") or "").strip():
+        raise HTTPException(status_code=409, detail="already_claimed")
+
+    data["assigned_member_id"] = str(user.id)
+    data["assigned_agent_id"] = str(user.id)
+    data["agent"] = user.full_name
+    data["assigned_to"] = user.full_name
+    data["assigned_at"] = datetime.now(timezone.utc).isoformat()
+    record.data = data
+    flag_modified(record, "data")
+    # "in_progress" is the real-estate ticket forward-status for picked-up work
+    # ("assigned" isn't in that vocabulary, so the tab would render it oddly).
+    if (record.status or "").strip().lower() not in _SITE_VISIT_TERMINAL_STATUSES:
+        record.status = "in_progress"
+    db.add(record)
+    await db.commit()
+    await db.refresh(record)
+    return _serialize_record(record)
+
+
 @router.post(
     "/me/blocked-slots",
     response_model=NokvoOneBlockedSlotResponse,

@@ -24,11 +24,52 @@ const {
   recordPhone,
   phoneHref,
   formatRelativeDate,
+  // Site-visit claim pool (real estate)
+  siteVisitFilter,
+  claimableSiteVisits,
+  myAssignedTickets,
+  isLoadingClaimable,
+  claimingVisitId,
+  refreshSiteVisitPool,
+  claimSiteVisit,
 } = useDashboardState();
 
-const records = computed(() => tabRecords?.value?.tickets || []);
-const isLoading = computed(() => !!tabRecordsLoading?.value?.tickets);
+// Real estate shows the claim pool instead of the raw admin tab list:
+//  · unclaimed → the pool any agent can claim (allotted on claim)
+//  · mine      → visits this member has already claimed
+//  · all       → every site visit on record (admin tab list)
+const records = computed(() => {
+  if (isRealEstateTemplate?.value) {
+    const filter = siteVisitFilter?.value || 'unclaimed';
+    if (filter === 'unclaimed') return claimableSiteVisits?.value || [];
+    if (filter === 'mine') return myAssignedTickets?.value || [];
+  }
+  return tabRecords?.value?.tickets || [];
+});
+const isLoading = computed(() => {
+  if (isRealEstateTemplate?.value && (siteVisitFilter?.value || 'unclaimed') !== 'all') {
+    return !!isLoadingClaimable?.value;
+  }
+  return !!tabRecordsLoading?.value?.tickets;
+});
 const fields = computed(() => schemaFor?.('tickets') || []);
+
+const isUnclaimed = (r) => !String(r?.data?.assigned_agent_id || '').trim();
+
+const refreshTickets = () => {
+  if (isRealEstateTemplate?.value) {
+    if ((siteVisitFilter?.value || 'unclaimed') === 'all') loadTabRecords('tickets');
+    else refreshSiteVisitPool?.();
+  } else {
+    loadTabRecords('tickets');
+  }
+};
+
+const setSiteVisitFilter = (value) => {
+  if (siteVisitFilter) siteVisitFilter.value = value;
+  if (value === 'all') loadTabRecords('tickets');
+  else refreshSiteVisitPool?.();
+};
 
 // Each site visit carries the post-call "call notes" — a 3-sentence summary the
 // condenser writes onto the record (data.handoff_note) the moment the call ends.
@@ -68,13 +109,36 @@ function statusTone(s) {
           type="button"
           class="n-btn n-btn--ghost n-btn--sm"
           :disabled="isLoading"
-          @click="loadTabRecords('tickets')"
+          @click="refreshTickets"
         >
           <RefreshCw :size="13" :class="{ 'n-spin': isLoading }" />
           {{ isLoading ? 'Refreshing' : 'Refresh' }}
         </button>
       </div>
     </header>
+
+    <!-- Claim-pool filter (real estate). Site visits arrive unassigned;
+         members claim from the pool and the visit is allotted to them. -->
+    <div v-if="isRealEstateTemplate" class="tickets__filter n-rise">
+      <button
+        type="button"
+        class="tickets__filter-btn"
+        :class="{ 'is-on': (siteVisitFilter || 'unclaimed') === 'unclaimed' }"
+        @click="setSiteVisitFilter('unclaimed')"
+      >Unclaimed</button>
+      <button
+        type="button"
+        class="tickets__filter-btn"
+        :class="{ 'is-on': (siteVisitFilter || 'unclaimed') === 'mine' }"
+        @click="setSiteVisitFilter('mine')"
+      >Mine</button>
+      <button
+        type="button"
+        class="tickets__filter-btn"
+        :class="{ 'is-on': (siteVisitFilter || 'unclaimed') === 'all' }"
+        @click="setSiteVisitFilter('all')"
+      >All</button>
+    </div>
 
     <!-- Schema card -->
     <section class="n-section n-rise" data-delay="1">
@@ -161,6 +225,15 @@ function statusTone(s) {
               <div class="rec__col rec__col--right">
                 <span class="rec__cap">Created</span>
                 <span class="rec__time n-mono">{{ formatRelativeDate(r.created_at) || '—' }}</span>
+                <button
+                  v-if="isRealEstateTemplate && isUnclaimed(r)"
+                  type="button"
+                  class="n-btn n-btn--brand n-btn--sm tickets__claim-btn"
+                  :disabled="claimingVisitId === r.id"
+                  @click.stop="claimSiteVisit(r)"
+                >
+                  {{ claimingVisitId === r.id ? 'Claiming…' : 'Claim' }}
+                </button>
               </div>
             </li>
             <!-- Post-call notes for this site visit (read-only). -->
@@ -183,6 +256,26 @@ function statusTone(s) {
 </template>
 
 <style scoped>
+/* Claim-pool filter (real estate). */
+.tickets__filter { display: flex; gap: 8px; margin-bottom: 4px; }
+.tickets__filter-btn {
+  padding: 6px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--n-border);
+  background: transparent;
+  color: var(--n-text-2);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background var(--n-t-fast) var(--n-ease), color var(--n-t-fast) var(--n-ease), border-color var(--n-t-fast) var(--n-ease);
+}
+.tickets__filter-btn.is-on {
+  background: var(--n-brand);
+  border-color: var(--n-brand);
+  color: #fff;
+}
+.tickets__claim-btn { margin-top: 6px; }
+
 /* Shared records-page primitives. Mirrored in LeadsView / AppointmentsView. */
 .rec__schema-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 

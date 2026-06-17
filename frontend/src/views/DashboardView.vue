@@ -39,7 +39,17 @@ const {
   removeMember,
   followupSummary,
   loadFollowupSummary,
+  isRealEstateTemplate,
+  orgWorkingHours,
+  isSavingOrgHours,
+  saveOrgWorkingHours,
+  toggleOrgHoursDay,
+  ORG_HOURS_DAYS,
 } = useDashboardState();
+
+const ORG_HOURS_DAY_LABELS = {
+  mon: 'Mon', tue: 'Tue', wed: 'Wed', thu: 'Thu', fri: 'Fri', sat: 'Sat', sun: 'Sun',
+};
 
 const followupCounts = computed(() => ({
   scheduled: followupSummary?.value?.scheduled || 0,
@@ -256,6 +266,59 @@ function initial(m) {
       </article>
     </section>
 
+    <!-- Organization working hours (real estate): one window for the whole
+         team. Replaces per-member timings — the voice agent refuses site
+         visits outside this window and offers the closest valid slot. -->
+    <section v-if="isRealEstateTemplate" class="n-section n-rise" data-delay="2">
+      <header class="n-section__head">
+        <div>
+          <h2 class="n-section__title">Organization working hours</h2>
+          <p class="n-section__sub">
+            Shared site-visit hours for every agent. The voice agent won't book visits outside this window.
+          </p>
+        </div>
+        <span v-if="orgWorkingHours.working_hours_summary" class="n-tag n-tag--mono">
+          {{ orgWorkingHours.working_hours_summary }}
+        </span>
+      </header>
+
+      <article class="n-card org-hours">
+        <div class="org-hours__days">
+          <button
+            v-for="day in ORG_HOURS_DAYS"
+            :key="day"
+            type="button"
+            class="org-hours__day"
+            :class="{ 'is-on': orgWorkingHours.working_days.includes(day) }"
+            :disabled="!isAdmin"
+            @click="toggleOrgHoursDay(day)"
+          >
+            {{ ORG_HOURS_DAY_LABELS[day] }}
+          </button>
+        </div>
+        <div class="org-hours__times">
+          <label class="org-hours__field">
+            <span>Opens</span>
+            <input type="time" v-model="orgWorkingHours.start_time" :disabled="!isAdmin" />
+          </label>
+          <label class="org-hours__field">
+            <span>Closes</span>
+            <input type="time" v-model="orgWorkingHours.end_time" :disabled="!isAdmin" />
+          </label>
+          <button
+            v-if="isAdmin"
+            type="button"
+            class="n-btn n-btn--brand n-btn--sm"
+            :disabled="isSavingOrgHours"
+            @click="saveOrgWorkingHours"
+          >
+            {{ isSavingOrgHours ? 'Saving…' : 'Save hours' }}
+          </button>
+        </div>
+        <p v-if="!isAdmin" class="org-hours__hint">Only an admin can change the organization's working hours.</p>
+      </article>
+    </section>
+
     <!-- Members table -->
     <section class="n-section n-rise" data-delay="3">
       <header class="n-section__head">
@@ -293,7 +356,8 @@ function initial(m) {
 
             <div class="dash__roster-avail">
               <span class="dash__roster-cap">Availability</span>
-              <p>{{ assignmentForMember(m.id).availability_summary }}</p>
+              <p v-if="isRealEstateTemplate">Org working hours</p>
+              <p v-else>{{ assignmentForMember(m.id).availability_summary }}</p>
             </div>
 
             <div class="dash__roster-load">
@@ -306,7 +370,12 @@ function initial(m) {
                 <CalendarClock :size="13" />
                 Timetable
               </button>
-              <button type="button" class="n-btn n-btn--ghost n-btn--sm" @click="startAssignmentEdit(m)">
+              <button
+                v-if="!isRealEstateTemplate"
+                type="button"
+                class="n-btn n-btn--ghost n-btn--sm"
+                @click="startAssignmentEdit(m)"
+              >
                 <CalendarDays :size="13" />
                 Schedule
               </button>
@@ -329,6 +398,38 @@ function initial(m) {
 </template>
 
 <style scoped>
+/* ─── Org working hours (real estate) ─────────────────── */
+.org-hours { display: flex; flex-direction: column; gap: 14px; padding: 18px; }
+.org-hours__days { display: flex; flex-wrap: wrap; gap: 8px; }
+.org-hours__day {
+  min-width: 48px;
+  padding: 7px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--n-border, rgba(120, 120, 140, 0.3));
+  background: transparent;
+  color: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+.org-hours__day.is-on {
+  background: var(--n-brand, #4f46e5);
+  border-color: var(--n-brand, #4f46e5);
+  color: #fff;
+}
+.org-hours__day:disabled { cursor: default; opacity: 0.75; }
+.org-hours__times { display: flex; align-items: flex-end; gap: 14px; flex-wrap: wrap; }
+.org-hours__field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; font-weight: 600; }
+.org-hours__field input {
+  padding: 7px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--n-border, rgba(120, 120, 140, 0.3));
+  background: transparent;
+  color: inherit;
+}
+.org-hours__hint { font-size: 12px; opacity: 0.7; margin: 0; }
+
 /* ─── Page-local composition ─────────────────────────── */
 .dash__head-actions {
   display: flex;

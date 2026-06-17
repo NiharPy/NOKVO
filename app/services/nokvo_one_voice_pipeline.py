@@ -1556,7 +1556,20 @@ class NokvoOneVoicePipeline:
             projects = await load_active_projects(db, organization_id)
         except Exception:
             return "", []
-        return projects_prompt_section(projects), projects
+        block = projects_prompt_section(projects)
+        # Append the org-wide site-visit working window so the live agent can
+        # refuse out-of-hours requests conversationally (the booking step also
+        # enforces it deterministically via the out-of-hours guard).
+        try:
+            from app.services.nokvo_one_assignment_service import working_hours_prompt_line
+
+            org_defaults = await NokvoOneAssignmentService.resolve_org_working_window(db, organization_id)
+            hours_line = working_hours_prompt_line(org_defaults)
+            if hours_line:
+                block = f"{block}\n\n{hours_line}" if block else hours_line
+        except Exception:
+            pass
+        return block, projects
 
     @staticmethod
     async def _services_block_for_bundle(
@@ -1755,6 +1768,11 @@ class NokvoOneVoicePipeline:
     @staticmethod
     def _parse_appointment_time(value: Any) -> time:
         raw = re.sub(r"\s+", " ", normalize_relative_datetime_text(str(value or "")).strip().lower())
+        # STT often emits dotted meridiems ("8 p.m.", "9 a. m."). Collapse them to
+        # bare "pm"/"am" so the AM/PM matcher below (which needs a contiguous
+        # token) fires — otherwise "8 p.m." falls through and raises, and callers
+        # silently lose the time (e.g. the out-of-hours guard couldn't see 8 PM).
+        raw = re.sub(r"\b([ap])\.\s*m\.?", r"\1m", raw)
         if not raw:
             raise _AppointmentToolInputError("preferred_time", "What time should I note for the appointment?")
         # Midnight is out of booking hours — clarify instead of resolving it (it
@@ -3395,6 +3413,49 @@ class NokvoOneVoicePipeline:
         return f"I have created the lead for {name}. The team will follow up.{sms_offer}"
 
     @staticmethod
+    def _site_visit_hours_reprompt(
+        *,
+        requested_dt: datetime,
+        suggestion_dt: datetime | None,
+        defaults: Any,
+        language: str | None,
+    ) -> str:
+        """Spoken rejection for an out-of-hours site-visit time: states the org
+        working window, says the requested time isn't available, and offers the
+        closest valid slot (when one could be computed)."""
+        lang = SarvamVoiceService.normalize_language(language)
+
+        def _fmt_time(value: time | None) -> str:
+            if value is None:
+                return ""
+            return value.strftime("%I:%M %p").lstrip("0")
+
+        def _fmt_dt(value: datetime | None) -> str:
+            if value is None:
+                return ""
+            return value.astimezone(_APPOINTMENT_LOCAL_TZ).strftime("%I:%M %p").lstrip("0")
+
+        start = _fmt_time(defaults.start_time)
+        end = _fmt_time(defaults.end_time)
+        requested = _fmt_dt(requested_dt)
+        suggestion = _fmt_dt(suggestion_dt)
+
+        if lang == "te":
+            base = f"మా site visits {start} నుంచి {end} వరకు మాత్రమే. {requested} కి కుదరదు."
+            if suggestion:
+                return f"{base} దగ్గరగా {suggestion} కి కుదురుతుంది. అది ok నా?"
+            return f"{base} working hours లో వేరే time చెప్పగలరా?"
+        if lang == "hi":
+            base = f"हमारी site visits {start} से {end} तक होती हैं. {requested} संभव नहीं है."
+            if suggestion:
+                return f"{base} सबसे करीब {suggestion} पर हो सकता है. क्या यह ठीक है?"
+            return f"{base} कृपया working hours के अंदर कोई और time बताइए."
+        base = f"Our site visits run {start} to {end}, so {requested} isn't possible."
+        if suggestion:
+            return f"{base} The closest I can do is {suggestion}. Does that work?"
+        return f"{base} Could you pick a time within working hours?"
+
+    @staticmethod
     async def _maybe_execute_tool_flow_action(
         tenant_res: TenantResources,
         call_id: str | None,
@@ -3463,7 +3524,42 @@ class NokvoOneVoicePipeline:
                     "route_reason": "tool flow needs exact scheduling detail",
                     "tool_calls": [],
                 }
-            visit_at = datetime.combine(visit_date, visit_time, tzinfo=_APPOINTMENT_LOCAL_TZ).astimezone(timezone.utc).isoformat()
+            visit_at_dt = datetime.combine(visit_date, visit_time, tzinfo=_APPOINTMENT_LOCAL_TZ).astimezone(timezone.utc)
+            visit_at = visit_at_dt.isoformat()
+
+            # Out-of-hours guard: site visits must fall inside the org-wide
+            # working window. If the caller asked for a time outside it (e.g.
+            # 8 PM when hours are 9 AM–7 PM), don't book — re-prompt with the
+            # window stated and the closest valid slot offered. Only enforced
+            # when the org has actually configured hours; otherwise no limit.
+            from app.services.nokvo_one_assignment_service import (
+                _within_working_window,
+                suggest_within_working_hours,
+            )
+
+            org_defaults = await NokvoOneAssignmentService.resolve_org_working_window(db, organization.id)
+            if (
+                org_defaults is not None
+                and not _within_working_window(org_defaults, visit_at_dt)
+            ):
+                suggestion_dt = suggest_within_working_hours(org_defaults, visit_at_dt)
+                reprompt = NokvoOneVoicePipeline._site_visit_hours_reprompt(
+                    requested_dt=visit_at_dt,
+                    suggestion_dt=suggestion_dt,
+                    defaults=org_defaults,
+                    language=language,
+                )
+                flow_state = dict(((tool_flow.get("state_patch") or {}).get("tool_flow") or {}))
+                flow_state["active"] = True
+                flow_state["completed"] = False
+                flow_state["pending_slot"] = time_keys[0]
+                return {
+                    "answer": reprompt,
+                    "state_patch": {"tool_flow": flow_state},
+                    "state_slot": time_keys[0],
+                    "route_reason": "site visit time is outside working hours",
+                    "tool_calls": [],
+                }
 
             # Field-keyed site-visit data for the Site Visits tab.
             record_data: dict[str, Any] = {}

@@ -6,6 +6,7 @@ import uuid
 from datetime import datetime, time, timezone, timedelta
 
 import pytest
+from fastapi import HTTPException
 from pydantic import ValidationError
 
 from app.api.nokvo_one_auth import (
@@ -390,6 +391,9 @@ class _FakeAssignmentDB:
         self.committed = True
 
     async def rollback(self):
+        pass
+
+    async def refresh(self, obj):
         pass
 
     async def execute(self, stmt):
@@ -1062,7 +1066,9 @@ def test_appointments_create_shifts_to_next_working_window():
     assert appointment.data["original_requested_time"] == "2026-05-16T12:00:00+00:00"
 
 
-def test_real_estate_site_visit_macro_assigns_available_agent():
+def test_real_estate_site_visit_macro_creates_unclaimed_pool_entry():
+    """Site visits are no longer auto-assigned. The macro drops an unassigned
+    ticket into the claim pool — a member picks it up from the dashboard."""
     from app.services.dynamic_tool_resolver import resolve_index
 
     organization, _ = _org_and_user(industry="real_estate")
@@ -1085,12 +1091,198 @@ def test_real_estate_site_visit_macro_assigns_available_agent():
             },
         )
     )
-    assert result["assignment_status"] == "assigned"
-    assert result["assigned_member_name"] == "Agent Priya"
+    # No member is allotted at creation — it lands in the pool unassigned.
+    assert result["assignment_status"] == "unassigned"
+    assert result["assigned_member_name"] is None
+    ticket = next(r for r in db.records if r.record_type == "ticket")
+    assert not ticket.data.get("assigned_agent_id")
     callback = next(r for r in db.records if r.record_type == "callback")
-    assert callback.status == "assigned"
-    assert callback.data["agent"] == "Agent Priya"
-    assert callback.data["assigned_agent_id"] == str(agent.id)
+    assert callback.status == "scheduled"
+    assert not callback.data.get("assigned_agent_id")
+
+
+# ─────────── Org working-hours: suggestion + prompt line ───────────
+
+
+def test_suggest_within_working_hours_clamps_after_close():
+    """A time after closing on a working day is clamped back to closing time
+    (the closest valid slot). Hours are evaluated in Asia/Kolkata."""
+    from zoneinfo import ZoneInfo
+    from app.services.nokvo_one_assignment_service import suggest_within_working_hours
+
+    ist = ZoneInfo("Asia/Kolkata")
+    org = uuid.uuid4()
+    defaults = _org_defaults(
+        org, working_days=["mon", "tue", "wed", "thu", "fri"], start=time(9, 0), end=time(19, 0)
+    )
+    # 2026-06-19 is a Friday. 8 PM IST is past the 7 PM close.
+    requested = datetime(2026, 6, 19, 20, 0, tzinfo=ist)
+    suggestion = suggest_within_working_hours(defaults, requested)
+    local = suggestion.astimezone(ist)
+    assert local.hour == 19 and local.minute == 0
+    assert local.date() == requested.date()
+
+
+def test_suggest_within_working_hours_jumps_to_next_working_day():
+    from zoneinfo import ZoneInfo
+    from app.services.nokvo_one_assignment_service import suggest_within_working_hours
+
+    ist = ZoneInfo("Asia/Kolkata")
+    org = uuid.uuid4()
+    defaults = _org_defaults(
+        org, working_days=["mon", "tue", "wed", "thu", "fri"], start=time(9, 0), end=time(19, 0)
+    )
+    # 2026-06-20 is a Saturday (closed) → next working day is Monday the 22nd.
+    requested = datetime(2026, 6, 20, 10, 0, tzinfo=ist)
+    suggestion = suggest_within_working_hours(defaults, requested).astimezone(ist)
+    assert suggestion.weekday() == 0  # Monday
+    assert suggestion.date() == datetime(2026, 6, 22).date()
+    assert suggestion.hour == 9 and suggestion.minute == 0
+
+
+def test_suggest_within_working_hours_none_when_unconfigured():
+    from app.services.nokvo_one_assignment_service import suggest_within_working_hours
+
+    org = uuid.uuid4()
+    defaults = _org_defaults(org, working_days=[], start=None, end=None)
+    requested = datetime(2026, 6, 19, 20, 0, tzinfo=timezone.utc)
+    assert suggest_within_working_hours(defaults, requested) is None
+
+
+def test_working_hours_prompt_line_states_window():
+    from app.services.nokvo_one_assignment_service import working_hours_prompt_line
+
+    org = uuid.uuid4()
+    defaults = _org_defaults(
+        org, working_days=["mon", "tue", "wed", "thu", "fri"], start=time(9, 0), end=time(19, 0)
+    )
+    line = working_hours_prompt_line(defaults)
+    assert "9:00 AM" in line
+    assert "7:00 PM" in line
+    assert "Mon" in line and "Fri" in line
+    # No hours configured → empty (no restriction stated).
+    assert working_hours_prompt_line(_org_defaults(org, working_days=[], start=None, end=None)) == ""
+
+
+def test_site_visit_hours_reprompt_offers_closest_slot():
+    from app.services.nokvo_one_voice_pipeline import NokvoOneVoicePipeline
+    from app.services.nokvo_one_assignment_service import suggest_within_working_hours
+    from zoneinfo import ZoneInfo
+
+    ist = ZoneInfo("Asia/Kolkata")
+    defaults = _org_defaults(
+        uuid.uuid4(), working_days=["mon", "tue", "wed", "thu", "fri"], start=time(9, 0), end=time(19, 0)
+    )
+    requested = datetime(2026, 6, 19, 20, 0, tzinfo=ist)
+    suggestion = suggest_within_working_hours(defaults, requested)
+    msg = NokvoOneVoicePipeline._site_visit_hours_reprompt(
+        requested_dt=requested, suggestion_dt=suggestion, defaults=defaults, language="en"
+    )
+    assert "7:00 PM" in msg  # the closing-time suggestion
+    assert "isn't possible" in msg
+
+
+def test_resolve_org_working_window_falls_back_to_member_hours():
+    """When org-wide hours aren't set yet, enforcement falls back to an existing
+    per-member assignment window so out-of-hours is still caught."""
+    organization, _ = _org_and_user(industry="real_estate")
+    member = _member(organization.id, "Agent Priya")
+    settings = _settings(
+        organization.id, member.id, request_types=["site_visit"], start=time(9, 0), end=time(19, 0)
+    )
+    # No org_defaults passed → resolver must fall back to the member window.
+    db = _FakeAssignmentDB(organization, [member], [settings])
+    window = _run(NokvoOneAssignmentService.resolve_org_working_window(db, organization.id))
+    assert window is settings
+    # Org-wide defaults, when present, take precedence over member hours.
+    defaults = _org_defaults(organization.id, start=time(10, 0), end=time(18, 0))
+    db2 = _FakeAssignmentDB(organization, [member], [settings], org_defaults=defaults)
+    assert _run(NokvoOneAssignmentService.resolve_org_working_window(db2, organization.id)) is defaults
+
+
+def test_site_visit_fast_confirm_rejects_out_of_hours():
+    """The 6ms templated booking confirmation must refuse an out-of-hours time
+    instead of 'noting' it — this is the path that previously accepted 8 PM."""
+    from types import SimpleNamespace
+    from app.services.nokvo_one_voice_stream_service import _site_visit_out_of_hours_reply
+
+    organization, _ = _org_and_user(industry="real_estate")
+    defaults = _org_defaults(
+        organization.id,
+        working_days=["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+        start=time(9, 0),
+        end=time(19, 0),
+    )
+    db = _FakeAssignmentDB(organization, [], [], org_defaults=defaults)
+    tenant_res = SimpleNamespace(organization_id=organization.id)
+
+    reply = _run(_site_visit_out_of_hours_reply(db, tenant_res, "tomorrow at 8 PM", "en"))
+    assert reply is not None
+    assert "7:00 PM" in reply
+    # A question naming an out-of-hours time must ALSO be refused — "Is tomorrow
+    # 8 PM possible?" is exactly the turn that previously slipped to the LLM.
+    from app.services.voice_turn_policy import text_has_datetime
+    assert text_has_datetime("Is tomorrow 8 PM possible?")
+    q_reply = _run(_site_visit_out_of_hours_reply(db, tenant_res, "Is tomorrow 8 PM possible?", "en"))
+    assert q_reply is not None
+    assert "7:00 PM" in q_reply
+    # An in-hours time returns None → the normal "noted" confirmation proceeds.
+    assert _run(_site_visit_out_of_hours_reply(db, tenant_res, "tomorrow at 11 AM", "en")) is None
+
+
+# ─────────── Site-visit claim pool (real estate) ───────────
+
+
+def _unclaimed_site_visit(org_id, project="Skyline"):
+    return NokvoOneToolRecord(
+        id=uuid.uuid4(),
+        organization_id=org_id,
+        record_type="ticket",
+        status="open",
+        data={"project_name": project, "issue_type": "site_visit"},
+        contact_phone="7569672503",
+        created_at=datetime(2026, 6, 17, 9, 0, tzinfo=timezone.utc),
+    )
+
+
+def test_claim_site_visit_allots_to_member_and_blocks_double_claim():
+    from app.api.nokvo_one_members import claim_site_visit, list_claimable_site_visits
+
+    organization, _ = _org_and_user(industry="real_estate")
+    member = _member(organization.id, "Agent Priya")
+    ticket = _unclaimed_site_visit(organization.id)
+    db = _FakeAssignmentDB(organization, [member], [], records=[ticket])
+
+    # Pool shows the unclaimed visit.
+    pool = _run(list_claimable_site_visits(user=member, db=db))
+    assert [r["id"] for r in pool] == [str(ticket.id)]
+
+    # Claiming allots it to the member.
+    result = _run(claim_site_visit(record_id=ticket.id, user=member, db=db))
+    assert result["data"]["assigned_agent_id"] == str(member.id)
+    assert result["data"]["agent"] == "Agent Priya"
+    assert result["status"] == "in_progress"
+    assert db.committed is True
+
+    # It drops out of the pool now that it's claimed.
+    assert _run(list_claimable_site_visits(user=member, db=db)) == []
+
+    # A second claim (e.g. a racing member) gets a 409.
+    other = _member(organization.id, "Agent Raj")
+    with pytest.raises(HTTPException) as exc:
+        _run(claim_site_visit(record_id=ticket.id, user=other, db=db))
+    assert exc.value.status_code == 409
+
+
+def test_claimable_site_visits_blocked_for_non_real_estate():
+    from app.api.nokvo_one_members import list_claimable_site_visits
+
+    organization, _ = _org_and_user(industry="clinics")
+    member = _member(organization.id, "Dr Rao")
+    db = _FakeAssignmentDB(organization, [member], [], records=[])
+    with pytest.raises(HTTPException) as exc:
+        _run(list_claimable_site_visits(user=member, db=db))
+    assert exc.value.status_code == 404
 
 
 def test_clinic_emergency_creates_escalation_without_normal_assignment():
@@ -1185,6 +1377,23 @@ def test_runtime_injects_business_template_prompt(monkeypatch):
     assert system_prompt.index("RAG rules:") < system_prompt.index("Member and availability rules:")
     assert system_prompt.index("Member and availability rules:") < system_prompt.index("Tool rules:")
     assert system_prompt.index("Tool rules:") < system_prompt.index("Escalation rules:")
+
+
+def test_build_system_prompt_includes_working_hours_section():
+    from app.services.nokvo_one_agent_runtime import _build_system_prompt
+
+    prompt = _build_system_prompt(
+        None,
+        [],
+        "real_estate",
+        projects_section="Skyline Heights — Kokapet",
+        working_hours_section="Site visits can only be booked between 9:00 AM and 7:00 PM on Mon, Tue.",
+    )
+    assert "Site-visit working hours:" in prompt
+    assert "9:00 AM and 7:00 PM" in prompt
+    # Omitted → section absent.
+    bare = _build_system_prompt(None, [], "real_estate")
+    assert "Site-visit working hours:" not in bare
 
 
 def test_runtime_turns_missing_tool_fields_into_clarifying_reply(monkeypatch):
@@ -2216,6 +2425,19 @@ def test_route_record_by_surface_rewrites_lead_to_ticket_for_inbound():
     assert "force_ticket: bool = False" in pipeline_source
     # Only lead-type records get rewritten (appointments/callbacks/tickets stay).
     assert 'rec.record_type != "lead"' in pipeline_source
+
+
+def test_pipeline_guards_site_visit_against_org_hours():
+    """The real_estate_site_visit branch must validate visit_at against the
+    org working window and re-prompt (not execute) when it's outside."""
+    pipeline_source = open("app/services/nokvo_one_voice_pipeline.py").read()
+    branch = pipeline_source.split('if flow_key == "real_estate_site_visit":', 1)[1]
+    guard_region = branch.split("Field-keyed site-visit data", 1)[0]
+    assert "resolve_org_working_window" in guard_region
+    assert "_within_working_window" in guard_region
+    assert "_site_visit_hours_reprompt" in guard_region
+    # The guard returns a re-prompt instead of booking.
+    assert "outside working hours" in guard_region
 
 
 def test_pipeline_calls_route_after_tool_flow_execution():

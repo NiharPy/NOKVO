@@ -578,6 +578,136 @@ const assignmentEditor = ref({
   isSavingBlock: false,
 });
 
+// Org-wide site-visit working hours (real estate). One window for the whole
+// org — replaces per-member timings. Members inherit it; the voice agent
+// refuses out-of-hours site visits against it.
+const ORG_HOURS_DAYS = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
+const orgWorkingHours = ref({
+  working_days: ['mon', 'tue', 'wed', 'thu', 'fri'],
+  start_time: '09:00',
+  end_time: '19:00',
+  working_hours_summary: '',
+});
+const isLoadingOrgHours = ref(false);
+const isSavingOrgHours = ref(false);
+
+const loadOrgWorkingHours = async () => {
+  if (!isRealEstateTemplate.value) return;
+  isLoadingOrgHours.value = true;
+  try {
+    const { data } = await api.get('/members/assignment-defaults', { headers: authHeader() });
+    orgWorkingHours.value = {
+      working_days: Array.isArray(data.working_days) && data.working_days.length
+        ? data.working_days
+        : ['mon', 'tue', 'wed', 'thu', 'fri'],
+      start_time: data.start_time || '09:00',
+      end_time: data.end_time || '19:00',
+      working_hours_summary: data.working_hours_summary || '',
+    };
+  } catch (err) {
+    // Non-fatal: keep the defaults already in the ref.
+  } finally {
+    isLoadingOrgHours.value = false;
+  }
+};
+
+const toggleOrgHoursDay = (day) => {
+  const days = new Set(orgWorkingHours.value.working_days || []);
+  if (days.has(day)) days.delete(day);
+  else days.add(day);
+  orgWorkingHours.value.working_days = ORG_HOURS_DAYS.filter((d) => days.has(d));
+};
+
+const saveOrgWorkingHours = async () => {
+  if (!isAdmin.value) return;
+  const hrs = orgWorkingHours.value;
+  if (!hrs.working_days?.length || !hrs.start_time || !hrs.end_time) {
+    errorMsg.value = 'Pick at least one day and a start/end time.';
+    return;
+  }
+  if (hrs.start_time >= hrs.end_time) {
+    errorMsg.value = 'Start time must be before end time.';
+    return;
+  }
+  isSavingOrgHours.value = true;
+  try {
+    const { data } = await api.put(
+      '/members/assignment-defaults',
+      {
+        working_days: hrs.working_days,
+        start_time: hrs.start_time,
+        end_time: hrs.end_time,
+      },
+      { headers: authHeader() },
+    );
+    orgWorkingHours.value.working_hours_summary = data.working_hours_summary || '';
+    infoMsg.value = 'Organization working hours saved.';
+  } catch (err) {
+    errorMsg.value = extractErrorMessage(err, 'Could not save working hours.');
+  } finally {
+    isSavingOrgHours.value = false;
+  }
+};
+
+// Site-visit claim pool (real estate). Voice-created visits land unassigned;
+// members claim the ones they want, which allots the visit to them.
+const siteVisitFilter = ref('unclaimed'); // 'unclaimed' | 'mine' | 'all'
+const claimableSiteVisits = ref([]);
+const myAssignedTickets = ref([]);
+const isLoadingClaimable = ref(false);
+const claimingVisitId = ref(null);
+
+const loadClaimableSiteVisits = async () => {
+  if (!isRealEstateTemplate.value) return;
+  isLoadingClaimable.value = true;
+  try {
+    const { data } = await api.get('/members/me/claimable-site-visits', { headers: authHeader() });
+    claimableSiteVisits.value = Array.isArray(data) ? data : [];
+  } catch (err) {
+    claimableSiteVisits.value = [];
+  } finally {
+    isLoadingClaimable.value = false;
+  }
+};
+
+const loadMyAssignedTickets = async () => {
+  if (!isRealEstateTemplate.value) return;
+  try {
+    const { data } = await api.get('/members/me/assigned-records', {
+      headers: authHeader(),
+      params: { record_type: 'ticket' },
+    });
+    myAssignedTickets.value = Array.isArray(data) ? data : [];
+  } catch (err) {
+    myAssignedTickets.value = [];
+  }
+};
+
+const refreshSiteVisitPool = async () => {
+  await Promise.all([loadClaimableSiteVisits(), loadMyAssignedTickets()]);
+};
+
+const claimSiteVisit = async (record) => {
+  if (!record?.id || claimingVisitId.value) return;
+  claimingVisitId.value = record.id;
+  try {
+    await api.post(`/members/me/site-visits/${record.id}/claim`, {}, { headers: authHeader() });
+    infoMsg.value = 'Site visit claimed — it is now assigned to you.';
+    await refreshSiteVisitPool();
+  } catch (err) {
+    // Stale pool: another member claimed it first. Tell the user plainly and
+    // refresh so the taken row drops out of their view.
+    if (err?.response?.status === 409) {
+      errorMsg.value = 'Sorry, another agent just claimed this visit.';
+      await loadClaimableSiteVisits();
+    } else {
+      errorMsg.value = extractErrorMessage(err, 'Could not claim this site visit.');
+    }
+  } finally {
+    claimingVisitId.value = null;
+  }
+};
+
 const inviteToken = ref('');
 const inviteContext = ref(null);
 const invitePassword = ref('');
@@ -845,6 +975,9 @@ const switchPage = (page) => {
   }
   if (['leads', 'tickets', 'appointments'].includes(page)) {
     loadTabRecords(page);
+  }
+  if (page === 'tickets' && isRealEstateTemplate.value) {
+    refreshSiteVisitPool();
   }
   if (page === 'nokvo_connect_step2') {
     loadConnectKeys();
@@ -1134,6 +1267,8 @@ const loadWorkspace = async () => {
     // doesn't degrade the rest of the workspace.
     loadNotifications();
     connectNotificationsSocket();
+    // Org-wide site-visit working hours (real estate only) — fire-and-forget.
+    loadOrgWorkingHours();
     if (['leads', 'tickets', 'appointments'].includes(currentPage.value)) {
       await loadTabRecords(currentPage.value);
     }
@@ -5621,6 +5756,25 @@ provideDashboardState({
   startAssignmentEdit,
   removingMemberId,
   removeMember,
+
+  // Org-wide site-visit working hours (real estate)
+  orgWorkingHours,
+  isLoadingOrgHours,
+  isSavingOrgHours,
+  loadOrgWorkingHours,
+  saveOrgWorkingHours,
+  toggleOrgHoursDay,
+  ORG_HOURS_DAYS,
+
+  // Site-visit claim pool (real estate)
+  siteVisitFilter,
+  claimableSiteVisits,
+  myAssignedTickets,
+  isLoadingClaimable,
+  claimingVisitId,
+  loadClaimableSiteVisits,
+  refreshSiteVisitPool,
+  claimSiteVisit,
 
   // Tabs / records / business type
   businessTypeLabel,

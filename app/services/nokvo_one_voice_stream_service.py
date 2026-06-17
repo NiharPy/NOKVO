@@ -426,6 +426,65 @@ def _site_visit_confirm_text(language: str | None, when: str = "") -> str:
     }.get(lang, "Perfect, noted. Our team will confirm and send you an SMS shortly.")
 
 
+async def _site_visit_out_of_hours_reply(db, tenant_res, text: str, language: str | None) -> str | None:
+    """When the caller names a site-visit time OUTSIDE the org's working window,
+    return a localized rejection that states the window and offers the closest
+    valid slot. Returns ``None`` when the time is in-hours, unparseable, or the
+    org hasn't configured hours — the caller then falls through to the normal
+    templated confirmation.
+
+    This guards the fast booking-confirmation path (the 6ms templated reply),
+    which short-circuits before the tool-flow executor where the same check
+    also runs. Without it the agent would cheerfully "note" an 8 PM visit when
+    hours end at 7 PM."""
+    try:
+        from datetime import datetime, timezone
+
+        from app.services.nokvo_one_assignment_service import (
+            NokvoOneAssignmentService,
+            _within_working_window,
+            suggest_within_working_hours,
+        )
+
+        org_id = getattr(tenant_res, "organization_id", None)
+        if org_id is None or db is None:
+            return None
+        defaults = await NokvoOneAssignmentService.resolve_org_working_window(db, org_id)
+        if defaults is None:
+            return None
+
+        from app.services.voice_turn_policy import extract_turn_entities
+        from app.services.nokvo_one_voice_pipeline import (
+            NokvoOneVoicePipeline,
+            _APPOINTMENT_LOCAL_TZ,
+            _AppointmentToolInputError,
+        )
+
+        ents = extract_turn_entities(text)
+        time_text = ents.get("time_text")
+        if not time_text:
+            return None  # no concrete time → can't range-check; let confirm proceed
+        try:
+            visit_date = NokvoOneVoicePipeline._parse_appointment_date(ents.get("date_text") or "today")
+            visit_time = NokvoOneVoicePipeline._parse_appointment_time(time_text)
+        except _AppointmentToolInputError:
+            return None
+        visit_dt = datetime.combine(
+            visit_date, visit_time, tzinfo=_APPOINTMENT_LOCAL_TZ
+        ).astimezone(timezone.utc)
+        if _within_working_window(defaults, visit_dt):
+            return None
+        suggestion = suggest_within_working_hours(defaults, visit_dt)
+        return NokvoOneVoicePipeline._site_visit_hours_reprompt(
+            requested_dt=visit_dt,
+            suggestion_dt=suggestion,
+            defaults=defaults,
+            language=language,
+        )
+    except Exception:
+        return None
+
+
 def _is_site_visit_confirmation_turn(text: str, history: list[dict[str, str]]) -> bool:
     """Conservative trigger for the templated booking confirmation: the caller
     just stated a date/time, isn't asking a question, and visit intent was
@@ -1099,10 +1158,31 @@ class NokvoOneVoiceStreamService:
                     _bt_confirm = None
                 if _bt_confirm == "real_estate":
                     _confirm_history = await AgentSessionStore.get_history(tenant_res, call_id)
-                    if _is_site_visit_confirmation_turn(cleaned, _confirm_history):
+                    # Out-of-hours guard runs on ANY real-estate turn that states a
+                    # site-visit time — not only the narrow "confirmation" turn —
+                    # so the LLM can't conversationally "note" an 8 PM visit across
+                    # several turns before any deterministic check fires. It returns
+                    # a rejection only when there's a concrete out-of-hours time.
+                    from app.services.voice_turn_policy import text_has_datetime
+
+                    # NOTE: questions are deliberately NOT excluded here. "Is
+                    # tomorrow 8 PM possible?" is exactly when the caller must hear
+                    # "no, we run 9-7" — gating out questions would let an
+                    # out-of-hours time slip straight to the LLM, which then says
+                    # yes. The guard still only fires on a concrete out-of-hours
+                    # time, so in-hours questions fall through to normal Q&A.
+                    _ooh_reply = None
+                    if source != "proactive_silence" and text_has_datetime(cleaned):
+                        _ooh_reply = await _site_visit_out_of_hours_reply(db, tenant_res, cleaned, language)
+                    if _ooh_reply or _is_site_visit_confirmation_turn(cleaned, _confirm_history):
                         from app.services.voice_turn_policy import extract_datetime_phrase
 
-                        confirm = _site_visit_confirm_text(language, extract_datetime_phrase(cleaned))
+                        if _ooh_reply:
+                            confirm = _ooh_reply
+                            confirm_source = "site_visit_hours_rejection"
+                        else:
+                            confirm = _site_visit_confirm_text(language, extract_datetime_phrase(cleaned))
+                            confirm_source = "site_visit_confirmation"
                         await websocket.send_json(
                             {"type": "stt_finished", "text": cleaned, "turn_id": turn_id, "source": source}
                         )
@@ -1114,7 +1194,7 @@ class NokvoOneVoiceStreamService:
                                 "tone": "warm",
                                 "first_sentence_ms": int((perf_counter() - started) * 1000),
                                 "cache_hit": False,
-                                "source": "site_visit_confirmation",
+                                "source": confirm_source,
                             }
                         )
                         prosody = prosody_for("warm")
@@ -1125,7 +1205,7 @@ class NokvoOneVoiceStreamService:
                                 tenant_res,
                                 confirm,
                                 language=language,
-                                purpose="site_visit_confirmation",
+                                purpose=confirm_source,
                                 pace=prosody.pace,
                                 pitch=prosody.pitch,
                                 loudness=prosody.loudness,
@@ -1146,8 +1226,8 @@ class NokvoOneVoiceStreamService:
                                 "refused": False,
                                 "citations": [],
                                 "chunks": [],
-                                "runtime": {"mode": "site_visit_confirmation"},
-                                "intent": {"type": "site_visit_confirmation", "should_retrieve": False},
+                                "runtime": {"mode": confirm_source},
+                                "intent": {"type": confirm_source, "should_retrieve": False},
                             }
                         )
                         await websocket.send_json(
@@ -1155,7 +1235,7 @@ class NokvoOneVoiceStreamService:
                                 "type": "turn_complete",
                                 "turn_id": turn_id,
                                 "total_ms": int((perf_counter() - started) * 1000),
-                                "context_source": "site_visit_confirmation",
+                                "context_source": confirm_source,
                                 "filler_played": False,
                             }
                         )
