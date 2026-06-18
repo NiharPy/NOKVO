@@ -1185,7 +1185,7 @@ const renderGoogleButtons = async () => {
       type: 'standard',
       theme: themeMode.value === 'dark' ? 'filled_black' : 'outline',
       size: 'large',
-      shape: 'pill',
+      shape: 'rectangular',
       text: 'continue_with',
       logo_alignment: 'left',
       width: Math.min(360, Math.max(280, host.clientWidth || 360)),
@@ -4250,17 +4250,23 @@ const appointmentAssignedLabel = (record) =>
 // Ticket helpers — mirror the appointment helpers but pull from the ticket
 // schema's keys (customer, issue_type, priority, property_id) with sensible
 // fallbacks for records routed from leads (which still carry name/phone).
-const ticketRecordTitle = (record) =>
-  formatRecordValue(
-    firstRecordValue(record, [
-      'customer', 'customer_name', 'patient_name', 'guest_name', 'name', 'contact_name',
-    ]) || firstRecordValue(record, ['subject', 'issue_type', 'reason', 'description']),
-    'Support ticket',
-  );
+const ticketRecordTitle = (record) => {
+  const primary = firstRecordValue(record, [
+    'customer', 'customer_name', 'patient_name', 'guest_name', 'name', 'contact_name',
+  ]);
+  if (primary) return formatRecordValue(primary, '');
+
+  const secondary = firstRecordValue(record, ['subject', 'issue_type', 'reason', 'description']);
+  if (secondary && secondary !== 'site_visit') return formatRecordValue(secondary, '');
+
+  return 'No Name';
+};
 
 const ticketRecordSubtitle = (record) => {
   const phone = firstRecordValue(record, ['contact_phone', 'phone', 'phone_number']);
-  const summary = firstRecordValue(record, ['issue_type', 'subject', 'reason', 'description', 'property_id', 'location']);
+  let summary = firstRecordValue(record, ['issue_type', 'subject', 'reason', 'description', 'property_id', 'location']);
+  if (summary === 'site_visit') summary = null;
+  
   return [phone, summary].map((item) => formatRecordValue(item, '')).filter(Boolean).join(' · ') || 'No extra details';
 };
 
@@ -6471,7 +6477,7 @@ provideDashboardState({
     :class="['org-shell', themeMode]"
     @pointermove="updateCursorGlow"
   >
-    <div class="ambient-layer" aria-hidden="true">
+    <div v-if="authState === 'ready'" class="ambient-layer" aria-hidden="true">
       <div class="ambient-orb orb-top"></div>
       <div class="ambient-orb orb-bottom"></div>
     </div>
@@ -6482,7 +6488,7 @@ provideDashboardState({
       v-if="authState !== 'ready'"
       class="mode-bar"
     >
-      <button type="button" class="mode-link" @click="toggleThemeMode">
+      <button v-if="false" type="button" class="mode-link" @click="toggleThemeMode">
         <SunMedium v-if="themeMode === 'dark'" :size="14" />
         <Moon v-else :size="14" />
         {{ themeToggleLabel }}
@@ -6618,67 +6624,14 @@ provideDashboardState({
     <main v-if="authState !== 'ready'" class="auth-v2">
       <!-- LEFT: brand / marketing stage -->
       <aside class="auth-v2__stage" aria-hidden="true">
-        <div class="auth-v2__mesh"></div>
-        <div class="auth-v2__grid"></div>
-        <div class="auth-v2__orb auth-v2__orb--a"></div>
-        <div class="auth-v2__orb auth-v2__orb--b"></div>
-        <div class="auth-v2__orb auth-v2__orb--c"></div>
-        <div class="auth-v2__noise"></div>
-
         <div class="auth-v2__stage-content">
-          <div class="auth-v2__brand">
-            <span class="auth-v2__brand-mark">
-              <span class="auth-v2__brand-glyph">N</span>
-            </span>
-            <span class="auth-v2__brand-name">Nokvo<span>/One</span></span>
-          </div>
-
           <div class="auth-v2__pitch">
-            <span class="auth-v2__pitch-eyebrow">
-              <span class="auth-v2__pulse"></span>
-              Voice AI platform · India
-            </span>
+            <div class="auth-v2__brand-name">Nokvo<br/>One</div>
             <h1 class="auth-v2__pitch-title">
               Voice agents<br />
-              that <em>close.</em>
+              that close.
             </h1>
-            <p class="auth-v2__pitch-sub">
-              Inbound and outbound campaigns on tenant-isolated infra. STT, LLM, TTS, retrieval —
-              one pipeline, audited and yours.
-            </p>
           </div>
-
-          <ul class="auth-v2__highlights">
-            <li>
-              <span class="auth-v2__check">✓</span>
-              <div>
-                <strong>Tenant-isolated infrastructure</strong>
-                <small>Azure OpenAI, Qdrant, Redis — your tenant, your data, audited.</small>
-              </div>
-            </li>
-            <li>
-              <span class="auth-v2__check">✓</span>
-              <div>
-                <strong>Sub-second LLM-to-voice</strong>
-                <small>Sarvam STT/TTS streaming, semantic cache, top-k retrieval.</small>
-              </div>
-            </li>
-            <li>
-              <span class="auth-v2__check">✓</span>
-              <div>
-                <strong>Consented outbound campaigns</strong>
-                <small>Meta, Google Ads, Forms — every lead carries a call-consent flag.</small>
-              </div>
-            </li>
-          </ul>
-
-          <footer class="auth-v2__stage-foot">
-            <div class="auth-v2__trust">
-              <span class="auth-v2__trust-dot"></span>
-              <span>SOC-aligned · MFA enforced · audit log</span>
-            </div>
-            <span class="auth-v2__copy">© Nokvo · v1</span>
-          </footer>
         </div>
       </aside>
 
@@ -6701,12 +6654,12 @@ provideDashboardState({
             <strong>Sign in to Nokvo One</strong>
             <span>Continue with Google or use your email + password</span>
           </div>
-          <div class="google-action">
-            <div v-if="authConfig?.google_login_enabled" ref="googleLoginButtonRef" class="google-button-host" :class="{ disabled: isAuthenticating }"></div>
-            <button v-else type="button" class="google-fallback-button" disabled>
+          <div class="google-action custom-google-overlay">
+            <button type="button" class="google-fallback-button" :class="{ disabled: isAuthenticating }">
               <span class="google-mark">G</span>
               Continue with Google
             </button>
+            <div v-if="authConfig?.google_login_enabled" ref="googleLoginButtonRef" class="google-button-host invisible-iframe"></div>
           </div>
           <div class="auth-divider"><span>or</span></div>
           <label class="code-label" for="nokvo-one-email">Email</label>
@@ -6757,12 +6710,12 @@ provideDashboardState({
             <strong>Create your Nokvo One organization</strong>
             <span>Continue with Google or self-serve with email + password. TOTP is required.</span>
           </div>
-          <div class="google-action">
-            <div v-if="authConfig?.google_login_enabled" ref="googleSignupButtonRef" class="google-button-host" :class="{ disabled: isAuthenticating }"></div>
-            <button v-else type="button" class="google-fallback-button" disabled>
+          <div class="google-action custom-google-overlay">
+            <button type="button" class="google-fallback-button" :class="{ disabled: isAuthenticating }">
               <span class="google-mark">G</span>
               Continue with Google
             </button>
+            <div v-if="authConfig?.google_login_enabled" ref="googleSignupButtonRef" class="google-button-host invisible-iframe"></div>
           </div>
           <div class="auth-divider"><span>or</span></div>
           <label class="code-label" for="signup-org">Organization name</label>
@@ -7359,10 +7312,7 @@ provideDashboardState({
                   <span>Builder</span>
                   <input v-model="projectDraft.builder_name" type="text" placeholder="Acme Developers" />
                 </label>
-                <label>
-                  <span>Brochure URL</span>
-                  <input v-model="projectDraft.brochure_url" type="url" placeholder="https://..." />
-                </label>
+
                 <label>
                   <span>Site contact</span>
                   <input v-model="projectDraft.contact_phone" type="tel" placeholder="+91 …" />
@@ -7718,13 +7668,15 @@ provideDashboardState({
     </main>
 
     <main v-else class="n-shell">
+      <div class="global-top-left-logo">
+        <img src="../assets/nokvo-logo.png" alt="Nokvo" />
+      </div>
       <header class="n-shell-dock" role="banner">
         <div class="n-shell-dock__glow" aria-hidden="true"></div>
         <div class="n-shell-dock__inner">
           <a class="n-shell-brand" href="#" @click.prevent="switchPage('dashboard')" aria-label="Nokvo One home">
             <span class="n-shell-brand__mark">
-              <span class="n-shell-brand__mark-glyph">N</span>
-              <span class="n-shell-brand__mark-shine" aria-hidden="true"></span>
+              <img src="../assets/nokvo-logo.png" alt="Nokvo" class="n-shell-brand__image" />
             </span>
           </a>
 
@@ -7833,16 +7785,7 @@ provideDashboardState({
           <span class="n-shell-dock__rule" aria-hidden="true"></span>
 
           <div class="n-shell-foot">
-            <button
-              type="button"
-              class="n-shell-icon-btn"
-              @click="toggleThemeMode"
-              :aria-label="themeToggleLabel"
-              :title="themeToggleLabel"
-            >
-              <SunMedium v-if="themeMode === 'dark'" :size="15" />
-              <Moon v-else :size="15" />
-            </button>
+
 
             <div v-if="!isMemberOnly" class="n-shell-bell">
               <button
@@ -7899,17 +7842,7 @@ provideDashboardState({
               </div>
             </div>
 
-            <button
-              v-if="!isMemberOnly"
-              type="button"
-              class="n-shell-icon-btn"
-              :class="{ 'is-active': currentPage === 'advanced_settings' || currentPage === 'nokvo_connect' || currentPage === 'nokvo_connect_step2' }"
-              @click="switchPage('advanced_settings')"
-              aria-label="Settings"
-              title="Settings"
-            >
-              <Settings2 :size="15" />
-            </button>
+
             <button type="button" class="n-shell-user" @click="handleLogout" aria-label="Account">
               <span class="n-shell-user__avatar">
                 <span class="n-shell-user__avatar-letter">{{ organizationInitial }}</span>
@@ -8414,14 +8347,7 @@ provideDashboardState({
       </section>
     </div>
 
-    <footer class="portal-footer">
-      <span>© Nokvo · Nokvo One</span>
-      <nav class="footer-nav">
-        <a href="#" @click.prevent>Status</a>
-        <a href="#" @click.prevent>Docs</a>
-        <a href="#" @click.prevent="$emit('switch-mode')">Prime / SuperAdmin</a>
-      </nav>
-    </footer>
+    <!-- Footer removed for brutalist aesthetic -->
   </section>
 </template>
 
@@ -8438,6 +8364,24 @@ provideDashboardState({
   font-family: var(--n-font-body);
   display: flex;
   flex-direction: column;
+}
+
+.global-top-left-logo {
+  position: absolute;
+  top: 16px;
+  left: var(--n-page-x);
+  width: 44px;
+  height: 44px;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  z-index: 30;
+}
+.global-top-left-logo img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  transform: scale(4.5);
 }
 
 /* ─── Floating bottom dock ─────────────────────────── */
@@ -8459,13 +8403,7 @@ provideDashboardState({
 }
 
 .n-shell-dock__glow {
-  position: absolute;
-  inset: -28px;
-  z-index: -1;
-  background:
-    radial-gradient(60% 80% at 50% 100%, rgba(99, 102, 241, 0.14), transparent 70%);
-  filter: blur(18px);
-  pointer-events: none;
+  display: none;
 }
 
 .n-shell-dock__inner {
@@ -8473,16 +8411,10 @@ provideDashboardState({
   align-items: center;
   gap: 6px;
   padding: 7px 10px 7px 8px;
-  background: rgba(255, 255, 255, 0.42);
-  backdrop-filter: saturate(200%) blur(28px);
-  -webkit-backdrop-filter: saturate(200%) blur(28px);
-  border: 1px solid rgba(255, 255, 255, 0.45);
-  border-radius: 22px;
-  box-shadow:
-    0 1px 0 rgba(255, 255, 255, 0.6) inset,
-    0 0 0 1px rgba(228, 228, 231, 0.35),
-    0 12px 32px -12px rgba(15, 15, 20, 0.16),
-    0 4px 14px -4px rgba(99, 102, 241, 0.16);
+  background: var(--n-bg-elev);
+  border: 2px solid var(--n-text);
+  border-radius: 0;
+  box-shadow: 4px 4px 0 0 var(--n-text);
 }
 :deep(.org-shell.dark) .n-shell-dock__inner {
   background: rgba(20, 20, 25, 0.45);
@@ -8525,35 +8457,17 @@ provideDashboardState({
   position: relative;
   width: 30px;
   height: 30px;
-  background:
-    radial-gradient(circle at 30% 25%, #4f46e5 0%, #312e81 100%);
-  border-radius: 9px;
+  background: transparent;
   display: grid;
   place-items: center;
   overflow: hidden;
-  box-shadow:
-    0 0 0 1px rgba(255, 255, 255, 0.04) inset,
-    0 4px 10px -4px rgba(49, 46, 129, 0.5),
-    0 1px 0 rgba(255, 255, 255, 0.1) inset;
-  transition: box-shadow var(--n-t-base) var(--n-ease);
   flex-shrink: 0;
 }
-.n-shell-brand__mark-glyph {
-  position: relative;
-  z-index: 1;
-  font-family: var(--n-font-display);
-  font-weight: 600;
-  font-size: 14px;
-  letter-spacing: -0.06em;
-  color: #ffffff;
-  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
-}
-.n-shell-brand__mark-shine {
-  position: absolute;
-  inset: 0;
-  background:
-    linear-gradient(155deg, rgba(255, 255, 255, 0.28) 0%, transparent 35%, transparent 65%, rgba(255, 255, 255, 0.05) 100%);
-  pointer-events: none;
+.n-shell-brand__image {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  transform: scale(4.5);
 }
 .n-shell-brand__name {
   font-family: var(--n-font-display);
@@ -8861,29 +8775,29 @@ provideDashboardState({
   position: relative;
   width: 28px;
   height: 28px;
-  border-radius: 50%;
-  background: linear-gradient(135deg, var(--n-brand-soft) 0%, var(--n-surface-2) 100%);
+  border-radius: 0;
+  background: var(--n-text);
   display: grid;
   place-items: center;
   flex-shrink: 0;
-  border: 1px solid rgba(99, 102, 241, 0.12);
+  border: 2px solid var(--n-text);
 }
 .n-shell-user__avatar-letter {
   font-family: var(--n-font-display);
   font-weight: 600;
   font-size: 12.5px;
-  color: var(--n-brand-ink);
+  color: var(--n-text-inverse);
   letter-spacing: -0.02em;
 }
 .n-shell-user__online {
   position: absolute;
-  bottom: -1px;
-  right: -1px;
+  bottom: -4px;
+  right: -4px;
   width: 9px;
   height: 9px;
   background: var(--n-success);
-  border: 2px solid var(--n-bg);
-  border-radius: 50%;
+  border: 2px solid var(--n-text);
+  border-radius: 0;
 }
 
 .n-shell-user__meta { display: grid; line-height: 1.15; text-align: left; max-width: 140px; }
@@ -8937,19 +8851,20 @@ provideDashboardState({
   gap: 16px;
   align-items: center;
   padding: 16px 20px;
-  background: var(--n-brand-soft);
-  border: 1px solid rgba(99, 102, 241, 0.18);
-  border-radius: var(--n-r-xl);
+  background: var(--n-bg);
+  border: 2px solid var(--n-text);
+  border-radius: 0;
+  box-shadow: 4px 4px 0 0 var(--n-text);
 }
 .n-shell-callout__icon {
   width: 36px;
   height: 36px;
-  border-radius: 10px;
-  background: var(--n-bg);
-  color: var(--n-brand);
+  border-radius: 0;
+  background: var(--n-text);
+  color: var(--n-text-inverse);
   display: grid;
   place-items: center;
-  border: 1px solid rgba(99, 102, 241, 0.18);
+  border: 2px solid var(--n-text);
 }
 .n-shell-callout__copy { display: grid; gap: 2px; }
 .n-shell-callout__copy strong {
@@ -8986,10 +8901,10 @@ provideDashboardState({
   position: relative;
   min-height: 100vh;
   display: grid;
-  grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr);
+  grid-template-columns: 1fr 1fr;
   font-family: var(--n-font-body);
-  color: var(--n-text);
-  background: var(--n-bg);
+  color: #000000;
+  background: #ffffff;
 }
 
 @media (max-width: 960px) {
@@ -9002,111 +8917,18 @@ provideDashboardState({
   position: relative;
   overflow: hidden;
   isolation: isolate;
-  background:
-    radial-gradient(140% 100% at -10% 110%, #1e1b4b 0%, transparent 55%),
-    radial-gradient(120% 100% at 110% -10%, #312e81 0%, transparent 55%),
-    linear-gradient(135deg, #0a0a18 0%, #14132b 35%, #1d1849 100%);
-  color: #f5f3ff;
-}
-
-/* Mesh wash overlay */
-.auth-v2__mesh {
-  position: absolute;
-  inset: -10%;
-  background:
-    radial-gradient(38% 28% at 22% 28%, rgba(99, 102, 241, 0.55), transparent 70%),
-    radial-gradient(34% 24% at 78% 70%, rgba(168, 85, 247, 0.42), transparent 70%),
-    radial-gradient(30% 22% at 12% 88%, rgba(56, 189, 248, 0.28), transparent 70%);
-  filter: blur(40px) saturate(140%);
-  opacity: 0.95;
-  z-index: 1;
-  pointer-events: none;
-  animation: authMesh 24s linear infinite;
-}
-@keyframes authMesh {
-  0%   { transform: translate(0, 0) scale(1); }
-  33%  { transform: translate(2%, -1.5%) scale(1.03); }
-  66%  { transform: translate(-2%, 1.5%) scale(0.99); }
-  100% { transform: translate(0, 0) scale(1); }
-}
-
-/* Subtle dot grid above mesh */
-.auth-v2__grid {
-  position: absolute;
-  inset: 0;
-  background-image:
-    radial-gradient(rgba(255, 255, 255, 0.08) 1px, transparent 1.5px);
-  background-size: 28px 28px;
-  background-position: 0 0;
-  mask-image: radial-gradient(80% 70% at 50% 50%, #000 40%, transparent 100%);
-  z-index: 2;
-  pointer-events: none;
-}
-
-/* Floating orbs (premium signature) */
-.auth-v2__orb {
-  position: absolute;
-  border-radius: 50%;
-  filter: blur(40px);
-  z-index: 3;
-  pointer-events: none;
-  opacity: 0.55;
-  mix-blend-mode: screen;
-}
-.auth-v2__orb--a {
-  width: 360px; height: 360px;
-  background: radial-gradient(circle, #818cf8 0%, transparent 70%);
-  top: -120px; left: -80px;
-  animation: authOrbA 14s ease-in-out infinite;
-}
-.auth-v2__orb--b {
-  width: 480px; height: 480px;
-  background: radial-gradient(circle, #c084fc 0%, transparent 70%);
-  bottom: -160px; right: -120px;
-  animation: authOrbB 18s ease-in-out infinite;
-}
-.auth-v2__orb--c {
-  width: 240px; height: 240px;
-  background: radial-gradient(circle, #38bdf8 0%, transparent 70%);
-  top: 45%; left: 35%;
-  animation: authOrbC 22s ease-in-out infinite;
-  opacity: 0.4;
-}
-@keyframes authOrbA {
-  0%, 100% { transform: translate(0, 0); }
-  50% { transform: translate(40px, 60px); }
-}
-@keyframes authOrbB {
-  0%, 100% { transform: translate(0, 0); }
-  50% { transform: translate(-50px, -40px); }
-}
-@keyframes authOrbC {
-  0%, 100% { transform: translate(0, 0); }
-  50% { transform: translate(30px, -50px); }
-}
-
-/* SVG grain overlay */
-.auth-v2__noise {
-  position: absolute;
-  inset: 0;
-  z-index: 4;
-  opacity: 0.18;
-  mix-blend-mode: overlay;
-  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='180' height='180'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 1  0 0 0 0 1  0 0 0 0 1  0 0 0 0.6 0'/></filter><rect width='180' height='180' filter='url(%23n)'/></svg>");
-  background-size: 180px;
-  pointer-events: none;
+  background: #000000;
+  color: #ffffff;
+  display: flex;
+  align-items: center;
+  padding: 4vw;
 }
 
 /* Stage content */
 .auth-v2__stage-content {
   position: relative;
   z-index: 5;
-  height: 100%;
-  min-height: 100vh;
-  padding: 48px clamp(40px, 5vw, 72px);
-  display: grid;
-  grid-template-rows: auto 1fr auto;
-  gap: 32px;
+  width: 100%;
   animation: authFade 640ms var(--n-ease) 80ms both;
 }
 
@@ -9116,212 +8938,64 @@ provideDashboardState({
 }
 
 /* Brand on stage */
-.auth-v2__brand {
-  display: inline-flex;
-  align-items: center;
-  gap: 11px;
-}
-.auth-v2__brand-mark {
-  position: relative;
-  width: 36px;
-  height: 36px;
-  background: radial-gradient(circle at 30% 25%, #6366f1 0%, #312e81 100%);
-  border-radius: 11px;
-  display: grid;
-  place-items: center;
-  box-shadow:
-    0 0 0 1px rgba(255, 255, 255, 0.08) inset,
-    0 4px 12px -2px rgba(99, 102, 241, 0.55),
-    0 1px 0 rgba(255, 255, 255, 0.18) inset;
-}
-.auth-v2__brand-glyph {
-  font-family: var(--n-font-display);
-  font-weight: 600;
-  font-size: 17px;
-  color: #fff;
-  letter-spacing: -0.06em;
-  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
-}
 .auth-v2__brand-name {
   font-family: var(--n-font-display);
-  font-weight: 600;
-  font-size: 16px;
-  letter-spacing: -0.02em;
+  font-weight: 800;
+  font-size: clamp(60px, 8vw, 120px);
+  line-height: 0.9;
+  letter-spacing: -0.04em;
+  text-transform: uppercase;
+  margin-bottom: 60px;
 }
-.auth-v2__brand-name span { color: rgba(255, 255, 255, 0.45); font-weight: 400; }
 
 .auth-v2__brand--mobile { display: none; margin-bottom: 24px; }
+.auth-v2__brand--mobile .auth-v2__brand-name { font-size: 24px; }
 
 /* Pitch block (the headline) */
-.auth-v2__pitch { display: grid; gap: 18px; max-width: 30ch; align-self: end; }
-.auth-v2__pitch-eyebrow {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  font-family: var(--n-font-mono);
-  font-size: 11px;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-  color: rgba(255, 255, 255, 0.75);
-  padding: 5px 12px;
-  background: rgba(255, 255, 255, 0.08);
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 999px;
-  width: max-content;
-  backdrop-filter: blur(8px);
-}
-.auth-v2__pulse {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: #34d399;
-  box-shadow: 0 0 0 4px rgba(52, 211, 153, 0.18);
-  animation: authPulse 1.6s ease-in-out infinite;
-}
-@keyframes authPulse {
-  0%, 100% { opacity: 0.7; transform: scale(1); }
-  50% { opacity: 1; transform: scale(1.15); }
-}
+.auth-v2__pitch { display: grid; gap: 18px; width: 100%; }
 
 .auth-v2__pitch-title {
   margin: 0;
   font-family: var(--n-font-display);
-  font-weight: 600;
-  font-size: clamp(48px, 5.2vw, 80px);
-  line-height: 0.96;
-  letter-spacing: -0.035em;
+  font-weight: 500;
+  font-size: clamp(40px, 5vw, 80px);
+  line-height: 1.0;
+  letter-spacing: -0.03em;
   color: #ffffff;
 }
-.auth-v2__pitch-title em {
-  font-style: italic;
-  font-weight: 400;
-  background: linear-gradient(135deg, #c7d2fe 0%, #f0abfc 50%, #93c5fd 100%);
-  background-clip: text;
-  -webkit-background-clip: text;
-  color: transparent;
-}
-.auth-v2__pitch-sub {
-  margin: 0;
-  font-size: 15px;
-  line-height: 1.6;
-  color: rgba(245, 243, 255, 0.7);
-  max-width: 42ch;
-}
-
-/* Highlights */
-.auth-v2__highlights {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: grid;
-  gap: 14px;
-  align-self: end;
-}
-.auth-v2__highlights li {
-  display: grid;
-  grid-template-columns: auto 1fr;
-  gap: 12px;
-  align-items: start;
-  padding: 14px 16px;
-  background: rgba(255, 255, 255, 0.04);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 14px;
-  backdrop-filter: blur(8px);
-  transition: background 200ms ease, border-color 200ms ease, transform 200ms ease;
-}
-.auth-v2__highlights li:hover {
-  background: rgba(255, 255, 255, 0.07);
-  border-color: rgba(255, 255, 255, 0.14);
-  transform: translateY(-1px);
-}
-.auth-v2__check {
-  width: 22px;
-  height: 22px;
-  border-radius: 7px;
-  background: linear-gradient(135deg, #6366f1 0%, #4f46e5 100%);
-  color: #ffffff;
-  font-size: 12px;
-  font-weight: 700;
-  display: grid;
-  place-items: center;
-  margin-top: 2px;
-  box-shadow: 0 2px 6px -1px rgba(99, 102, 241, 0.4);
-}
-.auth-v2__highlights strong {
-  display: block;
-  font-family: var(--n-font-display);
-  font-size: 14px;
-  font-weight: 600;
-  color: #ffffff;
-  letter-spacing: -0.005em;
-}
-.auth-v2__highlights small {
-  display: block;
-  font-size: 12.5px;
-  color: rgba(245, 243, 255, 0.6);
-  line-height: 1.5;
-  margin-top: 2px;
-}
-
-/* Stage footer */
-.auth-v2__stage-foot {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 14px;
-  font-size: 12px;
-  color: rgba(245, 243, 255, 0.5);
-  padding-top: 8px;
-  border-top: 1px solid rgba(255, 255, 255, 0.06);
-}
-.auth-v2__trust { display: inline-flex; align-items: center; gap: 8px; }
-.auth-v2__trust-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: #34d399;
-  box-shadow: 0 0 0 3px rgba(52, 211, 153, 0.18);
-}
-.auth-v2__copy { font-family: var(--n-font-mono); letter-spacing: 0.04em; }
 
 /* ─── Right form shell ────────────────────────────── */
 .auth-v2__form-shell {
   position: relative;
-  display: grid;
-  place-items: center;
-  padding: 48px clamp(24px, 4vw, 64px);
-  background:
-    radial-gradient(800px 400px at 100% 0%, rgba(99, 102, 241, 0.05), transparent 60%),
-    var(--n-bg);
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  padding: 4vw;
+  background: #ffffff;
+  color: #000000;
   overflow-y: auto;
 }
 
 @media (max-width: 960px) {
   .auth-v2__brand--mobile { display: inline-flex; }
-  .auth-v2__brand--mobile .auth-v2__brand-name { color: var(--n-text); }
-  .auth-v2__brand--mobile .auth-v2__brand-name span { color: var(--n-text-3); }
+  .auth-v2__brand--mobile .auth-v2__brand-name { color: #000000; font-size: 24px; font-weight: 600; }
+  .auth-v2__brand--mobile .auth-v2__brand-name span { color: #666666; font-weight: 400; }
 }
 
 .auth-v2__card {
   position: relative;
   width: 100%;
-  max-width: 440px;
-  padding: 36px 40px;
-  background: var(--n-bg-elev);
-  border: 1px solid var(--n-border);
-  border-radius: 20px;
-  box-shadow:
-    0 1px 0 rgba(255, 255, 255, 0.6) inset,
-    0 24px 48px -16px rgba(15, 15, 20, 0.12),
-    0 8px 16px -4px rgba(99, 102, 241, 0.08);
+  max-width: 480px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  box-shadow: none;
   animation: authFade 600ms var(--n-ease) 140ms both;
 }
 :deep(.org-shell.dark) .auth-v2__card {
-  background: var(--n-bg-elev);
-  box-shadow:
-    0 1px 0 rgba(255, 255, 255, 0.05) inset,
-    0 24px 48px -16px rgba(0, 0, 0, 0.6),
-    0 8px 16px -4px rgba(99, 102, 241, 0.12);
+  background: transparent;
+  box-shadow: none;
 }
 
 .auth-v2__foot-note {
@@ -9329,28 +9003,27 @@ provideDashboardState({
   max-width: 440px;
   text-align: center;
   font-size: 12px;
-  color: var(--n-text-3);
+  color: #666666;
   line-height: 1.5;
 }
 
 /* ─── Override the legacy auth primitives inside .auth-v2 ─── */
 .auth-v2 :deep(.message) {
-  border-radius: 12px;
+  border-radius: 4px;
   padding: 10px 14px;
   font-size: 13px;
   margin-bottom: 18px;
-  border-width: 1px;
-  border-style: solid;
+  border: 1px solid #000000;
 }
 .auth-v2 :deep(.message.error) {
-  background: var(--n-danger-soft);
-  border-color: rgba(220, 38, 38, 0.2);
-  color: var(--n-danger-2);
+  background: #fdf2f2;
+  border-color: #dc2626;
+  color: #dc2626;
 }
 .auth-v2 :deep(.message.info) {
-  background: var(--n-success-soft);
-  border-color: rgba(5, 150, 105, 0.2);
-  color: var(--n-success-2);
+  background: #f0fdf4;
+  border-color: #16a34a;
+  color: #16a34a;
 }
 
 .auth-v2 :deep(.mfa-panel) {
@@ -9364,23 +9037,23 @@ provideDashboardState({
 .auth-v2 :deep(.mfa-head) { display: grid; gap: 6px; margin-bottom: 6px; }
 .auth-v2 :deep(.mfa-head strong) {
   font-family: var(--n-font-display);
-  font-size: 22px;
+  font-size: 28px;
   font-weight: 600;
   letter-spacing: -0.025em;
-  color: var(--n-text);
+  color: #000000;
   line-height: 1.2;
 }
 .auth-v2 :deep(.mfa-head span) {
-  font-size: 13.5px;
-  color: var(--n-text-3);
+  font-size: 14px;
+  color: #666666;
   line-height: 1.5;
 }
 
 .auth-v2 :deep(.code-label) {
   font-family: var(--n-font-body);
-  font-size: 12.5px;
+  font-size: 13px;
   font-weight: 500;
-  color: var(--n-text-2);
+  color: #000000;
   letter-spacing: -0.005em;
   display: block;
   margin: 4px 0 6px;
@@ -9390,135 +9063,146 @@ provideDashboardState({
   appearance: none;
   width: 100%;
   font-family: var(--n-font-body);
-  font-size: 14px;
-  color: var(--n-text);
-  background: var(--n-bg);
-  border: 1px solid var(--n-border);
-  border-radius: 10px;
-  padding: 11px 14px;
+  font-size: 16px;
+  color: #000000;
+  background: transparent;
+  border: 2px solid #000000;
+  border-radius: 0;
+  padding: 14px 16px;
   line-height: 1.4;
-  transition:
-    border-color var(--n-t-fast) var(--n-ease),
-    box-shadow var(--n-t-fast) var(--n-ease);
+  transition: background var(--n-t-fast) var(--n-ease);
 }
-.auth-v2 :deep(.totp-input::placeholder) { color: var(--n-text-4); }
-.auth-v2 :deep(.totp-input:hover) { border-color: var(--n-border-strong); }
+.auth-v2 :deep(.totp-input::placeholder) { color: #888888; }
+.auth-v2 :deep(.totp-input:hover) { background: #f9f9f9; }
 .auth-v2 :deep(.totp-input:focus) {
   outline: none;
-  border-color: var(--n-brand);
-  box-shadow: var(--n-shadow-focus);
+  background: #ffffff;
+  box-shadow: 4px 4px 0 0 #000000;
 }
 .auth-v2 :deep(.totp-input[inputmode="numeric"]) {
   font-family: var(--n-font-mono);
   letter-spacing: 0.5em;
   text-align: center;
-  font-size: 22px;
-  padding: 14px 12px;
+  font-size: 24px;
+  padding: 18px 12px;
 }
 
 .auth-v2 :deep(.mfa-actions) {
   display: flex;
-  gap: 10px;
+  gap: 12px;
   justify-content: space-between;
-  margin-top: 10px;
+  margin-top: 12px;
 }
 .auth-v2 :deep(.primary-button) {
   appearance: none;
-  border: 0;
-  background: linear-gradient(180deg, #6366f1 0%, #4f46e5 100%);
+  border: 2px solid #000000;
+  background: #000000;
   color: #ffffff;
   font-family: var(--n-font-body);
-  font-size: 14px;
-  font-weight: 500;
-  letter-spacing: -0.005em;
-  padding: 11px 22px;
-  border-radius: 10px;
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: 0;
+  padding: 14px 24px;
+  border-radius: 0;
   cursor: pointer;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 6px;
-  box-shadow:
-    0 1px 0 rgba(255, 255, 255, 0.2) inset,
-    0 4px 12px -2px rgba(99, 102, 241, 0.4);
-  transition:
-    transform var(--n-t-fast) var(--n-ease),
-    box-shadow var(--n-t-fast) var(--n-ease);
+  gap: 8px;
+  box-shadow: none;
+  transition: all 150ms ease;
+  transform: translate(0, 0);
 }
 .auth-v2 :deep(.primary-button:hover:not(:disabled)) {
-  transform: translateY(-1px);
-  box-shadow:
-    0 1px 0 rgba(255, 255, 255, 0.25) inset,
-    0 8px 18px -4px rgba(99, 102, 241, 0.55);
+  background: #ffffff;
+  color: #000000;
+  box-shadow: 4px 4px 0 0 #000000;
+  transform: translate(-2px, -2px);
 }
 .auth-v2 :deep(.primary-button:disabled) { opacity: 0.55; cursor: not-allowed; transform: none; }
 
 .auth-v2 :deep(.ghost-button) {
   appearance: none;
   background: transparent;
-  border: 1px solid var(--n-border);
-  color: var(--n-text-2);
+  border: 2px solid #000000;
+  color: #000000;
   font-family: var(--n-font-body);
-  font-size: 14px;
-  font-weight: 500;
-  letter-spacing: -0.005em;
-  padding: 10px 18px;
-  border-radius: 10px;
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: 0;
+  padding: 14px 20px;
+  border-radius: 0;
   cursor: pointer;
-  transition: background var(--n-t-fast) var(--n-ease),
-              border-color var(--n-t-fast) var(--n-ease),
-              color var(--n-t-fast) var(--n-ease);
+  transition: all 150ms ease;
+  transform: translate(0, 0);
 }
 .auth-v2 :deep(.ghost-button:hover:not(:disabled)) {
-  background: var(--n-surface);
-  border-color: var(--n-border-strong);
-  color: var(--n-text);
+  background: #f5f5f5;
+  box-shadow: 4px 4px 0 0 #000000;
+  transform: translate(-2px, -2px);
 }
 
 .auth-v2 :deep(.login-help) {
   font-size: 12.5px;
-  color: var(--n-text-3);
+  color: #666666;
   line-height: 1.55;
   margin: 4px 0 0;
 }
 .auth-v2 :deep(.login-help.compact) { margin: 0; }
 
 /* Google button + divider */
-.auth-v2 :deep(.google-action) { margin-bottom: 4px; }
-.auth-v2 :deep(.google-button-host) {
-  display: flex;
-  justify-content: center;
-  border-radius: 10px;
+.auth-v2 :deep(.google-action) { margin-bottom: 12px; position: relative; }
+.auth-v2 :deep(.invisible-iframe) {
+  position: absolute;
+  inset: 0;
+  opacity: 0.01;
+  z-index: 10;
   overflow: hidden;
 }
-.auth-v2 :deep(.google-button-host iframe) { border-radius: 10px !important; }
+.auth-v2 :deep(.invisible-iframe iframe) {
+  width: 100% !important;
+  height: 100% !important;
+}
 .auth-v2 :deep(.google-fallback-button) {
   width: 100%;
   appearance: none;
-  background: var(--n-bg);
-  border: 1px solid var(--n-border);
-  border-radius: 10px;
-  padding: 11px 14px;
+  background: #ffffff;
+  border: 2px solid #000000;
+  border-radius: 0;
+  padding: 14px 16px;
   font-family: var(--n-font-body);
-  font-size: 14px;
-  color: var(--n-text);
+  font-size: 16px;
+  font-weight: 600;
+  color: #000000;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 10px;
+  gap: 12px;
+  cursor: pointer;
+  transition: all 150ms ease;
+  transform: translate(0, 0);
+  position: relative;
+  z-index: 1;
+}
+.auth-v2 :deep(.google-action:hover .google-fallback-button:not(.disabled)) {
+  box-shadow: 4px 4px 0 0 #000000;
+  transform: translate(-2px, -2px);
+  background: #f5f5f5;
+}
+.auth-v2 :deep(.google-fallback-button.disabled) {
+  opacity: 0.55;
   cursor: not-allowed;
-  opacity: 0.65;
 }
 .auth-v2 :deep(.google-mark) {
-  width: 22px;
-  height: 22px;
-  border-radius: 50%;
-  background: linear-gradient(135deg, #4285F4, #34A853, #FBBC05, #EA4335);
+  width: 24px;
+  height: 24px;
+  border-radius: 0;
+  background: #000000;
   color: #ffffff;
-  font-weight: 700;
+  font-weight: 800;
   display: grid;
   place-items: center;
-  font-size: 12px;
+  font-size: 14px;
   font-family: var(--n-font-display);
 }
 
@@ -9527,7 +9211,7 @@ provideDashboardState({
   align-items: center;
   gap: 12px;
   margin: 4px 0 4px;
-  color: var(--n-text-4);
+  color: #888888;
   font-family: var(--n-font-mono);
   font-size: 11px;
   letter-spacing: 0.18em;
@@ -9538,7 +9222,7 @@ provideDashboardState({
   content: '';
   flex: 1;
   height: 1px;
-  background: var(--n-border);
+  background: #e5e5e5;
 }
 
 /* QR + secret + provisioning */
@@ -9671,13 +9355,19 @@ provideDashboardState({
 }
 
 .mode-bar {
-  position: relative;
-  z-index: 1;
-  width: 100%;
-  padding: 1.5rem 2rem 0;
+  position: absolute;
+  top: 0;
+  right: 0;
+  z-index: 100;
+  width: auto;
+  padding: 2rem 2rem 0;
   display: flex;
   justify-content: flex-end;
   gap: 0.5rem;
+  pointer-events: none;
+}
+.mode-bar > * {
+  pointer-events: auto;
 }
 
 .mode-link {

@@ -62,17 +62,15 @@ const {
   discardDraft,
 } = useDashboardState();
 
-const pipeline = computed(() => [
-  { key: 'stt', label: 'STT', icon: Mic, model: runtimeStatus?.value?.stt?.model || 'Sarvam saaras:v3', meta: runtimeStatus?.value?.stt?.status || 'ready' },
-  { key: 'llm', label: 'LLM', icon: Brain, model: runtimeStatus?.value?.llm?.model || 'gpt-4.1-mini', meta: 'South India' },
-  { key: 'tts', label: 'TTS', icon: Volume2, model: runtimeStatus?.value?.tts?.model || 'Sarvam bulbul:v3', meta: runtimeStatus?.value?.tts?.status || 'ready' },
-  { key: 'emb', label: 'Embeddings', icon: Layers, model: 'text-embedding-3-small', meta: '1536 · cosine' },
-  { key: 'vec', label: 'Vector store', icon: Database, model: 'Qdrant', meta: runtimeStatus?.value?.knowledge_scope?.replace?.(/_/g, ' ') || 'tenant scope' },
-  { key: 'cache', label: 'Cache', icon: Activity, model: runtimeStatus?.value?.optimization?.semantic_cache_enabled ? 'Redis · on' : 'off', meta: `top-k ${runtimeStatus?.value?.optimization?.qdrant_top_k || 3}` },
-]);
+
 
 const voiceStatus = computed(() => voice?.value?.status || 'idle');
 const isCalling = computed(() => !['idle', 'error'].includes(voiceStatus.value));
+
+function formatPhoneStep(text) {
+  if (!text) return '';
+  return text.replace(/(\*\*\d+\*[\d\+]+#|##\d+#|\*\*\d+#)/g, '<code class="agent__ussd">$1</code>');
+}
 </script>
 
 <template>
@@ -109,21 +107,7 @@ const isCalling = computed(() => !['idle', 'error'].includes(voiceStatus.value))
         </div>
       </div>
 
-      <div class="agent__pipeline">
-        <div
-          v-for="(c, i) in pipeline"
-          :key="c.key"
-          class="agent__chip"
-          :style="{ animationDelay: `${80 + i * 40}ms` }"
-        >
-          <span class="agent__chip-icon"><component :is="c.icon" :size="14" /></span>
-          <div class="agent__chip-body">
-            <span class="agent__chip-label">{{ c.label }}</span>
-            <strong class="agent__chip-model n-truncate">{{ c.model }}</strong>
-            <span class="agent__chip-meta n-truncate">{{ c.meta }}</span>
-          </div>
-        </div>
-      </div>
+
 
       <div v-if="currentOrganization?.status === 'pending_approval'" class="agent__pending">
         <span class="n-dot n-dot--warning n-dot--pulse"></span>
@@ -259,7 +243,6 @@ const isCalling = computed(() => !['idle', 'error'].includes(voiceStatus.value))
               <span class="agent__phone-cap">Forward your calls to this number</span>
               <strong class="n-mono">{{ phoneLink?.plivo_number || 'Provisioning — awaiting carrier verification' }}</strong>
             </div>
-            <span class="n-tag n-tag--mono">PLIVO</span>
           </div>
         </div>
         <p v-if="phoneLink?.forwarding_instructions" class="agent__phone-hint">{{ phoneLink.forwarding_instructions }}</p>
@@ -277,7 +260,7 @@ const isCalling = computed(() => !['idle', 'error'].includes(voiceStatus.value))
 
         <ol v-if="phoneLink?.forwarding_steps?.length" class="agent__phone-steps">
           <li class="agent__phone-cap">Set up call forwarding (one time, on your phone):</li>
-          <li v-for="(step, i) in phoneLink.forwarding_steps" :key="i">{{ step }}</li>
+          <li v-for="(step, i) in phoneLink.forwarding_steps" :key="i" v-html="formatPhoneStep(step)"></li>
         </ol>
       </article>
     </section>
@@ -406,95 +389,7 @@ const isCalling = computed(() => !['idle', 'error'].includes(voiceStatus.value))
       </div>
     </section>
 
-    <!-- Chat tester + Email drafts -->
-    <section class="n-section n-rise" data-delay="4">
-      <header class="n-section__head">
-        <div>
-          <h2 class="n-section__title">Chat tester</h2>
-          <p class="n-section__sub">Talk to {{ activeAgent?.name || 'an agent' }}. Tool calls are sandboxed and audited.</p>
-        </div>
-        <span class="n-tag" :class="{ 'n-tag--brand': activeAgent }">
-          {{ activeAgent ? activeAgent.name : 'No agent selected' }}
-        </span>
-      </header>
 
-      <div class="agent__chat-grid">
-        <article class="n-card agent__chat">
-          <label class="n-field">
-            <span class="n-field__label">Message</span>
-            <textarea v-model="chatInput" class="n-textarea" rows="3" placeholder="Ask the agent…"></textarea>
-          </label>
-          <div class="agent__chat-actions">
-            <button type="button" class="n-btn n-btn--ghost n-btn--sm" :disabled="!activeAgent" @click="chatLog = []">Clear</button>
-            <button type="button" class="n-btn n-btn--primary" :disabled="!activeAgent || !chatInput.trim()" @click="sendChat">
-              <Send :size="14" />
-              Send
-            </button>
-          </div>
-
-          <div class="agent__chat-thread">
-            <p v-if="!chatLog.length" class="agent__chat-empty">Pick an agent and send a message to start.</p>
-            <div v-else>
-              <div
-                v-for="(turn, i) in chatLog"
-                :key="i"
-                class="agent__chat-turn"
-                :class="`agent__chat-turn--${turn.role}`"
-              >
-                <span class="n-tag" :class="{
-                  'n-tag--brand': turn.role === 'agent',
-                  'n-tag--danger': turn.role === 'system',
-                }">{{ turn.role }}</span>
-                <p>{{ turn.text }}</p>
-                <p v-if="turn.tool_calls?.length" class="agent__chat-tools">
-                  <span class="agent__chat-tools-label">Tool calls</span>
-                  <span v-for="(tc, idx) in turn.tool_calls" :key="idx" class="n-tag n-tag--mono">
-                    {{ tc.tool }}{{ tc.ok === false ? ' · error' : '' }}
-                  </span>
-                </p>
-              </div>
-            </div>
-          </div>
-        </article>
-
-        <article class="n-card agent__drafts">
-          <header class="agent__drafts-head">
-            <div>
-              <h3 class="agent__create-title">Email drafts</h3>
-              <p class="agent__create-sub">Queued until a human confirms. Nokvo One never sends email automatically.</p>
-            </div>
-            <button type="button" class="n-btn n-btn--ghost n-btn--sm" @click="loadEmailDrafts">Refresh</button>
-          </header>
-
-          <div v-if="!emailDrafts.length" class="agent__drafts-empty">
-            No drafts yet. They appear here when the agent calls <span class="n-kbd">send_email_draft</span>.
-          </div>
-
-          <ul v-else class="agent__draft-list">
-            <li v-for="d in emailDrafts" :key="d.id" class="agent__draft">
-              <div class="agent__draft-icon"><LinkIcon :size="14" /></div>
-              <div class="agent__draft-body">
-                <strong>{{ d.data?.subject }}</strong>
-                <span class="n-mono">to {{ d.data?.to_email }}</span>
-                <p>{{ d.data?.body }}</p>
-              </div>
-              <div class="agent__draft-actions">
-                <span class="n-tag" :class="d.status === 'pending_confirmation' ? 'n-tag--warning' : 'n-tag--brand'">{{ d.status }}</span>
-                <button
-                  v-if="d.status === 'pending_confirmation'"
-                  type="button"
-                  class="n-btn n-btn--danger n-btn--sm"
-                  @click="discardDraft(d.id)"
-                >
-                  <XCircle :size="13" />
-                  Discard
-                </button>
-              </div>
-            </li>
-          </ul>
-        </article>
-      </div>
-    </section>
   </div>
 </template>
 
@@ -727,6 +622,59 @@ const isCalling = computed(() => !['idle', 'error'].includes(voiceStatus.value))
   font-size: 12.5px;
   color: var(--n-text);
   display: block;
+}
+
+.agent__phone-steps {
+  list-style: none;
+  margin: 24px 0 0;
+  padding: 24px 28px;
+  background: var(--n-text);
+  border: 2px solid var(--n-text);
+  box-shadow: 6px 6px 0 var(--n-brand);
+  border-radius: 0;
+  display: grid;
+  gap: 16px;
+  counter-reset: phone-step;
+}
+.agent__phone-steps li.agent__phone-cap {
+  border-bottom: 2px solid rgba(255, 255, 255, 0.2);
+  padding-bottom: 12px;
+  margin-bottom: 6px;
+  color: var(--n-bg);
+  font-weight: 700;
+  font-size: 15px;
+  font-family: var(--n-font-display);
+  letter-spacing: -0.01em;
+  text-transform: uppercase;
+}
+.agent__phone-steps li:not(.agent__phone-cap) {
+  position: relative;
+  padding-left: 36px;
+  font-size: 13.5px;
+  color: rgba(255, 255, 255, 0.9);
+  line-height: 1.6;
+  font-family: var(--n-font-mono);
+  transition: transform var(--n-t-fast) var(--n-ease), color var(--n-t-fast) var(--n-ease);
+}
+.agent__phone-steps li:not(.agent__phone-cap):hover {
+  transform: translateX(4px);
+  color: #fff;
+}
+.agent__phone-steps li:not(.agent__phone-cap)::before {
+  counter-increment: phone-step;
+  content: counter(phone-step) '.';
+  position: absolute;
+  left: 0;
+  font-family: var(--n-font-mono);
+  font-weight: 700;
+  color: var(--n-brand);
+}
+.agent__phone-steps :deep(.agent__ussd) {
+  background: var(--n-brand);
+  color: #000;
+  padding: 2px 6px;
+  font-weight: 700;
+  border-radius: 0;
 }
 
 /* ─── Agent CRUD ───────────────────────────────── */

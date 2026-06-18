@@ -140,40 +140,6 @@ function statusTone(s) {
       >All</button>
     </div>
 
-    <!-- Schema card -->
-    <section class="n-section n-rise" data-delay="1">
-      <header class="n-section__head">
-        <div>
-          <h2 class="n-section__title">{{ ticketFieldTitle }}</h2>
-          <p class="n-section__sub">Fields shown when your team captures or reviews a {{ ticketSingularLabel }}.</p>
-        </div>
-        <div class="rec__schema-actions">
-          <span class="n-tag n-tag--mono">{{ fields.length }} fields</span>
-          <button type="button" class="n-btn n-btn--ghost n-btn--sm" @click="startFieldEdit('tickets', ticketFieldTitle)">
-            <Settings2 :size="13" />
-            Edit fields
-          </button>
-        </div>
-      </header>
-
-      <div class="rec__schema-grid">
-        <article
-          v-for="f in fields"
-          :key="f.key"
-          class="rec__schema-tile"
-          :class="{ 'is-required': f.required }"
-        >
-          <span class="rec__schema-icon">
-            <component :is="fieldTypeIcon(f.type)" :size="14" />
-          </span>
-          <div class="rec__schema-body">
-            <strong>{{ f.label }}</strong>
-            <span>{{ fieldTypeLabel(f.type) }}<em v-if="f.required"> · required</em></span>
-          </div>
-        </article>
-      </div>
-    </section>
-
     <!-- Records -->
     <section class="n-section n-rise" data-delay="2">
       <header class="n-section__head">
@@ -210,17 +176,10 @@ function statusTone(s) {
                   {{ recordPhone(r) }}
                 </a>
               </div>
-              <div class="rec__col">
-                <span class="rec__cap">Priority</span>
-                <strong>{{ ticketRecordPriority(r) }}</strong>
-              </div>
-              <div class="rec__col">
-                <span class="rec__cap">Owner</span>
-                <strong>{{ ticketRecordOwner(r) }}</strong>
-              </div>
-              <div class="rec__col">
-                <span class="rec__cap">Status</span>
-                <span class="n-tag" :class="statusTone(r.status)">{{ r.status || 'open' }}</span>
+              <div class="rec__col rec__col--note">
+                <span class="rec__cap">Call notes</span>
+                <blockquote v-if="recordHandoff(r)">{{ recordHandoff(r).note }}</blockquote>
+                <span v-else style="font-size: 13px; color: var(--n-text-3); font-style: italic;">No notes</span>
               </div>
               <div class="rec__col rec__col--right">
                 <span class="rec__cap">Created</span>
@@ -236,18 +195,7 @@ function statusTone(s) {
                 </button>
               </div>
             </li>
-            <!-- Post-call notes for this site visit (read-only). -->
-            <li v-if="recordHandoff(r)" class="tickets__handoff-row">
-              <div class="tickets__handoff-note">
-                <header>
-                  <span class="tickets__handoff-cap">Call notes</span>
-                  <span class="tickets__handoff-time">
-                    {{ formatRelativeDate(recordHandoff(r).at) || '' }}
-                  </span>
-                </header>
-                <blockquote>{{ recordHandoff(r).note }}</blockquote>
-              </div>
-            </li>
+
           </template>
         </ul>
       </article>
@@ -260,8 +208,8 @@ function statusTone(s) {
 .tickets__filter { display: flex; gap: 8px; margin-bottom: 4px; }
 .tickets__filter-btn {
   padding: 6px 14px;
-  border-radius: 999px;
-  border: 1px solid var(--n-border);
+  border-radius: 0;
+  border: 2px solid var(--n-border);
   background: transparent;
   color: var(--n-text-2);
   font-size: 12px;
@@ -270,9 +218,9 @@ function statusTone(s) {
   transition: background var(--n-t-fast) var(--n-ease), color var(--n-t-fast) var(--n-ease), border-color var(--n-t-fast) var(--n-ease);
 }
 .tickets__filter-btn.is-on {
-  background: var(--n-brand);
-  border-color: var(--n-brand);
-  color: #fff;
+  background: var(--n-text);
+  border-color: var(--n-text);
+  color: var(--n-text-inverse);
 }
 .tickets__claim-btn { margin-top: 6px; }
 
@@ -358,15 +306,13 @@ function statusTone(s) {
 .rec__row {
   display: grid;
   grid-template-columns:
-    [id] minmax(260px, 1.6fr)
-    [c1] minmax(100px, 0.8fr)
-    [c2] minmax(120px, 0.8fr)
-    [c3] minmax(110px, 0.8fr)
-    [c4] minmax(120px, 0.7fr);
+    [id] minmax(220px, 1.2fr)
+    [notes] minmax(300px, 2fr)
+    [actions] minmax(120px, 0.6fr);
   gap: 18px;
   align-items: center;
   padding: 14px 24px;
-  border-bottom: 1px solid var(--n-border-subtle);
+  border-bottom: 2px solid var(--n-border);
   transition: background var(--n-t-fast) var(--n-ease);
 }
 .rec__row:last-child { border-bottom: 0; }
@@ -394,7 +340,7 @@ function statusTone(s) {
 }
 .rec__phone:hover { text-decoration: underline; }
 
-.rec__col { display: grid; gap: 4px; min-width: 0; }
+.rec__col { display: grid; gap: 4px; min-width: 0; align-items: start; }
 .rec__col--right { justify-items: flex-end; text-align: right; }
 .rec__cap {
   font-family: var(--n-font-mono);
@@ -411,51 +357,21 @@ function statusTone(s) {
 .rec__time { font-size: 12px; color: var(--n-text-3); }
 
 @media (max-width: 1100px) {
-  .rec__row { grid-template-columns: 1fr; gap: 8px; padding: 16px 20px; }
+  .rec__row { grid-template-columns: 1fr; gap: 16px; padding: 16px 20px; }
   .rec__col--right { justify-items: flex-start; text-align: left; }
 }
-
-/* Post-call notes block (mirrors LeadsView's leads__handoff-*). */
-.tickets__handoff-row {
-  list-style: none;
-  padding: 0 20px 14px;
-}
-.tickets__handoff-note {
-  display: grid;
-  gap: 6px;
-  padding: 12px 14px;
-  background: linear-gradient(180deg, var(--n-brand-soft) 0%, transparent 80%);
-  border: 1px solid rgba(99, 102, 241, 0.18);
-  border-radius: var(--n-r-md);
-}
-.tickets__handoff-note header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-}
-.tickets__handoff-cap {
-  font-family: var(--n-font-mono);
-  font-size: 10px;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-  color: var(--n-brand-ink);
-  font-weight: 600;
-}
-.tickets__handoff-time {
-  font-family: var(--n-font-mono);
-  font-size: 10.5px;
-  color: var(--n-text-3);
-  letter-spacing: 0.02em;
-}
-.tickets__handoff-note blockquote {
+.rec__col--note blockquote {
   margin: 0;
   padding: 0;
-  font-size: 13.5px;
-  line-height: 1.55;
+  font-size: 13px;
+  line-height: 1.45;
   color: var(--n-text);
   font-family: var(--n-font-display);
   font-style: italic;
   letter-spacing: -0.005em;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 </style>

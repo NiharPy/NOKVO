@@ -404,8 +404,8 @@ function initial(m) {
 .org-hours__day {
   min-width: 48px;
   padding: 7px 12px;
-  border-radius: 8px;
-  border: 1px solid var(--n-border, rgba(120, 120, 140, 0.3));
+  border-radius: 0;
+  border: 2px solid var(--n-border);
   background: transparent;
   color: inherit;
   font-size: 12px;
@@ -414,17 +414,17 @@ function initial(m) {
   transition: background 0.15s, border-color 0.15s;
 }
 .org-hours__day.is-on {
-  background: var(--n-brand, #4f46e5);
-  border-color: var(--n-brand, #4f46e5);
-  color: #fff;
+  background: var(--n-text);
+  border-color: var(--n-text);
+  color: var(--n-text-inverse);
 }
 .org-hours__day:disabled { cursor: default; opacity: 0.75; }
 .org-hours__times { display: flex; align-items: flex-end; gap: 14px; flex-wrap: wrap; }
 .org-hours__field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; font-weight: 600; }
 .org-hours__field input {
   padding: 7px 10px;
-  border-radius: 8px;
-  border: 1px solid var(--n-border, rgba(120, 120, 140, 0.3));
+  border-radius: 0;
+  border: 2px solid var(--n-border);
   background: transparent;
   color: inherit;
 }
@@ -445,18 +445,11 @@ function initial(m) {
   gap: 16px;
 }
 .dash__stat--hero {
-  background:
-    radial-gradient(800px 200px at 100% 0%, var(--n-brand-soft), transparent 60%),
-    var(--n-bg-elev);
+  background: var(--n-bg-elev);
   position: relative;
 }
 .dash__stat--hero::before {
-  content: '';
-  position: absolute;
-  inset: 0;
-  border-radius: inherit;
-  background: linear-gradient(135deg, rgba(99, 102, 241, 0.04), transparent 40%);
-  pointer-events: none;
+  display: none;
 }
 .dash__stat--hero .n-stat__value {
   font-size: clamp(40px, 4.2vw, 52px);
@@ -485,7 +478,7 @@ function initial(m) {
   justify-content: space-between;
   gap: 16px;
   padding: 20px 24px 18px;
-  border-bottom: 1px solid var(--n-border-subtle);
+  border-bottom: 2px solid var(--n-border);
 }
 .dash__recent-head .n-section__title { font-size: 17px; letter-spacing: -0.01em; }
 
@@ -496,7 +489,7 @@ function initial(m) {
   align-items: center;
   gap: 16px;
   padding: 12px 24px;
-  border-bottom: 1px solid var(--n-border-subtle);
+  border-bottom: 2px solid var(--n-border);
   transition: background var(--n-t-fast) var(--n-ease);
 }
 .dash__call:last-child { border-bottom: 0; }
@@ -506,15 +499,14 @@ function initial(m) {
 .dash__call-icon {
   width: 32px;
   height: 32px;
-  border-radius: 9px;
-  background: var(--n-surface-2);
-  color: var(--n-text-2);
+  border-radius: 0;
+  border: 2px solid var(--n-text);
   display: grid;
   place-items: center;
   flex-shrink: 0;
 }
-.dash__call-icon[data-kind="inbound"] { background: var(--n-brand-soft); color: var(--n-brand); }
-.dash__call-icon[data-kind="outbound"] { background: var(--n-success-soft); color: var(--n-success); }
+.dash__call-icon[data-kind="inbound"] { background: var(--n-text); color: var(--n-text-inverse); }
+.dash__call-icon[data-kind="outbound"] { background: var(--n-bg); color: var(--n-text); }
 .dash__call-meta { display: grid; line-height: 1.2; min-width: 0; }
 .dash__call-meta strong { font-size: 13.5px; font-weight: 500; color: var(--n-text); }
 .dash__call-meta span { font-size: 12px; color: var(--n-text-3); font-family: var(--n-font-mono); }
@@ -575,7 +567,7 @@ function initial(m) {
   gap: 20px;
   align-items: center;
   padding: 16px 24px;
-  border-bottom: 1px solid var(--n-border-subtle);
+  border-bottom: 2px solid var(--n-border);
   transition: background var(--n-t-fast) var(--n-ease);
 }
 .dash__roster-row:last-child { border-bottom: 0; }
@@ -640,9 +632,7 @@ function initial(m) {
 
 /* ─── Follow-up tile ───────────────────────────────── */
 .dash__followup-card {
-  background:
-    linear-gradient(135deg, rgba(99, 102, 241, 0.06), transparent 50%),
-    var(--n-bg-elev);
+  background: var(--n-bg-elev);
   display: grid;
   gap: 18px;
 }
@@ -683,14 +673,14 @@ function initial(m) {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
   gap: 0;
-  border-top: 1px solid var(--n-border-subtle);
+  border-top: 2px solid var(--n-border);
   padding-top: 16px;
 }
 .dash__followup-stats > div {
   display: grid;
   gap: 2px;
   padding: 0 16px;
-  border-right: 1px solid var(--n-border-subtle);
+  border-right: 2px solid var(--n-border);
 }
 .dash__followup-stats > div:last-child { border-right: 0; }
 .dash__followup-stats > div:first-child { padding-left: 0; }

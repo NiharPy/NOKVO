@@ -139,22 +139,55 @@ function campaignStatusTone(s) {
     <!-- Page head -->
     <header class="n-page-head n-rise">
       <span class="n-page-head__eyebrow">Outbound agent</span>
-      <div class="n-page-head__row">
-        <div>
-          <h1 class="n-page-head__title">Campaign workspace</h1>
-          <p class="n-page-head__sub">
-            Source consented leads, mint pitch prompts, and run a live tester through the same pipeline your campaigns use.
-          </p>
-        </div>
+      <div>
+        <h1 class="n-page-head__title">Campaign workspace</h1>
+        <p class="n-page-head__sub">
+          Source consented leads, mint pitch prompts, and run a live tester through the same pipeline your campaigns use.
+        </p>
+      </div>
+      <div class="outbound__head-toolbar">
+        <!-- Tabs -->
+        <nav class="outbound__tabnav" aria-label="Outbound workspace">
+          <button
+            v-for="t in tabs"
+            :key="t.id"
+            type="button"
+            class="outbound__tab-btn"
+            :class="{ 'is-active': outgoingTab === t.id }"
+            @click="setTab(t.id)"
+          >
+            <component :is="t.icon" :size="14" />
+            {{ t.label }}
+          </button>
+        </nav>
+
         <div class="outbound__head-actions">
           <button
             type="button"
-            class="n-btn n-btn--ghost n-btn--sm"
+            class="outbound__icon-btn"
+            :aria-label="isLoadingLeadSources ? 'Refreshing...' : 'Refresh workspace'"
             :disabled="isLoadingLeadSources"
             @click="loadOutgoingAgentWorkspace"
+            :title="isLoadingLeadSources ? 'Refreshing...' : 'Refresh workspace'"
           >
-            <RefreshCw :size="13" :class="{ 'n-spin': isLoadingLeadSources }" />
-            {{ isLoadingLeadSources ? 'Refreshing' : 'Refresh' }}
+            <RefreshCw :size="16" :class="{ 'n-spin': isLoadingLeadSources }" />
+          </button>
+          <button
+            v-if="isAdmin"
+            type="button"
+            class="outbound__cta outbound__cta--ghost"
+            aria-label="Connect Meta Ads"
+            @click="requestLeadOAuth('meta_ads')"
+          >
+            <span class="outbound__cta-icon">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M8 8c-2.2 0-4 1.8-4 4s1.8 4 4 4c3 0 4-4 6-4s3 4 6 4 4-1.8 4-4-1.8-4-4-4c-3 0-4 4-6 4s-3-4-6-4Z"/>
+              </svg>
+            </span>
+            <span class="outbound__cta-label">
+              <strong>Connect Meta Ads</strong>
+              <small>Facebook & Instagram</small>
+            </span>
           </button>
           <button
             v-if="isAdmin"
@@ -173,75 +206,7 @@ function campaignStatusTone(s) {
       </div>
     </header>
 
-    <!-- Connections + Form builder -->
-    <section class="outbound__intake n-rise" data-delay="1">
-      <article class="n-card outbound__sources">
-        <header class="outbound__card-head">
-          <div>
-            <h2 class="outbound__card-title">Ad connections</h2>
-            <p class="outbound__card-sub">Connect Meta (Facebook / Instagram) Lead Ads. Leads still need consent before campaigns can use them.</p>
-          </div>
-        </header>
-
-        <div class="outbound__providers">
-          <button
-            type="button"
-            class="outbound__provider"
-            aria-label="Connect Facebook Ads"
-            @click="requestLeadOAuth('meta_ads', 'facebook_ads')"
-          >
-            <span class="outbound__provider-icon outbound__provider-icon--fb">
-              <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true">
-                <path d="M22 12.07C22 6.51 17.52 2 12 2S2 6.51 2 12.07c0 5.02 3.66 9.18 8.44 9.93v-7.02H7.9v-2.91h2.54V9.86c0-2.51 1.49-3.9 3.77-3.9 1.09 0 2.24.2 2.24.2v2.47h-1.26c-1.24 0-1.63.77-1.63 1.56v1.88h2.77l-.44 2.91h-2.33V22c4.78-.75 8.44-4.91 8.44-9.93z"/>
-              </svg>
-            </span>
-            <strong>Facebook Ads</strong>
-            <span>Lead Ads via Meta</span>
-          </button>
-          <button
-            type="button"
-            class="outbound__provider"
-            aria-label="Connect Instagram Ads"
-            @click="requestLeadOAuth('meta_ads', 'instagram_ads')"
-          >
-            <span class="outbound__provider-icon outbound__provider-icon--ig">
-              <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
-                <defs>
-                  <linearGradient id="og_ig" x1="0%" y1="100%" x2="100%" y2="0%">
-                    <stop offset="0%" stop-color="#FED576"/>
-                    <stop offset="30%" stop-color="#F47133"/>
-                    <stop offset="60%" stop-color="#BC3081"/>
-                    <stop offset="100%" stop-color="#4C63D2"/>
-                  </linearGradient>
-                </defs>
-                <path fill="url(#og_ig)" d="M12 2.16c3.2 0 3.58.012 4.85.07 1.17.054 1.8.25 2.23.41.56.22.96.48 1.38.9.42.42.68.82.9 1.38.16.42.36 1.06.41 2.23.058 1.27.07 1.64.07 4.85s-.012 3.58-.07 4.85c-.054 1.17-.25 1.8-.41 2.23-.22.56-.48.96-.9 1.38-.42.42-.82.68-1.38.9-.42.16-1.06.36-2.23.41-1.27.058-1.64.07-4.85.07s-3.58-.012-4.85-.07c-1.17-.054-1.8-.25-2.23-.41a3.75 3.75 0 0 1-1.38-.9 3.75 3.75 0 0 1-.9-1.38c-.16-.42-.36-1.06-.41-2.23C2.172 15.58 2.16 15.2 2.16 12s.012-3.58.07-4.85c.054-1.17.25-1.8.41-2.23.22-.56.48-.96.9-1.38.42-.42.82-.68 1.38-.9.42-.16 1.06-.36 2.23-.41C8.42 2.172 8.8 2.16 12 2.16M12 0C8.74 0 8.33.014 7.05.072 5.78.13 4.9.336 4.14.63a5.92 5.92 0 0 0-2.14 1.39A5.92 5.92 0 0 0 .63 4.14C.336 4.9.13 5.78.072 7.05.014 8.33 0 8.74 0 12s.014 3.67.072 4.95c.058 1.27.264 2.15.558 2.91.3.79.71 1.46 1.39 2.14.68.68 1.35 1.09 2.14 1.39.76.294 1.64.5 2.91.558C8.33 23.986 8.74 24 12 24s3.67-.014 4.95-.072c1.27-.058 2.15-.264 2.91-.558a5.92 5.92 0 0 0 2.14-1.39 5.92 5.92 0 0 0 1.39-2.14c.294-.76.5-1.64.558-2.91.058-1.28.072-1.69.072-4.95s-.014-3.67-.072-4.95c-.058-1.27-.264-2.15-.558-2.91a5.92 5.92 0 0 0-1.39-2.14A5.92 5.92 0 0 0 19.86.63C19.1.336 18.22.13 16.95.072 15.67.014 15.26 0 12 0z"/>
-                <path fill="url(#og_ig)" d="M12 5.84A6.16 6.16 0 1 0 12 18.16 6.16 6.16 0 0 0 12 5.84zm0 10.16A4 4 0 1 1 12 8a4 4 0 0 1 0 8z"/>
-                <circle fill="url(#og_ig)" cx="18.41" cy="5.59" r="1.44"/>
-              </svg>
-            </span>
-            <strong>Instagram Ads</strong>
-            <span>Lead Ads via Meta</span>
-          </button>
-        </div>
-      </article>
-    </section>
-
-    <!-- Tabs -->
     <section class="n-section n-rise" data-delay="2">
-      <nav class="n-pillnav outbound__tabs" aria-label="Outbound workspace">
-        <button
-          v-for="t in tabs"
-          :key="t.id"
-          type="button"
-          class="n-pillnav__btn"
-          :class="{ 'n-pillnav__btn--active': outgoingTab === t.id }"
-          @click="setTab(t.id)"
-        >
-          <component :is="t.icon" :size="13" />
-          {{ t.label }}
-        </button>
-      </nav>
-
       <!-- Leads tab -->
       <article v-if="outgoingTab === 'leads'" class="n-card outbound__forms">
         <header class="outbound__list-head">
@@ -952,6 +917,15 @@ function campaignStatusTone(s) {
 
 <style scoped>
 /* ─── Head actions + Create campaign CTA ──────── */
+.outbound__head-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin-top: 24px;
+}
+
 .outbound__head-actions {
   display: flex;
   align-items: center;
@@ -962,10 +936,10 @@ function campaignStatusTone(s) {
 .outbound__cta {
   appearance: none;
   position: relative;
-  background: linear-gradient(135deg, #4f46e5 0%, #6366f1 50%, #818cf8 100%);
-  color: #ffffff;
-  border: 0;
-  border-radius: var(--n-r-xl);
+  background: var(--n-text);
+  color: var(--n-bg);
+  border: 2px solid var(--n-text);
+  border-radius: 0;
   padding: 9px 16px 9px 9px;
   cursor: pointer;
   display: inline-flex;
@@ -974,33 +948,30 @@ function campaignStatusTone(s) {
   text-align: left;
   font-family: var(--n-font-body);
   overflow: hidden;
-  box-shadow:
-    0 1px 0 rgba(255, 255, 255, 0.2) inset,
-    0 4px 12px -3px rgba(99, 102, 241, 0.45),
-    0 1px 2px rgba(15, 15, 20, 0.06);
+  box-shadow: 4px 4px 0 var(--n-brand);
   transition:
     transform var(--n-t-fast) var(--n-ease),
     box-shadow var(--n-t-fast) var(--n-ease);
 }
 .outbound__cta:hover {
-  transform: translateY(-1px);
-  box-shadow:
-    0 1px 0 rgba(255, 255, 255, 0.25) inset,
-    0 8px 18px -4px rgba(99, 102, 241, 0.55),
-    0 2px 4px rgba(15, 15, 20, 0.08);
+  transform: translate(-2px, -2px);
+  box-shadow: 6px 6px 0 var(--n-brand);
 }
-.outbound__cta:active { transform: translateY(0); }
+.outbound__cta:active { 
+  transform: translate(0, 0); 
+  box-shadow: 0 0 0 var(--n-brand); 
+}
 
 .outbound__cta-icon {
   width: 30px;
   height: 30px;
-  border-radius: 10px;
-  background: rgba(255, 255, 255, 0.18);
+  border-radius: 0;
+  background: var(--n-bg);
+  color: var(--n-text);
   display: grid;
   place-items: center;
   flex-shrink: 0;
-  border: 1px solid rgba(255, 255, 255, 0.18);
-  backdrop-filter: blur(8px);
+  border: 2px solid var(--n-text);
 }
 .outbound__cta-label { display: grid; gap: 0; line-height: 1.15; }
 .outbound__cta-label strong {
@@ -1008,20 +979,63 @@ function campaignStatusTone(s) {
   font-size: 13.5px;
   font-weight: 600;
   letter-spacing: -0.005em;
-  color: #ffffff;
+  color: var(--n-bg);
 }
 .outbound__cta-label small {
   font-size: 10.5px;
-  color: rgba(255, 255, 255, 0.78);
+  color: var(--n-bg);
+  opacity: 0.8;
   font-weight: 500;
   letter-spacing: -0.005em;
 }
 .outbound__cta-glow {
-  position: absolute;
-  inset: 0;
-  background:
-    linear-gradient(135deg, rgba(255, 255, 255, 0.22) 0%, transparent 40%, transparent 60%, rgba(255, 255, 255, 0.06) 100%);
-  pointer-events: none;
+  display: none;
+}
+
+.outbound__cta--ghost {
+  background: var(--n-bg);
+  color: var(--n-text);
+  box-shadow: 4px 4px 0 var(--n-text);
+}
+.outbound__cta--ghost:hover {
+  box-shadow: 6px 6px 0 var(--n-text);
+}
+.outbound__cta--ghost .outbound__cta-icon {
+  background: var(--n-text);
+  color: var(--n-bg);
+}
+.outbound__cta--ghost .outbound__cta-label strong {
+  color: var(--n-text);
+}
+.outbound__cta--ghost .outbound__cta-label small {
+  color: var(--n-text);
+}
+
+.outbound__icon-btn {
+  appearance: none;
+  background: var(--n-bg);
+  border: 2px solid var(--n-text);
+  border-radius: 0;
+  width: 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  color: var(--n-text);
+  cursor: pointer;
+  box-shadow: 2px 2px 0 var(--n-text);
+  transition: transform var(--n-t-fast) var(--n-ease), box-shadow var(--n-t-fast) var(--n-ease);
+}
+.outbound__icon-btn:hover:not(:disabled) {
+  transform: translate(-2px, -2px);
+  box-shadow: 4px 4px 0 var(--n-text);
+}
+.outbound__icon-btn:active:not(:disabled) {
+  transform: translate(0, 0);
+  box-shadow: 0 0 0 var(--n-text);
+}
+.outbound__icon-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 
 /* Reused mini-helper */
@@ -1037,13 +1051,7 @@ function campaignStatusTone(s) {
   font-size: 11.5px;
 }
 
-/* ─── Intake (sources + form builder) ─────────── */
-.outbound__intake {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 16px;
-}
-@media (max-width: 1100px) { .outbound__intake { grid-template-columns: 1fr; } }
+
 
 .outbound__card-head {
   display: flex; align-items: flex-start; justify-content: space-between; gap: 14px;
@@ -1063,56 +1071,6 @@ function campaignStatusTone(s) {
   line-height: 1.45;
 }
 
-.outbound__sources { display: grid; gap: 16px; }
-.outbound__providers {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
-  gap: 10px;
-}
-.outbound__provider {
-  appearance: none;
-  background: var(--n-bg);
-  border: 1px solid var(--n-border);
-  border-radius: var(--n-r-lg);
-  padding: 14px 12px;
-  cursor: pointer;
-  display: grid;
-  gap: 6px;
-  justify-items: center;
-  text-align: center;
-  transition: border-color var(--n-t-fast) var(--n-ease),
-              transform var(--n-t-fast) var(--n-ease),
-              box-shadow var(--n-t-fast) var(--n-ease);
-}
-.outbound__provider:hover {
-  border-color: var(--n-border-strong);
-  transform: translateY(-1px);
-  box-shadow: var(--n-shadow-sm);
-}
-.outbound__provider-icon {
-  width: 40px;
-  height: 40px;
-  border-radius: 10px;
-  background: var(--n-surface);
-  display: grid;
-  place-items: center;
-  border: 1px solid var(--n-border-subtle);
-}
-.outbound__provider-icon--fb { color: #1877F2; background: rgba(24, 119, 242, 0.06); }
-.outbound__provider-icon--ig { background: linear-gradient(135deg, #FED576, #4C63D2 90%); }
-.outbound__provider-icon--ig svg { mix-blend-mode: lighten; }
-.outbound__provider strong {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--n-text);
-  margin-top: 2px;
-}
-.outbound__provider span {
-  font-family: var(--n-font-mono);
-  font-size: 10.5px;
-  color: var(--n-text-3);
-  letter-spacing: 0.04em;
-}
 
 .outbound__nokvo-form { display: grid; gap: 16px; }
 .outbound__form-body { display: grid; gap: 12px; }
@@ -1173,12 +1131,45 @@ function campaignStatusTone(s) {
 }
 
 /* ─── Tabs / table ─────────────────────────────── */
-.outbound__tabs { align-self: flex-start; }
+.outbound__tabnav {
+  display: flex;
+  align-items: stretch;
+  background: var(--n-bg);
+  border: 2px solid var(--n-text);
+  border-radius: 0;
+  box-shadow: 4px 4px 0 var(--n-brand);
+}
+.outbound__tab-btn {
+  appearance: none;
+  background: transparent;
+  border: none;
+  border-right: 2px solid var(--n-text);
+  padding: 12px 18px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--n-font-display);
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--n-text);
+  cursor: pointer;
+  transition: background var(--n-t-fast) var(--n-ease), color var(--n-t-fast) var(--n-ease);
+}
+.outbound__tab-btn:last-child {
+  border-right: none;
+}
+.outbound__tab-btn:hover {
+  background: var(--n-surface);
+}
+.outbound__tab-btn.is-active {
+  background: var(--n-text);
+  color: var(--n-bg);
+}
 .outbound__list-head {
   display: flex; align-items: flex-start; justify-content: space-between;
   gap: 14px;
   padding: 16px 20px;
-  border-bottom: 1px solid var(--n-border-subtle);
+  border-bottom: 2px solid var(--n-text);
 }
 .outbound__list-head strong {
   font-family: var(--n-font-display);
@@ -1216,20 +1207,24 @@ function campaignStatusTone(s) {
   align-items: center;
   gap: 6px;
   padding: 5px 10px;
-  border: 1px solid var(--n-border-subtle);
-  border-radius: 999px;
+  border: 2px solid var(--n-text);
+  border-radius: 0;
   background: transparent;
   font-size: 12.5px;
-  color: var(--n-text-2, var(--n-text-3));
+  color: var(--n-text);
   cursor: pointer;
-  transition: background 0.12s, border-color 0.12s, color 0.12s;
+  transition: transform 0.1s, box-shadow 0.1s;
 }
-.outbound__form-chip:hover { border-color: var(--n-border); color: var(--n-text); }
+.outbound__form-chip:hover { 
+  transform: translate(-1px, -1px);
+  box-shadow: 2px 2px 0 var(--n-brand);
+}
 .outbound__form-chip.is-active {
-  background: var(--n-brand-soft, rgba(99, 102, 241, 0.12));
-  border-color: var(--n-brand, #6366f1);
-  color: var(--n-brand, #6366f1);
+  background: var(--n-text);
+  color: var(--n-bg);
   font-weight: 600;
+  box-shadow: 2px 2px 0 var(--n-brand);
+  transform: translate(-1px, -1px);
 }
 .outbound__form-chip-count {
   font-family: var(--n-font-mono, monospace);
@@ -1269,10 +1264,11 @@ function campaignStatusTone(s) {
   justify-content: space-between;
   gap: 12px;
   margin-bottom: 12px;
-  padding: 10px 14px;
-  border: 1px solid var(--n-brand, #6366f1);
-  border-radius: 8px;
-  background: var(--n-brand-soft, rgba(99, 102, 241, 0.1));
+  padding: 12px 16px;
+  border: 2px solid var(--n-text);
+  border-radius: 0;
+  background: var(--n-surface);
+  box-shadow: 4px 4px 0 var(--n-brand);
   font-size: 13px;
   color: var(--n-text);
 }
@@ -1319,22 +1315,23 @@ function campaignStatusTone(s) {
   gap: 12px;
   align-items: center;
   padding: 12px 20px;
-  border-bottom: 1px solid var(--n-border-subtle);
+  border-bottom: 2px solid var(--n-text);
   cursor: pointer;
-  transition: background var(--n-t-fast) var(--n-ease);
+  transition: transform var(--n-t-fast) var(--n-ease);
 }
 .outbound__lead-row:last-child { border-bottom: 0; }
-.outbound__lead-row:hover { background: var(--n-surface); }
-.outbound__lead-row.is-on { background: var(--n-brand-soft); }
+.outbound__lead-row:hover { background: var(--n-surface); transform: translateX(2px); }
+.outbound__lead-row.is-on { background: var(--n-surface); box-shadow: inset 4px 0 0 var(--n-brand); }
 .outbound__lead-row.is-off { opacity: 0.6; cursor: not-allowed; }
 .outbound__lead-icon {
   width: 30px;
   height: 30px;
-  border-radius: 8px;
+  border-radius: 0;
   background: var(--n-surface-2);
-  color: var(--n-text-2);
+  color: var(--n-text);
   display: grid;
   place-items: center;
+  border: 2px solid var(--n-text);
 }
 .outbound__lead-row strong { font-size: 13.5px; font-weight: 600; color: var(--n-text); display: block; }
 .outbound__lead-row span {
@@ -1395,9 +1392,10 @@ function campaignStatusTone(s) {
 
 .outbound__outcome {
   padding: 14px;
-  border-radius: var(--n-r-lg);
-  border: 1px solid var(--n-border);
+  border-radius: 0;
+  border: 2px solid var(--n-text);
   background: var(--n-surface);
+  box-shadow: 4px 4px 0 var(--n-brand);
   display: grid;
   gap: 8px;
 }
@@ -1423,9 +1421,11 @@ function campaignStatusTone(s) {
   display: flex; align-items: center; gap: 8px;
   padding: 10px 12px;
   background: var(--n-surface);
-  border-radius: var(--n-r-md);
+  border: 2px solid var(--n-text);
+  border-radius: 0;
+  box-shadow: 2px 2px 0 var(--n-text);
   font-size: 13px;
-  color: var(--n-text-2);
+  color: var(--n-text);
 }
 .outbound__live em { font-style: italic; flex: 1; }
 .outbound__metrics { display: flex; gap: 6px; flex-wrap: wrap; }
@@ -1437,8 +1437,9 @@ function campaignStatusTone(s) {
   gap: 8px;
   padding: 12px;
   background: var(--n-surface);
-  border: 1px solid var(--n-border-subtle);
-  border-radius: var(--n-r-md);
+  border: 2px solid var(--n-text);
+  border-radius: 0;
+  box-shadow: 2px 2px 0 var(--n-text);
 }
 .outbound__turn-side { display: grid; gap: 4px; }
 .outbound__turn-side p { margin: 0; font-size: 13px; color: var(--n-text); line-height: 1.5; }
@@ -1471,13 +1472,13 @@ function campaignStatusTone(s) {
   align-items: flex-start;
   padding: 12px;
   background: var(--n-bg);
-  border: 1px solid var(--n-border);
-  border-radius: var(--n-r-md);
+  border: 2px solid var(--n-text);
+  border-radius: 0;
   cursor: pointer;
-  transition: border-color var(--n-t-fast) var(--n-ease), background var(--n-t-fast) var(--n-ease);
+  transition: transform var(--n-t-fast) var(--n-ease), box-shadow var(--n-t-fast) var(--n-ease);
 }
-.outbound__objective:hover { border-color: var(--n-border-strong); }
-.outbound__objective.is-on { background: var(--n-brand-soft); border-color: rgba(99, 102, 241, 0.24); }
+.outbound__objective:hover { transform: translate(-2px, -2px); box-shadow: 4px 4px 0 var(--n-text); }
+.outbound__objective.is-on { background: var(--n-surface); box-shadow: inset 4px 0 0 var(--n-brand); transform: translate(0, 0); }
 .outbound__objective strong { font-size: 13px; color: var(--n-text); display: block; font-weight: 600; }
 .outbound__objective.is-on strong { color: var(--n-brand-ink); }
 .outbound__objective span { font-size: 11.5px; color: var(--n-text-3); display: block; margin-top: 2px; line-height: 1.4; }
@@ -1506,6 +1507,7 @@ function campaignStatusTone(s) {
   cursor: pointer;
   transition: background var(--n-t-fast) var(--n-ease);
   gap: 12px;
+  border-bottom: 2px solid var(--n-text);
 }
 .outbound__campaign-head:hover { background: var(--n-surface); }
 .outbound__campaign.is-open .outbound__campaign-head { background: var(--n-surface); }
@@ -1513,9 +1515,10 @@ function campaignStatusTone(s) {
 .outbound__campaign-icon {
   width: 28px;
   height: 28px;
-  border-radius: 8px;
-  background: var(--n-brand-soft);
-  color: var(--n-brand);
+  border-radius: 0;
+  background: var(--n-surface);
+  color: var(--n-text);
+  border: 2px solid var(--n-text);
   display: grid;
   place-items: center;
 }
@@ -1552,8 +1555,9 @@ function campaignStatusTone(s) {
 .outbound__prompt-block {
   padding: 10px 12px;
   background: var(--n-bg);
-  border: 1px solid var(--n-border-subtle);
-  border-radius: var(--n-r-md);
+  border: 2px solid var(--n-text);
+  border-radius: 0;
+  box-shadow: 2px 2px 0 var(--n-text);
 }
 .outbound__prompt-cap {
   font-family: var(--n-font-mono);
@@ -1577,8 +1581,9 @@ function campaignStatusTone(s) {
   display: flex; align-items: center; justify-content: space-between; gap: 10px;
   padding: 10px 12px;
   background: var(--n-bg);
-  border: 1px solid var(--n-border-subtle);
-  border-radius: var(--n-r-md);
+  border: 2px solid var(--n-text);
+  border-radius: 0;
+  box-shadow: 2px 2px 0 var(--n-text);
 }
 .outbound__attached strong { font-size: 13px; color: var(--n-text); display: block; font-weight: 600; }
 .outbound__attached span { font-family: var(--n-font-mono); font-size: 11px; color: var(--n-text-3); }

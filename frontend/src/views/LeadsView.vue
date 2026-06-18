@@ -217,6 +217,11 @@ async function toggleLeadFollowupPanel(leadId) {
                   {{ recordPhone(r) }}
                 </a>
               </div>
+              <div class="rec__col rec__col--note">
+                <span class="rec__cap">Call notes</span>
+                <blockquote v-if="recordHandoff(r)?.handoff_note">{{ recordHandoff(r).handoff_note }}</blockquote>
+                <span v-else style="font-size: 13px; color: var(--n-text-3); font-style: italic;">No notes</span>
+              </div>
               <div class="rec__col">
                 <span class="rec__cap">Follow-up</span>
                 <button
@@ -239,24 +244,7 @@ async function toggleLeadFollowupPanel(leadId) {
                 <span class="rec__time n-mono">{{ formatRelativeDate(r.created_at) || '—' }}</span>
               </div>
             </li>
-            <!-- Every lead is name + number + CALL NOTES. The post-call
-                 condenser writes a 3-sentence summary onto the record
-                 (data.handoff_note); surface it inline (read-only) for every
-                 row — agent-created and outbound-classified alike. -->
-            <li
-              v-if="recordHandoff(r)?.handoff_note"
-              class="leads__handoff-row"
-            >
-              <div class="leads__handoff-note">
-                <header>
-                  <span class="leads__handoff-cap">Call notes</span>
-                  <span class="leads__handoff-time">
-                    {{ handoffWhen(recordHandoff(r).handoff_note_generated_at) }}
-                  </span>
-                </header>
-                <blockquote>{{ recordHandoff(r).handoff_note }}</blockquote>
-              </div>
-            </li>
+
             <li
               v-if="leadDbId(r) && expandedLeadId === leadDbId(r)"
               class="leads__followup-panel"
@@ -392,15 +380,14 @@ async function toggleLeadFollowupPanel(leadId) {
 .rec__row {
   display: grid;
   grid-template-columns:
-    minmax(260px, 1.6fr)
-    minmax(100px, 0.8fr)
-    minmax(120px, 1fr)
-    minmax(110px, 0.8fr)
-    minmax(120px, 0.7fr);
+    minmax(200px, 1.2fr)
+    minmax(250px, 2fr)
+    minmax(140px, 1fr)
+    minmax(120px, 0.6fr);
   gap: 18px;
   align-items: center;
   padding: 14px 24px;
-  border-bottom: 1px solid var(--n-border-subtle);
+  border-bottom: 2px solid var(--n-border);
   transition: background var(--n-t-fast) var(--n-ease);
 }
 .rec__row:last-child { border-bottom: 0; }
@@ -418,7 +405,7 @@ async function toggleLeadFollowupPanel(leadId) {
   text-decoration: none; width: max-content;
 }
 .rec__phone:hover { text-decoration: underline; }
-.rec__col { display: grid; gap: 4px; min-width: 0; }
+.rec__col { display: grid; gap: 4px; min-width: 0; align-items: start; }
 .rec__col--right { justify-items: flex-end; text-align: right; }
 .rec__cap {
   font-family: var(--n-font-mono); font-size: 9.5px;
@@ -428,7 +415,7 @@ async function toggleLeadFollowupPanel(leadId) {
 .rec__time { font-size: 12px; color: var(--n-text-3); }
 
 @media (max-width: 1100px) {
-  .rec__row { grid-template-columns: 1fr; gap: 8px; padding: 16px 20px; }
+  .rec__row { grid-template-columns: 1fr; gap: 16px; padding: 16px 20px; }
   .rec__col--right { justify-items: flex-start; text-align: left; }
 }
 
@@ -439,9 +426,9 @@ async function toggleLeadFollowupPanel(leadId) {
   align-items: center;
   gap: 5px;
   padding: 4px 9px;
-  border-radius: 999px;
-  border: 1px solid var(--n-border);
-  background: var(--n-surface);
+  border-radius: 0;
+  border: 2px solid var(--n-border);
+  background: var(--n-bg);
   font-family: var(--n-font-body);
   font-size: 11.5px;
   font-weight: 500;
@@ -483,8 +470,8 @@ async function toggleLeadFollowupPanel(leadId) {
   gap: 10px;
   padding: 12px 24px 16px;
   background: var(--n-surface);
-  border-top: 1px solid var(--n-border-subtle);
-  border-bottom: 1px solid var(--n-border-subtle);
+  border-top: 2px solid var(--n-border);
+  border-bottom: 2px solid var(--n-border);
   animation: leadsFollowupOpen 220ms var(--n-ease);
 }
 @keyframes leadsFollowupOpen {
@@ -511,8 +498,8 @@ async function toggleLeadFollowupPanel(leadId) {
   align-items: center;
   padding: 8px 12px;
   background: var(--n-bg);
-  border: 1px solid var(--n-border-subtle);
-  border-radius: var(--n-r-md);
+  border: 2px solid var(--n-border);
+  border-radius: 0;
 }
 .leads__followup-dot {
   width: 8px;
@@ -547,49 +534,18 @@ async function toggleLeadFollowupPanel(leadId) {
   padding-top: 4px;
 }
 
-/* ─── Handoff note (post-call condenser output) ─── */
-/* Inline wrapper used for inbound leads/site-visits that have no follow-up
-   panel — surfaces the call notes directly under the record row. */
-.leads__handoff-row {
-  list-style: none;
-  padding: 0 20px 14px;
-}
-.leads__handoff-note {
-  display: grid;
-  gap: 6px;
-  padding: 12px 14px;
-  background: linear-gradient(180deg, var(--n-brand-soft) 0%, transparent 80%);
-  border: 1px solid rgba(99, 102, 241, 0.18);
-  border-radius: var(--n-r-md);
-}
-.leads__handoff-note header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-}
-.leads__handoff-cap {
-  font-family: var(--n-font-mono);
-  font-size: 10px;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-  color: var(--n-brand-ink);
-  font-weight: 600;
-}
-.leads__handoff-time {
-  font-family: var(--n-font-mono);
-  font-size: 10.5px;
-  color: var(--n-text-3);
-  letter-spacing: 0.02em;
-}
-.leads__handoff-note blockquote {
+.rec__col--note blockquote {
   margin: 0;
   padding: 0;
-  font-size: 13.5px;
-  line-height: 1.55;
+  font-size: 13px;
+  line-height: 1.45;
   color: var(--n-text);
   font-family: var(--n-font-display);
   font-style: italic;
   letter-spacing: -0.005em;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 </style>
