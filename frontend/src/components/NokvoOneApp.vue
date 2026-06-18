@@ -14,6 +14,7 @@ import {
   CalendarDays,
   CalendarOff,
   CheckCircle2,
+  ClipboardList,
   Clock,
   ChevronLeft,
   ChevronRight,
@@ -253,6 +254,10 @@ const isAuthenticating = ref(false);
 const currentPage = ref('dashboard'); // dashboard | members | tickets | leads | appointments | agent | outgoing_agent | knowledge_base
 
 const signup = ref({ org_name: '', admin_name: '', admin_email: '', password: '' });
+// Razorpay payment-gated onboarding.
+const paymentToken = ref('');
+const selectedPlan = ref('inbound_only');
+const isPaying = ref(false);
 const login = ref({ email: '', password: '' });
 const totpCode = ref('');
 const totpUri = ref('');
@@ -409,6 +414,12 @@ const campaignObjectiveLabel = (code) => {
 const campaignForm = ref(emptyCampaignForm());
 const isCreatingCampaign = ref(false);
 const isLaunchingCampaign = ref(null);
+// The tenant's allotted outbound caller-ID number + plan flag (GET /outbound-number).
+const outboundNumber = ref({ number: null, status: null, calling_enabled: false });
+// When set, the create form builds the campaign from a whole form's callable
+// leads and launches immediately ("Create & call this form"). Shape:
+// { capture_form_id, formName, callableCount }.
+const campaignFormPreset = ref(null);
 const outgoingTab = ref('campaigns');
 const leadConnections = ref([]);
 const leadForms = ref([]);
@@ -459,6 +470,62 @@ const copyNokvoFormLink = async () => {
 const selectedCallableLeads = computed(() =>
   outgoingLeads.value.filter((lead) => selectedLeadIds.value.includes(lead.id) && lead.callable),
 );
+
+// ── Leads sorted by their originating form (= campaign/project), Option A ──────
+// null = "All forms". A sentinel for leads with no capture form (manual/legacy).
+const LEAD_FORM_NONE = '__none__';
+const activeLeadFormId = ref(null);
+
+// Map capture_form_id → form name, so each lead row shows which form/project it
+// came from. Falls back to the form's provider id when unnamed.
+const formNameById = computed(() => {
+  const map = {};
+  for (const form of leadForms.value) map[form.id] = form.name || form.provider_form_id || 'Lead form';
+  return map;
+});
+const leadFormName = (lead) =>
+  (lead?.capture_form_id && formNameById.value[lead.capture_form_id]) || 'No form';
+
+// Filter chips: "All" + one per form (with live counts from the API) + an
+// "Uncategorized" bucket only when such leads exist.
+const leadFormFilters = computed(() => {
+  const chips = [{ id: null, name: 'All forms', total: outgoingLeads.value.length }];
+  for (const form of leadForms.value) {
+    chips.push({
+      id: form.id,
+      name: form.name || form.provider_form_id || 'Lead form',
+      total: form.lead_count ?? 0,
+      callable: form.callable_lead_count ?? 0,
+    });
+  }
+  const noFormCount = outgoingLeads.value.filter((l) => !l.capture_form_id).length;
+  if (noFormCount) chips.push({ id: LEAD_FORM_NONE, name: 'Uncategorized', total: noFormCount });
+  return chips;
+});
+
+// The leads shown under the active filter.
+const visibleLeads = computed(() => {
+  if (activeLeadFormId.value === null) return outgoingLeads.value;
+  if (activeLeadFormId.value === LEAD_FORM_NONE) return outgoingLeads.value.filter((l) => !l.capture_form_id);
+  return outgoingLeads.value.filter((l) => l.capture_form_id === activeLeadFormId.value);
+});
+
+const setLeadFormFilter = (id) => {
+  activeLeadFormId.value = id;
+};
+
+// Select every callable lead currently visible (i.e. in the active form) — the
+// one-click "build a campaign from this form's leads" path.
+const selectAllCallableInForm = () => {
+  const ids = visibleLeads.value.filter((l) => l.callable).map((l) => l.id);
+  const set = new Set(selectedLeadIds.value);
+  for (const id of ids) set.add(id);
+  selectedLeadIds.value = [...set];
+};
+
+const clearLeadSelection = () => {
+  selectedLeadIds.value = [];
+};
 const OUTBOUND_OBJECTIVE_OPTIONS = [
   { value: 'lead_qualification', label: 'Lead qualification' },
   { value: 'demo_booking', label: 'Demo booking' },
@@ -916,6 +983,8 @@ const toggleThemeMode = () => {
 const switchPage = (page) => {
   if (page === 'appointments' && !showAppointmentsTab.value) return;
   if (page === 'tickets' && !showTicketsTab.value) return;
+  // Ticket Board is a real-estate-only claim surface (members + admins).
+  if (page === 'ticket_board' && !isRealEstateTemplate.value) return;
   // Clinics have no Leads tab (callers land in the Customer base instead),
   // and the Customer base only exists for clinics. Swallow deep-links /
   // programmatic navigation to the wrong surface.
@@ -976,7 +1045,7 @@ const switchPage = (page) => {
   if (['leads', 'tickets', 'appointments'].includes(page)) {
     loadTabRecords(page);
   }
-  if (page === 'tickets' && isRealEstateTemplate.value) {
+  if ((page === 'tickets' || page === 'ticket_board') && isRealEstateTemplate.value) {
     refreshSiteVisitPool();
   }
   if (page === 'nokvo_connect_step2') {
@@ -1135,6 +1204,22 @@ const handleGoogleCredential = async (response) => {
   try {
     const { data } = await api.post('/google/login', { id_token: response.credential });
     if (data.provisioning) provisioning.value = data.provisioning;
+    if (data.payment_required && data.payment_token) {
+      // New org via Google — pay before resources provision. Keep the Google
+      // session (the org is pending_payment so the dashboard stays gated until
+      // payment flips it to active).
+      paymentToken.value = data.payment_token;
+      if (data.access_token && data.user) persistSession(data);
+      signup.value.admin_email = data.email || signup.value.admin_email;
+      if (!selectedPlan.value) selectedPlan.value = 'inbound_only';
+      await resumePaymentScreen();
+      return;
+    }
+    if (data.code === 'onboarding_required') {
+      persistSession(data);
+      await beginOnboardingWizard();
+      return;
+    }
     if (data.code === 'totp_setup_required') {
       setupToken.value = data.setup_token;
       infoMsg.value = data.created_via_google
@@ -1207,10 +1292,18 @@ const enterWorkspaceAfterAuth = async () => {
     await loadMyTimetable();
     return;
   }
+  // Mid-onboarding (e.g. a reload while the org is still in the wizard) → reopen
+  // the wizard at the saved step instead of the dashboard.
+  if (currentOrganization.value?.status === 'onboarding') {
+    await beginOnboardingWizard();
+    return;
+  }
   await loadBusinessTypeOptions();
   if (businessTypeRequired.value) {
-    selectedBusinessType.value = '';
-    authState.value = 'business_type_setup';
+    // Real estate is the only vertical — skip the business-type picker, assign
+    // real_estate automatically, and go straight into the real-estate wizard.
+    selectedBusinessType.value = 'real_estate';
+    await saveBusinessType();
     return;
   }
   await loadBusinessTemplate();
@@ -2568,6 +2661,40 @@ const recordScheduledDate = (record) =>
 const recordCalendarDate = (record) =>
   recordScheduledDate(record) || parseRecordDate(record?.created_at);
 
+// Real-estate site visits store the day and the clock separately
+// (visit_date="2026-06-18" + visit_time="20:00" or "8:00 PM"). A plain
+// new Date(visit_date) lands at midnight UTC — i.e. an 8 PM visit shows at
+// ~5:30 AM IST. Combine the two into a real local datetime so the calendar
+// places the visit at the hour it was actually booked. Falls back to the
+// generic chain (which already handles full-timestamp fields + created_at).
+const recordEventStart = (record) => {
+  const dateOnly = firstRecordValue(record, ['visit_date', 'preferred_date']);
+  const dm = dateOnly && /^(\d{4})-(\d{2})-(\d{2})/.exec(String(dateOnly));
+  // Only special-case when there's a date-only string AND no full timestamp.
+  const hasFullTimestamp = !!firstRecordValue(record, [
+    'scheduled_time', 'appointment_time', 'appointment_start', 'visit_at',
+    'callback_at', 'requested_time', 'scheduled_at',
+  ]);
+  if (dm && !hasFullTimestamp) {
+    const timeRaw = firstRecordValue(record, ['visit_time', 'preferred_time']);
+    let hh = 0;
+    let mm = 0;
+    // Check AM/PM FIRST: "8:00 PM" must not be read as 24-hour "8:00" (8 AM).
+    // visit_time is stored either as 24h ("20:00", from the scheduler/LLM) or
+    // 12h ("8:00 PM" / "8 p.m.", from the structured booking flow).
+    const tAmPm = timeRaw && /(\d{1,2})(?::(\d{2}))?\s*([ap])\.?\s*m\.?/i.exec(String(timeRaw));
+    const t24 = timeRaw && /^(\d{1,2}):(\d{2})/.exec(String(timeRaw));
+    if (tAmPm) {
+      hh = (Number(tAmPm[1]) % 12) + (/p/i.test(tAmPm[3]) ? 12 : 0);
+      mm = Number(tAmPm[2] || 0);
+    } else if (t24) {
+      hh = Number(t24[1]); mm = Number(t24[2]);
+    }
+    return new Date(Number(dm[1]), Number(dm[2]) - 1, Number(dm[3]), hh, mm);
+  }
+  return recordCalendarDate(record);
+};
+
 const scheduleRecordTypeLabel = (record) => {
   if (record.record_type === 'appointment') return 'Appointment';
   if (record.record_type === 'lead') return 'Lead';
@@ -2631,7 +2758,7 @@ const memberAssignedWorkItems = computed(() => {
   const sourceRecords = matchedRecords.length ? matchedRecords : fallbackRecords;
   return sourceRecords
     .map((record) => {
-      const start = recordCalendarDate(record);
+      const start = recordEventStart(record);
       const duration = assignmentForMember(member.id).appointment_duration_minutes || 30;
       const end = start ? new Date(start.getTime() + duration * 60000) : null;
       return {
@@ -2873,70 +3000,289 @@ const handleSignup = async () => {
   errorMsg.value = '';
   infoMsg.value = '';
   isAuthenticating.value = true;
-  seedProvisioningSteps();
-  authState.value = 'provisioning_running';
-
   try {
-    const response = await fetch(`${API_BASE_URL}/signup`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' },
-      body: JSON.stringify(signup.value),
-    });
-
-    if (!response.ok) {
-      let detail = `Sign up failed (HTTP ${response.status})`;
-      try {
-        const body = await response.json();
-        detail = typeof body.detail === 'string' ? body.detail : detail;
-      } catch (_) {}
-      errorMsg.value = detail;
-      authState.value = 'signup';
-      return;
-    }
-
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-    let completePayload = null;
-    let errorEvent = null;
-
-    while (true) {
-      const { value, done } = await reader.read();
-      if (value) buffer += decoder.decode(value, { stream: true });
-      const [events, remainder] = parseSseLines(buffer);
-      buffer = remainder;
-      for (const event of events) {
-        if (event.event === 'step') {
-          applyStepEvent(event);
-        } else if (event.event === 'complete') {
-          completePayload = event;
-        } else if (event.event === 'error') {
-          errorEvent = event;
-        }
-      }
-      if (done) break;
-    }
-
-    if (errorEvent) {
-      errorMsg.value = `Provisioning failed at "${errorEvent.step}": ${errorEvent.message}`;
-      if (provisioning.value) provisioning.value.provisioning_status = 'failed';
-      authState.value = 'signup';
-      return;
-    }
-    if (!completePayload) {
-      errorMsg.value = 'Sign up ended without a completion event.';
-      authState.value = 'signup';
-      return;
-    }
-    provisioning.value = completePayload.provisioning || provisioning.value;
-    if (provisioning.value) provisioning.value.provisioning_status = 'success';
-    infoMsg.value = `Verification link sent to ${signup.value.admin_email}. Click it to continue setup.`;
-    authState.value = 'check_email';
+    // Account only — NO resources provisioned yet. The org is pending_payment;
+    // resources provision after the Razorpay payment succeeds.
+    const { data } = await api.post('/signup', signup.value);
+    paymentToken.value = data.payment_token;
+    selectedPlan.value = 'inbound_only';
+    authState.value = 'payment';
   } catch (err) {
-    errorMsg.value = err?.message || 'Sign up failed.';
+    errorMsg.value = extractErrorMessage(err, 'Sign up failed.');
     authState.value = 'signup';
   } finally {
     isAuthenticating.value = false;
+  }
+};
+
+// ── Razorpay payment (monthly subscription) ──────────────────────────────────
+const loadRazorpayCheckout = () =>
+  new Promise((resolve, reject) => {
+    if (window.Razorpay) return resolve();
+    const existing = document.getElementById('razorpay-checkout-js');
+    if (existing) {
+      existing.addEventListener('load', () => resolve());
+      existing.addEventListener('error', () => reject(new Error('Failed to load Razorpay')));
+      return;
+    }
+    const s = document.createElement('script');
+    s.id = 'razorpay-checkout-js';
+    s.src = 'https://checkout.razorpay.com/v1/checkout.js';
+    s.onload = () => resolve();
+    s.onerror = () => reject(new Error('Failed to load Razorpay'));
+    document.head.appendChild(s);
+  });
+
+const continueAfterPayment = async (orgStatus) => {
+  // Post-payment → the onboarding wizard (business KYC → compliance + number →
+  // hours → projects → agent → ToS). No email-verify / MFA gate.
+  if (orgStatus === 'onboarding') {
+    await beginOnboardingWizard();
+  } else if (orgStatus === 'active') {
+    await enterWorkspaceAfterAuth();
+  } else {
+    // Legacy fallback (older orgs that still email-verify).
+    infoMsg.value = `Verification link sent to ${signup.value.admin_email || 'your email'}. Click it to continue.`;
+    authState.value = 'check_email';
+  }
+};
+
+// ── Post-payment onboarding wizard ───────────────────────────────────────────
+const ONBOARDING_STEPS = ['business_details', 'documents', 'working_hours', 'projects', 'agent', 'terms'];
+const onboardingStep = ref('business_details');
+const onboardingState = ref(null);
+const isOnboardingSaving = ref(false);
+const onboardingBusiness = ref({ legal_name: '', alias_name: '', business_pan: '', cin: '' });
+const onboardingDocs = ref({ incorporation: null, gst_or_pan: null });
+const onboardingHours = ref({ working_days: [], start_time: '09:00', end_time: '18:00', timezone: 'Asia/Kolkata' });
+const onboardingAgentName = ref('Property Assistant');
+const onboardingTerms = ref({ terms: false, privacy: false });
+const onboardingNumber = ref({ number: null, number_status: null });
+
+const onboardingStepIndex = computed(() => ONBOARDING_STEPS.indexOf(onboardingStep.value));
+
+const loadOnboardingState = async () => {
+  const { data } = await api.get('/onboarding/state', { headers: authHeader() });
+  onboardingState.value = data;
+  onboardingStep.value = data.onboarding_step && data.onboarding_step !== 'done' ? data.onboarding_step : 'terms';
+  const b = data.business_details || {};
+  onboardingBusiness.value = {
+    legal_name: b.legal_name || '',
+    alias_name: b.alias_name || '',
+    business_pan: b.business_pan || '',
+    cin: b.cin || '',
+  };
+  const wh = data.working_hours || {};
+  onboardingHours.value = {
+    working_days: wh.working_days || [],
+    start_time: wh.start_time || '09:00',
+    end_time: wh.end_time || '18:00',
+    timezone: wh.timezone || 'Asia/Kolkata',
+  };
+  if (data.agent_name) onboardingAgentName.value = data.agent_name;
+  onboardingNumber.value = { number: data.number, number_status: data.number_status };
+};
+
+const beginOnboardingWizard = async () => {
+  try {
+    await loadOnboardingState();
+    if (onboardingStep.value === 'projects') await loadProjects();
+  } catch (e) {
+    errorMsg.value = extractErrorMessage(e, 'Could not load your onboarding progress.');
+  }
+  authState.value = 'onboarding';
+};
+
+const saveOnboardingBusiness = async () => {
+  if (!onboardingBusiness.value.legal_name.trim()) {
+    errorMsg.value = 'Company legal name is required.';
+    return;
+  }
+  isOnboardingSaving.value = true;
+  errorMsg.value = '';
+  try {
+    const { data } = await api.post('/onboarding/business-details', onboardingBusiness.value, { headers: authHeader() });
+    onboardingStep.value = data.onboarding_step;
+  } catch (e) {
+    errorMsg.value = extractErrorMessage(e, 'Could not save business details.');
+  } finally {
+    isOnboardingSaving.value = false;
+  }
+};
+
+const submitOnboardingDocs = async () => {
+  if (!onboardingDocs.value.incorporation || !onboardingDocs.value.gst_or_pan) {
+    errorMsg.value = 'Upload both the certificate of incorporation and your GST or business PAN.';
+    return;
+  }
+  isOnboardingSaving.value = true;
+  errorMsg.value = '';
+  try {
+    const fd = new FormData();
+    fd.append('incorporation', onboardingDocs.value.incorporation);
+    fd.append('gst_or_pan', onboardingDocs.value.gst_or_pan);
+    const { data } = await api.post('/onboarding/documents', fd, {
+      headers: { ...authHeader(), 'Content-Type': 'multipart/form-data' },
+    });
+    onboardingNumber.value = { number: data.number, number_status: data.number_status };
+    onboardingStep.value = data.onboarding_step;
+  } catch (e) {
+    errorMsg.value = extractErrorMessage(e, 'Could not submit your documents.');
+  } finally {
+    isOnboardingSaving.value = false;
+  }
+};
+
+const saveOnboardingHours = async () => {
+  isOnboardingSaving.value = true;
+  errorMsg.value = '';
+  try {
+    const { data } = await api.post('/onboarding/working-hours', onboardingHours.value, { headers: authHeader() });
+    onboardingStep.value = data.onboarding_step;
+  } catch (e) {
+    errorMsg.value = extractErrorMessage(e, 'Could not save working hours.');
+  } finally {
+    isOnboardingSaving.value = false;
+  }
+};
+
+const finishOnboardingProjects = async () => {
+  isOnboardingSaving.value = true;
+  errorMsg.value = '';
+  try {
+    const { data } = await api.post('/onboarding/projects/done', {}, { headers: authHeader() });
+    onboardingStep.value = data.onboarding_step;
+  } catch (e) {
+    errorMsg.value = extractErrorMessage(e, 'Add at least one project before continuing.');
+  } finally {
+    isOnboardingSaving.value = false;
+  }
+};
+
+const saveOnboardingAgent = async () => {
+  isOnboardingSaving.value = true;
+  errorMsg.value = '';
+  try {
+    const { data } = await api.post('/onboarding/agent', { name: onboardingAgentName.value }, { headers: authHeader() });
+    onboardingStep.value = data.onboarding_step;
+  } catch (e) {
+    errorMsg.value = extractErrorMessage(e, 'Could not save the agent.');
+  } finally {
+    isOnboardingSaving.value = false;
+  }
+};
+
+const acceptOnboardingTerms = async () => {
+  if (!onboardingTerms.value.terms || !onboardingTerms.value.privacy) {
+    errorMsg.value = 'Please accept both the Terms of Service and the Privacy Policy.';
+    return;
+  }
+  isOnboardingSaving.value = true;
+  errorMsg.value = '';
+  try {
+    await api.post('/onboarding/terms', { terms_accepted: true, privacy_accepted: true }, { headers: authHeader() });
+    if (currentOrganization.value) currentOrganization.value.status = 'active';
+    infoMsg.value = 'Welcome to Nokvo One!';
+    await enterWorkspaceAfterAuth();
+  } catch (e) {
+    errorMsg.value = extractErrorMessage(e, 'Could not finish onboarding.');
+  } finally {
+    isOnboardingSaving.value = false;
+  }
+};
+
+const onboardingPickFile = (slot, event) => {
+  const file = event?.target?.files?.[0] || null;
+  onboardingDocs.value[slot] = file;
+};
+
+const ONBOARDING_DAYS = [
+  { key: 'mon', label: 'Mon' }, { key: 'tue', label: 'Tue' }, { key: 'wed', label: 'Wed' },
+  { key: 'thu', label: 'Thu' }, { key: 'fri', label: 'Fri' }, { key: 'sat', label: 'Sat' }, { key: 'sun', label: 'Sun' },
+];
+const toggleOnboardingDay = (day) => {
+  const days = onboardingHours.value.working_days || [];
+  onboardingHours.value.working_days = days.includes(day) ? days.filter((d) => d !== day) : [...days, day];
+};
+const onboardingStepLabel = (step) => ({
+  business_details: 'Business', documents: 'Documents', working_hours: 'Hours',
+  projects: 'Projects', agent: 'Agent', terms: 'Terms',
+}[step] || step);
+
+// Entering the payment screen on a RESUME (returning user logs back in while
+// pending_payment). Reconcile with Razorpay first: if they already paid but the
+// verify call AND webhook were both lost, /payments/status finishes provisioning
+// server-side and we skip straight ahead instead of charging them again.
+const resumePaymentScreen = async () => {
+  authState.value = 'payment';
+  if (!paymentToken.value) return;
+  try {
+    const { data } = await api.get('/payments/status', {
+      params: { payment_token: paymentToken.value },
+    });
+    if (data && data.needs_payment === false) {
+      await continueAfterPayment(data.org_status);
+    }
+  } catch (e) {
+    // Non-fatal — fall back to showing the plan cards so they can pay.
+  }
+};
+
+const startPayment = async (plan) => {
+  errorMsg.value = '';
+  infoMsg.value = '';
+  if (!paymentToken.value) {
+    errorMsg.value = 'Your payment session expired. Please sign in again.';
+    return;
+  }
+  selectedPlan.value = plan;
+  isPaying.value = true;
+  try {
+    await loadRazorpayCheckout();
+    const { data } = await api.post('/payments/create-subscription', {
+      payment_token: paymentToken.value,
+      plan,
+    });
+    const rzp = new window.Razorpay({
+      key: data.key_id,
+      subscription_id: data.subscription_id,
+      name: data.name,
+      description: data.description,
+      prefill: { email: signup.value.admin_email || '', name: signup.value.admin_name || '' },
+      theme: { color: '#4f46e5' },
+      handler: async (resp) => {
+        try {
+          const { data: vr } = await api.post('/payments/verify', {
+            payment_token: paymentToken.value,
+            razorpay_payment_id: resp.razorpay_payment_id,
+            razorpay_subscription_id: resp.razorpay_subscription_id,
+            razorpay_signature: resp.razorpay_signature,
+          });
+          // verify now returns a session so the (active) admin can drive the
+          // onboarding wizard without an email round-trip.
+          if (vr.session) persistSession(vr.session);
+          await continueAfterPayment(vr.org_status);
+        } catch (e) {
+          errorMsg.value = extractErrorMessage(e, 'Payment verification failed. If you were charged, it will be reconciled automatically.');
+        } finally {
+          isPaying.value = false;
+        }
+      },
+      modal: {
+        ondismiss: () => {
+          isPaying.value = false;
+          infoMsg.value = 'Payment cancelled. Choose a plan to continue.';
+        },
+      },
+    });
+    rzp.on('payment.failed', (resp) => {
+      errorMsg.value = resp?.error?.description || 'Payment failed. Please try again.';
+      isPaying.value = false;
+    });
+    rzp.open();
+  } catch (err) {
+    errorMsg.value = extractErrorMessage(err, 'Could not start the payment. Please try again.');
+    isPaying.value = false;
   }
 };
 
@@ -3054,9 +3400,40 @@ const handleMfaProtectedError = async (err) => {
 
 const handleLogin = async () => {
   errorMsg.value = '';
+  infoMsg.value = '';
   isAuthenticating.value = true;
   try {
     const { data } = await api.post('/login', login.value);
+    // Resume unfinished onboarding from wherever the user left off.
+    if (data.code === 'payment_required' && data.payment_token) {
+      paymentToken.value = data.payment_token;
+      signup.value.admin_email = data.email || login.value.email;
+      if (!selectedPlan.value) selectedPlan.value = 'inbound_only';
+      await resumePaymentScreen();
+      return;
+    }
+    if (data.code === 'onboarding_required') {
+      persistSession(data);
+      await beginOnboardingWizard();
+      return;
+    }
+    if (data.code === 'email_verification_required') {
+      signup.value.admin_email = data.email || login.value.email;
+      infoMsg.value = `Verify your email (${data.email || login.value.email}) to continue — check your inbox for the link.`;
+      authState.value = 'check_email';
+      return;
+    }
+    if (data.code === 'totp_verify_required' || data.mfa_pending) {
+      loginTempToken.value = data.access_token;
+      authState.value = 'login_totp';
+      return;
+    }
+    if (data.access_token && data.user) {
+      persistSession(data);
+      await enterWorkspaceAfterAuth();
+      return;
+    }
+    // Legacy fallback: treat as a TOTP temp token.
     loginTempToken.value = data.access_token;
     authState.value = 'login_totp';
   } catch (err) {
@@ -3376,7 +3753,7 @@ const myAssignedScheduleItems = computed(() => {
   const duration = Number(myTimetable.value?.assignment?.appointment_duration_minutes || 30);
   return myAssignedRecords.value
     .map((record) => {
-      const start = recordCalendarDate(record);
+      const start = recordEventStart(record);
       const end = start ? new Date(start.getTime() + duration * 60000) : null;
       return {
         id: record.id,
@@ -3420,6 +3797,21 @@ const myCalendarBlocks = computed(() => {
     .sort((a, b) => a.start.getTime() - b.start.getTime());
 });
 
+// Bucket every calendar event by its local day ONCE, so the 42-cell grid and
+// the selected-day list are O(1) lookups instead of each re-scanning the full
+// event list. Recomputes only when the underlying events change.
+const myCalendarEventsByDay = computed(() => {
+  const map = new Map();
+  for (const item of myCalendarBlocks.value) {
+    const key = localDateKey(item.start);
+    if (!key) continue;
+    const bucket = map.get(key);
+    if (bucket) bucket.push(item);
+    else map.set(key, [item]);
+  }
+  return map;
+});
+
 const myCalendarMonthLabel = computed(() => {
   const visible = dateFromKey(myCalendarVisibleMonth.value) || new Date();
   return visible.toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
@@ -3441,9 +3833,7 @@ const myCalendarDays = computed(() => {
     const date = new Date(gridStart);
     date.setDate(gridStart.getDate() + index);
     const key = localDateKey(date);
-    const itemsOnDay = myCalendarBlocks.value.filter(
-      (item) => localDateKey(item.start) === key,
-    );
+    const itemsOnDay = myCalendarEventsByDay.value.get(key) || [];
     // Separate visit count from block count so the cell badge can read
     // "1 visit + 1 block" cleanly without lumping them together.
     const visitCount = itemsOnDay.filter((i) => !i.isBlocked).length;
@@ -3476,10 +3866,8 @@ const myCalendarSelectedIsWorking = computed(() => {
   return myWorkingDayIndexes.value.has(date.getDay());
 });
 
-const myCalendarSelectedItems = computed(() =>
-  myCalendarBlocks.value.filter(
-    (item) => localDateKey(item.start) === myCalendarSelectedDate.value,
-  ),
+const myCalendarSelectedItems = computed(
+  () => myCalendarEventsByDay.value.get(myCalendarSelectedDate.value) || [],
 );
 
 const selectMyCalendarDate = (key) => {
@@ -4313,10 +4701,19 @@ const loadOutgoingLeads = async () => {
   );
 };
 
+const loadOutboundNumber = async () => {
+  try {
+    const { data } = await agentsApi.get('/outbound-number', { headers: authHeader() });
+    outboundNumber.value = data || { number: null, status: null, calling_enabled: false };
+  } catch {
+    // Non-fatal — UI falls back to "no number provisioned" / gated state.
+  }
+};
+
 const loadOutgoingAgentWorkspace = async () => {
   isLoadingLeadSources.value = true;
   try {
-    await Promise.all([loadLeadConnections(), loadLeadForms(), loadOutgoingLeads()]);
+    await Promise.all([loadLeadConnections(), loadLeadForms(), loadOutgoingLeads(), loadOutboundNumber()]);
   } catch (err) {
     errorMsg.value = extractErrorMessage(err, 'Failed to load outgoing lead sources.');
   } finally {
@@ -4480,11 +4877,17 @@ const createCampaign = async () => {
     errorMsg.value = 'Campaign name and an agent prompt are required — the prompt is what the agent reads on the call.';
     return;
   }
+  const preset = campaignFormPreset.value;
+  if (preset && !outboundNumber.value.calling_enabled) {
+    errorMsg.value = 'Outbound calling isn\'t on your plan. Upgrade to Inbound + Outbound to call leads.';
+    return;
+  }
   isCreatingCampaign.value = true;
   try {
     const fd = new FormData();
     fd.append('name', campaignForm.value.name.trim());
-    if (campaignForm.value.from_number.trim()) fd.append('from_number', campaignForm.value.from_number.trim());
+    // Caller ID is always the tenant's allotted number (resolved server-side at
+    // launch) — no free-text from_number.
     fd.append('agent_prompt', campaignForm.value.agent_prompt.trim());
     // Objectives is now a list of structured codes (site_visit / lead) from
     // the dropdown. Always send the JSON array (even when empty) so the
@@ -4500,24 +4903,61 @@ const createCampaign = async () => {
     if (campaignForm.value.followup_rules) {
       fd.append('followup_rules', JSON.stringify(campaignForm.value.followup_rules));
     }
-    if (selectedCallableLeads.value.length) {
+    // "Create & call this form": the server builds the campaign from the form's
+    // callable leads and launches it. Otherwise, attach the hand-picked selection.
+    if (preset?.capture_form_id) {
+      fd.append('capture_form_id', preset.capture_form_id);
+      fd.append('launch', 'true');
+    } else if (selectedCallableLeads.value.length) {
       fd.append('lead_ids', JSON.stringify(selectedCallableLeads.value.map((lead) => lead.id)));
     }
-    await agentsApi.post('/campaigns', fd, { headers: { ...authHeader(), 'Content-Type': 'multipart/form-data' } });
+    const { data: created } = await agentsApi.post('/campaigns', fd, { headers: { ...authHeader(), 'Content-Type': 'multipart/form-data' } });
+    const launched = preset?.capture_form_id;
     campaignForm.value = emptyCampaignForm();
     selectedLeadIds.value = [];
+    campaignFormPreset.value = null;
     showCampaignCreateForm.value = false;
     await loadCampaigns();
     await loadOutgoingLeads();
-    infoMsg.value = selectedCallableLeads.value.length
-      ? 'Campaign created with attached leads.'
-      : 'Campaign created. Attach consented leads from the card to launch later.';
+    if (launched) {
+      infoMsg.value = `Calling ${created?.total_count ?? ''} lead(s) from ${created?.from_number || 'your number'} — campaign is live.`;
+    } else {
+      infoMsg.value = selectedCallableLeads.value.length
+        ? 'Campaign created with attached leads.'
+        : 'Campaign created. Attach consented leads from the card to launch later.';
+    }
   } catch (err) {
     if (await handleMfaProtectedError(err)) return;
     errorMsg.value = extractErrorMessage(err, 'Failed to create campaign.');
   } finally {
     isCreatingCampaign.value = false;
   }
+};
+
+// "Create & call this form's leads": open the create panel preset to build +
+// launch a campaign from one form's callable leads (Option A → outbound).
+const createAndCallFromForm = (form) => {
+  if (!outboundNumber.value.calling_enabled) {
+    errorMsg.value = 'Outbound calling isn\'t on your plan. Upgrade to Inbound + Outbound to call leads.';
+    return;
+  }
+  if (!outboundNumber.value.number) {
+    errorMsg.value = 'No outbound number is provisioned for your account yet.';
+    return;
+  }
+  campaignFormPreset.value = {
+    capture_form_id: form.id,
+    formName: form.name,
+    callableCount: form.callable ?? 0,
+  };
+  campaignForm.value = emptyCampaignForm();
+  campaignForm.value.name = `${form.name} — outbound`;
+  outgoingTab.value = 'campaigns';
+  showCampaignCreateForm.value = true;
+};
+
+const cancelCampaignPreset = () => {
+  campaignFormPreset.value = null;
 };
 
 // Toggle for the (collapsed-by-default) inline create form. Keeps the
@@ -5922,6 +6362,13 @@ provideDashboardState({
   outgoingLeads,
   selectedLeadIds,
   toggleLeadSelection,
+  activeLeadFormId,
+  leadFormFilters,
+  visibleLeads,
+  setLeadFormFilter,
+  selectAllCallableInForm,
+  clearLeadSelection,
+  leadFormName,
   outboundTester,
   OUTBOUND_OBJECTIVE_OPTIONS,
   selectedTesterCampaignId,
@@ -5933,6 +6380,10 @@ provideDashboardState({
   toggleCampaignObjective,
   isCreatingCampaign,
   createCampaign,
+  outboundNumber,
+  campaignFormPreset,
+  createAndCallFromForm,
+  cancelCampaignPreset,
   expandedCampaignId,
   toggleCampaignExpansion,
   campaignObjectiveLabel,
@@ -6248,7 +6699,7 @@ provideDashboardState({
         <div v-if="authState === 'login'" class="mfa-panel">
           <div class="mfa-head">
             <strong>Sign in to Nokvo One</strong>
-            <span>Continue with Google or use your work email + password</span>
+            <span>Continue with Google or use your email + password</span>
           </div>
           <div class="google-action">
             <div v-if="authConfig?.google_login_enabled" ref="googleLoginButtonRef" class="google-button-host" :class="{ disabled: isAuthenticating }"></div>
@@ -6258,8 +6709,8 @@ provideDashboardState({
             </button>
           </div>
           <div class="auth-divider"><span>or</span></div>
-          <label class="code-label" for="nokvo-one-email">Work Email</label>
-          <input id="nokvo-one-email" v-model="login.email" class="totp-input" type="email" placeholder="you@yourcompany.com" />
+          <label class="code-label" for="nokvo-one-email">Email</label>
+          <input id="nokvo-one-email" v-model="login.email" class="totp-input" type="email" placeholder="you@gmail.com" />
           <label class="code-label" for="nokvo-one-password">Password</label>
           <input id="nokvo-one-password" v-model="login.password" class="totp-input" type="password" placeholder="••••••••" />
           <div class="mfa-actions">
@@ -6269,7 +6720,7 @@ provideDashboardState({
             </button>
           </div>
           <p class="login-help">
-            Access is restricted to organization members on an approved work email domain.
+            Access is restricted to organization members on the organization's email domain.
           </p>
         </div>
 
@@ -6280,7 +6731,7 @@ provideDashboardState({
             <span>{{ login.email }}</span>
           </div>
           <p class="login-help compact">
-            Use the authenticator linked to this work email. A different email's TOTP will not work.
+            Use the authenticator linked to this email. A different email's TOTP will not work.
           </p>
           <label class="code-label" for="nokvo-one-totp-login">6-digit code</label>
           <input
@@ -6319,7 +6770,7 @@ provideDashboardState({
           <label class="code-label" for="signup-name">Your name</label>
           <input id="signup-name" v-model="signup.admin_name" class="totp-input" type="text" placeholder="Full name" />
           <label class="code-label" for="signup-email">Work email</label>
-          <input id="signup-email" v-model="signup.admin_email" class="totp-input" type="email" placeholder="you@yourcompany.com" />
+          <input id="signup-email" v-model="signup.admin_email" class="totp-input" type="email" placeholder="you@gmail.com" />
           <label class="code-label" for="signup-password">Password</label>
           <input id="signup-password" v-model="signup.password" class="totp-input" type="password" placeholder="min 10 chars · letters + digits" />
           <div class="mfa-actions">
@@ -6353,6 +6804,56 @@ provideDashboardState({
               </li>
             </ul>
           </div>
+        </div>
+
+        <div v-else-if="authState === 'payment'" class="mfa-panel pay-panel">
+          <div class="mfa-head">
+            <strong>Choose your plan</strong>
+            <span>Billed monthly · cancel anytime</span>
+          </div>
+          <p class="login-help compact">
+            Your workspace is set up after payment. Voice minutes are billed monthly on top, at tiered usage rates.
+          </p>
+          <div class="pay-plans">
+            <button
+              type="button"
+              class="pay-plan"
+              :class="{ 'is-selected': selectedPlan === 'inbound_only' }"
+              @click="selectedPlan = 'inbound_only'"
+            >
+              <span class="pay-plan__name">Inbound Only</span>
+              <span class="pay-plan__price">₹4,499<small>/mo</small></span>
+              <span class="pay-plan__desc">Answer inbound calls with your AI agent.</span>
+            </button>
+            <button
+              type="button"
+              class="pay-plan"
+              :class="{ 'is-selected': selectedPlan === 'inbound_outbound' }"
+              @click="selectedPlan = 'inbound_outbound'"
+            >
+              <span class="pay-plan__name">Inbound + Outbound</span>
+              <span class="pay-plan__price">₹6,499<small>/mo</small></span>
+              <span class="pay-plan__desc">Inbound + outbound calling campaigns.</span>
+            </button>
+          </div>
+          <div class="pay-tiers">
+            <span class="pay-tiers__head">Per-minute usage (monthly)</span>
+            <ul>
+              <li><span>0 – 1,000 min</span><strong>₹10/min</strong></li>
+              <li><span>1,000 – 10,000 min</span><strong>₹9/min</strong></li>
+              <li><span>10,000 – 25,000 min</span><strong>₹8/min</strong></li>
+              <li><span>25,000+ min</span><strong>₹6.5/min</strong></li>
+            </ul>
+          </div>
+          <button
+            type="button"
+            class="primary-button pay-cta"
+            :disabled="isPaying"
+            @click="startPayment(selectedPlan)"
+          >
+            {{ isPaying ? 'Opening secure checkout…' : `Subscribe & Pay — ${selectedPlan === 'inbound_outbound' ? '₹6,499' : '₹4,499'}/mo` }}
+          </button>
+          <p class="login-help compact">Payments are processed securely by Razorpay.</p>
         </div>
 
         <div v-else-if="authState === 'check_email'" class="mfa-panel">
@@ -6396,10 +6897,10 @@ provideDashboardState({
             <span>{{ currentUser?.email || signup.admin_email || inviteContext?.email }}</span>
           </div>
           <p v-if="mfaSetupMode === 'session_verify'" class="login-help compact">
-            Enter the 6-digit code from the authenticator already linked to this work email.
+            Enter the 6-digit code from the authenticator already linked to this email.
           </p>
           <p v-else class="login-help compact">
-            Scan this QR with the authenticator for this work email. Your TOTP secret is encrypted at rest.
+            Scan this QR with the authenticator for this email. Your TOTP secret is encrypted at rest.
           </p>
           <div v-if="mfaSetupMode !== 'session_verify' && totpUri" class="qr-shell">
             <QrcodeVue :value="totpUri" :size="168" level="M" background="var(--surface)" foreground="#111111" />
@@ -6527,6 +7028,220 @@ provideDashboardState({
             >
               {{ outcomeWizard.isSaving ? 'Creating agent...' : 'Create my agent →' }}
             </button>
+          </div>
+        </div>
+
+        <!-- POST-PAYMENT ONBOARDING WIZARD -->
+        <div v-else-if="authState === 'onboarding'" class="mfa-panel real-estate-wizard">
+          <div class="mfa-head">
+            <strong>
+              <template v-if="onboardingStep === 'business_details'">Your business details</template>
+              <template v-else-if="onboardingStep === 'documents'">Verify your business</template>
+              <template v-else-if="onboardingStep === 'working_hours'">Set your working hours</template>
+              <template v-else-if="onboardingStep === 'projects'">Add your projects</template>
+              <template v-else-if="onboardingStep === 'agent'">Name your agent</template>
+              <template v-else>Almost done</template>
+            </strong>
+            <span>
+              <template v-if="onboardingStep === 'documents'">We file these with the carrier to allot your calling number.</template>
+              <template v-else-if="onboardingStep === 'projects'">The agent uses these to answer questions and capture site visits + leads.</template>
+              <template v-else>Step {{ onboardingStepIndex + 1 }} of {{ ONBOARDING_STEPS.length }}</template>
+            </span>
+          </div>
+
+          <ol class="real-estate-stepper">
+            <li v-for="(step, idx) in ONBOARDING_STEPS" :key="step" :class="{ active: onboardingStep === step, done: onboardingStepIndex > idx }">
+              <span class="re-step-number">{{ idx + 1 }}</span>
+              <span class="re-step-label">{{ onboardingStepLabel(step) }}</span>
+            </li>
+          </ol>
+
+          <p v-if="errorMsg" class="login-error">{{ errorMsg }}</p>
+
+          <!-- STEP 1: Business details -->
+          <div v-if="onboardingStep === 'business_details'" class="re-wizard-step">
+            <form class="re-project-form" @submit.prevent="saveOnboardingBusiness">
+              <label class="re-form-fullwidth">
+                <span>Company legal name *</span>
+                <input v-model="onboardingBusiness.legal_name" type="text" placeholder="Acme Realty Private Limited" required />
+              </label>
+              <label class="re-form-fullwidth">
+                <span>Alias / trading name</span>
+                <input v-model="onboardingBusiness.alias_name" type="text" placeholder="Acme Realty" />
+              </label>
+              <div class="re-form-row">
+                <label>
+                  <span>Company PAN</span>
+                  <input v-model="onboardingBusiness.business_pan" type="text" placeholder="ABCDE1234F" />
+                </label>
+                <label>
+                  <span>CIN</span>
+                  <input v-model="onboardingBusiness.cin" type="text" placeholder="U70100KA2020PTC123456" />
+                </label>
+              </div>
+              <div class="mfa-actions">
+                <button type="submit" class="primary-button" :disabled="isOnboardingSaving || !onboardingBusiness.legal_name.trim()">
+                  {{ isOnboardingSaving ? 'Saving…' : 'Continue →' }}
+                </button>
+              </div>
+            </form>
+          </div>
+
+          <!-- STEP 2: Documents + compliance -->
+          <div v-else-if="onboardingStep === 'documents'" class="re-wizard-step">
+            <p class="login-help compact">
+              Required for telephony compliance. Upload clear PDFs or images.
+            </p>
+            <div class="re-project-form">
+              <label class="re-form-fullwidth">
+                <span>Certificate of incorporation *</span>
+                <input type="file" accept=".pdf,.jpg,.jpeg,.png" @change="onboardingPickFile('incorporation', $event)" />
+              </label>
+              <label class="re-form-fullwidth">
+                <span>GST certificate or business PAN *</span>
+                <input type="file" accept=".pdf,.jpg,.jpeg,.png" @change="onboardingPickFile('gst_or_pan', $event)" />
+              </label>
+              <div class="mfa-actions">
+                <button type="button" class="primary-button" :disabled="isOnboardingSaving || !onboardingDocs.incorporation || !onboardingDocs.gst_or_pan" @click="submitOnboardingDocs">
+                  {{ isOnboardingSaving ? 'Submitting…' : 'Submit & allot number →' }}
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <!-- STEP 3: Working hours -->
+          <div v-else-if="onboardingStep === 'working_hours'" class="re-wizard-step">
+            <div v-if="onboardingNumber.number" class="login-help compact">
+              📞 Your calling number <strong>{{ onboardingNumber.number }}</strong>
+              <span v-if="onboardingNumber.number_status !== 'active'">— pending carrier verification</span>
+            </div>
+            <div class="re-project-form">
+              <label class="re-form-fullwidth">
+                <span>Working days</span>
+                <div class="onb-days">
+                  <button
+                    v-for="d in ONBOARDING_DAYS"
+                    :key="d.key"
+                    type="button"
+                    class="onb-day"
+                    :class="{ 'is-on': (onboardingHours.working_days || []).includes(d.key) }"
+                    @click="toggleOnboardingDay(d.key)"
+                  >{{ d.label }}</button>
+                </div>
+              </label>
+              <div class="re-form-row">
+                <label>
+                  <span>Start time</span>
+                  <input v-model="onboardingHours.start_time" type="time" />
+                </label>
+                <label>
+                  <span>End time</span>
+                  <input v-model="onboardingHours.end_time" type="time" />
+                </label>
+              </div>
+              <div class="mfa-actions">
+                <button type="button" class="primary-button" :disabled="isOnboardingSaving" @click="saveOnboardingHours">
+                  {{ isOnboardingSaving ? 'Saving…' : 'Continue →' }}
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <!-- STEP 4: Projects (with brochure analyzer) -->
+          <div v-else-if="onboardingStep === 'projects'" class="re-wizard-step">
+            <div v-if="projects.length" class="re-project-list">
+              <article v-for="project in projects" :key="project.id" class="re-project-card">
+                <div class="re-project-card-head">
+                  <strong>{{ project.name }}</strong>
+                  <div class="re-project-card-actions">
+                    <button type="button" class="ghost-button compact" @click="startEditProject(project)">Edit</button>
+                    <button type="button" class="ghost-button compact danger" :disabled="isDeletingProjectId === project.id" @click="deleteProject(project)">Remove</button>
+                  </div>
+                </div>
+                <small v-if="project.location">📍 {{ project.location }}</small>
+                <small v-if="project.price_display">💰 {{ project.price_display }}</small>
+              </article>
+            </div>
+            <p v-else class="login-help compact">No projects yet. Analyze a brochure to auto-fill, or add one manually.</p>
+
+            <label class="re-form-fullwidth onb-brochure">
+              <span>📄 Auto-fill from a brochure</span>
+              <input type="file" accept=".pdf,.docx,.doc,.txt" :disabled="isAnalyzingBrochure" @change="analyzeBrochure($event.target.files?.[0])" />
+              <small v-if="isAnalyzingBrochure">Analyzing…</small>
+            </label>
+
+            <form class="re-project-form" @submit.prevent="saveProject">
+              <h4>{{ projectDraft.id ? 'Edit project' : 'Add a project' }}</h4>
+              <div class="re-form-row">
+                <label>
+                  <span>Name *</span>
+                  <input v-model="projectDraft.name" type="text" placeholder="Skyline Heights" required />
+                </label>
+                <label>
+                  <span>Location</span>
+                  <input v-model="projectDraft.location" type="text" placeholder="HSR Layout, Bangalore" />
+                </label>
+              </div>
+              <div class="re-form-row">
+                <label>
+                  <span>Property type</span>
+                  <input v-model="projectDraft.property_type" type="text" placeholder="Apartments / Villas / Plots" />
+                </label>
+                <label>
+                  <span>Price label</span>
+                  <input v-model="projectDraft.price_display" type="text" placeholder="₹95L – ₹1.45Cr" />
+                </label>
+              </div>
+              <label class="re-form-fullwidth">
+                <span>Description / pitch</span>
+                <textarea v-model="projectDraft.description" rows="3" placeholder="Premium gated community, RERA-approved…"></textarea>
+              </label>
+              <div class="mfa-actions">
+                <button v-if="projectDraft.id" type="button" class="ghost-button" :disabled="isSavingProject" @click="startNewProject">Cancel edit</button>
+                <button type="submit" class="primary-button" :disabled="isSavingProject">
+                  {{ isSavingProject ? 'Saving…' : (projectDraft.id ? 'Update project' : 'Add project') }}
+                </button>
+              </div>
+            </form>
+
+            <div class="mfa-actions">
+              <button type="button" class="primary-button" :disabled="!projects.length || isOnboardingSaving" @click="finishOnboardingProjects">Continue →</button>
+            </div>
+          </div>
+
+          <!-- STEP 5: Name the agent -->
+          <div v-else-if="onboardingStep === 'agent'" class="re-wizard-step">
+            <p class="login-help compact">Pick a name your callers and team will hear.</p>
+            <div class="re-project-form">
+              <label class="re-form-fullwidth">
+                <span>Agent name</span>
+                <input v-model="onboardingAgentName" type="text" placeholder="Property Assistant" />
+              </label>
+              <div class="mfa-actions">
+                <button type="button" class="primary-button" :disabled="isOnboardingSaving" @click="saveOnboardingAgent">
+                  {{ isOnboardingSaving ? 'Saving…' : 'Continue →' }}
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <!-- STEP 6: Terms + Privacy -->
+          <div v-else class="re-wizard-step">
+            <div class="re-project-form">
+              <label class="onb-check">
+                <input v-model="onboardingTerms.terms" type="checkbox" />
+                <span>I accept the <a href="https://nokvo.org/terms" target="_blank" rel="noopener">Terms of Service</a>.</span>
+              </label>
+              <label class="onb-check">
+                <input v-model="onboardingTerms.privacy" type="checkbox" />
+                <span>I accept the <a href="https://nokvo.org/privacy" target="_blank" rel="noopener">Privacy Policy</a>.</span>
+              </label>
+              <div class="mfa-actions">
+                <button type="button" class="primary-button" :disabled="isOnboardingSaving || !onboardingTerms.terms || !onboardingTerms.privacy" @click="acceptOnboardingTerms">
+                  {{ isOnboardingSaving ? 'Finishing…' : 'Finish & go to dashboard →' }}
+                </button>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -7025,6 +7740,17 @@ provideDashboardState({
             >
               <CalendarDays :size="14" />
               <span>My timetable</span>
+            </button>
+            <!-- Ticket Board: members claim AI-captured site-visit requests here. -->
+            <button
+              v-if="isMemberOnly && isRealEstateTemplate"
+              type="button"
+              class="n-shell-nav__item"
+              :class="{ 'is-active': currentPage === 'ticket_board' }"
+              @click="switchPage('ticket_board')"
+            >
+              <ClipboardList :size="14" />
+              <span>Ticket Board</span>
             </button>
 
             <!-- Operations group -->
@@ -9608,6 +10334,53 @@ provideDashboardState({
   gap: 1rem;
 }
 
+/* ── Payment (Razorpay) onboarding panel ── */
+.pay-plans {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.6rem;
+}
+@media (max-width: 480px) {
+  .pay-plans { grid-template-columns: 1fr; }
+}
+.pay-plan {
+  display: grid;
+  gap: 0.25rem;
+  text-align: left;
+  padding: 0.85rem 0.9rem;
+  border-radius: 12px;
+  border: 1.5px solid var(--n-border, rgba(120,120,140,0.3));
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s, transform 0.15s;
+}
+.pay-plan:hover { transform: translateY(-1px); }
+.pay-plan.is-selected {
+  border-color: #4f46e5;
+  background: rgba(79, 70, 229, 0.08);
+}
+.pay-plan__name { font-weight: 600; font-size: 0.92rem; }
+.pay-plan__price { font-size: 1.35rem; font-weight: 700; letter-spacing: -0.02em; }
+.pay-plan__price small { font-size: 0.7rem; font-weight: 500; opacity: 0.6; }
+.pay-plan__desc { font-size: 0.74rem; opacity: 0.7; line-height: 1.3; }
+.pay-tiers {
+  border: 1px solid var(--n-border, rgba(120,120,140,0.25));
+  border-radius: 10px;
+  padding: 0.6rem 0.8rem;
+}
+.pay-tiers__head {
+  font-family: var(--n-font-mono, monospace);
+  font-size: 0.62rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  opacity: 0.55;
+}
+.pay-tiers ul { list-style: none; margin: 0.4rem 0 0; padding: 0; display: grid; gap: 0.25rem; }
+.pay-tiers li { display: flex; justify-content: space-between; font-size: 0.78rem; }
+.pay-tiers li span { opacity: 0.7; }
+.pay-cta { width: 100%; }
+
 .mfa-head {
   display: flex;
   flex-direction: column;
@@ -11814,6 +12587,17 @@ provideDashboardState({
   display: flex;
   gap: 0.3rem;
 }
+
+/* Onboarding wizard extras */
+.onb-days { display: flex; flex-wrap: wrap; gap: 6px; }
+.onb-day {
+  padding: 6px 11px; border: 1px solid rgba(95, 95, 83, 0.3); border-radius: 999px;
+  background: transparent; cursor: pointer; font-size: 12.5px;
+}
+.onb-day.is-on { background: #4f46e5; border-color: #4f46e5; color: #fff; font-weight: 600; }
+.onb-check { display: flex; align-items: flex-start; gap: 8px; font-size: 13.5px; }
+.onb-check input { margin-top: 3px; }
+.onb-brochure { border: 1px dashed rgba(79, 70, 229, 0.4); border-radius: 10px; padding: 0.7rem; background: rgba(79, 70, 229, 0.05); }
 
 .re-project-form {
   border: 1px dashed rgba(95, 95, 83, 0.25);

@@ -308,7 +308,7 @@ class AzureGroundedLLM:
             provider_status.get("llm_deployment")
             or provider_status.get("deployment_name")
             or settings.AZURE_OPENAI_AGENT_DEPLOYMENT
-            or "gpt-4-1-mini"
+            or "gpt-5-mini"
         ).strip()
         if endpoint.endswith("/responses"):
             body: dict[str, Any] = {
@@ -2904,6 +2904,50 @@ class NokvoOneVoicePipeline:
             return None
 
     @staticmethod
+    async def _resolve_inbound_project(
+        db: AsyncSession,
+        org_id: Any,
+        *,
+        candidate: str | None,
+        history: list[dict[str, str]] | None,
+    ) -> tuple[str | None, str | None]:
+        """Resolve the site-visit's project to a REAL registered project, returning
+        ``(canonical_name, project_id)``.
+
+        The captured ``FACT_PROPERTY`` is heuristic and frequently grabs agent /
+        caller phrasing ("Show You The Site", "Or Did You Mean Another") rather
+        than a real project — storing that as the project is worse than storing
+        nothing. So we (1) fuzzy-match the candidate against the catalog, then
+        (2) scan recent caller turns for a real project mention, and only return
+        a project when it actually matches a registered one. Returns
+        ``(None, None)`` rather than echo garbage back onto the ticket."""
+        try:
+            from app.services.real_estate_project_service import (
+                find_project_match,
+                load_active_projects,
+            )
+
+            projects = await load_active_projects(db, org_id)
+        except Exception:
+            return None, None
+        if not projects:
+            cand = str(candidate or "").strip()
+            return (cand or None), None
+        matched = find_project_match(projects, project_name=candidate) if candidate else None
+        if matched is None:
+            for turn in reversed((history or [])[-12:]):
+                if turn.get("role") != "user":
+                    continue
+                matched = find_project_match(projects, project_name=str(turn.get("content") or ""))
+                if matched is not None:
+                    break
+        if matched is None and len(projects) == 1:
+            matched = projects[0]
+        if matched is not None:
+            return matched.name, str(matched.id)
+        return None, None
+
+    @staticmethod
     def _deterministic_call_note(
         *,
         kind: str,
@@ -3011,12 +3055,25 @@ class NokvoOneVoicePipeline:
             data["name"] = name
         if ani:
             data["phone"] = ani
+        # Resolve the project to a REAL registered one (catalog-validated) and
+        # store it as a structured field up front — so the Ticket Board shows the
+        # correct project even when the heuristic FACT_PROPERTY captured garbage.
+        project_name, project_id = await NokvoOneVoicePipeline._resolve_inbound_project(
+            db, org_id,
+            candidate=NokvoOneVoicePipeline._captured_project(state, memory),
+            history=history or [],
+        )
+        if project_name:
+            data["project_name"] = project_name
+        if project_id:
+            data["project_id"] = project_id
         # Deterministic note up front — guarantees the ticket always carries a
         # readable note (with the visit date/time for RE_agent_scheduler) even
-        # if the post-call condenser returns None.
+        # if the post-call condenser returns None. Uses the resolved real project
+        # (never the raw heuristic capture).
         data["handoff_note"] = NokvoOneVoicePipeline._deterministic_call_note(
             kind="site_visit", name=name, ani=ani, memory=memory, history=history or [],
-            project=NokvoOneVoicePipeline._captured_project(state, memory),
+            project=project_name,
         )
         data["handoff_note_generated_at"] = datetime.now(timezone.utc).isoformat()
         data["handoff_note_source"] = "deterministic"

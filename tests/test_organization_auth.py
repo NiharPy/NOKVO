@@ -196,12 +196,14 @@ async def cleanup_founder_user():
             await db.commit()
 
 
-async def test_org_creation_rejects_personal_admin_email(client):
+async def test_org_creation_allows_personal_admin_email(client):
+    """The work-email requirement was removed — personal providers (gmail, etc.)
+    are accepted, so signup must NOT be rejected with a 'work email' 422."""
     founder = await ensure_founder_user()
-    response = await provision_org(client, founder, "Personal Email Rejected Org", admin_email="owner@gmail.com")
-    assert response.status_code == 422
-    assert "work email" in str(response.json()).lower()
-    await cleanup_org("Personal Email Rejected Org")
+    response = await provision_org(client, founder, "Personal Email Allowed Org", admin_email="owner@gmail.com")
+    body = str(response.json()).lower()
+    assert not (response.status_code == 422 and "work email" in body), body
+    await cleanup_org("Personal Email Allowed Org")
 
 
 async def test_initial_admin_only_can_login_then_admin_can_add_member(client):

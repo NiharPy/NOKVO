@@ -117,6 +117,29 @@ async def _tenant_for_user(db: AsyncSession, user: OrganizationUser) -> TenantRe
     return tr
 
 
+async def _org_for_user(db: AsyncSession, user: OrganizationUser) -> Organization:
+    res = await db.execute(select(Organization).where(Organization.id == user.organization_id))
+    org = res.scalars().first()
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    return org
+
+
+async def _require_outbound_enabled(db: AsyncSession, user: OrganizationUser) -> Organization:
+    """Gate outbound calling on the plan. Only the Inbound + Outbound plan sets
+    ``calling_enabled`` (see Razorpay payment-gated onboarding)."""
+    org = await _org_for_user(db, user)
+    if not org.calling_enabled:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Outbound calling isn't included in your plan. Upgrade to "
+                "Inbound + Outbound to launch calling campaigns."
+            ),
+        )
+    return org
+
+
 async def _tenant_by_link_id(db: AsyncSession, link_id: str) -> TenantResources | None:
     # Push the filter into Postgres so we don't pull every tenant row into
     # Python on each Exotel webhook. Still requires a JSONB GIN index for sub-
@@ -1148,7 +1171,15 @@ async def list_lead_forms(
 ):
     tr = await _tenant_for_user(db, user)
     forms = await OutgoingLeadService.list_forms(tr, db)
-    return [_form_response(form, request) for form in forms]
+    counts = await OutgoingLeadService.lead_counts_by_form(tr, db)
+    responses = []
+    for form in forms:
+        data = _form_response(form, request)
+        form_counts = counts.get(str(form.id)) or {"total": 0, "callable": 0}
+        data["lead_count"] = form_counts["total"]
+        data["callable_lead_count"] = form_counts["callable"]
+        responses.append(data)
+    return responses
 
 
 @router.post("/lead-sources/forms", status_code=status.HTTP_201_CREATED)
@@ -1242,11 +1273,14 @@ async def submit_public_nokvo_form(
 async def list_outgoing_leads(
     eligible_only: bool = False,
     limit: int = 200,
+    capture_form_id: uuid.UUID | None = None,
     user: OrganizationUser = Depends(_viewer_dep()),
     db: AsyncSession = Depends(deps.get_db),
 ):
     tr = await _tenant_for_user(db, user)
-    leads = await OutgoingLeadService.list_leads(tr, db, eligible_only=eligible_only, limit=limit)
+    leads = await OutgoingLeadService.list_leads(
+        tr, db, eligible_only=eligible_only, limit=limit, capture_form_id=capture_form_id
+    )
     return [_lead_response(lead) for lead in leads]
 
 
@@ -1594,6 +1628,17 @@ async def plivo_outbound_status(
         db,
         followup_contact=contact if is_followup else None,
     )
+    # A call just ended → refill the throttled batch (dial the next pending lead).
+    # Best-effort: handle_call_status already committed; never fail the webhook.
+    if campaign is not None and not is_followup and normalized == "call.hangup":
+        from app.services.public_url import public_base_url as _pub
+
+        await OutboundCampaignService.dial_next_pending(
+            campaign,
+            db,
+            public_base_url=_pub(request),
+            path_prefix="/api/nokvo-one/agents",
+        )
     return {"ok": True, "call_link_id": call_link_id}
 
 
@@ -1764,6 +1809,27 @@ def _parse_campaign_list_field(value: str | None) -> list[str]:
     return [str(item).strip() for item in parsed if str(item).strip()]
 
 
+@router.get("/outbound-number")
+async def outbound_number(
+    user: OrganizationUser = Depends(_viewer_dep()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """The org's allotted outbound caller-ID number + whether outbound is on its
+    plan, so the campaign UI can show "calling from <number>" read-only and gate
+    the launch/create-and-call actions."""
+    from app.services.plivo_service import PlivoService
+
+    tr = await _tenant_for_user(db, user)
+    org = await _org_for_user(db, user)
+    number = PlivoService.outbound_caller_id(tr)
+    plivo_cfg = dict((tr.provider_status or {}).get("plivo") or {})
+    return {
+        "number": number,
+        "status": plivo_cfg.get("number_status") or ("active" if number else "not_provisioned"),
+        "calling_enabled": bool(org.calling_enabled),
+    }
+
+
 @router.get("/campaigns")
 async def list_campaigns(
     user: OrganizationUser = Depends(_viewer_dep()),
@@ -1776,8 +1842,11 @@ async def list_campaigns(
 
 @router.post("/campaigns", status_code=status.HTTP_201_CREATED)
 async def create_campaign(
+    request: Request,
     name: str = Form(...),
     lead_ids: str | None = Form(None),
+    capture_form_id: str | None = Form(None),
+    launch: bool = Form(False),
     excel_file: UploadFile | None = File(None),
     doc_file: UploadFile | None = File(None),
     from_number: str | None = Form(None),
@@ -1800,8 +1869,18 @@ async def create_campaign(
     ``lead_ids`` is optional. When omitted, the campaign is created in
     prompt-only mode and consented leads can be attached later via
     ``POST /campaigns/{id}/leads``.
+
+    ``capture_form_id`` is a shortcut for "build this campaign from every
+    callable lead of one lead form" (Option A — sort leads by their
+    originating form/project). When given and ``lead_ids`` is empty, the
+    server resolves the form's callable leads itself, so it isn't bounded by
+    the leads-list page size.
     """
     tr = await _tenant_for_user(db, user)
+    # "Create & call" (launch=true): gate on the plan BEFORE creating, so we never
+    # leave a campaign that can't be launched.
+    if launch:
+        await _require_outbound_enabled(db, user)
     if not (agent_prompt or "").strip():
         raise HTTPException(
             status_code=400,
@@ -1815,6 +1894,15 @@ async def create_campaign(
         if lead_ids:
             raw_ids = json.loads(lead_ids) if lead_ids.strip().startswith("[") else [x.strip() for x in lead_ids.split(",")]
             parsed_lead_ids = [uuid.UUID(str(item)) for item in raw_ids if str(item).strip()]
+        elif capture_form_id and capture_form_id.strip():
+            parsed_lead_ids = await OutgoingLeadService.callable_lead_ids_for_form(
+                tr, db, uuid.UUID(capture_form_id.strip())
+            )
+            if not parsed_lead_ids:
+                raise OutgoingLeadServiceError(
+                    "That form has no callable leads yet (leads need call consent "
+                    "and a valid phone number). Nothing to add."
+                )
         agent_config = {
             "agent_prompt": agent_prompt,
             "objectives": _parse_campaign_list_field(objectives),
@@ -1858,32 +1946,63 @@ async def create_campaign(
         raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
+
+    # "Create & call": launch immediately (calls go out from the allotted number,
+    # throttled). The plan gate already ran above. If dialing can't start (e.g. no
+    # provisioned number), the campaign stays a draft and we surface 409.
+    if launch and campaign.contacts:
+        from app.services.public_url import public_base_url as _pub
+
+        try:
+            campaign = await OutboundCampaignService.launch_campaign(
+                campaign,
+                db,
+                public_base_url=_pub(request),
+                path_prefix="/api/nokvo-one/agents",
+                tenant_res=tr,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=_safe_detail(exc)) from exc
     return _campaign_response(campaign)
 
 
 @router.post("/campaigns/{campaign_id}/leads")
 async def attach_campaign_leads(
     campaign_id: uuid.UUID,
-    lead_ids: str = Form(...),
+    lead_ids: str | None = Form(None),
+    capture_form_id: str | None = Form(None),
     user: OrganizationUser = Depends(_admin_dep()),
     _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
     db: AsyncSession = Depends(deps.get_db),
 ):
     """Attach consented leads to an existing draft campaign.
 
-    ``lead_ids`` may be a JSON array string (``"[\"uuid\", ...]"``) or a
-    comma-separated list. Each lead must be callable + scoped to the
-    caller's tenant. Already-attached leads are silently skipped.
+    Provide either ``lead_ids`` (a JSON array string ``"[\"uuid\", ...]"`` or a
+    comma-separated list) or ``capture_form_id`` to attach every callable lead
+    of one lead form. Each lead must be callable + scoped to the caller's
+    tenant. Already-attached leads are silently skipped.
     """
     tr = await _tenant_for_user(db, user)
     campaign = await OutboundCampaignService.get_campaign(campaign_id, tr, db)
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
     try:
-        raw_ids = json.loads(lead_ids) if lead_ids.strip().startswith("[") else [
-            x.strip() for x in lead_ids.split(",")
-        ]
-        parsed = [uuid.UUID(str(item)) for item in raw_ids if str(item).strip()]
+        if lead_ids and lead_ids.strip():
+            raw_ids = json.loads(lead_ids) if lead_ids.strip().startswith("[") else [
+                x.strip() for x in lead_ids.split(",")
+            ]
+            parsed = [uuid.UUID(str(item)) for item in raw_ids if str(item).strip()]
+        elif capture_form_id and capture_form_id.strip():
+            parsed = await OutgoingLeadService.callable_lead_ids_for_form(
+                tr, db, uuid.UUID(capture_form_id.strip())
+            )
+            if not parsed:
+                raise OutgoingLeadServiceError(
+                    "That form has no callable leads yet (leads need call consent "
+                    "and a valid phone number). Nothing to add."
+                )
+        else:
+            raise OutgoingLeadServiceError("Provide lead_ids or capture_form_id.")
         campaign = await OutboundCampaignService.attach_leads(
             tr, db, campaign=campaign, lead_ids=parsed
         )
@@ -1936,6 +2055,7 @@ async def launch_campaign(
     _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
     db: AsyncSession = Depends(deps.get_db),
 ):
+    await _require_outbound_enabled(db, user)  # 403 unless on the Inbound + Outbound plan
     tr = await _tenant_for_user(db, user)
     campaign = await OutboundCampaignService.get_campaign(campaign_id, tr, db)
     if not campaign:

@@ -234,6 +234,11 @@ def compose_rag_messages(
         "answer that's already clear.\n\n"
         "# VOICE & PERSONALITY\n"
         f"{custom_guidance_section}"
+        # Inbound was missing the NON-NEGOTIABLE inventory-override directive
+        # (it was only applied outbound), so gpt-4.1-mini would hallucinate a
+        # generic portfolio. Put the override BEFORE the inventory so the model
+        # reads "ignore your priors, quote only the list" first.
+        f"{projects_override_directive}"
         f"{projects_block_section}"
         + (f"# CLINIC SERVICES\n{services_block}\n\n" if services_block else "")
         + "- Use contractions ('I'll', 'you're'). Open with quick acks ('Sure', 'Got it', 'Right'), not 'I understand your concern'.\n"

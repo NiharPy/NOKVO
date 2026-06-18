@@ -168,14 +168,15 @@ def test_signup_password_validator_requires_letter_and_digit():
         )
 
 
-def test_signup_rejects_personal_email():
-    with pytest.raises(ValidationError):
-        NokvoOneSignupRequest(
-            org_name="Acme",
-            admin_name="A",
-            admin_email="a@gmail.com",
-            password="ValidPass123",
-        )
+def test_signup_accepts_personal_email():
+    # Work-email requirement removed — personal providers (gmail, etc.) allowed.
+    req = NokvoOneSignupRequest(
+        org_name="Acme",
+        admin_name="A",
+        admin_email="a@gmail.com",
+        password="ValidPass123",
+    )
+    assert req.admin_email == "a@gmail.com"
 
 
 def test_signup_accepts_valid_payload():
@@ -190,9 +191,12 @@ def test_signup_accepts_valid_payload():
     assert req.industry is None
 
 
-def test_business_template_request_accepts_allowed_values():
-    for value in ["real_estate", "clinics", "ecommerce", "hospitality", "other"]:
-        assert NokvoOneBusinessTemplateRequest(business_type=value).business_type == value
+def test_business_template_request_accepts_only_real_estate():
+    # Real estate is the only selectable vertical now.
+    assert NokvoOneBusinessTemplateRequest(business_type="real_estate").business_type == "real_estate"
+    for value in ["clinics", "ecommerce", "hospitality", "other"]:
+        with pytest.raises(ValidationError):
+            NokvoOneBusinessTemplateRequest(business_type=value)
 
 
 def test_business_template_request_rejects_invalid_value():
@@ -496,16 +500,16 @@ def test_save_business_template_updates_organization_industry():
     db = _FakeOrgDB(organization)
     response = _run(
         nokvo_one_save_business_template(
-            NokvoOneBusinessTemplateRequest(business_type="clinics"),
+            NokvoOneBusinessTemplateRequest(business_type="real_estate"),
             user=user,
             db=db,
         )
     )
-    assert organization.industry == "clinics"
+    assert organization.industry == "real_estate"
     assert db.committed is True
-    assert response.organization.industry == "clinics"
-    assert response.business_template.value == "clinics"
-    assert "appointments" in response.business_template.tabs
+    assert response.organization.industry == "real_estate"
+    assert response.business_template.value == "real_estate"
+    assert response.business_template.tabs  # real-estate has its own tab set
 
 
 def test_me_response_includes_business_type():
@@ -1180,6 +1184,20 @@ def test_site_visit_hours_reprompt_offers_closest_slot():
     )
     assert "7:00 PM" in msg  # the closing-time suggestion
     assert "isn't possible" in msg
+
+
+def test_parse_appointment_time_handles_dotted_meridiem():
+    """STT emits dotted meridiems ("8 p.m.", "9 a. m."). These must parse like
+    "8 PM" — a prior bug raised on the dots, so the out-of-hours guard silently
+    lost the time and the agent accepted 8 PM."""
+    from app.services.nokvo_one_voice_pipeline import NokvoOneVoicePipeline
+
+    assert NokvoOneVoicePipeline._parse_appointment_time("8 p.m.") == time(20, 0)
+    assert NokvoOneVoicePipeline._parse_appointment_time("8 p.m") == time(20, 0)
+    assert NokvoOneVoicePipeline._parse_appointment_time("9 a. m.") == time(9, 0)
+    assert NokvoOneVoicePipeline._parse_appointment_time("7 p.m.") == time(19, 0)
+    # Plain forms still work.
+    assert NokvoOneVoicePipeline._parse_appointment_time("8 PM") == time(20, 0)
 
 
 def test_resolve_org_working_window_falls_back_to_member_hours():

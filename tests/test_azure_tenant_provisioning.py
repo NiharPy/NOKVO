@@ -12,7 +12,6 @@ from app.models.organization import Organization
 from app.models.organization_user import OrganizationUser
 from app.models.tenant_resources import TenantResources
 from app.core.security import get_password_hash, create_access_token
-from app.services.azure_ai_service import AzureAIService
 from app.services.qdrant_service import QdrantService
 from sqlalchemy import select, delete
 import datetime
@@ -385,46 +384,8 @@ async def test_resource_group_step_called(client, founder):
     await cleanup_org(org_name)
 
 
-@pytest.mark.asyncio
-async def test_azure_ai_resource_is_pinned_to_central_india():
-    """Test that Azure OpenAI uses a supported deployment region and payload."""
-    fake_account = MagicMock()
-    fake_account.properties.endpoint = "https://nokvo-ai-test.openai.azure.com/"
-
-    fake_client = MagicMock()
-    fake_client.accounts.begin_create.return_value.result.return_value = fake_account
-    fake_client.accounts.list_keys.return_value = MagicMock()
-    fake_client.deployments.begin_create_or_update.return_value.result.return_value = MagicMock()
-
-    with patch("app.services.azure_ai_service.settings.AZURE_SUBSCRIPTION_ID", "sub-123"), \
-         patch("app.services.azure_ai_service.settings.AZURE_OPENAI_REGION", "swedencentral"), \
-         patch("app.services.azure_ai_service.AzureAuth.get_credential", return_value=MagicMock()), \
-         patch("app.services.azure_ai_service.AzureKeyVaultService.set_secret_value", new_callable=AsyncMock), \
-         patch("app.services.azure_ai_service.CognitiveServicesManagementClient", return_value=fake_client):
-        result = await AzureAIService.provision_ai_resource(
-            rg_name="rg-nokvo-test",
-            tenant_id="tenant-123",
-            slug="tenant-test",
-            region="eastus",
-            organization_name="Tenant Test",
-            industry="Technology",
-            country_code="IN",
-        )
-
-    create_call = fake_client.accounts.begin_create.call_args.kwargs
-    deployment_call = fake_client.deployments.begin_create_or_update.call_args.kwargs
-    deployment_payload = deployment_call["deployment"]
-
-    assert create_call["account"].location == "swedencentral"
-    assert create_call["account"].properties.custom_sub_domain_name == "nokvo-ai-tenant-test"
-    assert deployment_call["deployment_name"] == "gpt-4-1-mini"
-    assert deployment_payload.sku.name == "GlobalStandard"
-    assert deployment_payload.properties.model.name == "gpt-4.1-mini"
-    assert deployment_payload.properties.model.version == "2025-04-14"
-    assert result["model"] == "gpt-4.1-mini"
-    assert result["region"] == "swedencentral"
-    assert result["deployment_name"] == "gpt-4-1-mini"
-    assert "real-time voice support agent" in result["system_prompt"]
+# NOTE: per-tenant LLM provisioning was removed — the chat/voice LLM is served by
+# the shared gpt-5-mini pool, so there is no provision_ai_resource to test.
 
 
 def test_qdrant_collection_name_is_client_scoped():

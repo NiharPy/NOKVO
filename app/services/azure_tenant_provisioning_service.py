@@ -7,14 +7,12 @@ from sqlalchemy import select
 from app.core.config import settings
 
 from app.services.azure_resource_group_service import AzureResourceGroupService
-from app.services.qdrant_service import QdrantService
 from app.services.redis_tenant_service import RedisTenantService
 from app.services.azure_blob_service import AzureBlobService
 from app.services.azure_keyvault_service import AzureKeyVaultService
 from app.services.twilio_service import TwilioService
 from app.services.soniox_stt_service import SonioxSTTService
 from app.services.soniox_tts_service import SonioxTTSService
-from app.services.azure_ai_service import AzureAIService
 from app.services.tenant_billing_service import TenantBillingService
 
 class AzureTenantProvisioningService:
@@ -132,9 +130,9 @@ class AzureTenantProvisioningService:
             # 3. Key Vault Refs
             kv_res = await run_step("key_vault_secret_refs", lambda: AzureKeyVaultService.provision_secret_refs(tenant_id))
             
-            # 4. Qdrant
-            qdrant_res = await run_step("qdrant_collection", lambda: QdrantService.provision_collection(tenant_id))
-            
+            # 4. Qdrant collection provisioning REMOVED — KB / document retrieval
+            # is retired; no per-tenant Qdrant collection is created.
+
             # 5. Redis namespace (local/shared)
             redis_res = await run_step("redis_namespace", lambda: RedisTenantService.provision_redis(tenant_id))
             
@@ -169,37 +167,30 @@ class AzureTenantProvisioningService:
                 ),
             )
 
-            # 9. Azure OpenAI GPT-4o-mini
-            ai_res = await run_step("azure_openai_gpt4o_mini", lambda: AzureAIService.provision_ai_resource(
-                rg_name=rg_name, tenant_id=tenant_id, slug=slug, region=region,
-                organization_name=organization_name, industry=industry, country_code=country_code,
-                secret_refs=kv_res,
-            ))
-            
+            # 9. LLM — NOT provisioned per-tenant. The chat/voice LLM is served by
+            # the shared gpt-5-mini pool (app.services.llm_pool); there is no
+            # per-tenant Azure OpenAI deployment.
+
             # === Determine final status ===
             has_failures = any(s["status"] == "failed" for s in steps)
             final_status = "partial" if has_failures else "success"
             
             # === Build provider_status ===
             provider_status = {
-                "qdrant_status": "provisioned" if qdrant_res else "pending",
-                "qdrant_collection": qdrant_res,
-                "qdrant_url_ref": QdrantService.cluster_ref() if qdrant_res else None,
-                "llm_status": ai_res.get("status", "pending") if ai_res else (
-                    "failed" if get_step_status("azure_openai_gpt4o_mini") == "failed"
-                    else existing_provider_status.get("llm_status", "pending")
-                ),
-                "llm_provider": "azure_openai",
-                "llm_model": ai_res.get("model") if ai_res else existing_provider_status.get("llm_model", "gpt-4.1-mini"),
-                "llm_endpoint": ai_res.get("endpoint") if ai_res else existing_provider_status.get("llm_endpoint"),
-                "llm_account": ai_res.get("account_name") if ai_res else existing_provider_status.get("llm_account"),
-                "llm_api_key_ref": ai_res.get("api_key_ref") if ai_res else (
-                    (kv_res.get("llm_api_key", {}) if kv_res else {}).get("secret_name")
-                    or existing_provider_status.get("llm_api_key_ref")
-                ),
-                "llm_api_key_stored": ai_res.get("api_key_stored", False) if ai_res else existing_provider_status.get("llm_api_key_stored", False),
-                "llm_system_prompt": ai_res.get("system_prompt") if ai_res else existing_provider_status.get("llm_system_prompt"),
-                "llm_error": get_step_message("azure_openai_gpt4o_mini") if get_step_status("azure_openai_gpt4o_mini") == "failed" else None,
+                "qdrant_status": "retired",
+                "qdrant_collection": None,
+                "qdrant_url_ref": None,
+                # LLM is served by the shared gpt-5-mini pool — no per-tenant
+                # Azure OpenAI account/deployment/key is provisioned.
+                "llm_status": "pooled",
+                "llm_provider": "pool",
+                "llm_model": "gpt-5-mini",
+                "llm_endpoint": None,
+                "llm_account": None,
+                "llm_api_key_ref": None,
+                "llm_api_key_stored": False,
+                "llm_system_prompt": None,
+                "llm_error": None,
                 "stt_status": stt_res.get("stt_status", "pending_credentials") if stt_res else existing_provider_status.get("stt_status", "pending_credentials"),
                 "stt_provider": stt_res.get("stt_provider") if stt_res else existing_provider_status.get("stt_provider", "soniox"),
                 "stt_model": stt_res.get("stt_model") if stt_res else existing_provider_status.get("stt_model", settings.SONIOX_STT_MODEL),
@@ -237,8 +228,6 @@ class AzureTenantProvisioningService:
                 record.cleanup_required = has_failures
                 record.provider_status = provider_status
                 if rg_res: record.azure_resource_group_name = rg_res
-                if qdrant_res: record.qdrant_collection_name = qdrant_res
-                if qdrant_res: record.qdrant_url_ref = QdrantService.cluster_ref()
                 if redis_res: record.redis_namespace = redis_res
                 record.redis_host = None
                 record.redis_port = None
@@ -258,8 +247,8 @@ class AzureTenantProvisioningService:
                     organization_id=organization_id,
                     azure_resource_group_name=rg_res if rg_res else rg_name,
                     azure_region=region,
-                    qdrant_collection_name=qdrant_res,
-                    qdrant_url_ref=QdrantService.cluster_ref() if qdrant_res else None,
+                    qdrant_collection_name=None,
+                    qdrant_url_ref=None,
                     redis_namespace=redis_res,
                     redis_host=None,
                     redis_port=None,

@@ -26,17 +26,36 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.call_cost import CallCost
 from app.services.call_cost_calculator import (
-    RUPEES_PER_SECOND,
     CostBreakdown,
+    rupees_per_second_for,
 )
 
 
 logger = logging.getLogger(__name__)
+
+
+async def _month_to_date_minutes(db: AsyncSession, org_uuid, now: datetime) -> Decimal:
+    """The org's billed MINUTES so far this calendar month (UTC) — used to pick
+    the post-paid usage tier for this call. Best-effort: 0 on any error."""
+    month_start = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
+    try:
+        res = await db.execute(
+            select(func.coalesce(func.sum(CallCost.duration_seconds), 0)).where(
+                CallCost.organization_id == org_uuid,
+                CallCost.started_at >= month_start,
+            )
+        )
+        seconds = Decimal(str(res.scalar() or 0))
+        return seconds / Decimal("60")
+    except Exception:
+        logger.debug("NOKVO-COST: month-to-date minutes query failed", exc_info=True)
+        return Decimal("0")
 
 
 _CALL_KINDS = {"inbound", "outbound", "tester"}
@@ -92,8 +111,13 @@ async def record_call_cost(
         )
         duration_seconds = 0.0
 
+    # Tiered post-paid rate: pick from this org's month-to-date minutes, compute
+    # the cost at that rate, and persist the rate per row (so historical totals
+    # stay reproducible across tier changes — like the old flat rate did).
+    month_minutes = await _month_to_date_minutes(db, org_uuid, datetime.now(timezone.utc))
+    rate_per_second = rupees_per_second_for(month_minutes)
     try:
-        breakdown = CostBreakdown.for_duration(duration_seconds)
+        breakdown = CostBreakdown.for_duration_at_rate(duration_seconds, rate_per_second)
     except (TypeError, ValueError):
         logger.exception(
             "NOKVO-COST: cost calculator rejected duration %r for call_id=%s",
@@ -116,7 +140,7 @@ async def record_call_cost(
             campaign_id=campaign_uuid,
             duration_seconds=breakdown.seconds,
             rupees=breakdown.rupees,
-            rate_per_second=RUPEES_PER_SECOND.quantize(Decimal("0.000001")),
+            rate_per_second=rate_per_second.quantize(Decimal("0.000001")),
             started_at=started_at,
             ended_at=ended_at,
             trace_id=trace_id,

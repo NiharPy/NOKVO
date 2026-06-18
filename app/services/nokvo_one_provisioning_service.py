@@ -31,9 +31,7 @@ import redis.asyncio as redis_async
 from app.core.config import settings
 from app.services.azure_blob_service import AzureBlobService
 from app.services.azure_keyvault_service import AzureKeyVaultService
-from app.services.azure_openai_chat_service import AzureOpenAIChatService
 from app.services.azure_resource_group_service import AzureResourceGroupService
-from app.services.qdrant_service import QdrantService
 from app.services.redis_tenant_service import RedisTenantService
 
 
@@ -54,15 +52,6 @@ def _slug(name: str) -> str:
     slug = re.sub(r"[^a-z0-9\s-]", "", (name or "tenant").lower())
     slug = re.sub(r"[\s-]+", "-", slug).strip("-")
     return slug[:24] or "tenant"
-
-
-async def _delete_qdrant_collection(name: str) -> None:
-    try:
-        client = QdrantService._client()
-        if client.collection_exists(name):
-            client.delete_collection(name)
-    except Exception:
-        logger.exception("Failed to delete Qdrant collection %s during rollback", name)
 
 
 async def _delete_redis_namespace(namespace: str) -> None:
@@ -130,8 +119,6 @@ class NokvoOneProvisioningService:
             for kind, payload in reversed(rollback_actions):
                 if kind == "blob":
                     await _delete_blob_prefix(payload)
-                elif kind == "qdrant":
-                    await _delete_qdrant_collection(payload)
                 elif kind == "redis":
                     await _delete_redis_namespace(payload)
                 elif kind in ("plivo_number", "plivo_application", "plivo_subaccount"):
@@ -163,16 +150,8 @@ class NokvoOneProvisioningService:
             await rollback()
             raise NokvoOneProvisioningError("blob_prefix", str(exc), exc) from exc
 
-        # ── Step 2: Qdrant collection ────────────────────────────────────────
-        await _emit(on_step, "qdrant_collection", "running")
-        try:
-            qdrant_collection = await QdrantService.provision_collection(tenant_id)
-            rollback_actions.append(("qdrant", qdrant_collection))
-            await _emit(on_step, "qdrant_collection", "success")
-        except Exception as exc:
-            await _emit(on_step, "qdrant_collection", "failed", str(exc))
-            await rollback()
-            raise NokvoOneProvisioningError("qdrant_collection", str(exc), exc) from exc
+        # Qdrant collection provisioning REMOVED — the Knowledge Base / document
+        # retrieval is retired, so no per-tenant Qdrant collection is created.
 
         # ── Step 3: Redis namespace ──────────────────────────────────────────
         await _emit(on_step, "redis_namespace", "running")
@@ -222,17 +201,13 @@ class NokvoOneProvisioningService:
                 "application_id": app_id,
                 "answer_url": answer_url,
             })
-            try:
-                rented = await PlivoService.rent_number(
-                    country=settings.PLIVO_NUMBER_COUNTRY, app_id=app_id, sub_auth_id=sub["auth_id"]
-                )
-                rollback_actions.append(("plivo_number", rented["number"]))
-                plivo_record["number"] = rented["number"]
-                plivo_record["number_status"] = "active"
-                await _emit(on_step, "plivo_telephony", "success")
-            except PlivoError as num_exc:
-                # DID not instantly rentable (India KYC/regulatory) — leave pending.
-                await _emit(on_step, "plivo_telephony", "pending_number", str(num_exc))
+            # The number is NOT rented here. It's allotted during onboarding,
+            # AFTER the Plivo compliance application is filed with the business's
+            # KYC documents (India regulatory) — see PlivoComplianceService and
+            # the onboarding `documents` step. Leave the subaccount + application
+            # provisioned, number pending compliance.
+            plivo_record["number_status"] = "pending_compliance"
+            await _emit(on_step, "plivo_telephony", "pending_compliance")
         except Exception as exc:  # noqa: BLE001 — never block signup on telephony
             await _emit(on_step, "plivo_telephony", "pending_credentials", str(exc))
 
@@ -250,8 +225,8 @@ class NokvoOneProvisioningService:
             "stt_status": "global",
             "tts_provider": "sarvam",
             "tts_status": "global",
-            "qdrant_status": "provisioned",
-            "qdrant_url_ref": QdrantService.cluster_ref(),
+            "qdrant_status": "retired",
+            "qdrant_url_ref": None,
             "redis_status": "provisioned",
             "redis_mode": "shared",
             "plivo": plivo_record,
@@ -266,8 +241,8 @@ class NokvoOneProvisioningService:
             "tenant_id": tenant_id,
             "azure_resource_group_name": None,
             "azure_region": region,
-            "qdrant_collection_name": qdrant_collection,
-            "qdrant_url_ref": QdrantService.cluster_ref(),
+            "qdrant_collection_name": None,
+            "qdrant_url_ref": None,
             "redis_namespace": redis_namespace,
             "storage_account_name": blob_result.get("storage_account_name"),
             "storage_container_name": blob_result.get("container_name"),
@@ -276,7 +251,6 @@ class NokvoOneProvisioningService:
             "provisioning_status": "success",
             "provisioning_steps": [
                 {"name": "blob_prefix", "status": "success"},
-                {"name": "qdrant_collection", "status": "success"},
                 {"name": "redis_namespace", "status": "success"},
                 {"name": "plivo_telephony", "status": plivo_record["status"]},
             ],

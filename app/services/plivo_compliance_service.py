@@ -1,0 +1,207 @@
+"""Plivo compliance (India KYC) + number allotment for onboarding.
+
+India local DIDs are gated behind a regulatory **compliance application**: an
+End User (the business), a set of uploaded **Compliance Documents** (incorporation
+certificate + GST/business-PAN), and a **Compliance Application** tying them to the
+number type. Plivo then reviews the application (async — hours to days). We file
+everything, auto-allot a number immediately, and leave it ``pending_compliance``
+until Plivo approves (a later poll/webhook flips it ``active``).
+
+Everything is recorded under ``TenantResources.provider_status["plivo"]["compliance"]``
+and the call is **idempotent** — re-running a step reuses stored ids instead of
+creating duplicate end users / applications.
+
+The exact ``document_type_id``s + required meta fields are discovered at runtime
+from ``GET /ComplianceDocumentType/`` (they differ per country/number type and can
+change), so this service maps our two document kinds onto whatever Plivo returns by
+name heuristics rather than hard-coding ids.
+"""
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
+
+from app.core.config import settings
+from app.models.tenant_resources import TenantResources
+from app.services.plivo_service import PlivoError, PlivoService
+
+logger = logging.getLogger(__name__)
+
+# Heuristics to map our collected docs onto Plivo's returned document types.
+_DOC_KIND_KEYWORDS = {
+    "incorporation": ("incorporation", "registration", "business_registration", "certificate"),
+    "gst_or_pan": ("gst", "pan", "tax", "tin"),
+}
+
+
+class PlivoComplianceService:
+    @staticmethod
+    def _compliance_record(tenant_res: TenantResources) -> dict[str, Any]:
+        plivo = dict((tenant_res.provider_status or {}).get("plivo") or {})
+        return dict(plivo.get("compliance") or {})
+
+    @staticmethod
+    def _save(tenant_res: TenantResources, *, compliance: dict, number: str | None, number_status: str) -> None:
+        provider_status = dict(tenant_res.provider_status or {})
+        plivo = dict(provider_status.get("plivo") or {})
+        plivo["compliance"] = compliance
+        if number is not None:
+            plivo["number"] = number
+        plivo["number_status"] = number_status
+        provider_status["plivo"] = plivo
+        tenant_res.provider_status = provider_status
+        flag_modified(tenant_res, "provider_status")
+
+    @classmethod
+    async def _resolve_document_types(cls, auth: tuple[str, str], base: str) -> list[dict[str, Any]]:
+        """Plivo's India business document types (id + name)."""
+        try:
+            data = await PlivoService._request(
+                "GET",
+                f"{base}/ComplianceDocumentType/?country_iso=IN&number_type=local&end_user_type=business",
+                auth=auth,
+            )
+            return data.get("objects") or data.get("compliance_document_types") or data.get("data") or []
+        except PlivoError:
+            logger.warning("PLIVO-COMPLIANCE: could not list document types", exc_info=True)
+            return []
+
+    @staticmethod
+    def _match_type_id(doc_types: list[dict], kind: str) -> str | None:
+        keywords = _DOC_KIND_KEYWORDS.get(kind, ())
+        for dt in doc_types:
+            name = str(dt.get("document_name") or dt.get("name") or "").lower()
+            if any(k in name for k in keywords):
+                return str(dt.get("document_type_id") or dt.get("id") or "")
+        return None
+
+    @classmethod
+    async def submit_compliance_and_allot_number(
+        cls,
+        tenant_res: TenantResources,
+        db: AsyncSession,
+        *,
+        legal_name: str,
+        alias_name: str | None,
+        business_pan: str | None,
+        cin: str | None,
+        documents: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """File the compliance application + allot a number. Idempotent.
+
+        ``documents`` = ``[{"kind","filename","content"(bytes),"content_type"}, ...]``.
+        Returns the persisted compliance record + number/number_status. Best-effort:
+        any Plivo failure is captured into ``compliance["error"]`` and the number is
+        left ``pending_compliance`` so onboarding can still proceed.
+        """
+        plivo_cfg = dict((tenant_res.provider_status or {}).get("plivo") or {})
+        sub_auth_id = plivo_cfg.get("subaccount_auth_id")
+        app_id = plivo_cfg.get("application_id")
+        record = cls._compliance_record(tenant_res)
+
+        # Fully done already → no-op (idempotent).
+        if record.get("application_id") and plivo_cfg.get("number"):
+            return {"compliance": record, "number": plivo_cfg.get("number"), "number_status": plivo_cfg.get("number_status")}
+
+        try:
+            auth = PlivoService._master_auth()
+        except PlivoError as exc:
+            record["error"] = str(exc)
+            cls._save(tenant_res, compliance=record, number=None, number_status="pending_compliance")
+            await db.commit()
+            return {"compliance": record, "number": None, "number_status": "pending_compliance"}
+
+        base = PlivoService._base(auth[0])
+        number: str | None = plivo_cfg.get("number")
+        number_status = "pending_compliance"
+
+        try:
+            doc_types = await cls._resolve_document_types(auth, base)
+
+            # 1) End user (the business). Reuse if already created.
+            if not record.get("end_user_id"):
+                eu = await PlivoService._request(
+                    "POST",
+                    f"{base}/EndUser/",
+                    auth=auth,
+                    json_body={
+                        "name": legal_name[:120],
+                        "last_name": (alias_name or legal_name)[:120],
+                        "end_user_type": "business",
+                    },
+                )
+                record["end_user_id"] = str(eu.get("end_user_id") or eu.get("id") or "")
+            end_user_id = record["end_user_id"]
+
+            # 2) Upload each document (skip ones already uploaded by kind).
+            uploaded = dict(record.get("document_ids") or {})
+            for doc in documents:
+                kind = doc.get("kind")
+                if not kind or kind in uploaded:
+                    continue
+                type_id = cls._match_type_id(doc_types, kind) or ""
+                data = {
+                    "end_user_id": end_user_id,
+                    "document_type_id": type_id,
+                    "alias": f"{kind}-{legal_name}"[:120],
+                    "business_name": legal_name,
+                }
+                if business_pan:
+                    data["pan"] = business_pan
+                if cin:
+                    data["cin"] = cin
+                files = {
+                    "file": (
+                        doc.get("filename") or f"{kind}.pdf",
+                        doc.get("content") or b"",
+                        doc.get("content_type") or "application/octet-stream",
+                    )
+                }
+                up = await PlivoService._request_multipart(
+                    f"{base}/ComplianceDocument/", auth=auth, data=data, files=files
+                )
+                uploaded[kind] = str(up.get("document_id") or up.get("id") or "")
+            record["document_ids"] = uploaded
+
+            # 3) Compliance application tying end user + documents to the number type.
+            if not record.get("application_id"):
+                app = await PlivoService._request(
+                    "POST",
+                    f"{base}/ComplianceApplication/",
+                    auth=auth,
+                    json_body={
+                        "end_user_id": end_user_id,
+                        "document_ids": [v for v in uploaded.values() if v],
+                        "country_iso": "IN",
+                        "number_type": "local",
+                        "phone_number_type": "local",
+                        "alias": legal_name[:120],
+                    },
+                )
+                record["application_id"] = str(app.get("compliance_application_id") or app.get("id") or "")
+            record["status"] = "submitted"
+            record.pop("error", None)
+
+            # 4) Auto-allot a number (linked to the tenant's app + subaccount). India
+            # DIDs may not be instantly rentable pre-approval → leave pending.
+            if not number:
+                try:
+                    rented = await PlivoService.rent_number(
+                        country=settings.PLIVO_NUMBER_COUNTRY, app_id=app_id, sub_auth_id=sub_auth_id
+                    )
+                    number = rented.get("number")
+                    number_status = "active" if number else "pending_compliance"
+                except PlivoError as num_exc:
+                    logger.info("PLIVO-COMPLIANCE: number not instantly rentable: %s", num_exc)
+                    number_status = "pending_compliance"
+        except PlivoError as exc:
+            logger.warning("PLIVO-COMPLIANCE: submit failed: %s", exc)
+            record["error"] = str(exc)[:300]
+
+        record["number"] = number
+        cls._save(tenant_res, compliance=record, number=number, number_status=number_status)
+        await db.commit()
+        return {"compliance": record, "number": number, "number_status": number_status}

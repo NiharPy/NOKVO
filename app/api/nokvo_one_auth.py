@@ -340,20 +340,24 @@ async def _enforce_signup_attempt_quotas(db: AsyncSession, email: str, domain: s
             detail="Too many signup attempts for this email in the last 24 hours",
         )
 
-    # Domain quota: still uses a trailing-wildcard LIKE (no index can serve
-    # that), but at minimum we count in the DB instead of pulling every
-    # matching row across the wire and len()-ing it in Python.
-    domain_res = await db.execute(
-        select(sa_func.count(EmailVerification.id)).where(
-            EmailVerification.email.like(f"%@{domain}"),
-            EmailVerification.created_at >= window_start,
+    # Domain quota — SKIPPED for personal/shared providers (gmail.com, etc.),
+    # since those are shared by countless unrelated users and a per-domain cap
+    # would throttle all of them together. The per-email cap above still guards
+    # single-address abuse. Company domains keep the per-domain cap.
+    from app.core.email_policy import PERSONAL_EMAIL_DOMAINS
+
+    if domain not in PERSONAL_EMAIL_DOMAINS:
+        domain_res = await db.execute(
+            select(sa_func.count(EmailVerification.id)).where(
+                EmailVerification.email.like(f"%@{domain}"),
+                EmailVerification.created_at >= window_start,
+            )
         )
-    )
-    if (domain_res.scalar() or 0) >= 10:
-        raise HTTPException(
-            status_code=429,
-            detail="Too many signup attempts for this email domain in the last 24 hours",
-        )
+        if (domain_res.scalar() or 0) >= 10:
+            raise HTTPException(
+                status_code=429,
+                detail="Too many signup attempts for this email domain in the last 24 hours",
+            )
 
 
 # ─────────── Signup ───────────
@@ -365,185 +369,81 @@ def _sse(event_type: str, data: dict) -> bytes:
     return f"data: {payload}\n\n".encode("utf-8")
 
 
-@router.post("/signup")
+@router.post("/signup", response_model=NokvoOneSignupResponse)
 @limiter.limit("5/hour")
 async def nokvo_one_signup(
     request: Request,
     payload: NokvoOneSignupRequest,
     db: AsyncSession = Depends(deps.get_db),
 ):
-    """Streaming signup: each provisioning step is reported via Server-Sent Events.
+    """Create the account ONLY — no resources are provisioned yet.
 
-    The HTTP response stays open for ~60-90s while Azure provisions resources.
-    Events:
-      step       — { name, status, message? }   status ∈ {running, success, failed, skipped_no_*}
-      complete   — { provisioning: {...}, organization_id, admin_user_id, email, org_status }
-      error      — { step, message }            sent on rollback; no DB row persisted
+    The org lands in ``pending_payment``. The frontend then opens the Razorpay
+    payment screen (authorized by the returned ``payment_token``); resources are
+    provisioned after payment succeeds (see ``nokvo_one_payments``). Email
+    verification + MFA continue as before, *after* payment.
     """
     email = normalize_email(payload.admin_email)
     domain = extract_email_domain(email)
 
-    # Pre-flight validation — runs BEFORE we open the stream so rejections come back
-    # as proper HTTP errors instead of mid-stream events.
-    existing_org_by_domain = await _lookup_org_by_domain(db, domain)
-    if existing_org_by_domain is not None:
-        raise HTTPException(
-            status_code=409,
-            detail="A Nokvo One organization already exists for this work-email domain",
-        )
+    # No per-domain uniqueness — orgs are NOT tied to email domains (many can
+    # share gmail.com). The account is unique by EMAIL only.
     await _enforce_signup_attempt_quotas(db, email, domain)
     existing_user = await db.execute(select(OrganizationUser).where(OrganizationUser.email == email))
     if existing_user.scalars().first() is not None:
-        raise HTTPException(
-            status_code=409,
-            detail="An account with this email already exists",
-        )
+        raise HTTPException(status_code=409, detail="An account with this email already exists")
 
-    new_org_id = uuid.uuid4()
     region = payload.region or "southindia"
     org_name = payload.org_name.strip()
 
-    async def event_stream() -> AsyncGenerator[bytes, None]:
-        queue: asyncio.Queue[dict] = asyncio.Queue()
+    organization = Organization(
+        id=uuid.uuid4(),
+        name=org_name,
+        admin_email=email,
+        admin_name=payload.admin_name,
+        email_domain=domain,
+        region=region,
+        environment="staging",
+        call_type="inbound",
+        language=payload.language or "en-IN",
+        plan_type=None,
+        product_tier="nokvo_one",
+        status="pending_payment",
+        calling_enabled=False,
+        stores_pii=True,
+        record_calls=False,
+        create_resource_group=False,
+        twilio_auto_provision=False,
+        industry=None,
+        country_code=payload.country_code,
+    )
+    db.add(organization)
+    await db.flush()
 
-        async def on_step(name: str, status_: str, message: str | None = None) -> None:
-            await queue.put({"name": name, "status": status_, "message": message})
+    admin_user = OrganizationUser(
+        id=uuid.uuid4(),
+        organization_id=organization.id,
+        email=email,
+        full_name=payload.admin_name,
+        role="admin",
+        status="pending_payment",
+        auth_provider="password",
+        password_hash=security.get_password_hash(payload.password),
+        mfa_required=True,
+        email_verified=False,
+    )
+    db.add(admin_user)
+    await db.commit()
+    await db.refresh(organization)
+    await db.refresh(admin_user)
 
-        async def runner() -> dict:
-            return await NokvoOneProvisioningService.provision_or_raise(
-                organization_id=new_org_id,
-                organization_name=org_name,
-                environment="staging",
-                region=region,
-                on_step=on_step,
-            )
-
-        task = asyncio.create_task(runner())
-
-        # Stream step events until the provisioning task finishes.
-        while True:
-            getter = asyncio.create_task(queue.get())
-            done, _ = await asyncio.wait({getter, task}, return_when=asyncio.FIRST_COMPLETED)
-            if getter in done:
-                event = getter.result()
-                yield _sse("step", event)
-            else:
-                getter.cancel()
-            if task in done:
-                # Drain any remaining queued events emitted just before completion.
-                while not queue.empty():
-                    yield _sse("step", queue.get_nowait())
-                break
-
-        try:
-            provision = task.result()
-        except NokvoOneProvisioningError as exc:
-            yield _sse("error", {"step": exc.step, "message": exc.message})
-            return
-        except Exception as exc:
-            yield _sse("error", {"step": "unknown", "message": str(exc)})
-            return
-
-        # Provisioning succeeded — commit DB rows in one transaction.
-        try:
-            organization = Organization(
-                id=new_org_id,
-                name=org_name,
-                admin_email=email,
-                admin_name=payload.admin_name,
-                email_domain=domain,
-                region=region,
-                environment="staging",
-                call_type="inbound",
-                language=payload.language or "en-IN",
-                plan_type="pilot",
-                product_tier="nokvo_one",
-                status="pending_email_verification",
-                calling_enabled=False,
-                stores_pii=True,
-                record_calls=False,
-                create_resource_group=False,
-                twilio_auto_provision=False,
-                industry=None,
-                country_code=payload.country_code,
-            )
-            db.add(organization)
-            await db.flush()
-
-            admin_user = OrganizationUser(
-                id=uuid.uuid4(),
-                organization_id=organization.id,
-                email=email,
-                full_name=payload.admin_name,
-                role="admin",
-                status="pending_email_verification",
-                auth_provider="password",
-                password_hash=security.get_password_hash(payload.password),
-                mfa_required=True,
-                email_verified=False,
-            )
-            db.add(admin_user)
-            await db.flush()
-
-            tenant_resources = TenantResources(
-                id=uuid.uuid4(),
-                organization_id=organization.id,
-                tenant_id=provision["tenant_id"],
-                azure_resource_group_name=provision["azure_resource_group_name"],
-                azure_region=provision["azure_region"],
-                qdrant_collection_name=provision["qdrant_collection_name"],
-                qdrant_url_ref=provision["qdrant_url_ref"],
-                redis_namespace=provision["redis_namespace"],
-                storage_account_name=provision["storage_account_name"],
-                storage_container_name=provision["storage_container_name"],
-                blob_prefix=provision["blob_prefix"],
-                provider_status=provision["provider_status"],
-                provisioning_status=provision["provisioning_status"],
-                provisioning_steps=provision["provisioning_steps"],
-                cleanup_required=False,
-            )
-            db.add(tenant_resources)
-            await db.flush()
-
-            raw_token = secrets.token_urlsafe(32)
-            verification = EmailVerification(
-                id=uuid.uuid4(),
-                organization_id=organization.id,
-                organization_user_id=admin_user.id,
-                email=email,
-                token_hash=_hash_token(raw_token),
-                expires_at=datetime.now(timezone.utc) + timedelta(hours=settings.NOKVO_ONE_EMAIL_TOKEN_TTL_HOURS),
-            )
-            db.add(verification)
-            await db.commit()
-            await db.refresh(organization)
-            await db.refresh(admin_user)
-        except Exception as exc:
-            await db.rollback()
-            yield _sse("error", {"step": "db_commit", "message": str(exc)})
-            return
-
-        # Fire-and-forget verification email — failure here does not undo signup.
-        asyncio.create_task(
-            EmailService.send_verification_email(email, payload.admin_name, organization.name, raw_token)
-        )
-
-        response = NokvoOneSignupResponse(
-            organization_id=organization.id,
-            admin_user_id=admin_user.id,
-            email=email,
-            org_status=organization.status,
-            provisioning=_summary_from_provision_dict(provision),
-        )
-        yield _sse("complete", json.loads(response.model_dump_json()))
-
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",  # disable nginx proxy buffering
-        },
+    payment_token = _issue_setup_token(admin_user.id, organization.id, stage="payment", ttl_minutes=60)
+    return NokvoOneSignupResponse(
+        organization_id=organization.id,
+        admin_user_id=admin_user.id,
+        email=email,
+        org_status=organization.status,
+        payment_token=payment_token,
     )
 
 
@@ -752,11 +652,36 @@ async def nokvo_one_login(
         raise HTTPException(status_code=403, detail="Organization is suspended")
     if user.status == "disabled":
         raise HTTPException(status_code=403, detail="User account is disabled")
-    if not user.email_verified:
-        raise HTTPException(status_code=403, detail="Email is not yet verified")
-
     if not security.verify_password(payload.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    # ── Resume unfinished onboarding from wherever the user left off ──────────
+    # The org status is the source of truth for the onboarding stage.
+    if organization.status == "pending_payment":
+        return {
+            "code": "payment_required",
+            "payment_token": _issue_setup_token(user.id, organization.id, stage="payment", ttl_minutes=60),
+            "organization_id": str(organization.id),
+            "email": email,
+            "org_status": organization.status,
+        }
+    if organization.status == "onboarding":
+        # Resume the post-payment onboarding wizard. No email/MFA gate — issue a
+        # full session and tell the frontend which step to reopen.
+        session = await _issue_full_session(db, request, user, organization, mfa_completed=True)
+        data = session.model_dump()
+        data["code"] = "onboarding_required"
+        data["onboarding_step"] = organization.onboarding_step or "business_details"
+        return data
+    # Legacy email-verification gate (kept for orgs created before the onboarding
+    # wizard; new password signups never set this status).
+    if organization.status == "pending_email_verification":
+        return {
+            "code": "email_verification_required",
+            "organization_id": str(organization.id),
+            "email": email,
+            "org_status": organization.status,
+        }
 
     if not user.totp_secret_encrypted_v2:
         user.mfa_required = False
@@ -960,23 +885,23 @@ async def nokvo_one_google_login(
         raise HTTPException(status_code=403, detail=_safe_detail(exc)) from exc
 
     domain = extract_email_domain(email)
-    organization = await _lookup_org_by_domain(db, domain)
 
-    if organization is None:
+    # Identify the account by EMAIL (globally unique), NOT by domain. Multiple
+    # organizations may share an email domain (e.g. gmail.com), so a domain match
+    # must never route a new Google user into someone else's org or block them.
+    user = (
+        await db.execute(select(OrganizationUser).where(OrganizationUser.email == email))
+    ).scalars().first()
+
+    if user is None:
         # ── New org via Google signup ─────────────────────────────────────────
         await _enforce_signup_attempt_quotas(db, email, domain)
 
         new_org_id = uuid.uuid4()
         org_name = identity.get("full_name") or domain.split(".")[0].capitalize()
 
-        # Fail-closed provisioning; if anything fails, no DB rows persist.
-        provision = await _provision_or_503(
-            organization_id=new_org_id,
-            organization_name=org_name,
-            region="southindia",
-            environment="staging",
-        )
-
+        # NO provisioning here — the org is created in ``pending_payment`` and
+        # resources are provisioned after the Razorpay payment succeeds.
         organization = Organization(
             id=new_org_id,
             name=org_name,
@@ -987,9 +912,9 @@ async def nokvo_one_google_login(
             environment="staging",
             call_type="inbound",
             language="en-IN",
-            plan_type="pilot",
+            plan_type=None,
             product_tier="nokvo_one",
-            status="pending_totp",
+            status="pending_payment",
             calling_enabled=False,
             stores_pii=True,
             record_calls=False,
@@ -1013,57 +938,53 @@ async def nokvo_one_google_login(
             email_verified=True,
         )
         db.add(user)
-        await db.flush()
+        await db.commit()
+        await db.refresh(organization)
+        await db.refresh(user)
 
-        tenant_resources = TenantResources(
-            id=uuid.uuid4(),
-            organization_id=organization.id,
-            tenant_id=provision["tenant_id"],
-            azure_resource_group_name=provision["azure_resource_group_name"],
-            azure_region=provision["azure_region"],
-            qdrant_collection_name=provision["qdrant_collection_name"],
-            qdrant_url_ref=provision["qdrant_url_ref"],
-            redis_namespace=provision["redis_namespace"],
-            storage_account_name=provision["storage_account_name"],
-            storage_container_name=provision["storage_container_name"],
-            blob_prefix=provision["blob_prefix"],
-            provider_status=provision["provider_status"],
-            provisioning_status=provision["provisioning_status"],
-            provisioning_steps=provision["provisioning_steps"],
-            cleanup_required=False,
-        )
-        db.add(tenant_resources)
-        organization.status = "pending_approval"
-        await db.flush()
+        # Google admins are MFA-exempt, so we still mint a session (the dashboard
+        # stays gated because the org is ``pending_payment`` — not an allowed
+        # status), plus a payment_token so the frontend can run the payment step.
+        # ``activate_and_provision`` flips the org to ``active`` after payment.
         session = await _issue_full_session(db, request, user, organization, mfa_completed=False)
         session_payload = session.model_dump(mode="json")
         session_payload["created_via_google"] = True
-        session_payload["provisioning"] = _summary_from_provision_dict(provision).model_dump(mode="json")
+        session_payload["payment_required"] = True
+        session_payload["organization_id"] = str(organization.id)
+        session_payload["payment_token"] = _issue_setup_token(
+            user.id, organization.id, stage="payment", ttl_minutes=60
+        )
         return session_payload
 
-    # ── Existing org path (sign-in) ───────────────────────────────────────────
+    # ── Existing account → sign in (resolved by email, above) ─────────────────
+    organization = (
+        await db.execute(select(Organization).where(Organization.id == user.organization_id))
+    ).scalars().first()
+    if organization is None or organization.product_tier != "nokvo_one":
+        raise HTTPException(status_code=404, detail="Organization not found")
     if organization.status == "suspended":
         raise HTTPException(status_code=403, detail="Organization is suspended")
-    if identity.get("hosted_domain") and identity["hosted_domain"].lower() != (organization.email_domain or "").lower():
-        raise HTTPException(status_code=403, detail="Google hosted domain does not match the organization")
-
-    user_res = await db.execute(
-        select(OrganizationUser).where(
-            OrganizationUser.organization_id == organization.id,
-            OrganizationUser.email == email,
-        )
-    )
-    user = user_res.scalars().first()
-    if user is None:
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                "A Nokvo One organization already exists for this domain, but this Google account is "
-                "not provisioned. Ask an organization admin to invite you."
-            ),
-        )
     if user.status == "disabled":
         raise HTTPException(status_code=403, detail="User account is disabled")
+
+    # Resume: a returning Google user who hasn't finished paying → back to payment.
+    if organization.status == "pending_payment":
+        session = await _issue_full_session(db, request, user, organization, mfa_completed=False)
+        session_payload = session.model_dump(mode="json")
+        session_payload["payment_required"] = True
+        session_payload["organization_id"] = str(organization.id)
+        session_payload["payment_token"] = _issue_setup_token(
+            user.id, organization.id, stage="payment", ttl_minutes=60
+        )
+        return session_payload
+
+    # Resume: paid but mid-onboarding → reopen the wizard at the saved step.
+    if organization.status == "onboarding":
+        session = await _issue_full_session(db, request, user, organization, mfa_completed=True)
+        session_payload = session.model_dump(mode="json")
+        session_payload["code"] = "onboarding_required"
+        session_payload["onboarding_step"] = organization.onboarding_step or "business_details"
+        return session_payload
 
     user.email_verified = True
     if not user.totp_secret_encrypted_v2:
@@ -1174,7 +1095,7 @@ async def nokvo_one_logout(
 async def nokvo_one_me(
     user: OrganizationUser = Depends(
         deps.RequireNokvoOneOrganization(
-            allowed_statuses=["pending_approval", "active", "suspended"]
+            allowed_statuses=["onboarding", "pending_approval", "active", "suspended"]
         )
     ),
     db: AsyncSession = Depends(deps.get_db),

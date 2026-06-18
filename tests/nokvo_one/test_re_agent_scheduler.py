@@ -71,21 +71,20 @@ def _patch(monkeypatch, *, llm_out, projects=None, assignment=None, calls=None):
 _SKYLINE = SimpleNamespace(id="proj-1", name="Skyline Heights")
 
 
-def test_firm_time_fills_fields_and_assigns(monkeypatch):
+def test_firm_time_fills_fields_and_pools_for_claim(monkeypatch):
+    """Site visits are NOT auto-assigned: with a firm time the scheduler fills
+    date/time/project/phone and leaves the ticket UNASSIGNED (claimable on the
+    Ticket Board) — no assignment service call."""
     calls: list = []
     _patch(
         monkeypatch,
         llm_out='{"visit_date":"2026-06-20","visit_time":"16:00","project_name":"Skyline Heights",'
                 '"customer_name":"Nihar","phone":"+919999999999","requirements":"wants a 3 BHK"}',
         projects=[_SKYLINE],
-        assignment={
-            "selected_member_id": "m-1", "selected_member_name": "Rahul",
-            "scheduled_time": "2026-06-20T10:30:00+00:00", "time_adjusted": False,
-            "assignment_status": "assigned",
-        },
+        assignment=None,
         calls=calls,
     )
-    # Isolate the assignment wiring from the date parser.
+    # Isolate field-filling from the date parser (force a firm time).
     monkeypatch.setattr(
         REAgentScheduler, "_parse_visit_datetime",
         staticmethod(lambda d, t: __import__("datetime").datetime(2026, 6, 20, 10, 30, tzinfo=__import__("datetime").timezone.utc)),
@@ -99,11 +98,31 @@ def test_firm_time_fills_fields_and_assigns(monkeypatch):
     assert rec.data["project_name"] == "Skyline Heights"
     assert rec.data["project_id"] == "proj-1"
     assert rec.data["visit_date"] == "2026-06-20" and rec.data["visit_time"] == "16:00"
-    assert rec.data["assigned_member_id"] == "m-1"
-    assert rec.data["assigned_member_name"] == "Rahul"
-    assert rec.data["assignment_status"] == "assigned"
+    # Pooled, not assigned.
+    assert rec.data["assignment_status"] == "unassigned"
+    assert rec.data.get("assigned_member_id") is None
     assert rec.data["re_scheduled"] is True
-    assert any(c[0] == "assign" and c[2] == "site_visit" for c in calls if isinstance(c, tuple))
+    assert not any(isinstance(c, tuple) and c[0] == "assign" for c in calls)  # never auto-assigns
+
+
+def test_deterministic_backfill_recovers_datetime_when_llm_misses(monkeypatch):
+    """When the LLM returns null date/time but the note states them, the
+    deterministic backfill recovers visit_date/visit_time so the board still
+    shows a complete request."""
+    _patch(
+        monkeypatch,
+        llm_out='{"visit_date":null,"visit_time":null,"project_name":"Skyline Heights"}',
+        projects=[_SKYLINE], assignment=None,
+    )
+    rec = _ticket(handoff_note="Site visit for Skyline Heights tomorrow at 4 PM. Caller Nihar.")
+    db = _FakeDB(rec)
+
+    res = _run(REAgentScheduler.schedule_for_site_visit(db, SimpleNamespace(), str(rec.id)))
+
+    assert res["ok"] is True
+    assert rec.data.get("visit_time") == "16:00"          # recovered from prose
+    assert rec.data.get("visit_date")                      # a concrete date was resolved
+    assert rec.data["assignment_status"] == "unassigned"   # firm time → claimable
 
 
 def test_vague_note_enriches_but_needs_manual_scheduling(monkeypatch):

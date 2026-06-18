@@ -373,7 +373,7 @@ async def classify_intent_llm(
             "shouldRetrieve": False,
         }
 
-    deployment = settings.AZURE_OPENAI_GLOBAL_DEPLOYMENT or "gpt-4-1-mini"
+    deployment = settings.AZURE_OPENAI_GLOBAL_DEPLOYMENT or "gpt-5-mini"
     messages = [
         {"role": "system", "content": _CLASSIFIER_PROMPT},
         {"role": "user", "content": message},

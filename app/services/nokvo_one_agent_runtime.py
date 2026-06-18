@@ -346,13 +346,12 @@ class _AzureOpenAIClient:
 
     @classmethod
     async def chat(cls, messages: list[dict[str, Any]]) -> str:
-        body = {"messages": messages, "temperature": 0.3, "max_tokens": 400}
-        payload = await cls._chat_completion(body)
-        choices = payload.get("choices") or []
-        if not choices:
-            return ""
-        content = ((choices[0] or {}).get("message") or {}).get("content") or ""
-        return content.strip()
+        # Route through the shared gpt-5-mini LLM pool (handles both the
+        # Responses API and chat/completions). gpt-4.1-mini is retired, and the
+        # old global-endpoint path was unconfigured anyway.
+        from app.services.nokvo_one_voice_pipeline import AzureGroundedLLM
+
+        return await AzureGroundedLLM.complete(None, messages, max_tokens=400)
 
     @classmethod
     async def chat_with_tools(
@@ -360,18 +359,10 @@ class _AzureOpenAIClient:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        body = {
-            "messages": messages,
-            "temperature": 0.2,
-            "max_tokens": 500,
-            "tools": tools,
-            "tool_choice": "auto",
-        }
-        payload = await cls._chat_completion(body)
-        choices = payload.get("choices") or []
-        if not choices:
-            return {"role": "assistant", "content": ""}
-        return dict(((choices[0] or {}).get("message") or {}) or {"role": "assistant", "content": ""})
+        # Native (provider-side) tool calling isn't supported over the gpt-5-mini
+        # Responses-API pool here, so signal the caller to fall back to the
+        # legacy JSON-fence protocol (which runs on the same pool via ``chat``).
+        raise NokvoOneAgentRuntimeError("native tool calling routes through the gpt-5-mini pool via the JSON-fence path")
 
 
 class NokvoOneAgentRuntime:

@@ -40,6 +40,13 @@ const {
   outgoingLeads,
   selectedLeadIds,
   toggleLeadSelection,
+  activeLeadFormId,
+  leadFormFilters,
+  visibleLeads,
+  setLeadFormFilter,
+  selectAllCallableInForm,
+  clearLeadSelection,
+  leadFormName,
   phoneHref,
   outboundTester,
   OUTBOUND_OBJECTIVE_OPTIONS,
@@ -64,6 +71,10 @@ const {
   toggleCampaignObjective,
   isCreatingCampaign,
   createCampaign,
+  outboundNumber,
+  campaignFormPreset,
+  createAndCallFromForm,
+  cancelCampaignPreset,
   expandedCampaignId,
   toggleCampaignExpansion,
   formatRelativeDate,
@@ -84,6 +95,14 @@ const voiceStatus = computed(() => voice?.value?.status || 'idle');
 const isCalling = computed(() => !['idle', 'error'].includes(voiceStatus.value));
 
 const callableLeads = computed(() => (outgoingLeads?.value || []).filter((l) => l.callable));
+
+// The lead-form chip currently selected (a real form, not "All"/"Uncategorized")
+// — drives the "Create & call this form" action.
+const activeFormChip = computed(() =>
+  (leadFormFilters?.value || []).find(
+    (c) => c.id && c.id !== '__none__' && c.id === activeLeadFormId?.value,
+  ),
+);
 
 const tabs = [
   { id: 'campaigns', label: 'Campaigns', icon: PhoneCall },
@@ -228,30 +247,79 @@ function campaignStatusTone(s) {
         <header class="outbound__list-head">
           <div>
             <strong>Consented leads</strong>
-            <p>Select callable leads for the next campaign. Unknown-consent rows are visible but blocked.</p>
+            <p>Sorted by lead form. Pick a form (= campaign/project), then select its callable leads. Unknown-consent rows are visible but blocked.</p>
           </div>
           <span class="n-tag n-tag--brand n-tag--mono">{{ selectedCallableLeads.length }} selected</span>
         </header>
+
+        <!-- Form filter: sort leads by the form/post they came in on -->
+        <div v-if="leadFormFilters.length > 1" class="outbound__form-filter">
+          <button
+            v-for="chip in leadFormFilters"
+            :key="chip.id === null ? '__all__' : chip.id"
+            type="button"
+            class="outbound__form-chip"
+            :class="{ 'is-active': activeLeadFormId === chip.id }"
+            @click="setLeadFormFilter(chip.id)"
+          >
+            {{ chip.name }}
+            <span class="outbound__form-chip-count">
+              {{ chip.callable != null ? `${chip.callable}/${chip.total}` : chip.total }}
+            </span>
+          </button>
+        </div>
+
         <div v-if="!outgoingLeads.length" class="outbound__empty">
           No leads imported yet. Connect a source or publish a Nokvo form above.
         </div>
-        <ul v-else class="outbound__lead-list">
-          <li
-            v-for="lead in outgoingLeads"
-            :key="lead.id"
-            class="outbound__lead-row"
-            :class="{ 'is-on': selectedLeadIds.includes(lead.id), 'is-off': !lead.callable }"
-            role="button"
-            tabindex="0"
-            @click="toggleLeadSelection(lead)"
-            @keydown.enter.prevent="toggleLeadSelection(lead)"
-            @keydown.space.prevent="toggleLeadSelection(lead)"
-          >
-            <span class="outbound__lead-icon"><PhoneCall :size="14" /></span>
-            <div>
-              <strong>{{ lead.name || lead.phone_e164 || 'Unnamed lead' }}</strong>
-              <span class="n-mono">{{ lead.source_provider }} · {{ lead.phone_e164 || 'no phone' }} · {{ lead.consent_status }}</span>
-            </div>
+        <template v-else>
+          <div class="outbound__lead-actions">
+            <button type="button" class="n-btn n-btn--ghost n-btn--sm" @click="selectAllCallableInForm">
+              Select all callable{{ activeLeadFormId !== null ? ' in this form' : '' }}
+            </button>
+            <button
+              v-if="selectedCallableLeads.length"
+              type="button"
+              class="n-btn n-btn--ghost n-btn--sm"
+              @click="clearLeadSelection"
+            >
+              Clear selection
+            </button>
+            <button
+              v-if="isAdmin && activeFormChip && activeFormChip.callable > 0 && outboundNumber.calling_enabled"
+              type="button"
+              class="n-btn n-btn--primary n-btn--sm outbound__callbtn"
+              @click="createAndCallFromForm(activeFormChip)"
+            >
+              <PhoneCall :size="13" /> Create &amp; call this form ({{ activeFormChip.callable }})
+            </button>
+            <span
+              v-else-if="isAdmin && activeFormChip && activeFormChip.callable > 0 && !outboundNumber.calling_enabled"
+              class="outbound__upgrade-hint"
+            >
+              Upgrade to Inbound + Outbound to call these leads.
+            </span>
+          </div>
+          <div v-if="!visibleLeads.length" class="outbound__empty">
+            No leads for this form yet.
+          </div>
+          <ul v-else class="outbound__lead-list">
+            <li
+              v-for="lead in visibleLeads"
+              :key="lead.id"
+              class="outbound__lead-row"
+              :class="{ 'is-on': selectedLeadIds.includes(lead.id), 'is-off': !lead.callable }"
+              role="button"
+              tabindex="0"
+              @click="toggleLeadSelection(lead)"
+              @keydown.enter.prevent="toggleLeadSelection(lead)"
+              @keydown.space.prevent="toggleLeadSelection(lead)"
+            >
+              <span class="outbound__lead-icon"><PhoneCall :size="14" /></span>
+              <div>
+                <strong>{{ lead.name || lead.phone_e164 || 'Unnamed lead' }}</strong>
+                <span class="n-mono">{{ leadFormName(lead) }} · {{ lead.phone_e164 || 'no phone' }} · {{ lead.consent_status }}</span>
+              </div>
             <div class="outbound__lead-foot">
               <a
                 v-if="phoneHref(lead.phone_e164 || lead.phone_raw)"
@@ -264,7 +332,8 @@ function campaignStatusTone(s) {
               <span class="n-tag" :class="lead.callable ? 'n-tag--success' : 'n-tag--warning'">{{ lead.callable ? 'Callable' : 'Blocked' }}</span>
             </div>
           </li>
-        </ul>
+          </ul>
+        </template>
       </article>
 
       <!-- Tester -->
@@ -496,15 +565,26 @@ function campaignStatusTone(s) {
         </header>
 
         <div v-if="isAdmin && showCampaignCreateForm" class="outbound__create">
+          <div v-if="campaignFormPreset" class="outbound__preset-banner">
+            <span>
+              <strong>Create &amp; call:</strong>
+              {{ campaignFormPreset.callableCount }} callable lead(s) from
+              <strong>{{ campaignFormPreset.formName }}</strong> — launches the moment you create.
+            </span>
+            <button type="button" class="n-btn n-btn--ghost n-btn--sm" @click="cancelCampaignPreset">Cancel</button>
+          </div>
           <div class="outbound__create-grid">
             <label class="n-field">
               <span class="n-field__label">Campaign name</span>
               <input v-model="campaignForm.name" type="text" class="n-input" placeholder="Diwali outreach" />
             </label>
-            <label class="n-field">
-              <span class="n-field__label">From number</span>
-              <input v-model="campaignForm.from_number" type="text" class="n-input" placeholder="+91XXXXXXXXXX" />
-            </label>
+            <div class="n-field">
+              <span class="n-field__label">Caller ID <span class="n-field__sub">your allotted number — used for all campaigns</span></span>
+              <div class="outbound__callerid">
+                <span v-if="outboundNumber.number" class="n-mono">{{ outboundNumber.number }}</span>
+                <span v-else class="outbound__callerid-none">No outbound number provisioned yet</span>
+              </div>
+            </div>
             <label class="n-field outbound__col-2">
               <span class="n-field__label">Agent prompt <span class="n-field__sub">the agent's full knowledge: persona, what to pitch, what to know</span></span>
               <textarea v-model="campaignForm.agent_prompt" class="n-textarea" rows="8"></textarea>
@@ -688,7 +768,7 @@ function campaignStatusTone(s) {
               @click="createCampaign"
             >
               <Plus :size="13" />
-              {{ isCreatingCampaign ? 'Creating…' : 'Create campaign' }}
+              {{ isCreatingCampaign ? (campaignFormPreset ? 'Creating & calling…' : 'Creating…') : (campaignFormPreset ? 'Create & call' : 'Create campaign') }}
             </button>
           </div>
         </div>
@@ -835,7 +915,8 @@ function campaignStatusTone(s) {
                   v-if="c.status === 'draft'"
                   type="button"
                   class="n-btn n-btn--brand n-btn--sm"
-                  :disabled="isLaunchingCampaign === c.id || !(c.contacts || []).length"
+                  :disabled="isLaunchingCampaign === c.id || !(c.contacts || []).length || !outboundNumber.calling_enabled || !outboundNumber.number"
+                  :title="!outboundNumber.calling_enabled ? 'Upgrade to Inbound + Outbound to launch calls' : (!outboundNumber.number ? 'No outbound number provisioned yet' : '')"
                   @click="launchCampaign(c.id)"
                 >
                   <Send :size="13" />
@@ -1120,6 +1201,80 @@ function campaignStatusTone(s) {
   text-align: center;
   font-size: 13.5px;
   color: var(--n-text-3);
+}
+
+/* Leads-by-form filter (Option A: sort leads by originating form/project) */
+.outbound__form-filter {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--n-border-subtle);
+}
+.outbound__form-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  border: 1px solid var(--n-border-subtle);
+  border-radius: 999px;
+  background: transparent;
+  font-size: 12.5px;
+  color: var(--n-text-2, var(--n-text-3));
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s, color 0.12s;
+}
+.outbound__form-chip:hover { border-color: var(--n-border); color: var(--n-text); }
+.outbound__form-chip.is-active {
+  background: var(--n-brand-soft, rgba(99, 102, 241, 0.12));
+  border-color: var(--n-brand, #6366f1);
+  color: var(--n-brand, #6366f1);
+  font-weight: 600;
+}
+.outbound__form-chip-count {
+  font-family: var(--n-font-mono, monospace);
+  font-size: 11px;
+  opacity: 0.75;
+}
+.outbound__lead-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 20px 4px;
+}
+.outbound__callbtn { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; }
+.outbound__upgrade-hint {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--n-text-3);
+}
+
+/* Read-only allotted caller ID in the create form */
+.outbound__callerid {
+  display: flex;
+  align-items: center;
+  min-height: 38px;
+  padding: 8px 12px;
+  border: 1px dashed var(--n-border-subtle);
+  border-radius: 8px;
+  background: var(--n-surface-2, rgba(127, 127, 127, 0.04));
+}
+.outbound__callerid-none { font-size: 12.5px; color: var(--n-text-3); }
+
+/* "Create & call this form" preset banner */
+.outbound__preset-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+  padding: 10px 14px;
+  border: 1px solid var(--n-brand, #6366f1);
+  border-radius: 8px;
+  background: var(--n-brand-soft, rgba(99, 102, 241, 0.1));
+  font-size: 13px;
+  color: var(--n-text);
 }
 
 .outbound__form-list { list-style: none; margin: 0; padding: 4px 0; }

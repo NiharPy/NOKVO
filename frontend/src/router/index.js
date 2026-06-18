@@ -11,6 +11,7 @@ import SuperAdminDashboard from '../components/SuperAdminDashboard.vue';
 // pulled out into its view file, its v-if block is deleted from the shell.
 const DashboardView = () => import('../views/DashboardView.vue');
 const TicketsView = () => import('../views/TicketsView.vue');
+const TicketBoardView = () => import('../views/TicketBoardView.vue');
 const LeadsView = () => import('../views/LeadsView.vue');
 const CustomerBaseView = () => import('../views/CustomerBaseView.vue');
 const FollowUpPipeline = () => import('../views/FollowUpPipeline.vue');
@@ -29,6 +30,7 @@ const dashboardChildren = [
   { path: '', redirect: { name: 'dash-home' } },
   { path: 'home', component: DashboardView, name: 'dash-home', meta: { pageKey: 'dashboard' } },
   { path: 'tickets', component: TicketsView, name: 'dash-tickets', meta: { pageKey: 'tickets' } },
+  { path: 'ticket-board', component: TicketBoardView, name: 'dash-ticket-board', meta: { pageKey: 'ticket_board' } },
   { path: 'leads', component: LeadsView, name: 'dash-leads', meta: { pageKey: 'leads' } },
   { path: 'customers', component: CustomerBaseView, name: 'dash-customers', meta: { pageKey: 'customers' } },
   { path: 'followups', component: FollowUpPipeline, name: 'dash-followups', meta: { pageKey: 'followups' } },

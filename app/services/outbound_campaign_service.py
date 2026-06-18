@@ -602,6 +602,16 @@ class OutboundCampaignService:
             if tenant_res is None:
                 raise ValueError("Tenant resources for this campaign could not be loaded.")
 
+        # Caller ID = the tenant's allotted Plivo DID. Resolve + validate ONCE so we
+        # fail fast (instead of every contact failing at dial time) and record it on
+        # the campaign so the UI can show "calling from <number>".
+        caller_id = PlivoService.outbound_caller_id(tenant_res)
+        if not caller_id:
+            raise ValueError(
+                "No outbound number is provisioned for this account yet. "
+                "Finish telephony setup before launching a calling campaign."
+            )
+
         base = public_base_url.rstrip("/")
         prefix = path_prefix.rstrip("/")
         contacts = list(campaign.contacts or [])
@@ -622,40 +632,122 @@ class OutboundCampaignService:
         if len(callable_by_id) != len(contacts):
             raise ValueError("Campaign contains leads that are no longer callable.")
 
+        # Every contact starts pending; the throttled dialer places up to the
+        # concurrency cap and refills one-for-one as calls end (Plivo status
+        # webhook → dial_next_pending), so we never fire hundreds at once.
+        for contact in contacts:
+            contact["status"] = "pending"
+            contact.pop("ended", None)
+        campaign.from_number = caller_id
         campaign.status = CampaignStatus.running
         campaign.started_at = datetime.now(timezone.utc)
-        db.add(campaign)
-        await db.commit()
-        await db.refresh(campaign)
-
-        # Fire all calls in parallel — don't await individually
-        async def _call_one(contact: dict) -> None:
-            link_id = contact["call_link_id"]
-            # Plivo: pass an HTTP answer_url (returns <Stream> XML) — not a WS url.
-            answer_url = f"{base}{prefix}/plivo/outbound-answer/{link_id}"
-            status_callback = f"{base}{prefix}/plivo/outbound-status/{link_id}"
-            try:
-                result = await PlivoService.initiate_outbound_call(
-                    tenant_res,
-                    to_number=contact["phone"],
-                    answer_url=answer_url,
-                    status_callback=status_callback,
-                )
-                call = result.get("call") if isinstance(result.get("call"), dict) else result
-                contact["call_id"] = call.get("sid") or call.get("id")
-                contact["status"] = "calling"
-            except Exception as exc:
-                contact["status"] = "failed"
-                contact["error"] = str(exc)[:200]
-
-        await asyncio.gather(*[_call_one(c) for c in contacts], return_exceptions=True)
-
-        # Persist updated contact statuses
         campaign.contacts = contacts
         db.add(campaign)
         await db.commit()
         await db.refresh(campaign)
+
+        await OutboundCampaignService._dial_pending(
+            campaign, db, tenant_res=tenant_res, base=base, prefix=prefix
+        )
         return campaign
+
+    # ---- throttled dialer (place up to the cap, refill as calls end) ----------
+    @staticmethod
+    async def _place_call(
+        contact: dict, *, tenant_res: TenantResources, caller_id: str, base: str, prefix: str
+    ) -> None:
+        link_id = contact["call_link_id"]
+        # Plivo: pass an HTTP answer_url (returns <Stream> XML) — not a WS url.
+        answer_url = f"{base}{prefix}/plivo/outbound-answer/{link_id}"
+        status_callback = f"{base}{prefix}/plivo/outbound-status/{link_id}"
+        try:
+            result = await PlivoService.initiate_outbound_call(
+                tenant_res,
+                to_number=contact["phone"],
+                answer_url=answer_url,
+                status_callback=status_callback,
+                from_number=caller_id,
+            )
+            call = result.get("call") if isinstance(result.get("call"), dict) else result
+            contact["call_id"] = call.get("sid") or call.get("id")
+            contact["status"] = "calling"
+        except Exception as exc:
+            contact["status"] = "failed"
+            contact["ended"] = True  # frees the slot + counts toward batch completion
+            contact["error"] = str(exc)[:200]
+
+    @staticmethod
+    def _inflight_count(contacts: list[dict]) -> int:
+        # A contact occupies a line from placement until a terminal webhook
+        # (``ended``). A placement ``failed`` frees the slot immediately.
+        return sum(
+            1
+            for c in contacts
+            if c.get("status") not in ("pending", "failed") and not c.get("ended")
+        )
+
+    @staticmethod
+    async def _dial_pending(
+        campaign: OutboundCampaign,
+        db: AsyncSession,
+        *,
+        tenant_res: TenantResources,
+        base: str,
+        prefix: str,
+    ) -> None:
+        """Place pending contacts until the live-call count reaches the cap.
+        Idempotent + safe to call repeatedly (at launch and after each call ends).
+        Placed sequentially so the in-flight count stays accurate between calls."""
+        cap = max(1, int(settings.OUTBOUND_DIAL_CONCURRENCY or 5))
+        caller_id = campaign.from_number or PlivoService.outbound_caller_id(tenant_res)
+        if not caller_id:
+            return
+        contacts = list(campaign.contacts or [])
+        placed_any = False
+        for contact in contacts:
+            if OutboundCampaignService._inflight_count(contacts) >= cap:
+                break
+            if contact.get("status") == "pending":
+                await OutboundCampaignService._place_call(
+                    contact, tenant_res=tenant_res, caller_id=caller_id, base=base, prefix=prefix
+                )
+                placed_any = True
+        if placed_any:
+            campaign.contacts = contacts
+            db.add(campaign)
+            await db.commit()
+            await db.refresh(campaign)
+
+    @staticmethod
+    async def dial_next_pending(
+        campaign: OutboundCampaign,
+        db: AsyncSession,
+        *,
+        public_base_url: str,
+        path_prefix: str = "/api/nokvo-one/agents",
+        tenant_res: TenantResources | None = None,
+    ) -> None:
+        """Webhook-driven refill: top the live batch back up to the cap after a
+        call ends. Best-effort — never raise into the status webhook."""
+        if campaign.status != CampaignStatus.running:
+            return
+        try:
+            if tenant_res is None:
+                res = await db.execute(
+                    select(TenantResources).where(TenantResources.tenant_id == campaign.tenant_id)
+                )
+                tenant_res = res.scalars().first()
+                if tenant_res is None:
+                    return
+            await OutboundCampaignService._dial_pending(
+                campaign,
+                db,
+                tenant_res=tenant_res,
+                base=public_base_url.rstrip("/"),
+                prefix=path_prefix.rstrip("/"),
+            )
+        except Exception:
+            logger.exception("NOKVO-CAMPAIGN: dial_next_pending failed")
 
     # ------------------------------------------------------------------
     # Call-level status updates (called from status webhook)
@@ -705,6 +797,10 @@ class OutboundCampaignService:
 
         elif event_type in ("call.hangup", "call.failed", "call.machine.detection.ended"):
             hangup_cause = payload.get("hangup_cause", "")
+            # Terminal: the call no longer occupies a line. ``ended`` is what the
+            # throttled dialer counts (an answered-then-hung-up call keeps
+            # status="answered", so status alone can't signal "slot free").
+            target["ended"] = True
             if target["status"] not in ("answered",):
                 target["status"] = "no_answer" if "no_answer" in hangup_cause.lower() else "failed"
                 if campaign is not None:
@@ -949,10 +1045,12 @@ class OutboundCampaignService:
             }
             db.add(campaign_contact)
 
-        # Check if all calls are terminal
-        terminal = {"answered", "no_answer", "failed"}
+        # Campaign is done only when every contact has ENDED (or failed at
+        # placement). Using ``ended`` — not the status set — avoids a still-live
+        # "answered" call tripping premature completion while pending leads remain
+        # undialed in the throttled batch.
         just_completed = False
-        if all(c.get("status") in terminal for c in contacts):
+        if contacts and all(c.get("ended") or c.get("status") == "failed" for c in contacts):
             if campaign.status != CampaignStatus.completed:
                 just_completed = True
             campaign.status = CampaignStatus.completed

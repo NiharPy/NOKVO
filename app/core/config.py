@@ -161,8 +161,11 @@ class Settings(BaseSettings):
     IN_CALL_SUMMARY_SEND_WINDOW: int = 8
     IN_CALL_SUMMARY_MAX_TOKENS: int = 120
 
-    AZURE_OPENAI_AGENT_DEPLOYMENT: str = "gpt-4-1-mini"
-    AZURE_OPENAI_AGENT_MODEL: str = "gpt-4.1-mini"
+    # Standardized on gpt-5-mini (the shared LLM pool) — gpt-4.1-mini is retired.
+    # These are fallback names only; live LLM calls route through the gpt-5-mini
+    # pool (AZURE_OPENAI_POOL_JSON) via AzureGroundedLLM.complete.
+    AZURE_OPENAI_AGENT_DEPLOYMENT: str = "gpt-5-mini"
+    AZURE_OPENAI_AGENT_MODEL: str = "gpt-5-mini"
     AZURE_OPENAI_AGENT_API_VERSION: str = "2024-10-21"
 
     # Nokvo One Azure OpenAI realtime-mini deployment.
@@ -179,14 +182,12 @@ class Settings(BaseSettings):
     AZURE_OPENAI_REALTIME_SKU: str = "GlobalStandard"
     AZURE_OPENAI_REALTIME_REGION: str = "swedencentral"
 
-    # Nokvo One per-tenant chat deployment (gpt-4.1-mini in South India). Only used by
-    # the Nokvo One signup provisioner; other tenants are unaffected.
-    # gpt-4.1-mini's only Azure version is 2025-04-14 (verified against the
-    # Cognitive Services models catalog for southindia). 2024-07-18 belongs to
-    # gpt-4o-mini and was rejected with DeploymentModelNotSupported.
-    AZURE_OPENAI_CHAT_MODEL: str = "gpt-4.1-mini"
+    # Per-tenant chat fallback name — retired in favour of the shared gpt-5-mini
+    # pool (all chat now routes through it). Kept only so legacy code paths that
+    # read these have a sane default; no live call provisions gpt-4.1-mini.
+    AZURE_OPENAI_CHAT_MODEL: str = "gpt-5-mini"
     AZURE_OPENAI_CHAT_MODEL_VERSION: str = "2025-04-14"
-    AZURE_OPENAI_CHAT_DEPLOYMENT: str = "gpt-4-1-mini"
+    AZURE_OPENAI_CHAT_DEPLOYMENT: str = "gpt-5-mini"
     AZURE_OPENAI_CHAT_SKU: str = "GlobalStandard"
     # Capacity is in K-TPM (1 unit = 1,000 tokens/min, 6 requests/min). The Azure
     # floor of 1 (1K TPM / 6 RPM) is far too small for conversational voice — a
@@ -293,10 +294,29 @@ class Settings(BaseSettings):
     PLIVO_AUTH_ID: str = ""
     PLIVO_AUTH_TOKEN: str = ""
     PLIVO_API_BASE: str = "https://api.plivo.com/v1"
+
+    # ── Razorpay (payment-gated onboarding: monthly subscription) ──────────────
+    # KEY_SECRET stays backend-only (signs orders + verifies checkout signature);
+    # the public KEY_ID is returned by the create-subscription endpoint so the
+    # frontend never needs a build-time env var. WEBHOOK_SECRET is the dashboard
+    # webhook secret used to verify the X-Razorpay-Signature on inbound webhooks.
+    RAZORPAY_KEY_ID: str = ""
+    RAZORPAY_KEY_SECRET: str = ""
+    RAZORPAY_WEBHOOK_SECRET: str = ""
+    RAZORPAY_API_BASE: str = "https://api.razorpay.com/v1"
+    # Optional: pin the Razorpay Plan IDs (created once in the dashboard). When
+    # empty, the service lazily creates a monthly plan on first use and caches
+    # the id per-process. Pin these in production so restarts don't make plans.
+    RAZORPAY_PLAN_INBOUND_ONLY: str = ""
+    RAZORPAY_PLAN_INBOUND_OUTBOUND: str = ""
     # Public base used to build Application answer_url / media WS (defaults to the
     # request host when empty). e.g. https://api.nokvo.example
     PLIVO_WEBHOOK_BASE_URL: str = ""
     PLIVO_NUMBER_COUNTRY: str = "IN"
+    # Outbound campaign dialer: how many calls stay live at once. The launch
+    # places this many, then refills one-for-one as each call ends (driven by the
+    # Plivo status webhook), so we never fire hundreds of simultaneous calls.
+    OUTBOUND_DIAL_CONCURRENCY: int = 5
     # X-Plivo-Signature-V2 validation on the Plivo webhook endpoints.
     # off | warn | enforce. Default "warn": log mismatches (with which token
     # matched) without rejecting, so the first real call confirms whether

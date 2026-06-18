@@ -37,13 +37,13 @@ router = APIRouter()
 
 def _agent_dep():
     return deps.RequireNokvoOneOrganization(
-        allowed_statuses=["pending_approval", "active"],
+        allowed_statuses=["onboarding", "pending_approval", "active"],
     )
 
 
 def _admin_dep():
     return deps.RequireNokvoOneOrganization(
-        allowed_statuses=["pending_approval", "active"],
+        allowed_statuses=["onboarding", "pending_approval", "active"],
         allowed_roles=["admin", "manager"],
     )
 

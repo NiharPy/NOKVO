@@ -43,6 +43,8 @@ from app.api import (
     organization_auth,
     superadmin_tenant_provisioning,
     nokvo_one_auth,
+    nokvo_one_payments,
+    nokvo_one_onboarding,
     nokvo_one_members,
     nokvo_one_agents,
     nokvo_one_billing,
@@ -61,6 +63,8 @@ app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
 app.include_router(organization_auth.router, prefix="/api/org-auth", tags=["organization-auth"])
 app.include_router(superadmin_tenant_provisioning.router, prefix="/superadmin/tenants", tags=["tenant-provisioning"])
 app.include_router(nokvo_one_auth.router, prefix="/api/nokvo-one", tags=["nokvo-one"])
+app.include_router(nokvo_one_payments.router, prefix="/api/nokvo-one", tags=["nokvo-one-payments"])
+app.include_router(nokvo_one_onboarding.router, prefix="/api/nokvo-one/onboarding", tags=["nokvo-one-onboarding"])
 app.include_router(nokvo_one_requests.router, prefix="/api/nokvo-one", tags=["nokvo-one-requests"])
 app.include_router(nokvo_one_outcomes.router, prefix="/api/nokvo-one", tags=["nokvo-one-outcomes"])
 app.include_router(nokvo_one_transcripts.router, prefix="/api/nokvo-one", tags=["nokvo-one-transcripts"])

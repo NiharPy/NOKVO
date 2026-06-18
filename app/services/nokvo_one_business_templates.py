@@ -4,7 +4,10 @@ from copy import deepcopy
 from typing import Any
 
 
-ALLOWED_BUSINESS_TYPES = {"real_estate", "clinics", "ecommerce", "hospitality", "other"}
+# Real-estate is the ONLY supported vertical. Other verticals' configs/code
+# remain in this module for now but are never selectable — onboarding,
+# validation, and the options list all resolve to real_estate only.
+ALLOWED_BUSINESS_TYPES = {"real_estate"}
 
 
 # ─────────── Per-tab status vocabularies ───────────
@@ -406,26 +409,30 @@ BUSINESS_TYPE_CONFIGS: dict[str, dict[str, Any]] = {
 
 
 def normalize_business_type(value: str | None) -> str | None:
+    # Permissive: recognizes any business type that still has a config (so
+    # back-compat code + the dynamic tool resolver keep working). The
+    # real-estate-only LOCK is enforced by ``validate_business_type`` (user
+    # input) and ``business_type_options`` (onboarding), not here.
     if value is None:
         return None
     normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
-    if normalized == "real_estate":
-        return normalized
-    if normalized in ALLOWED_BUSINESS_TYPES:
+    if normalized in BUSINESS_TYPE_CONFIGS:
         return normalized
     return None
 
 
 def validate_business_type(value: str) -> str:
+    # Real-estate is the only selectable vertical — reject everything else.
     normalized = normalize_business_type(value)
-    if normalized is None:
+    if normalized not in ALLOWED_BUSINESS_TYPES:
         allowed = ", ".join(sorted(ALLOWED_BUSINESS_TYPES))
         raise ValueError(f"Business type must be one of: {allowed}")
     return normalized
 
 
 def business_type_options() -> list[dict[str, Any]]:
-    return [deepcopy(BUSINESS_TYPE_CONFIGS[key]) for key in ["real_estate", "clinics", "ecommerce", "hospitality", "other"]]
+    # Real-estate only — no other vertical is offered during onboarding.
+    return [deepcopy(BUSINESS_TYPE_CONFIGS["real_estate"])]
 
 
 def business_type_config(value: str | None) -> dict[str, Any] | None:

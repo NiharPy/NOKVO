@@ -97,8 +97,10 @@ class QdrantService:
 
     @staticmethod
     async def provision_collection(tenant_id: str) -> str:
-        """
-        Creates a Qdrant collection for the tenant.
+        """DEPRECATED / UNUSED: per-tenant Qdrant collection provisioning was
+        removed from onboarding (the Knowledge Base / document retrieval is
+        retired). No provisioning path calls this anymore; kept only so existing
+        cleanup tooling/tests that reference the symbol keep importing.
         """
         collection_name = QdrantService.collection_name_for_tenant(tenant_id)
 

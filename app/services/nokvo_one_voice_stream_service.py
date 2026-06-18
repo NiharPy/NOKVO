@@ -7,6 +7,7 @@ logger = logging.getLogger(__name__)
 import asyncio
 import contextlib
 import json
+import re
 import struct
 import uuid
 from datetime import datetime, timezone
@@ -483,6 +484,31 @@ async def _site_visit_out_of_hours_reply(db, tenant_res, text: str, language: st
         )
     except Exception:
         return None
+
+
+_INV_NOUN = r"(projects?|propert(?:y|ies)|listings?|inventory|options?)"
+
+
+def _is_project_inventory_question(text: str) -> bool:
+    """True when the caller is asking WHICH projects/properties exist (an
+    inventory listing), e.g. "what projects do you have", "which properties",
+    "what do you guys offer". Deliberately tight: it must not fire when the
+    caller names a specific project or asks to book/visit one (those stay on
+    the LLM/booking path). Callers code-switch heavily, so the English
+    "project/property" token is the anchor even in hi/te utterances."""
+    t = (text or "").lower().strip()
+    if not t:
+        return False
+    # Booking / specific-project / brochure intents are NOT inventory listings.
+    if re.search(r"\b(book|schedule|site\s*visit|brochure for|come (?:down|over)|claim)\b", t):
+        return False
+    if re.search(rf"\b(what|which|any|list|show me|tell me|name|kaun\s*se|kitne|enni|em(?:i)?)\b.{{0,30}}\b{_INV_NOUN}\b", t):
+        return True
+    if re.search(rf"\b{_INV_NOUN}\b.{{0,30}}\b(do (?:you|u) have|you guys have|available|right now|currently|on offer|you offer)\b", t):
+        return True
+    if re.search(r"\bwhat (?:do|are|kind of|all)\b.{0,20}\b(?:you|u|you guys|u guys)\b.{0,20}\b(?:have|offer|got|selling|building)\b", t):
+        return True
+    return False
 
 
 def _is_site_visit_confirmation_turn(text: str, history: list[dict[str, str]]) -> bool:
@@ -1171,18 +1197,40 @@ class NokvoOneVoiceStreamService:
                     # out-of-hours time slip straight to the LLM, which then says
                     # yes. The guard still only fires on a concrete out-of-hours
                     # time, so in-hours questions fall through to normal Q&A.
-                    _ooh_reply = None
-                    if source != "proactive_silence" and text_has_datetime(cleaned):
-                        _ooh_reply = await _site_visit_out_of_hours_reply(db, tenant_res, cleaned, language)
-                    if _ooh_reply or _is_site_visit_confirmation_turn(cleaned, _confirm_history):
-                        from app.services.voice_turn_policy import extract_datetime_phrase
+                    # Resolve the single deterministic reply (if any) for this
+                    # real-estate turn. Order matters: an explicit inventory
+                    # question is answered from the catalog FIRST (gpt-4.1-mini
+                    # otherwise hallucinates a fake portfolio), then the
+                    # out-of-hours guard, then the booking confirmation.
+                    confirm = None
+                    confirm_source = None
+                    if source != "proactive_silence" and _is_project_inventory_question(cleaned):
+                        try:
+                            from app.services.real_estate_project_service import (
+                                load_active_projects,
+                                project_inventory_spoken,
+                            )
 
+                            _projs = await load_active_projects(db, getattr(tenant_res, "organization_id", None))
+                            _inv = project_inventory_spoken(_projs, language)
+                        except Exception:
+                            _inv = None
+                        if _inv:
+                            confirm = _inv
+                            confirm_source = "project_inventory"
+                    if confirm is None:
+                        _ooh_reply = None
+                        if source != "proactive_silence" and text_has_datetime(cleaned):
+                            _ooh_reply = await _site_visit_out_of_hours_reply(db, tenant_res, cleaned, language)
                         if _ooh_reply:
                             confirm = _ooh_reply
                             confirm_source = "site_visit_hours_rejection"
-                        else:
+                        elif _is_site_visit_confirmation_turn(cleaned, _confirm_history):
+                            from app.services.voice_turn_policy import extract_datetime_phrase
+
                             confirm = _site_visit_confirm_text(language, extract_datetime_phrase(cleaned))
                             confirm_source = "site_visit_confirmation"
+                    if confirm is not None:
                         await websocket.send_json(
                             {"type": "stt_finished", "text": cleaned, "turn_id": turn_id, "source": source}
                         )

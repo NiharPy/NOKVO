@@ -106,7 +106,10 @@ class NokvoOneSignupResponse(BaseModel):
     admin_user_id: UUID
     email: EmailStr
     org_status: str
-    message: str = "Verification email sent. Confirm your email to continue."
+    message: str = "Choose a plan and pay to continue."
+    # Short-lived token (stage="payment") that authorizes the payment endpoints
+    # before any session exists. Provisioning happens after payment.
+    payment_token: Optional[str] = None
     provisioning: Optional[NokvoOneProvisioningSummary] = None
 
 

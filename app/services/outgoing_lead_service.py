@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 import httpx
 import jwt
-from sqlalchemy import select
+from sqlalchemy import and_, case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -51,6 +51,11 @@ META_SCOPES = [
     # Without it, the lead-forms fetch returns ``(#200) Requires pages_manage_ads
     # permission to manage the object`` even if leads_retrieval is granted.
     "pages_manage_ads",
+    # Required to subscribe the Page to our app for ``leadgen`` webhooks
+    # (``POST /{page-id}/subscribed_apps``). Without it that call returns 403 and
+    # Meta never delivers real-time lead notifications — leads only arrive on the
+    # periodic sync. With it, ``_sync_meta`` auto-subscribes each page.
+    "pages_manage_metadata",
     # Read aggregate ad performance for the analytics tab.
     "ads_read",
     # Pull the actual lead form submissions.
@@ -189,6 +194,19 @@ def lead_is_callable(lead: OutgoingLead) -> bool:
         and lead.consent_status == LeadConsentStatus.granted
         and lead.opt_out_at is None
         and lead.call_status != LeadCallStatus.opted_out
+    )
+
+
+def _callable_lead_clause():
+    """SQL predicate mirroring :func:`lead_is_callable` for grouped counts and
+    bulk selection (e.g. "all callable leads for form X"). Keep in lockstep with
+    the Python version above."""
+    return and_(
+        OutgoingLead.source_provider.in_(ALLOWED_CALL_SOURCES),
+        OutgoingLead.phone_e164.is_not(None),
+        OutgoingLead.consent_status == LeadConsentStatus.granted,
+        OutgoingLead.opt_out_at.is_(None),
+        OutgoingLead.call_status != LeadCallStatus.opted_out,
     )
 
 
@@ -708,6 +726,7 @@ class OutgoingLeadService:
         *,
         eligible_only: bool = False,
         limit: int = 200,
+        capture_form_id: uuid.UUID | None = None,
     ) -> list[OutgoingLead]:
         stmt = (
             select(OutgoingLead)
@@ -715,6 +734,8 @@ class OutgoingLeadService:
             .order_by(OutgoingLead.created_at.desc())
             .limit(max(1, min(limit, 500)))
         )
+        if capture_form_id is not None:
+            stmt = stmt.where(OutgoingLead.capture_form_id == capture_form_id)
         if eligible_only:
             stmt = stmt.where(
                 OutgoingLead.consent_status == LeadConsentStatus.granted,
@@ -724,6 +745,51 @@ class OutgoingLeadService:
         res = await db.execute(stmt)
         leads = list(res.scalars().all())
         return [lead for lead in leads if lead_is_callable(lead)] if eligible_only else leads
+
+    @staticmethod
+    async def lead_counts_by_form(
+        tenant_res: TenantResources, db: AsyncSession
+    ) -> dict[str | None, dict[str, int]]:
+        """Total + callable lead counts grouped by ``capture_form_id`` (one query).
+
+        Returned dict is keyed by form id as a string (``None`` key = leads with no
+        capture form). Each value is ``{"total": int, "callable": int}``. Used to
+        annotate forms so the UI can sort/segment leads by their originating form
+        (= campaign/project) — see Option A in
+        [[project_meta_leadgen_page_discovery]].
+        """
+        res = await db.execute(
+            select(
+                OutgoingLead.capture_form_id,
+                func.count().label("total"),
+                func.count(case((_callable_lead_clause(), 1))).label("callable"),
+            )
+            .where(OutgoingLead.tenant_id == tenant_res.tenant_id)
+            .group_by(OutgoingLead.capture_form_id)
+        )
+        counts: dict[str | None, dict[str, int]] = {}
+        for form_id, total, callable_count in res.all():
+            key = str(form_id) if form_id is not None else None
+            counts[key] = {"total": int(total or 0), "callable": int(callable_count or 0)}
+        return counts
+
+    @staticmethod
+    async def callable_lead_ids_for_form(
+        tenant_res: TenantResources, db: AsyncSession, capture_form_id: uuid.UUID
+    ) -> list[uuid.UUID]:
+        """All callable lead ids for one capture form — server-side selection for
+        "create campaign from this form's leads" (no client enumeration, no 500-row
+        list cap)."""
+        res = await db.execute(
+            select(OutgoingLead.id)
+            .where(
+                OutgoingLead.tenant_id == tenant_res.tenant_id,
+                OutgoingLead.capture_form_id == capture_form_id,
+                _callable_lead_clause(),
+            )
+            .order_by(OutgoingLead.created_at.desc())
+        )
+        return [row[0] for row in res.all()]
 
     @staticmethod
     async def validate_callable_leads(
@@ -879,38 +945,115 @@ class OutgoingLeadService:
         )
 
     @staticmethod
+    async def _discover_meta_pages(client: httpx.AsyncClient, token: str) -> list[dict[str, Any]]:
+        """Return the Facebook Pages this token can manage, as ``{id, name, access_token}``.
+
+        Two discovery paths are merged because they cover different OAuth flows:
+
+        1. ``/me/accounts`` — lists Pages where the user holds a *role* (classic
+           Facebook Login).
+        2. ``debug_token`` granular scopes — under **Facebook Login for Business**
+           (granular page selection) the user grants the app access to specific
+           Page *assets*. Those Pages do NOT appear in ``/me/accounts`` even
+           though every page permission is granted; the authorized Page IDs show
+           up as ``granular_scopes[].target_ids``. We fetch each such Page
+           directly by ID to obtain its Page access token.
+
+        Without (2), a lead form hosted on an asset-granted Page is invisible, the
+        sync finds no forms, and inbound leadgen webhooks for that form's
+        ``form_id`` cannot be mapped to a tenant — so the lead is silently dropped.
+        """
+        base = f"https://graph.facebook.com/{settings.META_GRAPH_VERSION}"
+        pages: dict[str, dict[str, Any]] = {}
+
+        # (1) Role-based pages.
+        try:
+            resp = await client.get(
+                f"{base}/me/accounts",
+                params={"fields": "id,name,access_token", "access_token": token},
+            )
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise OutgoingLeadService._explain_meta_error(exc, step="page lookup") from exc
+        except httpx.HTTPError as exc:
+            raise OutgoingLeadServiceError(f"Meta page lookup failed: {exc}") from exc
+        for p in resp.json().get("data") or []:
+            pid = str(p.get("id") or "")
+            if pid:
+                pages[pid] = {"id": pid, "name": p.get("name"), "access_token": p.get("access_token") or token}
+
+        # (2) Asset-granted pages from the token's granular scopes (FB Login for Business).
+        granted_page_ids: set[str] = set()
+        if settings.META_ADS_APP_ID and settings.META_ADS_APP_SECRET:
+            try:
+                app_token = f"{settings.META_ADS_APP_ID}|{settings.META_ADS_APP_SECRET}"
+                dbg = await client.get(
+                    f"{base}/debug_token",
+                    params={"input_token": token, "access_token": app_token},
+                )
+                dbg.raise_for_status()
+                for gs in (dbg.json().get("data") or {}).get("granular_scopes") or []:
+                    if gs.get("scope") in {
+                        "pages_show_list",
+                        "leads_retrieval",
+                        "pages_manage_ads",
+                        "pages_read_engagement",
+                    }:
+                        for tid in gs.get("target_ids") or []:
+                            granted_page_ids.add(str(tid))
+            except httpx.HTTPError:
+                pass  # best-effort — fall back to /me/accounts only
+
+        # Fetch each asset-granted page not already discovered, directly by ID.
+        for pid in granted_page_ids:
+            if pid in pages:
+                continue
+            try:
+                resp = await client.get(
+                    f"{base}/{pid}",
+                    params={"fields": "id,name,access_token", "access_token": token},
+                )
+                resp.raise_for_status()
+                pj = resp.json()
+                pages[pid] = {"id": pid, "name": pj.get("name"), "access_token": pj.get("access_token") or token}
+            except httpx.HTTPError:
+                continue  # page revoked or inaccessible — skip
+
+        return list(pages.values())
+
+    @staticmethod
     async def _sync_meta(connection: LeadSourceConnection, db: AsyncSession) -> dict[str, Any]:
         token = _connection_token(connection)
         base = f"https://graph.facebook.com/{settings.META_GRAPH_VERSION}"
         imported_forms = 0
         imported_leads = 0
         async with httpx.AsyncClient(timeout=30.0) as client:
-            try:
-                pages_resp = await client.get(
-                    f"{base}/me/accounts",
-                    params={"fields": "id,name,access_token", "access_token": token},
-                )
-                pages_resp.raise_for_status()
-            except httpx.HTTPStatusError as exc:
-                raise OutgoingLeadService._explain_meta_error(exc, step="page lookup") from exc
-            except httpx.HTTPError as exc:
-                raise OutgoingLeadServiceError(f"Meta page lookup failed: {exc}") from exc
-            pages = pages_resp.json().get("data") or []
+            pages = await OutgoingLeadService._discover_meta_pages(client, token)
             metadata = dict(connection.metadata_ or {})
             metadata["pages"] = [{"id": p.get("id"), "name": p.get("name")} for p in pages]
             connection.metadata_ = metadata
             flag_modified(connection, "metadata_")
             if not pages:
                 raise OutgoingLeadServiceError(
-                    "Meta returned no Facebook pages for this account. "
-                    "Make sure the connected user is an admin/editor on at "
-                    "least one page that hosts the lead form."
+                    "Meta returned no Facebook Pages for this account. Reconnect and, "
+                    "on Meta's 'What do you want to allow' screen, tick the specific "
+                    "Page that hosts your lead form (and confirm you're an admin of it)."
                 )
             for page in pages:
                 page_id = page.get("id")
                 page_token = page.get("access_token") or token
                 if not page_id:
                     continue
+                # Subscribe the Page to our app for ``leadgen`` so Meta delivers
+                # real-time webhooks for new submissions (idempotent; best-effort —
+                # a failure here must not abort the sync/back-fill below).
+                try:
+                    await client.post(
+                        f"{base}/{page_id}/subscribed_apps",
+                        params={"subscribed_fields": "leadgen", "access_token": page_token},
+                    )
+                except httpx.HTTPError:
+                    pass
                 try:
                     forms_resp = await client.get(
                         f"{base}/{page_id}/leadgen_forms",

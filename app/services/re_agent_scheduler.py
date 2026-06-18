@@ -65,8 +65,11 @@ class REAgentScheduler:
             return {"ok": False, "reason": "not_a_ticket"}
 
         data = dict(rec.data or {})
-        # Idempotency: never re-schedule a ticket we already processed/assigned.
-        if data.get("re_scheduled") or data.get("assigned_member_id"):
+        # Idempotency: never re-process a ticket we already enriched. (We no
+        # longer key off assigned_member_id — that now only appears AFTER a
+        # member claims the ticket, and a claimed-but-unenriched ticket should
+        # still get its fields filled.)
+        if data.get("re_scheduled"):
             return {"ok": False, "reason": "already_scheduled"}
         if str(data.get("issue_type") or data.get("request_type") or "") != "site_visit":
             return {"ok": False, "reason": "not_site_visit"}
@@ -76,49 +79,37 @@ class REAgentScheduler:
             return {"ok": False, "reason": "no_note"}
 
         extracted = await REAgentScheduler._extract(note)
+        # Deterministic safety net so date/time land "for sure" when the note
+        # states them but the LLM returned null (or failed): re-parse the note
+        # prose with the same lenient date/time parsers the live agent uses.
+        REAgentScheduler._backfill_datetime_from_note(note, extracted)
 
-        # ── 1) Fill the Site Visit Fields onto the SAME ticket ──────────────────
+        # Fill the Site Visit Fields onto the SAME ticket. Site visits are NOT
+        # auto-assigned anymore — they go to the claim pool (the Ticket Board)
+        # for a member to pick up. This layer only EXTRACTS + STRUCTURES the
+        # date / time / phone / project so the board shows a complete request;
+        # the member-to-visit binding happens on claim.
         await REAgentScheduler._fill_fields(db, org_id, data, extracted)
-        rec.data = data
-        _safe_flag_modified(flag_modified, rec)
 
-        # ── 2) Assign the nearest-free agent at the confirmed time ──────────────
+        # Phone "for sure": the call put the ANI on data["phone"] at creation;
+        # mirror it onto the contact_phone column the board serializer reads.
+        phone = str(data.get("phone") or "").strip()
+        if phone and not getattr(rec, "contact_phone", None):
+            try:
+                rec.contact_phone = phone
+            except Exception:
+                pass
+
         requested_at = REAgentScheduler._parse_visit_datetime(
             extracted.get("visit_date"), extracted.get("visit_time")
         )
-        assignment: dict[str, Any] | None = None
-        if requested_at is not None:
-            try:
-                from app.services.predefined_tools_service import _assign_existing_record
-
-                assignment = await _assign_existing_record(
-                    db,
-                    org_id,
-                    rec,
-                    request_type="site_visit",
-                    requested_time=requested_at,
-                    summary=note[:300],
-                    metadata={"assignment_source": "re_agent_scheduler"},
-                )
-            except Exception:
-                logger.exception("NOKVO-RE-SCHED: assignment failed")
-                assignment = None
-
-        # ── 3) Persist the outcome (re-read rec.data so the assignment service's
-        #       own mutations are preserved alongside our extracted fields) ──────
-        data = dict(rec.data or {})
-        if assignment and assignment.get("selected_member_id"):
-            data["assigned_member_id"] = assignment["selected_member_id"]
-            data["assigned_member_name"] = assignment.get("selected_member_name")
-            data["scheduled_time"] = assignment.get("scheduled_time")
-            data["time_adjusted"] = bool(assignment.get("time_adjusted"))
-            data["assignment_status"] = assignment.get("assignment_status") or "assigned"
-        elif requested_at is None:
-            # No firm date/time in the note → leave for a human to schedule.
-            data["assignment_status"] = "needs_manual_scheduling"
+        has_firm_time = requested_at is not None
+        # Unassigned == claimable on the Ticket Board. Flag the ones still missing
+        # a firm time so a member/ops can see they need a slot pinned down — they
+        # remain claimable either way.
+        data["assignment_status"] = "unassigned" if has_firm_time else "needs_manual_scheduling"
+        if not has_firm_time:
             data["assignment_reason"] = "no_firm_visit_time_in_note"
-        else:
-            data["assignment_status"] = (assignment or {}).get("assignment_status") or "no_available_member"
         data["re_scheduled"] = True
         data["re_scheduled_at"] = datetime.now(timezone.utc).isoformat()
         rec.data = data
@@ -135,16 +126,14 @@ class REAgentScheduler:
             return {"ok": False, "reason": "commit_failed"}
 
         logger.info(
-            "NOKVO-RE-SCHED: ticket %s status=%s member=%s time_adjusted=%s",
-            rec.id, data.get("assignment_status"), data.get("assigned_member_name"),
-            data.get("time_adjusted"),
+            "NOKVO-RE-SCHED: ticket %s pooled status=%s firm_time=%s project=%s",
+            rec.id, data.get("assignment_status"), has_firm_time, data.get("project_name"),
         )
         return {
             "ok": True,
             "record_id": str(rec.id),
-            "assigned_member_id": data.get("assigned_member_id"),
             "assignment_status": data.get("assignment_status"),
-            "time_adjusted": data.get("time_adjusted"),
+            "has_firm_time": has_firm_time,
         }
 
     # ── helpers ─────────────────────────────────────────────────────────────────
@@ -159,15 +148,18 @@ class REAgentScheduler:
             projects = await load_active_projects(db, org_id)
         except Exception:
             projects = []
-        spoken_project = extracted.get("project_name")
-        matched = find_project_match(projects, project_name=str(spoken_project)) if spoken_project else None
-        if matched is None and len(projects) == 1:
-            matched = projects[0]
-        if matched is not None:
-            data["project_name"] = matched.name
-            data["project_id"] = str(matched.id)
-        elif spoken_project:
-            data["project_name"] = str(spoken_project)
+        # Project: keep one already resolved at creation; else fuzzy-match the
+        # extracted name against the catalog. NEVER echo an unmatched free-text
+        # string back onto the ticket — a garbage project ("Show You The Site")
+        # is worse than leaving it blank for a human to pick.
+        if not data.get("project_id"):
+            spoken_project = extracted.get("project_name")
+            matched = find_project_match(projects, project_name=str(spoken_project)) if spoken_project else None
+            if matched is None and len(projects) == 1:
+                matched = projects[0]
+            if matched is not None:
+                data["project_name"] = matched.name
+                data["project_id"] = str(matched.id)
         # Name/phone: the call already put the ANI (+ name-if-known) on the ticket;
         # only fill from the note when the ticket doesn't already have them.
         if extracted.get("customer_name") and not data.get("name"):
@@ -180,6 +172,34 @@ class REAgentScheduler:
             data["visit_date"] = str(extracted["visit_date"])
         if extracted.get("visit_time"):
             data["visit_time"] = str(extracted["visit_time"])
+
+    @staticmethod
+    def _backfill_datetime_from_note(note: str, extracted: dict[str, Any]) -> None:
+        """Fill visit_date / visit_time from the note prose when the LLM left
+        them null. Deterministic — reuses the agent's date/time parsers so the
+        Ticket Board reliably shows a date + time whenever the note states one.
+        Mutates ``extracted`` in place; never raises."""
+        need_date = not extracted.get("visit_date")
+        need_time = not extracted.get("visit_time")
+        if not (need_date or need_time):
+            return
+        try:
+            from app.services.voice_turn_policy import extract_turn_entities
+            from app.services.nokvo_one_voice_pipeline import NokvoOneVoicePipeline as _P
+
+            ents = extract_turn_entities(note)
+            if need_date and ents.get("date_text"):
+                try:
+                    extracted["visit_date"] = _P._parse_appointment_date(ents["date_text"]).isoformat()
+                except Exception:
+                    pass
+            if need_time and ents.get("time_text"):
+                try:
+                    extracted["visit_time"] = _P._parse_appointment_time(ents["time_text"]).strftime("%H:%M")
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     @staticmethod
     async def _extract(note: str) -> dict[str, Any]:

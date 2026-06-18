@@ -1,10 +1,10 @@
 """All-or-nothing semantics for the slimmed Nokvo One provisioner.
 
 After the provisioning overhaul, signup provisions only shared/fast resources —
-4 ordered steps: blob prefix → Qdrant collection → Redis namespace → Exotel
-placeholder. The chat LLM (shared pool), embeddings (global OpenAI) and STT/TTS
-(global Sarvam) are NOT provisioned per tenant. If a step fails, every earlier
-step rolls back before the error reaches the caller.
+3 ordered steps: blob prefix → Redis namespace → Plivo telephony. The chat LLM
+(shared pool), embeddings (global OpenAI), STT/TTS (global Sarvam) and the
+Knowledge Base / Qdrant collection (retired) are NOT provisioned per tenant. If
+a step fails, every earlier step rolls back before the error reaches the caller.
 """
 from __future__ import annotations
 
@@ -24,16 +24,14 @@ def _run(coro):
     return asyncio.new_event_loop().run_until_complete(coro)
 
 
-def _common_patches(blob=None, qdrant=None, redis=None):
+def _common_patches(blob=None, redis=None):
     blob = blob or AsyncMock(
         return_value={"storage_account_name": "sa", "container_name": "c", "blob_prefix": "tenants/x/"}
     )
-    qdrant = qdrant or AsyncMock(return_value="qd")
     redis = redis or AsyncMock(return_value="ns")
     from app.core.config import settings as _settings
     return [
         patch("app.services.nokvo_one_provisioning_service.AzureBlobService.provision_blob_storage", blob),
-        patch("app.services.nokvo_one_provisioning_service.QdrantService.provision_collection", qdrant),
         patch("app.services.nokvo_one_provisioning_service.RedisTenantService.provision_redis", redis),
         # Force the Plivo telephony step to degrade to a pending slot (NO real Plivo
         # API calls during tests — otherwise it creates real subaccounts).
@@ -56,7 +54,8 @@ def test_provisioner_returns_resources_when_all_steps_succeed():
         assert result["provisioning_status"] == "success"
         # No per-tenant Azure resource group anymore.
         assert result["azure_resource_group_name"] is None
-        assert result["qdrant_collection_name"] == "qd"
+        # Qdrant collection provisioning removed (KB retired) → no collection.
+        assert result["qdrant_collection_name"] is None
         assert result["redis_namespace"] == "ns"
         ps = result["provider_status"]
         assert ps["llm_provider"] == "azure_openai_pool"
@@ -70,46 +69,22 @@ def test_provisioner_returns_resources_when_all_steps_succeed():
         # No per-tenant LLM key / Key Vault leaks into provider_status.
         assert "llm_api_key_secret_ref" not in ps and "key_vault_status" not in ps
         step_names = {s["name"] for s in result["provisioning_steps"]}
-        assert step_names == {"blob_prefix", "qdrant_collection", "redis_namespace", "plivo_telephony"}
+        assert step_names == {"blob_prefix", "redis_namespace", "plivo_telephony"}
+        assert "qdrant_collection" not in step_names
         assert "azure_openai_chat" not in step_names and "shared_key_vault" not in step_names
     finally:
         for p in patches:
             p.stop()
 
 
-def test_provisioner_rolls_back_when_qdrant_fails():
-    """Blob succeeds; Qdrant blows up → the blob prefix must roll back."""
-    blob_delete = AsyncMock()
-    qdrant = AsyncMock(side_effect=RuntimeError("qdrant down"))
-
-    patches = _common_patches(qdrant=qdrant) + [
-        patch("app.services.nokvo_one_provisioning_service._delete_blob_prefix", blob_delete),
-    ]
-    for p in patches:
-        p.start()
-    try:
-        with pytest.raises(NokvoOneProvisioningError) as excinfo:
-            _run(
-                NokvoOneProvisioningService.provision_or_raise(
-                    organization_id=uuid.uuid4(),
-                    organization_name="Acme Inc",
-                )
-            )
-        assert excinfo.value.step == "qdrant_collection"
-        blob_delete.assert_awaited_once()
-    finally:
-        for p in patches:
-            p.stop()
-
-
 def test_provisioner_rolls_back_when_redis_fails():
+    """Blob succeeds; Redis blows up → the blob prefix must roll back. (Qdrant is
+    no longer a step, so there's nothing between blob and redis to roll back.)"""
     blob_delete = AsyncMock()
-    qd_delete = AsyncMock()
     redis = AsyncMock(side_effect=RuntimeError("redis offline"))
 
     patches = _common_patches(redis=redis) + [
         patch("app.services.nokvo_one_provisioning_service._delete_blob_prefix", blob_delete),
-        patch("app.services.nokvo_one_provisioning_service._delete_qdrant_collection", qd_delete),
     ]
     for p in patches:
         p.start()
@@ -122,7 +97,6 @@ def test_provisioner_rolls_back_when_redis_fails():
                 )
             )
         assert excinfo.value.step == "redis_namespace"
-        qd_delete.assert_awaited_once_with("qd")
         blob_delete.assert_awaited_once()
     finally:
         for p in patches:
@@ -151,9 +125,10 @@ def test_on_step_emits_running_then_success_for_each_step():
             p.stop()
 
     step_names = [n for n, _ in events]
-    for required in ["blob_prefix", "qdrant_collection", "redis_namespace", "plivo_telephony"]:
+    for required in ["blob_prefix", "redis_namespace", "plivo_telephony"]:
         assert required in step_names, f"missing step {required} in {step_names}"
-    # The retired Azure steps must NOT be emitted.
+    # The retired steps must NOT be emitted.
+    assert "qdrant_collection" not in step_names
     assert "resource_group" not in step_names and "azure_openai_chat" not in step_names
     blob_events = [s for n, s in events if n == "blob_prefix"]
     assert blob_events[:2] == ["running", "success"]

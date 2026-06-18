@@ -47,8 +47,10 @@ def is_work_email(email: str | EmailStr) -> bool:
 
 
 def validate_work_email(email: str | EmailStr) -> str:
+    """Validate + normalize a signup email. Personal providers (gmail, etc.) are
+    NOW ALLOWED — any well-formed email is accepted. (Name + extract_email_domain
+    call are kept so the format check still rejects malformed input and every
+    schema/API caller needs no change.)"""
     normalized = normalize_email(email)
-    domain = extract_email_domain(normalized)
-    if domain in PERSONAL_EMAIL_DOMAINS:
-        raise ValueError("A work email is required. Personal email providers are not allowed.")
+    extract_email_domain(normalized)  # raises ValueError on a malformed address
     return normalized

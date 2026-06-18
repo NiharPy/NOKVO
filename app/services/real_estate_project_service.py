@@ -174,6 +174,38 @@ def project_summary_lines(projects: list[RealEstateProject]) -> list[str]:
     return lines
 
 
+def project_inventory_spoken(projects: list[RealEstateProject], language: str | None = None) -> str | None:
+    """A concise, FULLY-GROUNDED spoken answer to "what projects do you have?",
+    built straight from the catalog so the LLM can't hallucinate inventory.
+    Returns ``None`` when there are no projects (caller falls back to the LLM /
+    "team will share" path). Project facts stay in English/digits per the
+    native-script code-switching rule; only the light frame is localized."""
+    real = [p for p in projects if getattr(p, "name", None)]
+    if not real:
+        return None
+    segments: list[str] = []
+    for p in real[:6]:
+        seg = p.name
+        if p.location:
+            seg += f" in {p.location}"
+        configs = list(p.configurations or [])
+        if configs:
+            seg += f" — {', '.join(configs[:3])}"
+        price = _format_price(p)
+        if price:
+            seg += f", {price}"
+        segments.append(seg)
+    listed = ". ".join(segments)
+    n = len(real)
+    count_word = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five", 6: "six"}.get(n, str(n))
+    lang = (language or "en")[:2]
+    if lang == "te":
+        return f"మా దగ్గర {count_word} projects ఉన్నాయి. {listed}. వీటిలో ఏదాని గురించి details లేదా brochure కావాలి?"
+    if lang == "hi":
+        return f"हमारे पास {count_word} projects हैं. {listed}. इनमें से किसके details या brochure चाहिए?"
+    return f"We have {count_word} project{'s' if n != 1 else ''}. {listed}. Which one would you like details or a brochure for?"
+
+
 def projects_prompt_section(projects: list[RealEstateProject]) -> str:
     """Block that gets injected as a system-prompt section.
 

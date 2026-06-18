@@ -197,7 +197,23 @@ class AzureAgentLLMClient:
         return min(wait, AzureAgentLLMClient._MAX_RETRY_WAIT)
 
     @staticmethod
+    def _pool_member():
+        """The shared gpt-5-mini LLM-pool box (deterministic first member) so all
+        Agent-runtime calls run on the pool instead of a per-tenant gpt-4.1-mini
+        deployment. ``None`` when no pool is configured (legacy fallback)."""
+        try:
+            from app.services.llm_pool import LLMPool
+
+            members = LLMPool.members()
+            return members[0] if members else None
+        except Exception:
+            return None
+
+    @staticmethod
     async def _api_key(tenant_res: TenantResources) -> str:
+        member = AzureAgentLLMClient._pool_member()
+        if member is not None:
+            return member.api_key
         provider_status = dict(tenant_res.provider_status or {})
         key_ref = provider_status.get("llm_api_key_ref")
         if key_ref:
@@ -210,6 +226,29 @@ class AzureAgentLLMClient:
 
     @staticmethod
     def _endpoint_and_body(tenant_res: TenantResources, messages: list[dict[str, str]]) -> tuple[str, dict[str, Any]]:
+        # Prefer the shared gpt-5-mini pool. Its endpoint is the Responses API
+        # (gpt-5 is a reasoning model: it needs a reasoning-effort hint and ample
+        # max_output_tokens, or reasoning tokens eat the budget and the reply is
+        # empty). Streaming + extraction already handle the Responses format.
+        member = AzureAgentLLMClient._pool_member()
+        if member is not None:
+            m_endpoint = member.endpoint.rstrip("/")
+            if "/responses" in m_endpoint:
+                return m_endpoint, {
+                    "model": member.deployment,
+                    "input": messages,
+                    "reasoning": {"effort": settings.AZURE_OPENAI_REASONING_EFFORT},
+                    "max_output_tokens": 512,
+                }
+            api_version = urllib_parse.quote(settings.AZURE_OPENAI_POOL_API_VERSION.strip())
+            dep = urllib_parse.quote(member.deployment)
+            url = (
+                m_endpoint
+                if "/openai/deployments/" in m_endpoint
+                else f"{m_endpoint}/openai/deployments/{dep}/chat/completions?api-version={api_version}"
+            )
+            return url, {"messages": messages, "temperature": 0.3, "max_tokens": 120}
+
         provider_status = dict(tenant_res.provider_status or {})
         endpoint = str(provider_status.get("llm_endpoint") or settings.AZURE_OPENAI_GLOBAL_ENDPOINT or "").rstrip("/")
         if not endpoint:
@@ -219,7 +258,7 @@ class AzureAgentLLMClient:
             provider_status.get("llm_deployment")
             or provider_status.get("deployment_name")
             or settings.AZURE_OPENAI_AGENT_DEPLOYMENT
-            or "gpt-4-1-mini"
+            or "gpt-5-mini"
         ).strip()
         if endpoint.endswith("/responses"):
             return endpoint, {

@@ -42,9 +42,9 @@ from app.api import deps
 from app.models.call_cost import CallCost
 from app.models.organization_user import OrganizationUser
 from app.services.call_cost_calculator import (
-    RUPEES_PER_MINUTE,
-    RUPEES_PER_SECOND,
+    RATE_TIERS,
     rupees_display,
+    rupees_per_minute_for,
 )
 from app.services.notification_service import NotificationService, notification_bus
 
@@ -165,11 +165,20 @@ async def cost_summary(
                 }
             )
 
+    # Current per-minute rate = the tier this month's minutes-to-date fall into.
+    month_minutes = this_month[1] / Decimal("60")
+    current_rate = rupees_per_minute_for(month_minutes)
+    tier_ladder = [
+        {"up_to_minutes": upper, "rupees_per_minute": str(rate)} for upper, rate in RATE_TIERS
+    ]
+
     return {
         "rate": {
-            "rupees_per_minute": str(RUPEES_PER_MINUTE),
-            "rupees_per_second": str(RUPEES_PER_SECOND),
-            "rupees_per_second_display": "0.13",
+            "rupees_per_minute": str(current_rate),
+            "rupees_per_second": str(current_rate / Decimal("60")),
+            "rupees_per_second_display": f"{(current_rate / Decimal('60')):.2f}",
+            "month_minutes_to_date": str(month_minutes),
+            "tiers": tier_ladder,
         },
         "today": _format(today),
         "this_month": _format(this_month),

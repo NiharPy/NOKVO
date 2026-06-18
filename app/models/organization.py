@@ -26,4 +26,19 @@ class Organization(Base):
     twilio_auto_provision = Column(Boolean, nullable=False, default=False)
     industry = Column(String, nullable=True)
     country_code = Column(String, nullable=True)
+
+    # ── Post-payment onboarding wizard (business KYC → compliance → … → ToS) ──
+    # Business / legal details collected in onboarding step ①.
+    legal_name = Column(String, nullable=True)
+    alias_name = Column(String, nullable=True)        # trading / brand name
+    business_pan = Column(String, nullable=True)
+    cin = Column(String, nullable=True)
+    # Legal consent captured in the final onboarding step.
+    terms_accepted_at = Column(DateTime(timezone=True), nullable=True)
+    privacy_accepted_at = Column(DateTime(timezone=True), nullable=True)
+    terms_version = Column(String, nullable=True)
+    # Current wizard step for resume; null once onboarding is done. Values:
+    # business_details → documents → working_hours → projects → agent → terms → done.
+    onboarding_step = Column(String, nullable=True)
+
     created_at = Column(DateTime(timezone=True), server_default=func.now())

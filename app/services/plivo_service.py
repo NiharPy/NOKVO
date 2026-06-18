@@ -50,6 +50,23 @@ class PlivoService:
         except Exception:
             return {"raw": resp.text}
 
+    @staticmethod
+    async def _request_multipart(
+        url: str, *, auth: tuple[str, str], data: dict | None = None, files: dict | None = None
+    ) -> dict[str, Any]:
+        """POST multipart/form-data — used for Plivo compliance document uploads
+        (the file is sent as a part, not JSON)."""
+        async with httpx.AsyncClient(timeout=60.0, auth=auth) as client:
+            resp = await client.post(url, data=data or {}, files=files or {})
+        if resp.status_code >= 400:
+            raise PlivoError(
+                f"Plivo POST {url.split('/Account/')[-1]} failed ({resp.status_code}): {resp.text[:300]}"
+            )
+        try:
+            return resp.json()
+        except Exception:
+            return {"raw": resp.text}
+
     # ── subaccounts ─────────────────────────────────────────────────────────────
     @classmethod
     async def create_subaccount(cls, name: str) -> dict[str, str]:
@@ -245,6 +262,13 @@ class PlivoService:
 
     # ── outbound ─────────────────────────────────────────────────────────────────
     @classmethod
+    def outbound_caller_id(cls, tenant_res: TenantResources) -> str | None:
+        """The tenant's allotted outbound caller-ID number (rented Plivo DID),
+        or None when telephony isn't provisioned yet."""
+        cfg = cls._plivo_config(tenant_res)
+        return cfg.get("number") or tenant_res.twilio_phone_number or None
+
+    @classmethod
     async def initiate_outbound_call(
         cls,
         tenant_res: TenantResources,
@@ -252,11 +276,14 @@ class PlivoService:
         to_number: str,
         answer_url: str,
         status_callback: str | None = None,
+        from_number: str | None = None,
     ) -> dict[str, Any]:
         """Place an outbound call from the tenant's assigned DID. answer_url returns
-        the <Stream> XML that bridges audio to the agent."""
+        the <Stream> XML that bridges audio to the agent. ``from_number`` overrides
+        the caller ID (callers pass the campaign's resolved allotted number); when
+        omitted it falls back to the tenant's configured DID."""
         cfg = cls._plivo_config(tenant_res)
-        from_number = cfg.get("number") or tenant_res.twilio_phone_number
+        from_number = from_number or cls.outbound_caller_id(tenant_res)
         if not from_number:
             raise PlivoError("Tenant has no assigned Plivo DID for outbound caller ID.")
         # Calls are placed on the tenant's subaccount when available, else master.

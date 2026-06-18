@@ -48,12 +48,34 @@ from decimal import Decimal, ROUND_HALF_UP
 from typing import Union
 
 
-# Per-minute tariff, in rupees. Source of truth for the entire billing path.
+# Legacy flat default — kept as a fallback for any caller that doesn't supply a
+# tier-aware rate. The live billing path uses the tiered rates below.
 RUPEES_PER_MINUTE: Decimal = Decimal("8")
-
-# Per-second rate = ₹8 / 60. Computed once at import time so we don't pay
-# the division on every call. Decimal preserves the recurring fraction.
 RUPEES_PER_SECOND: Decimal = RUPEES_PER_MINUTE / Decimal("60")
+
+# Tiered per-minute tariff (post-paid), selected by the org's cumulative billed
+# MINUTES in the current calendar month. Each entry is
+# (exclusive_upper_minute_bound, rupees_per_minute); the last bound is None
+# (open-ended). Source of truth for the live billing path.
+RATE_TIERS: list[tuple[int | None, Decimal]] = [
+    (1000, Decimal("10")),
+    (10000, Decimal("9")),
+    (25000, Decimal("8")),
+    (None, Decimal("6.5")),
+]
+
+
+def rupees_per_minute_for(cumulative_minutes: Decimal | int | float) -> Decimal:
+    """Per-minute rate for the tier the month's cumulative minutes fall into."""
+    m = Decimal(str(cumulative_minutes))
+    for upper, rate in RATE_TIERS:
+        if upper is None or m < upper:
+            return rate
+    return RATE_TIERS[-1][1]
+
+
+def rupees_per_second_for(cumulative_minutes: Decimal | int | float) -> Decimal:
+    return rupees_per_minute_for(cumulative_minutes) / Decimal("60")
 
 # Quantisation templates. ``_LEDGER_Q`` is what gets persisted, ``_DISPLAY_Q``
 # is what the UI renders. The four-decimal ledger value preserves the
@@ -167,10 +189,16 @@ class CostBreakdown:
 
     @classmethod
     def for_duration(cls, duration: DurationLike) -> "CostBreakdown":
+        return cls.for_duration_at_rate(duration, RUPEES_PER_SECOND)
+
+    @classmethod
+    def for_duration_at_rate(cls, duration: DurationLike, rate_per_second: Decimal) -> "CostBreakdown":
+        """Cost for a duration at an explicit per-second rate (the tiered path
+        passes the rate chosen from the org's month-to-date minutes)."""
         seconds = _to_seconds(duration)
         if seconds < 0:
             raise ValueError(f"duration cannot be negative (got {seconds!s} seconds)")
-        ledger = (seconds * RUPEES_PER_SECOND).quantize(_LEDGER_Q, rounding=ROUND_HALF_UP)
+        ledger = (seconds * rate_per_second).quantize(_LEDGER_Q, rounding=ROUND_HALF_UP)
         display = ledger.quantize(_DISPLAY_Q, rounding=ROUND_HALF_UP)
         return cls(
             seconds=seconds,
