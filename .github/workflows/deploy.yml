@@ -1,0 +1,112 @@
+name: Deploy to Azure
+
+# Builds the API image in ACR (cloud build → always linux/amd64), runs DB
+# migrations, rolls a new Container App revision, then builds + ships the Vue
+# portal to Static Web Apps. Auth is OIDC federated — no stored SP secret.
+#
+# One-time setup (see infra/README.md):
+#   - Federated credential on an app registration / managed identity for this repo
+#   - Repo secrets:   AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID,
+#                     AZURE_STATIC_WEB_APPS_API_TOKEN
+#   - Repo variables: RESOURCE_GROUP, ACR_NAME, API_APP, MIGRATE_JOB,
+#                     API_BASE_URL  (e.g. https://api.nokvo.com)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  id-token: write   # OIDC
+  contents: read
+
+env:
+  IMAGE_NAME: nokvo-api
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  api:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build image in ACR (linux/amd64)
+        run: |
+          az acr build \
+            --registry "${{ vars.ACR_NAME }}" \
+            --image "${IMAGE_NAME}:${IMAGE_TAG}" \
+            --platform linux/amd64 \
+            .
+
+      - name: Run DB migrations (job → new image, wait for success)
+        run: |
+          set -euo pipefail
+          ACR_SERVER="$(az acr show -n "${{ vars.ACR_NAME }}" --query loginServer -o tsv)"
+          IMAGE="${ACR_SERVER}/${IMAGE_NAME}:${IMAGE_TAG}"
+          az containerapp job update -n "${{ vars.MIGRATE_JOB }}" -g "${{ vars.RESOURCE_GROUP }}" \
+            --image "$IMAGE" -o none
+          EXEC="$(az containerapp job start -n "${{ vars.MIGRATE_JOB }}" -g "${{ vars.RESOURCE_GROUP }}" \
+            --query name -o tsv)"
+          echo "migration execution: $EXEC"
+          for _ in $(seq 1 60); do
+            STATUS="$(az containerapp job execution show -n "${{ vars.MIGRATE_JOB }}" \
+              -g "${{ vars.RESOURCE_GROUP }}" --job-execution-name "$EXEC" \
+              --query properties.status -o tsv 2>/dev/null || echo Unknown)"
+            echo "  status: $STATUS"
+            case "$STATUS" in
+              Succeeded) exit 0 ;;
+              Failed|Degraded) echo "migration failed"; exit 1 ;;
+            esac
+            sleep 10
+          done
+          echo "migration timed out"; exit 1
+
+      - name: Roll new Container App revision
+        run: |
+          ACR_SERVER="$(az acr show -n "${{ vars.ACR_NAME }}" --query loginServer -o tsv)"
+          IMAGE="${ACR_SERVER}/${IMAGE_NAME}:${IMAGE_TAG}"
+          az containerapp update -n "${{ vars.API_APP }}" -g "${{ vars.RESOURCE_GROUP }}" \
+            --image "$IMAGE" -o none
+          # Multiple-revision mode: shift 100% of traffic to the newest revision.
+          NEW_REV="$(az containerapp revision list -n "${{ vars.API_APP }}" \
+            -g "${{ vars.RESOURCE_GROUP }}" --query "[?properties.active].name | [-1]" -o tsv)"
+          az containerapp ingress traffic set -n "${{ vars.API_APP }}" \
+            -g "${{ vars.RESOURCE_GROUP }}" --revision-weight "${NEW_REV}=100" -o none
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build portal
+        working-directory: frontend
+        env:
+          VITE_API_BASE_URL: ${{ vars.API_BASE_URL }}
+        run: |
+          npm ci
+          npm run build
+
+      - name: Deploy to Static Web Apps
+        uses: Azure/static-web-apps-deploy@v1
+        with:
+          azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
+          action: upload
+          app_location: frontend/dist
+          skip_app_build: true

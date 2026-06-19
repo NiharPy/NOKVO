@@ -149,15 +149,25 @@ class TranscriptService:
     @classmethod
     async def run_forever(cls) -> None:
         """Daily all-orgs retention sweep. Started as a background task at app
-        startup; never raises out of the loop."""
+        startup; never raises out of the loop. Leader-elected so only one
+        replica runs the sweep per window — the delete is idempotent, but this
+        stops every replica re-running the same DELETE daily."""
         from app.db.session import AsyncSessionLocal
+        from app.services.scheduler_leader import scheduler_leader
 
         while True:
             try:
-                async with AsyncSessionLocal() as db:
-                    deleted = await cls.purge_expired(db)
-                if deleted:
-                    logger.info("NOKVO-TRANSCRIPT: retention purged %d expired transcript(s)", deleted)
+                # Hold the lock for ~the whole window so a replica that wakes on
+                # an offset timer doesn't re-purge the same day; it expires
+                # before the next cycle so leadership can move if a pod cycles.
+                async with scheduler_leader(
+                    "transcript-retention", ttl_seconds=_PURGE_INTERVAL_SECONDS - 3600
+                ) as is_leader:
+                    if is_leader:
+                        async with AsyncSessionLocal() as db:
+                            deleted = await cls.purge_expired(db)
+                        if deleted:
+                            logger.info("NOKVO-TRANSCRIPT: retention purged %d expired transcript(s)", deleted)
             except Exception:
                 logger.warning("NOKVO-TRANSCRIPT: retention sweep failed", exc_info=True)
             await asyncio.sleep(_PURGE_INTERVAL_SECONDS)

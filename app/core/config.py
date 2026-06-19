@@ -2,7 +2,15 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     PROJECT_NAME: str = "SuperAdmin Privileged Access Management"
-    
+
+    # Deployment environment: "development" | "staging" | "production".
+    # Gates dev-only conveniences (e.g. localhost CORS origins) off in prod.
+    ENVIRONMENT: str = "development"
+
+    @property
+    def is_production(self) -> bool:
+        return self.ENVIRONMENT.strip().lower() in {"production", "prod"}
+
     # Database
     POSTGRES_SERVER: str
     POSTGRES_USER: str
@@ -106,6 +114,11 @@ class Settings(BaseSettings):
 
     # Redis (Rate Limiting & Tenant Cache)
     REDIS_URL: str = "redis://localhost:6379"
+
+    # Max simultaneous live calls per tenant (inbound + outbound share the
+    # budget). The N+1th inbound call gets a busy message; outbound follow-ups
+    # are deferred. Enforced via app/services/call_concurrency.py.
+    NOKVO_MAX_CONCURRENT_CALLS_PER_TENANT: int = 10
 
     # Session-state v2 dual-write rollout. When True (the default for one
     # deploy cycle), every unified-store write also updates the legacy

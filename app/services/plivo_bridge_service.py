@@ -10,6 +10,7 @@ Audio conversion reuses the numpy codec from twilio_bridge_service.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -108,7 +109,13 @@ class PlivoWebSocketAdapter(TwilioWebSocketAdapter):
             if not raw:
                 raw_bytes = message.get("bytes")
                 if raw_bytes:
-                    return {"type": "websocket.receive", "bytes": self._process_inbound(raw_bytes), "text": None}
+                    # DSP (resample + RNNoise + AGC) is CPU-bound; run it off the
+                    # event loop so it can't add latency jitter to other live
+                    # calls sharing this worker. Frames for THIS call stay serial
+                    # (we await before the next receive), so per-call RNNoise/AGC
+                    # state is never touched concurrently.
+                    processed = await asyncio.to_thread(self._process_inbound, raw_bytes)
+                    return {"type": "websocket.receive", "bytes": processed, "text": None}
                 continue
             try:
                 payload = json.loads(raw)
@@ -160,7 +167,9 @@ class PlivoWebSocketAdapter(TwilioWebSocketAdapter):
                 if not pcm_b64:
                     continue
                 raw_pcm = base64.b64decode(pcm_b64)
-                return {"type": "websocket.receive", "bytes": self._process_inbound(raw_pcm), "text": None}
+                # Offload CPU-bound DSP to a worker thread (see note above).
+                processed = await asyncio.to_thread(self._process_inbound, raw_pcm)
+                return {"type": "websocket.receive", "bytes": processed, "text": None}
             elif event in ("stop", "closed"):
                 return {"type": "websocket.disconnect", "code": 1000}
 

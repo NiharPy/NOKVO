@@ -24,15 +24,16 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
 
+# CORS: production allows only the configured portal origin. Localhost dev
+# origins are added only outside production so a deployed API can't be driven
+# from arbitrary local pages.
+_cors_origins = {settings.EXPECTED_ORIGIN.rstrip("/")}
+if not settings.is_production:
+    _cors_origins |= {"http://localhost:5173", "http://127.0.0.1:5173"}
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=list(
-        {
-            settings.EXPECTED_ORIGIN.rstrip("/"),
-            "http://localhost:5173",
-            "http://127.0.0.1:5173",
-        }
-    ),
+    allow_origins=list(_cors_origins),
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["authorization", "content-type", "x-requested-with"],
@@ -109,6 +110,7 @@ if _AMBIENCE_DIR.exists():
 
 
 @app.get("/health/live")
+@limiter.exempt
 async def health_live():
     """Pure liveness — the process is up and serving. No dependency I/O, so an
     LB probe never flaps on a Redis/Qdrant blip and cycles the pod."""
@@ -156,6 +158,7 @@ async def _check_qdrant() -> dict:
 
 
 @app.get("/health")
+@limiter.exempt
 async def health_check():
     """Deep readiness check. Pings every backing service in parallel so a silent
     dependency outage can't masquerade as a healthy service.

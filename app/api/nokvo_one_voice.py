@@ -1365,6 +1365,18 @@ def _plivo_stream_xml(media_url: str, status_url: str | None = None) -> str:
     )
 
 
+def _plivo_busy_xml() -> str:
+    """Answer XML for an at-capacity tenant: a short spoken notice, then hang up.
+    No <Stream> is opened, so the caller never reaches dead air."""
+    return (
+        "<Response>"
+        "<Speak>All our lines are busy at the moment. "
+        "Please call back in a few minutes.</Speak>"
+        "<Hangup/>"
+        "</Response>"
+    )
+
+
 # ── Plivo webhook signature validation (X-Plivo-Signature-V2) ──────────
 # V2 scheme: base64(HMAC-SHA256(auth_token, full_url + nonce)). The URL Plivo
 # signed is the PUBLIC one it called — reconstruct it via public_url, never
@@ -1491,14 +1503,33 @@ async def plivo_inbound_webhook(
     except Exception:
         form = {}
     from_number = str(form.get("From") or form.get("from") or "").strip()
+
+    # Per-tenant concurrency cap: reserve a slot BEFORE bridging audio. At the
+    # limit, play a short busy notice and never open a media stream — the caller
+    # hears a message instead of dead air. The token is handed to the media WS
+    # via the URL and released when the call ends.
+    from app.services.call_concurrency import acquire as _acquire_call_slot
+
+    call_token = await _acquire_call_slot(tr.tenant_id)
+    if call_token is None:
+        logger.info("PLIVO-INBOUND at-capacity tenant=%s link_id=%s → busy", tr.tenant_id, link_id)
+        _record_webhook_event(link_id, "voice", {"from": from_number, "busy": True})
+        return PlainTextResponse(_plivo_busy_xml(), media_type="text/xml")
+
     # URLs must be PUBLIC — behind a TLS-terminating proxy request.url says
     # http://internal-host, which yields ws:// media URLs Plivo can't open
     # (call answers → dead air). public_url prefers PLIVO_WEBHOOK_BASE_URL.
+    from urllib.parse import urlencode
     from app.services.public_url import public_base_url, ws_base_url
 
     media_url = f"{ws_base_url(request)}/api/nokvo-one/agents/plivo/media/{link_id}"
+    _media_q: dict[str, str] = {}
     if from_number:
-        media_url = f"{media_url}?caller={quote(from_number)}"
+        _media_q["caller"] = from_number
+    if call_token:
+        _media_q["ct"] = call_token
+    if _media_q:
+        media_url = f"{media_url}?{urlencode(_media_q)}"
     status_url = f"{public_base_url(request)}/api/nokvo-one/agents/plivo/stream-status/{link_id}"
     xml = _plivo_stream_xml(media_url, status_url)
     logger.info("PLIVO-INBOUND voice webhook link_id=%s from=%s xml=%s", link_id, from_number, xml)
@@ -1539,6 +1570,7 @@ async def plivo_stream_status(link_id: str, request: Request):
 @router.websocket("/plivo/media/{link_id}")
 async def plivo_inbound_media_websocket(websocket: WebSocket, link_id: str):
     caller_phone = websocket.query_params.get("caller") or None
+    call_token = websocket.query_params.get("ct") or None
     print(f"PLIVO-MEDIA ws connect link_id={link_id} caller={caller_phone}", flush=True)
     async for db in deps.get_db():
         tr = await _tenant_by_link_id(db, link_id)
@@ -1546,7 +1578,13 @@ async def plivo_inbound_media_websocket(websocket: WebSocket, link_id: str):
             print(f"PLIVO-MEDIA no tenant for link_id={link_id} → closing", flush=True)
             await websocket.close(code=1008)
             return
-        await PlivoBridgeService.run_session(websocket, tr, db=db, caller_phone=caller_phone)
+        try:
+            await PlivoBridgeService.run_session(websocket, tr, db=db, caller_phone=caller_phone)
+        finally:
+            # Release the concurrency slot the answer webhook reserved.
+            if call_token:
+                from app.services.call_concurrency import release as _release_call_slot
+                await _release_call_slot(tr.tenant_id, call_token)
         return
 
 
@@ -1680,6 +1718,17 @@ async def plivo_outbound_media_websocket(websocket: WebSocket, call_link_id: str
         if not tr:
             await websocket.close(code=1008)
             return
+        # Per-tenant concurrency cap (shared inbound+outbound budget). At cap →
+        # hang up; the follow-up scheduler retries on a later tick.
+        from app.services.call_concurrency import acquire as _acquire_call_slot
+        _out_call_token = await _acquire_call_slot(tr.tenant_id)
+        if _out_call_token is None:
+            logger.info(
+                "PLIVO-OUTBOUND at-capacity tenant=%s call_link_id=%s → hangup",
+                tr.tenant_id, call_link_id,
+            )
+            await websocket.close(code=1013)
+            return
         # Outbound campaigns can be authored in any supported language —
         # pull it off the persisted agent_config (default "en" for legacy
         # campaigns). Follow-ups inherit the parent campaign's language
@@ -1767,6 +1816,9 @@ async def plivo_outbound_media_websocket(websocket: WebSocket, call_link_id: str
             )
         finally:
             adapter.close_audio()
+            # Release the per-tenant concurrency slot.
+            from app.services.call_concurrency import release as _release_call_slot
+            await _release_call_slot(tr.tenant_id, _out_call_token)
         return
 
 

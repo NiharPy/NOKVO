@@ -26,7 +26,7 @@ import asyncio
 import logging
 import uuid
 from contextlib import suppress
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
 
@@ -234,6 +234,20 @@ async def _dispatch_one(row_id: uuid.UUID) -> None:
             await FollowupSchedulerService.mark_failed(
                 row=row, reason="tenant_resources_missing", db=db
             )
+            return
+
+        # Per-tenant concurrency cap: don't place an outbound call we can't
+        # service. At capacity the media WS would just hang up, so defer this
+        # row a minute and let a later tick retry when a line frees up.
+        from app.services.call_concurrency import active_count
+
+        if await active_count(tenant_res.tenant_id) >= int(
+            settings.NOKVO_MAX_CONCURRENT_CALLS_PER_TENANT or 10
+        ):
+            row.scheduled_at = now + timedelta(minutes=1)
+            db.add(row)
+            await db.commit()
+            logger.info("Follow-up %s deferred — tenant at call capacity", row.id)
             return
 
         # Pick a callable phone number.

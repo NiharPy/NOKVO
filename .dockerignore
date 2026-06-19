@@ -1,0 +1,28 @@
+# Secrets — never bake into the image (config comes from Container Apps env).
+.env
+.env.*
+*.env
+
+# Local virtualenv (wrong platform: arm64 dylibs) and caches.
+venv/
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+*.log
+
+# VCS / CI / planning artifacts.
+.git/
+.github/
+.gitignore
+.claude/
+
+# Frontend is built+hosted separately (Static Web Apps), not in the API image.
+frontend/
+
+# Not needed at runtime.
+docs/
+tests/
+test_*.py
+scripts/
+infra/
+*.md

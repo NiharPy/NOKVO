@@ -1,4 +1,7 @@
 .env
+.env.prod
+.env.*.local
+infra/app.params.json
 .pytest_cache/
 venv/
 __pycache__/
