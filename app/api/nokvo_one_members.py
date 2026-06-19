@@ -198,7 +198,7 @@ def _default_assignment_settings(organization_id: uuid.UUID, member_id: uuid.UUI
 @router.get("/", response_model=list[NokvoOneUserResponse])
 async def list_members(
     user: OrganizationUser = Depends(
-        deps.RequireNokvoOneOrganization(allowed_statuses=["pending_approval", "active"])
+        deps.RequireNokvoOneOrganization(allowed_statuses=["active"])
     ),
     db: AsyncSession = Depends(deps.get_db),
 ):
@@ -213,7 +213,7 @@ async def list_members(
 @router.get("/assignment-settings", response_model=list[NokvoOneAssignmentSettingsResponse])
 async def list_assignment_settings(
     user: OrganizationUser = Depends(
-        deps.RequireNokvoOneOrganization(allowed_statuses=["pending_approval", "active"])
+        deps.RequireNokvoOneOrganization(allowed_statuses=["active"])
     ),
     db: AsyncSession = Depends(deps.get_db),
 ):
@@ -254,7 +254,7 @@ def _assignment_defaults_response(
 @router.get("/assignment-defaults", response_model=NokvoOneAssignmentDefaultsResponse)
 async def get_assignment_defaults(
     user: OrganizationUser = Depends(
-        deps.RequireNokvoOneOrganization(allowed_statuses=["pending_approval", "active"])
+        deps.RequireNokvoOneOrganization(allowed_statuses=["active"])
     ),
     db: AsyncSession = Depends(deps.get_db),
 ):
@@ -269,7 +269,7 @@ async def update_assignment_defaults(
     payload: NokvoOneAssignmentDefaultsUpdateRequest,
     user: OrganizationUser = Depends(
         deps.RequireNokvoOneOrganization(
-            allowed_statuses=["pending_approval", "active"],
+            allowed_statuses=["active"],
             allowed_roles=["admin", "manager"],
         )
     ),
@@ -306,7 +306,7 @@ async def update_assignment_defaults(
 @router.get("/me/timetable", response_model=NokvoOneMemberTimetableResponse)
 async def get_my_timetable(
     user: OrganizationUser = Depends(
-        deps.RequireNokvoOneOrganization(allowed_statuses=["pending_approval", "active"])
+        deps.RequireNokvoOneOrganization(allowed_statuses=["active"])
     ),
     db: AsyncSession = Depends(deps.get_db),
 ):
@@ -348,7 +348,7 @@ async def list_my_assigned_records(
     record_type: str | None = None,
     limit: int = 200,
     user: OrganizationUser = Depends(
-        deps.RequireNokvoOneOrganization(allowed_statuses=["pending_approval", "active"])
+        deps.RequireNokvoOneOrganization(allowed_statuses=["active"])
     ),
     db: AsyncSession = Depends(deps.get_db),
 ):
@@ -431,7 +431,7 @@ _SITE_VISIT_TERMINAL_STATUSES = {"resolved", "closed"}
 async def list_claimable_site_visits(
     limit: int = 200,
     user: OrganizationUser = Depends(
-        deps.RequireNokvoOneOrganization(allowed_statuses=["pending_approval", "active"])
+        deps.RequireNokvoOneOrganization(allowed_statuses=["active"])
     ),
     db: AsyncSession = Depends(deps.get_db),
 ):
@@ -468,7 +468,7 @@ async def list_claimable_site_visits(
 async def claim_site_visit(
     record_id: uuid.UUID,
     user: OrganizationUser = Depends(
-        deps.RequireNokvoOneOrganization(allowed_statuses=["pending_approval", "active"])
+        deps.RequireNokvoOneOrganization(allowed_statuses=["active"])
     ),
     db: AsyncSession = Depends(deps.get_db),
 ):
@@ -523,7 +523,7 @@ async def claim_site_visit(
 async def create_my_blocked_slot(
     payload: NokvoOneBlockedSlotCreateRequest,
     user: OrganizationUser = Depends(
-        deps.RequireNokvoOneOrganization(allowed_statuses=["pending_approval", "active"])
+        deps.RequireNokvoOneOrganization(allowed_statuses=["active"])
     ),
     db: AsyncSession = Depends(deps.get_db),
 ):
@@ -554,7 +554,7 @@ async def create_my_blocked_slot(
 async def delete_my_blocked_slot(
     slot_id: uuid.UUID,
     user: OrganizationUser = Depends(
-        deps.RequireNokvoOneOrganization(allowed_statuses=["pending_approval", "active"])
+        deps.RequireNokvoOneOrganization(allowed_statuses=["active"])
     ),
     db: AsyncSession = Depends(deps.get_db),
 ):
@@ -582,7 +582,7 @@ async def update_assignment_settings(
     payload: NokvoOneAssignmentSettingsUpdateRequest,
     user: OrganizationUser = Depends(
         deps.RequireNokvoOneOrganization(
-            allowed_statuses=["pending_approval", "active"],
+            allowed_statuses=["active"],
             allowed_roles=["admin", "manager"],
         )
     ),
@@ -653,7 +653,7 @@ async def update_assignment_settings(
 async def get_clinic_schedule_settings(
     member_id: uuid.UUID,
     user: OrganizationUser = Depends(
-        deps.RequireNokvoOneOrganization(allowed_statuses=["pending_approval", "active"])
+        deps.RequireNokvoOneOrganization(allowed_statuses=["active"])
     ),
     db: AsyncSession = Depends(deps.get_db),
 ):
@@ -694,7 +694,7 @@ async def update_clinic_schedule_settings(
     payload: NokvoOneClinicScheduleSettingsUpdateRequest,
     user: OrganizationUser = Depends(
         deps.RequireNokvoOneOrganization(
-            allowed_statuses=["pending_approval", "active"],
+            allowed_statuses=["active"],
             allowed_roles=["admin", "manager"],
         )
     ),
@@ -742,7 +742,7 @@ async def update_clinic_schedule_settings(
 async def list_blocked_slots(
     member_id: uuid.UUID,
     user: OrganizationUser = Depends(
-        deps.RequireNokvoOneOrganization(allowed_statuses=["pending_approval", "active"])
+        deps.RequireNokvoOneOrganization(allowed_statuses=["active"])
     ),
     db: AsyncSession = Depends(deps.get_db),
 ):
@@ -762,7 +762,7 @@ async def create_blocked_slot(
     payload: NokvoOneBlockedSlotCreateRequest,
     user: OrganizationUser = Depends(
         deps.RequireNokvoOneOrganization(
-            allowed_statuses=["pending_approval", "active"],
+            allowed_statuses=["active"],
             allowed_roles=["admin", "manager"],
         )
     ),
@@ -792,7 +792,7 @@ async def remove_member(
     member_id: uuid.UUID,
     inviter: OrganizationUser = Depends(
         deps.RequireNokvoOneOrganization(
-            allowed_statuses=["pending_approval", "active"],
+            allowed_statuses=["active"],
             allowed_roles=["admin"],
         )
     ),
@@ -868,7 +868,7 @@ async def invite_member(
     background: BackgroundTasks,
     inviter: OrganizationUser = Depends(
         deps.RequireNokvoOneOrganization(
-            allowed_statuses=["pending_approval", "active"],
+            allowed_statuses=["active"],
             allowed_roles=["admin"],
         )
     ),

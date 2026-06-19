@@ -803,6 +803,18 @@ class SarvamVoiceService:
     ) -> dict[str, Any]:
         stream_id = f"sarvam-tts-{int(perf_counter() * 1000)}"
         started = perf_counter()
+        # Meter TTS characters for per-call COGS (best-effort). Counted ONCE
+        # here at the single TTS entry point so the streaming→REST fallback
+        # can't double-count. Uses the normalized text (what Sarvam bills),
+        # capped at the 3500-char request limit the leaf methods enforce.
+        try:
+            from app.services.call_usage import current_call_usage
+
+            _usage = current_call_usage()
+            if _usage is not None and text and text.strip():
+                _usage.add_tts_chars(len(normalize_text_for_tts(text)[:3500]))
+        except Exception:
+            pass
         try:
             await websocket.send_json({"type": "tts_started", "stream_id": stream_id, "purpose": purpose, "provider": "sarvam"})
         except Exception:

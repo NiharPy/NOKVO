@@ -377,7 +377,7 @@ async def get_api_key_record(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Nokvo Connect is available only on Nokvo One organizations",
         )
-    if organization.status not in {"active", "pending_approval"}:
+    if organization.status not in {"active"}:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Organization is not active")
 
     tr_res = await db.execute(

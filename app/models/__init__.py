@@ -2,7 +2,6 @@ from app.db.session import Base
 from app.models.user import SuperAdminUser
 from app.models.session import SuperAdminSession
 from app.models.audit import SuperAdminAuditLog, VoiceDataAccessAuditLog
-from app.models.approval import SuperAdminApprovalRequest
 from app.models.organization import Organization
 from app.models.organization_session import OrganizationSession
 from app.models.organization_user import OrganizationUser
@@ -48,7 +47,6 @@ __all__ = [
     "SuperAdminSession",
     "SuperAdminAuditLog",
     "VoiceDataAccessAuditLog",
-    "SuperAdminApprovalRequest",
     "Organization",
     "OrganizationUser",
     "OrganizationSession",

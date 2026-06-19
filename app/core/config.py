@@ -457,7 +457,18 @@ class Settings(BaseSettings):
     COST_PER_LLM_INPUT_1K_TOKENS_USD: float = 0.00025
     COST_PER_LLM_OUTPUT_1K_TOKENS_USD: float = 0.0020
     COST_PER_LLM_CACHED_INPUT_1K_TOKENS_USD: float = 0.000025
-    
+    # Per-call COGS components (STT/LLM/TTS/Plivo) are persisted in INR on
+    # CallCost. The per-unit rates above are vendor list prices in USD, so we
+    # convert with this FX rate. NOTE: COST_PER_TWILIO_MINUTE_USD is the Plivo
+    # telephony rate (the constant name is legacy — Plivo is the sole telephony
+    # provider) and the STT/TTS rates price Sarvam (saaras:v3 / bulbul:v3).
+    # The FX rate is hardcoded for this MVP: a static rate means the INR margin
+    # figures shown in the SuperAdmin console slowly decouple from the actual
+    # USD Azure/Sarvam/Plivo invoices as the rate drifts. Revisit with a live
+    # FX feed or INR-native vendor rates if call volume scales up.
+    USD_TO_INR: float = 86.0
+
+
     # Provider APIs
     QDRANT_URL: str = ":memory:"
     QDRANT_API_KEY: str = ""

@@ -56,14 +56,14 @@ router = APIRouter()
 def _viewer_dep():
     """Any Nokvo One org user may read the inbox + cost summary."""
     return deps.RequireNokvoOneOrganization(
-        allowed_statuses=["pending_approval", "active"],
+        allowed_statuses=["active"],
         allowed_roles=["admin", "manager", "member"],
     )
 
 
 def _admin_dep():
     return deps.RequireNokvoOneOrganization(
-        allowed_statuses=["pending_approval", "active"],
+        allowed_statuses=["active"],
         allowed_roles=["admin", "manager"],
     )
 

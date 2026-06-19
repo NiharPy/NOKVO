@@ -108,11 +108,6 @@ function formatPhoneStep(text) {
       </div>
 
 
-
-      <div v-if="currentOrganization?.status === 'pending_approval'" class="agent__pending">
-        <span class="n-dot n-dot--warning n-dot--pulse"></span>
-        <span>Your organization is awaiting Nokvo activation. Voice testing and CRUD work today; outbound calling unlocks after approval.</span>
-      </div>
     </header>
 
     <!-- Voice tester -->

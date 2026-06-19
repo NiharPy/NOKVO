@@ -1,973 +1,366 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Request
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
-from app.api.deps import RequireRole
-from app.core.email_policy import extract_email_domain, normalize_email, validate_work_email
-from app.models.user import SuperAdminUser
-from app.schemas.organization import OrganizationCreate
-from app.db.session import get_db
-from app.models.organization import Organization
-from app.models.organization_user import OrganizationUser
-from app.services.azure_tenant_provisioning_service import AzureTenantProvisioningService
-from app.models.tenant_resources import TenantResources
-from app.models.tenant_usage_event import TenantUsageEvent
-from app.models.audit import SuperAdminAuditLog
-from app.schemas.tenant_usage import TenantUsageEventCreate
-from app.services.tenant_billing_service import TenantBillingService
-from app.services.azure_keyvault_service import AzureKeyVaultService
-from app.core.azure_auth import AzureAuth
-from app.core.config import settings
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
-from uuid import UUID
+"""SuperAdmin console API — view every org + per-call cost + plan upgrade.
+
+This router is the rebuilt SuperAdmin console surface. Organizations now
+self-serve through Razorpay payment-gated onboarding, so the old operator
+workflows (manual Azure provisioning, org approval, WhatsApp concierge,
+hand-entered usage events) are gone. What remains is what an operator actually
+needs:
+
+  * ``GET  /superadmin/tenants``            — every org with real minutes used,
+    revenue (subscription + post-paid usage), COGS, and margin.
+  * ``GET  /superadmin/tenants/{org_id}``   — drill-down: the per-call
+    STT/LLM/TTS/Plivo cost breakdown + rollups.
+  * ``POST /superadmin/tenants/{org_id}/upgrade`` — flip an org between the
+    Inbound-only and Inbound+Outbound plans (capability only — no Razorpay
+    billing change).
+
+Auth is unchanged: every endpoint is gated to SuperAdmin roles via
+:class:`app.api.deps.RequireRole`.
+
+Money model
+-----------
+* **Revenue** = active monthly Razorpay subscription (``Subscription.amount_paise``)
+  + cumulative post-paid usage billed to the tenant (``CallCost.rupees``, the
+  tiered tariff). Subscription is a monthly figure; usage is all-time — both are
+  surfaced separately so the console can label them.
+* **COGS** = what Nokvo pays vendors per call (``CallCost.cost_total_inr``, the
+  STT+LLM+TTS+Plivo breakdown). NULL on calls recorded before instrumentation.
+* **Margin** = revenue − COGS.
+"""
+from __future__ import annotations
+
+from datetime import datetime, timezone
 from decimal import Decimal
-import json
-import asyncio
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.api.deps import RequireRole
+from app.db.session import get_db
+from app.models.audit import SuperAdminAuditLog
+from app.models.call_cost import CallCost
+from app.models.organization import Organization
+from app.models.subscription import Subscription
+from app.models.tenant_resources import TenantResources
+from app.models.user import SuperAdminUser
+from app.services.razorpay_service import PLAN_CATALOG
 
 router = APIRouter()
 
-ALLOWED_REGIONS = [
-    "centralindia", "southindia", "westindia",
-    "eastus", "westus", "westeurope", "southeastasia"
-]
+# SuperAdmin roles allowed to read the console. Mutations narrow this further.
+_READ_ROLES = ["founder", "engineering", "billing", "readonly"]
+_WRITE_ROLES = ["founder", "engineering"]
 
 
-def _organization_profile(org: Organization) -> dict:
-    return {
-        "admin_email": org.admin_email,
-        "admin_name": org.admin_name,
-        "email_domain": org.email_domain,
-        "call_type": org.call_type,
-        "language": org.language,
-        "plan_type": org.plan_type,
-        "stores_pii": org.stores_pii,
-        "record_calls": org.record_calls,
-        "create_resource_group": org.create_resource_group,
-        "twilio_auto_provision": org.twilio_auto_provision,
-    }
+def _month_start_utc() -> datetime:
+    now = datetime.now(timezone.utc)
+    return datetime(now.year, now.month, 1, tzinfo=timezone.utc)
 
 
-def _tenant_cost_breakdown(tenant: TenantResources | None) -> dict:
-    if not tenant:
-        return {
-            "provisioned_monthly_cost_usd": 0.0,
-            "usage_cost_usd": 0.0,
-            "total_cost_usd": 0.0,
+def _inr(value) -> float:
+    """Coerce a Decimal/None ledger value to a 2-dp rupee float for the API."""
+    if value is None:
+        return 0.0
+    return float(Decimal(str(value)).quantize(Decimal("0.01")))
+
+
+def _minutes(seconds) -> float:
+    if not seconds:
+        return 0.0
+    return round(float(Decimal(str(seconds)) / Decimal("60")), 2)
+
+
+# ── CallCost aggregation ─────────────────────────────────────────────────────
+# One grouped query per time-window returns the per-org rollup the console
+# needs. Keyed by organization_id (str) → dict of sums.
+
+def _callcost_select(since: datetime | None):
+    stmt = select(
+        CallCost.organization_id,
+        func.coalesce(func.sum(CallCost.duration_seconds), 0),
+        func.coalesce(func.sum(CallCost.rupees), 0),
+        func.coalesce(func.sum(CallCost.cost_total_inr), 0),
+        func.coalesce(func.sum(CallCost.cost_stt_inr), 0),
+        func.coalesce(func.sum(CallCost.cost_llm_inr), 0),
+        func.coalesce(func.sum(CallCost.cost_tts_inr), 0),
+        func.coalesce(func.sum(CallCost.cost_telephony_inr), 0),
+        func.count(CallCost.id),
+    ).group_by(CallCost.organization_id)
+    if since is not None:
+        stmt = stmt.where(CallCost.started_at >= since)
+    return stmt
+
+
+async def _callcost_rollup(db: AsyncSession, since: datetime | None) -> dict[str, dict]:
+    rows = await db.execute(_callcost_select(since))
+    out: dict[str, dict] = {}
+    for org_id, secs, rupees, cogs_total, cogs_stt, cogs_llm, cogs_tts, cogs_tel, count in rows.all():
+        out[str(org_id)] = {
+            "minutes": _minutes(secs),
+            "usage_revenue_inr": _inr(rupees),
+            "cogs_inr": _inr(cogs_total),
+            "cogs_stt_inr": _inr(cogs_stt),
+            "cogs_llm_inr": _inr(cogs_llm),
+            "cogs_tts_inr": _inr(cogs_tts),
+            "cogs_telephony_inr": _inr(cogs_tel),
+            "call_count": int(count or 0),
         }
-    provisioned = TenantBillingService.monthly_provisioned_cost(tenant)
-    total = Decimal(str(tenant.total_cost_usd or 0))
-    usage = total - provisioned
-    if usage < 0:
-        usage = Decimal("0")
-    return {
-        "provisioned_monthly_cost_usd": float(provisioned),
-        "usage_cost_usd": float(usage),
-        "total_cost_usd": float(total),
-    }
+    return out
 
 
-def _usage_aggregate(events: list[TenantUsageEvent], tenant: TenantResources | None) -> dict:
-    llm_input_tokens = sum(event.llm_input_tokens or 0 for event in events)
-    llm_output_tokens = sum(event.llm_output_tokens or 0 for event in events)
-    llm_api_calls = sum(event.llm_api_calls or 0 for event in events)
-    stt_minutes = sum(float(event.stt_minutes or 0) for event in events)
-    telephony_minutes = sum(float(event.telephony_minutes or 0) for event in events)
-    tts_characters = sum(event.tts_characters or 0 for event in events)
-    storage_gb = sum(float(event.storage_gb or 0) for event in events)
-    infrastructure_units = sum(event.infrastructure_units or 0 for event in events)
-    return {
-        "minutes": sum(event.minutes or 0 for event in events),
-        "llm_input_tokens": llm_input_tokens,
-        "llm_output_tokens": llm_output_tokens,
-        "llm_total_tokens": llm_input_tokens + llm_output_tokens,
-        "llm_api_calls": llm_api_calls,
-        "voice_minutes": telephony_minutes,
-        "stt_minutes": stt_minutes,
-        "tts_characters": tts_characters,
-        "storage_gb": round(storage_gb, 3),
-        "infrastructure_units": infrastructure_units + (
-            1 if tenant and tenant.qdrant_collection_name else 0
-        ) + (
-            1 if tenant and tenant.redis_namespace else 0
-        ) + (
-            1 if tenant and tenant.blob_prefix else 0
-        ) + (
-            1 if tenant and tenant.key_vault_name else 0
-        ),
-    }
-
-
-async def _ensure_organization_admin_user(
-    db: AsyncSession,
-    org: Organization,
-) -> None:
-    if not org.admin_email:
-        raise HTTPException(status_code=400, detail="Organization admin email is required")
-
-    normalized_admin_email = validate_work_email(org.admin_email)
-    email_domain = extract_email_domain(normalized_admin_email)
-    org.admin_email = normalized_admin_email
-    org.email_domain = email_domain
-
-    result = await db.execute(
-        select(OrganizationUser).where(
-            OrganizationUser.organization_id == org.id,
-            OrganizationUser.email == normalized_admin_email,
-        )
+async def _subscription_map(db: AsyncSession) -> dict[str, dict]:
+    """Per-org active subscription: monthly amount + plan. An org should have
+    at most one active sub, but we sum defensively in case of overlap."""
+    rows = await db.execute(
+        select(Subscription.organization_id, Subscription.plan, Subscription.amount_paise)
+        .where(Subscription.status == "active")
     )
-    admin_user = result.scalars().first()
-    if admin_user:
-        admin_user.role = "admin"
-        admin_user.full_name = org.admin_name or admin_user.full_name
-        if admin_user.status == "disabled":
-            admin_user.status = "invited"
-        db.add(admin_user)
-        return
+    out: dict[str, dict] = {}
+    for org_id, plan, amount_paise in rows.all():
+        entry = out.setdefault(str(org_id), {"plan": plan, "monthly_inr": 0.0})
+        entry["monthly_inr"] = round(entry["monthly_inr"] + (int(amount_paise or 0) / 100.0), 2)
+        if plan:
+            entry["plan"] = plan
+    return out
 
-    db.add(
-        OrganizationUser(
-            organization_id=org.id,
-            email=normalized_admin_email,
-            full_name=org.admin_name,
-            role="admin",
-            status="invited",
-            auth_provider="google",
-            email_verified=False,
-        )
-    )
+
+def _plan_label(plan: str | None) -> str:
+    if plan and plan in PLAN_CATALOG:
+        return PLAN_CATALOG[plan]["label"]
+    return "—"
 
 
 @router.get("")
 async def list_tenants(
     db: AsyncSession = Depends(get_db),
-    current_user: SuperAdminUser = Depends(RequireRole(["founder", "engineering", "billing", "readonly"]))
+    current_user: SuperAdminUser = Depends(RequireRole(_READ_ROLES)),
 ):
+    """Every organization with minutes used, revenue, COGS, and margin."""
     org_rows = await db.execute(select(Organization).order_by(Organization.created_at.desc()))
     organizations = org_rows.scalars().all()
 
-    tenant_rows = await db.execute(select(TenantResources))
-    tenant_map = {str(row.organization_id): row for row in tenant_rows.scalars().all()}
-    usage_rows = await db.execute(select(TenantUsageEvent))
-    usage_map: dict[str, list[TenantUsageEvent]] = {}
-    for row in usage_rows.scalars().all():
-        usage_map.setdefault(str(row.organization_id), []).append(row)
+    tenant_rows = await db.execute(
+        select(TenantResources.organization_id, TenantResources.tenant_id, TenantResources.provisioning_status)
+    )
+    tenant_map = {str(r[0]): {"tenant_id": r[1], "provisioning_status": r[2]} for r in tenant_rows.all()}
+
+    all_time = await _callcost_rollup(db, None)
+    mtd = await _callcost_rollup(db, _month_start_utc())
+    subs = await _subscription_map(db)
 
     items = []
+    tot_minutes = tot_revenue = tot_cogs = tot_margin = 0.0
     for org in organizations:
-        tenant = tenant_map.get(str(org.id))
-        usage = _usage_aggregate(usage_map.get(str(org.id), []), tenant)
-        cost_breakdown = _tenant_cost_breakdown(tenant)
-        revenue_usd = round(cost_breakdown["total_cost_usd"] * 1.35, 2)
-        margin_usd = round(revenue_usd - cost_breakdown["total_cost_usd"], 2)
+        oid = str(org.id)
+        at = all_time.get(oid, {})
+        mt = mtd.get(oid, {})
+        sub = subs.get(oid, {})
+
+        subscription_inr = sub.get("monthly_inr", 0.0)
+        usage_inr = at.get("usage_revenue_inr", 0.0)
+        revenue_inr = round(subscription_inr + usage_inr, 2)
+        cogs_inr = at.get("cogs_inr", 0.0)
+        margin_inr = round(revenue_inr - cogs_inr, 2)
+
+        tenant = tenant_map.get(oid, {})
         items.append({
-            "organization_id": str(org.id),
+            "organization_id": oid,
             "organization_name": org.name,
-            "organization_profile": _organization_profile(org),
-            "environment": org.environment,
+            "admin_email": org.admin_email,
+            "status": org.status,
+            "plan_type": org.plan_type,
+            "plan_label": _plan_label(org.plan_type),
+            "calling_enabled": bool(org.calling_enabled),
             "region": org.region,
             "created_at": org.created_at,
-            "tenant_id": tenant.tenant_id if tenant else None,
-            "provisioning_status": tenant.provisioning_status if tenant else "pending",
-            "usage_minutes": tenant.usage_minutes if tenant else 0,
-            "total_cost_usd": float(tenant.total_cost_usd or 0) if tenant else 0.0,
-            "billing_status": "overdue" if cost_breakdown["total_cost_usd"] > 0 and (tenant.provisioning_status if tenant else "pending") == "partial" else "current",
-            "money_tracker": {
-                "revenue_usd": revenue_usd,
-                "cost_usd": cost_breakdown["total_cost_usd"],
-                "margin_usd": margin_usd,
-                "outstanding_balance_usd": round(max(cost_breakdown["usage_cost_usd"], 0), 2),
+            "tenant_id": tenant.get("tenant_id"),
+            "provisioning_status": tenant.get("provisioning_status") or "pending",
+            "minutes_used": at.get("minutes", 0.0),
+            "minutes_used_mtd": mt.get("minutes", 0.0),
+            "call_count": at.get("call_count", 0),
+            "revenue": {
+                "subscription_monthly_inr": subscription_inr,
+                "usage_inr": usage_inr,
+                "total_inr": revenue_inr,
             },
-            "usage_tracker": usage,
-            "cost_breakdown": cost_breakdown,
+            "cogs_inr": cogs_inr,
+            "cogs_mtd_inr": mt.get("cogs_inr", 0.0),
+            "margin_inr": margin_inr,
         })
+        tot_minutes += at.get("minutes", 0.0)
+        tot_revenue += revenue_inr
+        tot_cogs += cogs_inr
+        tot_margin += margin_inr
 
     return {
         "organizations": items,
         "summary": {
             "count": len(items),
-            "total_minutes": sum(item["usage_minutes"] for item in items),
-            "total_cost_usd": round(sum(item["total_cost_usd"] for item in items), 2),
+            "total_minutes": round(tot_minutes, 2),
+            "total_revenue_inr": round(tot_revenue, 2),
+            "total_cogs_inr": round(tot_cogs, 2),
+            "total_margin_inr": round(tot_margin, 2),
         },
     }
 
 
-# ── Concierge WhatsApp onboarding (operator fulfilment) ──────────────────────
-# Clients request WhatsApp setup from their portal and never see Plivo. The
-# operator onboards the number in the Plivo Console, then records the connected
-# sender here, which flips the client's portal to "Ready".
-
-class WhatsAppConnectPayload(BaseModel):
-    whatsapp_number: str
-    waba_id: str | None = None
-    phone_number_id: str | None = None
-
-
-def _whatsapp_request_item(org: Organization, tenant: TenantResources | None) -> dict | None:
-    cfg = ((tenant.provider_status if tenant else None) or {}).get("plivo") or {}
-    ob = cfg.get("whatsapp_onboarding") or {}
-    if ob.get("step") != "requested":
-        return None
+def _call_row(cc: CallCost) -> dict:
+    """Serialize one CallCost row with its STT/LLM/TTS/Plivo breakdown."""
     return {
-        "organization_id": str(org.id),
-        "organization_name": org.name,
-        "tenant_id": tenant.tenant_id if tenant else None,
-        "business_name": ob.get("business_name"),
-        "contact_number": ob.get("contact_number"),
-        "display_name": ob.get("display_name"),
-        "requested_at": ob.get("requested_at"),
-        "requested_by": ob.get("requested_by"),
+        "call_id": cc.call_id,
+        "kind": cc.kind,
+        "started_at": cc.started_at,
+        "ended_at": cc.ended_at,
+        "duration_seconds": float(cc.duration_seconds or 0),
+        "minutes": _minutes(cc.duration_seconds),
+        # Revenue billed to the tenant (tiered tariff).
+        "revenue_inr": _inr(cc.rupees),
+        # COGS — NULL on pre-instrumentation calls (rendered as total-only).
+        "instrumented": cc.cost_total_inr is not None,
+        "cost_stt_inr": _inr(cc.cost_stt_inr),
+        "cost_llm_inr": _inr(cc.cost_llm_inr),
+        "cost_tts_inr": _inr(cc.cost_tts_inr),
+        "cost_telephony_inr": _inr(cc.cost_telephony_inr),
+        "cost_total_inr": _inr(cc.cost_total_inr),
+        "llm_input_tokens": cc.llm_input_tokens,
+        "llm_output_tokens": cc.llm_output_tokens,
+        "llm_cached_tokens": cc.llm_cached_tokens,
+        "stt_seconds": float(cc.stt_seconds) if cc.stt_seconds is not None else None,
+        "tts_characters": cc.tts_characters,
+        "trace_id": cc.trace_id,
     }
 
 
-@router.get("/whatsapp/requests")
-async def list_whatsapp_requests(
+@router.get("/{organization_id}")
+async def get_tenant_detail(
+    organization_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user: SuperAdminUser = Depends(RequireRole(["founder", "engineering"]))
+    current_user: SuperAdminUser = Depends(RequireRole(_READ_ROLES)),
 ):
-    """Pending concierge WhatsApp setup requests (onboarding step == requested)."""
-    org_rows = await db.execute(select(Organization).order_by(Organization.created_at.desc()))
-    organizations = org_rows.scalars().all()
-    tenant_rows = await db.execute(select(TenantResources))
-    tenant_map = {str(row.organization_id): row for row in tenant_rows.scalars().all()}
-    items = [
-        item for org in organizations
-        if (item := _whatsapp_request_item(org, tenant_map.get(str(org.id)))) is not None
-    ]
-    return {"requests": items, "count": len(items)}
+    """Drill-down for one org: per-call STT/LLM/TTS/Plivo breakdown + rollups."""
+    org = (
+        await db.execute(select(Organization).where(Organization.id == organization_id))
+    ).scalars().first()
+    if org is None:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    oid = str(org.id)
 
+    at = (await _callcost_rollup(db, None)).get(oid, {})
+    mt = (await _callcost_rollup(db, _month_start_utc())).get(oid, {})
+    sub = (await _subscription_map(db)).get(oid, {})
 
-@router.post("/{organization_id}/whatsapp/connect")
-async def connect_whatsapp_for_tenant(
-    organization_id: UUID,
-    payload: WhatsAppConnectPayload,
-    db: AsyncSession = Depends(get_db),
-    current_user: SuperAdminUser = Depends(RequireRole(["founder", "engineering"]))
-):
-    """Operator fulfilment: record the WABA sender onboarded for this tenant in the
-    Plivo Console. Flips the client's onboarding to ``connected`` and best-effort
-    emails them that WhatsApp is ready."""
-    from app.services.plivo_service import PlivoError, PlivoService
-
-    tenant_res_query = await db.execute(
-        select(TenantResources).where(TenantResources.organization_id == organization_id)
+    recent_rows = await db.execute(
+        select(CallCost)
+        .where(CallCost.organization_id == oid)
+        .order_by(CallCost.started_at.desc())
+        .limit(50)
     )
-    tenant = tenant_res_query.scalars().first()
-    if not tenant:
-        raise HTTPException(status_code=404, detail="Tenant not found for organization")
-    try:
-        result = await PlivoService.connect_whatsapp_number(
-            tenant, db,
-            whatsapp_number=payload.whatsapp_number,
-            waba_id=payload.waba_id,
-            phone_number_id=payload.phone_number_id,
+    recent = [_call_row(cc) for cc in recent_rows.scalars().all()]
+
+    subscription_inr = sub.get("monthly_inr", 0.0)
+    usage_inr = at.get("usage_revenue_inr", 0.0)
+    revenue_inr = round(subscription_inr + usage_inr, 2)
+    cogs_inr = at.get("cogs_inr", 0.0)
+
+    return {
+        "organization_id": oid,
+        "organization_name": org.name,
+        "admin_email": org.admin_email,
+        "admin_name": org.admin_name,
+        "status": org.status,
+        "plan_type": org.plan_type,
+        "plan_label": _plan_label(org.plan_type),
+        "calling_enabled": bool(org.calling_enabled),
+        "region": org.region,
+        "created_at": org.created_at,
+        "subscription": {
+            "plan": sub.get("plan"),
+            "plan_label": _plan_label(sub.get("plan")),
+            "monthly_inr": subscription_inr,
+        },
+        "totals": {
+            "minutes_used": at.get("minutes", 0.0),
+            "minutes_used_mtd": mt.get("minutes", 0.0),
+            "call_count": at.get("call_count", 0),
+            "revenue": {
+                "subscription_monthly_inr": subscription_inr,
+                "usage_inr": usage_inr,
+                "total_inr": revenue_inr,
+            },
+            "cogs": {
+                "total_inr": cogs_inr,
+                "stt_inr": at.get("cogs_stt_inr", 0.0),
+                "llm_inr": at.get("cogs_llm_inr", 0.0),
+                "tts_inr": at.get("cogs_tts_inr", 0.0),
+                "telephony_inr": at.get("cogs_telephony_inr", 0.0),
+                "mtd_total_inr": mt.get("cogs_inr", 0.0),
+            },
+            "margin_inr": round(revenue_inr - cogs_inr, 2),
+        },
+        "recent_calls": recent,
+    }
+
+
+class PlanChangePayload(BaseModel):
+    plan: str  # "inbound_only" | "inbound_outbound"
+
+
+@router.post("/{organization_id}/upgrade")
+async def change_organization_plan(
+    organization_id: str,
+    payload: PlanChangePayload,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: SuperAdminUser = Depends(RequireRole(_WRITE_ROLES)),
+):
+    """Switch an org between Inbound-only and Inbound+Outbound (capability only).
+
+    Sets ``calling_enabled`` + ``plan_type`` from the plan's catalog entry; does
+    NOT touch the Razorpay subscription (a manual grant). Mirrors the plan
+    application in ``nokvo_one_payments.activate_and_provision``. Use plan
+    ``inbound_only`` to downgrade (revoke outbound).
+    """
+    if payload.plan not in PLAN_CATALOG:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown plan '{payload.plan}'. Valid: {', '.join(PLAN_CATALOG)}",
         )
-    except PlivoError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    # Best-effort: tell the client WhatsApp is live (never fail the connect on mail).
-    try:
-        org_row = await db.execute(select(Organization).where(Organization.id == organization_id))
-        org = org_row.scalars().first()
-        to_email = (getattr(org, "admin_email", None) or "") if org else ""
-        if to_email:
-            from app.services.email_service import EmailService
+    org = (
+        await db.execute(select(Organization).where(Organization.id == organization_id))
+    ).scalars().first()
+    if org is None:
+        raise HTTPException(status_code=404, detail="Organization not found")
 
-            await EmailService.send(
-                to_email,
-                "Your WhatsApp is ready on Nokvo",
-                "Good news — WhatsApp is now connected for your account. Brochure and "
-                "location messages will be sent automatically from your WhatsApp number.",
-            )
-    except Exception:
-        pass
+    before = {"plan_type": org.plan_type, "calling_enabled": bool(org.calling_enabled)}
 
-    return {"organization_id": str(organization_id), "whatsapp": result}
-
-
-@router.post("/{organization_id}/usage-events")
-async def record_usage_event(
-    organization_id: UUID,
-    payload: TenantUsageEventCreate,
-    db: AsyncSession = Depends(get_db),
-    current_user: SuperAdminUser = Depends(RequireRole(["founder", "engineering", "billing"]))
-):
-    tenant_res_query = await db.execute(select(TenantResources).where(TenantResources.organization_id == organization_id))
-    tenant_res = tenant_res_query.scalars().first()
-    if not tenant_res:
-        raise HTTPException(status_code=404, detail="Tenant resources not found for organization")
-
-    minutes = payload.minutes
-    stt_minutes = payload.stt_minutes
-    telephony_minutes = payload.telephony_minutes
-    tts_characters = payload.tts_characters
-    llm_api_calls = payload.llm_api_calls
-    llm_input_tokens = payload.llm_input_tokens
-    llm_output_tokens = payload.llm_output_tokens
-    storage_gb = payload.storage_gb
-    infrastructure_units = payload.infrastructure_units
-
-    usage_cost = TenantBillingService.usage_cost(
-        minutes=minutes,
-        stt_minutes=stt_minutes,
-        telephony_minutes=telephony_minutes,
-        tts_characters=tts_characters,
-        llm_api_calls=llm_api_calls,
-        llm_input_tokens=llm_input_tokens,
-        llm_output_tokens=llm_output_tokens,
-        storage_gb=storage_gb,
-        infrastructure_units=infrastructure_units,
-    )
-
-    event = TenantUsageEvent(
-        organization_id=organization_id,
-        tenant_id=tenant_res.tenant_id,
-        event_type=payload.event_type,
-        minutes=minutes,
-        stt_minutes=stt_minutes,
-        telephony_minutes=telephony_minutes,
-        tts_characters=tts_characters,
-        llm_api_calls=llm_api_calls,
-        llm_input_tokens=llm_input_tokens,
-        llm_output_tokens=llm_output_tokens,
-        storage_gb=storage_gb,
-        infrastructure_units=infrastructure_units,
-        cost_usd=usage_cost,
-        metadata_=payload.metadata or {},
-    )
-    db.add(event)
-
-    tenant_res.usage_minutes = (tenant_res.usage_minutes or 0) + minutes
-    tenant_res.total_cost_usd = Decimal(str(tenant_res.total_cost_usd or 0)) + usage_cost
+    org.plan_type = payload.plan
+    org.calling_enabled = bool(PLAN_CATALOG[payload.plan]["outbound"])
+    after = {"plan_type": org.plan_type, "calling_enabled": bool(org.calling_enabled)}
+    db.add(org)
 
     db.add(
         SuperAdminAuditLog(
             superadmin_id=current_user.id,
-            action="tenant_usage_event_recorded",
-            risk_level="low",
+            action="organization_plan_changed",
+            risk_level="medium",
             target_type="organization",
-            target_id=str(organization_id),
-            metadata_={
-                "tenant_id": tenant_res.tenant_id,
-                "event_type": event.event_type,
-                "minutes": minutes,
-                "cost_usd": float(usage_cost),
-            },
+            target_id=str(org.id),
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            request_id=request.headers.get("x-request-id"),
+            before_state=before,
+            after_state=after,
+            metadata_={"plan": payload.plan, "label": PLAN_CATALOG[payload.plan]["label"]},
         )
     )
     await db.commit()
-    await db.refresh(event)
 
     return {
-        "event_id": str(event.id),
-        "organization_id": str(organization_id),
-        "tenant_id": tenant_res.tenant_id,
-        "minutes": event.minutes,
-        "cost_usd": float(event.cost_usd),
-        "cost_breakdown": TenantBillingService.event_cost_breakdown(payload.model_dump()),
-        "usage_totals": {
-            "usage_minutes": tenant_res.usage_minutes,
-            "total_cost_usd": float(tenant_res.total_cost_usd or 0),
-        },
-    }
-
-
-@router.get("/{organization_id}/usage-events")
-async def list_usage_events(
-    organization_id: UUID,
-    db: AsyncSession = Depends(get_db),
-    current_user: SuperAdminUser = Depends(RequireRole(["founder", "engineering", "billing", "readonly"]))
-):
-    tenant_res_query = await db.execute(select(TenantResources).where(TenantResources.organization_id == organization_id))
-    tenant_res = tenant_res_query.scalars().first()
-    if not tenant_res:
-        raise HTTPException(status_code=404, detail="Tenant resources not found for organization")
-
-    rows = await db.execute(
-        select(TenantUsageEvent)
-        .where(TenantUsageEvent.organization_id == organization_id)
-        .order_by(TenantUsageEvent.created_at.desc())
-    )
-    events = rows.scalars().all()
-
-    return {
-        "organization_id": str(organization_id),
-        "tenant_id": tenant_res.tenant_id,
-        "cost_breakdown": _tenant_cost_breakdown(tenant_res),
-        "usage_minutes": tenant_res.usage_minutes or 0,
-        "events": [
-            {
-                "id": str(event.id),
-                "event_type": event.event_type,
-                "minutes": event.minutes,
-                "stt_minutes": float(event.stt_minutes or 0),
-                "telephony_minutes": float(event.telephony_minutes or 0),
-                "tts_characters": event.tts_characters,
-                "llm_api_calls": event.llm_api_calls,
-                "llm_input_tokens": event.llm_input_tokens,
-                "llm_output_tokens": event.llm_output_tokens,
-                "storage_gb": float(event.storage_gb or 0),
-                "infrastructure_units": event.infrastructure_units,
-                "cost_usd": float(event.cost_usd or 0),
-                "metadata": event.metadata_ or {},
-                "created_at": event.created_at,
-            }
-            for event in events
-        ],
-    }
-
-
-@router.post("/{organization_id}/usage/recalculate")
-async def recalculate_usage_totals(
-    organization_id: UUID,
-    db: AsyncSession = Depends(get_db),
-    current_user: SuperAdminUser = Depends(RequireRole(["founder", "engineering", "billing"]))
-):
-    tenant_res_query = await db.execute(select(TenantResources).where(TenantResources.organization_id == organization_id))
-    tenant_res = tenant_res_query.scalars().first()
-    if not tenant_res:
-        raise HTTPException(status_code=404, detail="Tenant resources not found for organization")
-
-    rows = await db.execute(select(TenantUsageEvent).where(TenantUsageEvent.organization_id == organization_id))
-    events = rows.scalars().all()
-
-    total_minutes = sum(event.minutes or 0 for event in events)
-    usage_cost = sum(Decimal(str(event.cost_usd or 0)) for event in events)
-    provisioned_cost = TenantBillingService.monthly_provisioned_cost(tenant_res)
-
-    tenant_res.usage_minutes = total_minutes
-    tenant_res.total_cost_usd = provisioned_cost + usage_cost
-    await db.commit()
-
-    return {
-        "organization_id": str(organization_id),
-        "tenant_id": tenant_res.tenant_id,
-        "usage_minutes": tenant_res.usage_minutes,
-        "provisioned_monthly_cost_usd": float(provisioned_cost),
-        "usage_cost_usd": float(usage_cost),
-        "total_cost_usd": float(tenant_res.total_cost_usd or 0),
-    }
-
-@router.post("/provision", status_code=status.HTTP_201_CREATED)
-async def provision_tenant(
-    org_in: OrganizationCreate,
-    db: AsyncSession = Depends(get_db),
-    current_user: SuperAdminUser = Depends(RequireRole(["founder", "engineering"]))
-):
-    """
-    Provision a new tenant environment for an organization.
-    Creates Azure Resource Group, Blob prefixes, Key Vault refs,
-    Qdrant collection, Redis namespace, and Twilio provisioning.
-    Only accessible by founder and engineering roles.
-    """
-    # Validate region
-    region = org_in.region if org_in.region else "centralindia"
-    if region not in ALLOWED_REGIONS:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid region '{region}'. Allowed: {', '.join(ALLOWED_REGIONS)}"
-        )
-    admin_email = validate_work_email(org_in.admin_email)
-    admin_domain = extract_email_domain(admin_email)
-
-    # Create Organization record if not exists
-    existing_org = await db.execute(
-        select(Organization).where(
-            Organization.name == org_in.organization_name,
-            Organization.region == region,
-            Organization.environment == org_in.environment,
-        )
-    )
-    org = existing_org.scalars().first()
-
-    if not org:
-        org = Organization(
-            name=org_in.organization_name,
-            admin_email=admin_email,
-            admin_name=org_in.admin_name,
-            email_domain=admin_domain,
-            region=region,
-            environment=org_in.environment,
-            call_type=org_in.call_type,
-            language=org_in.language,
-            plan_type=org_in.plan_type,
-            product_tier=org_in.product_tier,
-            stores_pii=org_in.stores_pii,
-            record_calls=org_in.record_calls,
-            create_resource_group=org_in.create_resource_group,
-            twilio_auto_provision=org_in.twilio_auto_provision,
-            industry=org_in.industry,
-            country_code=org_in.country_code
-        )
-        db.add(org)
-        await db.commit()
-        await db.refresh(org)
-    else:
-        if org.admin_email and normalize_email(org.admin_email) != admin_email:
-            raise HTTPException(
-                status_code=409,
-                detail="Organization already exists with a different admin work email",
-            )
-        org.admin_email = admin_email
-        org.admin_name = org_in.admin_name
-        org.email_domain = admin_domain
-        db.add(org)
-
-    await _ensure_organization_admin_user(db, org)
-    await db.commit()
-
-    # Trigger Azure Tenant Provisioning
-    try:
-        result = await AzureTenantProvisioningService.provision(
-            organization_id=org.id,
-            organization_name=org.name,
-            environment=org.environment,
-            region=region,
-            industry=org.industry,
-            country_code=org.country_code,
-            language=org.language,
-            twilio_auto_provision=org.twilio_auto_provision,
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Provisioning orchestrator failed: {str(e)}"
-        )
-
-    result["organization_profile"] = _organization_profile(org)
-    return result
-
-
-@router.post("/provision/stream")
-async def provision_tenant_stream(
-    org_in: OrganizationCreate,
-    db: AsyncSession = Depends(get_db),
-    current_user: SuperAdminUser = Depends(RequireRole(["founder", "engineering"]))
-):
-    """
-    SSE streaming endpoint for real-time provisioning progress.
-    Each step emits an event as it starts, completes, or fails.
-    """
-    region = org_in.region if org_in.region else "centralindia"
-    if region not in ALLOWED_REGIONS:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid region '{region}'. Allowed: {', '.join(ALLOWED_REGIONS)}"
-        )
-    admin_email = validate_work_email(org_in.admin_email)
-    admin_domain = extract_email_domain(admin_email)
-
-    # Create Organization record if not exists
-    existing_org = await db.execute(
-        select(Organization).where(
-            Organization.name == org_in.organization_name,
-            Organization.region == region,
-            Organization.environment == org_in.environment,
-        )
-    )
-    org = existing_org.scalars().first()
-
-    if not org:
-        org = Organization(
-            name=org_in.organization_name,
-            admin_email=admin_email,
-            admin_name=org_in.admin_name,
-            email_domain=admin_domain,
-            region=region,
-            environment=org_in.environment,
-            call_type=org_in.call_type,
-            language=org_in.language,
-            plan_type=org_in.plan_type,
-            product_tier=org_in.product_tier,
-            stores_pii=org_in.stores_pii,
-            record_calls=org_in.record_calls,
-            create_resource_group=org_in.create_resource_group,
-            twilio_auto_provision=org_in.twilio_auto_provision,
-            industry=org_in.industry,
-            country_code=org_in.country_code
-        )
-        db.add(org)
-        await db.commit()
-        await db.refresh(org)
-    else:
-        if org.admin_email and normalize_email(org.admin_email) != admin_email:
-            raise HTTPException(
-                status_code=409,
-                detail="Organization already exists with a different admin work email",
-            )
-        org.admin_email = admin_email
-        org.admin_name = org_in.admin_name
-        org.email_domain = admin_domain
-        db.add(org)
-
-    await _ensure_organization_admin_user(db, org)
-    await db.commit()
-
-    # Capture org details before the generator runs (db session may close)
-    org_id = org.id
-    org_name = org.name
-    org_env = org.environment
-    org_industry = org.industry
-    org_country = org.country_code
-
-    async def event_generator():
-        queue = asyncio.Queue()
-
-        async def on_step(step_info):
-            await queue.put(step_info)
-
-        async def run_provisioning():
-            try:
-                result = await AzureTenantProvisioningService.provision(
-                    organization_id=org_id,
-                    organization_name=org_name,
-                    environment=org_env,
-                    region=region,
-                    industry=org_industry,
-                    country_code=org_country,
-                    language=org.language,
-                    twilio_auto_provision=org.twilio_auto_provision,
-                    on_step=on_step
-                )
-                result["organization_profile"] = _organization_profile(org)
-                await queue.put({"event": "complete", "data": result})
-            except Exception as e:
-                await queue.put({"event": "error", "data": str(e)})
-            await queue.put(None)  # Signal end
-
-        # Start provisioning in background
-        task = asyncio.create_task(run_provisioning())
-
-        while True:
-            item = await queue.get()
-            if item is None:
-                break
-            if item.get("event") == "complete":
-                yield f"event: complete\ndata: {json.dumps(item['data'], default=str)}\n\n"
-            elif item.get("event") == "error":
-                yield f"event: error\ndata: {json.dumps({'error': item['data']})}\n\n"
-            else:
-                yield f"event: step\ndata: {json.dumps(item)}\n\n"
-
-        await task
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        }
-    )
-
-
-@router.get("/provision/{organization_id}/status")
-async def get_provision_status(
-    organization_id: UUID,
-    db: AsyncSession = Depends(get_db),
-    current_user: SuperAdminUser = Depends(RequireRole(["founder", "engineering"]))
-):
-    org_res = await db.execute(select(Organization).where(Organization.id == organization_id))
-    org = org_res.scalars().first()
-    if not org:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organization not found")
-
-    tr_res = await db.execute(select(TenantResources).where(TenantResources.organization_id == organization_id))
-    tenant_res = tr_res.scalars().first()
-    if not tenant_res:
-        return {
-            "organization_id": organization_id,
-            "organization_name": org.name,
-            "organization_profile": _organization_profile(org),
-            "status": "pending",
-            "steps": [],
-        }
-
-    return {
-        "tenant_id": tenant_res.tenant_id,
-        "organization_id": organization_id,
-        "organization_name": org.name,
-        "organization_profile": _organization_profile(org),
-        "status": tenant_res.provisioning_status,
-        "usage_minutes": tenant_res.usage_minutes or 0,
-        "cost_breakdown": _tenant_cost_breakdown(tenant_res),
-        "azure": {
-            "resource_group": tenant_res.azure_resource_group_name,
-            "region": tenant_res.azure_region,
-        },
-        "resources": {
-            "qdrant_collection": tenant_res.qdrant_collection_name,
-            "qdrant_url_ref": tenant_res.qdrant_url_ref,
-            "redis_namespace": tenant_res.redis_namespace,
-            "redis_host": tenant_res.redis_host,
-            "redis_mode": (tenant_res.provider_status or {}).get("redis_mode", "shared"),
-            "blob_prefix": tenant_res.blob_prefix,
-            "key_vault": tenant_res.key_vault_name,
-            "twilio_status": tenant_res.twilio_status,
-            "twilio_provider": (tenant_res.provider_status or {}).get("twilio_provider"),
-            "twilio_subaccount_id": (tenant_res.provider_status or {}).get("twilio_subaccount_id"),
-            "twilio_error": (tenant_res.provider_status or {}).get("twilio_error"),
-            "stt_provider": (tenant_res.provider_status or {}).get("stt_provider"),
-            "stt_model": (tenant_res.provider_status or {}).get("stt_model"),
-            "stt_endpoint": (tenant_res.provider_status or {}).get("stt_endpoint"),
-            "stt_status": (tenant_res.provider_status or {}).get("stt_status"),
-            "tts_provider": (tenant_res.provider_status or {}).get("tts_provider"),
-            "tts_model": (tenant_res.provider_status or {}).get("tts_model"),
-            "tts_status": (tenant_res.provider_status or {}).get("tts_status"),
-            "tts_voice": (tenant_res.provider_status or {}).get("tts_voice"),
-            "llm_provider": (tenant_res.provider_status or {}).get("llm_provider"),
-            "llm_model": (tenant_res.provider_status or {}).get("llm_model"),
-            "llm_status": (tenant_res.provider_status or {}).get("llm_status"),
-            "llm_api_key_ref": (tenant_res.provider_status or {}).get("llm_api_key_ref"),
-            "llm_api_key_stored": (tenant_res.provider_status or {}).get("llm_api_key_stored"),
-            "llm_error": (tenant_res.provider_status or {}).get("llm_error"),
-            "llm_system_prompt": (tenant_res.provider_status or {}).get("llm_system_prompt"),
-        },
-        "steps": tenant_res.provisioning_steps or [],
-        "next_steps": [
-            "Connect client database",
-            "Connect CRM",
-            "Upload knowledge documents to blob storage",
-            "Assign or connect Twilio number",
-        ],
-    }
-
-
-@router.post("/{organization_id}/reprovision-llm-key", status_code=status.HTTP_200_OK)
-async def reprovision_llm_key(
-    organization_id: UUID,
-    db: AsyncSession = Depends(get_db),
-    current_user: SuperAdminUser = Depends(RequireRole(["founder", "engineering"])),
-):
-    """
-    Reads the Azure OpenAI API key from the existing resource group and writes it
-    to Key Vault under the correct secret name. Use this when provisioning succeeded
-    but Key Vault storage was skipped (e.g. AZURE_SHARED_KEY_VAULT_NAME was unset).
-    """
-    org_res = await db.execute(select(Organization).where(Organization.id == organization_id))
-    org = org_res.scalars().first()
-    if not org:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organization not found")
-
-    tr_res = await db.execute(select(TenantResources).where(TenantResources.organization_id == organization_id))
-    tenant_res = tr_res.scalars().first()
-    if not tenant_res:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tenant resources not found — run provisioning first")
-
-    provider = tenant_res.provider_status or {}
-    account_name = provider.get("llm_account")
-    rg_name = tenant_res.azure_resource_group_name
-    secret_name = provider.get("llm_api_key_ref")
-
-    if not account_name:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="llm_account not recorded in provider_status — cannot locate Azure OpenAI resource")
-    if not rg_name:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="azure_resource_group_name is not set on tenant resources")
-    if not settings.AZURE_SUBSCRIPTION_ID:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="AZURE_SUBSCRIPTION_ID is not configured")
-    if not settings.AZURE_SHARED_KEY_VAULT_NAME:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="AZURE_SHARED_KEY_VAULT_NAME is not configured")
-
-    if not secret_name:
-        secret_name = AzureKeyVaultService._secret_name(tenant_res.tenant_id, "llm-api-key")
-
-    try:
-        from azure.mgmt.cognitiveservices import CognitiveServicesManagementClient
-        credential = AzureAuth.get_credential()
-        cog_client = CognitiveServicesManagementClient(credential, settings.AZURE_SUBSCRIPTION_ID)
-        keys = cog_client.accounts.list_keys(
-            resource_group_name=rg_name,
-            account_name=account_name,
-        )
-        llm_api_key = getattr(keys, "key1", None) or getattr(keys, "primary_key", None)
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Failed to fetch API key from Azure OpenAI resource '{account_name}': {exc}",
-        )
-
-    if not llm_api_key:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Azure OpenAI resource '{account_name}' returned no API key")
-
-    await AzureKeyVaultService.set_secret_value(
-        secret_name,
-        llm_api_key,
-        tenant_res.tenant_id,
-        "llm_api_key",
-    )
-
-    updated_status = dict(provider)
-    updated_status["llm_api_key_ref"] = secret_name
-    updated_status["llm_api_key_stored"] = True
-    updated_status.pop("llm_error", None)
-    tenant_res.provider_status = updated_status
-    db.add(tenant_res)
-    await db.commit()
-
-    return {
-        "status": "ok",
-        "secret_name": secret_name,
-        "vault": settings.AZURE_SHARED_KEY_VAULT_NAME,
-        "account_name": account_name,
-        "resource_group": rg_name,
-    }
-
-
-# ─────────── Nokvo One approval queue ───────────
-
-
-@router.get("/nokvo-one/pending")
-async def list_pending_nokvo_one_orgs(
-    db: AsyncSession = Depends(get_db),
-    current_user: SuperAdminUser = Depends(RequireRole(["founder", "engineering"])),
-):
-    result = await db.execute(
-        select(Organization)
-        .where(
-            Organization.product_tier == "nokvo_one",
-            Organization.status == "pending_approval",
-        )
-        .order_by(Organization.created_at.asc())
-    )
-    orgs = result.scalars().all()
-    return [
-        {
-            "id": str(org.id),
-            "name": org.name,
-            "admin_email": org.admin_email,
-            "admin_name": org.admin_name,
-            "email_domain": org.email_domain,
-            "status": org.status,
-            "calling_enabled": org.calling_enabled,
-            "created_at": org.created_at,
-        }
-        for org in orgs
-    ]
-
-
-@router.post("/nokvo-one/{organization_id}/approve")
-async def approve_nokvo_one_org(
-    organization_id: UUID,
-    body: dict | None = None,
-    db: AsyncSession = Depends(get_db),
-    current_user: SuperAdminUser = Depends(RequireRole(["founder", "engineering"])),
-):
-    body = body or {}
-    enable_calling = bool(body.get("enable_calling", False))
-    plan_type = body.get("plan_type")
-
-    res = await db.execute(select(Organization).where(Organization.id == organization_id))
-    org = res.scalars().first()
-    if org is None:
-        raise HTTPException(status_code=404, detail="Organization not found")
-    if org.product_tier != "nokvo_one":
-        raise HTTPException(status_code=400, detail="Organization is not a Nokvo One tenant")
-    if org.status not in {"pending_approval", "active"}:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Cannot approve organization in status '{org.status}'",
-        )
-
-    org.status = "active"
-    if enable_calling:
-        org.calling_enabled = True
-    if plan_type:
-        org.plan_type = plan_type
-
-    # Promote any users still in pending_totp/invited (post-TOTP) to active.
-    member_res = await db.execute(
-        select(OrganizationUser).where(OrganizationUser.organization_id == org.id)
-    )
-    for member in member_res.scalars().all():
-        if member.status in {"pending_totp", "invited"}:
-            member.status = "active"
-            db.add(member)
-
-    db.add(org)
-    await db.commit()
-    await db.refresh(org)
-    return {
-        "id": str(org.id),
-        "status": org.status,
-        "calling_enabled": org.calling_enabled,
+        "organization_id": str(org.id),
         "plan_type": org.plan_type,
-    }
-
-
-@router.post("/nokvo-one/{organization_id}/suspend")
-async def suspend_nokvo_one_org(
-    organization_id: UUID,
-    db: AsyncSession = Depends(get_db),
-    current_user: SuperAdminUser = Depends(RequireRole(["founder", "engineering"])),
-):
-    res = await db.execute(select(Organization).where(Organization.id == organization_id))
-    org = res.scalars().first()
-    if org is None:
-        raise HTTPException(status_code=404, detail="Organization not found")
-    if org.product_tier != "nokvo_one":
-        raise HTTPException(status_code=400, detail="Organization is not a Nokvo One tenant")
-    org.status = "suspended"
-    org.calling_enabled = False
-    db.add(org)
-    await db.commit()
-    return {"id": str(org.id), "status": org.status}
-
-
-@router.post("/plivo/resync-webhooks")
-async def resync_plivo_webhooks(
-    dry_run: bool = False,
-    db: AsyncSession = Depends(get_db),
-    current_user: SuperAdminUser = Depends(RequireRole(["founder", "engineering"])),
-):
-    """Re-point every tenant's Plivo Application answer_url at the CURRENT
-    public base URL (PLIVO_WEBHOOK_BASE_URL). The answer_url is set once at
-    provisioning; after a domain/tunnel change every Application is stale and
-    inbound calls stop connecting — this is the repair path.
-
-    ``?dry_run=true`` reports which tenants WOULD be updated without touching
-    Plivo or the database.
-    """
-    from app.services.plivo_service import PlivoService
-    from app.services.public_url import public_base_url
-
-    base = public_base_url()
-    if not base or "localhost" in base:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Public base URL '{base}' is not externally reachable — set PLIVO_WEBHOOK_BASE_URL first.",
-        )
-
-    rows = (await db.execute(select(TenantResources))).scalars().all()
-    checked = 0
-    updated: list[dict] = []
-    failed: list[dict] = []
-    skipped = 0
-    for tr in rows:
-        plivo_cfg = (tr.provider_status or {}).get("plivo") or {}
-        if not plivo_cfg.get("application_id"):
-            skipped += 1
-            continue
-        checked += 1
-        if not PlivoService.needs_webhook_resync(plivo_cfg, base):
-            continue
-        if dry_run:
-            updated.append({
-                "tenant_id": tr.tenant_id,
-                "updated": False,
-                "dry_run": True,
-                "answer_url_stored": plivo_cfg.get("answer_url"),
-                "answer_url_expected": PlivoService.expected_answer_url(str(plivo_cfg.get("link_id")), base),
-            })
-            continue
-        try:
-            updated.append(await PlivoService.resync_tenant_webhook(tr, db, base=base))
-        except Exception as exc:  # noqa: BLE001 — report per-tenant, keep going
-            failed.append({"tenant_id": tr.tenant_id, "error": str(exc)[:300]})
-    return {
-        "base_url": base,
-        "dry_run": dry_run,
-        "checked": checked,
-        "skipped_no_application": skipped,
-        "updated": updated,
-        "failed": failed,
+        "plan_label": _plan_label(org.plan_type),
+        "calling_enabled": bool(org.calling_enabled),
     }

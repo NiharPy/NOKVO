@@ -4,6 +4,31 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
+def _meter_call_llm(usage: dict | None) -> None:
+    """Add one LLM response's token usage to the in-flight call's COGS sink.
+
+    Best-effort + null-safe: no-op outside a voice session (the contextvar is
+    unset) or when the provider didn't return a usage block. ``cached_tokens``
+    is the discounted-rate subset of ``prompt_tokens`` (Azure prompt cache).
+    """
+    if not usage:
+        return
+    try:
+        from app.services.call_usage import current_call_usage
+
+        sink = current_call_usage()
+        if sink is not None:
+            details = usage.get("prompt_tokens_details") or {}
+            sink.add_llm(
+                prompt_tokens=usage.get("prompt_tokens"),
+                completion_tokens=usage.get("completion_tokens"),
+                cached_tokens=details.get("cached_tokens"),
+            )
+    except Exception:
+        pass
+
+
 import asyncio
 from datetime import datetime, time, timedelta, timezone
 import json
@@ -495,6 +520,7 @@ class AzureGroundedLLM:
             text = AzureGroundedLLM.extract_text(payload)
             usage = payload.get("usage") if isinstance(payload, dict) else None
             await LLMPool.reconcile(member, _pool_est, int((usage or {}).get("total_tokens") or _pool_est))
+            _meter_call_llm(usage)
             end_llm_span(_llm_span, {
                 "response": text,
                 "status": "completed",
@@ -563,6 +589,7 @@ class AzureGroundedLLM:
             text = AzureGroundedLLM.extract_text(payload)
             usage = payload.get("usage") if isinstance(payload, dict) else None
             await LLMPool.reconcile(member, _pool_est, int((usage or {}).get("total_tokens") or _pool_est))
+            _meter_call_llm(usage)
             end_llm_span(_llm_span, {
                 "response": text,
                 "status": "completed",
@@ -755,6 +782,7 @@ class AzureGroundedLLM:
                                 continue
                             if event.get("usage"):
                                 _usage = event["usage"]  # final stream_options usage chunk
+                                _meter_call_llm(_usage)
                             if event.get("type") == "response.output_text.delta":
                                 token = event.get("delta") or ""
                                 if token:

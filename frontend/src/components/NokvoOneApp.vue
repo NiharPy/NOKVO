@@ -3358,7 +3358,7 @@ const verifySignupTotp = async () => {
       return;
     }
     await api.post('/signup/totp/verify', { setup_token: setupToken.value, code: totpCode.value });
-    infoMsg.value = 'TOTP enrolled. Your organization is pending Nokvo activation. Sign in once approved.';
+    infoMsg.value = 'TOTP enrolled. Your organization is active — sign in to continue.';
     resetLoginState();
     authState.value = 'login';
   } catch (err) {

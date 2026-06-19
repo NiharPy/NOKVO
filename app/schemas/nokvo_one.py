@@ -14,7 +14,6 @@ from app.services.nokvo_one_business_templates import validate_business_type
 NOKVO_ONE_ORG_STATUSES = {
     "pending_email_verification",
     "pending_totp",
-    "pending_approval",
     "active",
     "suspended",
 }

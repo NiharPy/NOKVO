@@ -61,15 +61,15 @@ router = APIRouter()
 
 
 def _agent_dep(allow_pending_approval: bool = True):
-    statuses = ["active"]
-    if allow_pending_approval:
-        statuses = ["pending_approval", "active"]
-    return deps.RequireNokvoOneOrganization(allowed_statuses=statuses)
+    # The 'pending_approval' org status was removed (orgs are active
+    # immediately — no superadmin gate). The parameter is retained for
+    # call-site compatibility but no longer widens the allowed set.
+    return deps.RequireNokvoOneOrganization(allowed_statuses=["active"])
 
 
 def _admin_agent_dep():
     return deps.RequireNokvoOneOrganization(
-        allowed_statuses=["pending_approval", "active"],
+        allowed_statuses=["active"],
         allowed_roles=["admin", "manager"],
     )
 

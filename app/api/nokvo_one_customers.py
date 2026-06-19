@@ -42,7 +42,7 @@ _NOTE_MAX_CHARS = 500
 
 def _admin_dep():
     return deps.RequireNokvoOneOrganization(
-        allowed_statuses=["pending_approval", "active"],
+        allowed_statuses=["active"],
         allowed_roles=["admin", "manager"],
     )
 

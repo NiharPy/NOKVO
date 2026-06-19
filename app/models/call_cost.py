@@ -21,6 +21,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    Integer,
     Numeric,
     String,
     UniqueConstraint,
@@ -80,6 +81,28 @@ class CallCost(Base):
     # Nullable: rows from before this column / calls with OTel off keep NULL.
     # Indexed so support can pivot "this call → its logs/LangSmith" by trace id.
     trace_id = Column(String, nullable=True, index=True)
+
+    # ── Per-call COGS breakdown (STT + LLM + TTS + Plivo) ──────────────────
+    # These are Nokvo's *vendor cost* for the call, NOT what the tenant is
+    # billed (that's ``rupees``). All nullable: only calls recorded after the
+    # instrumentation landed carry them — historical rows stay NULL and the
+    # SuperAdmin console renders them as "total-only".
+    #
+    # Raw usage counters (let us re-price later if a vendor rate changes):
+    llm_input_tokens = Column(Integer, nullable=True)
+    llm_output_tokens = Column(Integer, nullable=True)
+    llm_cached_tokens = Column(Integer, nullable=True)
+    stt_seconds = Column(Numeric(12, 4), nullable=True)
+    tts_characters = Column(Integer, nullable=True)
+    # Component costs in INR (computed at record time from the usage counters
+    # and the rate-in-force, mirroring how ``rate_per_second`` is frozen per
+    # row). ``cost_total_inr`` is the pre-summed COGS so dashboard rollups
+    # don't re-add the four components every query.
+    cost_stt_inr = Column(Numeric(12, 4), nullable=True)
+    cost_llm_inr = Column(Numeric(12, 4), nullable=True)
+    cost_tts_inr = Column(Numeric(12, 4), nullable=True)
+    cost_telephony_inr = Column(Numeric(12, 4), nullable=True)
+    cost_total_inr = Column(Numeric(12, 4), nullable=True)
 
     __table_args__ = (
         UniqueConstraint("call_id", name="uq_call_costs_call_id"),

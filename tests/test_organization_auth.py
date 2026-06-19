@@ -112,29 +112,64 @@ def org_payload(name: str, admin_email: str = "admin@orgauthco.com") -> dict:
     }
 
 
+class _SeedResponse:
+    """Mimics httpx.Response for the bits these tests use (status_code, json())."""
+
+    def __init__(self, status_code: int, payload: dict):
+        self.status_code = status_code
+        self._payload = payload
+
+    def json(self) -> dict:
+        return self._payload
+
+
 async def provision_org(client, founder: SuperAdminUser, name: str, admin_email: str = "admin@orgauthco.com"):
-    token = make_founder_token(founder.id, founder.role)
+    """Seed an organization directly in the DB.
 
-    async def _mock_provision(**kwargs):
-        return {
-            "status": "success",
-            "tenant_id": "tenant-org-auth",
-            "organization_id": str(kwargs["organization_id"]),
-            "resources": {},
-            "steps": [],
-            "next_steps": [],
-        }
-
-    with patch(
-        "app.services.azure_tenant_provisioning_service.AzureTenantProvisioningService.provision",
-        new_callable=AsyncMock,
-        side_effect=_mock_provision,
-    ):
-        return await client.post(
-            "/superadmin/tenants/provision",
-            json=org_payload(name, admin_email=admin_email),
-            headers={"Authorization": f"Bearer {token}"},
+    The SuperAdmin manual-provisioning endpoint (``POST /superadmin/tenants/
+    provision``) was removed in the console overhaul — orgs now self-serve and
+    the console is view + upgrade only. These legacy org-auth tests only need
+    an org + admin user + a provisioned tenant row to exist, so we create them
+    directly and return a 201-shaped shim matching the old endpoint's response.
+    """
+    normalized_email = admin_email.strip().lower()
+    email_domain = normalized_email.split("@", 1)[1] if "@" in normalized_email else None
+    async with db_session.AsyncSessionLocal() as db:
+        org = Organization(
+            id=uuid.uuid4(),
+            name=name,
+            admin_email=normalized_email,
+            admin_name="Org Auth Admin",
+            email_domain=email_domain,
+            region="centralindia",
+            environment="production",
+            call_type="inbound",
+            language="en-IN",
+            plan_type="pilot",
         )
+        db.add(org)
+        await db.flush()
+        db.add(
+            OrganizationUser(
+                organization_id=org.id,
+                email=normalized_email,
+                full_name="Org Auth Admin",
+                role="admin",
+                status="invited",
+                auth_provider="google",
+                email_verified=False,
+            )
+        )
+        db.add(
+            TenantResources(
+                organization_id=org.id,
+                tenant_id=f"tenant-{org.id.hex[:12]}",
+                provisioning_status="success",
+            )
+        )
+        await db.commit()
+        org_id = str(org.id)
+    return _SeedResponse(201, {"organization_id": org_id, "tenant_id": f"tenant-{org_id[:12]}"})
 
 
 async def complete_org_login(

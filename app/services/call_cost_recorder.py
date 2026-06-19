@@ -35,6 +35,7 @@ from app.services.call_cost_calculator import (
     CostBreakdown,
     rupees_per_second_for,
 )
+from app.services.call_usage import CallUsage, compute_cogs_inr
 
 
 logger = logging.getLogger(__name__)
@@ -83,8 +84,15 @@ async def record_call_cost(
     kind: str = "inbound",
     campaign_id: Any = None,
     trace_id: str | None = None,
+    usage: CallUsage | None = None,
 ) -> CallCost | None:
     """Insert a single CallCost row for a completed session.
+
+    ``usage`` carries the per-call metered vendor usage (LLM tokens, STT
+    seconds, TTS characters). When supplied we price it into the per-component
+    INR COGS columns (``cost_stt_inr`` … ``cost_total_inr``); when ``None``
+    (e.g. the legacy agent path) those columns stay NULL and the row is
+    "total-only" — ``rupees`` (the tenant's bill) is unaffected either way.
 
     Returns the persisted row, ``None`` when persistence was skipped
     (missing context, dedup hit, or rolled-back error). Never raises —
@@ -128,6 +136,31 @@ async def record_call_cost(
 
     campaign_uuid = _coerce_uuid(campaign_id)
 
+    # Per-component COGS (STT/LLM/TTS/Plivo) in INR, when usage was captured.
+    # Best-effort: a pricing hiccup must not block the (revenue) ledger write.
+    cogs_values: dict[str, Any] = {}
+    if usage is not None:
+        try:
+            cogs = compute_cogs_inr(usage, breakdown.seconds)
+            cogs_values = {
+                "llm_input_tokens": cogs.llm_input_tokens,
+                "llm_output_tokens": cogs.llm_output_tokens,
+                "llm_cached_tokens": cogs.llm_cached_tokens,
+                "stt_seconds": cogs.stt_seconds,
+                "tts_characters": cogs.tts_characters,
+                "cost_stt_inr": cogs.cost_stt_inr,
+                "cost_llm_inr": cogs.cost_llm_inr,
+                "cost_tts_inr": cogs.cost_tts_inr,
+                "cost_telephony_inr": cogs.cost_telephony_inr,
+                "cost_total_inr": cogs.cost_total_inr,
+            }
+        except Exception:
+            logger.exception(
+                "NOKVO-COST: COGS breakdown failed (call_id=%s) — recording total-only",
+                call_id,
+            )
+            cogs_values = {}
+
     # ON CONFLICT DO NOTHING — re-recording the same call_id is a no-op.
     stmt = (
         pg_insert(CallCost.__table__)
@@ -145,6 +178,7 @@ async def record_call_cost(
             ended_at=ended_at,
             trace_id=trace_id,
             created_at=datetime.now(timezone.utc),
+            **cogs_values,
         )
         .on_conflict_do_nothing(index_elements=["call_id"])
         .returning(CallCost.__table__)

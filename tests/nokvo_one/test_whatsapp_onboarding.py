@@ -193,32 +193,7 @@ def test_status_not_requested_when_empty(monkeypatch):
     assert res["onboarding"] is None
 
 
-# ── superadmin requests-queue filter ────────────────────────────────────────
-
-
-def test_superadmin_request_item_filters_to_pending():
-    from app.api.superadmin_tenant_provisioning import _whatsapp_request_item
-
-    org = SimpleNamespace(id="org-1", name="Skyline Org")
-
-    pending = SimpleNamespace(tenant_id="t-1", provider_status={"plivo": {
-        "whatsapp_onboarding": {
-            "step": "requested", "business_name": "Skyline Realty",
-            "contact_number": "+917569672503", "display_name": "Skyline",
-            "requested_at": "2026-06-14T00:00:00Z", "requested_by": "admin@skyline.com",
-        }
-    }})
-    item = _whatsapp_request_item(org, pending)
-    assert item is not None
-    assert item["organization_id"] == "org-1"
-    assert item["business_name"] == "Skyline Realty"
-    assert item["contact_number"] == "+917569672503"
-
-    # Already-connected and never-requested tenants are not in the queue.
-    connected = SimpleNamespace(tenant_id="t-2", provider_status={"plivo": {
-        "whatsapp_number": "+917569672503",
-        "whatsapp_onboarding": {"step": "connected", "business_name": "X"},
-    }})
-    assert _whatsapp_request_item(org, connected) is None
-    assert _whatsapp_request_item(org, SimpleNamespace(tenant_id="t-3", provider_status={})) is None
-    assert _whatsapp_request_item(org, None) is None
+# NOTE: the SuperAdmin WhatsApp requests-queue (and its `_whatsapp_request_item`
+# helper) was removed in the SuperAdmin console overhaul — the console is now
+# view + per-call-cost + plan-upgrade only. The client-side request → connected
+# state machine above (PlivoService) is unchanged and still covered.

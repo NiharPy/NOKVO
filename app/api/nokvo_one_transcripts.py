@@ -21,7 +21,7 @@ router = APIRouter()
 
 
 def _org_user():
-    return deps.RequireNokvoOneOrganization(allowed_statuses=["pending_approval", "active"])
+    return deps.RequireNokvoOneOrganization(allowed_statuses=["active"])
 
 
 @router.get("/transcripts")

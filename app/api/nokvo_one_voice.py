@@ -90,7 +90,7 @@ def _safe_detail(exc: BaseException) -> str:
 
 router = APIRouter()
 
-_ALLOWED_STATUSES = ["pending_approval", "active", "suspended"]
+_ALLOWED_STATUSES = ["active", "suspended"]
 
 
 def _viewer_dep():

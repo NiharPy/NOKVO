@@ -556,13 +556,13 @@ async def nokvo_one_signup_totp_verify(
     if not security.verify_totp(secret, payload.code):
         raise HTTPException(status_code=401, detail="Invalid TOTP code")
 
-    user.status = "invited"  # promoted to active once superadmin approves the org
+    user.status = "active"  # org is usable immediately — no superadmin approval gate
     org_res = await db.execute(select(Organization).where(Organization.id == org_id))
     organization = org_res.scalars().first()
     if organization is None:
         raise HTTPException(status_code=404, detail="Organization not found")
     if organization.status == "pending_totp":
-        organization.status = "pending_approval"
+        organization.status = "active"
     db.add(user)
     db.add(organization)
     await db.commit()
@@ -617,7 +617,7 @@ async def nokvo_one_signup_skip_totp(
     user.mfa_required = False
     user.status = "active"
     if organization.status == "pending_totp":
-        organization.status = "pending_approval"
+        organization.status = "active"
     db.add(user)
     db.add(organization)
     await db.flush()
@@ -688,7 +688,7 @@ async def nokvo_one_login(
         if user.status in {"invited", "pending_totp"}:
             user.status = "active"
         if organization.status == "pending_totp":
-            organization.status = "pending_approval"
+            organization.status = "active"
         db.add(user)
         db.add(organization)
         await db.flush()
@@ -762,7 +762,7 @@ async def nokvo_one_session_totp_setup(
     organization = org_res.scalars().first()
     if organization is None or organization.product_tier != "nokvo_one":
         raise HTTPException(status_code=403, detail="Not a Nokvo One organization")
-    if organization.status not in {"pending_approval", "active", "suspended"}:
+    if organization.status not in {"active", "suspended"}:
         raise HTTPException(
             status_code=403,
             detail=f"Organization status '{organization.status}' is not permitted on this endpoint",
@@ -808,7 +808,7 @@ async def nokvo_one_session_totp_verify(
     if organization is None or organization.product_tier != "nokvo_one":
         raise HTTPException(status_code=403, detail="Not a Nokvo One organization")
     if organization.status == "pending_totp":
-        organization.status = "pending_approval"
+        organization.status = "active"
         db.add(organization)
     if user.status in {"invited", "pending_totp"}:
         user.status = "active"
@@ -993,7 +993,7 @@ async def nokvo_one_google_login(
         if user.status in {"invited", "pending_totp"}:
             user.status = "active"
         if organization.status == "pending_totp":
-            organization.status = "pending_approval"
+            organization.status = "active"
         db.add(user)
         db.add(organization)
         await db.flush()
@@ -1095,7 +1095,7 @@ async def nokvo_one_logout(
 async def nokvo_one_me(
     user: OrganizationUser = Depends(
         deps.RequireNokvoOneOrganization(
-            allowed_statuses=["onboarding", "pending_approval", "active", "suspended"]
+            allowed_statuses=["onboarding", "active", "suspended"]
         )
     ),
     db: AsyncSession = Depends(deps.get_db),
@@ -1123,7 +1123,7 @@ async def nokvo_one_business_template_options():
 async def nokvo_one_current_business_template(
     user: OrganizationUser = Depends(
         deps.RequireNokvoOneOrganization(
-            allowed_statuses=["pending_approval", "active", "suspended"]
+            allowed_statuses=["active", "suspended"]
         )
     ),
     db: AsyncSession = Depends(deps.get_db),
@@ -1141,7 +1141,7 @@ async def nokvo_one_save_business_template(
     payload: NokvoOneBusinessTemplateRequest,
     user: OrganizationUser = Depends(
         deps.RequireNokvoOneOrganization(
-            allowed_statuses=["pending_approval", "active", "suspended"],
+            allowed_statuses=["active", "suspended"],
             allowed_roles=["admin", "manager"],
         )
     ),
@@ -1177,7 +1177,7 @@ async def nokvo_one_get_field_catalog(
     schema_key: str,
     user: OrganizationUser = Depends(
         deps.RequireNokvoOneOrganization(
-            allowed_statuses=["pending_approval", "active", "suspended"],
+            allowed_statuses=["active", "suspended"],
             allowed_roles=["admin", "manager"],
         )
     ),
@@ -1235,7 +1235,7 @@ async def nokvo_one_update_business_template_schema(
     payload: NokvoOneBusinessSchemaUpdateRequest,
     user: OrganizationUser = Depends(
         deps.RequireNokvoOneOrganization(
-            allowed_statuses=["pending_approval", "active", "suspended"],
+            allowed_statuses=["active", "suspended"],
             allowed_roles=["admin", "manager"],
         )
     ),
@@ -1273,14 +1273,14 @@ async def nokvo_one_update_business_template_schema(
 
 def _custom_tab_admin_dep():
     return deps.RequireNokvoOneOrganization(
-        allowed_statuses=["pending_approval", "active", "suspended"],
+        allowed_statuses=["active", "suspended"],
         allowed_roles=["admin", "manager"],
     )
 
 
 def _custom_tab_read_dep():
     return deps.RequireNokvoOneOrganization(
-        allowed_statuses=["pending_approval", "active", "suspended"],
+        allowed_statuses=["active", "suspended"],
     )
 
 
@@ -1390,7 +1390,7 @@ async def nokvo_one_delete_custom_tab(
 async def nokvo_one_provisioning_state(
     user: OrganizationUser = Depends(
         deps.RequireNokvoOneOrganization(
-            allowed_statuses=["pending_approval", "active", "suspended"]
+            allowed_statuses=["active", "suspended"]
         )
     ),
     db: AsyncSession = Depends(deps.get_db),

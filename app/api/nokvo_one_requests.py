@@ -62,7 +62,7 @@ def _assignment_response(result: dict) -> NokvoOneRequestAssignResponse:
 async def assign_new_request(
     payload: NokvoOneRequestAssignRequest,
     user: OrganizationUser = Depends(
-        deps.RequireNokvoOneOrganization(allowed_statuses=["pending_approval", "active"])
+        deps.RequireNokvoOneOrganization(allowed_statuses=["active"])
     ),
     db: AsyncSession = Depends(deps.get_db),
 ):
@@ -89,7 +89,7 @@ async def assign_existing_request(
     request_id: uuid.UUID,
     payload: NokvoOneRequestAssignRequest,
     user: OrganizationUser = Depends(
-        deps.RequireNokvoOneOrganization(allowed_statuses=["pending_approval", "active"])
+        deps.RequireNokvoOneOrganization(allowed_statuses=["active"])
     ),
     db: AsyncSession = Depends(deps.get_db),
 ):
@@ -118,7 +118,7 @@ async def update_blocked_slot(
     payload: NokvoOneBlockedSlotUpdateRequest,
     user: OrganizationUser = Depends(
         deps.RequireNokvoOneOrganization(
-            allowed_statuses=["pending_approval", "active"],
+            allowed_statuses=["active"],
             allowed_roles=["admin", "manager"],
         )
     ),
@@ -155,7 +155,7 @@ async def delete_blocked_slot(
     blocked_slot_id: uuid.UUID,
     user: OrganizationUser = Depends(
         deps.RequireNokvoOneOrganization(
-            allowed_statuses=["pending_approval", "active"],
+            allowed_statuses=["active"],
             allowed_roles=["admin", "manager"],
         )
     ),

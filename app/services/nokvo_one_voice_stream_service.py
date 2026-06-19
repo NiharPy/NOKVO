@@ -1964,6 +1964,24 @@ class NokvoOneVoiceStreamService:
                 logger.warning(f"NOKVO-TRANSLATE: failed: {exc!r}")
                 return ""
 
+        # Meter STT audio seconds for this turn → per-call COGS (best-effort,
+        # WAV only). Counted once for the native pass; the optional translate
+        # pass (a second Sarvam call when retrieval-translate is on) is not
+        # separately metered, so STT cost is a slight under-estimate when that
+        # path runs.
+        try:
+            from app.services.call_usage import current_call_usage
+
+            _usage = current_call_usage()
+            if _usage is not None and is_wav:
+                _stt_extracted = _extract_pcm_from_wav(audio_bytes)
+                if _stt_extracted is not None:
+                    _stt_pcm, _stt_sr = _stt_extracted
+                    if _stt_sr:
+                        _usage.add_stt_seconds(len(_stt_pcm) / 2 / _stt_sr)
+        except Exception:
+            pass
+
         native_task = asyncio.create_task(_native())
         translate_task = asyncio.create_task(_translated())
         try:
@@ -2251,6 +2269,12 @@ class NokvoOneVoiceStreamService:
         # context, so all descendant LLM calls inherit it.
         from app.services.llm_pool import set_call_id
         set_call_id(call_id)
+        # Per-call vendor-usage sink (STT seconds / LLM tokens / TTS chars).
+        # Installed BEFORE any turn tasks spawn so they inherit the contextvar
+        # and every increment lands on this one object; priced into the
+        # CallCost COGS columns at teardown. See app/services/call_usage.py.
+        from app.services.call_usage import begin_call_usage, end_call_usage
+        call_usage, _usage_token = begin_call_usage()
         session_started = perf_counter()
         # Wall-clock anchor for the billing ledger. ``perf_counter`` gives us
         # an accurate elapsed-time delta for runtime metrics, but the cost
@@ -3256,9 +3280,12 @@ class NokvoOneVoiceStreamService:
                         kind=cost_kind,
                         campaign_id=cost_campaign_id,
                         trace_id=_otel_trace_id,
+                        usage=call_usage,
                     )
                 except Exception:
                     logger.exception("NOKVO-VOICE: failed to record call cost")
+                finally:
+                    end_call_usage(_usage_token)
                 # Promote durable facts from this call's conversational
                 # memory into the per-phone caller-memory blob so a future
                 # call from the same number opens warm. Best-effort.

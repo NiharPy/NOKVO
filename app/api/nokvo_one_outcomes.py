@@ -30,7 +30,7 @@ async def agent_spec():
 async def list_pending_retries(
     user: OrganizationUser = Depends(
         deps.RequireNokvoOneOrganization(
-            allowed_statuses=["pending_approval", "active"],
+            allowed_statuses=["active"],
             allowed_roles=["admin", "manager"],
         )
     ),
@@ -59,7 +59,7 @@ async def list_pending_retries(
 async def process_pending_retries(
     user: OrganizationUser = Depends(
         deps.RequireNokvoOneOrganization(
-            allowed_statuses=["pending_approval", "active"],
+            allowed_statuses=["active"],
             allowed_roles=["admin", "manager"],
         )
     ),
@@ -76,7 +76,7 @@ async def campaign_outcomes(
     campaign_id: uuid.UUID,
     user: OrganizationUser = Depends(
         deps.RequireNokvoOneOrganization(
-            allowed_statuses=["pending_approval", "active"],
+            allowed_statuses=["active"],
         )
     ),
     db: AsyncSession = Depends(deps.get_db),
@@ -96,7 +96,7 @@ async def trigger_auto_followup(
     record_id: uuid.UUID,
     user: OrganizationUser = Depends(
         deps.RequireNokvoOneOrganization(
-            allowed_statuses=["pending_approval", "active"],
+            allowed_statuses=["active"],
             allowed_roles=["admin", "manager"],
         )
     ),
@@ -118,7 +118,7 @@ async def resolve_retry(
     retry_id: uuid.UUID,
     user: OrganizationUser = Depends(
         deps.RequireNokvoOneOrganization(
-            allowed_statuses=["pending_approval", "active"],
+            allowed_statuses=["active"],
             allowed_roles=["admin", "manager"],
         )
     ),
@@ -154,7 +154,7 @@ async def record_outcome(
     payload: OutcomeRequest,
     user: OrganizationUser = Depends(
         deps.RequireNokvoOneOrganization(
-            allowed_statuses=["pending_approval", "active"],
+            allowed_statuses=["active"],
             allowed_roles=["admin", "manager"],
         )
     ),
