@@ -219,7 +219,7 @@ class PlivoService:
 
     # ── numbers (DIDs) ───────────────────────────────────────────────────────────
     @classmethod
-    async def rent_number(cls, *, country: str | None = None, app_id: str | None = None, sub_auth_id: str | None = None) -> dict[str, Any]:
+    async def rent_number(cls, *, country: str | None = None, app_id: str | None = None, sub_auth_id: str | None = None, compliance_application_id: str | None = None) -> dict[str, Any]:
         """Search + buy a DID, then assign it to the Application + subaccount.
 
         India DIDs need KYC/regulatory approval and may not be instantly buyable —
@@ -238,7 +238,14 @@ class PlivoService:
         buy_body: dict[str, Any] = {}
         if app_id:
             buy_body["app_id"] = app_id
-        await cls._request("POST", f"{cls._base(auth[0])}/PhoneNumber/{number}/", auth=auth, json_body=buy_body or None)
+        # Regulated markets (India) won't sell a DID without an APPROVED business
+        # compliance application — pass its id so Plivo links the purchase.
+        if compliance_application_id:
+            buy_body["compliance_application_id"] = compliance_application_id
+        # Always send a JSON body (even ``{}``) — Plivo's buy endpoint requires an
+        # application/json POST and 400s ("use 'application/json'…") on a bodyless
+        # request, which is why bare ``buy_body or None`` failed.
+        await cls._request("POST", f"{cls._base(auth[0])}/PhoneNumber/{number}/", auth=auth, json_body=buy_body)
         if app_id or sub_auth_id:
             await cls.assign_number(number, app_id=app_id, sub_auth_id=sub_auth_id)
         return {"number": number, "status": "active"}

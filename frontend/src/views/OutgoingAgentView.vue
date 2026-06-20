@@ -88,6 +88,8 @@ const {
   isLaunchingCampaign,
   launchCampaign,
   cancelCampaign,
+  isTogglingFollowup,
+  setCampaignFollowup,
   removeCampaign,
 } = useDashboardState();
 
@@ -830,10 +832,10 @@ function campaignStatusTone(s) {
                 </ul>
               </section>
 
-              <section v-if="isAdmin && c.status === 'draft'" class="outbound__campaign-section">
+              <section v-if="isAdmin && c.status !== 'cancelled'" class="outbound__campaign-section">
                 <header>
                   <strong>Attach more leads</strong>
-                  <small>{{ callableLeads.length }} callable in inventory</small>
+                  <small>{{ callableLeads.length }} callable in inventory{{ c.status !== 'draft' ? ' · Relaunch to call new ones' : '' }}</small>
                 </header>
                 <div v-if="!callableLeads.length" class="outbound__inline-empty">
                   No consented leads imported yet.
@@ -886,6 +888,27 @@ function campaignStatusTone(s) {
                 >
                   <Send :size="13" />
                   {{ isLaunchingCampaign === c.id ? 'Launching…' : 'Launch' }}
+                </button>
+                <button
+                  v-if="(c.status === 'running' || c.status === 'completed') && (c.pending_to_dial || 0) > 0"
+                  type="button"
+                  class="n-btn n-btn--brand n-btn--sm"
+                  :disabled="isLaunchingCampaign === c.id || !outboundNumber.calling_enabled || !outboundNumber.number"
+                  :title="!outboundNumber.calling_enabled ? 'Upgrade to Inbound + Outbound to call' : (!outboundNumber.number ? 'No outbound number provisioned yet' : `Call ${c.pending_to_dial} newly-added lead(s)`)"
+                  @click="launchCampaign(c.id)"
+                >
+                  <Send :size="13" />
+                  {{ isLaunchingCampaign === c.id ? 'Relaunching…' : `Relaunch (${c.pending_to_dial})` }}
+                </button>
+                <button
+                  type="button"
+                  class="n-btn n-btn--ghost n-btn--sm outbound__followup-switch"
+                  :class="{ 'is-off': !c.followup_enabled }"
+                  :disabled="isTogglingFollowup === c.id"
+                  :title="c.followup_enabled ? 'Follow-up agent is ON — click to turn off' : 'Follow-up agent is OFF — click to turn on'"
+                  @click="setCampaignFollowup(c.id, !c.followup_enabled)"
+                >
+                  {{ isTogglingFollowup === c.id ? 'Saving…' : (c.followup_enabled ? '● Follow-up: On' : '○ Follow-up: Off') }}
                 </button>
                 <button
                   v-if="c.status === 'draft' || c.status === 'running'"
@@ -1576,6 +1599,8 @@ function campaignStatusTone(s) {
 .outbound__prompt-block ul { margin: 0; padding-left: 18px; font-size: 13px; color: var(--n-text-2); }
 .outbound__prompt-tags { display: flex; gap: 6px; flex-wrap: wrap; }
 
+.outbound__followup-switch { font-weight: 600; }
+.outbound__followup-switch.is-off { opacity: 0.6; }
 .outbound__attached { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
 .outbound__attached li {
   display: flex; align-items: center; justify-content: space-between; gap: 10px;

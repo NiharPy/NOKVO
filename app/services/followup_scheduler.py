@@ -212,6 +212,34 @@ async def _dispatch_one(row_id: uuid.UUID) -> None:
         if row.campaign_id is not None:
             campaign = await db.get(OutboundCampaign, row.campaign_id)
 
+        # Resolve the campaign the LEAD is attached to when the row didn't carry
+        # one (e.g. the follow-up was enqueued outside a campaign call). The
+        # follow-up must run as the lead's OWN campaign agent — project knowledge
+        # + the site_visit objective — not a generic "good fit?" chat. Persist it
+        # so the webhook/WS pipeline loads the full campaign context downstream.
+        if campaign is None and lead is not None:
+            from app.services.outbound_campaign_service import OutboundCampaignService
+
+            campaign = await OutboundCampaignService.get_campaign_for_lead(
+                row.tenant_id,
+                lead.id,
+                lead.phone_e164 or lead.phone_raw,
+                db,
+            )
+            if campaign is not None:
+                row.campaign_id = campaign.id
+                db.add(row)
+                await db.commit()
+
+        # A lead follow-up with no campaign to sell for is a no-op — skip it
+        # rather than run a knowledge-less agent (per product decision: orphan
+        # leads are not followed up).
+        if campaign is None and lead is not None:
+            await FollowupSchedulerService.mark_failed(
+                row=row, reason="no_campaign_for_lead", db=db
+            )
+            return
+
         # Re-clamp against the current call window (admin may have shifted
         # hours since the row was enqueued).
         rules = effective_followup_rules(campaign)
@@ -236,13 +264,13 @@ async def _dispatch_one(row_id: uuid.UUID) -> None:
             )
             return
 
-        # Per-tenant concurrency cap: don't place an outbound call we can't
-        # service. At capacity the media WS would just hang up, so defer this
-        # row a minute and let a later tick retry when a line frees up.
-        from app.services.call_concurrency import active_count
+        # Concurrency cap: follow-ups share the INBOUND pool, so don't place one
+        # we can't service. At capacity the media WS would just hang up, so defer
+        # this row a minute and let a later tick retry when a line frees up.
+        from app.services.call_concurrency import active_count, POOL_INBOUND_FOLLOWUP
 
-        if await active_count(tenant_res.tenant_id) >= int(
-            settings.NOKVO_MAX_CONCURRENT_CALLS_PER_TENANT or 10
+        if await active_count(tenant_res.tenant_id, pool=POOL_INBOUND_FOLLOWUP) >= int(
+            settings.NOKVO_MAX_CONCURRENT_INBOUND_FOLLOWUP_PER_TENANT or 5
         ):
             row.scheduled_at = now + timedelta(minutes=1)
             db.add(row)

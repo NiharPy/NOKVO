@@ -380,6 +380,15 @@ _LATENCY_GUARD_INBOUND = {
     "ur": "ایک لمحہ، میں دیکھ رہا ہوں۔",
     "od": "ଟିକେ ଅପେକ୍ଷା କରନ୍ତୁ, ମୁଁ ଦେଖୁଛି।",
 }
+# Beat to wait before speaking the OUTBOUND opener. When we dial out, the
+# callee's audio path isn't up the instant our media WS opens — they're still
+# raising the handset and saying "hello?". Speaking immediately gets the intro
+# ("Riya here from <company>…") clipped or talked over, so the prospect never
+# catches who's calling and asks "what is this?". A short pause lets their
+# "hello" land and the path settle, so the full intro is heard. Inbound is
+# unaffected (it has its own 0.35s opener delay). Tune against a live call.
+_OUTBOUND_OPENER_DELAY_SECONDS = 0.7
+
 # Outbound latency bridge: NOT a hold. On an outbound sales call "please hold /
 # one moment" reads as a stalled call-center queue and gets the prospect to hang
 # up. Instead a short, natural thinking-aloud token ("Mhm…", "I see,") so it
@@ -873,6 +882,18 @@ class NokvoOneVoiceStreamService:
         ``contact`` (the lead's own enquiry) and the cross-call caller-memory
         blob (a prior call). An empty dict yields the cold template opener."""
         facts: dict[str, Any] = {}
+        if isinstance(campaign_context, dict) and campaign_context.get("is_followup"):
+            # Flag the follow-up + the project/campaign name so the opener can
+            # re-engage grounded ("following up about <project>"). Only mark
+            # ``returning`` (the "follow up on our LAST CONVERSATION" wording)
+            # when a real prior call actually happened — i.e. a handoff_note
+            # exists. Otherwise that line is a lie.
+            facts["followup"] = True
+            project = str(campaign_context.get("goal") or "").strip()
+            if project and project.lower() != "follow-up call":
+                facts["project"] = project
+            if str(campaign_context.get("handoff_note") or "").strip():
+                facts["returning"] = True
         contact = (campaign_context or {}).get("contact") if isinstance(campaign_context, dict) else None
         contact = contact if isinstance(contact, dict) else {}
 
@@ -3009,6 +3030,13 @@ class NokvoOneVoiceStreamService:
                 outbound_opening_text = generate_outbound_opener_text(
                     outbound_context, language=language, known_facts=opener_facts
                 )
+                # Let the callee's audio path come up before we speak, so the
+                # intro isn't clipped (see _OUTBOUND_OPENER_DELAY_SECONDS). The
+                # opener still plays before the receive loop starts, so it always
+                # leads — we just hold it a beat. Any media arriving during the
+                # pause buffers and is drained once we start reading the socket.
+                if _OUTBOUND_OPENER_DELAY_SECONDS > 0:
+                    await asyncio.sleep(_OUTBOUND_OPENER_DELAY_SECONDS)
                 await NokvoOneVoiceStreamService._play_opener(
                     websocket,
                     tenant_res,

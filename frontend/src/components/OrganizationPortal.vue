@@ -197,26 +197,25 @@ const inviteEmailDomain = computed(() => {
   }
   return rawEmail.split('@').pop() || '';
 });
+// Anyone can be invited — no organization-domain restriction. We only check
+// for a syntactically plausible email; the backend EmailStr schema is final.
 const isInviteDomainValid = computed(() => {
   if (!inviteForm.value.email) {
     return true;
   }
-  return inviteEmailDomain.value === normalizedOrganizationDomain.value;
+  return Boolean(inviteEmailDomain.value);
 });
 const inviteValidationMessage = computed(() => {
   if (!inviteForm.value.email) {
-    return `Invites are restricted to ${normalizedOrganizationDomain.value || 'your organization domain'}.`;
+    return 'Enter the invitee’s email address.';
   }
   if (!inviteEmailDomain.value) {
-    return 'Enter a valid work email address.';
+    return 'Enter a valid email address.';
   }
-  if (!isInviteDomainValid.value) {
-    return `Invite email must use ${normalizedOrganizationDomain.value}.`;
-  }
-  return `This invite will be sent under ${normalizedOrganizationDomain.value}.`;
+  return 'This invite will be emailed with a one-time setup link.';
 });
 const inviteCanSubmit = computed(
-  () => Boolean(inviteForm.value.email) && Boolean(inviteEmailDomain.value) && isInviteDomainValid.value,
+  () => Boolean(inviteForm.value.email) && Boolean(inviteEmailDomain.value),
 );
 const activeMemberCount = computed(() => members.value.filter((member) => member.status === 'active').length);
 const invitedMemberCount = computed(() => members.value.filter((member) => member.status === 'invited').length);
@@ -2732,12 +2731,8 @@ onBeforeUnmount(() => {
             </div>
             <div>
               <h3>Invite Member</h3>
-              <p>Add admins or members under the same verified organization domain.</p>
+              <p>Add admins or members by email — anyone can be invited.</p>
             </div>
-          </div>
-          <div class="invite-domain-banner">
-            <span>Allowed Domain</span>
-            <strong>{{ currentOrganization?.email_domain }}</strong>
           </div>
           <form class="invite-form dashboard-invite-form" @submit.prevent="inviteMember">
             <label class="invite-field">

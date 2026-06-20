@@ -115,10 +115,16 @@ class Settings(BaseSettings):
     # Redis (Rate Limiting & Tenant Cache)
     REDIS_URL: str = "redis://localhost:6379"
 
-    # Max simultaneous live calls per tenant (inbound + outbound share the
-    # budget). The N+1th inbound call gets a busy message; outbound follow-ups
-    # are deferred. Enforced via app/services/call_concurrency.py.
+    # Per-tenant concurrency is split into TWO independent pools (see
+    # app/services/call_concurrency.py):
+    #   * outbound (campaign) calls           → NOKVO_MAX_CONCURRENT_OUTBOUND_PER_TENANT
+    #   * inbound + follow-up calls (shared)  → NOKVO_MAX_CONCURRENT_INBOUND_FOLLOWUP_PER_TENANT
+    # Follow-ups share the inbound pool, so disabling follow-up for a campaign
+    # frees that whole pool for inbound. The legacy single-budget knob below is
+    # kept for back-compat but no longer gates calls directly.
     NOKVO_MAX_CONCURRENT_CALLS_PER_TENANT: int = 10
+    NOKVO_MAX_CONCURRENT_OUTBOUND_PER_TENANT: int = 5
+    NOKVO_MAX_CONCURRENT_INBOUND_FOLLOWUP_PER_TENANT: int = 5
 
     # Session-state v2 dual-write rollout. When True (the default for one
     # deploy cycle), every unified-store write also updates the legacy
@@ -316,6 +322,11 @@ class Settings(BaseSettings):
     RAZORPAY_KEY_ID: str = ""
     RAZORPAY_KEY_SECRET: str = ""
     RAZORPAY_WEBHOOK_SECRET: str = ""
+    # Payment gateway master switch. When False (e.g. local dev), signup skips the
+    # Razorpay payment step entirely: the org is activated + provisioned straight
+    # away (the same convergence point a successful payment hits) and lands in the
+    # onboarding wizard. Keep True in production.
+    PAYMENTS_ENABLED: bool = True
     RAZORPAY_API_BASE: str = "https://api.razorpay.com/v1"
     # Optional: pin the Razorpay Plan IDs (created once in the dashboard). When
     # empty, the service lazily creates a monthly plan on first use and caches

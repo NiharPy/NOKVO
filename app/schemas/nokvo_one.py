@@ -187,6 +187,18 @@ class NokvoOneMemberInviteRequest(BaseModel):
         return value
 
 
+class NokvoOneOrganizationUpdateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+
+    @field_validator("name")
+    @classmethod
+    def _validate_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Organization name cannot be empty")
+        return value
+
+
 class NokvoOneInvitationResponse(BaseModel):
     id: UUID
     organization_id: UUID

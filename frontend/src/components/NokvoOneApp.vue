@@ -60,6 +60,7 @@ import {
   NOKVO_CONNECT_API_BASE,
   wsUrl,
 } from '../config.js';
+import { TERMS_OF_SERVICE_HTML, PRIVACY_POLICY_HTML } from '../content/legalDocs.js';
 
 const API_BASE_URL = NOKVO_ONE_API_BASE;
 const ACCESS_TOKEN_KEY = 'nokvo_one_access_token';
@@ -792,6 +793,9 @@ const currentBusinessTemplate = computed(() =>
   || null,
 );
 const businessTypeLabel = computed(() => currentBusinessTemplate.value?.label || 'Not selected');
+// Outbound + follow-up are only on the Inbound+Outbound plan (calling_enabled).
+// On "Inbound Only" those tabs are hidden.
+const outboundEnabled = computed(() => Boolean(currentOrganization.value?.calling_enabled));
 const isRealEstateTemplate = computed(() => currentOrganization.value?.industry === 'real_estate');
 const ticketsTabLabel = computed(() => (isRealEstateTemplate.value ? 'Site Visits' : 'Tickets'));
 const ticketSingularLabel = computed(() => (isRealEstateTemplate.value ? 'site visit' : 'ticket'));
@@ -879,18 +883,18 @@ const businessPromptPlaceholder = computed(() => {
   if (!currentBusinessTemplate.value) return 'Business Type rules will be injected after setup. Add agent-specific tone, escalation, and workflow details here.';
   return `${currentBusinessTemplate.value.label} rules are injected automatically. Add agent-specific tone, escalation, and workflow details here.`;
 });
+// Anyone can be invited — no organization-domain restriction. We only require
+// a syntactically plausible email; the backend EmailStr schema is authoritative.
 const isInviteDomainValid = computed(() => {
   if (!inviteForm.value.email) return true;
-  const at = inviteForm.value.email.indexOf('@');
-  if (at < 0) return false;
-  return inviteForm.value.email.slice(at + 1).toLowerCase() === inviteDomain.value.toLowerCase();
+  return inviteForm.value.email.includes('@');
 });
 const inviteCanSubmit = computed(
-  () => inviteForm.value.email && isInviteDomainValid.value,
+  () => Boolean(inviteForm.value.email) && isInviteDomainValid.value,
 );
 const inviteValidationMessage = computed(() => {
-  if (!inviteForm.value.email) return `Invitees must use @${inviteDomain.value}.`;
-  if (!isInviteDomainValid.value) return `Email must belong to @${inviteDomain.value}.`;
+  if (!inviteForm.value.email) return 'Enter the invitee’s email address.';
+  if (!isInviteDomainValid.value) return 'Enter a valid email address.';
   return 'A one-time link will be emailed. The invitee sets their own password and TOTP.';
 });
 
@@ -990,6 +994,9 @@ const switchPage = (page) => {
   // programmatic navigation to the wrong surface.
   if (page === 'leads' && isClinicTemplate.value) return;
   if (page === 'customers' && !isClinicTemplate.value) return;
+  // Outbound + Follow-up surfaces are only on the Inbound+Outbound plan
+  // (calling_enabled). Swallow deep-links / programmatic nav on Inbound Only.
+  if ((page === 'outgoing_agent' || page === 'followups') && !outboundEnabled.value) return;
   // Nokvo Connect is feature-flagged. When disabled, swallow any attempt to
   // navigate to its landing pages (nav button is already hidden, but this
   // catches deep-links / programmatic calls) so the user can't reach a
@@ -1911,15 +1918,27 @@ const deleteProject = async (project) => {
   if (!project?.id) return;
   if (!window.confirm(`Remove project "${project.name}"? This cannot be undone.`)) return;
   isDeletingProjectId.value = project.id;
-  try {
-    await api.delete(`/projects/${project.id}`, { headers: authHeader() });
+  const dropFromList = () => {
     projects.value = projects.value.filter((p) => p.id !== project.id);
     if (projectDraft.value.id === project.id) {
       projectDraft.value = _emptyProjectDraft();
     }
+  };
+  try {
+    await api.delete(`/projects/${project.id}`, { headers: authHeader() });
+    dropFromList();
     infoMsg.value = `Project "${project.name}" removed.`;
   } catch (err) {
-    errorMsg.value = extractErrorMessage(err, 'Project could not be deleted.');
+    // A 404 means the project no longer exists server-side (a stale / phantom
+    // row left over from a previous session or org). Don't strand it in the UI —
+    // drop it from the list and reconcile with the server.
+    if (err?.response?.status === 404) {
+      dropFromList();
+      infoMsg.value = `Project "${project.name}" removed.`;
+      try { await loadProjects(); } catch { /* best-effort resync */ }
+    } else {
+      errorMsg.value = extractErrorMessage(err, 'Project could not be deleted.');
+    }
   } finally {
     isDeletingProjectId.value = null;
   }
@@ -3004,6 +3023,13 @@ const handleSignup = async () => {
     // Account only — NO resources provisioned yet. The org is pending_payment;
     // resources provision after the Razorpay payment succeeds.
     const { data } = await api.post('/signup', signup.value);
+    if (!data.payment_token) {
+      // Payments disabled (dev): the backend already activated + provisioned the
+      // org. Sign in to drop into the onboarding wizard — no payment screen.
+      infoMsg.value = 'Account created. Sign in to continue.';
+      authState.value = 'login';
+      return;
+    }
     paymentToken.value = data.payment_token;
     selectedPlan.value = 'inbound_only';
     authState.value = 'payment';
@@ -3532,6 +3558,48 @@ const inviteMember = async () => {
     errorMsg.value = extractErrorMessage(err, 'Invite failed.');
   } finally {
     isSavingMember.value = false;
+  }
+};
+
+// ─── Inline org-name editing (admin) — persists to the DB via PATCH /me/organization
+const isEditingOrgName = ref(false);
+const orgNameDraft = ref('');
+const isSavingOrgName = ref(false);
+
+const startEditOrgName = () => {
+  if (!isAdmin.value) return;
+  orgNameDraft.value = currentOrganization.value?.name || '';
+  isEditingOrgName.value = true;
+};
+
+const cancelEditOrgName = () => {
+  isEditingOrgName.value = false;
+  orgNameDraft.value = '';
+};
+
+const saveOrgName = async () => {
+  const name = (orgNameDraft.value || '').trim();
+  if (!name) {
+    errorMsg.value = 'Organization name cannot be empty.';
+    return;
+  }
+  if (name === (currentOrganization.value?.name || '')) {
+    isEditingOrgName.value = false;
+    return;
+  }
+  errorMsg.value = '';
+  isSavingOrgName.value = true;
+  try {
+    const { data } = await api.patch('/me/organization', { name }, { headers: authHeader() });
+    if (currentOrganization.value) currentOrganization.value.name = data.name;
+    else currentOrganization.value = data;
+    infoMsg.value = 'Organization name updated.';
+    isEditingOrgName.value = false;
+  } catch (err) {
+    if (await handleMfaProtectedError(err)) return;
+    errorMsg.value = extractErrorMessage(err, 'Could not update organization name.');
+  } finally {
+    isSavingOrgName.value = false;
   }
 };
 
@@ -5072,6 +5140,23 @@ const cancelCampaign = async (id) => {
   }
 };
 
+// Turn the follow-up agent on/off for a campaign (persists to the campaign's
+// followup_rules.enabled, which the scheduler honours).
+const isTogglingFollowup = ref(null);
+const setCampaignFollowup = async (id, enabled) => {
+  isTogglingFollowup.value = id;
+  try {
+    await agentsApi.patch(`/campaigns/${id}/followup`, { enabled }, { headers: authHeader() });
+    await loadCampaigns();
+    infoMsg.value = `Follow-up agent turned ${enabled ? 'on' : 'off'} for this campaign.`;
+  } catch (err) {
+    if (await handleMfaProtectedError(err)) return;
+    errorMsg.value = extractErrorMessage(err, 'Failed to update follow-up setting.');
+  } finally {
+    isTogglingFollowup.value = null;
+  }
+};
+
 // Hard-delete a campaign. The backend refuses if the campaign is still running
 // (cancel-first). We collapse the expanded panel so we don't read state that
 // no longer exists.
@@ -6093,6 +6178,10 @@ const handleLogout = async () => {
   runtimeStatus.value = null;
   phoneLink.value = null;
   campaigns.value = [];
+  // Clear real-estate projects + any in-progress draft so a previous org's
+  // projects never leak into the next session/account.
+  projects.value = [];
+  projectDraft.value = _emptyProjectDraft();
   endVoiceCall();
   closeFieldEdit();
   closeAssignmentEdit();
@@ -6172,6 +6261,14 @@ provideDashboardState({
   currentOrganization,
   organizationInitial,
   organizationHealth,
+
+  // Inline org-name editing (admin)
+  isEditingOrgName,
+  orgNameDraft,
+  isSavingOrgName,
+  startEditOrgName,
+  cancelEditOrgName,
+  saveOrgName,
   nokvoConnectEnabled,
   themeMode,
   errorMsg,
@@ -6402,6 +6499,8 @@ provideDashboardState({
   isLaunchingCampaign,
   launchCampaign,
   cancelCampaign,
+  isTogglingFollowup,
+  setCampaignFollowup,
   removeCampaign,
 
   // Follow-up agent
@@ -7181,14 +7280,20 @@ provideDashboardState({
           <!-- STEP 6: Terms + Privacy -->
           <div v-else class="re-wizard-step">
             <div class="re-project-form">
+              <p class="onb-legal-intro">Please review and accept our Terms of Service and Privacy Policy to finish setting up your workspace.</p>
+
+              <div class="onb-legal-doc" v-html="TERMS_OF_SERVICE_HTML"></div>
               <label class="onb-check">
                 <input v-model="onboardingTerms.terms" type="checkbox" />
-                <span>I accept the <a href="https://nokvo.org/terms" target="_blank" rel="noopener">Terms of Service</a>.</span>
+                <span>I have read and accept the Terms of Service.</span>
               </label>
+
+              <div class="onb-legal-doc" v-html="PRIVACY_POLICY_HTML"></div>
               <label class="onb-check">
                 <input v-model="onboardingTerms.privacy" type="checkbox" />
-                <span>I accept the <a href="https://nokvo.org/privacy" target="_blank" rel="noopener">Privacy Policy</a>.</span>
+                <span>I have read and accept the Privacy Policy.</span>
               </label>
+
               <div class="mfa-actions">
                 <button type="button" class="primary-button" :disabled="isOnboardingSaving || !onboardingTerms.terms || !onboardingTerms.privacy" @click="acceptOnboardingTerms">
                   {{ isOnboardingSaving ? 'Finishing…' : 'Finish & go to dashboard →' }}
@@ -7729,7 +7834,7 @@ provideDashboardState({
                 <Users :size="14" />
                 <span>Customer base</span>
               </button>
-              <button type="button" class="n-shell-nav__item" :class="{ 'is-active': currentPage === 'followups' }" @click="switchPage('followups')">
+              <button v-if="outboundEnabled" type="button" class="n-shell-nav__item" :class="{ 'is-active': currentPage === 'followups' }" @click="switchPage('followups')">
                 <Repeat :size="14" />
                 <span>Follow-ups</span>
               </button>
@@ -7775,7 +7880,7 @@ provideDashboardState({
                 <Bot :size="14" />
                 <span>Inbound</span>
               </button>
-              <button type="button" class="n-shell-nav__item" :class="{ 'is-active': currentPage === 'outgoing_agent' }" @click="switchPage('outgoing_agent')">
+              <button v-if="outboundEnabled" type="button" class="n-shell-nav__item" :class="{ 'is-active': currentPage === 'outgoing_agent' }" @click="switchPage('outgoing_agent')">
                 <PhoneCall :size="14" />
                 <span>Outbound</span>
               </button>
@@ -12287,6 +12392,27 @@ provideDashboardState({
 .onb-day.is-on { background: #4f46e5; border-color: #4f46e5; color: #fff; font-weight: 600; }
 .onb-check { display: flex; align-items: flex-start; gap: 8px; font-size: 13.5px; }
 .onb-check input { margin-top: 3px; }
+
+/* Inline legal documents at the onboarding terms step */
+.onb-legal-intro { font-size: 13.5px; opacity: 0.8; margin: 0 0 12px; }
+.onb-legal-doc {
+  max-height: 280px;
+  overflow-y: auto;
+  border: 1px solid var(--n-border, #d9d9d9);
+  border-radius: 8px;
+  padding: 14px 16px;
+  margin-bottom: 10px;
+  background: var(--n-bg-elev, #fafafa);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.onb-legal-doc :deep(h3) { font-size: 15px; font-weight: 800; margin: 0 0 2px; }
+.onb-legal-doc :deep(h4) { font-size: 13px; font-weight: 700; margin: 16px 0 4px; }
+.onb-legal-doc :deep(.legal-meta) { font-size: 11px; opacity: 0.6; margin: 0 0 10px; }
+.onb-legal-doc :deep(p) { margin: 0 0 8px; }
+.onb-legal-doc :deep(ul) { margin: 0 0 8px; padding-left: 18px; }
+.onb-legal-doc :deep(li) { margin: 0 0 4px; }
+.onb-legal-doc :deep(a) { color: var(--n-brand, #4f46e5); }
 .onb-brochure { border: 1px dashed rgba(79, 70, 229, 0.4); border-radius: 10px; padding: 0.7rem; background: rgba(79, 70, 229, 0.05); }
 
 .re-project-form {

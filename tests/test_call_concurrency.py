@@ -36,8 +36,9 @@ async def test_cap_enforced_and_released(monkeypatch):
         pytest.skip("Redis not reachable")
 
     # Small cap so the test is fast and independent of the configured default.
+    # ``acquire`` defaults to the inbound+follow-up pool.
     monkeypatch.setattr(
-        cc.settings, "NOKVO_MAX_CONCURRENT_CALLS_PER_TENANT", 3, raising=False
+        cc.settings, "NOKVO_MAX_CONCURRENT_INBOUND_FOLLOWUP_PER_TENANT", 3, raising=False
     )
     tenant = f"test-{uuid.uuid4().hex[:8]}"
 
@@ -61,6 +62,33 @@ async def test_cap_enforced_and_released(monkeypatch):
             await cc.release(tenant, tok)
         # Key self-cleans; assert we left no slots behind.
         assert await cc.active_count(tenant) == 0
+
+
+@pytest.mark.asyncio
+async def test_pools_are_independent(monkeypatch):
+    """Outbound (campaign) and inbound+follow-up are separate budgets — filling
+    one must not consume the other."""
+    if not await _redis_up():
+        pytest.skip("Redis not reachable")
+
+    monkeypatch.setattr(cc.settings, "NOKVO_MAX_CONCURRENT_OUTBOUND_PER_TENANT", 2, raising=False)
+    monkeypatch.setattr(cc.settings, "NOKVO_MAX_CONCURRENT_INBOUND_FOLLOWUP_PER_TENANT", 2, raising=False)
+    tenant = f"test-{uuid.uuid4().hex[:8]}"
+    out, inb = [], []
+    try:
+        out = [await cc.acquire(tenant, pool=cc.POOL_OUTBOUND) for _ in range(2)]
+        assert all(out) and await cc.acquire(tenant, pool=cc.POOL_OUTBOUND) is None
+        # inbound pool is untouched by a full outbound pool.
+        assert await cc.active_count(tenant, pool=cc.POOL_INBOUND_FOLLOWUP) == 0
+        inb = [await cc.acquire(tenant, pool=cc.POOL_INBOUND_FOLLOWUP) for _ in range(2)]
+        assert all(inb) and await cc.acquire(tenant, pool=cc.POOL_INBOUND_FOLLOWUP) is None
+    finally:
+        for tok in out:
+            await cc.release(tenant, tok, pool=cc.POOL_OUTBOUND)
+        for tok in inb:
+            await cc.release(tenant, tok, pool=cc.POOL_INBOUND_FOLLOWUP)
+        assert await cc.active_count(tenant, pool=cc.POOL_OUTBOUND) == 0
+        assert await cc.active_count(tenant, pool=cc.POOL_INBOUND_FOLLOWUP) == 0
 
 
 @pytest.mark.asyncio

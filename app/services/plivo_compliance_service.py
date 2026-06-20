@@ -121,19 +121,44 @@ class PlivoComplianceService:
         try:
             doc_types = await cls._resolve_document_types(auth, base)
 
-            # 1) End user (the business). Reuse if already created.
+            # 1) End user (the business). Reuse if already created. Plivo end-users
+            # are unique by business name, so a prior signup for the same legal
+            # entity (or a retry after our record was lost) makes the POST 400 with
+            # "already exists". In that case look the existing end-user up and reuse
+            # it rather than dead-ending the whole compliance flow.
             if not record.get("end_user_id"):
-                eu = await PlivoService._request(
-                    "POST",
-                    f"{base}/EndUser/",
-                    auth=auth,
-                    json_body={
-                        "name": legal_name[:120],
-                        "last_name": (alias_name or legal_name)[:120],
-                        "end_user_type": "business",
-                    },
-                )
-                record["end_user_id"] = str(eu.get("end_user_id") or eu.get("id") or "")
+                eu_name = legal_name[:120]
+                try:
+                    eu = await PlivoService._request(
+                        "POST",
+                        f"{base}/EndUser/",
+                        auth=auth,
+                        json_body={
+                            "name": eu_name,
+                            "last_name": (alias_name or legal_name)[:120],
+                            "end_user_type": "business",
+                        },
+                    )
+                    record["end_user_id"] = str(eu.get("end_user_id") or eu.get("id") or "")
+                except PlivoError as exc:
+                    if "already exists" not in str(exc).lower():
+                        raise
+                    listing = await PlivoService._request(
+                        "GET", f"{base}/EndUser/?limit=50", auth=auth
+                    )
+                    objects = listing.get("objects") or listing.get("end_users") or []
+                    needle = eu_name.strip().lower()
+                    match = next(
+                        (
+                            o
+                            for o in objects
+                            if needle and needle in str(o.get("name") or "").strip().lower()
+                        ),
+                        None,
+                    )
+                    if not match:
+                        raise
+                    record["end_user_id"] = str(match.get("end_user_id") or match.get("id") or "")
             end_user_id = record["end_user_id"]
 
             # 2) Upload each document (skip ones already uploaded by kind).
@@ -174,10 +199,14 @@ class PlivoComplianceService:
                     auth=auth,
                     json_body={
                         "end_user_id": end_user_id,
+                        # Plivo's ComplianceApplication API requires ``end_user_type``
+                        # and ``country_iso2`` (NOT ``country_iso``). Omitting them
+                        # returns 400 "This field is required", which silently parks
+                        # the number at "awaiting carrier verification" forever.
+                        "end_user_type": "business",
+                        "country_iso2": "IN",
                         "document_ids": [v for v in uploaded.values() if v],
-                        "country_iso": "IN",
                         "number_type": "local",
-                        "phone_number_type": "local",
                         "alias": legal_name[:120],
                     },
                 )
@@ -190,7 +219,10 @@ class PlivoComplianceService:
             if not number:
                 try:
                     rented = await PlivoService.rent_number(
-                        country=settings.PLIVO_NUMBER_COUNTRY, app_id=app_id, sub_auth_id=sub_auth_id
+                        country=settings.PLIVO_NUMBER_COUNTRY,
+                        app_id=app_id,
+                        sub_auth_id=sub_auth_id,
+                        compliance_application_id=record.get("application_id") or None,
                     )
                     number = rented.get("number")
                     number_status = "active" if number else "pending_compliance"

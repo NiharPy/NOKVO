@@ -32,8 +32,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.call_cost import CallCost
 from app.services.call_cost_calculator import (
-    CostBreakdown,
-    rupees_per_second_for,
+    minutes_for_seconds,
+    rupees_for_minute_span,
+    rupees_per_minute_for,
 )
 from app.services.call_usage import CallUsage, compute_cogs_inr
 
@@ -41,22 +42,22 @@ from app.services.call_usage import CallUsage, compute_cogs_inr
 logger = logging.getLogger(__name__)
 
 
-async def _month_to_date_minutes(db: AsyncSession, org_uuid, now: datetime) -> Decimal:
-    """The org's billed MINUTES so far this calendar month (UTC) — used to pick
-    the post-paid usage tier for this call. Best-effort: 0 on any error."""
+async def _month_to_date_billed_minutes(db: AsyncSession, org_uuid, now: datetime) -> int:
+    """The org's BILLED minutes so far this calendar month (UTC) — used to place
+    this call's minutes on the progressive tier ladder. Best-effort: 0 on any
+    error (the call would then bill from tier 1, the safe under-charge)."""
     month_start = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
     try:
         res = await db.execute(
-            select(func.coalesce(func.sum(CallCost.duration_seconds), 0)).where(
+            select(func.coalesce(func.sum(CallCost.billed_minutes), 0)).where(
                 CallCost.organization_id == org_uuid,
                 CallCost.started_at >= month_start,
             )
         )
-        seconds = Decimal(str(res.scalar() or 0))
-        return seconds / Decimal("60")
+        return int(res.scalar() or 0)
     except Exception:
-        logger.debug("NOKVO-COST: month-to-date minutes query failed", exc_info=True)
-        return Decimal("0")
+        logger.debug("NOKVO-COST: month-to-date billed-minutes query failed", exc_info=True)
+        return 0
 
 
 _CALL_KINDS = {"inbound", "outbound", "tester"}
@@ -119,13 +120,12 @@ async def record_call_cost(
         )
         duration_seconds = 0.0
 
-    # Tiered post-paid rate: pick from this org's month-to-date minutes, compute
-    # the cost at that rate, and persist the rate per row (so historical totals
-    # stay reproducible across tier changes — like the old flat rate did).
-    month_minutes = await _month_to_date_minutes(db, org_uuid, datetime.now(timezone.utc))
-    rate_per_second = rupees_per_second_for(month_minutes)
+    # Whole-minute, progressive tiered billing. Every started minute is charged
+    # in full (ceil), and each of this call's minutes is priced at the tier its
+    # cumulative position in the month falls into — so a call that crosses a
+    # tier mark (e.g. the 1,000th minute) bills the overflow at the next rate.
     try:
-        breakdown = CostBreakdown.for_duration_at_rate(duration_seconds, rate_per_second)
+        billed_minutes = minutes_for_seconds(duration_seconds)
     except (TypeError, ValueError):
         logger.exception(
             "NOKVO-COST: cost calculator rejected duration %r for call_id=%s",
@@ -133,6 +133,14 @@ async def record_call_cost(
             call_id,
         )
         return None
+    prior_minutes = await _month_to_date_billed_minutes(db, org_uuid, datetime.now(timezone.utc))
+    rupees = rupees_for_minute_span(prior_minutes, billed_minutes)
+    # Persist the entry-tier per-minute rate (the rate in force when this call's
+    # first billed minute started) for historical reproducibility; ``rupees`` is
+    # the ledger of truth when a call straddles a tier boundary.
+    entry_rate_per_minute = rupees_per_minute_for(prior_minutes)
+    rate_per_second = entry_rate_per_minute / Decimal("60")
+    billed_seconds = Decimal(str(duration_seconds))
 
     campaign_uuid = _coerce_uuid(campaign_id)
 
@@ -141,7 +149,7 @@ async def record_call_cost(
     cogs_values: dict[str, Any] = {}
     if usage is not None:
         try:
-            cogs = compute_cogs_inr(usage, breakdown.seconds)
+            cogs = compute_cogs_inr(usage, billed_seconds)
             cogs_values = {
                 "llm_input_tokens": cogs.llm_input_tokens,
                 "llm_output_tokens": cogs.llm_output_tokens,
@@ -171,8 +179,9 @@ async def record_call_cost(
             call_id=call_id,
             kind=kind,
             campaign_id=campaign_uuid,
-            duration_seconds=breakdown.seconds,
-            rupees=breakdown.rupees,
+            duration_seconds=billed_seconds,
+            billed_minutes=billed_minutes,
+            rupees=rupees,
             rate_per_second=rate_per_second.quantize(Decimal("0.000001")),
             started_at=started_at,
             ended_at=ended_at,

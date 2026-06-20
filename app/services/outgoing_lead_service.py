@@ -407,16 +407,23 @@ class OutgoingLeadService:
           1. ``GOOGLE_LEADS_OAUTH_REDIRECT_URI`` if the admin set it
              explicitly (e.g., when the leads OAuth client lives in a
              different Google Cloud project than the SSO client).
-          2. Otherwise compose from ``AGENT_PUBLIC_BASE_URL`` so the
+          2. Otherwise compose from the canonical public base URL so the
              generic Nokvo One Google client (``GOOGLE_OAUTH_CLIENT_ID``)
              can also drive the leads flow without extra setup — Google
              accepts the same client across redirect URIs as long as
              they're whitelisted in the Cloud Console.
+
+        (2) goes through :func:`public_base_url` so every externally-facing
+        callback agrees on one host (``PLIVO_WEBHOOK_BASE_URL`` →
+        ``AGENT_PUBLIC_BASE_URL``) rather than reading one var directly and
+        drifting from the Plivo/webhook URLs.
         """
         explicit = (settings.GOOGLE_LEADS_OAUTH_REDIRECT_URI or "").strip()
         if explicit:
             return explicit
-        base = (settings.AGENT_PUBLIC_BASE_URL or "http://localhost:8000").rstrip("/")
+        from app.services.public_url import public_base_url
+
+        base = public_base_url().rstrip("/")
         return f"{base}/api/nokvo-one/agents/lead-sources/oauth/{provider}/callback"
 
     @staticmethod

@@ -1,7 +1,14 @@
-"""Per-tenant concurrent-call cap.
+"""Per-tenant concurrent-call caps, split into TWO independent pools.
 
-A tenant may run at most ``settings.NOKVO_MAX_CONCURRENT_CALLS_PER_TENANT``
-simultaneous live calls (inbound + outbound share one budget).
+  * ``outbound`` — campaign calls. Cap:
+    ``settings.NOKVO_MAX_CONCURRENT_OUTBOUND_PER_TENANT`` (default 5).
+  * ``inbound_followup`` — inbound calls AND follow-up calls, sharing one cap:
+    ``settings.NOKVO_MAX_CONCURRENT_INBOUND_FOLLOWUP_PER_TENANT`` (default 5).
+
+Follow-ups deliberately draw from the inbound pool (not the campaign pool), so
+when a campaign's follow-up agent is turned off, no follow-up calls are placed
+and the full inbound pool is available to inbound callers. Each pool is its own
+Redis sorted set, so they never starve each other.
 
 Live calls are tracked in a Redis **sorted set** per tenant — member = a unique
 call token, score = the time the slot was reserved. Using a sorted set (rather
@@ -61,23 +68,31 @@ return redis.call('ZCARD', KEYS[1])
 """
 
 
-def _key(tenant_id) -> str:
-    return f"nokvo:tenant:{tenant_id}:active_calls"
+# Concurrency pools. Outbound (campaign) calls and inbound+follow-up calls each
+# get their own budget and their own Redis key.
+POOL_OUTBOUND = "outbound"
+POOL_INBOUND_FOLLOWUP = "inbound_followup"
 
 
-def _limit() -> int:
+def _key(tenant_id, pool: str) -> str:
+    return f"nokvo:tenant:{tenant_id}:active_calls:{pool}"
+
+
+def _limit(pool: str) -> int:
     try:
-        return max(1, int(settings.NOKVO_MAX_CONCURRENT_CALLS_PER_TENANT))
+        if pool == POOL_OUTBOUND:
+            return max(1, int(settings.NOKVO_MAX_CONCURRENT_OUTBOUND_PER_TENANT))
+        return max(1, int(settings.NOKVO_MAX_CONCURRENT_INBOUND_FOLLOWUP_PER_TENANT))
     except Exception:
-        return 10
+        return 5
 
 
-async def acquire(tenant_id) -> str | None:
-    """Reserve a concurrency slot for ``tenant_id``.
+async def acquire(tenant_id, *, pool: str = POOL_INBOUND_FOLLOWUP) -> str | None:
+    """Reserve a concurrency slot for ``tenant_id`` in ``pool``.
 
-    Returns an opaque token to be passed to :func:`release`, or ``None`` if the
-    tenant is already at its cap. Fails open (returns a token) on any Redis
-    error so a cache blip never blocks calls.
+    Returns an opaque token to be passed to :func:`release` (with the SAME
+    ``pool``), or ``None`` if that pool is already at its cap. Fails open
+    (returns a token) on any Redis error so a cache blip never blocks calls.
     """
     token = uuid.uuid4().hex
     now = time.time()
@@ -85,8 +100,8 @@ async def acquire(tenant_id) -> str | None:
         ok = await AgentSessionStore.client().eval(
             _ACQUIRE_LUA,
             1,
-            _key(tenant_id),
-            _limit(),
+            _key(tenant_id, pool),
+            _limit(pool),
             now,
             _MAX_CALL_SECONDS,
             token,
@@ -94,29 +109,30 @@ async def acquire(tenant_id) -> str | None:
         )
         return token if int(ok) == 1 else None
     except Exception:
-        logger.warning("call_concurrency.acquire failed open for tenant=%s", tenant_id, exc_info=True)
+        logger.warning("call_concurrency.acquire failed open for tenant=%s pool=%s", tenant_id, pool, exc_info=True)
         return token
 
 
-async def release(tenant_id, token: str | None) -> None:
-    """Release a slot previously reserved by :func:`acquire`. No-op if ``token``
-    is falsy or Redis is unreachable (the entry self-prunes by age)."""
+async def release(tenant_id, token: str | None, *, pool: str = POOL_INBOUND_FOLLOWUP) -> None:
+    """Release a slot previously reserved by :func:`acquire` in the same
+    ``pool``. No-op if ``token`` is falsy or Redis is unreachable (the entry
+    self-prunes by age)."""
     if not token:
         return
     try:
-        await AgentSessionStore.client().zrem(_key(tenant_id), token)
+        await AgentSessionStore.client().zrem(_key(tenant_id, pool), token)
     except Exception:
-        logger.debug("call_concurrency.release failed for tenant=%s", tenant_id, exc_info=True)
+        logger.debug("call_concurrency.release failed for tenant=%s pool=%s", tenant_id, pool, exc_info=True)
 
 
-async def active_count(tenant_id) -> int:
-    """Live call count for ``tenant_id`` (stale tokens pruned). Returns 0 on
-    Redis error so callers fail open."""
+async def active_count(tenant_id, *, pool: str = POOL_INBOUND_FOLLOWUP) -> int:
+    """Live call count for ``tenant_id`` in ``pool`` (stale tokens pruned).
+    Returns 0 on Redis error so callers fail open."""
     try:
         n = await AgentSessionStore.client().eval(
             _COUNT_LUA,
             1,
-            _key(tenant_id),
+            _key(tenant_id, pool),
             time.time(),
             _MAX_CALL_SECONDS,
         )

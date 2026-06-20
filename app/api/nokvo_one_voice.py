@@ -1508,9 +1508,9 @@ async def plivo_inbound_webhook(
     # limit, play a short busy notice and never open a media stream — the caller
     # hears a message instead of dead air. The token is handed to the media WS
     # via the URL and released when the call ends.
-    from app.services.call_concurrency import acquire as _acquire_call_slot
+    from app.services.call_concurrency import acquire as _acquire_call_slot, POOL_INBOUND_FOLLOWUP
 
-    call_token = await _acquire_call_slot(tr.tenant_id)
+    call_token = await _acquire_call_slot(tr.tenant_id, pool=POOL_INBOUND_FOLLOWUP)
     if call_token is None:
         logger.info("PLIVO-INBOUND at-capacity tenant=%s link_id=%s → busy", tr.tenant_id, link_id)
         _record_webhook_event(link_id, "voice", {"from": from_number, "busy": True})
@@ -1581,10 +1581,10 @@ async def plivo_inbound_media_websocket(websocket: WebSocket, link_id: str):
         try:
             await PlivoBridgeService.run_session(websocket, tr, db=db, caller_phone=caller_phone)
         finally:
-            # Release the concurrency slot the answer webhook reserved.
+            # Release the concurrency slot the answer webhook reserved (inbound pool).
             if call_token:
-                from app.services.call_concurrency import release as _release_call_slot
-                await _release_call_slot(tr.tenant_id, call_token)
+                from app.services.call_concurrency import release as _release_call_slot, POOL_INBOUND_FOLLOWUP
+                await _release_call_slot(tr.tenant_id, call_token, pool=POOL_INBOUND_FOLLOWUP)
         return
 
 
@@ -1688,6 +1688,19 @@ async def plivo_outbound_media_websocket(websocket: WebSocket, call_link_id: str
         if not contact:
             await websocket.close(code=1008)
             return
+        # Defensive: a LEAD follow-up must run as its campaign's agent (project
+        # knowledge + site_visit objective). The scheduler already skips orphan
+        # leads (no campaign), so reaching here without one means a knowledge-less
+        # call — close politely rather than run a generic agent. Clinic customer
+        # follow-ups (customer_id, no lead_id) are exempt — they build their own
+        # context downstream.
+        if is_followup and contact.get("lead_id") and campaign is None:
+            logger.info(
+                "PLIVO-OUTBOUND: lead follow-up with no campaign (call_link_id=%s) — closing",
+                call_link_id,
+            )
+            await websocket.close(code=1008)
+            return
         # Follow-up calls may not be attached to a campaign (manual
         # follow-ups). When campaign is None, we still need the tenant
         # to resolve infra — pull it from the lead via the contact's
@@ -1718,10 +1731,17 @@ async def plivo_outbound_media_websocket(websocket: WebSocket, call_link_id: str
         if not tr:
             await websocket.close(code=1008)
             return
-        # Per-tenant concurrency cap (shared inbound+outbound budget). At cap →
-        # hang up; the follow-up scheduler retries on a later tick.
-        from app.services.call_concurrency import acquire as _acquire_call_slot
-        _out_call_token = await _acquire_call_slot(tr.tenant_id)
+        # Concurrency pool: a follow-up call draws from the shared INBOUND pool
+        # (so disabling follow-up frees that pool for inbound callers); a campaign
+        # call draws from the dedicated OUTBOUND pool. At cap → hang up; the dialer
+        # / follow-up scheduler retries on a later tick.
+        from app.services.call_concurrency import (
+            acquire as _acquire_call_slot,
+            POOL_OUTBOUND,
+            POOL_INBOUND_FOLLOWUP,
+        )
+        _out_pool = POOL_INBOUND_FOLLOWUP if is_followup else POOL_OUTBOUND
+        _out_call_token = await _acquire_call_slot(tr.tenant_id, pool=_out_pool)
         if _out_call_token is None:
             logger.info(
                 "PLIVO-OUTBOUND at-capacity tenant=%s call_link_id=%s → hangup",
@@ -1816,9 +1836,9 @@ async def plivo_outbound_media_websocket(websocket: WebSocket, call_link_id: str
             )
         finally:
             adapter.close_audio()
-            # Release the per-tenant concurrency slot.
+            # Release the per-tenant concurrency slot (same pool we acquired).
             from app.services.call_concurrency import release as _release_call_slot
-            await _release_call_slot(tr.tenant_id, _out_call_token)
+            await _release_call_slot(tr.tenant_id, _out_call_token, pool=_out_pool)
         return
 
 
@@ -1837,6 +1857,14 @@ def _campaign_response(c: OutboundCampaign) -> dict[str, Any]:
         "failed_count": c.failed_count or 0,
         "contacts": c.contacts or [],
         "agent_config": c.agent_config or {},
+        # Whether the follow-up agent is on for this campaign (defaults on).
+        "followup_enabled": bool(
+            ((c.agent_config or {}).get("followup_rules") or {}).get("enabled", True)
+        ),
+        # Undialed contacts that a relaunch would call (no call_id, not ended).
+        "pending_to_dial": sum(
+            1 for ct in (c.contacts or []) if not ct.get("call_id") and not ct.get("ended")
+        ),
         "doc_blob_path": c.doc_blob_path,
         "created_at": c.created_at.isoformat() if c.created_at else None,
         "started_at": c.started_at.isoformat() if c.started_at else None,
@@ -2143,6 +2171,27 @@ async def cancel_campaign(
         campaign = await OutboundCampaignService.cancel_campaign(campaign, db)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=_safe_detail(exc)) from exc
+    return _campaign_response(campaign)
+
+
+class CampaignFollowupToggle(BaseModel):
+    enabled: bool
+
+
+@router.patch("/campaigns/{campaign_id}/followup")
+async def set_campaign_followup(
+    campaign_id: uuid.UUID,
+    payload: CampaignFollowupToggle,
+    user: OrganizationUser = Depends(_admin_dep()),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Turn the follow-up agent on/off for a campaign."""
+    tr = await _tenant_for_user(db, user)
+    campaign = await OutboundCampaignService.get_campaign(campaign_id, tr, db)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    campaign = await OutboundCampaignService.set_followup_enabled(campaign, payload.enabled, db)
     return _campaign_response(campaign)
 
 

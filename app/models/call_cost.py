@@ -65,6 +65,11 @@ class CallCost(Base):
     # as Numeric(12, 4) so 4 decimals fit and we can record up to
     # 99,999,999.9999 seconds (~3 years) without overflow.
     duration_seconds = Column(Numeric(12, 4), nullable=False, server_default="0")
+    # Whole BILLED minutes (ceil of the call's seconds — every started minute is
+    # charged in full). This is the unit the tiered tariff and the dashboard
+    # invoice count; ``duration_seconds`` is retained only as the actual call
+    # length for analytics.
+    billed_minutes = Column(Integer, nullable=False, server_default="0")
     # Ledger amount in rupees at 4-dp precision. Numeric(14, 4) gives us
     # 10 integer digits — comfortably more than any realistic per-call
     # bill — without sacrificing the recurring-fraction tail.

@@ -4,6 +4,8 @@ import {
   ArrowUpRight,
   CalendarClock,
   CalendarDays,
+  Check,
+  Pencil,
   PhoneIncoming,
   PhoneOutgoing,
   RefreshCw,
@@ -11,6 +13,7 @@ import {
   Sparkles,
   Trash2,
   UserPlus,
+  X,
 } from 'lucide-vue-next';
 import { useDashboardState } from '../composables/useDashboardState.js';
 
@@ -21,6 +24,12 @@ const {
   formatMinutes,
   memberPageLabel,
   currentOrganization,
+  isEditingOrgName,
+  orgNameDraft,
+  isSavingOrgName,
+  startEditOrgName,
+  cancelEditOrgName,
+  saveOrgName,
   inviteForm,
   isInviteDomainValid,
   inviteValidationMessage,
@@ -63,19 +72,40 @@ const periodLabel = computed(() =>
   new Date().toLocaleString('en-IN', { month: 'long', year: 'numeric' }),
 );
 
-const monthTotal = computed(() => costSummary?.value?.this_month?.rupees_formatted || '₹0.00');
+// Headline = the progressive minute-based invoice total (matches the breakdown
+// card). For go-forward calls this equals the summed per-call ledger exactly.
+const monthTotal = computed(
+  () =>
+    costSummary?.value?.month_invoice?.total_formatted
+    || costSummary?.value?.this_month?.rupees_formatted
+    || '₹0.00',
+);
 const monthCalls = computed(() => costSummary?.value?.this_month?.call_count ?? 0);
 const todayTotal = computed(() => costSummary?.value?.today?.rupees_formatted || '₹0.00');
 const todayCalls = computed(() => costSummary?.value?.today?.call_count ?? 0);
-const minutesToday = computed(() => formatMinutes?.(costSummary?.value?.today?.seconds) || '0 min');
-const minutesMonth = computed(() => formatMinutes?.(costSummary?.value?.this_month?.seconds) || '0 min');
+const minutesToday = computed(() => `${costSummary?.value?.today?.minutes ?? 0} min`);
+const minutesMonth = computed(() => `${costSummary?.value?.this_month?.minutes ?? 0} min`);
 const recent = computed(() => (costSummary?.value?.recent_calls || []).slice(0, 8));
 
-const rate = computed(() => {
-  const rpm = costSummary?.value?.rate?.rupees_per_minute ?? 8;
-  const rps = costSummary?.value?.rate?.rupees_per_second_display ?? '0.13';
-  return `₹${rpm} / min · ₹${rps} / sec`;
-});
+// Whole-minute, progressive tariff: the current rate is what the next minute costs.
+const currentRatePerMinute = computed(
+  () => Number(costSummary?.value?.rate?.rupees_per_minute ?? 10),
+);
+const rate = computed(() => `₹${currentRatePerMinute.value} / min`);
+const monthMinutes = computed(() => costSummary?.value?.month_invoice?.minutes ?? 0);
+// Per-tier invoice rows for this month; hide the open-ended ₹6.5 tier until it activates.
+const invoiceTiers = computed(() =>
+  (costSummary?.value?.month_invoice?.tiers || []).filter(
+    (t) => t.to_minute !== null || t.active,
+  ),
+);
+const invoiceTotal = computed(
+  () => costSummary?.value?.month_invoice?.total_formatted || '₹0.00',
+);
+function tierBand(t) {
+  if (t.to_minute === null) return `${t.from_minute.toLocaleString('en-IN')}+ min`;
+  return `${t.from_minute.toLocaleString('en-IN')}–${t.to_minute.toLocaleString('en-IN')} min`;
+}
 
 function relTime(iso) {
   if (!iso) return '';
@@ -101,7 +131,38 @@ function initial(m) {
       <span class="n-page-head__eyebrow">{{ periodLabel }} · workspace</span>
       <div class="n-page-head__row">
         <div>
-          <h1 class="n-page-head__title">{{ currentOrganization?.name || 'Dashboard' }}</h1>
+          <div class="dash__org-name">
+            <template v-if="!isEditingOrgName">
+              <h1 class="n-page-head__title">{{ currentOrganization?.name || 'Dashboard' }}</h1>
+              <button
+                v-if="isAdmin && currentOrganization"
+                type="button"
+                class="dash__org-edit"
+                title="Rename organization"
+                aria-label="Rename organization"
+                @click="startEditOrgName"
+              >
+                <Pencil :size="14" />
+              </button>
+            </template>
+            <form v-else class="dash__org-form" @submit.prevent="saveOrgName">
+              <input
+                v-model="orgNameDraft"
+                class="n-input dash__org-input"
+                type="text"
+                maxlength="200"
+                placeholder="Organization name"
+                :disabled="isSavingOrgName"
+                @keydown.esc="cancelEditOrgName"
+              />
+              <button type="submit" class="dash__org-edit dash__org-edit--save" title="Save" :disabled="isSavingOrgName">
+                <Check :size="15" />
+              </button>
+              <button type="button" class="dash__org-edit" title="Cancel" :disabled="isSavingOrgName" @click="cancelEditOrgName">
+                <X :size="15" />
+              </button>
+            </form>
+          </div>
           <p class="n-page-head__sub">Conversation cost, team access and admissions, in one calm view.</p>
         </div>
         <div class="dash__head-actions">
@@ -141,6 +202,46 @@ function initial(m) {
           <span class="n-stat__sub">conversation time</span>
         </article>
       </div>
+    </section>
+
+    <!-- Tiered usage invoice -->
+    <section class="n-section n-rise" data-delay="1">
+      <article class="n-card dash__invoice">
+        <header class="dash__invoice-head">
+          <div>
+            <span class="n-page-head__eyebrow">Usage &amp; invoice · {{ periodLabel }}</span>
+            <h2 class="n-section__title">{{ monthMinutes.toLocaleString('en-IN') }} minute{{ monthMinutes === 1 ? '' : 's' }} this month</h2>
+            <p class="n-section__sub">
+              Billed per whole minute. The rate steps down as monthly volume grows —
+              your next minute bills <strong>₹{{ currentRatePerMinute }}/min</strong>.
+            </p>
+          </div>
+          <span class="n-tag n-tag--mono dash__invoice-total">{{ invoiceTotal }}</span>
+        </header>
+        <table class="dash__invoice-table">
+          <thead>
+            <tr><th>Slab</th><th>Rate</th><th class="is-num">Minutes</th><th class="is-num">Amount</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="t in invoiceTiers" :key="t.from_minute" :class="{ 'is-active': t.active }">
+              <td>
+                {{ tierBand(t) }}
+                <span v-if="t.active && t.rupees_per_minute == currentRatePerMinute" class="dash__invoice-now">current</span>
+              </td>
+              <td>₹{{ t.rupees_per_minute }}/min</td>
+              <td class="is-num">{{ t.minutes.toLocaleString('en-IN') }}</td>
+              <td class="is-num">₹{{ t.rupees_display }}</td>
+            </tr>
+          </tbody>
+          <tfoot>
+            <tr>
+              <td colspan="2">Total this month</td>
+              <td class="is-num">{{ monthMinutes.toLocaleString('en-IN') }}</td>
+              <td class="is-num">{{ invoiceTotal }}</td>
+            </tr>
+          </tfoot>
+        </table>
+      </article>
     </section>
 
     <!-- Follow-up agent tile -->
@@ -228,8 +329,7 @@ function initial(m) {
           <span class="n-page-head__eyebrow">Admissions</span>
           <h2 class="n-section__title">Invite to workspace</h2>
           <p class="n-section__sub">
-            Restricted to verified emails on
-            <span class="n-kbd">@{{ currentOrganization?.email_domain || 'your-domain' }}</span>.
+            Invite anyone by email — no domain restriction.
             Invitees set their own password and TOTP.
           </p>
         </header>
@@ -429,6 +529,69 @@ function initial(m) {
   color: inherit;
 }
 .org-hours__hint { font-size: 12px; opacity: 0.7; margin: 0; }
+
+/* Inline org-name editor */
+.dash__org-name { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.dash__org-form { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.dash__org-input {
+  font-size: 22px;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+  padding: 6px 12px;
+  min-width: 240px;
+  max-width: 100%;
+}
+.dash__org-edit {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border: 2px solid var(--n-border);
+  border-radius: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  opacity: 0.55;
+  transition: opacity var(--n-t-fast) var(--n-ease), background var(--n-t-fast) var(--n-ease);
+}
+.dash__org-name:hover .dash__org-edit { opacity: 1; }
+.dash__org-edit:hover:not(:disabled) { opacity: 1; background: var(--n-bg-elev, rgba(0,0,0,0.04)); }
+.dash__org-edit:disabled { opacity: 0.4; cursor: default; }
+.dash__org-edit--save { background: var(--n-ink, #111); color: var(--n-bg, #fff); border-color: var(--n-ink, #111); opacity: 1; }
+
+/* Tiered usage invoice */
+.dash__invoice { padding: 22px 24px; }
+.dash__invoice-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 16px; }
+.dash__invoice-total { font-size: 15px; font-weight: 800; }
+.dash__invoice-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.dash__invoice-table th {
+  text-align: left;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  opacity: 0.6;
+  padding: 8px 10px;
+  border-bottom: 2px solid var(--n-border);
+}
+.dash__invoice-table td { padding: 10px; border-bottom: 1px solid var(--n-border); }
+.dash__invoice-table .is-num { text-align: right; font-variant-numeric: tabular-nums; }
+.dash__invoice-table tbody tr { opacity: 0.55; }
+.dash__invoice-table tbody tr.is-active { opacity: 1; font-weight: 600; }
+.dash__invoice-now {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 6px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  border: 1.5px solid var(--n-border);
+  background: var(--n-ink, #111);
+  color: var(--n-bg, #fff);
+}
+.dash__invoice-table tfoot td { padding: 12px 10px; font-weight: 800; border-top: 2px solid var(--n-border); border-bottom: none; }
 
 /* ─── Page-local composition ─────────────────────────── */
 .dash__head-actions {

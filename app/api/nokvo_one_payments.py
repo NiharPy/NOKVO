@@ -35,6 +35,7 @@ from app.models.tenant_resources import TenantResources
 from app.services.email_service import EmailService
 from app.services.nokvo_one_provisioning_service import NokvoOneProvisioningService
 from app.services.razorpay_service import PLAN_CATALOG, RazorpayError, RazorpayService
+from app.services.tool_flow_questions import ensure_tool_flow_questions
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -104,6 +105,13 @@ async def activate_and_provision(db: AsyncSession, organization_id: uuid.UUID) -
         org.plan_type = plan
         org.calling_enabled = bool(PLAN_CATALOG[plan]["outbound"])
 
+    # Real estate is the only vertical — assign it as the org enters onboarding
+    # so the real-estate-gated onboarding steps (projects / brochure upload) work
+    # DURING the wizard, not only after it. (The post-onboarding auto-assign in
+    # the frontend runs too late for the projects step.)
+    if not (org.industry or "").strip():
+        org.industry = "real_estate"
+
     # Provision external resources once (guarded by the tenant existence check
     # under the row lock — a racing webhook waits here, then sees the tenant).
     if existing_tenant is None:
@@ -112,6 +120,9 @@ async def activate_and_provision(db: AsyncSession, organization_id: uuid.UUID) -
             organization_name=org.name,
             region=org.region or "southindia",
         )
+        # Seed the vertical's tool-flow questions on the new tenant (mirrors the
+        # /business-template step) so booking/lead flows are ready at runtime.
+        prov_status, _ = ensure_tool_flow_questions(provision["provider_status"], org.industry)
         db.add(
             TenantResources(
                 id=uuid.uuid4(),
@@ -125,7 +136,7 @@ async def activate_and_provision(db: AsyncSession, organization_id: uuid.UUID) -
                 storage_account_name=provision["storage_account_name"],
                 storage_container_name=provision["storage_container_name"],
                 blob_prefix=provision["blob_prefix"],
-                provider_status=provision["provider_status"],
+                provider_status=prov_status,
                 provisioning_status=provision["provisioning_status"],
                 provisioning_steps=provision["provisioning_steps"],
                 cleanup_required=False,

@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api import deps
 from app.core import security
 from app.core.config import settings
-from app.core.email_policy import extract_email_domain, normalize_email
+from app.core.email_policy import normalize_email
 from app.core.rate_limit import limiter
 from app.core.totp_crypto import encrypt_totp_secret
 from app.models.member_invitation import MemberInvitation
@@ -880,13 +880,9 @@ async def invite_member(
     if organization is None:
         raise HTTPException(status_code=404, detail="Organization not found")
 
+    # Anyone can be invited — no organization-domain restriction. The email
+    # is format-validated by the EmailStr schema; we just normalize it here.
     email = normalize_email(payload.email)
-    invited_domain = extract_email_domain(email)
-    if (organization.email_domain or "").lower() != invited_domain.lower():
-        raise HTTPException(
-            status_code=400,
-            detail="Invitees must share the organization's work-email domain",
-        )
 
     # Re-invite policy: if a user row already exists for this email we
     # only block when the seat is actively in use (``active`` /

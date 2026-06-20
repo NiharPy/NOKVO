@@ -2247,8 +2247,8 @@ async def create_organization_member(
     organization: Organization = Depends(deps.get_current_organization),
     db: AsyncSession = Depends(deps.get_db),
 ):
+    # Anyone can be invited — no organization work-email domain restriction.
     email = normalize_email(payload.email)
-    _ensure_same_domain(email, organization)
 
     existing_result = await db.execute(
         select(OrganizationUser).where(

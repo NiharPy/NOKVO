@@ -45,6 +45,7 @@ from app.services.call_cost_calculator import (
     RATE_TIERS,
     rupees_display,
     rupees_per_minute_for,
+    tier_breakdown_for_month,
 )
 from app.services.notification_service import NotificationService, notification_bus
 
@@ -76,25 +77,26 @@ async def _sum_for_window(
     organization_id: uuid.UUID,
     *,
     since: datetime | None,
-) -> tuple[Decimal, Decimal, int]:
-    """Return (total_rupees, total_seconds, call_count) over ``[since, now]``.
+) -> tuple[Decimal, int, int]:
+    """Return (total_rupees, total_billed_minutes, call_count) over ``[since, now]``.
 
     ``since`` of ``None`` means "all time". We sum the persisted rupee
     column directly — never recompute from duration, because the row
-    immortalises the rate that was in force when the call happened.
+    immortalises the tariff that was in force when the call happened —
+    and the persisted ``billed_minutes`` for the usage counter.
     """
     stmt = select(
         func.coalesce(func.sum(CallCost.rupees), 0),
-        func.coalesce(func.sum(CallCost.duration_seconds), 0),
+        func.coalesce(func.sum(CallCost.billed_minutes), 0),
         func.count(CallCost.id),
     ).where(CallCost.organization_id == organization_id)
     if since is not None:
         stmt = stmt.where(CallCost.started_at >= since)
     res = await db.execute(stmt)
-    rupees, seconds, count = res.first() or (0, 0, 0)
+    rupees, minutes, count = res.first() or (0, 0, 0)
     return (
         Decimal(str(rupees or 0)),
-        Decimal(str(seconds or 0)),
+        int(minutes or 0),
         int(count or 0),
     )
 
@@ -128,14 +130,16 @@ async def cost_summary(
     this_month = await _sum_for_window(db, org_id, since=month_start)
     all_time = await _sum_for_window(db, org_id, since=None)
 
-    def _format(bucket: tuple[Decimal, Decimal, int]) -> dict[str, Any]:
-        rupees, seconds, count = bucket
+    def _format(bucket: tuple[Decimal, int, int]) -> dict[str, Any]:
+        rupees, minutes, count = bucket
         display = rupees_display(rupees)
         return {
             "rupees": str(rupees),
             "rupees_display": f"{display:.2f}",
             "rupees_formatted": f"₹{display:.2f}",
-            "seconds": str(seconds),
+            "minutes": minutes,
+            # ``seconds`` retained for any older client still reading it.
+            "seconds": str(minutes * 60),
             "call_count": count,
         }
 
@@ -156,6 +160,7 @@ async def cost_summary(
                     "call_id": row.call_id,
                     "kind": row.kind,
                     "campaign_id": str(row.campaign_id) if row.campaign_id else None,
+                    "billed_minutes": int(row.billed_minutes or 0),
                     "duration_seconds": str(row.duration_seconds),
                     "rupees": str(row.rupees),
                     "rupees_display": f"{display:.2f}",
@@ -165,20 +170,46 @@ async def cost_summary(
                 }
             )
 
-    # Current per-minute rate = the tier this month's minutes-to-date fall into.
-    month_minutes = this_month[1] / Decimal("60")
+    # Billing is per whole minute, tiered progressively over the month's
+    # cumulative minutes. ``current_rate`` is what the NEXT minute will cost.
+    month_minutes = this_month[1]  # already whole billed minutes
     current_rate = rupees_per_minute_for(month_minutes)
     tier_ladder = [
         {"up_to_minutes": upper, "rupees_per_minute": str(rate)} for upper, rate in RATE_TIERS
     ]
 
+    # Progressive invoice: split this month's minutes across the tier bands and
+    # price each band — this is the breakdown the dashboard renders, and it
+    # shifts automatically as the minute counter crosses each mark.
+    invoice_rows = tier_breakdown_for_month(month_minutes)
+    invoice_tiers = [
+        {
+            "from_minute": r["from_minute"],
+            "to_minute": r["to_minute"],  # None = open-ended (25,001+)
+            "rupees_per_minute": str(r["rupees_per_minute"]),
+            "minutes": r["minutes"],
+            "rupees": str(r["rupees"]),
+            "rupees_display": f"{rupees_display(r['rupees']):.2f}",
+            "active": r["minutes"] > 0,
+        }
+        for r in invoice_rows
+    ]
+    invoice_total = sum((r["rupees"] for r in invoice_rows), Decimal("0"))
+
     return {
         "rate": {
             "rupees_per_minute": str(current_rate),
-            "rupees_per_second": str(current_rate / Decimal("60")),
-            "rupees_per_second_display": f"{(current_rate / Decimal('60')):.2f}",
-            "month_minutes_to_date": str(month_minutes),
+            "rupees_per_minute_display": f"{current_rate:.2f}",
+            "month_minutes_to_date": month_minutes,
             "tiers": tier_ladder,
+        },
+        # Tiered monthly invoice (drives the dashboard breakdown card).
+        "month_invoice": {
+            "minutes": month_minutes,
+            "current_rupees_per_minute": str(current_rate),
+            "tiers": invoice_tiers,
+            "total_rupees": str(invoice_total),
+            "total_formatted": f"₹{rupees_display(invoice_total):.2f}",
         },
         "today": _format(today),
         "this_month": _format(this_month),

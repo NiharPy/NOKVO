@@ -55,8 +55,13 @@ RUPEES_PER_SECOND: Decimal = RUPEES_PER_MINUTE / Decimal("60")
 
 # Tiered per-minute tariff (post-paid), selected by the org's cumulative billed
 # MINUTES in the current calendar month. Each entry is
-# (exclusive_upper_minute_bound, rupees_per_minute); the last bound is None
-# (open-ended). Source of truth for the live billing path.
+# (inclusive_upper_minute_bound, rupees_per_minute); the last bound is None
+# (open-ended). The bounds are INCLUSIVE per the published tariff:
+#   minutes      1 … 1,000   → ₹10/min
+#   minutes  1,001 … 10,000  → ₹9/min
+#   minutes 10,001 … 25,000  → ₹8/min
+#   minutes 25,001 +         → ₹6.5/min
+# Source of truth for the live billing path.
 RATE_TIERS: list[tuple[int | None, Decimal]] = [
     (1000, Decimal("10")),
     (10000, Decimal("9")),
@@ -65,17 +70,113 @@ RATE_TIERS: list[tuple[int | None, Decimal]] = [
 ]
 
 
-def rupees_per_minute_for(cumulative_minutes: Decimal | int | float) -> Decimal:
-    """Per-minute rate for the tier the month's cumulative minutes fall into."""
-    m = Decimal(str(cumulative_minutes))
+def rate_for_minute_index(minute_index: int) -> Decimal:
+    """Per-minute rate for the ``minute_index``-th minute (1-based) of the month.
+
+    e.g. the 1,000th minute bills ₹10, the 1,001st bills ₹9.
+    """
+    n = int(minute_index)
+    if n < 1:
+        n = 1
     for upper, rate in RATE_TIERS:
-        if upper is None or m < upper:
+        if upper is None or n <= upper:
             return rate
     return RATE_TIERS[-1][1]
 
 
+def rupees_per_minute_for(cumulative_minutes: Decimal | int | float) -> Decimal:
+    """Rate that the NEXT minute will bill, given ``cumulative_minutes`` already
+    consumed this month. Used for the dashboard's "current rate" display."""
+    consumed = int(Decimal(str(cumulative_minutes)))
+    return rate_for_minute_index(consumed + 1)
+
+
 def rupees_per_second_for(cumulative_minutes: Decimal | int | float) -> Decimal:
     return rupees_per_minute_for(cumulative_minutes) / Decimal("60")
+
+
+def minutes_for_seconds(seconds: DurationLike) -> int:
+    """Whole BILLED minutes for a call: every started minute is charged in full
+    (ceil). A connected call (>0s) is therefore at least 1 minute; a 0-second
+    row bills 0.
+
+    >>> minutes_for_seconds(0)      # never connected
+    0
+    >>> minutes_for_seconds(1)      # 1-second call → a full minute
+    1
+    >>> minutes_for_seconds(60)
+    1
+    >>> minutes_for_seconds(61)     # rolled into the 2nd minute
+    2
+    """
+    s = _to_seconds(seconds)
+    if s <= 0:
+        return 0
+    whole, rem = divmod(s, Decimal("60"))
+    return int(whole) + (1 if rem > 0 else 0)
+
+
+def rupees_for_minute_span(prior_minutes: int, added_minutes: int) -> Decimal:
+    """Progressive cost of ``added_minutes`` consumed AFTER ``prior_minutes``
+    already used this month — each minute priced at its own tier.
+
+    The minutes covered are the half-open index range
+    ``(prior_minutes, prior_minutes + added_minutes]`` (1-based), walked tier by
+    tier so a single call can straddle a boundary (e.g. crossing 1,000 mid-call
+    bills the overflow minutes at the next rate down).
+
+    >>> rupees_for_minute_span(0, 1)        # first minute of the month
+    Decimal('10.0000')
+    >>> rupees_for_minute_span(999, 2)      # minute 1000 @10, minute 1001 @9
+    Decimal('19.0000')
+    >>> rupees_for_minute_span(0, 1000)     # whole first tier
+    Decimal('10000.0000')
+    """
+    prior = max(int(prior_minutes), 0)
+    added = max(int(added_minutes), 0)
+    if added == 0:
+        return Decimal("0").quantize(_LEDGER_Q)
+    total = Decimal("0")
+    cursor = prior
+    end = prior + added
+    for upper, rate in RATE_TIERS:
+        cap = end if upper is None else min(end, upper)
+        if cap > cursor:
+            total += Decimal(cap - cursor) * rate
+            cursor = cap
+        if cursor >= end:
+            break
+    return total.quantize(_LEDGER_Q, rounding=ROUND_HALF_UP)
+
+
+def tier_breakdown_for_month(cumulative_minutes: int) -> list[dict]:
+    """Per-tier split of a month's consumed minutes — the dashboard invoice.
+
+    Returns one entry per tier: its inclusive minute band, rate, the minutes
+    of ``cumulative_minutes`` that landed in it, and the rupee subtotal.
+    """
+    consumed = max(int(cumulative_minutes), 0)
+    rows: list[dict] = []
+    lower = 0  # minutes already accounted for by earlier tiers
+    for upper, rate in RATE_TIERS:
+        band_end = upper  # inclusive upper, or None for open-ended
+        minutes_in_tier = 0
+        if consumed > lower:
+            cap = consumed if band_end is None else min(consumed, band_end)
+            minutes_in_tier = max(cap - lower, 0)
+        rows.append(
+            {
+                "from_minute": lower + 1,
+                "to_minute": band_end,  # None = open-ended
+                "rupees_per_minute": rate,
+                "minutes": minutes_in_tier,
+                "rupees": (Decimal(minutes_in_tier) * rate).quantize(_LEDGER_Q, rounding=ROUND_HALF_UP),
+            }
+        )
+        if band_end is None:
+            break
+        lower = band_end
+    return rows
 
 # Quantisation templates. ``_LEDGER_Q`` is what gets persisted, ``_DISPLAY_Q``
 # is what the UI renders. The four-decimal ledger value preserves the

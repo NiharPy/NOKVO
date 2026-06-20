@@ -464,6 +464,12 @@ The retrieved CONTEXT chunks come from the campaign's pitch document. Use them f
 # FEW-SHOT — copy this exact shape, vary the wording
 Each AGENT line is one acknowledgment + one next step. Never two questions, never list features, never repeat the same opener.
 
+CALLER: What is this? / Who is this? / For what?
+AGENT: [neutral]Sorry — {caller_name} from {company_name}, this is about our project in your area.[/neutral] [question]Is now an okay time for a quick minute?[/question]
+
+CALLER: But what is this regarding?
+AGENT: [neutral]Totally fair — we're reaching out to folks who might be looking for a home nearby.[/neutral] [question]Are you currently looking, or just keeping an eye out?[/question]
+
 CALLER: Yes
 AGENT: [warm]Mm, lovely.[/warm] [question]Quick check — self-use or investment?[/question]
 
@@ -493,6 +499,7 @@ _OUTBOUND_UNIVERSAL_TURN_RULES = """# OUTBOUND TURN-TAKING RULES — ALWAYS FOLL
 - If they already gave a detail, use it and move forward; do not ask again.
 - If they are busy, not interested, wrong number, frustrated, or ask not to be called, stop pitching and close politely.
 - Do not push past their answer. A respectful outbound call sounds like a conversation, not a script.
+- If the prospect repeats a question or asks the same thing again, they did NOT get a clear answer the first time — answer it directly and plainly THIS turn; do not deflect, re-ask, or change topic.
 
 # CALLBACK REQUEST — HARD RULE
 If the caller asks to be called back at a specific time ("call me later",
@@ -514,6 +521,22 @@ on THIS call is to confirm the time and end gracefully.
 - The whole call is bounded by this campaign. Nothing outside it is authoritative for what you tell the prospect."""
 
 
+# Cold-called prospects routinely ask "what is this?" before anything else. Small
+# models tend to barrel past it into the qualification script ("self-use or
+# investment?"), which reads as evasive and makes the prospect repeat themselves
+# (observed in production). This block is rendered LATE (high recency) and carries
+# a ready, concrete one-line answer composed from the campaign's own facts.
+_OUTBOUND_EXPLAIN_CALL_RULE = """# "WHAT IS THIS?" — ANSWER IT, DO NOT QUALIFY (HIGHEST PRIORITY)
+If the prospect asks what this is, who you are, why you're calling, or what it's about/regarding —
+or sounds confused ("what is this?", "who is this?", "for what?", "what's this regarding?",
+"why are you calling?") — STOP. Do NOT ask a qualifying question. Do NOT push the script.
+Reply with ONE plain sentence naming the company and the reason for the call, then at most one
+short check ("is now an okay time?"). NEVER answer "what is this?" with "is this for self-use or investment?".
+Your ready one-line answer (paraphrase naturally, keep it short):
+  {purpose_line}
+Once they've heard it and understand, you may continue with ONE discovery question."""
+
+
 # Small models routinely grab the agent's OWN name and use it to address the
 # prospect (observed in production: "Thanks, Riya — noted that it's for self-use."
 # where Riya is the rep, not the lead). This block hard-separates the two
@@ -523,6 +546,21 @@ _OUTBOUND_NAME_GUARDRAIL = """# WHO IS WHO — never confuse yourself with the p
 - You do NOT know the prospect's name unless THEY say it on this call (or it appears in the lead notes above). Do not guess it, do not borrow it from the brief, and NEVER address them as "{caller_name}" — that is you talking to yourself.
 - Until they give their name, just speak to them directly as "you" — a warm reply needs no name at all.
 - The instant they tell you their name, use it (correctly) from then on."""
+
+
+def _call_purpose_line(context: "OutboundCampaignContext") -> str:
+    """A ready, concrete one-line answer to 'what is this?', composed from the
+    campaign's own company + pitch so the model doesn't have to improvise a vague
+    'a quick home option'. Quoted so it reads as an example to paraphrase."""
+    company = (context.company_name or "").strip()
+    pitch = (context.pitch_summary or context.goal or "").strip()
+    if company and pitch:
+        return f'"This is {company} — {pitch}."'
+    if company:
+        return f'"This is a quick call from {company} about a project in your area."'
+    if pitch:
+        return f'"{pitch}."'
+    return '"It\'s a quick courtesy call on behalf of the company — I\'ll keep it brief."'
 
 
 def compose_outbound_system_section(
@@ -598,20 +636,23 @@ def compose_outbound_system_section(
             # this is the preferred path. Keep it short — the note itself
             # carries all the context.
             parts.append(
-                "═══ FOLLOW-UP CALL ═══\n"
-                f"This is attempt {attempt_n}. Here are the notes from the last call:\n\n"
+                "═══ FOLLOW-UP CALL — YOUR GOAL: BOOK A SITE VISIT ═══\n"
+                f"This is attempt {attempt_n}. Notes from the last call:\n\n"
                 f"{handoff_note}\n\n"
                 "Open warmly by referencing these notes — DO NOT restart with "
                 "\"Is this a good time to talk?\". If the notes mention an "
-                "unresolved objection, address it FIRST. Then resume where "
-                "the previous call ended.\n"
+                "unresolved objection, address it FIRST.\n"
+                "Your SINGLE goal on this call is to get them to commit to a SITE VISIT: "
+                "re-engage briefly, then propose a specific day and time "
+                "(e.g. \"this Saturday around 11?\") and lock it in. Don't just re-qualify "
+                "or make small talk — keep steering every turn back toward booking the visit.\n"
                 "══════════════════════"
             )
         else:
-            # No note (rare). Don't reconstruct a structured memory dump —
-            # just a minimal acknowledgement so the agent opens warm instead
-            # of cold. The prior promise (the reason this call was scheduled)
-            # is a single cheap field worth surfacing when present.
+            # No note (lead never had a connected prior call, or the condenser
+            # failed). Do NOT claim a previous conversation that didn't happen —
+            # open about the PROJECT instead. The prior promise (the reason this
+            # call was scheduled) is worth surfacing when present.
             prior_promise = str(followup.get("prior_promise") or "").strip()
             promise_clause = (
                 f" They had asked to be called back: {prior_promise}."
@@ -619,11 +660,14 @@ def compose_outbound_system_section(
                 else ""
             )
             parts.append(
-                "═══ FOLLOW-UP CALL ═══\n"
-                f"This is attempt {attempt_n}. You spoke with this person recently.{promise_clause}\n"
-                "Open warmly, referencing the prior conversation — DO NOT restart "
-                "cold with \"Is this a good time to talk?\". If they raise an "
-                "objection, address it FIRST, then resume where you left off.\n"
+                "═══ FOLLOW-UP CALL — YOUR GOAL: BOOK A SITE VISIT ═══\n"
+                f"This is attempt {attempt_n}. This is a follow-up to a lead who showed interest "
+                f"in the project above.{promise_clause}\n"
+                "Open warmly about the PROJECT — do NOT claim you spoke before if you have no notes "
+                "for it, and do NOT restart cold with \"Is this a good time to talk?\".\n"
+                "Your SINGLE goal on this call is to get them to commit to a SITE VISIT: spark "
+                "interest with one specific benefit, then propose a specific day and time and lock "
+                "it in. If they object, handle it once, then steer back to booking the visit.\n"
                 "══════════════════════"
             )
 
@@ -658,6 +702,7 @@ def compose_outbound_system_section(
         )
     )
     parts.append(_OUTBOUND_UNIVERSAL_TURN_RULES)
+    parts.append(_OUTBOUND_EXPLAIN_CALL_RULE.format(purpose_line=_call_purpose_line(context)))
     parts.append(
         _OUTBOUND_NAME_GUARDRAIL.format(caller_name=context.caller_name or "Riya")
     )
@@ -859,6 +904,8 @@ def generate_outbound_opener_text(
     facts = known_facts or {}
     lead_name = str(facts.get("name") or "").strip()
     returning = bool(facts.get("returning"))
+    followup = bool(facts.get("followup"))
+    project = str(facts.get("project") or "").strip()
     enquiry = _opener_enquiry_phrase(facts, code)
 
     if code == "te":
@@ -869,10 +916,17 @@ def generate_outbound_opener_text(
             else f"Hello{name_part}, నేను {caller} మాట్లాడుతున్నా."
         )
         if returning:
-            # Follow-up: defer specifics to the LLM (it has the call notes).
+            about_te = f"{project} గురించి " if project else "మన last conversation గురించి "
             return (
                 f"[warm]{intro_te}[/warm] "
-                "[neutral]మన last conversation గురించి follow up చేయడానికి call చేస్తున్నా.[/neutral] "
+                f"[neutral]{about_te}follow up చేయడానికి call చేస్తున్నా.[/neutral] "
+                "[question]ఇప్పుడు ఒక్క minute మాట్లాడగలరా?[/question]"
+            )
+        if followup:
+            about_te = project or "మీరు interest చూపిన project"
+            return (
+                f"[warm]{intro_te}[/warm] "
+                f"[neutral]{about_te} గురించి follow up చేయడానికి call చేస్తున్నా.[/neutral] "
                 "[question]ఇప్పుడు ఒక్క minute మాట్లాడగలరా?[/question]"
             )
         if enquiry:
@@ -892,8 +946,14 @@ def generate_outbound_opener_text(
                 f"[neutral]{pitch} గురించి call చేస్తున్నా.[/neutral] "
                 "[question]ఇప్పుడు ఒక్క minute మాట్లాడగలరా?[/question]"
             )
+        reason_te = (
+            f"[neutral]{company} తరఫున మీ area లో ఒక project గురించి call చేస్తున్నా.[/neutral] "
+            if company
+            else ""
+        )
         return (
             f"[warm]{intro_te}[/warm] "
+            f"{reason_te}"
             "[question]ఇప్పుడు ఒక్క minute మాట్లాడగలరా?[/question]"
         )
 
@@ -905,10 +965,17 @@ def generate_outbound_opener_text(
             else f"नमस्ते{name_part}, मैं {caller} बोल रहा हूँ."
         )
         if returning:
-            # Follow-up: defer specifics to the LLM (it has the call notes).
+            about_hi = f"{project} के बारे में " if project else "हमारी पिछली बात-चीत के "
             return (
                 f"[warm]{intro_hi}[/warm] "
-                "[neutral]हमारी पिछली बात-चीत के follow up के लिए call किया है.[/neutral] "
+                f"[neutral]{about_hi}follow up के लिए call किया है.[/neutral] "
+                "[question]क्या अभी एक minute बात कर सकते हैं?[/question]"
+            )
+        if followup:
+            about_hi = project or "जिस project में आपकी interest थी उसके"
+            return (
+                f"[warm]{intro_hi}[/warm] "
+                f"[neutral]{about_hi} के बारे में follow up के लिए call किया है.[/neutral] "
                 "[question]क्या अभी एक minute बात कर सकते हैं?[/question]"
             )
         if enquiry:
@@ -928,8 +995,14 @@ def generate_outbound_opener_text(
                 f"[neutral]{pitch} के लिए call किया है.[/neutral] "
                 "[question]क्या अभी एक minute बात कर सकते हैं?[/question]"
             )
+        reason_hi = (
+            f"[neutral]मैं {company} की तरफ़ से आपके area के एक project के बारे में call कर रहा हूँ.[/neutral] "
+            if company
+            else ""
+        )
         return (
             f"[warm]{intro_hi}[/warm] "
+            f"{reason_hi}"
             "[question]क्या अभी एक minute बात कर सकते हैं?[/question]"
         )
 
@@ -940,10 +1013,21 @@ def generate_outbound_opener_text(
         else f"Hi{name_part}, this is {caller}."
     )
     if returning:
-        # Follow-up: defer specifics to the LLM (it has the call notes).
+        # A real prior call happened (we have a note) — reference it, optionally
+        # naming the project. The LLM drives the booking from the note next turn.
+        about = f" about {project}" if project else ""
         return (
             f"[warm]{intro}[/warm] "
-            "[neutral]I'm calling to follow up on our last conversation.[/neutral] "
+            f"[neutral]I'm calling to follow up on our last conversation{about}.[/neutral] "
+            "[question]Is now a good time to talk for a minute?[/question]"
+        )
+    if followup:
+        # Follow-up with NO prior conversation — do NOT invent one. Re-engage
+        # grounded on the project; the LLM drives toward the site-visit booking.
+        about = project or "the project you were interested in"
+        return (
+            f"[warm]{intro}[/warm] "
+            f"[neutral]I'm following up about {about}.[/neutral] "
             "[question]Is now a good time to talk for a minute?[/question]"
         )
     if enquiry:
@@ -960,11 +1044,19 @@ def generate_outbound_opener_text(
     if pitch:
         return (
             f"[warm]{intro}[/warm] "
-            f"[neutral]I'm calling about {pitch}.[/neutral] "
+            f"[neutral]I'm reaching out about {pitch}.[/neutral] "
             "[question]Is now a good time to talk for a minute?[/question]"
         )
+    # No pitch summary: still give a reason so the prospect isn't left asking
+    # "what is this?". Reference the company when we have it.
+    reason_line = (
+        f"[neutral]I'm reaching out on behalf of {company} about a project in your area.[/neutral] "
+        if company
+        else ""
+    )
     return (
         f"[warm]{intro}[/warm] "
+        f"{reason_line}"
         "[question]Is now a good time to talk for a minute?[/question]"
     )
 

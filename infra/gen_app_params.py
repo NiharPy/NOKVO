@@ -80,6 +80,9 @@ def build(args) -> tuple[list, list]:
     """Return (appEnv, secretsKv) honoring overrides + secret classification."""
     env = parse_env(args.env_file)
 
+    api_base = (args.api_base or "").rstrip("/")
+    portal_base = (args.portal_base or "").rstrip("/")
+
     # Hard overrides for the prod runtime (win over whatever is in the file).
     overrides = {
         "ENVIRONMENT": "production",
@@ -88,11 +91,20 @@ def build(args) -> tuple[list, list]:
         "POSTGRES_SERVER": args.pg_fqdn,
         "AZURE_SHARED_STORAGE_ACCOUNT": args.storage_account,
         "AZURE_SHARED_KEY_VAULT_NAME": args.kv_name,
-        "AGENT_PUBLIC_BASE_URL": args.api_base,
-        "PLIVO_WEBHOOK_BASE_URL": args.api_base,
-        "NOKVO_ONE_PUBLIC_BASE_URL": args.portal_base,
-        "EXPECTED_ORIGIN": args.portal_base,
+        "AGENT_PUBLIC_BASE_URL": api_base,
+        "PLIVO_WEBHOOK_BASE_URL": api_base,
+        "NOKVO_ONE_PUBLIC_BASE_URL": portal_base,
+        "EXPECTED_ORIGIN": portal_base,
+        # Externally-registered OAuth callback URLs (the redirect_uri an external
+        # provider sends the browser back to). These are NOT request-derived, so
+        # a dev tunnel / localhost value left in .env.prod would otherwise ship
+        # to prod and break the flow. Compose them from the live api_base so the
+        # deploy can never publish a stale redirect_uri.
+        "META_ADS_REDIRECT_URI": f"{api_base}/api/nokvo-one/agents/lead-sources/oauth/meta_ads/callback",
+        "ZOHO_REDIRECT_URI": f"{api_base}/api/org-auth/crm/zoho/callback",
         "RP_ID": args.rp_id,
+        # Payments are ALWAYS on in production — never let a dev flag leak in.
+        "PAYMENTS_ENABLED": "true",
         "OTEL_ENABLED": "true",
         "APPLICATIONINSIGHTS_CONNECTION_STRING": args.appinsights_conn,
         "QDRANT_URL": ":memory:",
@@ -101,6 +113,10 @@ def build(args) -> tuple[list, list]:
     # REDIS_URL is a secret (carries the key) and is injected by deploy.sh into
     # KV directly, so don't surface it as a plain value here.
     env.pop("REDIS_URL", None)
+    # GOOGLE_LEADS_OAUTH_REDIRECT_URI is resolved per-provider (google_ads vs
+    # google_forms) from the public base URL at runtime; force it empty so a
+    # stale explicit value in .env.prod can't override the correct derivation.
+    env.pop("GOOGLE_LEADS_OAUTH_REDIRECT_URI", None)
 
     app_env: list[dict] = []
     secrets_kv: list[dict] = []

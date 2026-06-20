@@ -44,6 +44,7 @@ from app.schemas.nokvo_one import (
     NokvoOneLoginRequest,
     NokvoOneLoginTOTPRequest,
     NokvoOneOrganizationResponse,
+    NokvoOneOrganizationUpdateRequest,
     NokvoOnePostTotpResponse,
     NokvoOneProvisioningStepResponse,
     NokvoOneProvisioningSummary,
@@ -437,6 +438,23 @@ async def nokvo_one_signup(
     await db.refresh(organization)
     await db.refresh(admin_user)
 
+    # Payments disabled (dev): skip the Razorpay step — activate + provision now
+    # (the same convergence point a successful payment hits) and send the user
+    # straight into the onboarding wizard.
+    if not settings.PAYMENTS_ENABLED:
+        from app.api.nokvo_one_payments import activate_and_provision
+
+        await activate_and_provision(db, organization.id)
+        await db.refresh(organization)
+        return NokvoOneSignupResponse(
+            organization_id=organization.id,
+            admin_user_id=admin_user.id,
+            email=email,
+            org_status=organization.status,
+            message="Account created — finish onboarding to get started.",
+            payment_token=None,
+        )
+
     payment_token = _issue_setup_token(admin_user.id, organization.id, stage="payment", ttl_minutes=60)
     return NokvoOneSignupResponse(
         organization_id=organization.id,
@@ -657,6 +675,13 @@ async def nokvo_one_login(
 
     # ── Resume unfinished onboarding from wherever the user left off ──────────
     # The org status is the source of truth for the onboarding stage.
+    # Payments disabled (dev): a still-pending org is activated + provisioned on
+    # the spot so the user is never sent to a payment screen.
+    if organization.status == "pending_payment" and not settings.PAYMENTS_ENABLED:
+        from app.api.nokvo_one_payments import activate_and_provision
+
+        await activate_and_provision(db, organization.id)
+        await db.refresh(organization)
     if organization.status == "pending_payment":
         return {
             "code": "payment_required",
@@ -946,6 +971,23 @@ async def nokvo_one_google_login(
         # stays gated because the org is ``pending_payment`` — not an allowed
         # status), plus a payment_token so the frontend can run the payment step.
         # ``activate_and_provision`` flips the org to ``active`` after payment.
+        # Payments disabled (dev): activate + provision now and skip the payment
+        # step — the org goes straight into onboarding.
+        if not settings.PAYMENTS_ENABLED:
+            from app.api.nokvo_one_payments import activate_and_provision
+
+            await activate_and_provision(db, organization.id)
+            await db.refresh(organization)
+            session = await _issue_full_session(db, request, user, organization, mfa_completed=True)
+            session_payload = session.model_dump(mode="json")
+            session_payload["created_via_google"] = True
+            session_payload["payment_required"] = False
+            session_payload["organization_id"] = str(organization.id)
+            # Route straight into the onboarding wizard (the frontend honours this
+            # code) instead of the payment screen.
+            session_payload["code"] = "onboarding_required"
+            return session_payload
+
         session = await _issue_full_session(db, request, user, organization, mfa_completed=False)
         session_payload = session.model_dump(mode="json")
         session_payload["created_via_google"] = True
@@ -967,6 +1009,13 @@ async def nokvo_one_google_login(
     if user.status == "disabled":
         raise HTTPException(status_code=403, detail="User account is disabled")
 
+    # Payments disabled (dev): activate + provision a still-pending org instead of
+    # routing the returning user to payment.
+    if organization.status == "pending_payment" and not settings.PAYMENTS_ENABLED:
+        from app.api.nokvo_one_payments import activate_and_provision
+
+        await activate_and_provision(db, organization.id)
+        await db.refresh(organization)
     # Resume: a returning Google user who hasn't finished paying → back to payment.
     if organization.status == "pending_payment":
         session = await _issue_full_session(db, request, user, organization, mfa_completed=False)
@@ -1112,6 +1161,30 @@ async def nokvo_one_me(
         user=NokvoOneUserResponse.model_validate(user),
         organization=_organization_response(organization),
     )
+
+
+@router.patch("/me/organization", response_model=NokvoOneOrganizationResponse)
+async def update_my_organization(
+    payload: NokvoOneOrganizationUpdateRequest,
+    user: OrganizationUser = Depends(
+        deps.RequireNokvoOneOrganization(
+            allowed_statuses=["onboarding", "active", "suspended"],
+            allowed_roles=["admin"],
+        )
+    ),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Rename the caller's organization. Admin-only; persists to the DB."""
+    org_res = await db.execute(select(Organization).where(Organization.id == user.organization_id))
+    organization = org_res.scalars().first()
+    if organization is None:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    organization.name = payload.name
+    db.add(organization)
+    await db.commit()
+    await db.refresh(organization)
+    return _organization_response(organization)
 
 
 @router.get("/business-template/options", response_model=list[NokvoOneBusinessTemplateOptionResponse])

@@ -397,8 +397,11 @@ class OutboundCampaignService:
         """
         if not lead_ids:
             raise ValueError("Provide at least one lead to attach.")
-        if campaign.status not in (CampaignStatus.draft,):
-            raise ValueError("Leads can only be attached to draft campaigns.")
+        # Leads can be added to a draft OR an already-launched campaign (running
+        # / completed) so the admin can top up an existing campaign and relaunch
+        # to call the new ones. A cancelled campaign is terminal — recreate it.
+        if campaign.status == CampaignStatus.cancelled:
+            raise ValueError("This campaign was cancelled — create a new one to add leads.")
 
         leads = await OutgoingLeadService.validate_callable_leads(tenant_res, db, lead_ids)
 
@@ -591,8 +594,11 @@ class OutboundCampaignService:
         path_prefix: str = "/api/org-auth/agent",
         tenant_res: TenantResources | None = None,
     ) -> OutboundCampaign:
-        if campaign.status != CampaignStatus.draft:
-            raise ValueError(f"Campaign is already '{campaign.status}' — only draft campaigns can be launched.")
+        if campaign.status == CampaignStatus.cancelled:
+            raise ValueError("This campaign was cancelled — create a new one to call leads.")
+        # Relaunch: a running/completed campaign can be launched again to dial the
+        # leads added since (only the undialed contacts get called — see below).
+        is_relaunch = campaign.status in (CampaignStatus.running, CampaignStatus.completed)
 
         if tenant_res is None:
             res = await db.execute(
@@ -615,8 +621,19 @@ class OutboundCampaignService:
         base = public_base_url.rstrip("/")
         prefix = path_prefix.rstrip("/")
         contacts = list(campaign.contacts or [])
+        # Dial only contacts that haven't been placed yet: a fresh draft → all of
+        # them; a relaunch → only the newly-attached (undialed) ones, identified
+        # by the absence of a ``call_id`` / terminal ``ended`` marker. This is
+        # what stops a relaunch from re-calling leads already contacted.
+        to_dial = [c for c in contacts if not c.get("call_id") and not c.get("ended")]
+        if not to_dial:
+            raise ValueError(
+                "No new leads to call — attach more leads before relaunching."
+                if is_relaunch
+                else "This campaign has no leads to call. Attach leads first."
+            )
         lead_ids: list[uuid.UUID] = []
-        for contact in contacts:
+        for contact in to_dial:
             lead_id = contact.get("lead_id")
             if not lead_id:
                 raise ValueError(
@@ -629,13 +646,14 @@ class OutboundCampaignService:
                 raise ValueError("Campaign contains an invalid lead reference.") from exc
         leads = await OutgoingLeadService.validate_callable_leads(tenant_res, db, lead_ids)
         callable_by_id = {str(lead.id): lead for lead in leads if lead_is_callable(lead)}
-        if len(callable_by_id) != len(contacts):
-            raise ValueError("Campaign contains leads that are no longer callable.")
+        if len(callable_by_id) != len(to_dial):
+            raise ValueError("Some leads to call are no longer callable — refresh and try again.")
 
-        # Every contact starts pending; the throttled dialer places up to the
+        # Arm only the to-dial contacts; the throttled dialer places up to the
         # concurrency cap and refills one-for-one as calls end (Plivo status
-        # webhook → dial_next_pending), so we never fire hundreds at once.
-        for contact in contacts:
+        # webhook → dial_next_pending). Already-dialed contacts keep their state
+        # so a relaunch never re-calls them.
+        for contact in to_dial:
             contact["status"] = "pending"
             contact.pop("ended", None)
         campaign.from_number = caller_id
@@ -649,6 +667,27 @@ class OutboundCampaignService:
         await OutboundCampaignService._dial_pending(
             campaign, db, tenant_res=tenant_res, base=base, prefix=prefix
         )
+        return campaign
+
+    @staticmethod
+    async def set_followup_enabled(
+        campaign: OutboundCampaign, enabled: bool, db: AsyncSession
+    ) -> OutboundCampaign:
+        """Turn the follow-up agent on/off for a campaign.
+
+        Flips ``agent_config.followup_rules.enabled`` — the flag the follow-up
+        scheduler already honours (`followup_scheduler_service.py`: enqueue is a
+        no-op when it's False). Reassigns ``agent_config`` to a new dict so the
+        JSONB change is detected, and invalidates the cached outbound context."""
+        cfg = dict(campaign.agent_config or {})
+        rules = dict(cfg.get("followup_rules") or {})
+        rules["enabled"] = bool(enabled)
+        cfg["followup_rules"] = rules
+        campaign.agent_config = cfg
+        db.add(campaign)
+        await db.commit()
+        await db.refresh(campaign)
+        invalidate_outbound_context(campaign.id)
         return campaign
 
     # ---- throttled dialer (place up to the cap, refill as calls end) ----------
@@ -1117,6 +1156,39 @@ class OutboundCampaignService:
     # ------------------------------------------------------------------
     # Lookup by call_link_id (used in webhook handlers)
     # ------------------------------------------------------------------
+
+    @staticmethod
+    async def get_campaign_for_lead(
+        tenant_id: str,
+        lead_id: Any,
+        phone: str | None,
+        db: AsyncSession,
+    ) -> OutboundCampaign | None:
+        """The campaign a lead is attached to — the one whose ``contacts`` JSONB
+        carries this ``lead_id`` (fallback: a matching ``phone``).
+
+        Lets the follow-up scheduler run the follow-up as the lead's OWN campaign
+        agent (project knowledge + ``site_visit`` objective) instead of a generic
+        one. Scans every campaign for the tenant regardless of status (attachment
+        is what matters; the campaign is later loaded by id without a status
+        filter). Tenants have few campaigns so a Python scan is fine. Returns
+        ``None`` when the lead is attached to no campaign (orphan)."""
+        lead_str = str(lead_id) if lead_id is not None else None
+        phone_norm = (phone or "").strip()
+        if not lead_str and not phone_norm:
+            return None
+        res = await db.execute(
+            select(OutboundCampaign)
+            .where(OutboundCampaign.tenant_id == tenant_id)
+            .order_by(OutboundCampaign.created_at.desc())
+        )
+        for campaign in res.scalars().all():
+            for contact in campaign.contacts or []:
+                if lead_str and str(contact.get("lead_id")) == lead_str:
+                    return campaign
+                if phone_norm and str(contact.get("phone") or "").strip() == phone_norm:
+                    return campaign
+        return None
 
     @staticmethod
     async def get_by_call_link_id(

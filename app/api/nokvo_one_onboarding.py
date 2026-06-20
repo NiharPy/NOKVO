@@ -29,11 +29,13 @@ from app.models.organization_user import OrganizationUser
 from app.models.real_estate_project import RealEstateProject
 from app.models.tenant_resources import TenantResources
 from app.services.plivo_compliance_service import PlivoComplianceService
+from app.services.tool_flow_questions import ensure_tool_flow_questions
+from sqlalchemy.orm.attributes import flag_modified
 
 router = APIRouter()
 
 # Version stamped on the org when the user accepts the legal docs.
-TERMS_VERSION = "2026-06-18"
+TERMS_VERSION = "2026-06-20"
 
 _STEP_ORDER = ["business_details", "documents", "working_hours", "projects", "agent", "terms", "done"]
 
@@ -167,6 +169,18 @@ async def save_business_details(
     org.alias_name = (payload.alias_name or "").strip() or None
     org.business_pan = (payload.business_pan or "").strip() or None
     org.cin = (payload.cin or "").strip() or None
+    # Real estate is the only vertical — assign it here (the first onboarding
+    # step) so the later, real-estate-gated steps (projects / brochure upload)
+    # work. Also seed the vertical's tool-flow questions so booking/lead flows are
+    # ready at runtime (mirrors the /business-template step).
+    if not (org.industry or "").strip():
+        org.industry = "real_estate"
+        tr = await _tenant(db, user)
+        new_status, changed = ensure_tool_flow_questions(tr.provider_status, org.industry)
+        if changed:
+            tr.provider_status = new_status
+            flag_modified(tr, "provider_status")
+            db.add(tr)
     step = _advance(org, after="business_details")
     db.add(org)
     await db.commit()
