@@ -241,24 +241,45 @@ class PlivoComplianceService:
                             uploaded[str(o.get("alias") or did)] = did
                 record["document_ids"] = uploaded
 
-            # 3) Compliance application tying end user + documents to the number type.
+            # 3) Compliance application tying end user + documents to the number.
+            # Plivo keys requirements by a ``compliance_requirement_id`` (NOT the
+            # raw country/number_type/end_user_type triple — that 400s with
+            # "Could not find any requirement"). Plivo hands us the right id on
+            # each searchable number's ``compliance.business`` field; resolve it
+            # from an available number. NOTE: India DIDs are number_type "fixed".
+            country = (settings.PLIVO_NUMBER_COUNTRY or "IN").upper()
+            requirement_id = record.get("compliance_requirement_id")
+            if not requirement_id:
+                try:
+                    found = await PlivoService._request(
+                        "GET",
+                        f"{base}/PhoneNumber/?country_iso={country}&services=voice&limit=1",
+                        auth=auth,
+                    )
+                    objs = found.get("objects") or []
+                    comp_ref = ((objs[0].get("compliance") or {}) if objs else {}).get("business")
+                    if comp_ref:
+                        requirement_id = str(comp_ref).rstrip("/").rsplit("/", 1)[-1] or None
+                except PlivoError:
+                    requirement_id = None
+            if requirement_id:
+                record["compliance_requirement_id"] = requirement_id
+
             if not record.get("application_id"):
+                app_body: dict[str, Any] = {
+                    "end_user_id": end_user_id,
+                    "end_user_type": "business",
+                    "document_ids": [v for v in uploaded.values() if v],
+                    "alias": legal_name[:120],
+                }
+                if requirement_id:
+                    app_body["compliance_requirement_id"] = requirement_id
+                else:
+                    # Fallback to the explicit triple — India is "fixed", not "local".
+                    app_body["country_iso2"] = country
+                    app_body["number_type"] = "fixed"
                 app = await PlivoService._request(
-                    "POST",
-                    f"{base}/ComplianceApplication/",
-                    auth=auth,
-                    json_body={
-                        "end_user_id": end_user_id,
-                        # Plivo's ComplianceApplication API requires ``end_user_type``
-                        # and ``country_iso2`` (NOT ``country_iso``). Omitting them
-                        # returns 400 "This field is required", which silently parks
-                        # the number at "awaiting carrier verification" forever.
-                        "end_user_type": "business",
-                        "country_iso2": "IN",
-                        "document_ids": [v for v in uploaded.values() if v],
-                        "number_type": "local",
-                        "alias": legal_name[:120],
-                    },
+                    "POST", f"{base}/ComplianceApplication/", auth=auth, json_body=app_body
                 )
                 record["application_id"] = str(app.get("compliance_application_id") or app.get("id") or "")
             record["status"] = "submitted"
