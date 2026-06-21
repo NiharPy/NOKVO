@@ -78,6 +78,14 @@ const routes = [
     name: 'nokvo-one-dashboard',
     children: dashboardChildren,
   },
+  // Post-payment onboarding wizard. Bootstraps like a deep-link: restoreSession
+  // resumes the wizard when the org is mid-onboarding.
+  {
+    path: '/nokvo-one/onboarding',
+    component: NokvoOneApp,
+    props: { initialAuthState: 'login' },
+    name: 'nokvo-one-onboarding',
+  },
   // Deep-link routes handled internally by the component
   {
     path: '/nokvo-one/verify-email',

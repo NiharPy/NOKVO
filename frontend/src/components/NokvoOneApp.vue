@@ -3205,6 +3205,10 @@ const beginOnboardingWizard = async () => {
     errorMsg.value = extractErrorMessage(e, 'Could not load your onboarding progress.');
   }
   authState.value = 'onboarding';
+  // Reflect the wizard in the URL so a refresh / deep-link resumes it here.
+  if (route.name !== 'nokvo-one-onboarding') {
+    router.push({ name: 'nokvo-one-onboarding' }).catch(() => {});
+  }
 };
 
 const saveOnboardingBusiness = async () => {
@@ -3298,6 +3302,11 @@ const acceptOnboardingTerms = async () => {
     if (currentOrganization.value) currentOrganization.value.status = 'active';
     infoMsg.value = 'Welcome to Nokvo One!';
     await enterWorkspaceAfterAuth();
+    // Onboarding done → leave the /onboarding URL for the dashboard.
+    if (route.name === 'nokvo-one-onboarding') {
+      const dash = pageKeyToRouteName['dashboard'];
+      if (dash) router.push({ name: dash }).catch(() => {});
+    }
   } catch (e) {
     errorMsg.value = extractErrorMessage(e, 'Could not finish onboarding.');
   } finally {
