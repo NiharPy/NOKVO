@@ -698,12 +698,16 @@ async def get_tenant_detail(
         await db.execute(select(TenantResources).where(TenantResources.organization_id == org.id))
     ).scalars().first()
     plivo_cfg = (tenant_res.provider_status or {}).get("plivo", {}) if tenant_res else {}
+    _comp = (plivo_cfg.get("compliance") or {}) if isinstance(plivo_cfg, dict) else {}
     telephony = {
         "tenant_id": tenant_res.tenant_id if tenant_res else None,
         "number": (plivo_cfg.get("number") if isinstance(plivo_cfg, dict) else None)
         or (tenant_res.twilio_phone_number if tenant_res else None),
         "has_application": bool(isinstance(plivo_cfg, dict) and plivo_cfg.get("application_id")),
         "provisioning_status": tenant_res.provisioning_status if tenant_res else None,
+        "number_status": plivo_cfg.get("number_status") if isinstance(plivo_cfg, dict) else None,
+        "compliance_application_id": _comp.get("application_id"),
+        "compliance_error": _comp.get("error"),
     }
 
     subscription_inr = sub.get("monthly_inr", 0.0)
@@ -990,4 +994,74 @@ async def bypass_payment(
         "org_status": result.get("org_status"),
         "onboarding_step": result.get("onboarding_step"),
         "idempotent": bool(result.get("idempotent", False)),
+    }
+
+
+@router.post("/{organization_id}/retry-compliance")
+async def retry_compliance(
+    organization_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: SuperAdminUser = Depends(RequireRole(_WRITE_ROLES)),
+):
+    """Re-file Plivo compliance for a tenant stuck at ``pending_compliance``.
+
+    Reuses the end-user's already-uploaded Plivo documents (no re-upload needed)
+    and files the ``ComplianceApplication`` if it never got filed. Once approved,
+    the number poller rents + assigns the DID automatically."""
+    org = (
+        await db.execute(select(Organization).where(Organization.id == organization_id))
+    ).scalars().first()
+    if org is None:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    tenant_res = (
+        await db.execute(select(TenantResources).where(TenantResources.organization_id == org.id))
+    ).scalars().first()
+    if tenant_res is None:
+        raise HTTPException(status_code=409, detail="Tenant is not provisioned yet — nothing to retry.")
+
+    legal = (org.legal_name or org.name or "").strip()
+    if not legal:
+        raise HTTPException(status_code=400, detail="Organization has no legal name on file.")
+
+    from app.services.plivo_compliance_service import PlivoComplianceService
+
+    try:
+        result = await PlivoComplianceService.submit_compliance_and_allot_number(
+            tenant_res,
+            db,
+            legal_name=legal,
+            alias_name=org.alias_name,
+            business_pan=org.business_pan,
+            cin=org.cin,
+            documents=[],  # reuse existing Plivo documents
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Compliance retry failed: {exc}")
+
+    comp = (result.get("compliance") or {})
+    db.add(
+        SuperAdminAuditLog(
+            superadmin_id=current_user.id,
+            action="organization_compliance_retried",
+            risk_level="low",
+            target_type="organization",
+            target_id=str(organization_id),
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            request_id=request.headers.get("x-request-id"),
+            metadata_={
+                "application_id": comp.get("application_id"),
+                "number_status": result.get("number_status"),
+            },
+        )
+    )
+    await db.commit()
+
+    return {
+        "organization_id": str(organization_id),
+        "application_id": comp.get("application_id"),
+        "number": result.get("number"),
+        "number_status": result.get("number_status"),
+        "error": comp.get("error"),
     }

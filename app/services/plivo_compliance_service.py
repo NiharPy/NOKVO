@@ -162,7 +162,11 @@ class PlivoComplianceService:
             end_user_id = record["end_user_id"]
 
             # 2) Upload each document (skip ones already uploaded by kind).
+            # Bind the dict into ``record`` up front so a mid-loop failure still
+            # persists the docs uploaded so far (the save on the error path reads
+            # ``record``) — preventing the duplicate-alias collision on retry.
             uploaded = dict(record.get("document_ids") or {})
+            record["document_ids"] = uploaded
             for doc in documents:
                 kind = doc.get("kind")
                 if not kind or kind in uploaded:
@@ -185,11 +189,57 @@ class PlivoComplianceService:
                         doc.get("content_type") or "application/octet-stream",
                     )
                 }
-                up = await PlivoService._request_multipart(
-                    f"{base}/ComplianceDocument/", auth=auth, data=data, files=files
-                )
-                uploaded[kind] = str(up.get("document_id") or up.get("id") or "")
+                try:
+                    up = await PlivoService._request_multipart(
+                        f"{base}/ComplianceDocument/", auth=auth, data=data, files=files
+                    )
+                    uploaded[kind] = str(up.get("document_id") or up.get("id") or "")
+                except PlivoError as exc:
+                    # The document was uploaded on a prior run but our document_ids
+                    # record was lost (the save happens late / on the error path), so
+                    # the retry collides on the unique alias. Mirror the end-user
+                    # path: look the existing document up and REUSE it instead of
+                    # dead-ending the whole compliance filing.
+                    if "already exists" not in str(exc).lower():
+                        raise
+                    alias = data["alias"]
+                    listing = await PlivoService._request(
+                        "GET", f"{base}/ComplianceDocument/?limit=50", auth=auth
+                    )
+                    objects = listing.get("objects") or listing.get("compliance_documents") or []
+                    match = next(
+                        (
+                            o for o in objects
+                            if str(o.get("alias") or "").strip() == alias.strip()
+                            and (not end_user_id or str(o.get("end_user_id") or "") == str(end_user_id))
+                        ),
+                        None,
+                    )
+                    if match is None:
+                        # Fall back to alias-only match (some list rows omit end_user_id).
+                        match = next(
+                            (o for o in objects if str(o.get("alias") or "").strip() == alias.strip()),
+                            None,
+                        )
+                    if match is None:
+                        raise
+                    uploaded[kind] = str(match.get("document_id") or match.get("id") or "")
             record["document_ids"] = uploaded
+
+            # Retry-safety: if no documents are recorded (a retry with no fresh
+            # files, or a prior run that uploaded to Plivo but lost our record),
+            # reuse the end-user's EXISTING Plivo ComplianceDocuments so we can
+            # still file the application instead of dead-ending.
+            if not [v for v in uploaded.values() if v] and end_user_id:
+                listing = await PlivoService._request(
+                    "GET", f"{base}/ComplianceDocument/?limit=50", auth=auth
+                )
+                for o in (listing.get("objects") or listing.get("compliance_documents") or []):
+                    if str(o.get("end_user_id") or "") == str(end_user_id):
+                        did = str(o.get("document_id") or o.get("id") or "")
+                        if did:
+                            uploaded[str(o.get("alias") or did)] = did
+                record["document_ids"] = uploaded
 
             # 3) Compliance application tying end user + documents to the number type.
             if not record.get("application_id"):

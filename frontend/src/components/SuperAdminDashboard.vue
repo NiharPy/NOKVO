@@ -454,6 +454,33 @@ const confirmPlanChange = async () => {
   }
 };
 
+// ── Retry Plivo compliance (stuck at pending_compliance) ─────
+const compRetryBusy = ref('');
+const retryCompliance = async (d) => {
+  const orgId = d.organization_id;
+  if (!window.confirm('Re-file Plivo compliance for this tenant? It reuses the already-uploaded documents and files the application; the number is allotted automatically once Plivo approves.')) return;
+  compRetryBusy.value = orgId; errorMsg.value = '';
+  try {
+    const res = await fetch(`${SUPERADMIN_API_BASE}/tenants/${orgId}/retry-compliance`, {
+      method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }),
+    });
+    if (res.status === 401) { emit('logout'); return; }
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) { errorMsg.value = data.detail || `Retry failed (${res.status}).`; return; }
+    if (detail.value && detail.value.organization_id === orgId && detail.value.telephony) {
+      detail.value.telephony.number = data.number || detail.value.telephony.number;
+      detail.value.telephony.number_status = data.number_status;
+      detail.value.telephony.compliance_application_id = data.application_id;
+      detail.value.telephony.compliance_error = data.error;
+    }
+    if (data.application_id) errorMsg.value = '';
+  } catch (_) {
+    errorMsg.value = 'Network error during compliance retry.';
+  } finally {
+    compRetryBusy.value = '';
+  }
+};
+
 // ── Plivo number change ─────────────────────────────────────
 const plivoTarget = ref(null); // { org_id, name, current, number, reassign }
 const plivoBusy = ref(false);
@@ -695,10 +722,23 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
               <span class="card-foot">
                 tenant {{ detail.telephony.tenant_id || '—' }} ·
                 {{ detail.telephony.has_application ? 'app linked' : 'no application' }}
+                <template v-if="detail.telephony.number_status"> · {{ detail.telephony.number_status }}</template>
+                <template v-if="detail.telephony.compliance_application_id"> · KYC filed</template>
               </span>
             </div>
-            <button type="button" class="plan-btn" @click="openPlivoChange(detail)">Change number</button>
+            <div class="telephony-actions">
+              <button
+                v-if="!detail.telephony.number && detail.telephony.has_application"
+                type="button" class="plan-btn upgrade"
+                :disabled="compRetryBusy === detail.organization_id"
+                @click="retryCompliance(detail)"
+              >{{ compRetryBusy === detail.organization_id ? 'Retrying…' : 'Retry compliance' }}</button>
+              <button type="button" class="plan-btn" @click="openPlivoChange(detail)">Change number</button>
+            </div>
           </div>
+          <p v-if="detail.telephony && detail.telephony.compliance_error" class="comp-error">
+            <strong>Compliance error:</strong> {{ detail.telephony.compliance_error }}
+          </p>
 
           <div class="cogs-breakdown">
             <span class="stage-eyebrow">COST BREAKDOWN (ALL-TIME)</span>
@@ -1471,6 +1511,8 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
 .telephony-panel { display: flex; align-items: center; justify-content: space-between; gap: 1rem; border: 1px solid var(--border-color); border-radius: 12px; padding: 0.9rem 1.1rem; flex-wrap: wrap; }
 .telephony-info { display: flex; flex-direction: column; gap: 0.2rem; }
 .telephony-info strong { font-size: 1.05rem; color: var(--text-primary); }
+.telephony-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+.comp-error { margin: 0.5rem 0 0; padding: 0.6rem 0.8rem; font-size: 0.78rem; line-height: 1.5; color: #f87171; border: 1px solid rgba(248,113,113,0.4); border-radius: 8px; background: rgba(248,113,113,0.08); word-break: break-word; }
 
 /* LLM keys tab */
 .llm-form-row { display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap; }
