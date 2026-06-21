@@ -193,7 +193,9 @@ class PlivoComplianceService:
                     up = await PlivoService._request_multipart(
                         f"{base}/ComplianceDocument/", auth=auth, data=data, files=files
                     )
-                    uploaded[kind] = str(up.get("document_id") or up.get("id") or "")
+                    uploaded[kind] = str(
+                        up.get("compliance_document_id") or up.get("document_id") or up.get("id") or ""
+                    )
                 except PlivoError as exc:
                     # The document was uploaded on a prior run but our document_ids
                     # record was lost (the save happens late / on the error path), so
@@ -223,7 +225,9 @@ class PlivoComplianceService:
                         )
                     if match is None:
                         raise
-                    uploaded[kind] = str(match.get("document_id") or match.get("id") or "")
+                    uploaded[kind] = str(
+                        match.get("compliance_document_id") or match.get("document_id") or match.get("id") or ""
+                    )
             record["document_ids"] = uploaded
 
             # Retry-safety: if no documents are recorded (a retry with no fresh
@@ -236,7 +240,7 @@ class PlivoComplianceService:
                 )
                 for o in (listing.get("objects") or listing.get("compliance_documents") or []):
                     if str(o.get("end_user_id") or "") == str(end_user_id):
-                        did = str(o.get("document_id") or o.get("id") or "")
+                        did = str(o.get("compliance_document_id") or o.get("document_id") or o.get("id") or "")
                         if did:
                             uploaded[str(o.get("alias") or did)] = did
                 record["document_ids"] = uploaded
@@ -272,6 +276,29 @@ class PlivoComplianceService:
                     requirement_id = None
             if requirement_id:
                 record["compliance_requirement_id"] = requirement_id
+
+            # Self-heal a prior application filed WITHOUT documents (the document-id
+            # extraction bug): such an application can never be approved. If it has
+            # no documents but we now have them, delete it so we re-file correctly.
+            doc_ids_now = [v for v in uploaded.values() if v]
+            if record.get("application_id") and doc_ids_now:
+                try:
+                    appinfo = await PlivoService._request(
+                        "GET", f"{base}/ComplianceApplication/{record['application_id']}/", auth=auth
+                    )
+                    existing_docs = appinfo.get("document_ids") or appinfo.get("documents") or []
+                    if not existing_docs:
+                        try:
+                            await PlivoService._request(
+                                "DELETE",
+                                f"{base}/ComplianceApplication/{record['application_id']}/",
+                                auth=auth,
+                            )
+                        except PlivoError:
+                            pass
+                        record["application_id"] = None
+                except PlivoError:
+                    pass
 
             if not record.get("application_id"):
                 app_body: dict[str, Any] = {
