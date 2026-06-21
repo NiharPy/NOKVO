@@ -8620,7 +8620,12 @@ provideDashboardState({
   width: 100%;
   height: 100%;
   object-fit: contain;
-  transform: scale(4.5);
+  transform: scale(0.78);
+}
+.global-top-left-logo svg {
+  width: 100%;
+  height: 100%;
+  display: block;
 }
 
 /* ─── Floating bottom dock ─────────────────────────── */
@@ -8706,7 +8711,12 @@ provideDashboardState({
   width: 100%;
   height: 100%;
   object-fit: contain;
-  transform: scale(4.5);
+  transform: scale(0.78);
+}
+.n-shell-brand__svg {
+  width: 100%;
+  height: 100%;
+  display: block;
 }
 .n-shell-brand__name {
   font-family: var(--n-font-display);

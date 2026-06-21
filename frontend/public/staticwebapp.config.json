@@ -1,8 +1,17 @@
 {
   "navigationFallback": {
     "rewrite": "/index.html",
-    "exclude": ["/assets/*", "/*.{css,js,svg,png,jpg,jpeg,ico,json,woff,woff2,ttf,map}"]
+    "exclude": ["/assets/*", "/*.{css,js,svg,png,jpg,jpeg,ico,json,txt,xml,webmanifest,woff,woff2,ttf,map}"]
   },
+  "mimeTypes": {
+    ".webmanifest": "application/manifest+json",
+    ".svg": "image/svg+xml"
+  },
+  "routes": [
+    { "route": "/robots.txt", "headers": { "content-type": "text/plain; charset=utf-8" } },
+    { "route": "/llms.txt", "headers": { "content-type": "text/plain; charset=utf-8" } },
+    { "route": "/sitemap.xml", "headers": { "content-type": "application/xml; charset=utf-8" } }
+  ],
   "responseOverrides": {
     "404": { "rewrite": "/index.html", "statusCode": 200 }
   }

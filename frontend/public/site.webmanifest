@@ -1,0 +1,12 @@
+{
+  "name": "NOKVO One — AI Voice Agents",
+  "short_name": "NOKVO One",
+  "description": "AI voice agent platform that answers inbound calls, qualifies leads, books appointments, and runs outbound campaigns 24/7.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#0a0a0c",
+  "icons": [
+    { "src": "/favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}
