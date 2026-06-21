@@ -38,8 +38,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from pydantic import BaseModel, Field
+
 from app.api import deps
 from app.models.call_cost import CallCost
+from app.models.feedback import FEEDBACK_CATEGORIES, TenantFeedback
 from app.models.organization_user import OrganizationUser
 from app.services.call_cost_calculator import (
     RATE_TIERS,
@@ -216,6 +219,38 @@ async def cost_summary(
         "all_time": _format(all_time),
         "recent_calls": recent_calls,
     }
+
+
+# ── Feedback / feature requests ─────────────────────────────────────────────
+
+
+class FeedbackSubmitRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=5000)
+    category: str = "feedback"  # 'feedback' | 'feature'
+
+
+@router.post("/feedback", status_code=status.HTTP_201_CREATED)
+async def submit_feedback(
+    payload: FeedbackSubmitRequest,
+    user: OrganizationUser = Depends(_viewer_dep()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Any org user can submit feedback or a feature request. Stored for the
+    SuperAdmin console's Feedback tab."""
+    message = payload.message.strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Message cannot be empty.")
+    category = payload.category if payload.category in FEEDBACK_CATEGORIES else "feedback"
+    db.add(
+        TenantFeedback(
+            organization_id=user.organization_id,
+            submitted_by_user_id=user.id,
+            category=category,
+            message=message[:5000],
+        )
+    )
+    await db.commit()
+    return {"ok": True}
 
 
 # ── Notifications inbox ─────────────────────────────────────────────────────

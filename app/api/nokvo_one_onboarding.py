@@ -13,12 +13,13 @@ the user on the dashboard. Projects are added via the existing
 """
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import datetime, time, timezone
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api import deps
@@ -156,6 +157,70 @@ async def onboarding_state(
     }
 
 
+def _norm_code(value: str | None) -> str | None:
+    """Normalize a PAN/CIN for comparison: strip all whitespace, uppercase."""
+    if not value:
+        return None
+    cleaned = re.sub(r"\s+", "", value).upper()
+    return cleaned or None
+
+
+def _norm_name(value: str | None) -> str | None:
+    """Normalize a company name: trim, collapse inner whitespace, lowercase."""
+    if not value:
+        return None
+    cleaned = re.sub(r"\s+", " ", value).strip().lower()
+    return cleaned or None
+
+
+async def _duplicate_company_conflict(
+    db: AsyncSession,
+    *,
+    exclude_id,
+    legal_name: str | None,
+    business_pan: str | None,
+    cin: str | None,
+) -> str | None:
+    """Return the field that collides with another org, or None.
+
+    A company is considered a duplicate if its CIN, business PAN, or company
+    name matches an existing organization (case-/whitespace-insensitive). CIN
+    and PAN are government identifiers (truly unique per company); the name is
+    a softer check but the user wants all three guarded.
+    """
+    name_n = _norm_name(legal_name)
+    pan_n = _norm_code(business_pan)
+    cin_n = _norm_code(cin)
+
+    conds = []
+    if name_n:
+        conds.append(func.lower(func.btrim(Organization.legal_name)) == name_n)
+        conds.append(func.lower(func.btrim(Organization.name)) == name_n)
+    if pan_n:
+        conds.append(Organization.business_pan.isnot(None))
+    if cin_n:
+        conds.append(Organization.cin.isnot(None))
+    if not conds:
+        return None
+
+    rows = (
+        await db.execute(
+            select(Organization.legal_name, Organization.name, Organization.business_pan, Organization.cin)
+            .where(Organization.id != exclude_id, or_(*conds))
+        )
+    ).all()
+
+    for o_legal, o_name, o_pan, o_cin in rows:
+        # PAN/CIN compared with full normalization (the SQL only narrowed rows).
+        if cin_n and _norm_code(o_cin) == cin_n:
+            return "CIN"
+        if pan_n and _norm_code(o_pan) == pan_n:
+            return "business PAN"
+        if name_n and (_norm_name(o_legal) == name_n or _norm_name(o_name) == name_n):
+            return "company name"
+    return None
+
+
 @router.post("/business-details")
 async def save_business_details(
     payload: BusinessDetailsRequest,
@@ -165,6 +230,22 @@ async def save_business_details(
     if not payload.legal_name.strip():
         raise HTTPException(status_code=400, detail="Company legal name is required.")
     org = await _org(db, user)
+
+    # Safeguard: block onboarding a company that already exists. The company
+    # name, business PAN and CIN are each checked against every other org.
+    conflict = await _duplicate_company_conflict(
+        db,
+        exclude_id=org.id,
+        legal_name=payload.legal_name,
+        business_pan=payload.business_pan,
+        cin=payload.cin,
+    )
+    if conflict:
+        raise HTTPException(
+            status_code=409,
+            detail=f"A company with this {conflict} is already registered on Nokvo One.",
+        )
+
     org.legal_name = payload.legal_name.strip()
     org.alias_name = (payload.alias_name or "").strip() or None
     org.business_pan = (payload.business_pan or "").strip() or None

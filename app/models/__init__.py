@@ -8,6 +8,8 @@ from app.models.organization_user import OrganizationUser
 from app.models.tenant_resources import TenantResources
 from app.models.tenant_usage_event import TenantUsageEvent
 from app.models.mcp_tool_registry import MCPToolRegistryEntry
+from app.models.feedback import TenantFeedback
+from app.models.superadmin_todo import SuperAdminTodo
 from app.models.email_verification import EmailVerification
 from app.models.member_invitation import MemberInvitation
 from app.models.nokvo_one_tool_record import NokvoOneToolRecord
@@ -36,6 +38,8 @@ from app.models.connect_api_key import OrganizationApiKey
 from app.models.connect_session import ConnectSession
 from app.models.call_cost import CallCost
 from app.models.subscription import Subscription
+from app.models.usage_invoice import UsageInvoice
+from app.models.llm_pool_key import LlmPoolKey
 from app.models.call_transcript import CallTranscript
 from app.models.notification import Notification
 from app.models.real_estate_project import RealEstateProject
@@ -71,6 +75,8 @@ __all__ = [
     "ConnectSession",
     "CallCost",
     "Subscription",
+    "UsageInvoice",
+    "LlmPoolKey",
     "CallTranscript",
     "Notification",
     "RealEstateProject",
@@ -78,4 +84,6 @@ __all__ = [
     "FollowupStatus",
     "LeadFollowupSchedule",
     "CustomerBase",
+    "TenantFeedback",
+    "SuperAdminTodo",
 ]

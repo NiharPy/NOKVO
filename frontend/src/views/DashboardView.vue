@@ -218,6 +218,7 @@ function initial(m) {
           </div>
           <span class="n-tag n-tag--mono dash__invoice-total">{{ invoiceTotal }}</span>
         </header>
+        <div class="dash__invoice-table-wrap">
         <table class="dash__invoice-table">
           <thead>
             <tr><th>Slab</th><th>Rate</th><th class="is-num">Minutes</th><th class="is-num">Amount</th></tr>
@@ -241,6 +242,7 @@ function initial(m) {
             </tr>
           </tfoot>
         </table>
+        </div>
       </article>
     </section>
 
@@ -868,5 +870,34 @@ function initial(m) {
     row-gap: 12px;
   }
   .dash__followup-stats > div:nth-child(2) { border-right: 0; }
+}
+
+/* ─── Phone polish ─────────────────────────────────── */
+@media (max-width: 600px) {
+  /* Header: title + edit + actions all stack cleanly. */
+  .dash__org-name { gap: 6px; }
+  .dash__org-form { width: 100%; flex-wrap: wrap; }
+  .dash__org-input { flex: 1 1 100%; }
+  .dash__head-actions { width: 100%; }
+
+  /* Recent calls: tighter padding so the amount column never clips. */
+  .dash__recent-head { padding: 16px 16px 14px; }
+  .dash__call { padding: 12px 16px; gap: 10px; }
+  .dash__call-dur { min-width: 0; }
+  .dash__call-amt { min-width: 0; }
+
+  /* Invoice card: the 4-column slab table scrolls horizontally instead of
+     crushing into an unreadable, overlapping mess. */
+  .dash__invoice { padding: 18px 16px; }
+  .dash__invoice-head { margin-bottom: 12px; gap: 10px; }
+  .dash__invoice-table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; margin: 0 -2px; }
+  .dash__invoice-table { min-width: 420px; font-size: 12px; }
+  .dash__invoice-table th { padding: 8px; }
+  .dash__invoice-table td { padding: 9px 8px; }
+  .dash__invoice-now { margin-left: 6px; }
+
+  /* Roster + follow-up tile breathing room. */
+  .dash__roster-row { padding: 16px; }
+  .dash__followup-stats > div { padding: 0 10px; }
 }
 </style>

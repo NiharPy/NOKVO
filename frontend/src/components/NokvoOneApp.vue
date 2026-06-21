@@ -166,6 +166,30 @@ const sampleUpload = ref({
 });
 const settingsMenuOpen = ref(false);
 
+// Feedback / Suggest-a-feature — small modal anyone in the org can submit from.
+const feedbackOpen = ref(false);
+const feedbackForm = ref({ message: '', category: 'feedback' });
+const isSubmittingFeedback = ref(false);
+const openFeedback = () => {
+  feedbackForm.value = { message: '', category: 'feedback' };
+  feedbackOpen.value = true;
+};
+const submitFeedback = async () => {
+  const msg = (feedbackForm.value.message || '').trim();
+  if (!msg) { errorMsg.value = 'Please type your feedback first.'; return; }
+  isSubmittingFeedback.value = true;
+  errorMsg.value = '';
+  try {
+    await api.post('/feedback', { message: msg, category: feedbackForm.value.category }, { headers: authHeader() });
+    feedbackOpen.value = false;
+    infoMsg.value = 'Thanks! Your feedback has been sent to our team.';
+  } catch (err) {
+    errorMsg.value = extractErrorMessage(err, 'Could not send feedback. Please try again.');
+  } finally {
+    isSubmittingFeedback.value = false;
+  }
+};
+
 // ── Nokvo Connect — API key management state ────────────────────────────────
 const connect = ref({
   isLoadingList: false,
@@ -776,6 +800,57 @@ const claimSiteVisit = async (record) => {
   }
 };
 
+// ── Claimed site-visit actions: outcome (Done / Didn't show up) + transfer ──
+const siteVisitActionId = ref(null);   // record id with an action in flight
+const transferOpenId = ref(null);      // record id whose transfer picker is open
+const transferTargetId = ref('');
+const transferMembers = computed(() => members.value.filter((m) => m.status !== 'removed'));
+
+const ensureMembersLoaded = async () => {
+  if (members.value.length) return;
+  try {
+    const { data } = await api.get('/members/', { headers: authHeader() });
+    members.value = Array.isArray(data) ? data : [];
+  } catch (_) { /* picker will just be empty */ }
+};
+
+const setSiteVisitStatus = async (record, status) => {
+  if (!record?.id || siteVisitActionId.value) return;
+  siteVisitActionId.value = record.id;
+  errorMsg.value = '';
+  try {
+    await api.post(`/members/me/site-visits/${record.id}/status`, { status }, { headers: authHeader() });
+    infoMsg.value = status === 'done' ? 'Site visit marked as done.' : 'Site visit marked as "didn’t show up".';
+    await refreshSiteVisitPool();
+  } catch (err) {
+    errorMsg.value = extractErrorMessage(err, 'Could not update the site visit.');
+  } finally {
+    siteVisitActionId.value = null;
+  }
+};
+
+const openTransfer = async (record) => {
+  transferTargetId.value = '';
+  transferOpenId.value = record.id;
+  await ensureMembersLoaded();
+};
+const cancelTransfer = () => { transferOpenId.value = null; transferTargetId.value = ''; };
+const submitTransfer = async (record) => {
+  if (!transferTargetId.value) { errorMsg.value = 'Pick a member to transfer to.'; return; }
+  siteVisitActionId.value = record.id;
+  errorMsg.value = '';
+  try {
+    await api.post(`/members/me/site-visits/${record.id}/transfer`, { member_id: transferTargetId.value }, { headers: authHeader() });
+    infoMsg.value = 'Site visit transferred.';
+    cancelTransfer();
+    await refreshSiteVisitPool();
+  } catch (err) {
+    errorMsg.value = extractErrorMessage(err, 'Could not transfer the site visit.');
+  } finally {
+    siteVisitActionId.value = null;
+  }
+};
+
 const inviteToken = ref('');
 const inviteContext = ref(null);
 const invitePassword = ref('');
@@ -985,6 +1060,13 @@ const toggleThemeMode = () => {
 };
 
 const switchPage = (page) => {
+  // Member/viewer accounts only have their own surfaces — the timetable and
+  // (real estate) the ticket board. Redirect any attempt to reach an
+  // admin-only page (dashboard, leads, agent, …) — whether from the brand
+  // logo, a stale URL or a deep-link — back to their own home.
+  if (isMemberOnly.value && !['my_timetable', 'ticket_board'].includes(page)) {
+    page = 'my_timetable';
+  }
   if (page === 'appointments' && !showAppointmentsTab.value) return;
   if (page === 'tickets' && !showTicketsTab.value) return;
   // Ticket Board is a real-estate-only claim surface (members + admins).
@@ -1296,6 +1378,12 @@ const enterWorkspaceAfterAuth = async () => {
   if (isMemberOnly.value) {
     authState.value = 'ready';
     currentPage.value = 'my_timetable';
+    // Keep the URL in step with the member's landing page so it doesn't sit
+    // on a stale /dashboard route from a previous admin session.
+    const mttRoute = pageKeyToRouteName['my_timetable'];
+    if (mttRoute && route.name !== mttRoute) {
+      router.push({ name: mttRoute }).catch(() => {});
+    }
     await loadMyTimetable();
     return;
   }
@@ -6185,6 +6273,15 @@ const handleLogout = async () => {
   endVoiceCall();
   closeFieldEdit();
   closeAssignmentEdit();
+  // Reset the active page + URL to a clean baseline. Otherwise the previous
+  // account's page (e.g. the admin dashboard) lingers as `currentPage` and
+  // the next login — whose bootstrap may not re-set the page for its role —
+  // renders the stale view until a manual refresh re-syncs from the URL.
+  currentPage.value = 'dashboard';
+  const baseRoute = pageKeyToRouteName['dashboard'];
+  if (baseRoute && route.name !== baseRoute) {
+    router.push({ name: baseRoute }).catch(() => {});
+  }
   authState.value = 'login';
 };
 
@@ -6318,6 +6415,14 @@ provideDashboardState({
   loadClaimableSiteVisits,
   refreshSiteVisitPool,
   claimSiteVisit,
+  siteVisitActionId,
+  setSiteVisitStatus,
+  transferOpenId,
+  transferTargetId,
+  transferMembers,
+  openTransfer,
+  cancelTransfer,
+  submitTransfer,
 
   // Tabs / records / business type
   businessTypeLabel,
@@ -6736,13 +6841,6 @@ provideDashboardState({
 
       <!-- RIGHT: form -->
       <section class="auth-v2__form-shell">
-        <div class="auth-v2__brand auth-v2__brand--mobile">
-          <span class="auth-v2__brand-mark">
-            <span class="auth-v2__brand-glyph">N</span>
-          </span>
-          <span class="auth-v2__brand-name">Nokvo<span>/One</span></span>
-        </div>
-
         <div class="auth-v2__card">
         <div v-if="errorMsg" class="message error">{{ errorMsg }}</div>
         <div v-else-if="infoMsg" class="message info">{{ infoMsg }}</div>
@@ -7779,7 +7877,7 @@ provideDashboardState({
       <header class="n-shell-dock" role="banner">
         <div class="n-shell-dock__glow" aria-hidden="true"></div>
         <div class="n-shell-dock__inner">
-          <a class="n-shell-brand" href="#" @click.prevent="switchPage('dashboard')" aria-label="Nokvo One home">
+          <a class="n-shell-brand" href="#" @click.prevent="switchPage(isMemberOnly ? 'my_timetable' : 'dashboard')" aria-label="Nokvo One home">
             <span class="n-shell-brand__mark">
               <img src="../assets/nokvo-logo.png" alt="Nokvo" class="n-shell-brand__image" />
             </span>
@@ -7891,6 +7989,15 @@ provideDashboardState({
 
           <div class="n-shell-foot">
 
+            <button
+              type="button"
+              class="n-shell-icon-btn n-shell-feedback__trigger"
+              @click="openFeedback"
+              aria-label="Feedback / Suggest a feature"
+              title="Feedback / Suggest a feature"
+            >
+              <MessageSquare :size="15" />
+            </button>
 
             <div v-if="!isMemberOnly" class="n-shell-bell">
               <button
@@ -7988,6 +8095,33 @@ provideDashboardState({
       </section>
 
       <router-view v-if="authState === 'ready'" />
+
+      <!-- Feedback / Suggest-a-feature modal -->
+      <div v-if="feedbackOpen" class="fb-overlay" @click.self="feedbackOpen = false">
+        <div class="fb-modal" role="dialog" aria-label="Send feedback">
+          <header class="fb-modal__head">
+            <h3>Feedback &amp; feature requests</h3>
+            <button type="button" class="fb-modal__close" aria-label="Close" @click="feedbackOpen = false">✕</button>
+          </header>
+          <div class="fb-modal__seg">
+            <button type="button" :class="{ 'is-on': feedbackForm.category === 'feedback' }" @click="feedbackForm.category = 'feedback'">Feedback</button>
+            <button type="button" :class="{ 'is-on': feedbackForm.category === 'feature' }" @click="feedbackForm.category = 'feature'">Suggest a feature</button>
+          </div>
+          <textarea
+            v-model="feedbackForm.message"
+            class="fb-modal__text"
+            rows="5"
+            maxlength="5000"
+            :placeholder="feedbackForm.category === 'feature' ? 'Describe the feature you’d love to see…' : 'Tell us what’s working, what’s not, or any idea…'"
+          ></textarea>
+          <footer class="fb-modal__foot">
+            <button type="button" class="n-btn n-btn--ghost n-btn--sm" @click="feedbackOpen = false">Cancel</button>
+            <button type="button" class="n-btn n-btn--brand n-btn--sm" :disabled="isSubmittingFeedback || !feedbackForm.message.trim()" @click="submitFeedback">
+              {{ isSubmittingFeedback ? 'Sending…' : 'Send' }}
+            </button>
+          </footer>
+        </div>
+      </div>
     </main>
 
     <div v-if="pendingLeadOAuth" class="field-modal-shell">
@@ -8690,6 +8824,36 @@ provideDashboardState({
   box-shadow: 0 0 0 1px rgba(99, 102, 241, 0.16) inset;
 }
 
+/* ─── Feedback modal ─────────── */
+.fb-overlay {
+  position: fixed; inset: 0; z-index: 1000;
+  background: rgba(10, 10, 12, 0.45);
+  display: flex; align-items: center; justify-content: center;
+  padding: 20px;
+}
+.fb-modal {
+  width: 460px; max-width: 100%;
+  background: var(--n-bg-elev, #fff);
+  border: 1px solid var(--n-border, #e3e3e3);
+  border-radius: 14px;
+  padding: 18px 18px 16px;
+  box-shadow: 0 18px 50px rgba(0,0,0,0.25);
+}
+.fb-modal__head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.fb-modal__head h3 { margin: 0; font-size: 15px; font-weight: 700; }
+.fb-modal__close { background: none; border: none; font-size: 16px; cursor: pointer; color: var(--n-text-3, #888); line-height: 1; padding: 4px; }
+.fb-modal__seg { display: inline-flex; border: 1px solid var(--n-border, #e3e3e3); border-radius: 8px; overflow: hidden; margin-bottom: 12px; }
+.fb-modal__seg button { padding: 6px 14px; font-size: 12.5px; font-weight: 600; background: transparent; border: none; cursor: pointer; color: var(--n-text-2, #666); }
+.fb-modal__seg button.is-on { background: var(--n-brand, #4f46e5); color: #fff; }
+.fb-modal__text {
+  width: 100%; box-sizing: border-box; resize: vertical;
+  border: 1px solid var(--n-border, #d9d9d9); border-radius: 8px;
+  padding: 10px 12px; font: inherit; font-size: 13.5px; line-height: 1.45;
+  background: var(--n-bg, #fff); color: inherit;
+}
+.fb-modal__foot { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+.n-shell-feedback__trigger { color: var(--n-text-2, #777); }
+
 /* ─── Bell + notif panel (opens upward) ─────────── */
 .n-shell-bell { position: relative; }
 .n-shell-bell__trigger { position: relative; }
@@ -8993,10 +9157,33 @@ provideDashboardState({
   .n-shell-user { padding: 3px; }
 }
 @media (max-width: 720px) {
-  .n-shell-dock { left: 12px; right: 12px; transform: none; bottom: max(12px, env(safe-area-inset-bottom, 0px)); }
+  /* The dock wraps onto multiple rows on phones so every nav item stays
+     reachable. We intentionally do NOT make the dock a scroll container —
+     that would clip the upward-opening notification / settings popovers.
+     Bottom padding is generous so a 3-row dock never overlaps content. */
+  .n-shell { padding-bottom: calc(150px + env(safe-area-inset-bottom)); }
+  .n-shell-dock { left: 8px; right: 8px; transform: none; bottom: max(8px, env(safe-area-inset-bottom, 0px)); }
   @keyframes nDockRise { from { opacity: 0; transform: translateY(16px); } to { opacity: 1; transform: translateY(0); } }
-  .n-shell-dock__inner { width: 100%; justify-content: space-between; }
+  .n-shell-dock__inner {
+    width: 100%;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 4px;
+    padding: 8px;
+  }
+  .n-shell-nav { flex-wrap: wrap; justify-content: center; gap: 4px; }
   .n-shell-dock__rule { display: none; }
+  /* Keep the brand mark in the dock from eating a whole row. */
+  .n-shell-brand { padding: 2px; }
+}
+@media (max-width: 480px) {
+  .n-shell-nav__item, .n-shell-icon-btn { padding: 8px; }
+}
+@media (max-width: 380px) {
+  .n-shell { padding-bottom: calc(168px + env(safe-area-inset-bottom)); }
+  .n-shell-nav__item, .n-shell-icon-btn { padding: 7px; }
+  .n-shell-dock__inner { gap: 2px; }
+  .n-shell-nav { gap: 2px; }
 }
 
 /* ============================================================
@@ -10412,6 +10599,19 @@ provideDashboardState({
   background: var(--surface);
   box-shadow: 0 28px 90px -34px rgba(27, 28, 21, 0.45);
   padding: 1.4rem;
+}
+
+/* Phone: modals become near-fullscreen sheets with tighter padding and
+   full-width, stacked action buttons that are easy to tap. */
+@media (max-width: 600px) {
+  .field-modal-shell { padding: 12px; align-items: flex-start; }
+  .field-modal {
+    max-height: 92vh;
+    padding: 1.1rem;
+    border-radius: 0.9rem;
+  }
+  .field-modal-actions { flex-direction: column-reverse; }
+  .field-modal-actions > * { width: 100%; }
 }
 
 .field-editor-list {

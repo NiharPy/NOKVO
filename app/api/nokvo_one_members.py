@@ -7,6 +7,7 @@ import uuid
 from datetime import datetime, time, timedelta, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -424,7 +425,17 @@ def _serialize_record(r) -> dict:
 # Site-visit claim pool. Real-estate site visits are no longer auto-assigned —
 # they land here unassigned (no ``assigned_agent_id``) and any member can claim
 # one, which allots it to them. ``/me/`` so a member can only act as themselves.
-_SITE_VISIT_TERMINAL_STATUSES = {"resolved", "closed"}
+_SITE_VISIT_TERMINAL_STATUSES = {"resolved", "closed", "done", "no_show"}
+# Outcomes a member can set on a claimed site visit.
+_SITE_VISIT_OUTCOMES = {"done", "no_show"}
+
+
+class SiteVisitStatusRequest(BaseModel):
+    status: str  # 'done' | 'no_show'
+
+
+class SiteVisitTransferRequest(BaseModel):
+    member_id: uuid.UUID
 
 
 @router.get("/me/claimable-site-visits")
@@ -508,6 +519,99 @@ async def claim_site_visit(
     # "in_progress" is the real-estate ticket forward-status for picked-up work
     # ("assigned" isn't in that vocabulary, so the tab would render it oddly).
     if (record.status or "").strip().lower() not in _SITE_VISIT_TERMINAL_STATUSES:
+        record.status = "in_progress"
+    db.add(record)
+    await db.commit()
+    await db.refresh(record)
+    return _serialize_record(record)
+
+
+async def _claimed_site_visit_for_action(
+    db: AsyncSession, *, record_id: uuid.UUID, user: OrganizationUser
+):
+    """Load a claimed site-visit ticket and authorize the caller to act on it
+    (the member who holds it, or an admin). Returns (record, data)."""
+    from app.models.nokvo_one_tool_record import NokvoOneToolRecord
+
+    res = await db.execute(
+        select(NokvoOneToolRecord)
+        .where(
+            NokvoOneToolRecord.id == record_id,
+            NokvoOneToolRecord.organization_id == user.organization_id,
+            NokvoOneToolRecord.record_type == "ticket",
+        )
+        .with_for_update()
+    )
+    record = res.scalars().first()
+    if record is None:
+        raise HTTPException(status_code=404, detail="Site visit not found")
+    data = dict(record.data or {})
+    assigned = str(data.get("assigned_member_id") or "").strip()
+    if not assigned:
+        raise HTTPException(status_code=400, detail="This site visit hasn't been claimed yet.")
+    if assigned != str(user.id) and user.role != "admin":
+        raise HTTPException(status_code=403, detail="Only the assigned member or an admin can do that.")
+    return record, data
+
+
+@router.post("/me/site-visits/{record_id}/status")
+async def set_site_visit_status(
+    record_id: uuid.UUID,
+    payload: SiteVisitStatusRequest,
+    user: OrganizationUser = Depends(
+        deps.RequireNokvoOneOrganization(allowed_statuses=["active"])
+    ),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Mark a claimed site visit as ``done`` or ``no_show`` (caller must hold it
+    or be an admin)."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    status_val = (payload.status or "").strip().lower()
+    if status_val not in _SITE_VISIT_OUTCOMES:
+        raise HTTPException(status_code=400, detail="status must be 'done' or 'no_show'.")
+    record, data = await _claimed_site_visit_for_action(db, record_id=record_id, user=user)
+    record.status = status_val
+    data["outcome"] = status_val
+    data["completed_at"] = datetime.now(timezone.utc).isoformat()
+    data["completed_by"] = user.full_name
+    record.data = data
+    flag_modified(record, "data")
+    db.add(record)
+    await db.commit()
+    await db.refresh(record)
+    return _serialize_record(record)
+
+
+@router.post("/me/site-visits/{record_id}/transfer")
+async def transfer_site_visit(
+    record_id: uuid.UUID,
+    payload: SiteVisitTransferRequest,
+    user: OrganizationUser = Depends(
+        deps.RequireNokvoOneOrganization(allowed_statuses=["active"])
+    ),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Hand a claimed site visit to another member in the org (caller must hold
+    it or be an admin)."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    target = await _get_member(db, user.organization_id, payload.member_id)
+    if target.status == "removed":
+        raise HTTPException(status_code=400, detail="That member is no longer active.")
+    record, data = await _claimed_site_visit_for_action(db, record_id=record_id, user=user)
+    if str(target.id) == str(data.get("assigned_member_id") or ""):
+        raise HTTPException(status_code=400, detail="This visit is already assigned to that member.")
+    data["assigned_member_id"] = str(target.id)
+    data["assigned_agent_id"] = str(target.id)
+    data["agent"] = target.full_name
+    data["assigned_to"] = target.full_name
+    data["transferred_at"] = datetime.now(timezone.utc).isoformat()
+    data["transferred_by"] = user.full_name
+    record.data = data
+    flag_modified(record, "data")
+    # A transfer re-activates the visit if it had been concluded.
+    if (record.status or "").strip().lower() in _SITE_VISIT_TERMINAL_STATUSES:
         record.status = "in_progress"
     db.add(record)
     await db.commit()

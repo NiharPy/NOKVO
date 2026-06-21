@@ -267,6 +267,65 @@ class PlivoService:
         auth = cls._master_auth()
         await cls._request("DELETE", f"{cls._base(auth[0])}/Number/{number}/", auth=auth)
 
+    @classmethod
+    async def set_tenant_number(
+        cls,
+        tenant_res: TenantResources,
+        db,
+        *,
+        number: str,
+        reassign: bool = True,
+        base: str | None = None,
+    ) -> dict[str, Any]:
+        """Point a tenant at a different DID (operator override).
+
+        Persists ``provider_status.plivo.number`` (+ ``twilio_phone_number``) and,
+        when ``reassign`` and the tenant has a Plivo Application, best-effort binds
+        the DID to that Application + subaccount and re-syncs the answer webhook so
+        inbound calls route. Telephony API failures are reported, never fatal — the
+        stored number still updates so outbound caller-ID is correct.
+        """
+        from sqlalchemy.orm.attributes import flag_modified
+
+        number = (number or "").strip()
+        if not number:
+            raise PlivoError("A phone number is required.")
+
+        cfg = cls._plivo_config(tenant_res)
+        previous = cfg.get("number") or tenant_res.twilio_phone_number
+        app_id = cfg.get("application_id")
+        sub_auth_id = cfg.get("subaccount_auth_id")
+
+        result: dict[str, Any] = {"number": number, "previous": previous, "assigned": False, "webhook": None}
+
+        if reassign and app_id:
+            try:
+                await cls.assign_number(number, app_id=str(app_id), sub_auth_id=sub_auth_id)
+                result["assigned"] = True
+            except Exception as exc:  # noqa: BLE001
+                result["assign_error"] = str(exc)
+
+        provider_status = dict(tenant_res.provider_status or {})
+        plivo_cfg = dict(provider_status.get("plivo") or {})
+        plivo_cfg["number"] = number
+        provider_status["plivo"] = plivo_cfg
+        tenant_res.provider_status = provider_status
+        tenant_res.twilio_phone_number = number
+        try:
+            flag_modified(tenant_res, "provider_status")
+        except Exception:
+            pass
+        db.add(tenant_res)
+        await db.commit()
+
+        if reassign and base and app_id:
+            try:
+                result["webhook"] = await cls.resync_tenant_webhook(tenant_res, db, base=base)
+            except Exception as exc:  # noqa: BLE001
+                result["webhook"] = {"updated": False, "error": str(exc)}
+
+        return result
+
     # ── outbound ─────────────────────────────────────────────────────────────────
     @classmethod
     def outbound_caller_id(cls, tenant_res: TenantResources) -> str | None:

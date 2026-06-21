@@ -414,6 +414,7 @@
   box-shadow: var(--n-shadow-focus);
 }
 .n-textarea { resize: vertical; min-height: 96px; }
+.n-input--sm { padding: 6px 10px; font-size: var(--n-t-caption); width: auto; }
 
 /* ─── Tag / chip / pill ────────────────────────────── */
 .n-tag {
@@ -436,6 +437,7 @@
 .n-tag--warning { background: var(--n-warning-soft); color: var(--n-warning); border-color: transparent; }
 .n-tag--danger { background: var(--n-danger-soft); color: var(--n-danger-2); border-color: transparent; }
 .n-tag--mono { font-family: var(--n-font-mono); font-size: 10.5px; letter-spacing: 0.04em; }
+.n-tag--muted { background: var(--n-surface); color: var(--n-text-3); border-color: var(--n-border); }
 
 /* ─── Divider ─────────────────────────────────────── */
 .n-divider {
@@ -679,3 +681,60 @@
 }
 .n-page ::-webkit-scrollbar-thumb:hover { background: var(--n-text-4); background-clip: padding-box; border: 2px solid transparent; }
 .n-page ::-webkit-scrollbar-track { background: transparent; }
+
+/* ============================================================
+   Responsive — phone & small-tablet layout
+   ----------------------------------------------------------------
+   The per-view split grids already collapse around 1000–1100px.
+   This layer tightens the shared chrome (page padding, cards,
+   tables, page heads, modals) for true phone widths and guards
+   against any single element forcing horizontal page scroll.
+   ============================================================ */
+
+/* Never let one wide child scroll the whole page sideways. */
+html, body { max-width: 100%; overflow-x: hidden; }
+/* Media & embeds stay within their column. */
+.n-page img,
+.n-page video,
+.n-page canvas { max-width: 100%; height: auto; }
+
+@media (max-width: 768px) {
+  /* Tighter page frame so content gets the width back. */
+  :root {
+    --n-page-x: 18px;
+    --n-page-y: 24px;
+    --n-content-w: 100%;
+  }
+  .n-page { gap: var(--n-s-6); }
+
+  /* Page / section heads stack instead of justifying across. */
+  .n-page-head { padding-bottom: var(--n-s-4); }
+  .n-page-head__row,
+  .n-section__head { flex-direction: column; align-items: stretch; gap: var(--n-s-3); }
+  .n-page-head__title { font-size: clamp(24px, 7vw, 30px); }
+
+  /* Cards & stats: reclaim the inner padding. */
+  .n-card { padding: var(--n-s-5); }
+  .n-card--inset { padding: var(--n-s-4); }
+  .n-stat { padding: var(--n-s-4); }
+
+  /* Wide record tables scroll horizontally rather than clip. */
+  .n-table { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+
+  /* Segmented pill navs scroll instead of overflowing. */
+  .n-pillnav {
+    display: flex;
+    max-width: 100%;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .n-pillnav::-webkit-scrollbar { display: none; }
+  .n-pillnav__btn { flex: 0 0 auto; }
+}
+
+@media (max-width: 480px) {
+  :root { --n-page-x: 14px; }
+  /* Touch-friendly default control sizing. */
+  .n-btn { padding: 10px 14px; }
+  .n-input, .n-select, .n-textarea { font-size: 16px; } /* prevents iOS zoom-on-focus */
+}

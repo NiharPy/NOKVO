@@ -49,6 +49,7 @@ from app.api import (
     nokvo_one_members,
     nokvo_one_agents,
     nokvo_one_billing,
+    billing_invoicing,
     nokvo_one_customers,
     nokvo_one_outcomes,
     nokvo_one_projects,
@@ -84,6 +85,13 @@ app.include_router(
     nokvo_one_billing.router,
     prefix="/api/nokvo-one",
     tags=["nokvo-one-billing"],
+)
+
+# Internal billing (recurring usage-invoice mailer; cron-secret guarded).
+app.include_router(
+    billing_invoicing.router,
+    prefix="/api/internal/billing",
+    tags=["internal-billing"],
 )
 
 # Nokvo Connect — Nokvo One organizations only. Admin key management lives
@@ -218,6 +226,10 @@ from app.services.plivo_number_poller import (  # noqa: E402
     start_plivo_number_poller,
     stop_plivo_number_poller,
 )
+from app.services.llm_pool import (  # noqa: E402
+    start_llm_pool_refresher,
+    stop_llm_pool_refresher,
+)
 # Prompt-observability seam. ``init_tracer`` reads the LangSmith config
 # and sets up the SDK (or no-ops cleanly when LANGSMITH_API_KEY is unset).
 from app.services.langsmith_tracer import init_tracer  # noqa: E402
@@ -240,6 +252,7 @@ async def _start_retry_scheduler() -> None:
     start_lead_sync_scheduler()
     start_followup_scheduler()
     start_plivo_number_poller()
+    start_llm_pool_refresher()
     # Public-URL sanity: a wrong/unset PLIVO_WEBHOOK_BASE_URL is the #1 cause
     # of "inbound calls don't connect" (Plivo can't reach the webhook or the
     # media WS). Loud ERROR logs, never fatal — provisioning degrades anyway.
@@ -277,3 +290,4 @@ async def _stop_retry_scheduler() -> None:
     await stop_lead_sync_scheduler()
     await stop_followup_scheduler()
     await stop_plivo_number_poller()
+    await stop_llm_pool_refresher()

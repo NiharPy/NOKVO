@@ -40,6 +40,16 @@ class Settings(BaseSettings):
     NOKVO_ONE_EMAIL_TOKEN_TTL_HOURS: int = 24
     NOKVO_ONE_INVITE_TOKEN_TTL_HOURS: int = 72
 
+    # Recurring usage-invoice mailer. The internal endpoint that runs the
+    # billing cycle is guarded by this shared secret (sent as the
+    # ``X-Cron-Secret`` header by the scheduler). Empty in dev = endpoint
+    # rejects all calls unless a secret is configured.
+    BILLING_CRON_SECRET: str = ""
+    USAGE_INVOICE_ENABLED: bool = True
+    # Don't reprocess more than this many overdue cycles for one org in a single
+    # run — a safety cap against a runaway catch-up loop.
+    USAGE_INVOICE_MAX_CYCLES_PER_RUN: int = 6
+
     # Nokvo One onboarding v2 (outcome wizard, deferred MFA, simplified nav).
     # When false, the legacy onboarding flow is preserved exactly. The v2 surface
     # piggybacks on the same auth states + endpoints; it only changes how the
@@ -153,6 +163,9 @@ class Settings(BaseSettings):
     AZURE_OPENAI_POOL_MODEL: str = "gpt-5-mini"
     LLM_POOL_WINDOW_SECONDS: int = 60
     LLM_POOL_DEFAULT_TPM: int = 200000
+    # How often each instance re-reads the DB-managed pool keys (llm_pool_keys)
+    # so SuperAdmin changes propagate without a redeploy.
+    LLM_POOL_DB_REFRESH_SECONDS: int = 30
     # gpt-5 family is a REASONING model: with the default effort its reasoning
     # tokens eat the whole max_output_tokens budget → empty visible reply. For a
     # latency-sensitive voice agent we want minimal reasoning so the budget goes
@@ -491,6 +504,15 @@ class Settings(BaseSettings):
     # USD Azure/Sarvam/Plivo invoices as the rate drifts. Revisit with a live
     # FX feed or INR-native vendor rates if call volume scales up.
     USD_TO_INR: float = 86.0
+
+    # Blended COGS per BILLED minute (INR), used by the SuperAdmin console to
+    # compute margin as ``revenue − (COGS_PER_MINUTE_INR × billed_minutes)``.
+    # A flat per-minute rate gives a complete, consistent COGS for every call
+    # (the per-component ``cost_*_inr`` columns are NULL on uninstrumented/older
+    # calls, which would undercount COGS and overstate margin). Derived from the
+    # fixed STT+telephony floor (~₹2.15/min) plus typical LLM+TTS (~₹1/min);
+    # tune as vendor rates / call density change.
+    COGS_PER_MINUTE_INR: float = 3.2
 
 
     # Provider APIs

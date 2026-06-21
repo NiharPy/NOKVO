@@ -160,6 +160,9 @@ class LLMPool:
 
     _redis: redis.Redis | None = None
     _members_cache: dict[str, list[PoolMember]] = {}
+    # DB-backed pool keys (managed from the SuperAdmin console), refreshed by a
+    # background task so all instances pick up changes within a few seconds.
+    _db_members: dict[str, list[PoolMember]] = {}
     _MAX_RETRY_WAIT = 1.5
     _RETRY_BASE = 0.25
 
@@ -174,7 +177,57 @@ class LLMPool:
     def members(cls, pool: str = "mini") -> list[PoolMember]:
         if pool not in cls._members_cache:
             cls._members_cache[pool] = _members(pool)
-        return cls._members_cache[pool]
+        env_members = cls._members_cache[pool]
+        db_members = cls._db_members.get(pool) or []
+        if not db_members:
+            return env_members
+        # Merge live DB-managed keys, de-duped by endpoint (env wins on clash).
+        merged = list(env_members)
+        seen = {m.endpoint for m in merged}
+        for m in db_members:
+            if m.endpoint not in seen:
+                merged.append(m)
+                seen.add(m.endpoint)
+        return merged
+
+    @classmethod
+    async def reload_db_members(cls) -> int:
+        """Re-read enabled ``llm_pool_keys`` rows into the live pool. Returns the
+        number of DB members loaded. Best-effort: failures leave the cache as-is."""
+        from app.core.secret_crypto import decrypt_secret
+        from app.db.session import AsyncSessionLocal
+        from app.models.llm_pool_key import LlmPoolKey
+
+        try:
+            async with AsyncSessionLocal() as db:
+                from sqlalchemy import select
+
+                rows = (
+                    await db.execute(select(LlmPoolKey).where(LlmPoolKey.enabled.is_(True)))
+                ).scalars().all()
+            buckets: dict[str, list[PoolMember]] = {}
+            for r in rows:
+                try:
+                    api_key = decrypt_secret(r.api_key_enc)
+                except Exception:
+                    continue
+                endpoint = (r.endpoint or "").rstrip("/")
+                if not endpoint or not api_key:
+                    continue
+                buckets.setdefault(r.pool or "mini", []).append(
+                    PoolMember(
+                        key_id=f"db:{r.id}",
+                        endpoint=endpoint,
+                        api_key=api_key,
+                        deployment=r.deployment
+                        or (settings.AZURE_OPENAI_NANO_DEPLOYMENT if (r.pool == "nano") else settings.AZURE_OPENAI_POOL_MODEL),
+                        tpm=int(r.tpm or settings.LLM_POOL_DEFAULT_TPM),
+                    )
+                )
+            cls._db_members = buckets
+            return sum(len(v) for v in buckets.values())
+        except Exception:  # noqa: BLE001 — never let a refresh failure break calls
+            return -1
 
     @classmethod
     def reset_cache(cls) -> None:
@@ -330,3 +383,42 @@ async def _sleep(seconds: float) -> None:
     import asyncio
 
     await asyncio.sleep(max(0.0, seconds))
+
+
+# ── DB-managed pool key refresher ────────────────────────────────────────────
+# A lightweight background loop so every instance re-reads ``llm_pool_keys`` on
+# an interval, letting SuperAdmin key changes take effect without a redeploy.
+_refresher_task = None
+
+
+async def _llm_pool_refresh_loop() -> None:
+    import asyncio
+    import logging
+
+    log = logging.getLogger(__name__)
+    interval = max(5, int(settings.LLM_POOL_DB_REFRESH_SECONDS or 30))
+    while True:
+        n = await LLMPool.reload_db_members()
+        if n > 0:
+            log.debug("LLM-POOL: loaded %d DB-managed key(s)", n)
+        await asyncio.sleep(interval)
+
+
+def start_llm_pool_refresher() -> None:
+    import asyncio
+    import logging
+
+    global _refresher_task
+    if _refresher_task is not None:
+        return
+    try:
+        _refresher_task = asyncio.get_event_loop().create_task(_llm_pool_refresh_loop())
+    except Exception:  # noqa: BLE001
+        logging.getLogger(__name__).exception("LLM-POOL: failed to start refresher")
+
+
+async def stop_llm_pool_refresher() -> None:
+    global _refresher_task
+    if _refresher_task is not None:
+        _refresher_task.cancel()
+        _refresher_task = None

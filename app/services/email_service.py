@@ -6,6 +6,7 @@ import functools
 import html
 import logging
 import pathlib
+import re
 import smtplib
 from email.message import EmailMessage
 from urllib.parse import urlencode
@@ -147,6 +148,110 @@ class EmailService:
 </body></html>"""
 
     @staticmethod
+    def _text_to_paragraphs_html(text: str) -> str:
+        """Turn an admin-authored plain-text body into safe HTML paragraphs.
+
+        Blank lines split paragraphs; single newlines become <br>. Everything
+        is HTML-escaped so a broadcast can never inject markup.
+        """
+        blocks = [b.strip() for b in re.split(r"\n\s*\n", (text or "").strip()) if b.strip()]
+        out = []
+        for block in blocks:
+            safe = html.escape(block).replace("\n", "<br>")
+            out.append(
+                f'<p style="margin:0 0 14px;font:400 15px/24px Helvetica,Arial,sans-serif;color:{_MUTED};">{safe}</p>'
+            )
+        return "".join(out)
+
+    @staticmethod
+    def _branded_message_html(
+        *,
+        preheader: str,
+        eyebrow: str,
+        heading: str,
+        body_html: str,
+        cta_label: str | None = None,
+        cta_url: str | None = None,
+        footer_html: str | None = None,
+    ) -> str:
+        """Same B&W boxy shell as the invite, but for a free-form announcement.
+
+        The CTA + fallback-link blocks render only when ``cta_url`` is given, so
+        a plain broadcast (no link) still looks on-theme.
+        """
+        year = datetime.datetime.now().year
+        logo_img = (
+            f'<img src="cid:{_LOGO_CID}" alt="" width="31" height="22" '
+            f'style="display:inline-block;height:22px;width:auto;border:0;vertical-align:middle;margin-right:10px;">'
+            if _logo_bytes() is not None
+            else ""
+        )
+        cta_block = ""
+        fallback_block = ""
+        if cta_url:
+            cta_block = (
+                f'<tr><td style="padding:26px 36px 10px;">'
+                f'<table role="presentation" cellpadding="0" cellspacing="0"><tr>'
+                f'<td style="background:{_BLACK};border:2px solid {_LINE};box-shadow:6px 6px 0 {_LINE};">'
+                f'<a href="{html.escape(cta_url, quote=True)}" target="_blank" '
+                f'style="display:inline-block;padding:14px 28px;font:800 14px/1 Helvetica,Arial,sans-serif;letter-spacing:.08em;text-transform:uppercase;color:#ffffff;text-decoration:none;">'
+                f'{html.escape(cta_label or "Open")}&nbsp;&rarr;</a>'
+                f"</td></tr></table></td></tr>"
+            )
+            fallback_block = (
+                f'<tr><td style="padding:18px 36px 0;">'
+                f'<p style="margin:0 0 6px;font:600 11px/16px Helvetica,Arial,sans-serif;letter-spacing:.06em;text-transform:uppercase;color:{_FAINT};">Or paste this link into your browser</p>'
+                f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>'
+                f'<td style="border:1px solid {_HAIRLINE};background:{_CANVAS};padding:10px 12px;">'
+                f"<span style=\"font:400 12px/18px 'SFMono-Regular',Menlo,Consolas,monospace;color:{_INK};word-break:break-all;\">{html.escape(cta_url)}</span>"
+                f"</td></tr></table></td></tr>"
+            )
+        footer_block = footer_html or (
+            "You’re receiving this because your organization uses Nokvo One."
+        )
+        return f"""\
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light only">
+<meta name="supported-color-schemes" content="light">
+<title>{html.escape(eyebrow)}</title></head>
+<body style="margin:0;padding:0;background:{_CANVAS};">
+<div style="display:none;max-height:0;overflow:hidden;opacity:0;">{html.escape(preheader)}</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:{_CANVAS};">
+  <tr><td align="center" style="padding:36px 16px;">
+    <table role="presentation" width="480" cellpadding="0" cellspacing="0" style="width:480px;max-width:100%;">
+      <tr><td style="background:{_CARD};border:2px solid {_LINE};">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+          <tr><td style="padding:20px 36px;border-bottom:2px solid {_LINE};">
+            {logo_img}<span style="font:800 18px/1 Helvetica,Arial,sans-serif;letter-spacing:.12em;color:{_INK};vertical-align:middle;">NOKVO</span>
+          </td></tr>
+          <tr><td style="padding:34px 36px 4px;">
+            <span style="display:inline-block;border:1.5px solid {_LINE};padding:4px 9px;font:700 10px/1 Helvetica,Arial,sans-serif;letter-spacing:.14em;text-transform:uppercase;color:{_INK};">{html.escape(eyebrow)}</span>
+          </td></tr>
+          <tr><td style="padding:16px 36px 0;">
+            <h1 style="margin:0;font:800 28px/32px Helvetica,Arial,sans-serif;letter-spacing:-.01em;color:{_INK};">{html.escape(heading)}</h1>
+          </td></tr>
+          <tr><td style="padding:14px 36px 0;">
+            {body_html}
+          </td></tr>
+          {cta_block}
+          {fallback_block}
+          <tr><td style="padding:26px 36px 30px;">
+            <div style="height:2px;background:{_LINE};font-size:0;line-height:0;">&nbsp;</div>
+            <p style="margin:16px 0 0;font:400 13px/20px Helvetica,Arial,sans-serif;color:{_MUTED};">{footer_block}</p>
+          </td></tr>
+        </table>
+      </td></tr>
+      <tr><td style="padding:16px 4px 4px;">
+        <p style="margin:0;font:600 11px/18px Helvetica,Arial,sans-serif;letter-spacing:.04em;color:{_FAINT};text-transform:uppercase;">© {year} NOKVO ONE · Voice agents for your business</p>
+      </td></tr>
+    </table>
+  </td></tr>
+</table>
+</body></html>"""
+
+    @staticmethod
     def _send_sync(
         to_email: str,
         subject: str,
@@ -253,5 +358,95 @@ class EmailService:
             cta_label="Accept invitation",
             cta_url=url,
             note_html=f"This invitation expires in {ttl} hours",
+        )
+        await cls.send(to_email, subject, text, html_body=html_body, inline_images=cls._brand_inline_images())
+
+    @classmethod
+    async def send_usage_invoice_email(
+        cls,
+        to_email: str,
+        *,
+        org_name: str,
+        invoice_number: str,
+        period_label: str,
+        minutes: int,
+        call_count: int,
+        amount_display: str,
+        dashboard_url: str,
+    ) -> None:
+        """Email a tenant their monthly usage invoice (B&W boxy, on-brand)."""
+        subject = f"Your Nokvo One invoice · {amount_display} · {period_label}"
+        # Itemized summary box, inline-styled so it survives Gmail/Outlook.
+        rows = [
+            ("Billing period", html.escape(period_label)),
+            ("Calls", str(call_count)),
+            ("Minutes used", f"{minutes:,}"),
+        ]
+        row_html = "".join(
+            f'<tr>'
+            f'<td style="padding:8px 0;border-bottom:1px solid {_HAIRLINE};font:400 13px/18px Helvetica,Arial,sans-serif;color:{_MUTED};">{label}</td>'
+            f'<td style="padding:8px 0;border-bottom:1px solid {_HAIRLINE};font:600 13px/18px Helvetica,Arial,sans-serif;color:{_INK};text-align:right;">{value}</td>'
+            f"</tr>"
+            for label, value in rows
+        )
+        body_html = (
+            f'<p style="margin:0 0 16px;font:400 15px/24px Helvetica,Arial,sans-serif;color:{_MUTED};">'
+            f'Here is your usage invoice for <strong style="color:{_INK};">{html.escape(org_name)}</strong>, '
+            f'covering the voice minutes used this billing cycle.</p>'
+            f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
+            f'style="border:1.5px solid {_LINE};background:{_CANVAS};">'
+            f'<tr><td style="padding:14px 16px 4px;font:700 10px/1 Helvetica,Arial,sans-serif;letter-spacing:.14em;text-transform:uppercase;color:{_FAINT};">'
+            f'Invoice {html.escape(invoice_number)}</td></tr>'
+            f'<tr><td style="padding:6px 16px 14px;">'
+            f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0">{row_html}'
+            f'<tr>'
+            f'<td style="padding:12px 0 2px;font:800 15px/20px Helvetica,Arial,sans-serif;color:{_INK};text-transform:uppercase;letter-spacing:.04em;">Amount due</td>'
+            f'<td style="padding:12px 0 2px;font:800 18px/20px Helvetica,Arial,sans-serif;color:{_INK};text-align:right;">{html.escape(amount_display)}</td>'
+            f'</tr></table></td></tr></table>'
+        )
+        text = (
+            f"Invoice {invoice_number} — {org_name}\n"
+            f"Billing period: {period_label}\n"
+            f"Calls: {call_count}\nMinutes used: {minutes:,}\n"
+            f"Amount due: {amount_display}\n\n"
+            f"View the full breakdown: {dashboard_url}\n\n— The Nokvo One team"
+        )
+        html_body = cls._branded_message_html(
+            preheader=f"Usage invoice {amount_display} for {period_label}.",
+            eyebrow="Invoice",
+            heading=f"{amount_display} due",
+            body_html=body_html,
+            cta_label="View invoice",
+            cta_url=dashboard_url,
+            footer_html=(
+                "This invoice covers metered voice usage for the period shown. "
+                "Questions? Just reply to this email."
+            ),
+        )
+        await cls.send(to_email, subject, text, html_body=html_body, inline_images=cls._brand_inline_images())
+
+    @classmethod
+    async def send_broadcast_email(
+        cls,
+        to_email: str,
+        *,
+        subject: str,
+        heading: str,
+        body_text: str,
+        eyebrow: str = "Announcement",
+        cta_label: str | None = None,
+        cta_url: str | None = None,
+    ) -> None:
+        """Send a SuperAdmin broadcast to one tenant, styled like the invite."""
+        preheader = " ".join((body_text or "").split())[:140]
+        link_line = f"\n\n{cta_label or 'Open'}: {cta_url}" if cta_url else ""
+        text = f"{heading}\n\n{(body_text or '').strip()}{link_line}\n\n— The Nokvo One team"
+        html_body = cls._branded_message_html(
+            preheader=preheader or heading,
+            eyebrow=eyebrow or "Announcement",
+            heading=heading,
+            body_html=cls._text_to_paragraphs_html(body_text),
+            cta_label=cta_label,
+            cta_url=cta_url,
         )
         await cls.send(to_email, subject, text, html_body=html_body, inline_images=cls._brand_inline_images())

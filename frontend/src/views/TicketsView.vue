@@ -32,7 +32,17 @@ const {
   claimingVisitId,
   refreshSiteVisitPool,
   claimSiteVisit,
+  siteVisitActionId,
+  setSiteVisitStatus,
+  transferOpenId,
+  transferTargetId,
+  transferMembers,
+  openTransfer,
+  cancelTransfer,
+  submitTransfer,
 } = useDashboardState();
+
+const isTerminalVisit = (r) => ['done', 'no_show', 'resolved', 'closed'].includes(String(r?.status || '').toLowerCase());
 
 // Real estate shows the claim pool instead of the raw admin tab list:
 //  · unclaimed → the pool any agent can claim (allotted on claim)
@@ -193,6 +203,32 @@ function statusTone(s) {
                 >
                   {{ claimingVisitId === r.id ? 'Claiming…' : 'Claim' }}
                 </button>
+                <span
+                  v-else-if="isRealEstateTemplate && isTerminalVisit(r)"
+                  class="n-tag"
+                  :class="r.status === 'done' ? 'n-tag--success' : 'n-tag--muted'"
+                >{{ r.status === 'done' ? 'Done' : 'No show' }}</span>
+
+                <!-- Outcome + transfer on claimed ("mine") tickets that are still open -->
+                <div
+                  v-if="isRealEstateTemplate && (siteVisitFilter || 'unclaimed') === 'mine' && !isUnclaimed(r) && !isTerminalVisit(r)"
+                  class="tickets__actions"
+                  @click.stop
+                >
+                  <div class="tickets__actions-row">
+                    <button type="button" class="n-btn n-btn--sm n-btn--brand" :disabled="siteVisitActionId === r.id" @click.stop="setSiteVisitStatus(r, 'done')">Done</button>
+                    <button type="button" class="n-btn n-btn--sm n-btn--ghost" :disabled="siteVisitActionId === r.id" @click.stop="setSiteVisitStatus(r, 'no_show')">Didn’t show up</button>
+                    <button type="button" class="n-btn n-btn--sm n-btn--ghost" :disabled="siteVisitActionId === r.id" @click.stop="transferOpenId === r.id ? cancelTransfer() : openTransfer(r)">Transfer</button>
+                  </div>
+                  <div v-if="transferOpenId === r.id" class="tickets__transfer" @click.stop>
+                    <select v-model="transferTargetId" class="n-input n-input--sm">
+                      <option value="">Transfer to…</option>
+                      <option v-for="m in transferMembers" :key="m.id" :value="m.id">{{ m.full_name || m.email }}</option>
+                    </select>
+                    <button type="button" class="n-btn n-btn--sm n-btn--brand" :disabled="siteVisitActionId === r.id || !transferTargetId" @click.stop="submitTransfer(r)">Send</button>
+                    <button type="button" class="n-btn n-btn--sm n-btn--ghost" @click.stop="cancelTransfer">Cancel</button>
+                  </div>
+                </div>
               </div>
             </li>
 
@@ -204,6 +240,15 @@ function statusTone(s) {
 </template>
 
 <style scoped>
+.tickets__actions {
+  margin-top: 8px;
+  display: grid;
+  gap: 6px;
+  justify-items: end;
+}
+.tickets__actions-row { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
+.tickets__transfer { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; justify-content: flex-end; }
+
 /* Claim-pool filter (real estate). */
 .tickets__filter { display: flex; gap: 8px; margin-bottom: 4px; }
 .tickets__filter-btn {
