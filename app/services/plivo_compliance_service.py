@@ -242,24 +242,32 @@ class PlivoComplianceService:
                 record["document_ids"] = uploaded
 
             # 3) Compliance application tying end user + documents to the number.
-            # Plivo keys requirements by a ``compliance_requirement_id`` (NOT the
-            # raw country/number_type/end_user_type triple — that 400s with
-            # "Could not find any requirement"). Plivo hands us the right id on
-            # each searchable number's ``compliance.business`` field; resolve it
-            # from an available number. NOTE: India DIDs are number_type "fixed".
+            # Plivo resolves a requirement by (country, number_type, end_user_type,
+            # OPERATION_TYPE) — omitting operation_type 400s with "Could not find
+            # any requirement". For buying an India DID the requirement is:
+            #   country=IN, number_type=local, end_user_type=business, op=buy_number
+            # Discover its ``compliance_requirement_id`` from the catalog and pass
+            # that to the application (the cleanest, version-stable path).
             country = (settings.PLIVO_NUMBER_COUNTRY or "IN").upper()
+            number_type = "local"
+            operation_type = "buy_number"
             requirement_id = record.get("compliance_requirement_id")
             if not requirement_id:
                 try:
-                    found = await PlivoService._request(
+                    reqs = await PlivoService._request(
                         "GET",
-                        f"{base}/PhoneNumber/?country_iso={country}&services=voice&limit=1",
+                        f"{base}/ComplianceRequirement/?country_iso2={country}"
+                        f"&number_type={number_type}&end_user_type=business"
+                        f"&operation_type={operation_type}",
                         auth=auth,
                     )
-                    objs = found.get("objects") or []
-                    comp_ref = ((objs[0].get("compliance") or {}) if objs else {}).get("business")
-                    if comp_ref:
-                        requirement_id = str(comp_ref).rstrip("/").rsplit("/", 1)[-1] or None
+                    cand = reqs.get("objects") or (
+                        [reqs] if (reqs.get("compliance_requirement_id") or reqs.get("id")) else []
+                    )
+                    if cand:
+                        requirement_id = str(
+                            cand[0].get("compliance_requirement_id") or cand[0].get("id") or ""
+                        ) or None
                 except PlivoError:
                     requirement_id = None
             if requirement_id:
@@ -275,9 +283,11 @@ class PlivoComplianceService:
                 if requirement_id:
                     app_body["compliance_requirement_id"] = requirement_id
                 else:
-                    # Fallback to the explicit triple — India is "fixed", not "local".
+                    # Fallback: the explicit triple WITH operation_type so Plivo can
+                    # resolve the requirement itself.
                     app_body["country_iso2"] = country
-                    app_body["number_type"] = "fixed"
+                    app_body["number_type"] = number_type
+                    app_body["operation_type"] = operation_type
                 app = await PlivoService._request(
                     "POST", f"{base}/ComplianceApplication/", auth=auth, json_body=app_body
                 )
