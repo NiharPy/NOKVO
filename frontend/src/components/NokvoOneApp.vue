@@ -1741,6 +1741,15 @@ const restoreSession = async () => {
     const { data } = await api.get('/me', { headers: { Authorization: `Bearer ${token}` } });
     currentUser.value = data.user;
     currentOrganization.value = data.organization;
+    // The bare /nokvo-one and /nokvo-one/signin are the login entry. Don't
+    // auto-resume an in-progress ONBOARDING session there — it would hijack the
+    // URL to /onboarding. Show login; the wizard resumes after sign-in, or by
+    // opening /nokvo-one/onboarding directly. (Dashboard sessions still resume.)
+    const isLoginEntry = ['nokvo-one', 'nokvo-one-signin'].includes(route.name);
+    if (isLoginEntry && data.organization?.status === 'onboarding') {
+      authState.value = 'login';
+      return true;
+    }
     await enterWorkspaceAfterAuth();
     return true;
   } catch (_) {
