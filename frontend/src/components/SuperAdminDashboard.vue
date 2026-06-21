@@ -24,6 +24,9 @@ const detailLoading = ref(false);
 const planBusy = ref('');          // org id currently mutating
 const confirmTarget = ref(null);   // { org, plan, label, direction }
 const compAck = ref(false);        // explicit "no payment will be collected" acknowledgement
+const bypassTarget = ref(null);    // pending-payment org to comp-activate
+const bypassAck = ref(false);
+const bypassPlan = ref('inbound_only');
 
 const feedbackView = ref(false);
 const feedback = ref([]);
@@ -382,6 +385,38 @@ function requestPlanChange(org) {
 
 function cancelPlanChange() { confirmTarget.value = null; compAck.value = false; }
 
+// ── Bypass payment (comp-activate a pending_payment tenant) ──
+function requestBypass(org) { bypassAck.value = false; bypassPlan.value = 'inbound_only'; bypassTarget.value = org; }
+function cancelBypass() { bypassTarget.value = null; bypassAck.value = false; }
+const confirmBypass = async () => {
+  const org = bypassTarget.value;
+  if (!org || !bypassAck.value) return;
+  const orgId = org.organization_id;
+  planBusy.value = orgId;
+  bypassTarget.value = null;
+  try {
+    const res = await fetch(`${SUPERADMIN_API_BASE}/tenants/${orgId}/bypass-payment`, {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ acknowledge_comp: true, plan: bypassPlan.value }),
+    });
+    if (res.status === 401) { emit('logout'); return; }
+    if (!res.ok) {
+      const d = await res.json().catch(() => ({}));
+      errorMsg.value = d.detail || `Bypass failed (${res.status}).`;
+      return;
+    }
+    const updated = await res.json();
+    if (detail.value && detail.value.organization_id === orgId) detail.value.status = updated.org_status;
+    const row = organizations.value.find((o) => o.organization_id === orgId);
+    if (row) row.status = updated.org_status;
+  } catch (_) {
+    errorMsg.value = 'Network error while bypassing payment.';
+  } finally {
+    planBusy.value = '';
+  }
+};
+
 const confirmPlanChange = async () => {
   const target = confirmTarget.value;
   if (!target) return;
@@ -395,7 +430,11 @@ const confirmPlanChange = async () => {
       body: JSON.stringify({ plan: target.plan, acknowledge_comp: target.direction === 'upgrade' }),
     });
     if (res.status === 401) { emit('logout'); return; }
-    if (!res.ok) { errorMsg.value = `Plan change failed (${res.status}).`; return; }
+    if (!res.ok) {
+      const d = await res.json().catch(() => ({}));
+      errorMsg.value = d.detail || `Plan change failed (${res.status}).`;
+      return;
+    }
     const updated = await res.json();
     const row = organizations.value.find((o) => o.organization_id === orgId);
     if (row) {
@@ -608,6 +647,12 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
             </div>
             <div class="detail-plan">
               <span class="plan-pill" :class="detail.calling_enabled ? 'plan-out' : 'plan-in'">{{ detail.plan_label }}</span>
+              <button
+                v-if="detail.status === 'pending_payment'"
+                class="plan-btn upgrade"
+                :disabled="planBusy === detail.organization_id"
+                @click="requestBypass(detail)"
+              >Bypass payment</button>
               <button
                 class="plan-btn"
                 :class="detail.calling_enabled ? 'downgrade' : 'upgrade'"
@@ -1060,6 +1105,38 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
       </div>
     </div>
 
+    <!-- ── Bypass payment confirm ───────────────────────────────── -->
+    <div v-if="bypassTarget" class="modal-overlay" @click.self="cancelBypass">
+      <div class="modal-card">
+        <span class="stage-eyebrow">BYPASS PAYMENT</span>
+        <h4>{{ bypassTarget.organization_name }}</h4>
+        <p>
+          Provision and activate this tenant <strong>without collecting payment</strong>,
+          moving it out of <strong>pending&nbsp;payment</strong> straight into onboarding.
+          No Razorpay charge is made.
+        </p>
+        <label class="comp-field">
+          Plan to grant
+          <select v-model="bypassPlan" class="todo-input">
+            <option value="inbound_only">Inbound only</option>
+            <option value="inbound_outbound">Inbound + Outbound</option>
+          </select>
+        </label>
+        <p class="comp-warn">
+          ⚠ This is a <strong>manual comp activation</strong> — payment is skipped and the
+          action is recorded in the audit log.
+        </p>
+        <label class="comp-ack">
+          <input type="checkbox" v-model="bypassAck" />
+          I understand this provisions a paid tenant for free (no payment will be charged).
+        </label>
+        <div class="modal-actions">
+          <button class="ghost-btn" @click="cancelBypass">CANCEL</button>
+          <button class="plan-btn upgrade" :disabled="!bypassAck" @click="confirmBypass">ACTIVATE (COMP)</button>
+        </div>
+      </div>
+    </div>
+
     <!-- ── Change Plivo number ──────────────────────────────────── -->
     <div v-if="plivoTarget" class="modal-overlay" @click.self="cancelPlivoChange">
       <div class="modal-card">
@@ -1427,6 +1504,8 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
 .comp-warn { margin: 0.8rem 0 0; padding: 0.6rem 0.7rem; font-size: 0.8rem; line-height: 1.45; color: #fbbf24; border: 1px solid rgba(251,191,36,0.4); border-radius: 8px; background: rgba(251,191,36,0.08); }
 .comp-ack { display: flex; align-items: flex-start; gap: 0.5rem; margin-top: 0.7rem; font-size: 0.8rem; color: var(--text-secondary); cursor: pointer; }
 .comp-ack input { margin-top: 0.15rem; }
+.comp-field { display: flex; flex-direction: column; gap: 0.35rem; margin-top: 0.9rem; font-size: 0.72rem; letter-spacing: 1px; text-transform: uppercase; color: var(--text-secondary); }
+.comp-field select { text-transform: none; letter-spacing: 0; }
 
 @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
 @keyframes spin { to { transform: rotate(360deg); } }

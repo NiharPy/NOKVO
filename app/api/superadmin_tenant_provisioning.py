@@ -894,3 +894,100 @@ async def change_organization_plan(
         "plan_label": _plan_label(org.plan_type),
         "calling_enabled": bool(org.calling_enabled),
     }
+
+
+class BypassPaymentPayload(BaseModel):
+    # Provisioning a tenant without collecting payment is a comp/manual grant;
+    # require an explicit acknowledgement (recorded in the audit log).
+    acknowledge_comp: bool = False
+    # Optional plan to grant for the comp tenant (when no subscription drives it).
+    plan: str | None = None  # "inbound_only" | "inbound_outbound"
+
+
+@router.post("/{organization_id}/bypass-payment")
+async def bypass_payment(
+    organization_id: str,
+    payload: BypassPaymentPayload,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: SuperAdminUser = Depends(RequireRole(_WRITE_ROLES)),
+):
+    """Comp-activate a tenant stuck in ``pending_payment`` WITHOUT a Razorpay
+    payment — runs the same idempotent provisioning the payment webhook would,
+    flipping the org into onboarding. A manual grant, so it requires an explicit
+    acknowledgement and is logged as a high-risk payment bypass."""
+    if not payload.acknowledge_comp:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Bypassing payment provisions a tenant without collecting payment. "
+                "Confirm the comp/manual activation to proceed (acknowledge_comp=true)."
+            ),
+        )
+    if payload.plan is not None and payload.plan not in PLAN_CATALOG:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown plan '{payload.plan}'. Valid: {', '.join(PLAN_CATALOG)}",
+        )
+
+    org = (
+        await db.execute(select(Organization).where(Organization.id == organization_id))
+    ).scalars().first()
+    if org is None:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    if org.status != "pending_payment":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Organization is '{org.status}', not pending_payment — nothing to bypass.",
+        )
+
+    before_status = org.status
+
+    # Run the exact post-payment activation (provision + activate + onboarding).
+    from app.api.nokvo_one_payments import activate_and_provision
+
+    try:
+        result = await activate_and_provision(db, org.id)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Provisioning failed: {exc}")
+
+    # Optional explicit plan grant (when no subscription set one).
+    if payload.plan is not None:
+        org = (
+            await db.execute(select(Organization).where(Organization.id == organization_id))
+        ).scalars().first()
+        org.plan_type = payload.plan
+        org.calling_enabled = bool(PLAN_CATALOG[payload.plan]["outbound"])
+        db.add(org)
+
+    db.add(
+        SuperAdminAuditLog(
+            superadmin_id=current_user.id,
+            action="organization_payment_bypassed",
+            risk_level="high",
+            target_type="organization",
+            target_id=str(organization_id),
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            request_id=request.headers.get("x-request-id"),
+            before_state={"status": before_status},
+            after_state={"status": result.get("org_status")},
+            metadata_={
+                "comp_grant": True,
+                "payment_skipped": True,
+                "acknowledged": True,
+                "plan": payload.plan,
+            },
+        )
+    )
+    await db.commit()
+
+    return {
+        "organization_id": str(organization_id),
+        "provisioned": bool(result.get("provisioned")),
+        "org_status": result.get("org_status"),
+        "onboarding_step": result.get("onboarding_step"),
+        "idempotent": bool(result.get("idempotent", False)),
+    }
