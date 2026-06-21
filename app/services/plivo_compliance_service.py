@@ -277,17 +277,23 @@ class PlivoComplianceService:
             if requirement_id:
                 record["compliance_requirement_id"] = requirement_id
 
-            # Self-heal a prior application filed WITHOUT documents (the document-id
-            # extraction bug): such an application can never be approved. If it has
-            # no documents but we now have them, delete it so we re-file correctly.
+            # Self-heal a stale/bad application reference so we re-file:
+            #   (a) it was filed WITHOUT documents (the document-id bug) — can
+            #       never be approved → delete + re-file, or
+            #   (b) it no longer exists in Plivo (404 — e.g. deleted by a prior
+            #       self-heal run, but our DB still points at it) → just re-file.
+            # NOTE: a 404 on the GET must NOT be swallowed (that left the stale id
+            # in place and skipped re-filing — the "retry does nothing" bug).
             doc_ids_now = [v for v in uploaded.values() if v]
             if record.get("application_id") and doc_ids_now:
+                needs_refile = False
                 try:
                     appinfo = await PlivoService._request(
                         "GET", f"{base}/ComplianceApplication/{record['application_id']}/", auth=auth
                     )
                     existing_docs = appinfo.get("document_ids") or appinfo.get("documents") or []
                     if not existing_docs:
+                        needs_refile = True
                         try:
                             await PlivoService._request(
                                 "DELETE",
@@ -296,9 +302,13 @@ class PlivoComplianceService:
                             )
                         except PlivoError:
                             pass
-                        record["application_id"] = None
-                except PlivoError:
-                    pass
+                except PlivoError as exc:
+                    # 404 = the application is gone in Plivo → re-file. Other errors
+                    # (transient) → leave it alone and let the poller keep checking.
+                    if "not found" in str(exc).lower() or "(404)" in str(exc):
+                        needs_refile = True
+                if needs_refile:
+                    record["application_id"] = None
 
             if not record.get("application_id"):
                 app_body: dict[str, Any] = {
