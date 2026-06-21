@@ -809,6 +809,10 @@ async def change_plivo_number(
 
 class PlanChangePayload(BaseModel):
     plan: str  # "inbound_only" | "inbound_outbound"
+    # Enabling outbound is a paid capability. This flips it on WITHOUT charging
+    # (a manual comp/override), so granting it requires an explicit ack that no
+    # payment will be collected — recorded in the audit log.
+    acknowledge_comp: bool = False
 
 
 @router.post("/{organization_id}/upgrade")
@@ -832,16 +836,31 @@ async def change_organization_plan(
             detail=f"Unknown plan '{payload.plan}'. Valid: {', '.join(PLAN_CATALOG)}",
         )
 
+    enabling_outbound = bool(PLAN_CATALOG[payload.plan]["outbound"])
+
     org = (
         await db.execute(select(Organization).where(Organization.id == organization_id))
     ).scalars().first()
     if org is None:
         raise HTTPException(status_code=404, detail="Organization not found")
 
+    # Granting outbound flips on a PAID capability without charging — a manual
+    # comp/override. Require an explicit acknowledgement so payment is never
+    # skipped silently (the SuperAdmin UI surfaces this as a confirmation).
+    is_comp_grant = enabling_outbound and not bool(org.calling_enabled)
+    if is_comp_grant and not payload.acknowledge_comp:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Enabling outbound grants a paid feature without collecting payment. "
+                "Confirm the comp/manual grant to proceed (acknowledge_comp=true)."
+            ),
+        )
+
     before = {"plan_type": org.plan_type, "calling_enabled": bool(org.calling_enabled)}
 
     org.plan_type = payload.plan
-    org.calling_enabled = bool(PLAN_CATALOG[payload.plan]["outbound"])
+    org.calling_enabled = enabling_outbound
     after = {"plan_type": org.plan_type, "calling_enabled": bool(org.calling_enabled)}
     db.add(org)
 
@@ -849,7 +868,8 @@ async def change_organization_plan(
         SuperAdminAuditLog(
             superadmin_id=current_user.id,
             action="organization_plan_changed",
-            risk_level="medium",
+            # A free grant of a paid capability is higher-risk than a downgrade.
+            risk_level="high" if is_comp_grant else "medium",
             target_type="organization",
             target_id=str(org.id),
             ip_address=request.client.host if request.client else None,
@@ -857,7 +877,13 @@ async def change_organization_plan(
             request_id=request.headers.get("x-request-id"),
             before_state=before,
             after_state=after,
-            metadata_={"plan": payload.plan, "label": PLAN_CATALOG[payload.plan]["label"]},
+            metadata_={
+                "plan": payload.plan,
+                "label": PLAN_CATALOG[payload.plan]["label"],
+                "comp_grant": is_comp_grant,
+                "payment_skipped": is_comp_grant,
+                "acknowledged": bool(payload.acknowledge_comp),
+            },
         )
     )
     await db.commit()

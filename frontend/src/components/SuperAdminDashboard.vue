@@ -23,6 +23,7 @@ const detail = ref(null);
 const detailLoading = ref(false);
 const planBusy = ref('');          // org id currently mutating
 const confirmTarget = ref(null);   // { org, plan, label, direction }
+const compAck = ref(false);        // explicit "no payment will be collected" acknowledgement
 
 const feedbackView = ref(false);
 const feedback = ref([]);
@@ -370,6 +371,7 @@ const closeDetail = () => { detail.value = null; };
 function requestPlanChange(org) {
   // calling_enabled → offer downgrade; otherwise offer the outbound upgrade.
   const enabling = !org.calling_enabled;
+  compAck.value = false;
   confirmTarget.value = {
     org,
     plan: enabling ? 'inbound_outbound' : 'inbound_only',
@@ -378,7 +380,7 @@ function requestPlanChange(org) {
   };
 }
 
-function cancelPlanChange() { confirmTarget.value = null; }
+function cancelPlanChange() { confirmTarget.value = null; compAck.value = false; }
 
 const confirmPlanChange = async () => {
   const target = confirmTarget.value;
@@ -390,7 +392,7 @@ const confirmPlanChange = async () => {
     const res = await fetch(`${SUPERADMIN_API_BASE}/tenants/${orgId}/upgrade`, {
       method: 'POST',
       headers: authHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ plan: target.plan }),
+      body: JSON.stringify({ plan: target.plan, acknowledge_comp: target.direction === 'upgrade' }),
     });
     if (res.status === 401) { emit('logout'); return; }
     if (!res.ok) { errorMsg.value = `Plan change failed (${res.status}).`; return; }
@@ -1033,11 +1035,27 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
           Switch this organization to <strong>{{ confirmTarget.label }}</strong>.
           This flips outbound calling
           {{ confirmTarget.direction === 'upgrade' ? 'on' : 'off' }} immediately.
-          Billing is not changed.
         </p>
+
+        <template v-if="confirmTarget.direction === 'upgrade'">
+          <p class="comp-warn">
+            ⚠ Outbound is a <strong>paid</strong> capability. This grants it as a
+            <strong>manual comp — no payment will be collected</strong> and no Razorpay
+            subscription is created. The action is recorded in the audit log.
+          </p>
+          <label class="comp-ack">
+            <input type="checkbox" v-model="compAck" />
+            I understand this enables paid outbound for free (no payment will be charged).
+          </label>
+        </template>
+
         <div class="modal-actions">
           <button class="ghost-btn" @click="cancelPlanChange">CANCEL</button>
-          <button class="plan-btn" :class="confirmTarget.direction" @click="confirmPlanChange">CONFIRM</button>
+          <button
+            class="plan-btn" :class="confirmTarget.direction"
+            :disabled="confirmTarget.direction === 'upgrade' && !compAck"
+            @click="confirmPlanChange"
+          >{{ confirmTarget.direction === 'upgrade' ? 'GRANT (COMP)' : 'CONFIRM' }}</button>
         </div>
       </div>
     </div>
@@ -1405,6 +1423,10 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
 .modal-card strong { color: var(--text-primary); }
 .modal-actions { display: flex; justify-content: flex-end; gap: 0.6rem; margin-top: 1.25rem; }
 .modal-actions .plan-btn { padding: 0.5rem 1rem; }
+.modal-actions .plan-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.comp-warn { margin: 0.8rem 0 0; padding: 0.6rem 0.7rem; font-size: 0.8rem; line-height: 1.45; color: #fbbf24; border: 1px solid rgba(251,191,36,0.4); border-radius: 8px; background: rgba(251,191,36,0.08); }
+.comp-ack { display: flex; align-items: flex-start; gap: 0.5rem; margin-top: 0.7rem; font-size: 0.8rem; color: var(--text-secondary); cursor: pointer; }
+.comp-ack input { margin-top: 0.15rem; }
 
 @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
 @keyframes spin { to { transform: rotate(360deg); } }
