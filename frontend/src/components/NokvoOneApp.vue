@@ -370,6 +370,18 @@ const isLoadingNotifications = ref(false);
 const notificationsSocket = ref(null);
 const phoneLink = ref(null);
 const phoneLinkInput = ref('');
+// While the DID is still being provisioned (compliance approval → carrier
+// verification) the number isn't allotted yet. Poll so the assigned number
+// appears under "Forward your calls to this number" without a manual reload,
+// then stop once it's active.
+const phoneLinkPollTimer = ref(null);
+const PHONE_LINK_POLL_INTERVAL_MS = 15000;
+const stopPhoneLinkPoll = () => {
+  if (phoneLinkPollTimer.value) {
+    clearTimeout(phoneLinkPollTimer.value);
+    phoneLinkPollTimer.value = null;
+  }
+};
 // Concierge WhatsApp onboarding (the client never sees Plivo): the portal shows
 // not_requested → setting_up → connected; the operator fulfils it out-of-band.
 const whatsappLink = ref(null);
@@ -4736,11 +4748,16 @@ const loadRuntimeStatus = async () => {
 };
 
 const loadPhoneLink = async () => {
+  stopPhoneLinkPoll();
   try {
     const { data } = await agentsApi.get('/phone-link', { headers: authHeader() });
     phoneLink.value = data;
     // The tenant enters THEIR own number to forward to the assigned Plivo DID.
     phoneLinkInput.value = data.forward_from_number || '';
+    // No number yet (still provisioning) → keep polling so it shows up live.
+    if (currentPage.value === 'agent' && !(data.plivo_number && data.number_status === 'active')) {
+      phoneLinkPollTimer.value = setTimeout(loadPhoneLink, PHONE_LINK_POLL_INTERVAL_MS);
+    }
   } catch (err) {
     phoneLink.value = null;
   }
@@ -6282,6 +6299,7 @@ const handleLogout = async () => {
   kbInfo.value = '';
   kbError.value = '';
   runtimeStatus.value = null;
+  stopPhoneLinkPoll();
   phoneLink.value = null;
   campaigns.value = [];
   // Clear real-estate projects + any in-progress draft so a previous org's
@@ -6323,6 +6341,7 @@ watch(authConfig, async () => {
 
 onBeforeUnmount(() => {
   if (cursorTimer.value) clearTimeout(cursorTimer.value);
+  stopPhoneLinkPoll();
   closeNotificationsSocket();
 });
 
