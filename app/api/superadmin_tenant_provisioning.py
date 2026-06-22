@@ -34,7 +34,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -666,6 +666,191 @@ async def delete_llm_key(
         await db.commit()
         await LLMPool.reload_db_members()
     return None
+
+
+# ── Bulk CSV calling access requests ────────────────────────────────────────
+# Defined BEFORE "/{organization_id}" so "bulk-calling-requests" isn't parsed as
+# an org id. Tenants request the add-on (leaving a contact number); granting it
+# means provisioning a dedicated Plivo number/auth onto their TenantResources.
+
+
+def _bulk_request_dict(req, org_name, user_email, enabled: bool, number: str | None) -> dict:
+    return {
+        "id": str(req.id),
+        "organization_id": str(req.organization_id),
+        "organization_name": org_name or "—",
+        "tenant_id": req.tenant_id,
+        "requested_by_email": user_email or "—",
+        "contact_number": req.contact_number,
+        "note": req.note,
+        "status": req.status,
+        "enabled": enabled,
+        "bulk_number": number,
+        "created_at": req.created_at.isoformat() if req.created_at else None,
+        "reviewed_at": req.reviewed_at.isoformat() if req.reviewed_at else None,
+    }
+
+
+@router.get("/bulk-calling-requests")
+async def list_bulk_calling_requests(
+    db: AsyncSession = Depends(get_db),
+    current_user: SuperAdminUser = Depends(RequireRole(_READ_ROLES)),
+    limit: int = 500,
+):
+    """Every tenant request for Bulk CSV Calling, newest first, with the live
+    enabled state so the console can show pending vs already-provisioned."""
+    from app.models.bulk_calling_request import BulkCallingRequest
+
+    limit = max(1, min(int(limit or 500), 2000))
+    rows = await db.execute(
+        select(BulkCallingRequest, Organization.name, OrganizationUser.email)
+        .join(Organization, Organization.id == BulkCallingRequest.organization_id, isouter=True)
+        .join(OrganizationUser, OrganizationUser.id == BulkCallingRequest.requested_by_user_id, isouter=True)
+        .order_by(BulkCallingRequest.created_at.desc())
+        .limit(limit)
+    )
+    rows = rows.all()
+    # Resolve the live bulk-calling state per tenant in one pass.
+    tenant_ids = [r[0].tenant_id for r in rows if r[0].tenant_id]
+    tr_by_tid: dict[str, TenantResources] = {}
+    if tenant_ids:
+        tr_rows = await db.execute(
+            select(TenantResources).where(TenantResources.tenant_id.in_(tenant_ids))
+        )
+        tr_by_tid = {tr.tenant_id: tr for tr in tr_rows.scalars().all()}
+    items = []
+    for req, org_name, user_email in rows:
+        tr = tr_by_tid.get(req.tenant_id) if req.tenant_id else None
+        enabled = PlivoService.bulk_calling_enabled(tr) if tr else False
+        number = PlivoService.bulk_calling_caller_id(tr) if tr else None
+        items.append(_bulk_request_dict(req, org_name, user_email, enabled, number))
+    return {"items": items}
+
+
+class BulkCallingGrantPayload(BaseModel):
+    # The dedicated Plivo telephony provisioned for this tenant's bulk calling.
+    auth_id: str = Field(min_length=3, max_length=128)
+    auth_token: str = Field(min_length=3, max_length=512)
+    number: str = Field(min_length=4, max_length=32)  # the DID / outbound caller ID
+
+
+@router.post("/bulk-calling-requests/{request_id}/grant")
+async def grant_bulk_calling_request(
+    request_id: uuid.UUID,
+    payload: BulkCallingGrantPayload,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: SuperAdminUser = Depends(RequireRole(_WRITE_ROLES)),
+):
+    """Provision dedicated Plivo telephony for the tenant and unlock the feature.
+
+    Writes ``provider_status["bulk_calling"]`` (auth token encrypted at rest) and
+    flips the request to ``approved``. The auth token is never echoed back."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from app.models.bulk_calling_request import BulkCallingRequest
+
+    req = (
+        await db.execute(select(BulkCallingRequest).where(BulkCallingRequest.id == request_id))
+    ).scalars().first()
+    if req is None:
+        raise HTTPException(status_code=404, detail="Request not found")
+
+    # Resolve the tenant to provision onto (denormalized tenant_id, else via org).
+    tr = None
+    if req.tenant_id:
+        tr = (
+            await db.execute(select(TenantResources).where(TenantResources.tenant_id == req.tenant_id))
+        ).scalars().first()
+    if tr is None:
+        tr = (
+            await db.execute(
+                select(TenantResources).where(TenantResources.organization_id == req.organization_id)
+            )
+        ).scalars().first()
+    if tr is None:
+        raise HTTPException(status_code=404, detail="Tenant resources not found for this organization")
+
+    auth_id = payload.auth_id.strip()
+    auth_token = payload.auth_token.strip()
+    # Normalize to bare digits — Plivo's Call API rejects formatted numbers like
+    # "+91 22 6423 2977", which would make every campaign silently fail to dial.
+    number = PlivoService.normalize_number(payload.number)
+
+    # Pre-flight the dedicated telephony so we never "enable" a config that can't
+    # place calls (bad creds, or a caller ID not actually rented on that account).
+    validation_error = await PlivoService.validate_bulk_telephony(auth_id, auth_token, number)
+    if validation_error:
+        raise HTTPException(status_code=400, detail=validation_error)
+
+    provider_status = dict(tr.provider_status or {})
+    provider_status["bulk_calling"] = {
+        "auth_id": auth_id,
+        "auth_token_enc": encrypt_secret(auth_token),
+        "number": number,
+        "enabled": True,
+        "granted_at": datetime.now(timezone.utc).isoformat(),
+        "granted_by_superadmin_id": str(current_user.id),
+    }
+    tr.provider_status = provider_status
+    flag_modified(tr, "provider_status")
+    db.add(tr)
+
+    req.status = "approved"
+    req.reviewed_at = datetime.now(timezone.utc)
+    req.reviewed_by_superadmin_id = current_user.id
+    db.add(req)
+
+    db.add(
+        SuperAdminAuditLog(
+            superadmin_id=current_user.id,
+            action="bulk_calling_granted",
+            risk_level="high",  # provisions outbound calling capability
+            target_type="organization",
+            target_id=str(req.organization_id),
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            request_id=request.headers.get("x-request-id"),
+            metadata_={"tenant_id": tr.tenant_id, "number": number, "auth_id": auth_id},
+        )
+    )
+    await db.commit()
+    return {"id": str(req.id), "status": req.status, "enabled": True, "bulk_number": number}
+
+
+@router.post("/bulk-calling-requests/{request_id}/deny")
+async def deny_bulk_calling_request(
+    request_id: uuid.UUID,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: SuperAdminUser = Depends(RequireRole(_WRITE_ROLES)),
+):
+    """Decline a request (leaves any existing telephony untouched)."""
+    from app.models.bulk_calling_request import BulkCallingRequest
+
+    req = (
+        await db.execute(select(BulkCallingRequest).where(BulkCallingRequest.id == request_id))
+    ).scalars().first()
+    if req is None:
+        raise HTTPException(status_code=404, detail="Request not found")
+    req.status = "denied"
+    req.reviewed_at = datetime.now(timezone.utc)
+    req.reviewed_by_superadmin_id = current_user.id
+    db.add(req)
+    db.add(
+        SuperAdminAuditLog(
+            superadmin_id=current_user.id,
+            action="bulk_calling_denied",
+            risk_level="low",
+            target_type="organization",
+            target_id=str(req.organization_id),
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            request_id=request.headers.get("x-request-id"),
+        )
+    )
+    await db.commit()
+    return {"id": str(req.id), "status": req.status}
 
 
 @router.get("/{organization_id}")

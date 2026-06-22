@@ -24,6 +24,7 @@ const {
   pauseFollowup,
   resumeFollowup,
   cancelFollowupsForLead,
+  followupAgentEnabled,
 } = useDashboardState();
 
 function handoffNoteFor(leadId) {
@@ -222,7 +223,7 @@ async function toggleLeadFollowupPanel(leadId) {
                 <blockquote v-if="recordHandoff(r)?.handoff_note">{{ recordHandoff(r).handoff_note }}</blockquote>
                 <span v-else style="font-size: 13px; color: var(--n-text-3); font-style: italic;">No notes</span>
               </div>
-              <div class="rec__col">
+              <div v-if="followupAgentEnabled" class="rec__col">
                 <span class="rec__cap">Follow-up</span>
                 <button
                   v-if="leadDbId(r)"
@@ -246,7 +247,7 @@ async function toggleLeadFollowupPanel(leadId) {
             </li>
 
             <li
-              v-if="leadDbId(r) && expandedLeadId === leadDbId(r)"
+              v-if="leadDbId(r) && expandedLeadId === leadDbId(r) && followupAgentEnabled"
               class="leads__followup-panel"
             >
               <div v-if="!(followupsFor(leadDbId(r)).length)" class="leads__followup-empty">

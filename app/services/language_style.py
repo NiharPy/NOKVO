@@ -70,6 +70,9 @@ _GENERIC_INDIAN_STYLE = """- Speak the way a real Indian call-center rep speaks 
 
 
 _FEWSHOT_TELUGU_OUTBOUND = """# TELUGU FEW-SHOT — copy this register (Telugu in Telugu script, English loanwords + numbers in Latin)
+CALLER: ఇది ఏంటి అండి? ఎవరు మాట్లాడుతున్నారు?
+AGENT: [neutral]మా team నుండి — మీ area లో ఒక new project గురించి quick గా చెప్పడానికి call చేశా.[/neutral] [question]ఇప్పుడు ఒక్క minute మాట్లాడగలరా?[/question]
+
 CALLER: అవును, చెప్పండి.
 AGENT: [warm]Super, thanks అండి.[/warm] [question]ఈ call quick గా — investment కోసమా, లేకపోతే self-use కోసమా?[/question]
 
@@ -79,6 +82,12 @@ AGENT: [warm]మంచి choice — investment buyers కి ఈ project బా
 CALLER: One crore వరకు.
 AGENT: [excited]Perfect — అది మన 3BHK upper floors కి match అవుతుంది.[/excited] [question]Site visit కి weekend better ఆ, weekday ఆ?[/question]
 
+CALLER: నా పేరు Nihar.
+AGENT: [warm]Thanks Nihar.[/warm] [question]మిమ్మల్ని reach అవ్వడానికి best number ఏది?[/question]
+
+CALLER: ఇప్పుడు busy గా ఉన్నా, తరువాత call చేయండి.
+AGENT: [warm]Sure అండి, 2 hours లో call చేస్తా.[/warm] [neutral]Thank you, talk soon.[/neutral]
+
 CALLER: ఇంకా details పంపండి, follow up చేస్కుంటాను.
 AGENT: [warm]Sure, brochure తో available units ని WhatsApp లో పంపిస్తా.[/warm] [neutral]Team ఒకసారి confirm చేస్తారు.[/neutral]
 
@@ -87,6 +96,9 @@ AGENT: [empathy]Got it అండి — sorry for the interruption.[/empathy] [n
 
 
 _FEWSHOT_HINDI_OUTBOUND = """# HINDI FEW-SHOT — copy this register (Hindi in Devanagari, English loanwords + numbers in Latin)
+CALLER: ये किस बारे में है? कौन बोल रहा है?
+AGENT: [neutral]हमारी team से — आपके area में एक new project के बारे में quick बताने के लिए call किया.[/neutral] [question]क्या अभी एक minute बात कर सकते हैं?[/question]
+
 CALLER: हाँ, बताइए.
 AGENT: [warm]बिलकुल, एक quick check.[/warm] [question]आप ये self-use के लिए देख रहे हैं या investment के लिए?[/question]
 
@@ -95,6 +107,12 @@ AGENT: [warm]अच्छा — investment के लिए इस project म�
 
 CALLER: 80 lakh तक.
 AGENT: [excited]ठीक है — उसके अंदर 2BHK options available हैं.[/excited] [question]Site visit weekend पे ठीक रहेगा या weekday?[/question]
+
+CALLER: मेरा नाम Nihar है.
+AGENT: [warm]Thanks Nihar.[/warm] [question]आपसे contact करने के लिए best number कौन सा रहेगा?[/question]
+
+CALLER: अभी busy हूँ, बाद में call कीजिए.
+AGENT: [warm]ज़रूर, 2 hours में call कर लेता हूँ.[/warm] [neutral]Thank you, talk soon.[/neutral]
 
 CALLER: Brochure भेज दो, देख के बताता हूँ.
 AGENT: [warm]ज़रूर, brochure और available units WhatsApp पे भेज देता हूँ.[/warm] [neutral]Team थोड़ी देर में confirm करेगी.[/neutral]

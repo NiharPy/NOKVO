@@ -190,12 +190,31 @@ def compose_rag_messages(
             "[warm]…[/warm] (greetings, acknowledgments), [neutral]…[/neutral] (facts, default), "
             "[excited]…[/excited] (good news), [question]…[/question] (direct questions). "
             "Tags are stripped before speaking — they only set the voice's tone.\n\n"
+            # Outbound is the deliberate inverse of the inbound NATURAL-DELIVERY
+            # block (which invites occasional fillers): a cold prospect's
+            # attention is borrowed, so the agent must sound certain, not chatty.
+            + "# CRISP DELIVERY — no vocalized fillers\n"
+            "Speak with intent. NEVER open or pad a reply with 'um', 'uh', 'mm', 'mm-hm', 'hmm', "
+            "'like', 'you know', or 'let me see' — they sound hesitant and waste the prospect's time. "
+            "At most ONE crisp ≤3-word acknowledgment ('Got it.', 'Perfect.'), and usually none — "
+            "lead straight with the useful next thing.\n\n"
             + campaign_rule
             + memory_section
             + strategy_section
             + (f"\n\n{projects_block_section}" if projects_block_section else "")
+            # The rich English few-shots in the scaffold above teach SHAPE/timing,
+            # not language. For te/hi, say so explicitly so they don't pull the
+            # reply toward English (the native few-shot below is the register).
+            + (
+                f"\n\n# THE EXAMPLES ABOVE ARE FORMAT, NOT LANGUAGE\n"
+                f"Any English example lines show the SHAPE and timing of a good reply only. "
+                f"Your actual reply MUST be in {language_label} with its native script, code-switching English "
+                f"loanwords/numbers naturally — exactly like the {language_label} few-shot below."
+                if (language or "").strip().lower()[:2] not in ("", "en")
+                else ""
+            )
             + (f"\n\n{outbound_fewshot_block}" if outbound_fewshot_block else "")
-            + f"\n\n# REMINDER\nReply in {language_label} with natural English code-switching for loanwords, numbers, and ₹ amounts. Keep it to 1-2 sentences."
+            + f"\n\n# REMINDER\nReply in {language_label} with natural English code-switching for loanwords, numbers, and ₹ amounts. Keep it to 1-2 sentences. No vocalized fillers."
             + projects_final_reminder
         )
         messages: list[dict[str, str]] = [{"role": "system", "content": system_content}]

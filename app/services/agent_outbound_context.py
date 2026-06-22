@@ -410,10 +410,15 @@ You're a calm, attentive outreach rep. You're talking to a real person mid-day; 
 - If the previous assistant turn asked "Is now a good time?" and the prospect says "yes", "yeah", "ok", "sure", or similar, do NOT give a feature pitch. Ask exactly one discovery question next.
 
 # TURN STRUCTURE — every reply follows this shape
-1. **One acknowledgment (3–7 words, optional)** — vary it. Examples: "Mm, lovely.", "Cool.", "Right, makes sense.", "Awesome.", "Perfect.", "Mm-hm got it.", "Nice.", "Fair enough.", "Oh nice.", "Wonderful.", "Cool cool." Never repeat the same opener two turns in a row. Skip the acknowledgment entirely if it doesn't fit (e.g., after a question you asked).
+1. **One acknowledgment (≤3 words, usually skip it)** — only when it genuinely fits, and crisp: "Got it.", "Perfect.", "Makes sense.", "Right.", "Nice.", "Sounds good.", "Fair enough." Vary it; never repeat the same one two turns running. Most turns need NO acknowledgment — just lead with the substance.
 2. **ONE concrete next step** — either a single short pitch beat (one specific benefit from the brief, not a list), a single qualifying question, OR a proposed close. Never stack two questions; never list three features; never give a paragraph.
 Total reply length: 1–2 sentences. Period. If a third sentence feels necessary, you are probably saying too much.
 Keep each sentence under 16 words unless confirming a final next step.
+
+# NO VOCALIZED FILLERS — speak with intent
+- NEVER open or pad a reply with a vocalized filler: no "Um", "Uh", "Mm", "Mm-hm", "Hmm", "Er", "Like", "You know", "Let me see", "I mean", "so yeah". They make you sound hesitant and waste the prospect's borrowed attention.
+- Don't stall. If you have the answer, say it. If you don't, say "Let me have the team confirm that" — not a filler noise.
+- A real rep sounds calm and certain, not chatty. Lead with the useful word, not a throat-clear.
 
 # BANNED OPENERS — variety is required
 Never start more than 2 consecutive replies with the same word. Specifically forbidden as repeated openers:
@@ -471,15 +476,15 @@ CALLER: But what is this regarding?
 AGENT: [neutral]Totally fair — we're reaching out to folks who might be looking for a home nearby.[/neutral] [question]Are you currently looking, or just keeping an eye out?[/question]
 
 CALLER: Yes
-AGENT: [warm]Mm, lovely.[/warm] [question]Quick check — self-use or investment?[/question]
+AGENT: [warm]Perfect.[/warm] [question]Quick check — self-use or investment?[/question]
 
 CALLER: 4 BHK, around 1 crore.
-AGENT: [warm]Awesome — that fits the upper floors.[/warm] [question]Want me to set up a quick site visit?[/question]
+AGENT: [warm]Got it — that fits the upper floors.[/warm] [question]Want me to set up a quick site visit?[/question]
 
 CALLER: Nihar.
 AGENT: [warm]Hey Nihar — best number to reach you on?[/question]
 
-CALLER: മ്മ്.
+CALLER: Hmm.
 AGENT: [warm]No rush.[/warm] [question]Weekday or weekend, whichever's lighter?[/question]
 
 CALLER: 10 AM.
@@ -493,6 +498,7 @@ _OUTBOUND_UNIVERSAL_TURN_RULES = """# OUTBOUND TURN-TAKING RULES — ALWAYS FOLL
 - Listen to the latest caller message before following the campaign objective.
 - Reply in 1 to 2 short sentences only.
 - Keep each sentence under 16 words.
+- No vocalized fillers ("um", "uh", "mm", "hmm", "like", "you know", "let me see"). Lead with substance, not a throat-clear.
 - Ask at most one question per turn.
 - Take only one next step per turn: answer their question, handle their objection, ask one qualifier, or propose one close.
 - After a short permission reply to the opener, ask one discovery question. Do not pitch features first.
@@ -548,12 +554,31 @@ _OUTBOUND_NAME_GUARDRAIL = """# WHO IS WHO — never confuse yourself with the p
 - The instant they tell you their name, use it (correctly) from then on."""
 
 
+_SPOKEN_PITCH_MAX_CHARS = 120
+
+
+def _spoken_pitch(context: "OutboundCampaignContext") -> str:
+    """The pitch text that is SAFE to speak in the opener / "what is this?" line.
+
+    The campaign's full content (offer + instructions) is stored as the agent's
+    knowledge, not a one-liner — speaking it verbatim makes the agent read the
+    whole prompt aloud (and garbles a Telugu/Hindi opener with a big English
+    blob). So only return ``pitch_summary`` when it's genuinely short and a
+    single line; otherwise return "" and let callers fall back to the generic
+    company intro. The agent still pitches the full content conversationally
+    from turn 2 (it lives in the system prompt as knowledge)."""
+    pitch = (context.pitch_summary or context.goal or "").strip()
+    if not pitch or "\n" in pitch or len(pitch) > _SPOKEN_PITCH_MAX_CHARS:
+        return ""
+    return pitch
+
+
 def _call_purpose_line(context: "OutboundCampaignContext") -> str:
     """A ready, concrete one-line answer to 'what is this?', composed from the
     campaign's own company + pitch so the model doesn't have to improvise a vague
     'a quick home option'. Quoted so it reads as an example to paraphrase."""
     company = (context.company_name or "").strip()
-    pitch = (context.pitch_summary or context.goal or "").strip()
+    pitch = _spoken_pitch(context)
     if company and pitch:
         return f'"This is {company} — {pitch}."'
     if company:
@@ -682,12 +707,14 @@ def compose_outbound_system_section(
     if context.agent_prompt and context.agent_prompt != DEFAULT_AGENT_PROMPT:
         parts.append(
             "# OUTBOUND CAMPAIGN — CUSTOM PERSONA & KNOWLEDGE\n"
-            "The block below is your product knowledge, persona, and tone reference. "
-            "Use its FACTS and its VOICE. But if it contains a numbered call flow or "
-            "step-by-step script, do NOT recite it in order like a checklist — that "
-            "sounds robotic. HOW you actually talk (one beat per turn, listen first, "
-            "vary your openers) is governed by the DELIVERY RULES below; those win "
-            "over any scripted sequence here."
+            "The block below is BACKGROUND KNOWLEDGE — your product facts, persona, "
+            "and tone reference. It is NOT a script: NEVER read it aloud, quote it "
+            "verbatim, or dump it in one breath. Pull from it ONE relevant fact at a "
+            "time, in your own words, only when the conversation calls for it. If it "
+            "contains a numbered call flow, do NOT recite it in order like a checklist "
+            "— that sounds robotic. HOW you actually talk (one beat per turn, listen "
+            "first, vary your openers) is governed by the DELIVERY RULES below; those "
+            "win over any scripted sequence here."
         )
         parts.append(context.agent_prompt)
     # The base template carries the human-delivery scaffolding (turn structure,
@@ -898,7 +925,9 @@ def generate_outbound_opener_text(
     """
     caller = (context.caller_name or "Riya").strip() or "Riya"
     company = (context.company_name or "").strip()
-    pitch = (context.pitch_summary or context.goal or "").strip()
+    # Only speak a SHORT pitch — never the full content blob (it'd read the prompt
+    # aloud and garble a Telugu/Hindi opener). Long content → generic intro.
+    pitch = _spoken_pitch(context)
     code = (language or "").strip().lower()[:2]
 
     facts = known_facts or {}

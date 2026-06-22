@@ -48,6 +48,7 @@ const {
   removeMember,
   followupSummary,
   loadFollowupSummary,
+  followupAgentEnabled,
   isRealEstateTemplate,
   orgWorkingHours,
   isSavingOrgHours,
@@ -247,7 +248,7 @@ function initial(m) {
     </section>
 
     <!-- Follow-up agent tile -->
-    <section class="n-section n-rise dash__followups" data-delay="2">
+    <section v-if="followupAgentEnabled" class="n-section n-rise dash__followups" data-delay="2">
       <article class="n-card dash__followup-card">
         <header class="dash__followup-head">
           <div>

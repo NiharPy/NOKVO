@@ -37,6 +37,7 @@ from typing import Optional
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.models.lead_followup_schedule import (
     FollowupReason,
     FollowupStatus,
@@ -186,6 +187,10 @@ class FollowupSchedulerService:
         Returns the inserted row, or None if no follow-up was scheduled
         (conversion, opt-out, exhausted, rule says skip, lead paused).
         """
+        # Master kill switch: the Follow-up agent is globally disabled — never
+        # auto-schedule a callback (inbound or outbound) for any disposition.
+        if not settings.FOLLOWUP_AGENT_ENABLED:
+            return None
         cue = cue or FollowupCue()
         rules = effective_followup_rules(campaign)
 
@@ -297,6 +302,9 @@ class FollowupSchedulerService:
         Targets exactly one of ``lead_id`` (outbound) / ``customer_id``
         (inbound-via-CustomerBase).
         """
+        # Master kill switch: the Follow-up agent is globally disabled.
+        if not settings.FOLLOWUP_AGENT_ENABLED:
+            return None
         # ── Resolve + validate the target; pull tenant_id + consent. ──────────
         tenant_id: str | None = None
         if lead_id is not None:

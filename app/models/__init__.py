@@ -43,6 +43,7 @@ from app.models.llm_pool_key import LlmPoolKey
 from app.models.call_transcript import CallTranscript
 from app.models.notification import Notification
 from app.models.real_estate_project import RealEstateProject
+from app.models.bulk_calling_request import BulkCallingRequest
 
 # For Alembic to discover all models
 __all__ = [
@@ -86,4 +87,5 @@ __all__ = [
     "CustomerBase",
     "TenantFeedback",
     "SuperAdminTodo",
+    "BulkCallingRequest",
 ]

@@ -13,9 +13,20 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+import pytest
+
+from app.core.config import settings
 from app.models.lead_followup_schedule import FollowupReason, FollowupStatus
 from app.models.outgoing_lead import LeadConsentStatus
 from app.services.followup_scheduler_service import FollowupSchedulerService as S
+
+
+@pytest.fixture(autouse=True)
+def _enable_followup_agent(monkeypatch):
+    """These tests exercise the Follow-up agent's scheduling logic. Production
+    ships it OFF (FOLLOWUP_AGENT_ENABLED=False), so turn it on for the feature
+    tests; monkeypatch reverts after each."""
+    monkeypatch.setattr(settings, "FOLLOWUP_AGENT_ENABLED", True)
 
 
 # A fixed "now" mid-day so day-boundary math is unambiguous.
@@ -103,8 +114,27 @@ def _stub_helpers(monkeypatch, *, pending=None, attempts=0, clinic=False, paused
 
 
 # A promised time inside the default 09:00–19:00 IST window (12:00 IST = 06:30 UTC)
-# so the call-window clamp leaves it unchanged.
-PROMISED = datetime(2026, 6, 16, 6, 30, tzinfo=timezone.utc)
+# so the call-window clamp leaves it unchanged. Relative to now (+5 days) so the
+# past-promise guard never rewrites it — a hardcoded date silently rots into the
+# past and the assertion breaks once "today" rolls past it.
+PROMISED = (datetime.now(timezone.utc) + timedelta(days=5)).replace(
+    hour=6, minute=30, second=0, microsecond=0
+)
+
+
+def test_upsert_noop_when_followup_agent_disabled(monkeypatch):
+    # Master kill switch: nothing is scheduled and the DB is never touched.
+    monkeypatch.setattr(settings, "FOLLOWUP_AGENT_ENABLED", False)
+    _stub_helpers(monkeypatch, pending=None)
+    lead = _lead()
+    db = _FakeDB(lead)
+    row = _run(
+        S.upsert_promise_from_note(
+            db=db, promised_at=PROMISED, note="x", source_call_id="c", lead_id=lead.id,
+        )
+    )
+    assert row is None
+    assert not db.committed
 
 
 def test_upsert_inserts_when_no_pending(monkeypatch):

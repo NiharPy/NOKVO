@@ -407,7 +407,12 @@ const defaultCampaignExitConditions = [
 const emptyCampaignForm = () => ({
   name: '',
   from_number: '',
-  agent_prompt: 'You are making a consented outbound call. Be concise, explain the reason for the call, and guide the lead toward one clear next step.',
+  // Guided campaign DETAILS + CONTENT — the engineered system prompt turns
+  // these into the agent's behaviour (no hand-written delivery prompt).
+  company_name: '',
+  caller_name: 'Riya',
+  language: 'en',
+  content: '',
   // List of objective codes from CAMPAIGN_OBJECTIVE_OPTIONS. Defaults to
   // both selected so a fresh campaign is willing to do either next step.
   objectives: ['site_visit', 'lead'],
@@ -883,6 +888,12 @@ const businessTypeLabel = computed(() => currentBusinessTemplate.value?.label ||
 // Outbound + follow-up are only on the Inbound+Outbound plan (calling_enabled).
 // On "Inbound Only" those tabs are hidden.
 const outboundEnabled = computed(() => Boolean(currentOrganization.value?.calling_enabled));
+// Master switch for the Follow-up agent UI. Mirrors the backend
+// FOLLOWUP_AGENT_ENABLED kill switch (default OFF): when false, every follow-up
+// surface (nav item, page, per-campaign toggle, rules block, dashboard tile,
+// per-lead chips) is hidden and the feature does nothing. Flip to true to bring
+// it back in lockstep with the backend flag.
+const followupAgentEnabled = false;
 const isRealEstateTemplate = computed(() => currentOrganization.value?.industry === 'real_estate');
 const ticketsTabLabel = computed(() => (isRealEstateTemplate.value ? 'Site Visits' : 'Tickets'));
 const ticketSingularLabel = computed(() => (isRealEstateTemplate.value ? 'site visit' : 'ticket'));
@@ -1091,6 +1102,8 @@ const switchPage = (page) => {
   // Outbound + Follow-up surfaces are only on the Inbound+Outbound plan
   // (calling_enabled). Swallow deep-links / programmatic nav on Inbound Only.
   if ((page === 'outgoing_agent' || page === 'followups') && !outboundEnabled.value) return;
+  // Follow-up agent is globally disabled — swallow any nav/deep-link to its page.
+  if (page === 'followups' && !followupAgentEnabled) return;
   // Nokvo Connect is feature-flagged. When disabled, swallow any attempt to
   // navigate to its landing pages (nav button is already hidden, but this
   // catches deep-links / programmatic calls) so the user can't reach a
@@ -1461,7 +1474,8 @@ const loadWorkspace = async () => {
     loadCostSummary();
     // Follow-up agent: refresh the dashboard tile once at boot. Per-lead
     // chips load lazily via loadFollowupsForLead when the user expands a row.
-    loadFollowupSummary();
+    // Skipped entirely while the Follow-up agent is disabled.
+    if (followupAgentEnabled) loadFollowupSummary();
     // Notifications: bulk inbox load + live WS subscription. Both are
     // fire-and-forget; failures are silent so a notifications outage
     // doesn't degrade the rest of the workspace.
@@ -4907,10 +4921,138 @@ const loadOutboundNumber = async () => {
   }
 };
 
+// ── Bulk CSV calling (Inbound+Outbound add-on, operator-granted) ─────────────
+const bulkCalling = ref({ plan_eligible: false, enabled: false, request_status: null, contact_number: null });
+const bulkRequestForm = ref({ contact_number: '', note: '' });
+const isSubmittingBulkRequest = ref(false);
+const bulkCampaignForm = ref({ name: '', company_name: '', caller_name: 'Riya', language: 'en', content: '', file: null });
+const isLaunchingBulkCampaign = ref(false);
+const bulkCallingError = ref('');
+const bulkCallingNotice = ref('');
+// Per-number placement failures from the last launch/rerun: [{ phone, error }].
+// Surfaces WHY a number wasn't called (e.g. Plivo rejected an unverified number
+// on a trial account) instead of silently only ringing the first contact.
+const bulkDialFailures = ref([]);
+
+const loadBulkCallingStatus = async () => {
+  try {
+    const { data } = await agentsApi.get('/bulk-calling/status', { headers: authHeader() });
+    bulkCalling.value = data || { plan_eligible: false, enabled: false, request_status: null, contact_number: null };
+  } catch {
+    bulkCalling.value = { plan_eligible: false, enabled: false, request_status: null, contact_number: null };
+  }
+};
+
+const submitBulkCallingRequest = async () => {
+  bulkCallingError.value = '';
+  const contact = (bulkRequestForm.value.contact_number || '').trim();
+  if (!contact) {
+    bulkCallingError.value = 'Enter a number we can reach you on.';
+    return;
+  }
+  isSubmittingBulkRequest.value = true;
+  try {
+    await agentsApi.post(
+      '/bulk-calling/request',
+      { contact_number: contact, note: (bulkRequestForm.value.note || '').trim() || null },
+      { headers: authHeader() },
+    );
+    bulkCallingNotice.value = "Request sent — we'll reach out to set up your dedicated calling number.";
+    bulkRequestForm.value = { contact_number: '', note: '' };
+    await loadBulkCallingStatus();
+  } catch (err) {
+    if (await handleMfaProtectedError(err)) return;
+    bulkCallingError.value = extractErrorMessage(err, 'Could not submit your request.');
+  } finally {
+    isSubmittingBulkRequest.value = false;
+  }
+};
+
+const onBulkCampaignFilePick = (event) => {
+  bulkCampaignForm.value.file = event?.target?.files?.[0] || null;
+};
+
+const startBulkCallingCampaign = async () => {
+  bulkCallingError.value = '';
+  bulkCallingNotice.value = '';
+  bulkDialFailures.value = [];
+  const form = bulkCampaignForm.value;
+  if (!(form.name || '').trim()) { bulkCallingError.value = 'Name the campaign.'; return; }
+  if (!(form.content || '').trim()) { bulkCallingError.value = 'Add the campaign content — what the agent should say.'; return; }
+  if (!form.file) { bulkCallingError.value = 'Choose a CSV (or XLSX) of phone numbers.'; return; }
+  isLaunchingBulkCampaign.value = true;
+  try {
+    const fd = new FormData();
+    fd.append('name', form.name.trim());
+    fd.append('content', form.content.trim());
+    if ((form.company_name || '').trim()) fd.append('company_name', form.company_name.trim());
+    if ((form.caller_name || '').trim()) fd.append('caller_name', form.caller_name.trim());
+    if (form.language) fd.append('language', form.language);
+    fd.append('contacts_file', form.file);
+    const { data } = await agentsApi.post('/bulk-calling/campaigns', fd, {
+      headers: { ...authHeader(), 'Content-Type': 'multipart/form-data' },
+    });
+    // Surface immediate placement failures (e.g. a bad caller ID) instead of a
+    // misleading "queued" — the first batch is dialed synchronously on create.
+    const contacts = Array.isArray(data?.contacts) ? data.contacts : [];
+    const failed = contacts.filter((c) => c.status === 'failed');
+    bulkDialFailures.value = failed.map((c) => ({ phone: c.phone, error: c.error || 'rejected by the carrier' }));
+    if (failed.length && failed.length >= contacts.length) {
+      bulkCallingError.value = `Calls couldn't be placed: ${failed[0]?.error || 'check the dedicated number setup'}.`;
+      bulkCallingNotice.value = '';
+    } else {
+      const note = failed.length ? ` (${failed.length} couldn't be placed)` : '';
+      bulkCallingNotice.value = `Calling started — ${data?.total_count || 0} contacts${note}.`;
+    }
+    bulkCampaignForm.value = { name: '', company_name: '', caller_name: 'Riya', language: 'en', content: '', file: null };
+    await loadCampaigns();
+  } catch (err) {
+    if (await handleMfaProtectedError(err)) return;
+    bulkCallingError.value = extractErrorMessage(err, 'Could not start the bulk campaign.');
+  } finally {
+    isLaunchingBulkCampaign.value = false;
+  }
+};
+
+const isRerunningBulkCampaign = ref(null);
+const rerunBulkCampaign = async (campaignId) => {
+  if (!campaignId || isRerunningBulkCampaign.value) return;
+  isRerunningBulkCampaign.value = campaignId;
+  bulkCallingError.value = '';
+  bulkCallingNotice.value = '';
+  bulkDialFailures.value = [];
+  try {
+    const { data } = await agentsApi.post(`/bulk-calling/campaigns/${campaignId}/rerun`, {}, { headers: authHeader() });
+    const contacts = Array.isArray(data?.contacts) ? data.contacts : [];
+    // Re-run only dials contacts that weren't already reached (answered/cut).
+    const dialing = contacts.filter((c) => c.status !== 'answered' && !c.answered_at);
+    const failed = dialing.filter((c) => c.status === 'failed');
+    bulkDialFailures.value = failed.map((c) => ({ phone: c.phone, error: c.error || 'rejected by the carrier' }));
+    if (dialing.length && failed.length >= dialing.length) {
+      bulkCallingError.value = `Calls couldn't be placed: ${failed[0]?.error || 'check the dedicated number setup'}.`;
+    } else {
+      const note = failed.length ? ` (${failed.length} couldn't be placed)` : '';
+      bulkCallingNotice.value = `Re-run started — calling ${dialing.length} contact(s)${note}.`;
+    }
+    await loadCampaigns();
+  } catch (err) {
+    if (await handleMfaProtectedError(err)) return;
+    bulkCallingError.value = extractErrorMessage(err, 'Could not re-run the campaign.');
+  } finally {
+    isRerunningBulkCampaign.value = null;
+  }
+};
+
 const loadOutgoingAgentWorkspace = async () => {
   isLoadingLeadSources.value = true;
   try {
-    await Promise.all([loadLeadConnections(), loadLeadForms(), loadOutgoingLeads(), loadOutboundNumber()]);
+    await Promise.all([
+      loadLeadConnections(),
+      loadLeadForms(),
+      loadOutgoingLeads(),
+      loadOutboundNumber(),
+      loadBulkCallingStatus(),
+    ]);
   } catch (err) {
     errorMsg.value = extractErrorMessage(err, 'Failed to load outgoing lead sources.');
   } finally {
@@ -5067,11 +5209,11 @@ const toggleLeadSelection = (lead) => {
 };
 
 const createCampaign = async () => {
-  // The agent_prompt IS the agent's knowledge — it's required. No separate
-  // doc upload. Leads are optional here; the operator can attach them later
-  // from the campaign card.
-  if (!campaignForm.value.name.trim() || !campaignForm.value.agent_prompt.trim()) {
-    errorMsg.value = 'Campaign name and an agent prompt are required — the prompt is what the agent reads on the call.';
+  // Guided setup: the operator gives campaign details + content; the engineered
+  // system prompt does the rest. Content (what to say) is required. Leads are
+  // optional here; the operator can attach them later from the campaign card.
+  if (!campaignForm.value.name.trim() || !campaignForm.value.content.trim()) {
+    errorMsg.value = 'Campaign name and the campaign content (what to say) are required.';
     return;
   }
   const preset = campaignFormPreset.value;
@@ -5085,7 +5227,11 @@ const createCampaign = async () => {
     fd.append('name', campaignForm.value.name.trim());
     // Caller ID is always the tenant's allotted number (resolved server-side at
     // launch) — no free-text from_number.
-    fd.append('agent_prompt', campaignForm.value.agent_prompt.trim());
+    // Guided details + content → the backend's engineered system prompt.
+    fd.append('content', campaignForm.value.content.trim());
+    if (campaignForm.value.company_name.trim()) fd.append('company_name', campaignForm.value.company_name.trim());
+    if (campaignForm.value.caller_name.trim()) fd.append('caller_name', campaignForm.value.caller_name.trim());
+    if (campaignForm.value.language) fd.append('language', campaignForm.value.language);
     // Objectives is now a list of structured codes (site_visit / lead) from
     // the dropdown. Always send the JSON array (even when empty) so the
     // backend knows the operator explicitly chose to skip side flows.
@@ -6390,6 +6536,9 @@ watch(authState, async (newState, oldState) => {
 // preserves reactivity — Vue's template compiler auto-unwraps top-level
 // setup bindings that are Refs.
 provideDashboardState({
+  // Feature flags
+  followupAgentEnabled,
+
   // Identity / org / theme
   currentUser,
   currentOrganization,
@@ -6592,6 +6741,20 @@ provideDashboardState({
   // Outgoing agent
   isLoadingLeadSources,
   loadOutgoingAgentWorkspace,
+  // Bulk CSV calling (Inbound+Outbound add-on)
+  bulkCalling,
+  bulkRequestForm,
+  isSubmittingBulkRequest,
+  submitBulkCallingRequest,
+  bulkCampaignForm,
+  isLaunchingBulkCampaign,
+  onBulkCampaignFilePick,
+  startBulkCallingCampaign,
+  isRerunningBulkCampaign,
+  rerunBulkCampaign,
+  bulkCallingError,
+  bulkCallingNotice,
+  bulkDialFailures,
   requestLeadOAuth,
   nokvoLeadForm,
   NOKVO_FORM_FIELD_TYPES,
@@ -7969,7 +8132,7 @@ provideDashboardState({
                 <Users :size="14" />
                 <span>Customer base</span>
               </button>
-              <button v-if="outboundEnabled" type="button" class="n-shell-nav__item" :class="{ 'is-active': currentPage === 'followups' }" @click="switchPage('followups')">
+              <button v-if="outboundEnabled && followupAgentEnabled" type="button" class="n-shell-nav__item" :class="{ 'is-active': currentPage === 'followups' }" @click="switchPage('followups')">
                 <Repeat :size="14" />
                 <span>Follow-ups</span>
               </button>

@@ -367,6 +367,13 @@ class Settings(BaseSettings):
     # A follow-up row stuck in_flight (status webhook never arrived) is
     # failed by the reconciliation sweep after this many minutes.
     FOLLOWUP_INFLIGHT_TIMEOUT_MINUTES: int = 30
+    # Master kill switch for the Follow-up agent (auto-callbacks after a call
+    # ends). Default OFF: we do NOT auto-call leads/customers back — not after a
+    # cut call, a no-answer, or a promised callback, for inbound OR outbound.
+    # When False: every enqueue path is a no-op, the dispatch loop never dials
+    # (so even already-pending rows stay put), and the UI hides all follow-up
+    # surfaces. Flip to True to bring the feature back.
+    FOLLOWUP_AGENT_ENABLED: bool = False
     # Request 16 kHz from Plivo's <Stream> (its highest L16 rate): preserves HD/VoLTE
     # audio when present, and matches Sarvam STT's native 16 kHz input so there's no
     # lossy 8k→16k upsample. Better recognition, especially for spoken digits.

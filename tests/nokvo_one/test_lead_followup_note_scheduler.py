@@ -13,7 +13,17 @@ import uuid
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
+import pytest
+
+from app.core.config import settings
 from app.services.lead_followup_note_scheduler import LeadFollowupNoteScheduler
+
+
+@pytest.fixture(autouse=True)
+def _enable_followup_agent(monkeypatch):
+    """Production ships the Follow-up agent OFF (FOLLOWUP_AGENT_ENABLED=False);
+    enable it so these tests exercise the note→callback logic."""
+    monkeypatch.setattr(settings, "FOLLOWUP_AGENT_ENABLED", True)
 
 
 def _run(coro):
@@ -178,6 +188,31 @@ def test_schedule_from_note_empty_note_no_target():
         )
     )
     assert res["reason"] == "no_note"
+
+
+def test_schedule_from_note_disabled_when_followup_agent_off(monkeypatch):
+    # Master kill switch short-circuits BEFORE the extraction LLM is ever called.
+    monkeypatch.setattr(settings, "FOLLOWUP_AGENT_ENABLED", False)
+    seen = {"llm": False}
+
+    async def fake_llm(messages, **kw):
+        seen["llm"] = True
+        return "{}"
+
+    monkeypatch.setattr(
+        "app.services.nokvo_one_voice_pipeline.AzureGroundedLLM.complete_nano", fake_llm
+    )
+    res = _run(
+        LeadFollowupNoteScheduler.schedule_from_note(
+            db=object(),
+            tenant_res=_TENANT,
+            note="call me tomorrow at 4pm",
+            source_call_id="c",
+            lead_id=uuid.uuid4(),
+        )
+    )
+    assert res["reason"] == "followup_disabled"
+    assert seen["llm"] is False
 
 
 def test_schedule_from_note_extracts_json_from_prose(monkeypatch):

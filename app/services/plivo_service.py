@@ -40,6 +40,13 @@ class PlivoService:
         return f"{settings.PLIVO_API_BASE.rstrip('/')}/Account/{auth_id}"
 
     @staticmethod
+    def normalize_number(num: str | None) -> str:
+        """Plivo's Call API rejects formatted numbers ('+91 22 6423 2977'). Strip
+        to bare digits (the convention DIDs are stored in elsewhere, e.g.
+        '918031321315'). Returns '' for falsy input."""
+        return "".join(ch for ch in str(num or "") if ch.isdigit())
+
+    @staticmethod
     async def _request(method: str, url: str, *, auth: tuple[str, str], json_body: dict | None = None) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=30.0, auth=auth) as client:
             resp = await client.request(method, url, json=json_body)
@@ -334,6 +341,70 @@ class PlivoService:
         cfg = cls._plivo_config(tenant_res)
         return cfg.get("number") or tenant_res.twilio_phone_number or None
 
+    # ── bulk CSV calling (dedicated, operator-provisioned telephony) ─────────────
+    # Bulk calling does NOT reuse the tenant's inbound DID/subaccount — an operator
+    # provisions a separate Plivo number + auth from the SuperAdmin console. It's
+    # stored under ``provider_status["bulk_calling"]`` so it can't clash with the
+    # tenant's own ``plivo`` config:  {auth_id, auth_token_enc, number, enabled}.
+    @staticmethod
+    def bulk_calling_config(tenant_res: TenantResources) -> dict:
+        return dict((tenant_res.provider_status or {}).get("bulk_calling") or {})
+
+    @classmethod
+    def bulk_calling_enabled(cls, tenant_res: TenantResources) -> bool:
+        cfg = cls.bulk_calling_config(tenant_res)
+        return bool(cfg.get("enabled") and cfg.get("number") and cfg.get("auth_id") and cfg.get("auth_token_enc"))
+
+    @classmethod
+    def bulk_calling_caller_id(cls, tenant_res: TenantResources) -> str | None:
+        # Normalize at the source: operators hand-enter the dedicated number in the
+        # SuperAdmin grant (often formatted, e.g. "+91 22 6423 2977"). Plivo is fed
+        # bare digits at dial time regardless, but normalizing here also keeps the
+        # value we store on ``campaign.from_number`` clean for the UI.
+        return cls.normalize_number(cls.bulk_calling_config(tenant_res).get("number")) or None
+
+    @classmethod
+    async def validate_bulk_telephony(cls, auth_id: str, auth_token: str, number: str) -> str | None:
+        """Read-only pre-flight for a SuperAdmin bulk-calling grant. Returns an
+        error string when the dedicated telephony can't place calls, else None.
+
+        Catches the two silent-failure modes seen in practice: bad credentials,
+        and a ``from`` number that isn't actually rented on that Plivo account
+        (Plivo 400s every /Call with an unowned caller ID, so the campaign just
+        never dials). Validating here turns "silently not calling" into an
+        actionable error before the feature is enabled."""
+        num = cls.normalize_number(number)
+        if not num:
+            return "Enter a valid phone number (digits only)."
+        auth = (auth_id, auth_token)
+        base = cls._base(auth_id)
+        try:
+            await cls._request("GET", f"{base}/", auth=auth)
+        except PlivoError:
+            return "Plivo rejected these credentials — check the Auth ID and Auth Token."
+        try:
+            await cls._request("GET", f"{base}/Number/{num}/", auth=auth)
+        except PlivoError:
+            return (
+                f"The number {num} isn't rented on that Plivo account, so it can't "
+                "place calls. Rent/assign the DID to this account in Plivo first, "
+                "then grant again."
+            )
+        return None
+
+    @classmethod
+    def bulk_calling_auth(cls, tenant_res: TenantResources) -> tuple[str, str] | None:
+        """(auth_id, decrypted auth_token) for the dedicated bulk account, or None."""
+        cfg = cls.bulk_calling_config(tenant_res)
+        auth_id = cfg.get("auth_id")
+        enc = cfg.get("auth_token_enc")
+        if not auth_id or not enc:
+            return None
+        try:
+            return (str(auth_id), decrypt_secret(enc))
+        except Exception:
+            return None
+
     @classmethod
     async def initiate_outbound_call(
         cls,
@@ -343,22 +414,36 @@ class PlivoService:
         answer_url: str,
         status_callback: str | None = None,
         from_number: str | None = None,
+        auth_override: tuple[str, str] | None = None,
     ) -> dict[str, Any]:
         """Place an outbound call from the tenant's assigned DID. answer_url returns
         the <Stream> XML that bridges audio to the agent. ``from_number`` overrides
         the caller ID (callers pass the campaign's resolved allotted number); when
-        omitted it falls back to the tenant's configured DID."""
+        omitted it falls back to the tenant's configured DID.
+
+        ``auth_override`` (auth_id, auth_token) places the call on a DIFFERENT
+        Plivo (sub)account than the tenant's — used by Bulk CSV Calling, whose
+        dedicated number + credentials are provisioned by an operator and live
+        under ``provider_status["bulk_calling"]`` rather than the tenant's own
+        ``plivo`` config."""
         cfg = cls._plivo_config(tenant_res)
         from_number = from_number or cls.outbound_caller_id(tenant_res)
         if not from_number:
             raise PlivoError("Tenant has no assigned Plivo DID for outbound caller ID.")
-        # Calls are placed on the tenant's subaccount when available, else master.
-        sub_auth_id = cfg.get("subaccount_auth_id")
-        sub_token = cls._subaccount_token(cfg)
-        auth = (sub_auth_id, sub_token) if (sub_auth_id and sub_token) else cls._master_auth()
+        # Bulk calling places on its dedicated account; otherwise the tenant's
+        # subaccount when available, else master.
+        if auth_override and auth_override[0] and auth_override[1]:
+            auth = auth_override
+        else:
+            sub_auth_id = cfg.get("subaccount_auth_id")
+            sub_token = cls._subaccount_token(cfg)
+            auth = (sub_auth_id, sub_token) if (sub_auth_id and sub_token) else cls._master_auth()
+        # Plivo rejects formatted numbers — normalize to bare digits. An operator
+        # may have entered the bulk DID as "+91 22 6423 2977"; without this the
+        # /Call POST 400s and the contact silently fails to dial.
         body: dict[str, Any] = {
-            "from": from_number,
-            "to": to_number,
+            "from": cls.normalize_number(from_number),
+            "to": cls.normalize_number(to_number),
             "answer_url": answer_url,
             "answer_method": "POST",
         }

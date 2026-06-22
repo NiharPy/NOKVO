@@ -91,6 +91,20 @@ const {
   isTogglingFollowup,
   setCampaignFollowup,
   removeCampaign,
+  bulkCalling,
+  bulkRequestForm,
+  isSubmittingBulkRequest,
+  submitBulkCallingRequest,
+  bulkCampaignForm,
+  isLaunchingBulkCampaign,
+  onBulkCampaignFilePick,
+  startBulkCallingCampaign,
+  isRerunningBulkCampaign,
+  rerunBulkCampaign,
+  bulkCallingError,
+  bulkCallingNotice,
+  bulkDialFailures,
+  followupAgentEnabled,
 } = useDashboardState();
 
 const voiceStatus = computed(() => voice?.value?.status || 'idle');
@@ -133,6 +147,12 @@ function campaignStatusTone(s) {
   if (s === 'running') return 'n-tag--success';
   if (s === 'draft') return 'n-tag--brand';
   return 'n-tag--danger';
+}
+
+// Contacts a bulk re-run would dial: everyone NOT already reached. A lead who
+// picked up (incl. answered-then-cut) is left alone — we don't call them back.
+function bulkRedialCount(c) {
+  return (c.contacts || []).filter((ct) => ct.status !== 'answered' && !ct.answered_at).length;
 }
 </script>
 
@@ -531,6 +551,126 @@ function campaignStatusTone(s) {
           </div>
         </header>
 
+        <!-- Bulk CSV calling (Inbound+Outbound add-on, operator-granted) -->
+        <div v-if="bulkCalling && bulkCalling.plan_eligible" class="outbound__bulk">
+          <div class="outbound__bulk-head">
+            <div>
+              <strong>Bulk CSV calling</strong>
+              <p>Upload a CSV of phone numbers and call the whole list automatically.</p>
+            </div>
+            <span
+              class="n-tag"
+              :class="bulkCalling.enabled ? 'n-tag--success' : 'n-tag--muted'"
+            >{{ bulkCalling.enabled ? 'Enabled' : 'Add-on' }}</span>
+          </div>
+
+          <p v-if="bulkCallingNotice" class="outbound__bulk-notice">{{ bulkCallingNotice }}</p>
+          <p v-if="bulkCallingError" class="outbound__bulk-error">{{ bulkCallingError }}</p>
+          <div v-if="bulkDialFailures && bulkDialFailures.length" class="outbound__bulk-failures">
+            <p class="outbound__bulk-failures-title">These numbers couldn't be dialed (carrier rejected the call):</p>
+            <ul class="outbound__bulk-failures-list">
+              <li v-for="f in bulkDialFailures" :key="f.phone">
+                <span class="n-mono">{{ f.phone }}</span> — {{ f.error }}
+              </li>
+            </ul>
+          </div>
+
+          <!-- Not yet granted → request access -->
+          <template v-if="!bulkCalling.enabled">
+            <div v-if="bulkCalling.request_status === 'pending'" class="outbound__bulk-pending">
+              Request received — our team will reach you on
+              <strong>{{ bulkCalling.contact_number }}</strong> to set up your dedicated calling number.
+            </div>
+            <div v-else class="outbound__bulk-request">
+              <p class="outbound__bulk-pitch">
+                Bulk calling runs on a dedicated number our team provisions for you.
+                Leave a number we can reach you on to request access.
+              </p>
+              <div class="outbound__bulk-row">
+                <label class="n-field">
+                  <span class="n-field__label">Contact number</span>
+                  <input
+                    v-model="bulkRequestForm.contact_number"
+                    type="text"
+                    class="n-input"
+                    placeholder="+91 98765 43210"
+                    :disabled="!isAdmin"
+                  />
+                </label>
+                <label class="n-field">
+                  <span class="n-field__label">Note <span class="n-field__sub">optional</span></span>
+                  <input
+                    v-model="bulkRequestForm.note"
+                    type="text"
+                    class="n-input"
+                    placeholder="Best time to call, expected volume…"
+                    :disabled="!isAdmin"
+                  />
+                </label>
+              </div>
+              <button
+                type="button"
+                class="n-btn n-btn--primary n-btn--sm"
+                :disabled="!isAdmin || isSubmittingBulkRequest"
+                @click="submitBulkCallingRequest"
+              >
+                {{ isSubmittingBulkRequest ? 'Sending…' : 'Request access' }}
+              </button>
+              <p v-if="bulkCalling.request_status === 'denied'" class="outbound__bulk-denied">
+                A previous request was declined — submit again or contact support.
+              </p>
+            </div>
+          </template>
+
+          <!-- Granted → upload CSV + start calling -->
+          <div v-else class="outbound__bulk-launch">
+            <div class="outbound__bulk-row">
+              <label class="n-field">
+                <span class="n-field__label">Campaign name</span>
+                <input v-model="bulkCampaignForm.name" type="text" class="n-input" placeholder="December outreach" :disabled="!isAdmin" />
+              </label>
+              <label class="n-field">
+                <span class="n-field__label">Contacts file <span class="n-field__sub">CSV or XLSX — phone in column A, name in B</span></span>
+                <input type="file" accept=".csv,.xlsx" class="n-input" :disabled="!isAdmin" @change="onBulkCampaignFilePick" />
+              </label>
+            </div>
+            <div class="outbound__bulk-row">
+              <label class="n-field">
+                <span class="n-field__label">Business name</span>
+                <input v-model="bulkCampaignForm.company_name" type="text" class="n-input" placeholder="Raghava Estates" :disabled="!isAdmin" />
+              </label>
+              <label class="n-field">
+                <span class="n-field__label">Agent's name</span>
+                <input v-model="bulkCampaignForm.caller_name" type="text" class="n-input" placeholder="Riya" :disabled="!isAdmin" />
+              </label>
+              <label class="n-field">
+                <span class="n-field__label">Language</span>
+                <select v-model="bulkCampaignForm.language" class="n-input" :disabled="!isAdmin">
+                  <option v-for="opt in voiceLanguageOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
+                </select>
+              </label>
+            </div>
+            <label class="n-field">
+              <span class="n-field__label">What to say / offer details <span class="n-field__sub">the offer + key facts — we turn this into the agent's script</span></span>
+              <textarea
+                v-model="bulkCampaignForm.content"
+                class="n-input"
+                rows="3"
+                placeholder="New 3BHK gated community in Kollur, ₹85L onward, ready by December. Offer: free registration this month."
+                :disabled="!isAdmin"
+              ></textarea>
+            </label>
+            <button
+              type="button"
+              class="n-btn n-btn--primary n-btn--sm"
+              :disabled="!isAdmin || isLaunchingBulkCampaign"
+              @click="startBulkCallingCampaign"
+            >
+              {{ isLaunchingBulkCampaign ? 'Starting…' : 'Upload & start calling' }}
+            </button>
+          </div>
+        </div>
+
         <div v-if="isAdmin && showCampaignCreateForm" class="outbound__create">
           <div v-if="campaignFormPreset" class="outbound__preset-banner">
             <span>
@@ -552,13 +692,27 @@ function campaignStatusTone(s) {
                 <span v-else class="outbound__callerid-none">No outbound number provisioned yet</span>
               </div>
             </div>
+            <label class="n-field">
+              <span class="n-field__label">Business name <span class="n-field__sub">who the agent calls on behalf of</span></span>
+              <input v-model="campaignForm.company_name" type="text" class="n-input" placeholder="Raghava Estates" />
+            </label>
+            <label class="n-field">
+              <span class="n-field__label">Agent's name <span class="n-field__sub">how the agent introduces itself</span></span>
+              <input v-model="campaignForm.caller_name" type="text" class="n-input" placeholder="Riya" />
+            </label>
+            <label class="n-field">
+              <span class="n-field__label">Language</span>
+              <select v-model="campaignForm.language" class="n-input">
+                <option v-for="opt in voiceLanguageOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
+              </select>
+            </label>
             <label class="n-field outbound__col-2">
-              <span class="n-field__label">Agent prompt <span class="n-field__sub">the agent's full knowledge: persona, what to pitch, what to know</span></span>
-              <textarea v-model="campaignForm.agent_prompt" class="n-textarea" rows="8"></textarea>
+              <span class="n-field__label">What to say / offer details <span class="n-field__sub">the campaign content — the offer, key facts, what to pitch. We turn this into the agent's script.</span></span>
+              <textarea v-model="campaignForm.content" class="n-textarea" rows="6" placeholder="New 3BHK gated community in Kollur, ₹85L onward, ready by December. Offer: free registration this month. Mention the clubhouse and metro connectivity."></textarea>
             </label>
 
             <div class="n-field outbound__col-2">
-              <span class="n-field__label">Objectives <span class="n-field__sub">pick which side-flows the agent is allowed to drive</span></span>
+              <span class="n-field__label">Call goal <span class="n-field__sub">pick which next steps the agent is allowed to drive</span></span>
               <div class="outbound__objectives">
                 <label
                   v-for="opt in CAMPAIGN_OBJECTIVE_OPTIONS"
@@ -599,7 +753,7 @@ function campaignStatusTone(s) {
                  Admin sets the fallback retry policy here. Promise-extracted
                  callbacks from memory always take priority over these rules;
                  these only fire when no promise was extracted. -->
-            <div v-if="campaignForm.followup_rules" class="n-field outbound__col-2 outbound__followup-rules">
+            <div v-if="campaignForm.followup_rules && followupAgentEnabled" class="n-field outbound__col-2 outbound__followup-rules">
               <div class="outbound__followup-head">
                 <span class="n-field__label">
                   Follow-up rules
@@ -731,7 +885,7 @@ function campaignStatusTone(s) {
             <button
               type="button"
               class="n-btn n-btn--primary"
-              :disabled="isCreatingCampaign || !campaignForm.name.trim() || !campaignForm.agent_prompt.trim()"
+              :disabled="isCreatingCampaign || !campaignForm.name.trim() || !campaignForm.content.trim()"
               @click="createCampaign"
             >
               <Plus :size="13" />
@@ -786,7 +940,7 @@ function campaignStatusTone(s) {
                   <small v-if="c.from_number">Calls go out from {{ c.from_number }}</small>
                 </header>
                 <div v-if="c.agent_config?.agent_prompt" class="outbound__prompt-block">
-                  <span class="outbound__prompt-cap">Agent prompt</span>
+                  <span class="outbound__prompt-cap">Campaign content</span>
                   <p>{{ c.agent_config.agent_prompt }}</p>
                 </div>
                 <div v-if="c.agent_config?.objectives?.length" class="outbound__prompt-block">
@@ -890,7 +1044,7 @@ function campaignStatusTone(s) {
                   {{ isLaunchingCampaign === c.id ? 'Launching…' : 'Launch' }}
                 </button>
                 <button
-                  v-if="(c.status === 'running' || c.status === 'completed') && (c.pending_to_dial || 0) > 0"
+                  v-if="!c.agent_config?.bulk_csv && (c.status === 'running' || c.status === 'completed') && (c.pending_to_dial || 0) > 0"
                   type="button"
                   class="n-btn n-btn--brand n-btn--sm"
                   :disabled="isLaunchingCampaign === c.id || !outboundNumber.calling_enabled || !outboundNumber.number"
@@ -901,6 +1055,18 @@ function campaignStatusTone(s) {
                   {{ isLaunchingCampaign === c.id ? 'Relaunching…' : `Relaunch (${c.pending_to_dial})` }}
                 </button>
                 <button
+                  v-if="c.agent_config?.bulk_csv && bulkRedialCount(c) > 0"
+                  type="button"
+                  class="n-btn n-btn--brand n-btn--sm"
+                  :disabled="isRerunningBulkCampaign === c.id || !bulkCalling?.enabled"
+                  :title="!bulkCalling?.enabled ? 'Bulk calling isn\'t enabled' : `Call the ${bulkRedialCount(c)} contact(s) you haven't reached yet — answered/cut leads aren't called back`"
+                  @click="rerunBulkCampaign(c.id)"
+                >
+                  <RefreshCw :size="13" />
+                  {{ isRerunningBulkCampaign === c.id ? 'Re-running…' : `Re-run (${bulkRedialCount(c)})` }}
+                </button>
+                <button
+                  v-if="!c.agent_config?.bulk_csv && followupAgentEnabled"
                   type="button"
                   class="n-btn n-btn--ghost n-btn--sm outbound__followup-switch"
                   :class="{ 'is-off': !c.followup_enabled }"
@@ -1471,6 +1637,35 @@ function campaignStatusTone(s) {
 /* ─── Campaigns ───────────────────────────────── */
 .outbound__campaigns { padding: 0; }
 .outbound__campaigns-empty { margin: 24px 20px; }
+
+.outbound__bulk {
+  padding: 20px;
+  border-bottom: 1px solid var(--n-border-subtle);
+  background: var(--n-surface-raised, var(--n-surface));
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.outbound__bulk-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.outbound__bulk-head p { margin: 2px 0 0; color: var(--n-text-muted); font-size: 13px; }
+.outbound__bulk-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.outbound__bulk-pitch,
+.outbound__bulk-pending,
+.outbound__bulk-denied { font-size: 13px; color: var(--n-text-muted); margin: 0; }
+.outbound__bulk-pending { color: var(--n-text); }
+.outbound__bulk-launch,
+.outbound__bulk-request { display: flex; flex-direction: column; gap: 12px; align-items: flex-start; }
+.outbound__bulk-launch .n-field,
+.outbound__bulk-request .n-field { width: 100%; }
+.outbound__bulk-notice { color: var(--n-success, #1a7f37); font-size: 13px; margin: 0; }
+.outbound__bulk-error { color: var(--n-danger, #c0362c); font-size: 13px; margin: 0; }
+.outbound__bulk-failures { border: 1px solid var(--n-danger, #c0362c); border-radius: 8px; padding: 8px 12px; }
+.outbound__bulk-failures-title { color: var(--n-danger, #c0362c); font-size: 13px; font-weight: 600; margin: 0 0 4px; }
+.outbound__bulk-failures-list { margin: 0; padding-left: 18px; font-size: 12px; color: var(--n-text-muted); }
+.outbound__bulk-failures-list li { margin: 2px 0; }
+@media (max-width: 640px) {
+  .outbound__bulk-row { grid-template-columns: 1fr; }
+}
 
 .outbound__create {
   padding: 20px;

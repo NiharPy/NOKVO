@@ -60,6 +60,10 @@ _shutdown = asyncio.Event()
 async def _drain_once() -> None:
     """One pass over the due queue. Opens its own session per dispatch so a
     slow Exotel call doesn't hold a DB transaction open for long."""
+    # Master kill switch: when the Follow-up agent is disabled, place no calls —
+    # not even rows left pending from before it was switched off.
+    if not settings.FOLLOWUP_AGENT_ENABLED:
+        return
     try:
         async with scheduler_leader(
             "followup-scheduler",

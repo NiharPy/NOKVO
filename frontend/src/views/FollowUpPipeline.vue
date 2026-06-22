@@ -22,6 +22,7 @@ const {
   scheduleManualFollowup,
   phoneHref,
   isClinicTemplate,
+  followupAgentEnabled,
 } = useDashboardState();
 
 const refreshing = ref(false);
@@ -55,6 +56,9 @@ async function refresh() {
 // First paint: switchPage already kicks a load, but refresh on mount too so a
 // deep-link / hard refresh to /followups populates without a manual click.
 onMounted(() => {
+  // Follow-up agent globally disabled → don't load (the page renders a
+  // disabled notice instead). Guards a hard deep-link to /followups.
+  if (!followupAgentEnabled) return;
   if (!pipeline.value) loadFollowupPipeline();
 });
 
@@ -148,6 +152,11 @@ async function submitManual() {
 
 <template>
   <div class="n-page">
+    <div v-if="!followupAgentEnabled" class="n-page-head n-rise">
+      <h1 class="n-page-head__title">Follow-ups are turned off</h1>
+      <p class="n-page-head__sub">The Follow-up agent is currently disabled.</p>
+    </div>
+    <template v-else>
     <header class="n-page-head n-rise">
       <span class="n-page-head__eyebrow">Re-engagement</span>
       <div class="n-page-head__row">
@@ -290,6 +299,7 @@ async function submitManual() {
         </footer>
       </div>
     </div>
+    </template>
   </div>
 </template>
 

@@ -418,6 +418,72 @@ def _latency_guard_text(language: str | None, direction: str = "inbound") -> str
     return table.get(language or "en", default)
 
 
+# Answering-machine / voicemail greetings, as Sarvam STT transcribes them. When
+# an OUTBOUND call hits voicemail, the machine's greeting gets transcribed as a
+# "caller" turn — the agent must NOT pitch to a recording. These are deliberately
+# *strong*, specific phrases so a live human's words don't false-trigger the
+# guard. Matched case-insensitively as substrings; outbound-only.
+_VOICEMAIL_PHRASES = (
+    "forwarded to voicemail",
+    "reached the voicemail",
+    "your call has been forwarded",
+    "leave a message",
+    "leave your message",
+    "record your message",
+    "please record",
+    "after the tone",
+    "after the beep",
+    "the person you are trying to reach",
+    "not available to take your call",
+    "when you have finished recording",
+    "is unavailable",
+)
+
+
+def _is_voicemail_utterance(text: str | None) -> bool:
+    """True when ``text`` looks like an answering-machine greeting (outbound only).
+    Pure + unit-testable."""
+    if not text:
+        return False
+    low = text.casefold()
+    return any(phrase in low for phrase in _VOICEMAIL_PHRASES)
+
+
+def _voicemail_message(
+    language: str | None, *, caller_name: str = "", company_name: str = ""
+) -> str:
+    """One short, on-brand line to leave on a prospect's voicemail before we hang
+    up. Personalised with the campaign's agent + company name; native script for
+    hi/te (so Sarvam TTS pronounces it right), English fallback otherwise."""
+    caller = (caller_name or "").strip()
+    company = (company_name or "").strip()
+    lang = (language or "en")[:2]
+    if lang == "hi":
+        who = (f"{company} से {caller}".strip() if company else caller) or "हमारी टीम"
+        return (
+            f"नमस्ते, मैं {who} बोल रही हूँ — आपसे बात नहीं हो पाई। "
+            "हम दोबारा कोशिश करेंगे, या आप हमें कॉल बैक कर सकते हैं। धन्यवाद!"
+        )
+    if lang == "te":
+        who = (f"{company} నుండి {caller}".strip() if company else caller) or "మా టీమ్"
+        return (
+            f"నమస్తే, నేను {who} మాట్లాడుతున్నాను — మిమ్మల్ని కలవలేకపోయాం. "
+            "మేము మళ్ళీ ప్రయత్నిస్తాం, లేదా మీరు మాకు తిరిగి కాల్ చేయవచ్చు. ధన్యవాదాలు!"
+        )
+    if caller and company:
+        who = f"this is {caller} from {company}"
+    elif caller:
+        who = f"this is {caller}"
+    elif company:
+        who = f"this is {company}"
+    else:
+        who = "this is your callback team"
+    return (
+        f"Hi, {who} — sorry we missed you. "
+        "We'll try you again, or feel free to call us back. Thank you!"
+    )
+
+
 def _site_visit_confirm_text(language: str | None, when: str = "") -> str:
     """Deterministic, per-language confirmation for the moment a caller agrees
     to a site visit and gives a date/time. Replaces free-generated Telugu/Hindi
@@ -1073,6 +1139,27 @@ class NokvoOneVoiceStreamService:
         # ceiling.
         cleaned = " ".join((text or "").split())
         if not cleaned:
+            return
+        # Outbound answering-machine guard: a voicemail greeting gets transcribed
+        # as a "caller" turn. Don't pitch to a recording — leave one short message
+        # and end the call. One-shot per call via a flag on the shared
+        # campaign_context dict (the same object across every turn of the call).
+        if (
+            campaign_context is not None
+            and not campaign_context.get("_voicemail_ended")
+            and _is_voicemail_utterance(cleaned)
+        ):
+            campaign_context["_voicemail_ended"] = True
+            await NokvoOneVoiceStreamService._leave_voicemail_and_end(
+                websocket,
+                tenant_res,
+                language=language,
+                call_id=call_id,
+                campaign_context=campaign_context,
+                outbound_context=outbound_context,
+                arbiter=arbiter,
+                turn_state=turn_state,
+            )
             return
         if outbound_context is not None and call_id and source != "proactive_silence":
             await AgentSessionStore.merge_state(
@@ -2173,6 +2260,75 @@ class NokvoOneVoiceStreamService:
             outbound_context=outbound_context,
             after_turn=after_turn,
         )
+
+    @staticmethod
+    async def _leave_voicemail_and_end(
+        websocket: WebSocket,
+        tenant_res: TenantResources,
+        *,
+        language: str,
+        call_id: str | None,
+        campaign_context: dict[str, Any] | None = None,
+        outbound_context: OutboundCampaignContext | None = None,
+        arbiter: TurnArbiter | None = None,
+        turn_state: dict[str, Any] | None = None,
+    ) -> None:
+        """Outbound voicemail reached: speak ONE short on-brand line, then hang up.
+
+        Closing the media WS ends the Plivo ``<Stream>`` and drops the call; the
+        ``call.hangup`` status webhook then closes the contact out as usual. Never
+        raises — a TTS hiccup must still let us hang up.
+        """
+        caller = ""
+        company = ""
+        if outbound_context is not None:
+            caller = (getattr(outbound_context, "caller_name", "") or "").strip()
+            company = (getattr(outbound_context, "company_name", "") or "").strip()
+        if not company:
+            company = str((campaign_context or {}).get("company_name") or "").strip()
+        line = _voicemail_message(language, caller_name=caller, company_name=company)
+
+        # Mark speaking so a racing check-in can't barge our final line.
+        if turn_state is not None:
+            turn_state["speaking"] = True
+        if arbiter is not None:
+            arbiter.mark_speaking()
+
+        turn_id = str(uuid.uuid4())[:8]
+        try:
+            await websocket.send_json(
+                {
+                    "type": "agent_sentence",
+                    "turn_id": turn_id,
+                    "sentence": line,
+                    "tone": "warm",
+                    "cache_hit": False,
+                    "source": "voicemail_drop",
+                }
+            )
+            await SarvamVoiceService.stream_sentence_tts(
+                websocket,
+                tenant_res,
+                line,
+                language=language,
+                purpose="voicemail",
+            )
+        except Exception:
+            logger.debug("NOKVO-VOICE: voicemail drop TTS failed", exc_info=True)
+        try:
+            await AgentSessionStore.append_turn(
+                tenant_res, call_id, "(voicemail detected)", line
+            )
+        except Exception:
+            pass
+        logger.info(
+            "NOKVO-VOICE: answering machine detected call=%s — left message, ending call",
+            call_id,
+        )
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
     @staticmethod
     async def _play_opener(

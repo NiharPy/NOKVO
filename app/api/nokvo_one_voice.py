@@ -1429,6 +1429,30 @@ async def _check_plivo_signature(request: Request, *, tenant_token: str | None =
     return mode != "enforce"
 
 
+async def _outbound_signing_token(call_link_id: str, db: AsyncSession) -> str | None:
+    """The auth token Plivo signed an outbound webhook with — the call was NOT
+    placed on the master account, so master-only validation always mismatches.
+    Bulk campaigns sign with the dedicated bulk token; everything else with the
+    tenant's subaccount token. Returned as the extra ``_check_plivo_signature``
+    candidate so outbound answer/status webhooks validate under enforce mode."""
+    from app.services.plivo_service import PlivoService
+
+    try:
+        campaign, _contact = await OutboundCampaignService.get_by_call_link_id(call_link_id, db)
+        if not campaign:
+            return None
+        tr = await _tenant_by_tenant_id(db, campaign.tenant_id)
+        if not tr:
+            return None
+        if bool((campaign.agent_config or {}).get("bulk_csv")):
+            auth = PlivoService.bulk_calling_auth(tr)
+            return auth[1] if auth else None
+        cfg = dict((tr.provider_status or {}).get("plivo") or {})
+        return PlivoService._subaccount_token(cfg)
+    except Exception:
+        return None
+
+
 # ── Webhook observability ──────────────────────────────────────────────
 # Best-effort Redis breadcrumbs (TTL 7 days) so /phone-link can answer the
 # two diagnostic questions for "inbound calls don't connect": did Plivo's
@@ -1592,12 +1616,15 @@ async def plivo_inbound_media_websocket(websocket: WebSocket, link_id: str):
 
 
 @router.post("/plivo/outbound-answer/{call_link_id}", response_class=PlainTextResponse)
-async def plivo_outbound_answer(call_link_id: str, request: Request):
+async def plivo_outbound_answer(
+    call_link_id: str, request: Request, db: AsyncSession = Depends(deps.get_db)
+):
     """Plivo fetches this when the outbound call connects → returns the <Stream> XML
     that bridges audio to the agent's outbound media WS."""
     from app.services.public_url import ws_base_url
 
-    if not await _check_plivo_signature(request):
+    _sig_token = await _outbound_signing_token(call_link_id, db)
+    if not await _check_plivo_signature(request, tenant_token=_sig_token):
         return PlainTextResponse(
             "<Response><Hangup/></Response>", media_type="application/xml", status_code=403
         )
@@ -1609,7 +1636,9 @@ async def plivo_outbound_answer(call_link_id: str, request: Request):
 async def plivo_outbound_status(
     call_link_id: str, request: Request, db: AsyncSession = Depends(deps.get_db)
 ):
-    if not await _check_plivo_signature(request):
+    if not await _check_plivo_signature(
+        request, tenant_token=await _outbound_signing_token(call_link_id, db)
+    ):
         raise HTTPException(status_code=403, detail="Plivo signature verification failed")
     # Parse the payload FIRST (with a hard {} fallback — a malformed body must
     # never NameError) so it can be stashed even when the row isn't found yet.
@@ -1910,6 +1939,201 @@ async def outbound_number(
     }
 
 
+# ───────────────────────── Bulk CSV calling (add-on) ─────────────────────────
+# Only offered on the Inbound + Outbound plan, and not self-serve: a tenant
+# requests access (leaving a contact number) and an operator grants it from the
+# SuperAdmin console by provisioning a dedicated Plivo number. See
+# app/models/bulk_calling_request.py.
+
+
+async def _latest_bulk_request(db: AsyncSession, organization_id):
+    from app.models.bulk_calling_request import BulkCallingRequest
+
+    res = await db.execute(
+        select(BulkCallingRequest)
+        .where(BulkCallingRequest.organization_id == organization_id)
+        .order_by(BulkCallingRequest.created_at.desc())
+        .limit(1)
+    )
+    return res.scalars().first()
+
+
+@router.get("/bulk-calling/status")
+async def bulk_calling_status(
+    user: OrganizationUser = Depends(_viewer_dep()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Gate state for the Bulk CSV Calling card:
+      * ``plan_eligible``  — on the Inbound + Outbound plan (can request).
+      * ``enabled``        — operator has provisioned the dedicated number.
+      * ``request_status`` — pending | approved | denied | null (latest request).
+    """
+    from app.services.plivo_service import PlivoService
+
+    tr = await _tenant_for_user(db, user)
+    org = await _org_for_user(db, user)
+    latest = await _latest_bulk_request(db, org.id)
+    return {
+        "plan_eligible": bool(org.calling_enabled),
+        "enabled": PlivoService.bulk_calling_enabled(tr),
+        "request_status": latest.status if latest else None,
+        "contact_number": latest.contact_number if latest else None,
+        "requested_at": latest.created_at.isoformat() if (latest and latest.created_at) else None,
+    }
+
+
+class BulkCallingRequestPayload(BaseModel):
+    contact_number: str = Field(min_length=4, max_length=32)
+    note: str | None = Field(default=None, max_length=2000)
+
+
+@router.post("/bulk-calling/request", status_code=status.HTTP_201_CREATED)
+async def request_bulk_calling(
+    payload: BulkCallingRequestPayload,
+    user: OrganizationUser = Depends(_admin_dep()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """An admin requests Bulk CSV Calling access. Gated to the Inbound + Outbound
+    plan; rejected if already enabled or a request is already pending."""
+    from app.models.bulk_calling_request import BulkCallingRequest
+    from app.services.plivo_service import PlivoService
+
+    org = await _require_outbound_enabled(db, user)
+    tr = await _tenant_for_user(db, user)
+    if PlivoService.bulk_calling_enabled(tr):
+        raise HTTPException(status_code=409, detail="Bulk calling is already enabled for your account.")
+    latest = await _latest_bulk_request(db, org.id)
+    if latest and latest.status == "pending":
+        raise HTTPException(
+            status_code=409,
+            detail="You already have a pending request — we'll reach out shortly.",
+        )
+    contact = payload.contact_number.strip()
+    if not contact:
+        raise HTTPException(status_code=400, detail="A contact number is required.")
+    db.add(
+        BulkCallingRequest(
+            organization_id=org.id,
+            tenant_id=tr.tenant_id,
+            requested_by_user_id=user.id,
+            contact_number=contact[:32],
+            note=(payload.note or "").strip()[:2000] or None,
+        )
+    )
+    await db.commit()
+    return {"ok": True, "request_status": "pending"}
+
+
+@router.post("/bulk-calling/campaigns", status_code=status.HTTP_201_CREATED)
+async def create_bulk_calling_campaign(
+    request: Request,
+    name: str = Form(...),
+    contacts_file: UploadFile = File(...),
+    content: str = Form(...),
+    company_name: str | None = Form(None),
+    caller_name: str | None = Form(None),
+    language: str | None = Form(None),
+    objectives: str | None = Form(None),
+    exit_conditions: str | None = Form(None),
+    tone: str | None = Form(None),
+    silence_timeout_seconds: float | None = Form(None),
+    user: OrganizationUser = Depends(_admin_dep()),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Upload a CSV/XLSX of phone numbers and immediately start calling the whole
+    list from the tenant's dedicated bulk number. Gated on the operator grant.
+
+    Like the lead-based path, the operator supplies guided DETAILS
+    (``company_name``, ``caller_name``, ``language``, ``tone``, goal) plus the
+    ``content`` (what to say / offer); the engineered system prompt does the rest.
+    """
+    from app.services.plivo_service import PlivoService
+    from app.services.public_url import public_base_url as _pub
+
+    await _require_outbound_enabled(db, user)
+    tr = await _tenant_for_user(db, user)
+    if not PlivoService.bulk_calling_enabled(tr):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Bulk calling isn't enabled yet. Request access and we'll provision "
+                "your dedicated calling number."
+            ),
+        )
+    if not (name or "").strip():
+        raise HTTPException(status_code=400, detail="Give the campaign a name.")
+    if not (content or "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Tell the agent what to say — add the campaign content / offer details.",
+        )
+    agent_config = {
+        # Content is the agent's KNOWLEDGE (agent_prompt), not a spoken line — do
+        # NOT route it into pitch_summary, or the deterministic opener would read
+        # the whole blob aloud. The agent pitches it conversationally from turn 2.
+        "agent_prompt": content,
+        "company_name": company_name,
+        "caller_name": caller_name,
+        "language": language,
+        "objectives": _parse_campaign_list_field(objectives),
+        "exit_conditions": _parse_campaign_list_field(exit_conditions),
+        "tone": tone,
+        "silence_timeout_seconds": silence_timeout_seconds,
+    }
+    try:
+        campaign = await OutboundCampaignService.create_and_launch_bulk_campaign(
+            tr,
+            db,
+            name=name.strip(),
+            contacts_file=contacts_file,
+            agent_config=agent_config,
+            public_base_url=_pub(request),
+            path_prefix="/api/nokvo-one/agents",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
+    return _campaign_response(campaign)
+
+
+@router.post("/bulk-calling/campaigns/{campaign_id}/rerun")
+async def rerun_bulk_calling_campaign(
+    campaign_id: uuid.UUID,
+    request: Request,
+    user: OrganizationUser = Depends(_admin_dep()),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Dial a bulk CSV campaign's whole list again (e.g. after the dedicated
+    number was fixed). Re-arms every contact, unlike the lead-based relaunch."""
+    from app.services.plivo_service import PlivoService
+    from app.services.public_url import public_base_url as _pub
+
+    await _require_outbound_enabled(db, user)
+    tr = await _tenant_for_user(db, user)
+    if not PlivoService.bulk_calling_enabled(tr):
+        raise HTTPException(
+            status_code=403,
+            detail="Bulk calling isn't enabled for your account.",
+        )
+    campaign = await OutboundCampaignService.get_campaign(campaign_id, tr, db)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    try:
+        campaign = await OutboundCampaignService.rerun_bulk_campaign(
+            campaign,
+            db,
+            tenant_res=tr,
+            public_base_url=_pub(request),
+            path_prefix="/api/nokvo-one/agents",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=_safe_detail(exc)) from exc
+    return _campaign_response(campaign)
+
+
 @router.get("/campaigns")
 async def list_campaigns(
     user: OrganizationUser = Depends(_viewer_dep()),
@@ -1930,7 +2154,10 @@ async def create_campaign(
     excel_file: UploadFile | None = File(None),
     doc_file: UploadFile | None = File(None),
     from_number: str | None = Form(None),
-    agent_prompt: str = Form(...),
+    content: str = Form(...),
+    company_name: str | None = Form(None),
+    caller_name: str | None = Form(None),
+    language: str | None = Form(None),
     objectives: str | None = Form(None),
     exit_conditions: str | None = Form(None),
     tone: str | None = Form(None),
@@ -1942,9 +2169,12 @@ async def create_campaign(
 ):
     """Create a campaign.
 
-    The campaign's "knowledge" is the ``agent_prompt`` itself — there is
-    no separate reference document. ``doc_file`` is kept as an optional
-    legacy input but new callers should leave it empty.
+    The operator supplies guided campaign DETAILS (``company_name``,
+    ``caller_name``, ``language``, ``tone``, the ``objectives`` goal) plus the
+    campaign CONTENT (``content`` — what to say / the offer details). The
+    engineered outbound system prompt (``agent_outbound_context``) turns those
+    into the agent's behaviour — there is no hand-written delivery prompt.
+    ``content`` becomes both the layered campaign knowledge and the short pitch.
 
     ``lead_ids`` is optional. When omitted, the campaign is created in
     prompt-only mode and consented leads can be attached later via
@@ -1961,12 +2191,12 @@ async def create_campaign(
     # leave a campaign that can't be launched.
     if launch:
         await _require_outbound_enabled(db, user)
-    if not (agent_prompt or "").strip():
+    if not (content or "").strip():
         raise HTTPException(
             status_code=400,
             detail=(
-                "Campaigns need an agent prompt — it's what the agent reads "
-                "during the call. Add one and try again."
+                "Tell the agent what to say — add the campaign content / offer "
+                "details and try again."
             ),
         )
     try:
@@ -1984,7 +2214,13 @@ async def create_campaign(
                     "and a valid phone number). Nothing to add."
                 )
         agent_config = {
-            "agent_prompt": agent_prompt,
+            # Content is the agent's KNOWLEDGE (agent_prompt), not a spoken line —
+            # do NOT route it into pitch_summary, or the deterministic opener would
+            # read the whole blob aloud. The agent pitches it from turn 2.
+            "agent_prompt": content,
+            "company_name": company_name,
+            "caller_name": caller_name,
+            "language": language,
             "objectives": _parse_campaign_list_field(objectives),
             "exit_conditions": _parse_campaign_list_field(exit_conditions),
             "tone": tone,

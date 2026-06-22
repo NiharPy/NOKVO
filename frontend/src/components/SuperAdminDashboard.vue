@@ -65,7 +65,15 @@ const llmBusy = ref(false);
 const _emptyLlmForm = () => ({ id: null, pool: 'mini', label: '', endpoint: '', api_key: '', deployment: '', tpm: null, enabled: true });
 const llmForm = ref(_emptyLlmForm());
 
+const bulkView = ref(false);
+const bulkRequests = ref([]);
+const bulkLoading = ref(false);
+const bulkBusy = ref(false);
+// Per-request grant form (auth/number the operator provisions), keyed by request id.
+const bulkGrantForms = ref({});
+
 const view = computed(() => {
+  if (bulkView.value) return 'bulk';
   if (llmView.value) return 'llm';
   if (langsmithView.value) return 'langsmith';
   if (broadcastView.value) return 'broadcast';
@@ -271,6 +279,67 @@ const openLlm = () => {
   loadLlmKeys();
 };
 const closeLlm = () => { llmView.value = false; };
+
+// ── Bulk CSV calling access requests ────────────────────────────────────────
+const loadBulkRequests = async () => {
+  bulkLoading.value = true;
+  try {
+    const res = await fetch(`${SUPERADMIN_API_BASE}/tenants/bulk-calling-requests`, { headers: authHeaders() });
+    if (res.status === 401) { handleLogout(); return; }
+    if (!res.ok) { errorMsg.value = `Failed to load bulk calling requests (${res.status}).`; return; }
+    bulkRequests.value = (await res.json()).items || [];
+  } catch (e) {
+    errorMsg.value = 'Network error loading bulk calling requests.';
+  } finally {
+    bulkLoading.value = false;
+  }
+};
+const openBulk = () => {
+  detail.value = null; feedbackView.value = false; todoView.value = false; broadcastView.value = false; langsmithView.value = false; llmView.value = false;
+  bulkView.value = true;
+  loadBulkRequests();
+};
+const closeBulk = () => { bulkView.value = false; };
+const bulkGrantForm = (id) => {
+  if (!bulkGrantForms.value[id]) bulkGrantForms.value[id] = { auth_id: '', auth_token: '', number: '' };
+  return bulkGrantForms.value[id];
+};
+const grantBulk = async (req) => {
+  const f = bulkGrantForm(req.id);
+  if (!f.auth_id.trim() || !f.auth_token.trim() || !f.number.trim()) {
+    errorMsg.value = 'Enter the Plivo Auth ID, Auth Token, and number to grant.';
+    return;
+  }
+  bulkBusy.value = true; errorMsg.value = '';
+  try {
+    const res = await fetch(`${SUPERADMIN_API_BASE}/tenants/bulk-calling-requests/${req.id}/grant`, {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ auth_id: f.auth_id.trim(), auth_token: f.auth_token.trim(), number: f.number.trim() }),
+    });
+    if (!res.ok) { errorMsg.value = `Grant failed (${res.status}).`; return; }
+    delete bulkGrantForms.value[req.id];
+    await loadBulkRequests();
+  } catch (e) {
+    errorMsg.value = 'Network error granting access.';
+  } finally {
+    bulkBusy.value = false;
+  }
+};
+const denyBulk = async (req) => {
+  bulkBusy.value = true; errorMsg.value = '';
+  try {
+    const res = await fetch(`${SUPERADMIN_API_BASE}/tenants/bulk-calling-requests/${req.id}/deny`, {
+      method: 'POST', headers: authHeaders(),
+    });
+    if (!res.ok) { errorMsg.value = `Deny failed (${res.status}).`; return; }
+    await loadBulkRequests();
+  } catch (e) {
+    errorMsg.value = 'Network error.';
+  } finally {
+    bulkBusy.value = false;
+  }
+};
 const editLlmKey = (k) => {
   llmForm.value = { id: k.id, pool: k.pool, label: k.label || '', endpoint: k.endpoint, api_key: '', deployment: k.deployment || '', tpm: k.tpm, enabled: k.enabled };
 };
@@ -555,14 +624,15 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
         </div>
       </div>
       <div class="header-actions">
-        <template v-if="view === 'feedback' || view === 'todos' || view === 'broadcast' || view === 'langsmith' || view === 'llm'">
-          <button class="ghost-btn" @click="closeFeedback(); closeTodos(); closeBroadcast(); closeLangsmith(); closeLlm();">← TENANTS</button>
+        <template v-if="view === 'feedback' || view === 'todos' || view === 'broadcast' || view === 'langsmith' || view === 'llm' || view === 'bulk'">
+          <button class="ghost-btn" @click="closeFeedback(); closeTodos(); closeBroadcast(); closeLangsmith(); closeLlm(); closeBulk();">← TENANTS</button>
         </template>
         <template v-else>
           <button class="ghost-btn" @click="openLlm">LLM KEYS</button>
           <button class="ghost-btn" @click="openLangsmith">LANGSMITH</button>
           <button class="ghost-btn" @click="openBroadcast">BROADCAST</button>
           <button class="ghost-btn" @click="openFeedback">FEEDBACK</button>
+          <button class="ghost-btn" @click="openBulk">BULK CALLING</button>
           <button class="ghost-btn" @click="openTodos">TO-DO</button>
         </template>
         <button class="theme-toggle" @click="props.toggleTheme">
@@ -822,6 +892,50 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
         </div>
         <div v-else-if="!feedbackLoading" class="empty-orgs"><p>No feedback submitted yet.</p></div>
         <div v-else class="empty-orgs"><p>Loading feedback…</p></div>
+      </div>
+
+      <!-- ── BULK CSV CALLING REQUESTS ───────────────────────────── -->
+      <div v-else-if="view === 'bulk'" key="bulk" class="dashboard-content">
+        <div class="orgs-panel-header">
+          <div>
+            <span class="stage-eyebrow">TELEPHONY</span>
+            <h3>Bulk CSV Calling Requests</h3>
+          </div>
+          <button type="button" class="ghost-btn" :disabled="bulkLoading" @click="loadBulkRequests">
+            <RefreshCw :size="14" :class="{ spin: bulkLoading }" />
+            REFRESH
+          </button>
+        </div>
+        <p class="bulk-help">
+          Granting provisions a dedicated Plivo number for the tenant's bulk calling and unlocks the
+          feature. Enter the new Auth ID, Auth Token, and DID/number to call them on the contact number below.
+        </p>
+        <div v-if="bulkRequests.length" class="bulk-list">
+          <div v-for="req in bulkRequests" :key="req.id" class="bulk-card">
+            <div class="bulk-card-top">
+              <div>
+                <strong>{{ req.organization_name }}</strong>
+                <span class="bulk-meta">contact: <a :href="`tel:${req.contact_number}`">{{ req.contact_number }}</a></span>
+                <span class="bulk-meta">{{ req.requested_by_email }} · {{ fmtDate(req.created_at) }}</span>
+                <p v-if="req.note" class="bulk-note">“{{ req.note }}”</p>
+              </div>
+              <span
+                class="fb-tag"
+                :class="req.enabled ? 'is-feature' : (req.status === 'denied' ? 'is-feedback' : 'is-feedback')"
+              >{{ req.enabled ? 'Enabled' : req.status }}</span>
+            </div>
+            <div v-if="req.enabled" class="bulk-enabled">Calling from <strong>{{ req.bulk_number }}</strong></div>
+            <div v-else class="bulk-grant">
+              <input class="bulk-input" placeholder="Plivo Auth ID" v-model="bulkGrantForm(req.id).auth_id" />
+              <input class="bulk-input" placeholder="Plivo Auth Token" type="password" v-model="bulkGrantForm(req.id).auth_token" />
+              <input class="bulk-input" placeholder="DID / number (+91…)" v-model="bulkGrantForm(req.id).number" />
+              <button type="button" class="plan-btn" :disabled="bulkBusy" @click="grantBulk(req)">GRANT</button>
+              <button type="button" class="ghost-btn sm" :disabled="bulkBusy" @click="denyBulk(req)">DENY</button>
+            </div>
+          </div>
+        </div>
+        <div v-else-if="!bulkLoading" class="empty-orgs"><p>No bulk calling requests yet.</p></div>
+        <div v-else class="empty-orgs"><p>Loading requests…</p></div>
       </div>
 
       <!-- ── TO-DO ───────────────────────────────────────────────── -->
@@ -1421,6 +1535,23 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
 .fb-msg { white-space: pre-wrap; max-width: 460px; color: var(--text-primary); }
 .ghost-btn.sm { padding: 0.3rem 0.6rem; font-size: 0.7rem; white-space: nowrap; }
 .ghost-btn.sm.danger { color: #f87171; border-color: rgba(248,113,113,0.4); }
+
+/* Bulk CSV calling requests */
+.bulk-help { color: var(--text-secondary, #9aa); font-size: 0.8rem; margin: 0 0 12px; max-width: 720px; }
+.bulk-list { display: flex; flex-direction: column; gap: 12px; }
+.bulk-card { border: 1px solid var(--border-color, rgba(255,255,255,0.1)); border-radius: 10px; padding: 14px 16px; }
+.bulk-card-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+.bulk-card-top strong { display: block; }
+.bulk-meta { display: block; font-size: 0.75rem; color: var(--text-secondary, #9aa); margin-top: 2px; }
+.bulk-meta a { color: inherit; }
+.bulk-note { font-style: italic; color: var(--text-secondary, #9aa); margin: 6px 0 0; font-size: 0.8rem; }
+.bulk-enabled { margin-top: 10px; font-size: 0.85rem; }
+.bulk-grant { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; align-items: center; }
+.bulk-input {
+  flex: 1 1 160px; min-width: 140px; padding: 0.45rem 0.6rem; border-radius: 8px;
+  border: 1px solid var(--border-color, rgba(255,255,255,0.15)); background: var(--input-bg, rgba(0,0,0,0.2));
+  color: var(--text-primary, #fff); font-size: 0.8rem;
+}
 
 /* To-do tab */
 .todo-create { border: 1px solid var(--border-color); border-radius: 10px; padding: 0.9rem; margin-bottom: 1rem; display: flex; flex-direction: column; gap: 0.6rem; }

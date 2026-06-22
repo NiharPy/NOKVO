@@ -72,6 +72,12 @@ class LeadFollowupNoteScheduler:
 
         Returns a small status dict. Best-effort; never raises out.
         """
+        # Master kill switch: the Follow-up agent is globally disabled — skip the
+        # callback-extraction LLM entirely (saves spend on every inbound call).
+        from app.core.config import settings
+
+        if not settings.FOLLOWUP_AGENT_ENABLED:
+            return {"ok": False, "reason": "followup_disabled"}
         note = (note or "").strip()
         if not note:
             return {"ok": False, "reason": "no_note"}

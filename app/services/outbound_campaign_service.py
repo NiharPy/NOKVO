@@ -61,6 +61,79 @@ def _parse_excel(content: bytes) -> list[dict[str, str]]:
     return contacts
 
 
+def _parse_csv(content: bytes) -> list[dict[str, str]]:
+    """Return list of {phone, name} from a CSV: first two populated columns,
+    same contract as ``_parse_excel`` (phone in col A, name in col B, header
+    row auto-skipped)."""
+    import csv
+
+    text = content.decode("utf-8-sig", errors="ignore")
+    contacts: list[dict[str, str]] = []
+    header_skipped = False
+    for row in csv.reader(io.StringIO(text)):
+        cells = [str(c).strip() if c is not None else "" for c in row]
+        if not any(cells):
+            continue
+        first = cells[0] if cells else ""
+        # Auto-detect header: first row with no digit-run in col0 is the header.
+        if not header_skipped and not re.search(r"\d{7,}", first):
+            header_skipped = True
+            continue
+        phone = re.sub(r"[^\d+]", "", first)
+        name = cells[1] if len(cells) > 1 else ""
+        if len(phone) >= 7:
+            contacts.append({"phone": phone, "name": name or phone})
+    return contacts
+
+
+def _parse_contacts(filename: str | None, content: bytes) -> list[dict[str, str]]:
+    """Parse a contacts upload into [{phone, name}]. Branches on extension:
+    ``.csv`` → CSV reader; ``.xlsx`` (anything else) → openpyxl."""
+    name = (filename or "").lower()
+    if name.endswith(".csv"):
+        return _parse_csv(content)
+    return _parse_excel(content)
+
+
+def _canonical_phone(raw: str | None) -> str:
+    """Canonicalize a phone to bare-digit E.164 for India (this is an India-only
+    product — +91, DLT, etc.). Strips all formatting; a 10-digit bare mobile gets
+    the 91 country code, a leading-0 trunk form (0XXXXXXXXXX) becomes
+    91XXXXXXXXXX. Returns "" when there are no usable digits.
+
+    The point is dedupe + correct dialing: ``7569672503``, ``+91 75696 72503``
+    and ``917569672503`` all collapse to ``917569672503`` — so the same person
+    isn't entered (and dialed) as several separate contacts, and a bare 10-digit
+    number that Plivo would otherwise reject gets its country code."""
+    digits = re.sub(r"\D", "", raw or "")
+    if not digits:
+        return ""
+    if len(digits) == 10:
+        return "91" + digits
+    if len(digits) == 11 and digits.startswith("0"):
+        return "91" + digits[1:]
+    return digits
+
+
+def _dedupe_contacts(contacts_raw: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Collapse a parsed dial list to one entry per canonical phone (first
+    occurrence's name wins), dropping rows whose number can't be canonicalized.
+    Returns [{phone, name}] with ``phone`` already in canonical dial form.
+
+    Without this, a CSV that lists the same person twice — commonly once bare and
+    once with the country code — dials them twice (and only the +country-code one
+    actually connects), which reads to the recipient as "it keeps calling me"."""
+    seen: set[str] = set()
+    out: list[dict[str, str]] = []
+    for c in contacts_raw:
+        canon = _canonical_phone(c.get("phone"))
+        if not canon or canon in seen:
+            continue
+        seen.add(canon)
+        out.append({"phone": canon, "name": c.get("name") or canon})
+    return out
+
+
 def _parse_document(filename: str, content: bytes) -> str:
     """Extract plain text from a PDF, DOCX, or TXT file.
 
@@ -98,6 +171,10 @@ def _doc_to_chunks(text: str, words_per_chunk: int = 350) -> list[dict[str, Any]
 # ---------------------------------------------------------------------------
 
 class OutboundCampaignService:
+    # Bulk CSV campaigns dial up to this many lines simultaneously, refilling
+    # one-for-one as calls end (independent of the global dial concurrency).
+    BULK_DIAL_CONCURRENCY = 5
+
     @staticmethod
     async def _index_campaign_script(
         tenant_res: TenantResources,
@@ -405,6 +482,17 @@ class OutboundCampaignService:
 
         leads = await OutgoingLeadService.validate_callable_leads(tenant_res, db, lead_ids)
 
+        # Row-lock + refresh BEFORE the read-modify-write of ``contacts``. attach can
+        # run on an already-running campaign (only ``cancelled`` is blocked above), so
+        # a concurrent in-flight status webhook may be mutating the same JSON blob.
+        # Without the lock this admin commit would write back a snapshot read before
+        # the webhook landed — reverting a just-ended/answered contact and re-opening
+        # the lost-update that strands slots / re-dials reached leads. Held until the
+        # commit below. See ``_lock_campaign``.
+        locked = await OutboundCampaignService._lock_campaign(db, campaign.id)
+        if locked is not None:
+            campaign = locked
+
         contacts = list(campaign.contacts or [])
         already_attached_ids = {str(c.get("lead_id")) for c in contacts if c.get("lead_id")}
         existing_rows_res = await db.execute(
@@ -620,6 +708,14 @@ class OutboundCampaignService:
 
         base = public_base_url.rstrip("/")
         prefix = path_prefix.rstrip("/")
+        # Row-lock + refresh BEFORE re-arming ``contacts``. On a relaunch the prior
+        # batch may still be draining (status webhooks mutating the JSON blob under
+        # their own lock); arming from an unlocked snapshot would clobber a just-ended
+        # contact back to a live state, leaking its slot and starving fan-out. A fresh
+        # draft launch simply locks an uncontended row. Held until the commit below.
+        locked = await OutboundCampaignService._lock_campaign(db, campaign.id)
+        if locked is not None:
+            campaign = locked
         contacts = list(campaign.contacts or [])
         # Dial only contacts that haven't been placed yet: a fresh draft → all of
         # them; a relaunch → only the newly-attached (undialed) ones, identified
@@ -670,6 +766,219 @@ class OutboundCampaignService:
         return campaign
 
     @staticmethod
+    async def create_and_launch_bulk_campaign(
+        tenant_res: TenantResources,
+        db: AsyncSession,
+        *,
+        name: str,
+        contacts_file: UploadFile,
+        agent_config: dict[str, Any] | None = None,
+        public_base_url: str,
+        path_prefix: str = "/api/nokvo-one/agents",
+    ) -> OutboundCampaign:
+        """Bulk CSV Calling: parse an uploaded CSV/XLSX of phone+name rows and
+        immediately dial the whole list from the tenant's dedicated bulk number.
+
+        Unlike the lead-based path this does NOT require consented lead records —
+        access is gated upstream (Inbound+Outbound plan + a SuperAdmin grant that
+        provisions the dedicated Plivo number/auth). Calls are placed on that
+        dedicated account, never the tenant's inbound DID.
+        """
+        if not PlivoService.bulk_calling_enabled(tenant_res):
+            raise ValueError(
+                "Bulk calling isn't enabled for this account yet. It unlocks once "
+                "the team provisions your dedicated calling number."
+            )
+        cfg = build_agent_config(**dict(agent_config or {}))
+        cfg["bulk_csv"] = True
+        # Bulk campaigns never auto-call a lead back: a CSV list is dialed once,
+        # and if the lead cuts the call we don't chase them with a follow-up.
+        cfg["followup_rules"] = {"enabled": False}
+        if not str(cfg.get("agent_prompt") or "").strip():
+            raise ValueError(
+                "Bulk campaigns need an agent prompt — it's what the agent reads "
+                "during the call. Add one and try again."
+            )
+
+        raw = await contacts_file.read()
+        # Canonicalize + dedupe so the same person listed twice (e.g. bare
+        # ``7569672503`` and ``+917569672503``) becomes ONE contact dialed once,
+        # in a form Plivo accepts.
+        contacts_raw = _dedupe_contacts(_parse_contacts(contacts_file.filename, raw))
+        if not contacts_raw:
+            raise ValueError(
+                "No valid phone numbers found in the file. Put phone numbers in the "
+                "first column and names in the second (CSV or XLSX)."
+            )
+
+        caller_id = PlivoService.bulk_calling_caller_id(tenant_res)
+        auth_override = PlivoService.bulk_calling_auth(tenant_res)
+        if not caller_id or not auth_override:
+            raise ValueError(
+                "Your dedicated bulk calling number isn't fully configured. "
+                "Contact support to finish setup."
+            )
+
+        contacts = [
+            {
+                "phone": c["phone"],
+                "name": c["name"],
+                "status": "pending",
+                "call_id": None,
+                "call_link_id": str(uuid.uuid4()),
+                "duration_s": None,
+                "answered_at": None,
+            }
+            for c in contacts_raw
+        ]
+
+        campaign = OutboundCampaign(
+            id=uuid.uuid4(),
+            tenant_id=tenant_res.tenant_id,
+            name=name,
+            status=CampaignStatus.running,
+            contacts=contacts,
+            agent_config=cfg,
+            from_number=caller_id,
+            total_count=len(contacts),
+            started_at=datetime.now(timezone.utc),
+        )
+        db.add(campaign)
+        await db.commit()
+        await db.refresh(campaign)
+        invalidate_outbound_context(campaign.id)
+
+        await OutboundCampaignService._dial_pending(
+            campaign,
+            db,
+            tenant_res=tenant_res,
+            base=public_base_url.rstrip("/"),
+            prefix=path_prefix.rstrip("/"),
+        )
+        return campaign
+
+    @staticmethod
+    async def rerun_bulk_campaign(
+        campaign: OutboundCampaign,
+        db: AsyncSession,
+        *,
+        tenant_res: TenantResources,
+        public_base_url: str,
+        path_prefix: str = "/api/nokvo-one/agents",
+    ) -> OutboundCampaign:
+        """Dial a bulk CSV campaign's whole list again — re-runs the same contacts
+        from scratch (fresh call_link_ids, counters reset). Useful after fixing the
+        dedicated number, or to re-contact the list. Unlike the lead-based relaunch
+        (which only dials newly-added consented leads), this re-arms EVERY contact.
+        """
+        if not OutboundCampaignService._is_bulk(campaign):
+            raise ValueError("Re-run is only for bulk CSV campaigns.")
+        if not PlivoService.bulk_calling_enabled(tenant_res):
+            raise ValueError(
+                "Bulk calling isn't enabled for this account. It unlocks once the "
+                "team provisions your dedicated calling number."
+            )
+        caller_id = PlivoService.bulk_calling_caller_id(tenant_res)
+        if not caller_id or not PlivoService.bulk_calling_auth(tenant_res):
+            raise ValueError(
+                "Your dedicated bulk calling number isn't fully configured yet."
+            )
+        # Row-lock + refresh BEFORE reading/rebuilding ``contacts``. Re-run has no
+        # status guard, so the prior batch can still be in flight when the operator
+        # clicks it. Reading the contacts snapshot unlocked here races each call's
+        # single hangup webhook: if a contact's ``answered``/``ended`` commit landed
+        # after this method's stale read, the rebuild below would see it as
+        # not-reached, re-arm it with a fresh call_link_id and re-dial someone who
+        # already picked up — the "I cut the call and it rang me again" report. The
+        # lock (held to the commit below) serializes against the webhook writer.
+        locked = await OutboundCampaignService._lock_campaign(db, campaign.id)
+        if locked is not None:
+            campaign = locked
+        existing = [ct for ct in (campaign.contacts or []) if ct.get("phone")]
+        if not existing:
+            raise ValueError("This campaign has no contacts to call.")
+
+        # Don't call anyone back who was already reached — a lead who picked up
+        # (including one who answered then cut the call) is left untouched. Re-run
+        # only re-arms contacts we never connected to (no answer / failed / never
+        # dialed). Fresh call_link_ids so stale webhooks can't map onto retries.
+        def _reached(ct: dict) -> bool:
+            return ct.get("status") == "answered" or bool(ct.get("answered_at"))
+
+        # Canonicalize phones (bare 10-digit → 91…) and collapse duplicates while
+        # rebuilding. Campaigns created before canonicalization existed stored RAW
+        # numbers, which break re-run two ways:
+        #   * a bare 10-digit Indian mobile whose leading digits aren't "91" (e.g.
+        #     7569672503) is read by Plivo as a *foreign* country code and 403'd
+        #     ("Calls to this destination region are barred."), so it never dials —
+        #     prepending 91 routes it to India;
+        #   * the same person listed BOTH bare and as +91 becomes two contacts and
+        #     is dialed twice ("it keeps calling me").
+        # Re-run is the fix-up path for those older lists, so dial the corrected,
+        # deduped numbers. A person reached under ANY form is never re-dialed; the
+        # ``reached`` set wins so a redial twin can't resurrect an answered contact.
+        reached_out: list[dict] = []
+        reached_canon: set[str] = set()
+        seen: set[str] = set()
+        for ct in existing:
+            if not _reached(ct):
+                continue
+            canon = _canonical_phone(ct.get("phone"))
+            if not canon or canon in seen:
+                continue
+            seen.add(canon)
+            reached_canon.add(canon)
+            kept = dict(ct)
+            kept["phone"] = canon  # normalize the stored form for the UI
+            reached_out.append(kept)
+
+        rearmed: list[dict] = []
+        for ct in existing:
+            if _reached(ct):
+                continue
+            canon = _canonical_phone(ct.get("phone"))
+            # Drop uncanonicalizable junk, anyone already reached under another
+            # form, and duplicates within the redial set itself.
+            if not canon or canon in reached_canon or canon in seen:
+                continue
+            seen.add(canon)
+            rearmed.append({
+                "phone": canon,
+                "name": ct.get("name") or canon,
+                "status": "pending",
+                "call_id": None,
+                "call_link_id": str(uuid.uuid4()),
+                "duration_s": None,
+                "answered_at": None,
+            })
+        if not rearmed:
+            raise ValueError(
+                "Everyone on this list was already reached — there's no one to re-run."
+            )
+        contacts = reached_out + rearmed
+        campaign.contacts = contacts
+        campaign.status = CampaignStatus.running
+        campaign.started_at = datetime.now(timezone.utc)
+        campaign.completed_at = None
+        campaign.total_count = len(contacts)
+        campaign.answered_count = len(reached_out)  # keep prior answers; recount the rest
+        campaign.failed_count = 0
+        campaign.from_number = caller_id  # re-resolve in case it changed on re-grant
+        db.add(campaign)
+        await db.commit()
+        await db.refresh(campaign)
+        invalidate_outbound_context(campaign.id)
+
+        await OutboundCampaignService._dial_pending(
+            campaign,
+            db,
+            tenant_res=tenant_res,
+            base=public_base_url.rstrip("/"),
+            prefix=path_prefix.rstrip("/"),
+        )
+        return campaign
+
+    @staticmethod
     async def set_followup_enabled(
         campaign: OutboundCampaign, enabled: bool, db: AsyncSession
     ) -> OutboundCampaign:
@@ -692,8 +1001,34 @@ class OutboundCampaignService:
 
     # ---- throttled dialer (place up to the cap, refill as calls end) ----------
     @staticmethod
+    def _is_bulk(campaign: OutboundCampaign) -> bool:
+        """Bulk CSV campaigns dial from dedicated, operator-provisioned telephony
+        (a separate Plivo account), not the tenant's inbound DID."""
+        return bool((campaign.agent_config or {}).get("bulk_csv"))
+
+    @staticmethod
+    def _dial_params(
+        campaign: OutboundCampaign, tenant_res: TenantResources
+    ) -> tuple[str | None, tuple[str, str] | None]:
+        """Resolve (caller_id, auth_override) for placing this campaign's calls.
+        Bulk campaigns use the dedicated bulk number + auth; everything else uses
+        the tenant's allotted DID on its own subaccount (auth_override=None)."""
+        if OutboundCampaignService._is_bulk(campaign):
+            return (
+                PlivoService.bulk_calling_caller_id(tenant_res),
+                PlivoService.bulk_calling_auth(tenant_res),
+            )
+        return (campaign.from_number or PlivoService.outbound_caller_id(tenant_res), None)
+
+    @staticmethod
     async def _place_call(
-        contact: dict, *, tenant_res: TenantResources, caller_id: str, base: str, prefix: str
+        contact: dict,
+        *,
+        tenant_res: TenantResources,
+        caller_id: str,
+        base: str,
+        prefix: str,
+        auth_override: tuple[str, str] | None = None,
     ) -> None:
         link_id = contact["call_link_id"]
         # Plivo: pass an HTTP answer_url (returns <Stream> XML) — not a WS url.
@@ -706,14 +1041,33 @@ class OutboundCampaignService:
                 answer_url=answer_url,
                 status_callback=status_callback,
                 from_number=caller_id,
+                auth_override=auth_override,
             )
             call = result.get("call") if isinstance(result.get("call"), dict) else result
-            contact["call_id"] = call.get("sid") or call.get("id")
+            # Plivo's /Call returns {"message","request_uuid","api_id"} (no sid/id);
+            # fall back to request_uuid so a successful placement still records an id.
+            contact["call_id"] = (
+                call.get("sid")
+                or call.get("id")
+                or call.get("request_uuid")
+                or result.get("request_uuid")
+            )
             contact["status"] = "calling"
+            contact.pop("error", None)  # clear any prior failure on re-dial
+            logger.info(
+                "NOKVO-DIAL: placed phone=%s call_id=%s",
+                contact.get("phone"), contact.get("call_id"),
+            )
         except Exception as exc:
             contact["status"] = "failed"
             contact["ended"] = True  # frees the slot + counts toward batch completion
             contact["error"] = str(exc)[:200]
+            # Surface WHY a number didn't dial (Plivo trial/unverified-number/
+            # concurrency-cap rejections were previously swallowed silently).
+            logger.warning(
+                "NOKVO-DIAL: place FAILED phone=%s err=%s",
+                contact.get("phone"), str(exc)[:300],
+            )
 
     @staticmethod
     def _inflight_count(contacts: list[dict]) -> int:
@@ -726,6 +1080,31 @@ class OutboundCampaignService:
         )
 
     @staticmethod
+    async def _lock_campaign(
+        db: AsyncSession, campaign_id: uuid.UUID
+    ) -> OutboundCampaign | None:
+        """Row-lock the campaign and refresh its in-memory state to the latest
+        committed snapshot.
+
+        EVERY read-modify-write of ``campaign.contacts`` (the inline JSON batch
+        state) must go through this. ``SELECT … FOR UPDATE`` serializes concurrent
+        Plivo status webhooks and the launch dialer against each other; the lock is
+        released by the caller's next commit. ``populate_existing`` overwrites any
+        stale attributes the caller still holds — the session is
+        ``expire_on_commit=False``, so a campaign loaded before another handler
+        committed would otherwise carry a stale ``contacts`` snapshot. Writing that
+        stale snapshot back is exactly what reverted just-placed contacts to
+        ``pending`` and made the dialer re-place them in an endless loop (the
+        "it keeps calling me" report)."""
+        res = await db.execute(
+            select(OutboundCampaign)
+            .where(OutboundCampaign.id == campaign_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return res.scalar_one_or_none()
+
+    @staticmethod
     async def _dial_pending(
         campaign: OutboundCampaign,
         db: AsyncSession,
@@ -736,26 +1115,58 @@ class OutboundCampaignService:
     ) -> None:
         """Place pending contacts until the live-call count reaches the cap.
         Idempotent + safe to call repeatedly (at launch and after each call ends).
-        Placed sequentially so the in-flight count stays accurate between calls."""
-        cap = max(1, int(settings.OUTBOUND_DIAL_CONCURRENCY or 5))
-        caller_id = campaign.from_number or PlivoService.outbound_caller_id(tenant_res)
-        if not caller_id:
+        Placed sequentially so the in-flight count stays accurate between calls.
+
+        Runs under a per-campaign row lock (acquired here, held across the
+        placement loop, released by the commit below) so a status webhook can't
+        read a stale snapshot mid-placement and revert just-placed contacts to
+        ``pending`` — which previously made the dialer re-place them forever."""
+        # Lock + refresh to the latest committed batch state before deciding what
+        # to dial. Without this a launch that placed calls and a webhook that ended
+        # one could each write a stale ``contacts`` snapshot over the other.
+        campaign = await OutboundCampaignService._lock_campaign(db, campaign.id)
+        if campaign is None:
             return
+        # Bulk CSV campaigns always fan out up to BULK_DIAL_CONCURRENCY (5) lines
+        # at once, independent of the global per-tenant dial concurrency.
+        if OutboundCampaignService._is_bulk(campaign):
+            cap = OutboundCampaignService.BULK_DIAL_CONCURRENCY
+        else:
+            cap = max(1, int(settings.OUTBOUND_DIAL_CONCURRENCY or 5))
+        caller_id, auth_override = OutboundCampaignService._dial_params(campaign, tenant_res)
         contacts = list(campaign.contacts or [])
         placed_any = False
-        for contact in contacts:
-            if OutboundCampaignService._inflight_count(contacts) >= cap:
-                break
-            if contact.get("status") == "pending":
-                await OutboundCampaignService._place_call(
-                    contact, tenant_res=tenant_res, caller_id=caller_id, base=base, prefix=prefix
-                )
-                placed_any = True
+        if caller_id:
+            for contact in contacts:
+                if OutboundCampaignService._inflight_count(contacts) >= cap:
+                    break
+                # Only place a genuinely-undialed contact: pending, with no call
+                # already placed and not already ended. The call_id / ended checks
+                # are belt-and-suspenders — even if a stale "pending" ever slips in,
+                # we never re-dial a line that already has a placement.
+                if (
+                    contact.get("status") == "pending"
+                    and not contact.get("call_id")
+                    and not contact.get("ended")
+                ):
+                    await OutboundCampaignService._place_call(
+                        contact,
+                        tenant_res=tenant_res,
+                        caller_id=caller_id,
+                        base=base,
+                        prefix=prefix,
+                        auth_override=auth_override,
+                    )
+                    placed_any = True
         if placed_any:
             campaign.contacts = contacts
             db.add(campaign)
             await db.commit()
             await db.refresh(campaign)
+        else:
+            # Nothing placed (cap full, no pending, or no caller ID): still commit
+            # to release the FOR UPDATE lock we took above.
+            await db.commit()
 
     @staticmethod
     async def dial_next_pending(
@@ -817,10 +1228,22 @@ class OutboundCampaignService:
         else:
             if campaign is None:
                 return
+            # Row-lock + refresh so the read-modify-write of ``contacts`` below
+            # starts from the freshest committed state and serializes against
+            # concurrent webhooks / the launch dialer — the fix for the re-dial
+            # loop where a stale snapshot reverted placed calls to "pending".
+            campaign = await OutboundCampaignService._lock_campaign(db, campaign.id)
+            if campaign is None:
+                return
             contacts = list(campaign.contacts or [])
             target = next((c for c in contacts if c.get("call_link_id") == call_link_id), None)
             if not target:
                 return
+
+        is_terminal = event_type in (
+            "call.hangup", "call.failed", "call.machine.detection.ended"
+        )
+        hangup_cause = ""
 
         if event_type == "call.answered":
             target["status"] = "answered"
@@ -834,7 +1257,7 @@ class OutboundCampaignService:
                     lead.call_status = LeadCallStatus.called
                     db.add(lead)
 
-        elif event_type in ("call.hangup", "call.failed", "call.machine.detection.ended"):
+        elif is_terminal:
             hangup_cause = payload.get("hangup_cause", "")
             # Terminal: the call no longer occupies a line. ``ended`` is what the
             # throttled dialer counts (an answered-then-hung-up call keeps
@@ -847,171 +1270,57 @@ class OutboundCampaignService:
             duration = payload.get("duration_seconds") or 0
             target["duration_s"] = int(duration)
 
-            # Close the outcome loop: any record the agent created during
-            # this call gets its outcome derived from the call disposition,
-            # and a follow-up callback is auto-scheduled for no_show /
-            # failed_followup states.
-            converted_outcome = False
-            tenant_for_lookups = (
-                campaign.tenant_id if campaign is not None else target.get("tenant_id")
+        # ── Persist the campaign-contact mutation ATOMICALLY, under the lock ──
+        # For a regular campaign this is the ONLY write of ``campaign.contacts``;
+        # committing here — before the best-effort side effects below, which open
+        # their own transactions and would otherwise release the lock early — is
+        # what guarantees a concurrent webhook can never overwrite it with a stale
+        # snapshot (the lost-update that caused the re-dial loop).
+        just_completed = False
+        if not is_followup_synthetic:
+            campaign.contacts = contacts
+            contact_res = await db.execute(
+                select(OutboundCampaignContact).where(
+                    OutboundCampaignContact.campaign_id == campaign.id,
+                    OutboundCampaignContact.call_link_id == call_link_id,
+                )
             )
-            try:
-                from app.services.outcome_tracker import OutcomeTracker
-                from app.models.tenant_resources import TenantResources
-                from app.services.outcome_tracker import OUTCOME_STATES
-                from app.services import flow_session
+            campaign_contact = contact_res.scalars().first()
+            if campaign_contact:
+                campaign_contact.status = target.get("status") or campaign_contact.status
+                campaign_contact.call_id = target.get("call_id") or campaign_contact.call_id
+                campaign_contact.snapshot = {
+                    **dict(campaign_contact.snapshot or {}),
+                    "duration_s": target.get("duration_s"),
+                    "answered_at": target.get("answered_at"),
+                    "last_status_payload": payload,
+                }
+                db.add(campaign_contact)
 
-                if tenant_for_lookups is None:
-                    raise RuntimeError("no tenant context for outcome closure")
-                tr_res = await db.execute(
-                    select(TenantResources).where(TenantResources.tenant_id == tenant_for_lookups)
-                )
-                tr = tr_res.scalars().first()
-                org_id = tr.organization_id if tr else None
-                created_record_ids = list(target.get("created_record_ids") or [])
-                if org_id:
-                    for rec_id in created_record_ids:
-                        try:
-                            rec_uuid = uuid.UUID(str(rec_id))
-                        except (TypeError, ValueError):
-                            continue
-                        await OutcomeTracker.record_from_disposition(
-                            db,
-                            organization_id=org_id,
-                            record_id=rec_uuid,
-                            disposition=target["status"],
-                            notes=f"hangup_cause={hangup_cause}" if hangup_cause else None,
-                        )
-                        # Note: we no longer call auto_followup_if_needed
-                        # here — the follow-up agent below owns the
-                        # scheduling decision (promise > rule > clamp >
-                        # caps), and double-firing would create two pending
-                        # rows for the same lead.
+            # Campaign is done only when every contact has ENDED (or failed at
+            # placement). Using ``ended`` — not the status set — avoids a still-live
+            # "answered" call tripping premature completion while pending leads
+            # remain undialed in the throttled batch.
+            if contacts and all(c.get("ended") or c.get("status") == "failed" for c in contacts):
+                if campaign.status != CampaignStatus.completed:
+                    just_completed = True
+                campaign.status = CampaignStatus.completed
+                campaign.completed_at = datetime.now(timezone.utc)
 
-                # Conversion kill switch: if any created record reached the
-                # 'completed' outcome (i.e. a successful booking/lead row),
-                # we treat the call as converted and follow-up enqueue will
-                # cancel pending follow-ups instead of scheduling more.
-                from app.models.nokvo_one_tool_record import NokvoOneToolRecord
+            db.add(campaign)
+            await db.commit()  # persists contacts + releases the FOR UPDATE lock
 
-                if org_id and created_record_ids:
-                    for rec_id in created_record_ids:
-                        try:
-                            rec_uuid = uuid.UUID(str(rec_id))
-                        except (TypeError, ValueError):
-                            continue
-                        rec = await db.execute(
-                            select(NokvoOneToolRecord)
-                            .where(NokvoOneToolRecord.id == rec_uuid)
-                            .where(NokvoOneToolRecord.organization_id == org_id)
-                        )
-                        record = rec.scalars().first()
-                        if record is None:
-                            continue
-                        outcome = flow_session.outcome_summary(record.data or {})
-                        if (
-                            outcome
-                            and outcome.get("status") == OUTCOME_STATES.completed
-                        ):
-                            converted_outcome = True
-                            break
-            except Exception:
-                logger.exception("NOKVO-CAMPAIGN: outcome closure failed")
-
-            # ── Follow-up agent enqueue ──────────────────────────────────
-            # Read the prior call's session memory to surface a callback
-            # promise or opt-out cue. If neither is present, the follow-up
-            # service falls back to the campaign's admin-set disposition
-            # rules. Either way, four kill switches gate the actual insert.
-            try:
-                from app.services.followup_scheduler_service import (
-                    FollowupCue,
-                    FollowupSchedulerService,
-                )
-                from app.services.conversational_memory import (
-                    FACT_OPTED_OUT,
-                    FACT_PROMISED_CALLBACK_AT,
-                )
-                from app.services.agent_session_store import AgentSessionStore
-                from app.services.outgoing_lead_service import (
-                    OutgoingLeadService,
-                )
-                from app.models.tenant_resources import TenantResources
-                from datetime import datetime
-
-                if target.get("lead_id"):
-                    lead_id = uuid.UUID(str(target["lead_id"]))
-                    lead_res = await db.execute(
-                        select(OutgoingLead).where(OutgoingLead.id == lead_id)
-                    )
-                    lead = lead_res.scalars().first()
-                else:
-                    lead = None
-
-                # Inspect session memory for opt-out / promise cues. The
-                # session may already have been promoted + GC'd by another
-                # post-call hook; we gracefully degrade to disposition-only.
-                cue_opted_out = False
-                cue_promised: datetime | None = None
-                call_id = target.get("call_id") or call_link_id
-                tenant_for_cue = (
-                    campaign.tenant_id if campaign is not None else target.get("tenant_id")
-                )
-                tr_res2 = (
-                    await db.execute(
-                        select(TenantResources).where(
-                            TenantResources.tenant_id == tenant_for_cue
-                        )
-                    )
-                    if tenant_for_cue
-                    else None
-                )
-                tr2 = tr_res2.scalars().first() if tr_res2 is not None else None
-                if tr2 and call_id:
-                    try:
-                        state = await AgentSessionStore.get_state(tr2, call_id)
-                        facts = ((state or {}).get("memory") or {}).get("facts") or {}
-                        opt_fact = facts.get(FACT_OPTED_OUT) or {}
-                        if opt_fact.get("value") is True:
-                            cue_opted_out = True
-                        promised_fact = facts.get(FACT_PROMISED_CALLBACK_AT) or {}
-                        iso = promised_fact.get("value")
-                        if isinstance(iso, str) and iso:
-                            try:
-                                cue_promised = datetime.fromisoformat(iso)
-                            except ValueError:
-                                cue_promised = None
-                    except Exception:
-                        logger.debug(
-                            "NOKVO-CAMPAIGN: session inspect for cues failed",
-                            exc_info=True,
-                        )
-
-                # Opt-out is the legal kill switch — flip consent + cancel
-                # pending follow-ups, then stop. Don't enqueue anything.
-                if lead and cue_opted_out:
-                    await OutgoingLeadService.revoke_consent_and_cancel_followups(
-                        lead, db=db, reason="opted_out"
-                    )
-                elif lead:
-                    cue = FollowupCue(
-                        promised_callback_at=cue_promised,
-                        opted_out=False,
-                        converted=converted_outcome,
-                    )
-                    # Clinic tenants are gated inside enqueue_after_call
-                    # (kill switch #0): clinics never auto-schedule.
-                    await FollowupSchedulerService.enqueue_after_call(
-                        lead=lead,
-                        campaign=campaign,
-                        source_call_id=call_id,
-                        disposition=target["status"],
-                        outcome=None,
-                        cue=cue,
-                        db=db,
-                    )
-            except Exception:
-                logger.exception("NOKVO-CAMPAIGN: follow-up enqueue failed")
+        # ── Best-effort post-call side effects (terminal events only) ────────
+        # These run AFTER the atomic contacts commit and open their own
+        # transactions; they never touch ``campaign.contacts`` so they cannot
+        # reintroduce the lost-update race. Each is internally try/excepted.
+        if is_terminal:
+            converted_outcome = await OutboundCampaignService._close_call_outcomes(
+                campaign, target, hangup_cause, db
+            )
+            await OutboundCampaignService._enqueue_post_call_followup(
+                campaign, target, call_link_id, converted_outcome, db
+            )
 
         # Follow-up synthetic path: just update the follow-up row state.
         # No campaign contact row to update, no batch terminal check.
@@ -1064,40 +1373,6 @@ class OutboundCampaignService:
                 await db.commit()
             return
 
-        # Regular campaign path.
-        campaign.contacts = contacts
-        contact_res = await db.execute(
-            select(OutboundCampaignContact).where(
-                OutboundCampaignContact.campaign_id == campaign.id,
-                OutboundCampaignContact.call_link_id == call_link_id,
-            )
-        )
-        campaign_contact = contact_res.scalars().first()
-        if campaign_contact:
-            campaign_contact.status = target.get("status") or campaign_contact.status
-            campaign_contact.call_id = target.get("call_id") or campaign_contact.call_id
-            campaign_contact.snapshot = {
-                **dict(campaign_contact.snapshot or {}),
-                "duration_s": target.get("duration_s"),
-                "answered_at": target.get("answered_at"),
-                "last_status_payload": payload,
-            }
-            db.add(campaign_contact)
-
-        # Campaign is done only when every contact has ENDED (or failed at
-        # placement). Using ``ended`` — not the status set — avoids a still-live
-        # "answered" call tripping premature completion while pending leads remain
-        # undialed in the throttled batch.
-        just_completed = False
-        if contacts and all(c.get("ended") or c.get("status") == "failed" for c in contacts):
-            if campaign.status != CampaignStatus.completed:
-                just_completed = True
-            campaign.status = CampaignStatus.completed
-            campaign.completed_at = datetime.now(timezone.utc)
-
-        db.add(campaign)
-        await db.commit()
-
         # When the campaign just finished, post a P2 inbox summary so
         # the operator sees the batch result without polling the page.
         # Best-effort — a notification failure must not roll back the
@@ -1109,6 +1384,193 @@ class OutboundCampaignService:
                 )
             except Exception:
                 logger.exception("NOKVO-NOTIF: failed to emit outbound_batch summary")
+
+    @staticmethod
+    async def _close_call_outcomes(
+        campaign: OutboundCampaign | None,
+        target: dict,
+        hangup_cause: str,
+        db: AsyncSession,
+    ) -> bool:
+        """Derive each agent-created record's outcome from the call disposition.
+
+        Returns True when any created record reached the 'completed' outcome (a
+        successful booking/lead), which the follow-up enqueue treats as
+        'converted' — cancel pending follow-ups instead of scheduling more.
+        Best-effort and self-committing; never raises into the webhook. Split out
+        of ``handle_call_status`` so it runs AFTER the atomic ``contacts`` commit
+        (it opens its own transaction)."""
+        converted_outcome = False
+        tenant_for_lookups = (
+            campaign.tenant_id if campaign is not None else target.get("tenant_id")
+        )
+        try:
+            from app.services.outcome_tracker import OutcomeTracker
+            from app.models.tenant_resources import TenantResources
+            from app.services.outcome_tracker import OUTCOME_STATES
+            from app.services import flow_session
+
+            if tenant_for_lookups is None:
+                raise RuntimeError("no tenant context for outcome closure")
+            tr_res = await db.execute(
+                select(TenantResources).where(TenantResources.tenant_id == tenant_for_lookups)
+            )
+            tr = tr_res.scalars().first()
+            org_id = tr.organization_id if tr else None
+            created_record_ids = list(target.get("created_record_ids") or [])
+            if org_id:
+                for rec_id in created_record_ids:
+                    try:
+                        rec_uuid = uuid.UUID(str(rec_id))
+                    except (TypeError, ValueError):
+                        continue
+                    await OutcomeTracker.record_from_disposition(
+                        db,
+                        organization_id=org_id,
+                        record_id=rec_uuid,
+                        disposition=target["status"],
+                        notes=f"hangup_cause={hangup_cause}" if hangup_cause else None,
+                    )
+                    # Note: we no longer call auto_followup_if_needed here — the
+                    # follow-up agent owns the scheduling decision (promise > rule
+                    # > clamp > caps), and double-firing would create two pending
+                    # rows for the same lead.
+
+            # Conversion kill switch: if any created record reached the 'completed'
+            # outcome (i.e. a successful booking/lead row), we treat the call as
+            # converted and follow-up enqueue will cancel pending follow-ups
+            # instead of scheduling more.
+            from app.models.nokvo_one_tool_record import NokvoOneToolRecord
+
+            if org_id and created_record_ids:
+                for rec_id in created_record_ids:
+                    try:
+                        rec_uuid = uuid.UUID(str(rec_id))
+                    except (TypeError, ValueError):
+                        continue
+                    rec = await db.execute(
+                        select(NokvoOneToolRecord)
+                        .where(NokvoOneToolRecord.id == rec_uuid)
+                        .where(NokvoOneToolRecord.organization_id == org_id)
+                    )
+                    record = rec.scalars().first()
+                    if record is None:
+                        continue
+                    outcome = flow_session.outcome_summary(record.data or {})
+                    if (
+                        outcome
+                        and outcome.get("status") == OUTCOME_STATES.completed
+                    ):
+                        converted_outcome = True
+                        break
+        except Exception:
+            logger.exception("NOKVO-CAMPAIGN: outcome closure failed")
+        return converted_outcome
+
+    @staticmethod
+    async def _enqueue_post_call_followup(
+        campaign: OutboundCampaign | None,
+        target: dict,
+        call_link_id: str,
+        converted_outcome: bool,
+        db: AsyncSession,
+    ) -> None:
+        """Read the prior call's session memory to surface a callback promise or
+        opt-out cue, then enqueue (or suppress) a follow-up. If neither cue is
+        present the follow-up service falls back to the campaign's admin-set
+        disposition rules. Four kill switches inside ``enqueue_after_call`` gate
+        the actual insert. Best-effort and self-committing; never raises into the
+        webhook. Split out of ``handle_call_status`` so it runs AFTER the atomic
+        ``contacts`` commit (it opens its own transaction)."""
+        try:
+            from app.services.followup_scheduler_service import (
+                FollowupCue,
+                FollowupSchedulerService,
+            )
+            from app.services.conversational_memory import (
+                FACT_OPTED_OUT,
+                FACT_PROMISED_CALLBACK_AT,
+            )
+            from app.services.agent_session_store import AgentSessionStore
+            from app.services.outgoing_lead_service import (
+                OutgoingLeadService,
+            )
+            from app.models.tenant_resources import TenantResources
+            from datetime import datetime
+
+            if target.get("lead_id"):
+                lead_id = uuid.UUID(str(target["lead_id"]))
+                lead_res = await db.execute(
+                    select(OutgoingLead).where(OutgoingLead.id == lead_id)
+                )
+                lead = lead_res.scalars().first()
+            else:
+                lead = None
+
+            # Inspect session memory for opt-out / promise cues. The session may
+            # already have been promoted + GC'd by another post-call hook; we
+            # gracefully degrade to disposition-only.
+            cue_opted_out = False
+            cue_promised: datetime | None = None
+            call_id = target.get("call_id") or call_link_id
+            tenant_for_cue = (
+                campaign.tenant_id if campaign is not None else target.get("tenant_id")
+            )
+            tr_res2 = (
+                await db.execute(
+                    select(TenantResources).where(
+                        TenantResources.tenant_id == tenant_for_cue
+                    )
+                )
+                if tenant_for_cue
+                else None
+            )
+            tr2 = tr_res2.scalars().first() if tr_res2 is not None else None
+            if tr2 and call_id:
+                try:
+                    state = await AgentSessionStore.get_state(tr2, call_id)
+                    facts = ((state or {}).get("memory") or {}).get("facts") or {}
+                    opt_fact = facts.get(FACT_OPTED_OUT) or {}
+                    if opt_fact.get("value") is True:
+                        cue_opted_out = True
+                    promised_fact = facts.get(FACT_PROMISED_CALLBACK_AT) or {}
+                    iso = promised_fact.get("value")
+                    if isinstance(iso, str) and iso:
+                        try:
+                            cue_promised = datetime.fromisoformat(iso)
+                        except ValueError:
+                            cue_promised = None
+                except Exception:
+                    logger.debug(
+                        "NOKVO-CAMPAIGN: session inspect for cues failed",
+                        exc_info=True,
+                    )
+
+            # Opt-out is the legal kill switch — flip consent + cancel pending
+            # follow-ups, then stop. Don't enqueue anything.
+            if lead and cue_opted_out:
+                await OutgoingLeadService.revoke_consent_and_cancel_followups(
+                    lead, db=db, reason="opted_out"
+                )
+            elif lead:
+                cue = FollowupCue(
+                    promised_callback_at=cue_promised,
+                    opted_out=False,
+                    converted=converted_outcome,
+                )
+                # Clinic tenants are gated inside enqueue_after_call (kill switch
+                # #0): clinics never auto-schedule.
+                await FollowupSchedulerService.enqueue_after_call(
+                    lead=lead,
+                    campaign=campaign,
+                    source_call_id=call_id,
+                    disposition=target["status"],
+                    outcome=None,
+                    cue=cue,
+                    db=db,
+                )
+        except Exception:
+            logger.exception("NOKVO-CAMPAIGN: follow-up enqueue failed")
 
     @staticmethod
     async def _notify_batch_complete(
