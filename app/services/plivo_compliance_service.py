@@ -329,7 +329,37 @@ class PlivoComplianceService:
                     "POST", f"{base}/ComplianceApplication/", auth=auth, json_body=app_body
                 )
                 record["application_id"] = str(app.get("compliance_application_id") or app.get("id") or "")
-            record["status"] = "submitted"
+
+            # A freshly created (or reused-but-not-yet-submitted) ComplianceApplication
+            # is created in DRAFT — Plivo's review teams never see a draft, so it can
+            # never be approved and the poller waits forever (the "retry stays a draft,
+            # never goes pending" bug). POST .../Submit/ to push draft → submitted.
+            # Tolerant of an already-submitted app (re-submitting errors): re-read the
+            # live status instead of failing the whole flow.
+            app_status = ""
+            if record.get("application_id"):
+                try:
+                    submitted = await PlivoService._request(
+                        "POST",
+                        f"{base}/ComplianceApplication/{record['application_id']}/Submit/",
+                        auth=auth,
+                    )
+                    app_status = str((submitted or {}).get("status") or "submitted")
+                except PlivoError as sub_exc:
+                    try:
+                        info = await PlivoService._request(
+                            "GET",
+                            f"{base}/ComplianceApplication/{record['application_id']}/",
+                            auth=auth,
+                        )
+                        app_status = str((info or {}).get("status") or "")
+                    except PlivoError:
+                        app_status = ""
+                    if app_status.lower() not in ("submitted", "in_review", "pending", "approved"):
+                        # Genuinely couldn't submit → re-raise so the error is recorded
+                        # and the next retry tries again (rather than silently drafting).
+                        raise sub_exc
+            record["status"] = app_status or "submitted"
             record.pop("error", None)
 
             # 4) Auto-allot a number (linked to the tenant's app + subaccount). India
