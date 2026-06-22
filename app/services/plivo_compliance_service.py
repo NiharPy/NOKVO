@@ -343,6 +343,11 @@ class PlivoComplianceService:
                         "POST",
                         f"{base}/ComplianceApplication/{record['application_id']}/Submit/",
                         auth=auth,
+                        # Plivo's Submit endpoint demands an application/json body even
+                        # though it takes no fields — an empty dict makes httpx send
+                        # `{}` with the right Content-Type (json_body=None sends neither
+                        # → 400 "use 'application/json' Content-Type and raw POST").
+                        json_body={},
                     )
                     app_status = str((submitted or {}).get("status") or "submitted")
                 except PlivoError as sub_exc:
