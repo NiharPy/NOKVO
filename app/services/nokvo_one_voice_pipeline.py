@@ -137,6 +137,23 @@ _SENSITIVE_OR_DYNAMIC_RE = re.compile(
     re.IGNORECASE,
 )
 _ORDER_CONTEXT_RE = re.compile(r"\b(order|delivery|shipment|ఆర్డర్|డెలివరీ)\b", re.IGNORECASE)
+
+# Unambiguous "not interested / don't want it" phrases for the multilingual
+# capture-block backstop (``_real_estate_opt_out``). STT emits native script for
+# te/hi, so we substring-match those directly; romanized forms cover transliteration.
+# A disinterested prospect must NEVER be captured as a lead, in any language.
+_MULTILINGUAL_DISINTEREST_PHRASES = (
+    # Hindi (native)
+    "नहीं चाहिए", "नही चाहिए", "इंटरेस्ट नहीं", "interest नहीं", "ज़रूरत नहीं",
+    "जरूरत नहीं", "रहने दो", "मत करो", "मत कीजिए", "नहीं भाई",
+    # Hindi (romanized)
+    "nahi chahiye", "nahin chahiye", "interest nahi", "zaroorat nahi",
+    "zarurat nahi", "rehne do", "mat karo",
+    # Telugu (native)
+    "వద్దు", "ఇంటరెస్ట్ లేదు", "interest లేదు", "అవసరం లేదు", "అక్కర్లేదు",
+    # Telugu (romanized)
+    "vaddu", "interest ledu", "avasaram ledu", "akkarledu",
+)
 _LOCATION_EXPLICIT_RE = re.compile(
     "|".join([
         r"\b(location|address|directions?|area|branch|clinic|hospital|where\s+(?:are|is)\s+(?:you|it|the))\b",
@@ -2633,13 +2650,21 @@ class NokvoOneVoicePipeline:
             for turn in (history or [])[-12:]
             if turn.get("role") == "user"
         ).lower()
-        return bool(
-            re.search(
-                r"\b(not interested|don'?t call|do not call|do-not-call|remove me|"
-                r"wrong number|stop calling|take me off|unsubscribe)\b",
-                f"{blob} {user_text}",
-            )
-        )
+        combined = f"{blob} {user_text}"
+        if re.search(
+            r"\b(not interested|don'?t call|do not call|do-not-call|remove me|"
+            r"wrong number|stop calling|take me off|unsubscribe|not looking|"
+            r"don'?t need|do not need|not needed|leave me alone)\b",
+            combined,
+        ):
+            return True
+        # Multilingual disinterest backstop: STT emits NATIVE script for te/hi, so
+        # match those directly (``\b`` is unreliable on non-ASCII). Romanized forms
+        # too, in case the caller's words were transliterated. Kept to UNAMBIGUOUS
+        # refusal phrases — we'd rather not-capture a borderline case than capture a
+        # disinterested one (an explicit product requirement). ``combined`` is
+        # already lowercased; native script is unaffected by ``.lower()``.
+        return any(p in combined for p in _MULTILINGUAL_DISINTEREST_PHRASES)
 
     def _real_estate_interest_signal(
         *,

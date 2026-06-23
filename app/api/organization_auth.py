@@ -2063,10 +2063,10 @@ async def plivo_outbound_media_websocket(websocket: WebSocket, call_link_id: str
             "campaign_id": str(campaign.id),
             "goal": campaign.name,
             "contact": contact,
-            "opening_message": (
-                f"Start the outbound campaign call for {contact.get('name') or 'the recipient'}. "
-                "Use the campaign script context, introduce yourself briefly, and ask if this is a good time to talk."
-            ),
+            # No ``opening_message``: the stream service generates the spoken opener
+            # via ``generate_outbound_opener_text``. ``_play_opener`` speaks this field
+            # VERBATIM, so a kickoff instruction here would be read aloud — only pass
+            # real opener text, never an instruction.
         }
         await NokvoOneVoiceStreamService.run_session(
             adapter,

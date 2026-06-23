@@ -412,3 +412,31 @@ def test_is_webhook_timed_out_boundaries():
         created_at=None,
     )
     assert S.is_webhook_timed_out(naive, now, 30) is True
+
+
+# ── list_account_numbers: rotate caller IDs over a sub-account's DID pool ──────
+
+def test_list_account_numbers_parses_objects(monkeypatch):
+    """GET /Number/ → bare-digit, voice-only, deduped list (the pool the bulk
+    dialer rotates the caller ID across)."""
+    def handler(method, url, body):
+        assert method == "GET" and "/Number/" in url
+        return {
+            "objects": [
+                {"number": "+91 22 6423 2977", "voice_enabled": True},
+                {"number": "918031321315", "voice_enabled": True},
+                {"number": "918031321315", "voice_enabled": True},   # dup → dropped
+                {"number": "917000000000", "voice_enabled": False},  # SMS-only → skipped
+            ]
+        }
+    _mock_request(monkeypatch, handler)
+    nums = _run(PlivoService.list_account_numbers(("SUBacct", "tok")))
+    assert nums == ["912264232977", "918031321315"]
+
+
+def test_list_account_numbers_empty_on_error(monkeypatch):
+    """Any Plivo error → [] so the dialer falls back to its single configured DID."""
+    def handler(method, url, body):
+        raise PlivoError("boom")
+    _mock_request(monkeypatch, handler)
+    assert _run(PlivoService.list_account_numbers(("SUBacct", "tok"))) == []

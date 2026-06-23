@@ -394,6 +394,7 @@ _OUTBOUND_OPENER_DELAY_SECONDS = 0.7
 # up. Instead a short, natural thinking-aloud token ("Mhm…", "I see,") so it
 # sounds like a human gathering a thought, not a system stalling.
 _LATENCY_GUARD_OUTBOUND = {
+    "en": "Right, so…",
     "hi": "जी, बस एक सेकंड…",
     "ta": "ம்ம், சரி…",
     "te": "ఊఁ, అలాగే…",
@@ -414,7 +415,7 @@ def _latency_guard_text(language: str | None, direction: str = "inbound") -> str
     short conversational bridge so it sounds like a person thinking, not a queue.
     All 12 supported languages are covered; unknown → English."""
     table = _LATENCY_GUARD_OUTBOUND if direction == "outbound" else _LATENCY_GUARD_INBOUND
-    default = "Just a moment…" if direction == "outbound" else "One moment, I'm checking that."
+    default = "Right, so…" if direction == "outbound" else "One moment, I'm checking that."
     return table.get(language or "en", default)
 
 
@@ -3164,8 +3165,9 @@ class NokvoOneVoiceStreamService:
             # verbatim (zero LLM latency). Otherwise we kick the outbound agent
             # off with PROACTIVE_OPENER_PROMPT so it generates a campaign-aware
             # opener from the system fragment + brief.
-            _outbound_proactive = bool(outbound_context) and outbound_context.is_proactive
             if opening:
+                # A pre-generated, ready-to-speak opener (real text, NOT an
+                # instruction — see the call sites). Played verbatim, zero LLM.
                 await NokvoOneVoiceStreamService._play_opener(
                     websocket,
                     tenant_res,
@@ -3175,7 +3177,7 @@ class NokvoOneVoiceStreamService:
                     campaign_context=campaign_context,
                 )
                 await _arm_proactive_watchdog()
-            elif _outbound_proactive:
+            elif outbound_context is not None:
                 # Use the deterministic, template-filled opener — no LLM call,
                 # ~150ms faster first audio. The LLM takes over from turn 2.
                 # Personalise from what we already know about this lead (enquiry
@@ -3576,6 +3578,17 @@ class NokvoOneVoiceStreamService:
                     # (which fires after the WS closes and the contextvar is
                     # gone) still appears under the call's trace tree.
                     _bg_call_run = _ls_call_run
+                    # Campaign id for the follow-up scheduler. OutgoingLead has
+                    # NO campaign_id column (the link lives in
+                    # OutboundCampaignContact) — read it off the live campaign
+                    # context instead. Coerced to UUID for ``db.get``.
+                    _bg_campaign_id = None
+                    try:
+                        _cid_raw = getattr(outbound_ctx, "campaign_id", None)
+                        if _cid_raw:
+                            _bg_campaign_id = uuid.UUID(str(_cid_raw))
+                    except Exception:
+                        _bg_campaign_id = None
 
                     async def _condense_and_persist():
                         try:
@@ -3606,6 +3619,81 @@ class NokvoOneVoiceStreamService:
                             )
                             if not note:
                                 return
+
+                            # ── Outbound parity with the inbound condenser ──
+                            # Write the SAME note onto the lead / site-visit
+                            # records THIS call created (the dashboard Leads /
+                            # Site Visits tabs live in nokvo_one_tool_records,
+                            # NOT the OutgoingLead contact row written below),
+                            # and hand a booked site visit to the RE scheduler.
+                            # Reuses the single condense above — no second LLM
+                            # call. Best-effort + isolated so a record write can
+                            # never block the OutgoingLead handoff_note below.
+                            try:
+                                from app.models.nokvo_one_tool_record import NokvoOneToolRecord
+                                from sqlalchemy.orm.attributes import flag_modified
+
+                                _ob_state = await AgentSessionStore.get_state(
+                                    _bg_tenant_res, _bg_call_id
+                                ) or {}
+                                _ob_tf = _ob_state.get("tool_flow") or {}
+                                _ob_record_ids: list[str] = []
+                                for _idv in (
+                                    _ob_state.get("auto_site_visit_id"),
+                                    _ob_state.get("auto_lead_id"),
+                                    _ob_tf.get("created_record_id"),
+                                ):
+                                    if _idv:
+                                        _ob_record_ids.append(str(_idv))
+                                _ob_record_ids = list(dict.fromkeys(_ob_record_ids))
+                                if _ob_record_ids:
+                                    _now_iso = datetime.now(timezone.utc).isoformat()
+                                    _written = 0
+                                    async with AsyncSessionLocal() as rec_db:
+                                        for _rid in _ob_record_ids:
+                                            try:
+                                                _ruuid = uuid.UUID(str(_rid))
+                                            except (TypeError, ValueError):
+                                                continue
+                                            _rec = await rec_db.get(NokvoOneToolRecord, _ruuid)
+                                            if _rec is None:
+                                                continue
+                                            _data = dict(_rec.data or {})
+                                            _data["handoff_note"] = note
+                                            _data["handoff_note_generated_at"] = _now_iso
+                                            _data["handoff_note_source"] = "condenser"
+                                            _rec.data = _data
+                                            flag_modified(_rec, "data")
+                                            rec_db.add(_rec)
+                                            _written += 1
+                                        await rec_db.commit()
+                                    logger.info(
+                                        "NOKVO-CONDENSE: outbound handoff note written to %d record(s) for call %s (%d chars)",
+                                        _written, _bg_call_id, len(note),
+                                    )
+                                    # Booked site visit → RE scheduler fills the
+                                    # Site Visit Fields from the note + assigns
+                                    # the nearest-free agent (same as inbound).
+                                    _ob_sv_id = _ob_state.get("auto_site_visit_id")
+                                    if not _ob_sv_id and _ob_tf.get("flow_key") == "real_estate_site_visit":
+                                        _ob_sv_id = _ob_tf.get("created_record_id")
+                                    if _ob_sv_id:
+                                        try:
+                                            from app.services.re_agent_scheduler import REAgentScheduler
+
+                                            async with AsyncSessionLocal() as sched_db:
+                                                await REAgentScheduler.schedule_for_site_visit(
+                                                    sched_db, _bg_tenant_res, str(_ob_sv_id)
+                                                )
+                                        except Exception:
+                                            logger.exception(
+                                                "NOKVO-RE-SCHED: outbound agent scheduling failed"
+                                            )
+                            except Exception:
+                                logger.exception(
+                                    "NOKVO-CONDENSE: outbound record note write failed"
+                                )
+
                             if _customer_id_raw and not _lead_id_raw:
                                 try:
                                     customer_uuid = uuid.UUID(str(_customer_id_raw))
@@ -3641,7 +3729,9 @@ class NokvoOneVoiceStreamService:
                                     lead.handoff_note_generated_at = datetime.now(timezone.utc)
                                     bg_db.add(lead)
                                     await bg_db.commit()
-                                    _lead_campaign_id = lead.campaign_id
+                                    # OutgoingLead has no campaign_id column; the
+                                    # campaign comes from the live call context.
+                                    _lead_campaign_id = _bg_campaign_id
                                     logger.info(
                                         "NOKVO-CONDENSE: handoff note written for lead %s (%d chars)",
                                         lead_uuid, len(note),

@@ -83,7 +83,7 @@ CALLER: One crore వరకు.
 AGENT: [excited]Perfect — అది మన 3BHK upper floors కి match అవుతుంది.[/excited] [question]Site visit కి weekend better ఆ, weekday ఆ?[/question]
 
 CALLER: నా పేరు Nihar.
-AGENT: [warm]Thanks Nihar.[/warm] [question]మిమ్మల్ని reach అవ్వడానికి best number ఏది?[/question]
+AGENT: [warm]Nice to meet you Nihar.[/warm] [question]Site visit కి Saturday morning better ఆ, Sunday evening ఆ?[/question]
 
 CALLER: ఇప్పుడు busy గా ఉన్నా, తరువాత call చేయండి.
 AGENT: [warm]Sure అండి, 2 hours లో call చేస్తా.[/warm] [neutral]Thank you, talk soon.[/neutral]
@@ -109,7 +109,7 @@ CALLER: 80 lakh तक.
 AGENT: [excited]ठीक है — उसके अंदर 2BHK options available हैं.[/excited] [question]Site visit weekend पे ठीक रहेगा या weekday?[/question]
 
 CALLER: मेरा नाम Nihar है.
-AGENT: [warm]Thanks Nihar.[/warm] [question]आपसे contact करने के लिए best number कौन सा रहेगा?[/question]
+AGENT: [warm]Nice to meet you Nihar.[/warm] [question]Site visit के लिए Saturday morning better रहेगा या Sunday evening?[/question]
 
 CALLER: अभी busy हूँ, बाद में call कीजिए.
 AGENT: [warm]ज़रूर, 2 hours में call कर लेता हूँ.[/warm] [neutral]Thank you, talk soon.[/neutral]

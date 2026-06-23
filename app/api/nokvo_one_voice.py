@@ -1844,15 +1844,13 @@ async def plivo_outbound_media_websocket(websocket: WebSocket, call_link_id: str
             # as the REASON FOR THIS CALL block in the outbound prompt.
             "admin_note": (contact.get("_admin_note") or "").strip() or None,
             "customer_id": contact.get("customer_id"),
-            "opening_message": (
-                f"Start the follow-up call for {contact.get('name') or 'the recipient'}. "
-                "Acknowledge the prior conversation briefly before asking your first question."
-                if is_followup
-                else (
-                    f"Start the outbound campaign call for {contact.get('name') or 'the recipient'}. "
-                    "Use the campaign script context, introduce yourself briefly, and ask if this is a good time to talk."
-                )
-            ),
+            # Deliberately NO ``opening_message``: the outbound opener is generated
+            # deterministically by ``generate_outbound_opener_text`` in the stream
+            # service (personalised, language-aware, prosody-tagged). ``_play_opener``
+            # speaks ``opening_message`` VERBATIM, so passing a kickoff INSTRUCTION
+            # here made the agent read it aloud ("Start the outbound campaign call
+            # for …, introduce yourself …"). Only ever set ``opening_message`` to
+            # real, ready-to-speak opener text — never an instruction.
         }
         try:
             await NokvoOneVoiceStreamService.run_session(

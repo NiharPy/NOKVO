@@ -12,7 +12,9 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import random
 import re
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -30,6 +32,13 @@ from app.models.tenant_resources import TenantResources
 from app.services.plivo_service import PlivoService
 from app.services.agent_outbound_context import build_agent_config, invalidate as invalidate_outbound_context
 from app.services.outgoing_lead_service import OutgoingLeadService, lead_is_callable
+
+
+# Bulk caller-ID pool cache: the DIDs rented on a bulk sub-account, keyed by
+# auth_id, so we don't hit Plivo's /Number/ list on every dial refill. Short TTL
+# so newly-rented numbers appear within a minute. ``time.monotonic`` stamped.
+_CALLER_POOL_TTL_S = 60.0
+_CALLER_POOL_CACHE: dict[str, tuple[float, list[str]]] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -1021,6 +1030,51 @@ class OutboundCampaignService:
         return (campaign.from_number or PlivoService.outbound_caller_id(tenant_res), None)
 
     @staticmethod
+    async def _resolve_caller_pool(
+        campaign: OutboundCampaign,
+        tenant_res: TenantResources,
+        *,
+        auth_override: tuple[str, str] | None,
+        fallback: str | None,
+    ) -> list[str]:
+        """Caller-ID pool to spread this campaign's calls across.
+
+        Bulk campaigns rotate over EVERY DID rented on the dedicated sub-account
+        (listed live from Plivo, cached ~60s by auth_id) so 5 concurrent calls go
+        out on 5 different numbers instead of one. Non-bulk campaigns keep their
+        single ``fallback`` number — exactly today's behaviour. Always degrades to
+        ``[fallback]`` when the pool can't be listed or comes back empty, so we
+        never regress to "no caller ID"."""
+        fallback_pool = [fallback] if fallback else []
+        if not OutboundCampaignService._is_bulk(campaign):
+            return fallback_pool
+        if not (auth_override and auth_override[0] and auth_override[1]):
+            return fallback_pool
+        auth_id = auth_override[0]
+        now = time.monotonic()
+        cached = _CALLER_POOL_CACHE.get(auth_id)
+        if cached and (now - cached[0]) < _CALLER_POOL_TTL_S:
+            pool = cached[1]
+        else:
+            pool = await PlivoService.list_account_numbers(auth_override)
+            _CALLER_POOL_CACHE[auth_id] = (now, pool)
+        if not pool:
+            return fallback_pool
+        # The granted caller ID is owned + validated; keep it dialable even if a
+        # partial listing missed it.
+        if fallback and fallback not in pool:
+            pool = [*pool, fallback]
+        return pool
+
+    @staticmethod
+    def _pick_caller(pool: list[str], in_flight: set[str]) -> str:
+        """Choose the caller ID for the next call: random among numbers NOT already
+        on a live line (so concurrent calls fan out over different DIDs); when every
+        number is busy — or the pool holds one — fall back to a plain random pick."""
+        free = [n for n in pool if n not in in_flight]
+        return random.choice(free) if free else random.choice(pool)
+
+    @staticmethod
     async def _place_call(
         contact: dict,
         *,
@@ -1055,8 +1109,8 @@ class OutboundCampaignService:
             contact["status"] = "calling"
             contact.pop("error", None)  # clear any prior failure on re-dial
             logger.info(
-                "NOKVO-DIAL: placed phone=%s call_id=%s",
-                contact.get("phone"), contact.get("call_id"),
+                "NOKVO-DIAL: placed phone=%s from=%s call_id=%s",
+                contact.get("phone"), caller_id, contact.get("call_id"),
             )
         except Exception as exc:
             contact["status"] = "failed"
@@ -1135,8 +1189,22 @@ class OutboundCampaignService:
             cap = max(1, int(settings.OUTBOUND_DIAL_CONCURRENCY or 5))
         caller_id, auth_override = OutboundCampaignService._dial_params(campaign, tenant_res)
         contacts = list(campaign.contacts or [])
+        # Spread calls across every DID the (bulk) sub-account owns — pick one per
+        # call that isn't already on a live line, so concurrent calls fan out over
+        # different numbers instead of hammering one caller ID (which reads as spam).
+        # Non-bulk campaigns get a one-number pool, i.e. exactly today's behaviour.
+        pool = await OutboundCampaignService._resolve_caller_pool(
+            campaign, tenant_res, auth_override=auth_override, fallback=caller_id
+        )
+        in_flight_numbers = {
+            c.get("from_number")
+            for c in contacts
+            if c.get("from_number")
+            and c.get("status") not in ("pending", "failed")
+            and not c.get("ended")
+        }
         placed_any = False
-        if caller_id:
+        if pool:
             for contact in contacts:
                 if OutboundCampaignService._inflight_count(contacts) >= cap:
                     break
@@ -1149,14 +1217,17 @@ class OutboundCampaignService:
                     and not contact.get("call_id")
                     and not contact.get("ended")
                 ):
+                    chosen = OutboundCampaignService._pick_caller(pool, in_flight_numbers)
+                    contact["from_number"] = chosen
                     await OutboundCampaignService._place_call(
                         contact,
                         tenant_res=tenant_res,
-                        caller_id=caller_id,
+                        caller_id=chosen,
                         base=base,
                         prefix=prefix,
                         auth_override=auth_override,
                     )
+                    in_flight_numbers.add(chosen)
                     placed_any = True
         if placed_any:
             campaign.contacts = contacts

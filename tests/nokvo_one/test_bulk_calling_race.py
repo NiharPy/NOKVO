@@ -355,6 +355,128 @@ def test_all_contacts_mutators_go_through_lock_campaign():
         )
 
 
+# ── caller-ID rotation: spread a bulk batch across the sub-account's DID pool ──
+
+
+def test_pick_caller_prefers_free_number():
+    # A number not already on a live call is preferred (spread).
+    assert S._pick_caller(["A", "B", "C"], {"A", "B"}) == "C"
+    # Everything busy → still returns a pool member (plain random pick).
+    assert S._pick_caller(["A", "B"], {"A", "B"}) in {"A", "B"}
+    # Single-number pool → that number, busy or not.
+    assert S._pick_caller(["A"], set()) == "A"
+    assert S._pick_caller(["A"], {"A"}) == "A"
+
+
+@pytest.mark.asyncio
+async def test_dial_pending_rotates_across_pool(monkeypatch):
+    """A bulk batch of 3 fans out over 3 DIFFERENT numbers from the pool, and each
+    placed contact records the from_number it dialed on."""
+    camp = OutboundCampaign(
+        tenant_id="t1", name="c", status=CampaignStatus.running,
+        agent_config={"bulk_csv": True},
+        contacts=[
+            {"phone": "911", "status": "pending", "call_link_id": "L1"},
+            {"phone": "922", "status": "pending", "call_link_id": "L2"},
+            {"phone": "933", "status": "pending", "call_link_id": "L3"},
+        ],
+    )
+    _bulk_caller(monkeypatch)
+    monkeypatch.setattr(S, "_lock_campaign", staticmethod(lambda db, cid: _async(camp)))
+    monkeypatch.setattr(S, "_resolve_caller_pool",
+                        staticmethod(lambda *a, **k: _async(["A", "B", "C"])))
+
+    used = []
+
+    async def fake_place(contact, *, caller_id, **_kw):
+        used.append(caller_id)
+        contact["status"] = "calling"
+        contact["call_id"] = "NEW"
+
+    monkeypatch.setattr(S, "_place_call", staticmethod(fake_place))
+
+    await S._dial_pending(camp, _FakeDB(), tenant_res=object(), base="https://x", prefix="/p")
+
+    assert sorted(used) == ["A", "B", "C"]                       # 3 distinct numbers
+    assert sorted(c["from_number"] for c in camp.contacts) == ["A", "B", "C"]
+
+
+@pytest.mark.asyncio
+async def test_dial_pending_uses_single_caller_when_pool_has_one(monkeypatch):
+    """A one-DID pool (non-bulk, or a bulk account with one number / empty listing)
+    dials every call from that number — exactly today's behaviour."""
+    camp = OutboundCampaign(
+        tenant_id="t1", name="c", status=CampaignStatus.running,
+        agent_config={"bulk_csv": True},
+        contacts=[
+            {"phone": "911", "status": "pending", "call_link_id": "L1"},
+            {"phone": "922", "status": "pending", "call_link_id": "L2"},
+        ],
+    )
+    _bulk_caller(monkeypatch)
+    monkeypatch.setattr(S, "_lock_campaign", staticmethod(lambda db, cid: _async(camp)))
+    monkeypatch.setattr(S, "_resolve_caller_pool",
+                        staticmethod(lambda *a, **k: _async(["912264232977"])))
+
+    used = []
+
+    async def fake_place(contact, *, caller_id, **_kw):
+        used.append(caller_id)
+        contact["status"] = "calling"
+        contact["call_id"] = "NEW"
+
+    monkeypatch.setattr(S, "_place_call", staticmethod(fake_place))
+
+    await S._dial_pending(camp, _FakeDB(), tenant_res=object(), base="https://x", prefix="/p")
+
+    assert used == ["912264232977", "912264232977"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_caller_pool_bulk_lists_and_caches(monkeypatch):
+    """Bulk → live DID list (granted fallback appended if missing), cached by
+    auth_id; non-bulk → single fallback, never lists."""
+    import app.services.outbound_campaign_service as ocs
+    ocs._CALLER_POOL_CACHE.clear()
+
+    calls = {"n": 0}
+
+    async def fake_list(auth):
+        calls["n"] += 1
+        return ["N1", "N2"]
+
+    monkeypatch.setattr(PlivoService, "list_account_numbers", staticmethod(fake_list))
+
+    bulk = OutboundCampaign(tenant_id="t1", name="c", status=CampaignStatus.running,
+                            agent_config={"bulk_csv": True}, contacts=[])
+    lead = OutboundCampaign(tenant_id="t1", name="c", status=CampaignStatus.running,
+                            agent_config={}, contacts=[])
+
+    # non-bulk never lists — keeps its single fallback
+    out = await S._resolve_caller_pool(lead, object(), auth_override=None, fallback="F")
+    assert out == ["F"] and calls["n"] == 0
+
+    # bulk lists live; fallback appended because it's not in the listing
+    out1 = await S._resolve_caller_pool(bulk, object(), auth_override=("AID", "tok"), fallback="F")
+    assert out1 == ["N1", "N2", "F"] and calls["n"] == 1
+    # within TTL → served from cache, no second Plivo hit
+    out2 = await S._resolve_caller_pool(bulk, object(), auth_override=("AID", "tok"), fallback="F")
+    assert out2 == ["N1", "N2", "F"] and calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_resolve_caller_pool_empty_list_falls_back(monkeypatch):
+    """An empty/failed listing degrades to the single granted caller ID."""
+    import app.services.outbound_campaign_service as ocs
+    ocs._CALLER_POOL_CACHE.clear()
+    monkeypatch.setattr(PlivoService, "list_account_numbers",
+                        staticmethod(lambda auth: _async([])))
+    bulk = OutboundCampaign(tenant_id="t1", name="c", status=CampaignStatus.running,
+                            agent_config={"bulk_csv": True}, contacts=[])
+    out = await S._resolve_caller_pool(bulk, object(), auth_override=("AID", "tok"), fallback="F")
+    assert out == ["F"]
+
+
 def _async(value):
     """Wrap a plain value in an awaitable for monkeypatched async staticmethods."""
     async def _coro(*_a, **_k):
