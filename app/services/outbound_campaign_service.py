@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 from fastapi import UploadFile
 from sqlalchemy import select
+from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -141,6 +142,25 @@ def _dedupe_contacts(contacts_raw: list[dict[str, str]]) -> list[dict[str, str]]
         seen.add(canon)
         out.append({"phone": canon, "name": c.get("name") or canon})
     return out
+
+
+async def _scrub_dnd(contacts: list[dict[str, str]]) -> tuple[list[dict[str, str]], list[str]]:
+    """Drop DND-registered numbers from a canonicalized contact list before dialing.
+
+    Returns ``(kept, dropped)`` where ``dropped`` is the list of canonical phones
+    removed because they're on the NCPR/DND register. Fail-open: if scrubbing is
+    disabled or the vendor API errors, nothing is dropped (the un-scrubbed list is
+    returned). See :mod:`app.services.dnd_scrub_service`."""
+    from app.services.dnd_scrub_service import scrub_numbers
+
+    result = await scrub_numbers([c["phone"] for c in contacts])
+    if not result.blocked:
+        return contacts, []
+    kept = [c for c in contacts if not result.is_blocked(c["phone"])]
+    dropped = [c["phone"] for c in contacts if result.is_blocked(c["phone"])]
+    if dropped:
+        logger.info("NOKVO-DND: removed %d DND number(s) from dial list", len(dropped))
+    return kept, dropped
 
 
 def _parse_document(filename: str, content: bytes) -> str:
@@ -558,6 +578,11 @@ class OutboundCampaignService:
             added += 1
 
         campaign.contacts = contacts
+        # MUST flag: contacts is a plain JSONB column and the read-modify-write
+        # above mutates shared dict refs in place, so SQLAlchemy's old==new check
+        # would otherwise SKIP the UPDATE — freezing contacts at the INSERT value
+        # and making the dialer re-dial "pending" contacts forever.
+        flag_modified(campaign, "contacts")
         campaign.total_count = len(contacts)
         db.add(campaign)
         await db.commit()
@@ -603,6 +628,11 @@ class OutboundCampaignService:
             db.add(lead)
 
         campaign.contacts = contacts
+        # MUST flag: contacts is a plain JSONB column and the read-modify-write
+        # above mutates shared dict refs in place, so SQLAlchemy's old==new check
+        # would otherwise SKIP the UPDATE — freezing contacts at the INSERT value
+        # and making the dialer re-dial "pending" contacts forever.
+        flag_modified(campaign, "contacts")
         campaign.total_count = len(contacts)
         db.add(campaign)
         await db.commit()
@@ -765,6 +795,11 @@ class OutboundCampaignService:
         campaign.status = CampaignStatus.running
         campaign.started_at = datetime.now(timezone.utc)
         campaign.contacts = contacts
+        # MUST flag: contacts is a plain JSONB column and the read-modify-write
+        # above mutates shared dict refs in place, so SQLAlchemy's old==new check
+        # would otherwise SKIP the UPDATE — freezing contacts at the INSERT value
+        # and making the dialer re-dial "pending" contacts forever.
+        flag_modified(campaign, "contacts")
         db.add(campaign)
         await db.commit()
         await db.refresh(campaign)
@@ -803,10 +838,16 @@ class OutboundCampaignService:
         # Bulk campaigns never auto-call a lead back: a CSV list is dialed once,
         # and if the lead cuts the call we don't chase them with a follow-up.
         cfg["followup_rules"] = {"enabled": False}
-        if not str(cfg.get("agent_prompt") or "").strip():
+        # Campaign type marker (deterministic = intro + scored questionnaire;
+        # non-deterministic = free-form offer pitch). Set post-build like bulk_csv
+        # since build_agent_config doesn't echo unknown keys.
+        cfg["deterministic"] = bool((agent_config or {}).get("deterministic"))
+        # A bulk campaign needs SOMETHING to drive the call: either free-form
+        # offer details (non-deterministic) OR a questionnaire (deterministic).
+        if not str(cfg.get("agent_prompt") or "").strip() and not cfg.get("questionnaire"):
             raise ValueError(
-                "Bulk campaigns need an agent prompt — it's what the agent reads "
-                "during the call. Add one and try again."
+                "Bulk campaigns need either offer details (what to say) or a "
+                "questionnaire. Add one and try again."
             )
 
         raw = await contacts_file.read()
@@ -819,6 +860,19 @@ class OutboundCampaignService:
                 "No valid phone numbers found in the file. Put phone numbers in the "
                 "first column and names in the second (CSV or XLSX)."
             )
+
+        # Scrub the DND register before dialing — drop opted-out numbers so we
+        # don't call people on India's NCPR list. Fail-open: a vendor hiccup leaves
+        # the list untouched rather than killing the campaign.
+        contacts_raw, dnd_dropped = await _scrub_dnd(contacts_raw)
+        if not contacts_raw:
+            raise ValueError(
+                "Every number on this list is registered on the DND (Do Not "
+                "Disturb) register, so none can be called."
+            )
+
+        # Surface DND removals to the UI (notice + list), persisted on the config.
+        cfg["dnd_dropped"] = dnd_dropped
 
         caller_id = PlivoService.bulk_calling_caller_id(tenant_res)
         auth_override = PlivoService.bulk_calling_auth(tenant_res)
@@ -964,8 +1018,25 @@ class OutboundCampaignService:
             raise ValueError(
                 "Everyone on this list was already reached — there's no one to re-run."
             )
+        # Re-scrub the redial set against DND before re-arming — a number may have
+        # opted out since the original campaign. Already-reached contacts are left
+        # as-is (we're not calling them again either way). Fail-open.
+        rearmed, dnd_dropped = await _scrub_dnd(rearmed)
+        if not rearmed:
+            raise ValueError(
+                "Everyone left to re-run is now on the DND register — there's no "
+                "one to call."
+            )
+        cfg = dict(campaign.agent_config or {})
+        cfg["dnd_dropped"] = dnd_dropped
+        campaign.agent_config = cfg
         contacts = reached_out + rearmed
         campaign.contacts = contacts
+        # MUST flag: contacts is a plain JSONB column and the read-modify-write
+        # above mutates shared dict refs in place, so SQLAlchemy's old==new check
+        # would otherwise SKIP the UPDATE — freezing contacts at the INSERT value
+        # and making the dialer re-dial "pending" contacts forever.
+        flag_modified(campaign, "contacts")
         campaign.status = CampaignStatus.running
         campaign.started_at = datetime.now(timezone.utc)
         campaign.completed_at = None
@@ -1231,6 +1302,10 @@ class OutboundCampaignService:
                     placed_any = True
         if placed_any:
             campaign.contacts = contacts
+            # MUST flag — plain JSONB + in-place dict mutation means SQLAlchemy's
+            # old==new check skips the UPDATE; without this the placement (call_id,
+            # status=calling) never persists and the dialer re-dials forever.
+            flag_modified(campaign, "contacts")
             db.add(campaign)
             await db.commit()
             await db.refresh(campaign)
@@ -1350,6 +1425,10 @@ class OutboundCampaignService:
         just_completed = False
         if not is_followup_synthetic:
             campaign.contacts = contacts
+            # MUST flag — plain JSONB + in-place dict mutation means SQLAlchemy's
+            # old==new check skips the UPDATE; without this the terminal write
+            # (ended=True) never persists and the dialer re-dials the contact.
+            flag_modified(campaign, "contacts")
             contact_res = await db.execute(
                 select(OutboundCampaignContact).where(
                     OutboundCampaignContact.campaign_id == campaign.id,

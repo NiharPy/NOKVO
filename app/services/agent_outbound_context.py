@@ -47,6 +47,162 @@ _CAMPAIGN_TTL_SECONDS = 120.0
 _CAMPAIGN_CACHE_MAX = 256
 _DEFAULT_SILENCE_TIMEOUT_SECONDS = 12.0
 
+
+# ── Leading-filler scrub ────────────────────────────────────────────────────
+# The outbound agents are prompt-banned from opening a reply with the stock
+# filler "right so" / "right, so" / a bare "Right." (see the HOW YOU TALK block
+# in _compose_questionnaire_only_section and the base sales template), but a
+# prompt ban is only probabilistic and small models still leak it. This strips
+# it deterministically from the FIRST spoken sentence of an outbound turn so it
+# is never heard, shown in the transcript, or stored in history.
+#
+# "right"/"alright" glued to a following discourse "so" — "right so", "right,
+# so", "right. so", "right—so", "right…so", "alright so". Anchored to the very
+# start, case-insensitive. Two separator classes do different jobs:
+#   _BETWEEN — between "right" and "so": dashes/ellipsis allowed (they're bounded
+#              by two known tokens, so they can't run into real content).
+#   _AFTER   — after "so": NO hyphen/dash, so the match can't bridge into a
+#              hyphenated compound and eat it ("so-called", "so-so", "so-and-so"
+#              must survive). A lookahead also requires "so" to be a STANDALONE
+#              word (followed by whitespace / sentence punctuation / end) so the
+#              "so" inside "so-called" is never treated as the filler.
+_BETWEEN = r"[\s,.;:!?…—–-]"
+_AFTER = r"[\s,.;:!?…]"
+_LEADING_RIGHT_SO_RE = re.compile(
+    rf"^\s*(?:al)?right\b{_BETWEEN}*so(?={_AFTER}|$){_AFTER}*",
+    re.IGNORECASE,
+)
+# The whole sentence is nothing but a bare "right"/"alright" acknowledgement
+# ("Right.", "Right!", "Right", "Alright,"). These pair with a following "So …"
+# sentence to reproduce "right so", so drop them outright. The ``$`` anchor means
+# "Right now …" / "Right away …" / "Right, the 3 BHK …" are NEVER touched — only
+# a standalone ack is removed.
+_BARE_RIGHT_ACK_RE = re.compile(
+    r"^\s*(?:al)?right\b[\s,.;:!?…—–-]*$",
+    re.IGNORECASE,
+)
+
+
+def strip_leading_right_so(text: str) -> str:
+    """Remove a leading "right so" / bare "Right." filler from an outbound reply.
+
+    Returns ``""`` when the sentence was ONLY the filler (a bare "Right.") so the
+    caller can skip speaking it and let the next sentence carry the turn.
+    Conservative by design: it only touches a "(al)right"-anchored opener whose
+    "so" is a standalone word — never a standalone "So …" (natural speech), a
+    mid-sentence "right", "right now"/"right away" where "right" is a real word,
+    nor a hyphenated "so-called"/"so-so" compound.
+    """
+    if not text:
+        return text
+    if _BARE_RIGHT_ACK_RE.match(text):
+        return ""
+    stripped = _LEADING_RIGHT_SO_RE.sub("", text, count=1)
+    if stripped == text:
+        return text
+    stripped = stripped.lstrip()
+    if not stripped:
+        return ""
+    # Re-capitalize the first alphabetic character — we removed the capitalized
+    # opener, so the remainder would otherwise start lowercase ("what's your
+    # budget?" → "What's your budget?"). A non-letter first char (digit/emoji)
+    # is left as-is.
+    for i, ch in enumerate(stripped):
+        if ch.isalpha():
+            return stripped[:i] + ch.upper() + stripped[i + 1 :]
+        if not ch.isspace():
+            break
+    return stripped
+
+
+# ── Broader leading-filler scrub (DETERMINISTIC questionnaire agent only) ─────
+# The deterministic questionnaire agent's only job is to ASK the next question,
+# crisply — it must never pad a turn with a stock acknowledgement opener
+# ("Great,", "Perfect.", "Got it.", "Good to hear,", "Sure,", "Okay,"). The HOW
+# YOU TALK block bans them, but a small model still leaks one, so we strip the
+# WHOLE acknowledgement set deterministically from the first spoken sentence —
+# the same idea as strip_leading_right_so, widened. Used ONLY for the
+# deterministic agent; the free-form salesperson agent keeps the narrower
+# strip_leading_right_so so a natural "Got it," can still warm the rapport.
+#
+# CONSERVATIVE GATE: a single filler word is removed only when it is immediately
+# followed by SENTENCE PUNCTUATION (a multi-word phrase too). So "Good morning",
+# "Right now", "So happy", "Actually the…" — where the word runs straight into
+# real content with no comma/stop — are NEVER touched. Plain hyphens are excluded
+# from the separator class so "so-called" / "well-being" survive.
+_FILLER_PHRASES = (
+    "thank you so much", "thanks so much", "thanks for that", "good to hear",
+    "let me see", "let's see", "fair enough", "makes sense", "of course",
+    "no worries", "thank you", "you know", "i mean", "got it", "great thanks",
+    "okay great", "perfect thanks",
+)
+_FILLER_WORDS = (
+    "great", "perfect", "nice", "lovely", "wonderful", "excellent", "awesome",
+    "cool", "good", "okay", "ok", "alright", "right", "sure", "gotcha",
+    "understood", "noted", "thanks", "well", "so", "um", "umm", "uh", "uhh",
+    "er", "erm", "hmm", "mm", "mhm", "ah", "oh", "basically", "actually",
+    "anyway", "anyways", "yeah", "yep", "yup",
+)
+
+
+def _filler_unit_pattern(unit: str) -> str:
+    # Allow flexible whitespace between words of a multi-word filler.
+    return r"\s+".join(re.escape(w) for w in unit.split(" "))
+
+
+# Longest-first so "good to hear" wins over "good", "thank you so much" over
+# "thank you", etc. (regex alternation backtracks anyway, but this is clearer).
+_FILLER_ALTERNATION = "|".join(
+    _filler_unit_pattern(u)
+    for u in sorted(_FILLER_PHRASES + _FILLER_WORDS, key=len, reverse=True)
+)
+# One leading filler unit: the phrase/word + REQUIRED sentence punctuation
+# (em/en dash and ellipsis included; plain hyphen deliberately excluded). The
+# trailing \s* eats the gap to the real content.
+_LEADING_FILLER_RE = re.compile(
+    rf"^\s*(?:{_FILLER_ALTERNATION})\b\s*[,.;:!?…—–]+\s*",
+    re.IGNORECASE,
+)
+
+
+def strip_leading_fillers(text: str) -> str:
+    """Remove ALL leading acknowledgement/discourse fillers from a deterministic
+    outbound (questionnaire) reply so the agent opens with the question itself.
+
+    Composes strip_leading_right_so (which also catches the space-separated
+    "right so" that has no punctuation) with an iterative peel of the wider
+    acknowledgement set, each unit gated on trailing sentence punctuation. Peels
+    chained fillers ("Great, thanks, …" → "…"). Returns "" when the sentence was
+    nothing but filler, so the caller skips it and the next sentence carries the
+    turn — identical to the bare-"Right." behaviour.
+    """
+    if not text:
+        return text
+    s = text
+    while True:
+        before = s
+        s = strip_leading_right_so(s)
+        if s == "":
+            return ""
+        peeled = _LEADING_FILLER_RE.sub("", s, count=1)
+        if peeled != s:
+            s = peeled.lstrip()
+            if s == "":
+                return ""
+        if s == before:
+            break
+    s = s.strip()
+    if not s:
+        return ""
+    # Re-capitalize the first alphabetic char (we removed the capitalized opener).
+    for i, ch in enumerate(s):
+        if ch.isalpha():
+            return s[:i] + ch.upper() + s[i + 1 :]
+        if not ch.isspace():
+            break
+    return s
+
+
 DEFAULT_AGENT_PROMPT = (
     "You are making a consented outbound call for the configured business. "
     "Be concise, identify the reason for the call, and guide the lead toward "
@@ -138,19 +294,42 @@ class OutboundCampaignContext:
     company_name: str = ""
     pitch_summary: str = ""
     objective: str = "lead_qualification"
+    # Lead-capture questionnaire (bulk campaigns). Ordered list of normalized
+    # question dicts {id, type: "intent"|"answer", text, desired_answer} plus the
+    # qualifying threshold. Empty list = no questionnaire (legacy interest path).
+    # See :func:`_coerce_questionnaire` for the canonical shape.
+    questions: list[dict] = field(default_factory=list)
+    question_threshold: int = 0
+    # Admin-authored opener line for a questionnaire campaign (spoken as the
+    # deterministic opener); empty falls back to the template opener.
+    question_intro: str = ""
+    # Admin-authored closing line; the agent says it to end any call and the
+    # system plays-then-hangs-up when it's delivered (incl. a failed intent gate).
+    question_outro: str = ""
 
     @property
     def is_proactive(self) -> bool:
         """A campaign is proactive when either the operator gave us an
-        explicit ``agent_prompt``, objectives to land, or any campaign
-        branding (caller_name / company_name / pitch_summary). Pure
+        explicit ``agent_prompt``, objectives to land, a questionnaire, or any
+        campaign branding (caller_name / company_name / pitch_summary). Pure
         ``goal``-only campaigns stay reactive (legacy behaviour)."""
         return bool(
             self.agent_prompt.strip()
             or self.objectives
+            or self.questions
             or self.company_name.strip()
             or self.pitch_summary.strip()
         )
+
+    @property
+    def has_questionnaire(self) -> bool:
+        return bool(self.questions)
+
+    def remaining_questions(self, asked: Iterable[str]) -> list[dict]:
+        """Questions whose ``id`` is not yet in ``asked`` (asked-tracking is a
+        future enhancement; today the prompt renders the full list)."""
+        asked_ids = {str(a) for a in (asked or []) if a}
+        return [q for q in self.questions if str(q.get("id")) not in asked_ids]
 
     @property
     def objective_description(self) -> str:
@@ -202,6 +381,205 @@ def _coerce_str_list(value: Any) -> list[str]:
     return []
 
 
+_MAX_QUESTIONS = 10
+_MAX_QUESTION_TEXT = 300
+# Weighted / graded scoring caps (a question may carry a single `points` weight,
+# or — for answer questions — a list of graded `tiers`/bands each worth points).
+_MAX_TIERS = 6
+_MAX_TIER_LABEL = 120
+_MAX_POINTS = 100
+
+
+def _coerce_tiers(
+    raw_tiers: Any, *, strict: bool = False, idx: int = 0, qtext: str = ""
+) -> list[dict[str, Any]]:
+    """Normalize a graded answer's ``tiers`` (scoring bands) to
+    ``[{id, label, points}]``.
+
+    Each tier needs a non-empty ``label`` (the band the scorer matches against,
+    e.g. "above 1 crore") and ``points`` (clamped ``1.._MAX_POINTS``, default 1).
+    Blank-label tiers are dropped (lenient even in strict — same as blank-text
+    questions). ``id`` is a stable join key for the scorer's verdict; assigned
+    when missing/duplicate. Capped at ``_MAX_TIERS``. Non-list → ``[]``.
+    """
+    if not isinstance(raw_tiers, list):
+        return []
+    tiers: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for t in raw_tiers:
+        if not isinstance(t, dict):
+            continue
+        label = str(t.get("label") or "").strip()[:_MAX_TIER_LABEL]
+        if not label:
+            continue
+        try:
+            pts = int(t.get("points"))
+        except (TypeError, ValueError):
+            pts = 1
+        pts = max(1, min(_MAX_POINTS, pts))
+        tid = str(t.get("id") or "").strip()[:32]
+        if not tid or tid in seen:
+            tid = uuid.uuid4().hex[:6]
+        seen.add(tid)
+        tiers.append({"id": tid, "label": label, "points": pts})
+        if len(tiers) >= _MAX_TIERS:
+            break
+    return tiers
+
+
+def questionnaire_max_points(questions: list[dict[str, Any]] | None) -> int:
+    """Best achievable score for a questionnaire: each question contributes the
+    most it can earn — the highest band of a graded answer, else its ``points``
+    weight (default 1).
+
+    This is the ONE place "max score" is computed; the scorer and the API both
+    call it so they can never drift. Backward-compatible: a questionnaire with
+    no ``points`` and no ``tiers`` yields ``len(questions)`` — the legacy
+    1-point-per-question maximum.
+    """
+    total = 0
+    for q in questions or []:
+        tiers = q.get("tiers")
+        if isinstance(tiers, list) and tiers:
+            total += max((int(t.get("points") or 0) for t in tiers), default=0)
+        else:
+            try:
+                total += max(1, int(q.get("points") or 1))
+            except (TypeError, ValueError):
+                total += 1
+    return total
+
+
+def _coerce_questionnaire(value: Any, *, strict: bool = False) -> dict[str, Any] | None:
+    """Normalize a campaign lead-capture questionnaire to the ONE canonical shape
+    used everywhere (agent prompt, scorer, API, UI), or ``None`` when absent.
+
+    Canonical::
+
+        {"questions": [{"id": str, "type": "intent"|"answer",
+                        "text": str, "desired_answer": str,
+                        "points": int?,                       # weight, default 1
+                        "tiers": [{id, label, points}]?}, ...],  # graded answers
+         "threshold": int}
+
+    Rules:
+      * ``type`` is exactly ``"intent"`` or ``"answer"`` (anything else → intent).
+      * ``text`` stripped + capped; blank-text questions dropped.
+      * ``desired_answer`` is non-empty IFF ``type == "answer"`` AND the question
+        is not graded; for ``"intent"`` it is forced to ``""``.
+      * ``points`` is an optional per-question weight (``1.._MAX_POINTS``, default
+        1), stored only when ``> 1``; ignored for graded answers (their tiers
+        carry the points).
+      * ``tiers`` (answer questions only) is a graded rubric — the post-call
+        scorer awards the points of the single best-matching band. A graded
+        answer needs no ``desired_answer``. Graded questions can't be live
+        dealbreaker ``gate``s (no single fail answer), so ``gate`` is dropped.
+      * ``id`` is a stable join key (used by scoring breakdown); assigned
+        ``uuid4().hex[:8]`` when missing/duplicate.
+      * question count capped at ``_MAX_QUESTIONS``.
+      * ``threshold`` clamped to ``1..questionnaire_max_points``; missing → the
+        max (i.e. must-earn-everything). Legacy all-1-point questionnaires keep
+        ``1..len`` semantics since their max equals ``len``.
+      * Empty/invalid → ``None`` (caller falls back to the legacy interest path).
+
+    This is the SINGLE normalizer — the API imports it (with ``strict=True``) so
+    it never diverges from the agent read-path (``strict=False``). ``strict``
+    raises :class:`ValueError` for an ``answer`` question with neither an
+    expected answer nor graded tiers (surfaced to the admin) instead of silently
+    dropping it; the read path is lenient so a malformed stored config can never
+    break context load.
+    """
+    if not isinstance(value, dict):
+        return None
+    raw_questions = value.get("questions")
+    if not isinstance(raw_questions, list):
+        return None
+    questions: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for idx, item in enumerate(raw_questions):
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text") or "").strip()[:_MAX_QUESTION_TEXT]
+        if not text:
+            continue
+        qtype = str(item.get("type") or "").strip().lower()
+        if qtype not in ("intent", "answer"):
+            qtype = "intent"
+        desired = str(item.get("desired_answer") or "").strip()[:_MAX_QUESTION_TEXT]
+        # Graded rubric (answer questions only): bands the post-call scorer awards
+        # points for. A graded answer satisfies the answer-needs-an-expected-value
+        # rule via its tiers rather than a single desired_answer.
+        tiers = (
+            _coerce_tiers(item.get("tiers"), strict=strict, idx=idx, qtext=text)
+            if qtype == "answer"
+            else []
+        )
+        if qtype == "answer" and not desired and not tiers:
+            if strict:
+                raise ValueError(
+                    f'Question {idx + 1} ("{text[:40]}") is a desired-answer '
+                    "question but has no expected answer or graded bands — add "
+                    "one, add scoring bands, or switch it to intent detection."
+                )
+            continue  # lenient read path: drop the unusable answer question
+        required = ""
+        if qtype == "intent":
+            desired = ""
+            # The Yes/No answer the admin requires to QUALIFY this question.
+            required = str(item.get("required") or "yes").strip().lower()
+            if required not in ("yes", "no"):
+                required = "yes"
+        # Per-question DEALBREAKER gate (admin checkbox): when set, failing this
+        # question (intent → opposite of required; answer → not matching the
+        # desired answer) ends the call — agent goes to the outro and hangs up.
+        # Graded questions can't gate (no single fail answer) — drop it for them.
+        gate = bool(item.get("gate")) and not tiers
+        # Per-question weight (single-band questions); graded answers carry their
+        # points on the tiers instead.
+        try:
+            points = max(1, min(_MAX_POINTS, int(item.get("points"))))
+        except (TypeError, ValueError):
+            points = 1
+        qid = str(item.get("id") or "").strip()[:32]
+        if not qid or qid in seen_ids:
+            qid = uuid.uuid4().hex[:8]
+        seen_ids.add(qid)
+        q: dict[str, Any] = {"id": qid, "type": qtype, "text": text, "desired_answer": desired}
+        if qtype == "intent":
+            q["required"] = required
+        if tiers:
+            q["tiers"] = tiers
+        elif points != 1:
+            # Store the weight only when non-default so legacy 1-pt questionnaires
+            # round-trip byte-identical.
+            q["points"] = points
+        if gate:
+            q["gate"] = True
+        questions.append(q)
+        if len(questions) >= _MAX_QUESTIONS:
+            break
+    if not questions:
+        return None
+    max_points = questionnaire_max_points(questions)
+    try:
+        threshold = int(value.get("threshold"))
+    except (TypeError, ValueError):
+        threshold = max_points
+    threshold = max(1, min(max_points, threshold))
+    result: dict[str, Any] = {"questions": questions, "threshold": threshold}
+    # Optional admin-authored opener line the agent leads the call with. Spoken
+    # as the deterministic opener when set (see generate_outbound_opener_text).
+    intro = str(value.get("intro") or "").strip()[:600]
+    if intro:
+        result["intro"] = intro
+    # Optional closing line. The agent says it to end ANY call; the system also
+    # plays it then hangs up when an intent gate fails (see the stream service).
+    outro = str(value.get("outro") or "").strip()[:600]
+    if outro:
+        result["outro"] = outro
+    return result
+
+
 def _coerce_timeout(value: Any) -> float:
     try:
         timeout = float(value)
@@ -228,6 +606,11 @@ def build_agent_config(
     # ``effective_followup_rules``; anything in ``_extra`` is preserved
     # verbatim so future agent_config additions don't need a signature bump.
     followup_rules: Any = None,
+    # The lead-capture questionnaire. MUST be a named param (not swallowed into
+    # ``_extra``) because ``_build_context`` re-runs build_agent_config on the
+    # agent READ path — anything not echoed into ``cfg`` here is silently
+    # stripped before the agent ever sees it.
+    questionnaire: Any = None,
     **_extra: Any,
 ) -> dict[str, Any]:
     """Normalize campaign proactive-agent config.
@@ -285,6 +668,10 @@ def build_agent_config(
     # just means "use the platform defaults".
     if isinstance(followup_rules, dict) and followup_rules:
         cfg["followup_rules"] = followup_rules
+    # Echo the normalized questionnaire so it survives the read-path rebuild.
+    normalized_q = _coerce_questionnaire(questionnaire)
+    if normalized_q:
+        cfg["questionnaire"] = normalized_q
     return cfg
 
 
@@ -304,6 +691,10 @@ def _build_context(campaign: OutboundCampaign, *, goal: str | None = None) -> Ou
         company_name=str(agent_config.get("company_name") or ""),
         pitch_summary=str(agent_config.get("pitch_summary") or ""),
         objective=str(agent_config.get("objective") or "lead_qualification"),
+        questions=list((agent_config.get("questionnaire") or {}).get("questions") or []),
+        question_threshold=int((agent_config.get("questionnaire") or {}).get("threshold") or 0),
+        question_intro=str((agent_config.get("questionnaire") or {}).get("intro") or ""),
+        question_outro=str((agent_config.get("questionnaire") or {}).get("outro") or ""),
     )
 
 
@@ -351,6 +742,10 @@ async def load_outbound_context(
                     company_name=ctx.company_name,
                     pitch_summary=ctx.pitch_summary,
                     objective=ctx.objective,
+                    questions=ctx.questions,
+                    question_threshold=ctx.question_threshold,
+                    question_intro=ctx.question_intro,
+                    question_outro=ctx.question_outro,
                 )
             return ctx
 
@@ -645,6 +1040,310 @@ def _call_purpose_line(context: "OutboundCampaignContext") -> str:
     return '"It\'s a quick courtesy call on behalf of the company — I\'ll keep it brief."'
 
 
+# ── Deterministic questionnaire progress (asked-tracking) ────────────────────
+# The model is NOT trusted to track which questionnaire question it is on. In
+# production it restarted the whole call from Q1 (re-greeting the prospect) on a
+# bare "Hello" even with the FULL prior conversation in front of it. A prompt-
+# only "never loop back" rule already failed once. So we compute, deterministic-
+# ally from the assistant turns in history, which questions have already been
+# asked (content-token overlap) and render an explicit "ask THIS one next, NEVER
+# restart" directive. Cheap string logic — no extra LLM call on the hot path.
+
+_Q_STOPWORDS = frozenset(
+    {
+        "the", "a", "an", "you", "your", "are", "is", "do", "does", "to", "for",
+        "of", "and", "or", "would", "like", "get", "this", "that", "what", "how",
+        "can", "could", "we", "us", "our", "i", "me", "my", "on", "in", "it",
+        "with", "have", "has", "want", "looking", "please", "any", "some",
+        "there", "here", "be", "will", "just", "so", "if", "about", "from", "at",
+    }
+)
+# A latest-reply made of ONLY these tokens carries no real answer — it's a
+# re-greeting / "are you there?" / bare affirmation-noise. Such a turn must
+# trigger a RE-ASK of the current question, never an advance and never a restart.
+_NON_ANSWER_TOKENS = frozenset(
+    {"hello", "hellohello", "hi", "hey", "there", "anyone", "still", "yo", "hii", "ya"}
+)
+
+
+def _q_tokens(text: str) -> set[str]:
+    """Content-word token set for overlap matching (tone tags + stopwords removed)."""
+    text = re.sub(r"\[/?[a-z_]+\]", " ", text or "")
+    return {
+        w
+        for w in re.findall(r"[a-z0-9]+", text.lower())
+        if w not in _Q_STOPWORDS and len(w) > 2
+    }
+
+
+def _is_non_answer(text: str) -> bool:
+    """Latest caller reply is a re-greeting / 'are you there?' / silence — no
+    real content. These are exactly what made the agent restart from Q1."""
+    toks = set(re.findall(r"[a-z0-9]+", (text or "").lower()))
+    if not toks:
+        return True
+    return toks.issubset(_NON_ANSWER_TOKENS)
+
+
+def questionnaire_asked_state(questions: list, history: list | None) -> dict:
+    """Which questionnaire questions has the agent already asked?
+
+    Matches each ASSISTANT turn to its closest question by content-token overlap
+    (≥0.5 of the question's content tokens present). Question numbers are 1-based
+    and align with ``render_questionnaire_block`` / ``context.questions`` order.
+    """
+    qs = questions or []
+    assistant_turns = [
+        str(t.get("content") or "")
+        for t in (history or [])
+        if isinstance(t, dict) and t.get("role") == "assistant"
+    ]
+    asked = [False] * len(qs)
+    last_asked: int | None = None
+    q_tok = [_q_tokens(str(q.get("text") or "")) for q in qs]
+    for turn in assistant_turns:
+        a_tok = _q_tokens(turn)
+        if not a_tok:
+            continue
+        best_i, best = None, 0.0
+        for i, qt in enumerate(q_tok):
+            if not qt:
+                continue
+            score = len(a_tok & qt) / len(qt)
+            if score > best:
+                best, best_i = score, i
+        if best_i is not None and best >= 0.5:
+            asked[best_i] = True
+            last_asked = best_i + 1
+    return {
+        "asked_count": sum(asked),
+        "asked_numbers": [i + 1 for i, a in enumerate(asked) if a],
+        "next_number": next((i + 1 for i, a in enumerate(asked) if not a), None),
+        "last_asked_number": last_asked,
+        "assistant_turns": len(assistant_turns),
+    }
+
+
+def _render_progress_directive(
+    questions: list, history: list | None, latest_user_text: str | None
+) -> str:
+    """A deterministic, top-of-prompt directive that removes the model's freedom
+    to restart the call. Empty until the agent has actually asked ≥1 question."""
+    state = questionnaire_asked_state(questions, history)
+    if state["assistant_turns"] <= 0 or state["asked_count"] <= 0:
+        return ""  # call hasn't really started — let the normal flow open it
+
+    def _qtext(n: int | None) -> str:
+        if not n or n < 1 or n > len(questions):
+            return ""
+        return str((questions[n - 1] or {}).get("text") or "").strip()
+
+    asked_list = ", ".join(f"Q{x}" for x in state["asked_numbers"])
+    next_n = state["next_number"]
+    last_n = state["last_asked_number"]
+    parts = [
+        "# WHERE YOU ARE — DO NOT RESTART (the call is already underway)",
+        f"You have ALREADY greeted the prospect and asked {asked_list}. NEVER "
+        "re-greet, never re-introduce yourself, never restart the call, and never "
+        "ask Q1 or any earlier question again — the conversation only moves "
+        "FORWARD.",
+    ]
+    if _is_non_answer(latest_user_text) and last_n is not None and _qtext(last_n):
+        parts.append(
+            "Their last reply did NOT answer the question (it was a re-greeting / "
+            "\"are you there?\" / silence). In ONE short line confirm you're still "
+            f"here, then RE-ASK Q{last_n}: \"{_qtext(last_n)}\". Do not advance "
+            "until it's genuinely answered."
+        )
+    elif next_n is not None and _qtext(next_n):
+        line = (
+            f"ASK THIS QUESTION NEXT — and only this one — Q{next_n}: "
+            f"\"{_qtext(next_n)}\"."
+        )
+        if last_n is not None and _qtext(last_n):
+            line += (
+                f" (But if their last reply did not actually answer Q{last_n}, "
+                f"re-ask Q{last_n} instead — never an earlier question.)"
+            )
+        parts.append(line)
+    else:
+        parts.append(
+            "You have now asked every question — wrap up with your closing line; "
+            "do NOT loop back to any earlier question."
+        )
+    return "\n".join(parts) + "\n\n"
+
+
+def render_questionnaire_block(
+    context: OutboundCampaignContext,
+    *,
+    language: str | None = None,
+    history: list | None = None,
+    latest_user_text: str | None = None,
+) -> str:
+    """High-priority prompt block listing the campaign's lead-capture questions.
+
+    The agent must ASK every question (naturally, one per turn) before wrapping
+    the call, unless the prospect signals disinterest. The ``desired_answer`` for
+    an ``answer`` question is NEVER revealed — the caller must answer in their own
+    words or the post-call score is meaningless. Returns ``""`` when there is no
+    questionnaire, so callers can append unconditionally.
+    """
+    questions = context.questions or []
+    lines: list[str] = []
+    has_gate = False
+    for i, q in enumerate(questions, 1):
+        text = str(q.get("text") or "").strip()
+        if not text:
+            continue
+        gate = bool(q.get("gate"))
+        if str(q.get("type")) == "intent":
+            required = str(q.get("required") or "yes").strip().lower()
+            dealbreaker = "no" if required == "yes" else "yes"
+            if gate:
+                has_gate = True
+                lines.append(
+                    f"  {i}. {text}  (REQUIRED to qualify: \"{required}\". DEALBREAKER — "
+                    f"if they clearly say \"{dealbreaker}\", STOP and go to your closing line.)"
+                )
+            else:
+                lines.append(f"  {i}. {text}  (REQUIRED to qualify: \"{required}\")")
+        else:
+            if gate:
+                has_gate = True
+                desired = str(q.get("desired_answer") or "").strip()
+                lines.append(
+                    f"  {i}. {text}  (DEALBREAKER — continue ONLY if their answer means "
+                    f"\"{desired}\"; if it clearly does not, STOP and go to your closing "
+                    "line. Use this only to decide whether to continue — NEVER say the "
+                    "expected answer aloud.)"
+                )
+            else:
+                lines.append(f"  {i}. {text}  (let them answer in their own words)")
+    if not lines:
+        return ""
+    n = len(lines)
+    outro = (getattr(context, "question_outro", "") or "").strip()
+    block = (
+        f"# LEAD-CAPTURE QUESTIONNAIRE — GET A REAL ANSWER TO ALL {n}\n"
+        "Your job on this call is to get a genuine answer to every one of these "
+        "questions, in order:\n"
+        + "\n".join(lines)
+        + "\n\nHOW TO ASK — sound like a real person, not a form:\n"
+        "  - Ask ONE question at a time, IN ORDER. Look at the conversation so far "
+        "and ask the FIRST question you have NOT already asked. NEVER re-ask a "
+        "question they've already answered and NEVER loop back to an earlier one — "
+        "always move FORWARD to the next unasked question.\n"
+        "  - Lead with the question. Do NOT pad turns with stock acknowledgements — "
+        "no 'right so', 'great, thanks', 'good to hear', 'perfect', 'nice', 'thanks "
+        "for that' at the start of replies (it's repetitive and robotic). At most a "
+        "bare 'Got it.' once in a while; usually just ask.\n"
+        "  - Don't re-confirm an answer they already gave clearly (if they said "
+        "'3 BHK', do NOT ask 'so you want a 3 BHK, right?') — accept it and move on.\n"
+        "  - Never read them as a list, never stack two in one turn, never number "
+        "them out loud ('question one…'). Vary your wording so it feels natural.\n"
+        "  - Ask in whatever language the prospect is speaking.\n"
+        "  - For natural pacing, you MAY add a light comma or '…' for a brief breath "
+        "between clauses ('So… are you the homeowner?') — but no vocalized fillers "
+        "('um'/'uh'), and keep numbers, dates, and confirmations crisp.\n"
+        "  - NEVER reveal or hint at any expected/required answer — let them answer freely.\n"
+        "RE-ASK ONLY WHEN A QUESTION ISN'T REALLY ANSWERED: if they dodge the "
+        "CURRENT question, change the subject, or give a vague/unrelated reply, "
+        "gently ask that SAME question again — rephrased — before moving on. This "
+        "is the ONLY time you repeat a question; once it's answered, never ask it "
+        "again.\n"
+        f"Do NOT wrap up or close the call until you have a real answer to all {n} "
+        "questions — UNLESS the prospect signals disinterest or asks you to stop "
+        "(stop immediately; the disinterest rule below overrides this)."
+    )
+    if has_gate:
+        block += (
+            "\nDEALBREAKER GATES: some questions above are marked DEALBREAKER. If "
+            "the caller clearly fails one of those, there's no point continuing — "
+            "do NOT ask the remaining questions; go straight to your closing line "
+            "and end the call. Non-dealbreaker questions never end the call; just "
+            "note the answer and move on."
+        )
+    if outro:
+        block += (
+            f"\nCLOSING LINE — END EVERY CALL WITH THIS, WORD FOR WORD: \"{outro}\"\n"
+            "Whenever the call ends for ANY reason — all questions answered, a "
+            "dealbreaker gate, or they're not interested — your final spoken line "
+            "must be EXACTLY this closing line, verbatim (do not translate or "
+            "rephrase it), then stop. Say nothing after it."
+        )
+    # Deterministic progress directive goes FIRST (max salience) — it pins the
+    # exact next question and forbids the restart-to-Q1 loop seen in production.
+    progress = _render_progress_directive(questions, history, latest_user_text)
+    return progress + block if progress else block
+
+
+def _compose_questionnaire_only_section(
+    context: OutboundCampaignContext,
+    *,
+    language: str | None = None,
+    history: list | None = None,
+    latest_user_text: str | None = None,
+) -> str:
+    """Dedicated, MINIMAL system prompt for a deterministic questionnaire campaign.
+
+    These calls do exactly one thing: open with the intro (the deterministic
+    opener), ask the configured questions one by one (scoring + dealbreaker
+    gates), then close with the outro. They must NOT inherit the real-estate
+    sales scaffold — the FSM site-visit mode, the "YOUR ONE GOAL: book a site
+    visit" north-star, the booking flow, and the objectives list all hijack the
+    call (the agent starts pitching site visits instead of running the
+    questionnaire). So this builds a clean, questionnaire-only prompt: role +
+    delivery basics + the questionnaire block + the name/number guardrails +
+    the disinterest rule (dead last). No sales, no FSM, no objectives, no
+    booking.
+    """
+    caller = (context.caller_name or "Riya").strip() or "Riya"
+    company = (context.company_name or "").strip()
+    who = f"{caller} from {company}" if company else caller
+    parts: list[str] = []
+    role = (
+        f"# WHO YOU ARE\nYou are {who}, making a short outbound call to run a quick "
+        "set of questions with the person who answered. You are warm, natural, and "
+        "human — never robotic, never a survey-bot reading a form."
+    )
+    # Optional background context the admin attached (deterministic campaigns may
+    # carry it) — for off-script moments only, never to be recited.
+    bg = (context.agent_prompt or "").strip()
+    if bg:
+        role += (
+            "\n\nBackground you may lean on ONLY if they ask something off-script "
+            f"(never recite it, never pitch from it): {bg[:1500]}"
+        )
+    parts.append(role)
+    parts.append(
+        "# HOW YOU TALK\n"
+        "- Say ONE short, natural line per turn and OPEN WITH THE QUESTION "
+        "ITSELF. NEVER start a turn with an acknowledgement filler — no 'right "
+        "so', 'okay', 'great', 'great thanks', 'good to hear', 'perfect', 'nice', "
+        "'sure', 'cool', 'got it', 'thanks for that' (and no equivalent in any "
+        "other language). They sound robotic and waste the prospect's borrowed "
+        "attention. Just ask the next question.\n"
+        "- Don't re-confirm an answer they already gave clearly (if they said "
+        "'3 BHK', do NOT ask 'so you want a 3 BHK, right?') — just move on.\n"
+        "- Talk like a real person on a call — vary your wording, no lists, never "
+        "stack two questions, never read anything aloud like a script.\n"
+        "- Speak in whatever language the prospect speaks.\n"
+        "- This is the ONLY purpose of the call: ask the questions below and get a "
+        "real answer to each. Do NOT pitch, do NOT offer site visits, demos, or "
+        "meetings, and do NOT collect anything beyond these questions."
+    )
+    q_block = render_questionnaire_block(
+        context, language=language, history=history, latest_user_text=latest_user_text
+    )
+    if q_block:
+        parts.append(q_block)
+    parts.append(_OUTBOUND_NAME_GUARDRAIL.format(caller_name=caller))
+    parts.append(_OUTBOUND_HAVE_NUMBER_RULE)
+    parts.append(_OUTBOUND_DISINTEREST_RULE)
+    return "\n\n".join(parts)
+
+
 def compose_outbound_system_section(
     context: OutboundCampaignContext | None,
     *,
@@ -657,6 +1356,7 @@ def compose_outbound_system_section(
     conversational_memory: Any = None,
     business_type: str | None = None,
     latest_user_text: str | None = None,
+    history: list | None = None,
 ) -> str:
     """Build the system-prompt fragment for an outbound turn.
 
@@ -678,6 +1378,16 @@ def compose_outbound_system_section(
     """
     if context is None or not context.is_proactive:
         return ""
+    # Deterministic questionnaire campaigns run a SEPARATE, minimal pipeline —
+    # they must not inherit the sales/FSM/site-visit scaffold below (it hijacks
+    # the call). See _compose_questionnaire_only_section.
+    if context.has_questionnaire:
+        return _compose_questionnaire_only_section(
+            context,
+            language=language,
+            history=history,
+            latest_user_text=latest_user_text,
+        )
     remaining = context.remaining_objectives(covered_objectives or [])
     parts: list[str] = []
 
@@ -914,6 +1624,11 @@ def compose_outbound_system_section(
                 for item in remaining
             )
             section += f"\n\nStill pending this call:\n{remaining_render}"
+        elif context.has_questionnaire:
+            section += (
+                "\n\nObjectives covered — but keep going until you've asked every "
+                "lead-capture question below; don't wrap up yet."
+            )
         else:
             section += "\n\nAll objectives covered — confirm the next step and wrap the call politely."
         parts.append(section)
@@ -951,6 +1666,15 @@ def compose_outbound_system_section(
         _OUTBOUND_NAME_GUARDRAIL.format(caller_name=context.caller_name or "Riya")
     )
     parts.append(_OUTBOUND_HAVE_NUMBER_RULE)
+    # Questionnaire block: high recency (just above disinterest) so the agent
+    # asks every question before wrapping — but the disinterest rule stays DEAD
+    # LAST so a "no" still ends the call mid-questionnaire.
+    if context.has_questionnaire:
+        q_block = render_questionnaire_block(
+        context, language=language, history=history, latest_user_text=latest_user_text
+    )
+        if q_block:
+            parts.append(q_block)
     parts.append(_OUTBOUND_DISINTEREST_RULE)
     return "\n\n".join(parts)
 
@@ -995,6 +1719,13 @@ def generate_outbound_opener_text(
     """
     caller = (context.caller_name or "Riya").strip() or "Riya"
     company = (context.company_name or "").strip()
+    # An admin-authored questionnaire intro overrides the template opener — the
+    # operator wrote exactly how they want the call to open (in the campaign's
+    # language). Spoken as-is; voiced warm by _play_opener when it carries no
+    # prosody tags.
+    intro = (getattr(context, "question_intro", "") or "").strip()
+    if intro:
+        return f"[warm]{intro}[/warm]"
     # Only speak a SHORT pitch — never the full content blob (it'd read the prompt
     # aloud and garble a Telugu/Hindi opener). Long content → generic intro.
     pitch = _spoken_pitch(context)
@@ -1623,5 +2354,8 @@ __all__ = [
     "invalidate_all",
     "load_outbound_context",
     "render_outbound_memory",
+    "render_questionnaire_block",
+    "strip_leading_fillers",
+    "strip_leading_right_so",
     "update_outbound_memory",
 ]

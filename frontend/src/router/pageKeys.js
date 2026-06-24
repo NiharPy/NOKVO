@@ -20,6 +20,7 @@ export const pageKeyToRouteName = {
   services: 'dash-services',
   agent: 'dash-agent',
   outgoing_agent: 'dash-campaigns',
+  bulk_leads: 'dash-bulk-leads',
   my_timetable: 'dash-my-timetable',
   organization_health: 'dash-org-health',
   nokvo_connect: 'dash-connect',

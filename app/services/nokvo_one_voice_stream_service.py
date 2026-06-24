@@ -97,6 +97,8 @@ from app.services.agent_outbound_context import (
     generate_outbound_opener_text,
     infer_covered_objectives,
     load_outbound_context,
+    strip_leading_fillers,
+    strip_leading_right_so,
     update_outbound_memory,
 )
 from app.services.agent_robustness import (
@@ -161,6 +163,38 @@ _CHECK_IN_CONTAINS = (
     "இருக்கீங்களா",
 )
 
+# Short backchannels / acknowledgements a caller drops WHILE the agent is
+# speaking — "uh-huh", "yeah", "haan", "avunu". On an OUTBOUND call these must
+# NOT cancel the agent (it's affirmation, not a turn-grab). Mirrors the
+# _CHECK_IN_* lists; used by the transcript-level barge-in backstop. The primary
+# outbound guard is the time-based sustained-speech window (see the streaming
+# speech_start path) — this list only catches the vad_blob transcript path.
+_BACKCHANNEL_WORDS = {
+    "uh-huh", "uhhuh", "uh huh", "mhm", "mm", "mmm", "hmm", "mm-hmm", "mmhmm",
+    "yeah", "yep", "yup", "ok", "okay", "k", "right", "sure", "got it",
+    "gotcha", "i see", "yes", "ya", "aha", "oh", "cool", "nice", "alright",
+    # Hindi
+    "haan", "हाँ", "हां", "ji", "जी", "achha", "अच्छा", "theek", "ठीक",
+    "theek hai", "ठीक है", "sahi", "सही", "हम्म",
+    # Telugu
+    "avunu", "అవును", "sare", "సరే", "ఊ", "ఆ", "అవ్",
+    # Tamil
+    "ஆமா", "சரி", "ஆம்",
+}
+
+
+def _is_backchannel_utterance(text: str) -> bool:
+    """True when ``text`` is a short backchannel/acknowledgement (≤2 words and in
+    :data:`_BACKCHANNEL_WORDS`) or empty — i.e. the kind of "uh-huh" / cough a
+    caller emits while the agent is talking, which should NOT count as a
+    barge-in on an outbound call."""
+    cleaned = " ".join((text or "").lower().split()).rstrip("?.,!।؟…")
+    if not cleaned:
+        return True
+    if len(cleaned.split()) > 2:
+        return False
+    return cleaned in _BACKCHANNEL_WORDS
+
 
 # How many sentences may be combined into a single TTS call after the first
 # one has been spoken. The first sentence is ALWAYS dispatched on its own so
@@ -207,6 +241,20 @@ async def _drain_turn(task: asyncio.Task | None) -> None:
         pass
 
 
+def _scaled_pace(base_pace: float | None, factor: float) -> float | None:
+    """Scale a TTS pace by ``factor``, clamped to Sarvam's 0.3–3.0 range.
+
+    A ``factor`` of 1.0 returns ``base_pace`` unchanged (``None`` stays ``None``)
+    so non-scaled paths are byte-identical. When scaling and ``base_pace`` is
+    ``None`` (no explicit per-tone pace), the neutral 1.0 baseline is used so the
+    factor still applies (it then composes with the per-language pace factor in
+    ``stream_sentence_tts``)."""
+    if factor == 1.0:
+        return base_pace
+    base = 1.0 if base_pace is None else float(base_pace)
+    return max(0.3, min(3.0, base * factor))
+
+
 class _TtsPump:
     """Background TTS dispatcher that batches sentences after the first one.
 
@@ -231,6 +279,7 @@ class _TtsPump:
         turn_id: str,
         purpose: str = "answer",
         speaking_mark: Any | None = None,
+        pace_factor: float = 1.0,
     ) -> None:
         self._websocket = websocket
         self._tenant_res = tenant_res
@@ -238,6 +287,10 @@ class _TtsPump:
         self._turn_id = turn_id
         self._purpose = purpose
         self._speaking_mark = speaking_mark
+        # Multiplier applied to every sentence's pace (1.0 = unchanged). Used to
+        # slow outbound delivery slightly; composes with the per-language pace
+        # factor inside stream_sentence_tts.
+        self._pace_factor = pace_factor
         self._queue: asyncio.Queue[tuple[str, str, bool] | None] = asyncio.Queue()
         self._worker: asyncio.Task[None] | None = None
         self._first_audio_fired = False
@@ -312,6 +365,11 @@ class _TtsPump:
                 self._speaking_mark()
             except Exception:
                 pass
+        # Apply the pace multiplier even on the first sentence (prosody=None →
+        # baseline 1.0). Factor 1.0 leaves pace untouched (None stays None) so
+        # the inbound path is byte-identical.
+        base_pace = prosody.pace if prosody else None
+        pace = _scaled_pace(base_pace, self._pace_factor)
         try:
             await SarvamVoiceService.stream_sentence_tts(
                 self._websocket,
@@ -319,7 +377,7 @@ class _TtsPump:
                 text,
                 language=self._language,
                 purpose=self._purpose,
-                pace=prosody.pace if prosody else None,
+                pace=pace,
                 pitch=prosody.pitch if prosody else None,
                 loudness=prosody.loudness if prosody else None,
                 enable_cached_responses=all(cacheable for _, _, cacheable in batch),
@@ -394,7 +452,7 @@ _OUTBOUND_OPENER_DELAY_SECONDS = 0.7
 # up. Instead a short, natural thinking-aloud token ("Mhm…", "I see,") so it
 # sounds like a human gathering a thought, not a system stalling.
 _LATENCY_GUARD_OUTBOUND = {
-    "en": "Right, so…",
+    "en": "Okay, just a sec…",
     "hi": "जी, बस एक सेकंड…",
     "ta": "ம்ம், சரி…",
     "te": "ఊఁ, అలాగే…",
@@ -415,7 +473,7 @@ def _latency_guard_text(language: str | None, direction: str = "inbound") -> str
     short conversational bridge so it sounds like a person thinking, not a queue.
     All 12 supported languages are covered; unknown → English."""
     table = _LATENCY_GUARD_OUTBOUND if direction == "outbound" else _LATENCY_GUARD_INBOUND
-    default = "Right, so…" if direction == "outbound" else "One moment, I'm checking that."
+    default = "Okay, just a sec…" if direction == "outbound" else "One moment, I'm checking that."
     return table.get(language or "en", default)
 
 
@@ -448,6 +506,60 @@ def _is_voicemail_utterance(text: str | None) -> bool:
         return False
     low = text.casefold()
     return any(phrase in low for phrase in _VOICEMAIL_PHRASES)
+
+
+# Grace period (seconds) to let the outro audio drain to the caller before we
+# drop the media WS — closing immediately can clip the last words.
+_OUTRO_DRAIN_SECONDS = 2.5
+
+
+def _answer_is_outro(answer: str | None, outro: str | None) -> bool:
+    """True when the agent's spoken reply IS (essentially) the campaign's outro.
+
+    Token-overlap match: ``True`` when ≥70% of the outro's words appear in the
+    reply. Used to detect that the agent delivered its closing line (a failed
+    intent gate, a normal wrap, or a disinterest close) so the system can play it
+    out and hang up. Pure + unit-testable. Conservative on purpose — a miss just
+    means the call isn't auto-cut (the agent still wrapped), never a wrong hangup
+    on a live prospect."""
+    a = re.sub(r"[^\w\s]", " ", (answer or "").lower()).split()
+    o = re.sub(r"[^\w\s]", " ", (outro or "").lower()).split()
+    if not o or not a:
+        return False
+    aset = set(a)
+    hits = sum(1 for w in o if w in aset)
+    return hits / len(o) >= 0.7
+
+
+def _outbound_post_call_targets(
+    contact: dict[str, Any] | None,
+    *,
+    has_outbound_ctx: bool,
+    campaign_id: Any,
+) -> tuple[bool, bool]:
+    """Decide what post-call work an outbound call's contact needs.
+
+    Returns ``(run_post_call_block, has_followup_target)``:
+      * ``has_followup_target`` — the contact points at a lead / customer ROW
+        (``lead_id`` or ``customer_id``), so the condenser can write a handoff
+        note onto it and schedule a follow-up.
+      * ``run_post_call_block`` — whether to run the post-call block at all. True
+        for a follow-up target OR any real campaign DIAL (it has a
+        ``call_link_id`` AND a ``campaign_id``). The second arm is what lets bulk
+        CSV lead-capture contacts — which carry NEITHER a ``lead_id`` nor a
+        ``customer_id`` — still get SCORED post-call (the Lead Score that powers
+        the Qualified Leads tab). Without it those campaigns were never scored,
+        so no contact was ever marked qualified and the tab stayed empty.
+
+    Pure + unit-testable: this is exactly the gate that used to drop bulk
+    campaigns on the floor. A live tester call has no ``call_link_id`` and so is
+    (correctly) excluded — it has its own classifier path.
+    """
+    if not (has_outbound_ctx and isinstance(contact, dict)):
+        return False, False
+    has_followup_target = bool(contact.get("lead_id") or contact.get("customer_id"))
+    is_campaign_call = bool(contact.get("call_link_id") and campaign_id)
+    return (has_followup_target or is_campaign_call), has_followup_target
 
 
 def _voicemail_message(
@@ -1485,6 +1597,13 @@ class NokvoOneVoiceStreamService:
             # owns the Sarvam calls so the LLM token loop never blocks waiting
             # on TTS, and adjacent sentences are batched into a single REST
             # call after the first one has been dispatched.
+            # Outbound calls speak slightly slower (more deliberate/human);
+            # inbound is unchanged (factor 1.0).
+            _pace_factor = (
+                settings.VOICE_OUTBOUND_PACE_FACTOR
+                if bool((campaign_context or {}).get("campaign_id"))
+                else 1.0
+            )
             tts_pump = _TtsPump(
                 websocket=websocket,
                 tenant_res=tenant_res,
@@ -1492,6 +1611,7 @@ class NokvoOneVoiceStreamService:
                 turn_id=turn_id,
                 purpose="answer",
                 speaking_mark=_mark_speaking,
+                pace_factor=_pace_factor,
             )
             tts_pump.start()
             if arbiter is not None:
@@ -1703,6 +1823,25 @@ class NokvoOneVoiceStreamService:
                     sentence = str(event.get("text") or "").strip()
                     if not sentence:
                         return
+                    # Deterministic leading-filler scrub for outbound turns: the
+                    # agents are prompt-banned from opening with a stock
+                    # acknowledgement filler, but the LLM still leaks one. Strip
+                    # it from the FIRST content sentence so it is never heard,
+                    # shown, or stored. A bare-ack sentence scrubs to "" → skip
+                    # it; the next sentence becomes the first and carries the turn.
+                    #
+                    # The DETERMINISTIC questionnaire agent must be crisp — open
+                    # with the question itself — so it gets the FULL filler scrub
+                    # ("Great,", "Perfect.", "Got it.", "Sure,", "Okay,", …). The
+                    # free-form salesperson agent keeps the narrow "right so"-only
+                    # scrub, so a natural "Got it," can still warm the rapport.
+                    if outbound_context is not None and not answer_parts:
+                        if getattr(outbound_context, "has_questionnaire", False):
+                            sentence = strip_leading_fillers(sentence)
+                        else:
+                            sentence = strip_leading_right_so(sentence)
+                        if not sentence:
+                            return
                     _sentence_perf = perf_counter()
                     if first_sentence_ms is None:
                         first_sentence_ms = int((_sentence_perf - started) * 1000)
@@ -1958,6 +2097,29 @@ class NokvoOneVoiceStreamService:
                 if asyncio.iscoroutine(result):
                     await result
 
+            # ── Outro hang-up (deterministic questionnaire campaigns) ──
+            # When the agent delivers the campaign's closing line — a failed
+            # intent gate ("dealbreaker"), all questions answered, or a
+            # disinterest close — play it out, then drop the call. Mirrors the
+            # voicemail speak→close pattern. One-shot per call. Gated on an outro
+            # being set, so non-deterministic / lead / clinic calls never hang up
+            # here. A non-match is harmless (the agent wrapped; the call ends as
+            # before) — we never cut a live prospect on a wrong guess.
+            _outro = (getattr(outbound_context, "question_outro", "") or "").strip()
+            if (
+                _outro
+                and campaign_context is not None
+                and not campaign_context.get("_outro_ended")
+                and _answer_is_outro(answer, _outro)
+            ):
+                campaign_context["_outro_ended"] = True
+                logger.info(
+                    "NOKVO-OUTRO: agent delivered closing line — ending call %s", call_id
+                )
+                with contextlib.suppress(Exception):
+                    await asyncio.sleep(_OUTRO_DRAIN_SECONDS)
+                    await websocket.close()
+
     @staticmethod
     async def _process_blob_utterance(
         websocket: WebSocket,
@@ -2167,6 +2329,19 @@ class NokvoOneVoiceStreamService:
                 verdict = "barge_in"
             else:
                 verdict = "proceed"
+
+        # OUTBOUND barge-in immunity (vad_blob backstop): a short backchannel
+        # ("uh-huh" / "haan", or a cough that transcribed to noise) must not cut
+        # the agent off — leave the in-flight reply running. The streaming path's
+        # sustained-speech window is the primary outbound guard; this covers the
+        # vad_blob path. Inbound keeps the existing immediate barge-in.
+        if (
+            verdict == "barge_in"
+            and bool((campaign_context or {}).get("campaign_id"))
+            and _is_backchannel_utterance(transcript)
+        ):
+            logger.info("NOKVO-BARGEIN: suppressed:backchannel call=%s", call_id)
+            return
 
         if verdict == "check_in":
             ack_lang = session_locked_language[0] or detected_lang
@@ -2659,18 +2834,35 @@ class NokvoOneVoiceStreamService:
             # speech_end is treated as a HINT (restart the debounce), not as
             # authority to fire. The turn only fires after the debounce elapses
             # with no new speech — i.e., the user actually finished their thought.
-            EOU_DEBOUNCE_MS = max(500, int(settings.VOICE_EOU_DEBOUNCE_MS))
-            EOU_CONTINUATION_BONUS_MS = max(0, int(settings.VOICE_EOU_CONTINUATION_BONUS_MS))
+            # Outbound (an active campaign) gets its own humanization knobs:
+            # direction-tunable EOU tiers + barge-in immunity + a slower pace.
+            # Inbound keeps the global behaviour unchanged.
+            is_outbound = bool((campaign_context or {}).get("campaign_id"))
             # Adaptive endpointing tiers (see module-level _eou_completeness_tier):
             # fire fast on high-confidence-complete utterances, a moderate wait on
             # ambiguous declaratives, and keep DEBOUNCE+BONUS for trailing-off
             # speech. The continuation word list now lives at module level
             # (_EOU_CONTINUATION_TAIL_WORDS) so the classifier is unit-testable.
-            EOU_COMPLETE_MS = max(200, int(settings.VOICE_EOU_COMPLETE_MS))
-            EOU_NEUTRAL_MS = max(400, int(settings.VOICE_EOU_NEUTRAL_MS))
+            # Outbound reads the *_OUTBOUND settings (default == global, so no
+            # behaviour change until an operator tunes them).
+            if is_outbound:
+                EOU_DEBOUNCE_MS = max(500, int(settings.VOICE_EOU_DEBOUNCE_MS_OUTBOUND))
+                EOU_CONTINUATION_BONUS_MS = max(0, int(settings.VOICE_EOU_CONTINUATION_BONUS_MS_OUTBOUND))
+                EOU_COMPLETE_MS = max(200, int(settings.VOICE_EOU_COMPLETE_MS_OUTBOUND))
+                EOU_NEUTRAL_MS = max(400, int(settings.VOICE_EOU_NEUTRAL_MS_OUTBOUND))
+            else:
+                EOU_DEBOUNCE_MS = max(500, int(settings.VOICE_EOU_DEBOUNCE_MS))
+                EOU_CONTINUATION_BONUS_MS = max(0, int(settings.VOICE_EOU_CONTINUATION_BONUS_MS))
+                EOU_COMPLETE_MS = max(200, int(settings.VOICE_EOU_COMPLETE_MS))
+                EOU_NEUTRAL_MS = max(400, int(settings.VOICE_EOU_NEUTRAL_MS))
             utterance_segments: list[str] = []
             utterance_language: list[str] = [language]
             eou_timer_task: asyncio.Task | None = None
+            # Outbound barge-in immunity: a pending "is this a real interruption?"
+            # confirm timer armed on speech_start while the agent is speaking. It
+            # fires the cancel only if speech is sustained past
+            # VOICE_BARGE_IN_MIN_MS; a speech_end blip (cough) aborts it.
+            pending_barge_task: asyncio.Task | None = None
             # End-of-speech anchor for the sub-1s budget. Set on every EOU-timer
             # (re)start — i.e. each time the caller's silence-countdown begins —
             # so the LAST value before the timer actually fires is the true end
@@ -3017,6 +3209,47 @@ class NokvoOneVoiceStreamService:
                     eou_timer_task.cancel()
                 eou_timer_task = None
 
+            # ── Outbound barge-in immunity (sustained-speech gate) ──────────
+            def _cancel_pending_barge() -> None:
+                nonlocal pending_barge_task
+                if pending_barge_task and not pending_barge_task.done():
+                    pending_barge_task.cancel()
+                pending_barge_task = None
+
+            async def _do_barge_cancel(reason: str) -> None:
+                """Honour a real barge-in: cancel the agent's in-flight turn +
+                TTS pump, reset the utterance buffers, tell the client."""
+                nonlocal pending_barge_task
+                # Drop the reference WITHOUT cancelling: this runs from inside the
+                # confirm task itself, so .cancel() here would raise CancelledError
+                # at the next await and abort the barge mid-way.
+                pending_barge_task = None
+                await robustness.arbiter.cancel()
+                _cancel_eou_timer()
+                utterance_segments.clear()
+                utterance_audio.clear()
+                logger.info("NOKVO-BARGEIN: confirmed (%s) call=%s", reason, call_id)
+                await websocket.send_json({"type": "barge_in_detected", "call_id": call_id})
+
+            def _arm_barge_confirm() -> None:
+                """Outbound: don't cut on the first energy spike. Wait
+                VOICE_BARGE_IN_MIN_MS of sustained speech before cancelling — a
+                cough/'uh-huh' ends (speech_end) within the window and aborts."""
+                nonlocal pending_barge_task
+                if pending_barge_task and not pending_barge_task.done():
+                    return  # already waiting on this interruption
+
+                async def _confirm() -> None:
+                    try:
+                        await asyncio.sleep(settings.VOICE_BARGE_IN_MIN_MS / 1000)
+                    except asyncio.CancelledError:
+                        return
+                    # Still speaking after the window → a genuine interruption.
+                    if robustness.arbiter.phase == TURN_SPEAKING:
+                        await _do_barge_cancel("sustained")
+
+                pending_barge_task = asyncio.create_task(_confirm())
+
             def _eou_decision() -> tuple[str, int]:
                 """Adaptive end-of-utterance wait → ``(tier, delay_ms)``. Fire fast
                 on high-confidence-complete utterances (questions, time/yes-no
@@ -3088,19 +3321,24 @@ class NokvoOneVoiceStreamService:
                             if event_type == "speech_start":
                                 # Arbiter classifies speech_start without a
                                 # transcript yet. If the agent is already in
-                                # the SPEAKING phase this is a real barge-in
-                                # and we cancel atomically (LLM stream + TTS
-                                # pump). Otherwise we just rewind the EOU
+                                # the SPEAKING phase this is a (potential)
+                                # barge-in. Otherwise we just rewind the EOU
                                 # timer and wait for the transcript to come
                                 # in so _fire_turn can do check-in vs
                                 # barge-in classification.
                                 verdict = robustness.arbiter.classify_incoming(is_check_in=False)
                                 if verdict == "barge_in" and robustness.arbiter.phase == TURN_SPEAKING:
-                                    await robustness.arbiter.cancel()
-                                    _cancel_eou_timer()
-                                    utterance_segments.clear()
-                                    utterance_audio.clear()
-                                    await websocket.send_json({"type": "barge_in_detected", "call_id": call_id})
+                                    if is_outbound:
+                                        # Outbound immunity: a cough or a quick
+                                        # "uh-huh" shouldn't cut the agent off.
+                                        # Arm a sustained-speech confirm timer;
+                                        # cancel only if they keep talking past
+                                        # VOICE_BARGE_IN_MIN_MS (a speech_end
+                                        # blip below aborts it). Leave the EOU
+                                        # timer alone until the barge confirms.
+                                        _arm_barge_confirm()
+                                    else:
+                                        await _do_barge_cancel("immediate")
                                 else:
                                     _cancel_eou_timer()
                                 continue
@@ -3109,6 +3347,12 @@ class NokvoOneVoiceStreamService:
                                 # emits this on every pause. Treat as a hint:
                                 # restart the debounce. We only fire when the
                                 # user has actually been silent for EOU_DEBOUNCE_MS.
+                                # A speech_end while a barge confirm is pending =
+                                # a short blip (cough/backchannel) that ended
+                                # inside the window → abort the cancel.
+                                if pending_barge_task is not None:
+                                    _cancel_pending_barge()
+                                    logger.info("NOKVO-BARGEIN: suppressed:blip call=%s", call_id)
                                 if utterance_segments:
                                     _restart_eou_timer()
                                 continue
@@ -3407,6 +3651,7 @@ class NokvoOneVoiceStreamService:
                 if proactive_watchdog is not None:
                     proactive_watchdog.cancel()
                 _cancel_eou_timer()
+                _cancel_pending_barge()
                 await _drain_turn(current_turn)
                 if stt_reader_task and not stt_reader_task.done():
                     stt_reader_task.cancel()
@@ -3552,14 +3797,26 @@ class NokvoOneVoiceStreamService:
                     if isinstance(final_campaign_context, dict)
                     else None
                 )
-                if (
-                    outbound_ctx is not None
-                    and isinstance(contact_for_followup, dict)
-                    and (
-                        contact_for_followup.get("lead_id")
-                        or contact_for_followup.get("customer_id")
-                    )
-                ):
+                # A lead/customer-targeted call has a ROW to write the handoff
+                # note back to (OutgoingLead / CustomerBase) and to schedule a
+                # follow-up from. A bulk CSV campaign contact has NEITHER — it is
+                # just {phone, name, call_link_id} — but it STILL needs post-call
+                # SCORING (the Lead Score that powers the Qualified Leads tab) and
+                # a Call Note. ``_run_post_call_block`` is True for both; the two
+                # background tasks below self-select what each of them does.
+                # (Previously this gate required lead_id/customer_id, so bulk
+                # questionnaire campaigns were never scored and the Qualified
+                # Leads tab stayed empty.)
+                _run_post_call_block, _has_followup_target = _outbound_post_call_targets(
+                    contact_for_followup,
+                    has_outbound_ctx=outbound_ctx is not None,
+                    campaign_id=(
+                        getattr(outbound_ctx, "campaign_id", None)
+                        if outbound_ctx is not None
+                        else None
+                    ),
+                )
+                if _run_post_call_block:
                     _lead_id_raw = contact_for_followup.get("lead_id")
                     # Customer-targeted follow-up (clinic manual path): the note
                     # goes to CustomerBase.last_call_summary, not a lead row.
@@ -3589,6 +3846,200 @@ class NokvoOneVoiceStreamService:
                             _bg_campaign_id = uuid.UUID(str(_cid_raw))
                     except Exception:
                         _bg_campaign_id = None
+
+                    # ── Interest verdict (powers the Qualified Leads table) ──
+                    # The condenser doesn't judge interest, so classify it from
+                    # the transcript here. call_link_id is the stable per-contact
+                    # key — the webhook's call_id may not be set yet at teardown.
+                    _bg_call_link_id = str(contact_for_followup.get("call_link_id") or "")
+                    _campaign_goal_for_interest = None
+                    try:
+                        _campaign_goal_for_interest = getattr(outbound_ctx, "goal", None) or getattr(
+                            outbound_ctx, "pitch_summary", None
+                        )
+                    except Exception:
+                        _campaign_goal_for_interest = None
+
+                    # Lead-capture questionnaire snapshot (immutable post-launch).
+                    # When the campaign has one, post-call SCORING replaces the
+                    # binary interest verdict for this contact. Read off the
+                    # already-loaded context — no extra DB round-trip.
+                    try:
+                        _bg_questions = list(getattr(outbound_ctx, "questions", []) or [])
+                        _bg_threshold = int(getattr(outbound_ctx, "question_threshold", 0) or 0)
+                    except Exception:
+                        _bg_questions, _bg_threshold = [], 0
+                    _bg_language = None
+                    if isinstance(final_campaign_context, dict):
+                        _bg_language = final_campaign_context.get("language") or None
+
+                    async def _classify_and_persist_interest():
+                        # Best-effort: judge the call outcome from the transcript
+                        # and stamp the verdict onto the matching campaign.contacts
+                        # entry. For questionnaire campaigns this is the LEAD SCORE
+                        # (score/qualified/breakdown); otherwise the legacy interest
+                        # bucket. Surfaced by GET /campaigns → "Qualified Leads".
+                        if not (_bg_campaign_id and _bg_call_link_id):
+                            return
+                        try:
+                            from app.services.outbound_call_outcome_classifier import (
+                                classify_outbound_outcome,
+                            )
+                            from app.services.lead_score_service import (
+                                classify_lead_score,
+                            )
+                            from app.services.outbound_campaign_service import (
+                                OutboundCampaignService,
+                            )
+                            from app.db.session import AsyncSessionLocal
+                            from sqlalchemy.orm.attributes import flag_modified
+
+                            try:
+                                _hist = await AgentSessionStore.get_history(_bg_tenant_res, _bg_call_id)
+                            except Exception:
+                                _hist = []
+                            # {role, content} history → {query, answer} turn pairs
+                            # (the shape classify_outbound_outcome expects).
+                            _turns: list[dict[str, Any]] = []
+                            _pending_user: str | None = None
+                            for _e in _hist or []:
+                                _role = (_e.get("role") or "").lower()
+                                _content = (_e.get("content") or "").strip()
+                                if not _content:
+                                    continue
+                                if _role == "user":
+                                    if _pending_user is not None:
+                                        _turns.append({"query": _pending_user, "answer": ""})
+                                    _pending_user = _content
+                                elif _role == "assistant":
+                                    _turns.append({"query": _pending_user or "", "answer": _content})
+                                    _pending_user = None
+                                else:
+                                    _turns.append({"query": "", "answer": _content})
+                            if _pending_user is not None:
+                                _turns.append({"query": _pending_user, "answer": ""})
+                            if not _turns:
+                                return
+
+                            # Branch: questionnaire campaigns are SCORED (score +
+                            # qualified + per-question breakdown); everything else
+                            # keeps the legacy interest bucket. The LLM call runs
+                            # OUTSIDE the FOR UPDATE lock (never hold a row lock
+                            # across model latency).
+                            _stamp: dict[str, Any]
+                            _log: str
+                            if _bg_questions:
+                                _ls = await classify_lead_score(
+                                    _bg_tenant_res,
+                                    transcript_turns=_turns,
+                                    questions=_bg_questions,
+                                    threshold=_bg_threshold,
+                                    language=_bg_language,
+                                    campaign_name=_campaign_name,
+                                )
+                                _stamp = {
+                                    "lead_score": _ls.score,
+                                    "max_score": _ls.max_score,
+                                    "qualified": _ls.qualified,
+                                    "score_breakdown": _ls.breakdown,
+                                    "lead_score_reason": _ls.reason,
+                                    "lead_score_degraded": _ls.degraded,
+                                    # Derived so legacy tabs/condenser/follow-up
+                                    # that read interest_outcome keep working.
+                                    "interest_outcome": _ls.interest_outcome,
+                                    "interest_reason": _ls.reason,
+                                }
+                                _log = (
+                                    f"lead_score {_ls.score}/{_ls.max_score} "
+                                    f"qualified={_ls.qualified}"
+                                )
+                            else:
+                                _outcome = await classify_outbound_outcome(
+                                    _bg_tenant_res,
+                                    transcript_turns=_turns,
+                                    campaign_name=_campaign_name,
+                                    campaign_goal=_campaign_goal_for_interest,
+                                )
+                                _stamp = {
+                                    "interest_outcome": _outcome.outcome,
+                                    "interest_reason": _outcome.reason,
+                                }
+                                _log = f"interest {_outcome.outcome}"
+
+                            # A contact that QUALIFIED (questionnaire campaigns)
+                            # or read as INTERESTED (non-questionnaire) becomes a
+                            # qualified-lead "ticket" in the campaign's Qualified
+                            # Leads tab. Attach a human Call Note (the same
+                            # condenser the lead/clinic paths use) so the operator
+                            # sees what happened without opening the transcript —
+                            # the contact already carries the phone number. The
+                            # condense LLM call stays OUTSIDE the FOR UPDATE lock,
+                            # mirroring the scorer above; it reuses the history we
+                            # already fetched. Best-effort: a missing note just
+                            # leaves the row showing phone + score, no summary.
+                            #
+                            # Only the bulk path (no lead/customer row) needs the
+                            # scorer to produce the note — lead/customer calls get
+                            # theirs from the condenser task, which ALSO writes it
+                            # onto the lead row; doing it here too would condense
+                            # the same call twice.
+                            _surfaces_as_qualified = (
+                                bool(_ls.qualified)
+                                if _bg_questions
+                                else _outcome.outcome == "interested"
+                            )
+                            if _surfaces_as_qualified and not _has_followup_target:
+                                try:
+                                    from app.services.call_condenser_service import (
+                                        condense_call,
+                                    )
+
+                                    _note = await condense_call(
+                                        tenant_res=_bg_tenant_res,
+                                        call_id=_bg_call_id,
+                                        lead_name=_lead_name,
+                                        campaign_name=_campaign_name,
+                                        transcript=_hist,
+                                        timeout_s=8.0,
+                                    )
+                                except Exception:
+                                    logger.exception(
+                                        "NOKVO-OUTBOUND-INTEREST: call-note condense failed"
+                                    )
+                                    _note = None
+                                if _note:
+                                    _stamp["call_note"] = _note
+                                    _stamp["call_note_generated_at"] = datetime.now(
+                                        timezone.utc
+                                    ).isoformat()
+
+                            # Write the verdict onto the contact under the campaign
+                            # FOR UPDATE lock — the only safe way to touch the
+                            # contacts JSON (races with the status webhook).
+                            async with AsyncSessionLocal() as _idb:
+                                _camp = await OutboundCampaignService._lock_campaign(
+                                    _idb, _bg_campaign_id
+                                )
+                                if _camp is None:
+                                    return
+                                _contacts = list(_camp.contacts or [])
+                                _changed = False
+                                for _ct in _contacts:
+                                    if str(_ct.get("call_link_id") or "") == _bg_call_link_id:
+                                        _ct.update(_stamp)
+                                        _changed = True
+                                        break
+                                if _changed:
+                                    _camp.contacts = _contacts
+                                    flag_modified(_camp, "contacts")
+                                    _idb.add(_camp)
+                                    await _idb.commit()
+                                    logger.info(
+                                        "NOKVO-OUTBOUND-INTEREST: %s for call %s",
+                                        _log, _bg_call_id,
+                                    )
+                        except Exception:
+                            logger.exception("NOKVO-OUTBOUND-INTEREST: classify/persist failed")
 
                     async def _condense_and_persist():
                         try:
@@ -3778,11 +4229,23 @@ class NokvoOneVoiceStreamService:
                             except Exception:
                                 pass
 
-                    _condense_task = asyncio.create_task(
-                        _condense_and_persist(), name=f"condense:{call_id}"
+                    # The condenser writes the handoff note onto the lead /
+                    # customer row and schedules the follow-up — only meaningful
+                    # when there IS such a row. A bulk CSV campaign contact has
+                    # none, so skip it (its Call Note is produced by the scorer
+                    # task below) rather than burn a condense LLM call per dial.
+                    if _has_followup_target:
+                        _condense_task = asyncio.create_task(
+                            _condense_and_persist(), name=f"condense:{call_id}"
+                        )
+                        _background_tasks.add(_condense_task)
+                        _condense_task.add_done_callback(_background_tasks.discard)
+
+                    _interest_task = asyncio.create_task(
+                        _classify_and_persist_interest(), name=f"interest:{call_id}"
                     )
-                    _background_tasks.add(_condense_task)
-                    _condense_task.add_done_callback(_background_tasks.discard)
+                    _background_tasks.add(_interest_task)
+                    _interest_task.add_done_callback(_background_tasks.discard)
 
                 # ── Post-call handoff note for INBOUND records ────────────
                 # Inbound leads & site-visits live in nokvo_one_tool_records

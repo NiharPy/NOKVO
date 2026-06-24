@@ -1872,6 +1872,17 @@ async def plivo_outbound_media_websocket(websocket: WebSocket, call_link_id: str
 # ────────────────────────── Campaigns ──────────────────────────
 
 
+def _questionnaire_max_score(agent_config: dict[str, Any]) -> int | None:
+    """Max achievable lead score for a campaign's questionnaire (weighted/graded
+    points via the ONE shared helper), or ``None`` when there's no questionnaire."""
+    questions = ((agent_config or {}).get("questionnaire") or {}).get("questions") or []
+    if not questions:
+        return None
+    from app.services.agent_outbound_context import questionnaire_max_points
+
+    return questionnaire_max_points(questions) or None
+
+
 def _campaign_response(c: OutboundCampaign) -> dict[str, Any]:
     status_val = c.status.value if hasattr(c.status, "value") else c.status
     return {
@@ -1884,6 +1895,26 @@ def _campaign_response(c: OutboundCampaign) -> dict[str, Any]:
         "failed_count": c.failed_count or 0,
         "contacts": c.contacts or [],
         "agent_config": c.agent_config or {},
+        # Numbers removed from the dial list because they're on the DND/NCPR
+        # register (bulk CSV campaigns only). Empty when nothing was scrubbed.
+        "dnd_dropped": (c.agent_config or {}).get("dnd_dropped") or [],
+        # Lead-capture questionnaire (bulk campaigns) + its max score, so the UI
+        # can render the builder + switch Qualified Leads to score-based. Null
+        # when the campaign has none (UI falls back to the interest filter). The
+        # per-contact lead_score/qualified/score_breakdown ride in "contacts".
+        "questionnaire": (c.agent_config or {}).get("questionnaire"),
+        # Max achievable lead score — weighted/graded points, not just the
+        # question count. Shared helper so the denominator never drifts from the
+        # scorer. Null when the campaign has no questionnaire.
+        "max_score": _questionnaire_max_score(c.agent_config or {}),
+        # Campaign type: deterministic (questionnaire + lead score) vs
+        # non-deterministic (free-form pitch). Defaults to the questionnaire
+        # presence for rows created before the explicit flag existed.
+        "deterministic": bool(
+            (c.agent_config or {}).get(
+                "deterministic", bool((c.agent_config or {}).get("questionnaire"))
+            )
+        ),
         # Whether the follow-up agent is on for this campaign (defaults on).
         "followup_enabled": bool(
             ((c.agent_config or {}).get("followup_rules") or {}).get("enabled", True)
@@ -1914,6 +1945,29 @@ def _parse_campaign_list_field(value: str | None) -> list[str]:
     if not isinstance(parsed, list):
         return []
     return [str(item).strip() for item in parsed if str(item).strip()]
+
+
+def _parse_questionnaire_field(raw: str | None) -> dict | None:
+    """Parse the bulk-campaign questionnaire multipart field (a JSON string) into
+    the ONE canonical normalized shape, or ``None`` when absent.
+
+    Raises :class:`ValueError` (mapped to a 400 via ``_safe_detail`` at the call
+    site) on malformed JSON or an ``answer`` question missing its expected
+    answer, so the admin sees a clear message in the same channel as other
+    campaign validation errors. Delegates shape rules to the single normalizer.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ValueError(
+            "The questionnaire couldn't be read — please re-add the questions and try again."
+        ) from exc
+    from app.services.agent_outbound_context import _coerce_questionnaire
+
+    return _coerce_questionnaire(data, strict=True)
 
 
 @router.get("/outbound-number")
@@ -2035,6 +2089,8 @@ async def create_bulk_calling_campaign(
     exit_conditions: str | None = Form(None),
     tone: str | None = Form(None),
     silence_timeout_seconds: float | None = Form(None),
+    questionnaire: str | None = Form(None),
+    deterministic: bool = Form(False),
     user: OrganizationUser = Depends(_admin_dep()),
     _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
     db: AsyncSession = Depends(deps.get_db),
@@ -2061,7 +2117,10 @@ async def create_bulk_calling_campaign(
         )
     if not (name or "").strip():
         raise HTTPException(status_code=400, detail="Give the campaign a name.")
-    if not (content or "").strip():
+    # Two campaign types: a NON-deterministic campaign improvises from free-form
+    # offer details (content); a DETERMINISTIC campaign runs a fixed intro +
+    # scored questionnaire (content is not used). Require the field each type needs.
+    if not deterministic and not (content or "").strip():
         raise HTTPException(
             status_code=400,
             detail="Tell the agent what to say — add the campaign content / offer details.",
@@ -2080,6 +2139,18 @@ async def create_bulk_calling_campaign(
         "silence_timeout_seconds": silence_timeout_seconds,
     }
     try:
+        # Parse the optional lead-capture questionnaire here so a validation
+        # error (malformed JSON / answer row missing its expected answer) surfaces
+        # via the same ValueError → _safe_detail 400 channel as the campaign body.
+        parsed_questionnaire = _parse_questionnaire_field(questionnaire)
+        if deterministic and not parsed_questionnaire:
+            raise ValueError(
+                "A deterministic campaign needs a questionnaire with at least one "
+                "question. Add a question or switch to a non-deterministic campaign."
+            )
+        agent_config["deterministic"] = bool(deterministic)
+        if parsed_questionnaire:
+            agent_config["questionnaire"] = parsed_questionnaire
         campaign = await OutboundCampaignService.create_and_launch_bulk_campaign(
             tr,
             db,

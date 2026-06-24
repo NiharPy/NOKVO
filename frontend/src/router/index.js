@@ -25,6 +25,7 @@ const OrganizationHealthView = () => import('../views/OrganizationHealthView.vue
 const NokvoConnectView = () => import('../views/NokvoConnectView.vue');
 const AdvancedSettingsView = () => import('../views/AdvancedSettingsView.vue');
 const TranscriptsView = () => import('../views/TranscriptsView.vue');
+const BulkLeadCapturingView = () => import('../views/BulkLeadCapturingView.vue');
 
 const dashboardChildren = [
   { path: '', redirect: { name: 'dash-home' } },
@@ -41,6 +42,7 @@ const dashboardChildren = [
   { path: 'agent', component: AgentView, name: 'dash-agent', meta: { pageKey: 'agent' } },
   { path: 'campaigns', component: OutgoingAgentView, name: 'dash-campaigns', meta: { pageKey: 'outgoing_agent' } },
   { path: 'campaigns/:campaignId', component: OutgoingAgentView, name: 'dash-campaign-detail', meta: { pageKey: 'outgoing_agent' } },
+  { path: 'bulk-leads', component: BulkLeadCapturingView, name: 'dash-bulk-leads', meta: { pageKey: 'bulk_leads' } },
   { path: 'my-timetable', component: MyTimetableView, name: 'dash-my-timetable', meta: { pageKey: 'my_timetable' } },
   { path: 'organization-health', component: OrganizationHealthView, name: 'dash-org-health', meta: { pageKey: 'organization_health' } },
   { path: 'connect', component: NokvoConnectView, name: 'dash-connect', meta: { pageKey: 'nokvo_connect' } },

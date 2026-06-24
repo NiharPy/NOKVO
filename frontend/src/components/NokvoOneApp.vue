@@ -4925,7 +4925,7 @@ const loadOutboundNumber = async () => {
 const bulkCalling = ref({ plan_eligible: false, enabled: false, request_status: null, contact_number: null });
 const bulkRequestForm = ref({ contact_number: '', note: '' });
 const isSubmittingBulkRequest = ref(false);
-const bulkCampaignForm = ref({ name: '', company_name: '', caller_name: 'Riya', language: 'en', content: '', file: null });
+const bulkCampaignForm = ref({ name: '', company_name: '', caller_name: 'Riya', language: 'en', campaign_type: 'non_deterministic', content: '', file: null, intro: '', outro: '', questions: [], threshold: 1 });
 const isLaunchingBulkCampaign = ref(false);
 const bulkCallingError = ref('');
 const bulkCallingNotice = ref('');
@@ -4933,6 +4933,10 @@ const bulkCallingNotice = ref('');
 // Surfaces WHY a number wasn't called (e.g. Plivo rejected an unverified number
 // on a trial account) instead of silently only ringing the first contact.
 const bulkDialFailures = ref([]);
+// Numbers removed from the dial list because they're on the DND/NCPR register,
+// from the last launch/rerun. Surfaced so the operator knows opted-out contacts
+// were skipped rather than silently missing.
+const bulkDndDropped = ref([]);
 
 const loadBulkCallingStatus = async () => {
   try {
@@ -4976,18 +4980,86 @@ const startBulkCallingCampaign = async () => {
   bulkCallingError.value = '';
   bulkCallingNotice.value = '';
   bulkDialFailures.value = [];
+  bulkDndDropped.value = [];
   const form = bulkCampaignForm.value;
+  const isDeterministic = form.campaign_type === 'deterministic';
   if (!(form.name || '').trim()) { bulkCallingError.value = 'Name the campaign.'; return; }
-  if (!(form.content || '').trim()) { bulkCallingError.value = 'Add the campaign content — what the agent should say.'; return; }
   if (!form.file) { bulkCallingError.value = 'Choose a CSV (or XLSX) of phone numbers.'; return; }
+  // Deterministic campaigns are driven by an intro + scored questionnaire;
+  // non-deterministic campaigns are driven by free-form offer details (content).
+  // Each question carries a weight (`points`, default 1). An "answer" question
+  // may instead be GRADED — a set of bands {label, points}; the scorer awards
+  // the best-matching band's points. Graded answers can't be live dealbreakers.
+  const clampPts = (v) => Math.max(1, Math.min(100, Math.round(Number(v) || 1)));
+  const cleanedQuestions = (form.questions || [])
+    .map((q) => {
+      const type = q.type === 'answer' ? 'answer' : 'intent';
+      const graded = type === 'answer' && !!q.graded;
+      const tiers = graded
+        ? (q.tiers || [])
+            .map((t) => ({ label: (t.label || '').trim(), points: clampPts(t.points) }))
+            .filter((t) => t.label)
+        : [];
+      const out = {
+        type,
+        text: (q.text || '').trim(),
+        desired_answer: type === 'answer' && !graded ? (q.desired_answer || '').trim() : '',
+        required: type === 'answer' ? undefined : (q.required === 'no' ? 'no' : 'yes'),
+        gate: graded ? false : !!q.gate,
+        points: clampPts(q.points),
+      };
+      if (tiers.length) out.tiers = tiers;
+      return out;
+    })
+    .filter((q) => q.text);
+  if (isDeterministic) {
+    if (!(form.intro || '').trim()) { bulkCallingError.value = 'Add an intro — how the agent opens the call.'; return; }
+    if (!cleanedQuestions.length) { bulkCallingError.value = 'Add at least one question for a deterministic campaign.'; return; }
+    for (const q of cleanedQuestions) {
+      if (q.type !== 'answer') continue;
+      if (q.tiers) {
+        if (!q.tiers.length) {
+          bulkCallingError.value = `"${q.text.slice(0, 40)}" is graded but has no scoring bands — add a band with a label, or turn off graded scoring.`;
+          return;
+        }
+      } else if (!q.desired_answer) {
+        bulkCallingError.value = 'Each "Desired answer" question needs an expected answer (add one, turn on graded scoring, or switch it to Intent detection).';
+        return;
+      }
+    }
+  } else if (!(form.content || '').trim()) {
+    bulkCallingError.value = 'Add the campaign content — what the agent should say.';
+    return;
+  }
+  // Max achievable score = each question's best contribution (top band for a
+  // graded answer, else its weight). Threshold clamps into 1..maxPoints.
+  const maxPoints = cleanedQuestions.reduce(
+    (sum, q) => sum + (q.tiers && q.tiers.length ? Math.max(...q.tiers.map((t) => t.points)) : (q.points || 1)),
+    0,
+  );
+  const clampedThreshold = cleanedQuestions.length
+    ? Math.min(maxPoints, Math.max(1, Number(form.threshold) || maxPoints))
+    : 1;
   isLaunchingBulkCampaign.value = true;
   try {
     const fd = new FormData();
     fd.append('name', form.name.trim());
-    fd.append('content', form.content.trim());
+    fd.append('deterministic', isDeterministic ? 'true' : 'false');
+    // Content = the agent's free-form knowledge. Required offer details for a
+    // non-deterministic campaign; optional background context for a deterministic
+    // one (the agent can lean on it for off-script moments).
+    fd.append('content', (form.content || '').trim());
     if ((form.company_name || '').trim()) fd.append('company_name', form.company_name.trim());
     if ((form.caller_name || '').trim()) fd.append('caller_name', form.caller_name.trim());
     if (form.language) fd.append('language', form.language);
+    if (isDeterministic) {
+      fd.append('questionnaire', JSON.stringify({
+        intro: (form.intro || '').trim(),
+        outro: (form.outro || '').trim(),
+        questions: cleanedQuestions,
+        threshold: clampedThreshold,
+      }));
+    }
     fd.append('contacts_file', form.file);
     const { data } = await agentsApi.post('/bulk-calling/campaigns', fd, {
       headers: { ...authHeader(), 'Content-Type': 'multipart/form-data' },
@@ -4997,14 +5069,16 @@ const startBulkCallingCampaign = async () => {
     const contacts = Array.isArray(data?.contacts) ? data.contacts : [];
     const failed = contacts.filter((c) => c.status === 'failed');
     bulkDialFailures.value = failed.map((c) => ({ phone: c.phone, error: c.error || 'rejected by the carrier' }));
+    bulkDndDropped.value = Array.isArray(data?.dnd_dropped) ? data.dnd_dropped : [];
+    const dndNote = bulkDndDropped.value.length ? `, ${bulkDndDropped.value.length} skipped (on DND)` : '';
     if (failed.length && failed.length >= contacts.length) {
       bulkCallingError.value = `Calls couldn't be placed: ${failed[0]?.error || 'check the dedicated number setup'}.`;
       bulkCallingNotice.value = '';
     } else {
       const note = failed.length ? ` (${failed.length} couldn't be placed)` : '';
-      bulkCallingNotice.value = `Calling started — ${data?.total_count || 0} contacts${note}.`;
+      bulkCallingNotice.value = `Calling started — ${data?.total_count || 0} contacts${note}${dndNote}.`;
     }
-    bulkCampaignForm.value = { name: '', company_name: '', caller_name: 'Riya', language: 'en', content: '', file: null };
+    bulkCampaignForm.value = { name: '', company_name: '', caller_name: 'Riya', language: 'en', campaign_type: 'non_deterministic', content: '', file: null, intro: '', outro: '', questions: [], threshold: 1 };
     await loadCampaigns();
   } catch (err) {
     if (await handleMfaProtectedError(err)) return;
@@ -5021,6 +5095,7 @@ const rerunBulkCampaign = async (campaignId) => {
   bulkCallingError.value = '';
   bulkCallingNotice.value = '';
   bulkDialFailures.value = [];
+  bulkDndDropped.value = [];
   try {
     const { data } = await agentsApi.post(`/bulk-calling/campaigns/${campaignId}/rerun`, {}, { headers: authHeader() });
     const contacts = Array.isArray(data?.contacts) ? data.contacts : [];
@@ -5028,11 +5103,13 @@ const rerunBulkCampaign = async (campaignId) => {
     const dialing = contacts.filter((c) => c.status !== 'answered' && !c.answered_at);
     const failed = dialing.filter((c) => c.status === 'failed');
     bulkDialFailures.value = failed.map((c) => ({ phone: c.phone, error: c.error || 'rejected by the carrier' }));
+    bulkDndDropped.value = Array.isArray(data?.dnd_dropped) ? data.dnd_dropped : [];
+    const dndNote = bulkDndDropped.value.length ? `, ${bulkDndDropped.value.length} skipped (on DND)` : '';
     if (dialing.length && failed.length >= dialing.length) {
       bulkCallingError.value = `Calls couldn't be placed: ${failed[0]?.error || 'check the dedicated number setup'}.`;
     } else {
       const note = failed.length ? ` (${failed.length} couldn't be placed)` : '';
-      bulkCallingNotice.value = `Re-run started — calling ${dialing.length} contact(s)${note}.`;
+      bulkCallingNotice.value = `Re-run started — calling ${dialing.length} contact(s)${note}${dndNote}.`;
     }
     await loadCampaigns();
   } catch (err) {
@@ -6755,6 +6832,7 @@ provideDashboardState({
   bulkCallingError,
   bulkCallingNotice,
   bulkDialFailures,
+  bulkDndDropped,
   requestLeadOAuth,
   nokvoLeadForm,
   NOKVO_FORM_FIELD_TYPES,

@@ -355,6 +355,28 @@ def test_all_contacts_mutators_go_through_lock_campaign():
         )
 
 
+def test_every_contacts_write_flags_modified():
+    """Invariant guard: ``contacts`` is a plain JSONB column and the writers mutate
+    shared dict refs IN PLACE before reassigning, so SQLAlchemy's old==new check
+    SKIPS the UPDATE unless flag_modified is called — the placement (call_id) and
+    terminal (ended) writes silently don't persist, freezing contacts at the INSERT
+    value and re-dialing 'pending' contacts forever ('keeps calling even after I cut').
+    Every ``campaign.contacts = contacts`` MUST be followed closely by
+    ``flag_modified(campaign, "contacts")``."""
+    import inspect
+
+    src = inspect.getsource(S)
+    lines = src.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip() == "campaign.contacts = contacts":
+            window = "\n".join(lines[i : i + 8])
+            assert 'flag_modified(campaign, "contacts")' in window, (
+                "a 'campaign.contacts = contacts' write is not followed by "
+                "flag_modified(campaign, 'contacts') — the JSONB UPDATE will be "
+                "skipped and the dialer will re-dial forever."
+            )
+
+
 # ── caller-ID rotation: spread a bulk batch across the sub-account's DID pool ──
 
 

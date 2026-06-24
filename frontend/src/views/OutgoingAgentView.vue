@@ -1,5 +1,6 @@
 <script setup>
 import { computed } from 'vue';
+import { useRouter } from 'vue-router';
 import {
   ChevronDown,
   ChevronUp,
@@ -15,6 +16,7 @@ import {
   Send,
   Square,
   Trash2,
+  Upload,
   UserPlus,
   Users,
   Wallet,
@@ -120,13 +122,29 @@ const activeFormChip = computed(() =>
   ),
 );
 
+const router = useRouter();
+
 const tabs = [
   { id: 'campaigns', label: 'Campaigns', icon: PhoneCall },
+  { id: 'bulk', label: 'Bulk Lead Capturing', icon: Upload },
   { id: 'leads', label: 'Consented leads', icon: Users },
   { id: 'tester', label: 'Tester', icon: Mic },
 ];
 
+// The Bulk Lead Capturing tab is an operator-granted add-on — only surface it
+// for plan-eligible tenants (mirrors the bulk card's own plan_eligible gate) so
+// a non-eligible tenant never lands on an empty tab.
+const visibleTabs = computed(() =>
+  tabs.filter((t) => t.id !== 'bulk' || (bulkCalling.value && bulkCalling.value.plan_eligible)),
+);
+
 function setTab(id) {
+  // Bulk Lead Capturing is its own page now — route to it instead of
+  // swapping an inline panel.
+  if (id === 'bulk') {
+    router.push({ name: 'dash-bulk-leads' });
+    return;
+  }
   outgoingTab.value = id;
   if (id === 'campaigns' || id === 'tester') loadCampaigns();
 }
@@ -171,7 +189,7 @@ function bulkRedialCount(c) {
         <!-- Tabs -->
         <nav class="outbound__tabnav" aria-label="Outbound workspace">
           <button
-            v-for="t in tabs"
+            v-for="t in visibleTabs"
             :key="t.id"
             type="button"
             class="outbound__tab-btn"
@@ -550,126 +568,6 @@ function bulkRedialCount(c) {
             </button>
           </div>
         </header>
-
-        <!-- Bulk CSV calling (Inbound+Outbound add-on, operator-granted) -->
-        <div v-if="bulkCalling && bulkCalling.plan_eligible" class="outbound__bulk">
-          <div class="outbound__bulk-head">
-            <div>
-              <strong>Bulk CSV calling</strong>
-              <p>Upload a CSV of phone numbers and call the whole list automatically.</p>
-            </div>
-            <span
-              class="n-tag"
-              :class="bulkCalling.enabled ? 'n-tag--success' : 'n-tag--muted'"
-            >{{ bulkCalling.enabled ? 'Enabled' : 'Add-on' }}</span>
-          </div>
-
-          <p v-if="bulkCallingNotice" class="outbound__bulk-notice">{{ bulkCallingNotice }}</p>
-          <p v-if="bulkCallingError" class="outbound__bulk-error">{{ bulkCallingError }}</p>
-          <div v-if="bulkDialFailures && bulkDialFailures.length" class="outbound__bulk-failures">
-            <p class="outbound__bulk-failures-title">These numbers couldn't be dialed (carrier rejected the call):</p>
-            <ul class="outbound__bulk-failures-list">
-              <li v-for="f in bulkDialFailures" :key="f.phone">
-                <span class="n-mono">{{ f.phone }}</span> — {{ f.error }}
-              </li>
-            </ul>
-          </div>
-
-          <!-- Not yet granted → request access -->
-          <template v-if="!bulkCalling.enabled">
-            <div v-if="bulkCalling.request_status === 'pending'" class="outbound__bulk-pending">
-              Request received — our team will reach you on
-              <strong>{{ bulkCalling.contact_number }}</strong> to set up your dedicated calling number.
-            </div>
-            <div v-else class="outbound__bulk-request">
-              <p class="outbound__bulk-pitch">
-                Bulk calling runs on a dedicated number our team provisions for you.
-                Leave a number we can reach you on to request access.
-              </p>
-              <div class="outbound__bulk-row">
-                <label class="n-field">
-                  <span class="n-field__label">Contact number</span>
-                  <input
-                    v-model="bulkRequestForm.contact_number"
-                    type="text"
-                    class="n-input"
-                    placeholder="+91 98765 43210"
-                    :disabled="!isAdmin"
-                  />
-                </label>
-                <label class="n-field">
-                  <span class="n-field__label">Note <span class="n-field__sub">optional</span></span>
-                  <input
-                    v-model="bulkRequestForm.note"
-                    type="text"
-                    class="n-input"
-                    placeholder="Best time to call, expected volume…"
-                    :disabled="!isAdmin"
-                  />
-                </label>
-              </div>
-              <button
-                type="button"
-                class="n-btn n-btn--primary n-btn--sm"
-                :disabled="!isAdmin || isSubmittingBulkRequest"
-                @click="submitBulkCallingRequest"
-              >
-                {{ isSubmittingBulkRequest ? 'Sending…' : 'Request access' }}
-              </button>
-              <p v-if="bulkCalling.request_status === 'denied'" class="outbound__bulk-denied">
-                A previous request was declined — submit again or contact support.
-              </p>
-            </div>
-          </template>
-
-          <!-- Granted → upload CSV + start calling -->
-          <div v-else class="outbound__bulk-launch">
-            <div class="outbound__bulk-row">
-              <label class="n-field">
-                <span class="n-field__label">Campaign name</span>
-                <input v-model="bulkCampaignForm.name" type="text" class="n-input" placeholder="December outreach" :disabled="!isAdmin" />
-              </label>
-              <label class="n-field">
-                <span class="n-field__label">Contacts file <span class="n-field__sub">CSV or XLSX — phone in column A, name in B</span></span>
-                <input type="file" accept=".csv,.xlsx" class="n-input" :disabled="!isAdmin" @change="onBulkCampaignFilePick" />
-              </label>
-            </div>
-            <div class="outbound__bulk-row">
-              <label class="n-field">
-                <span class="n-field__label">Business name</span>
-                <input v-model="bulkCampaignForm.company_name" type="text" class="n-input" placeholder="Raghava Estates" :disabled="!isAdmin" />
-              </label>
-              <label class="n-field">
-                <span class="n-field__label">Agent's name</span>
-                <input v-model="bulkCampaignForm.caller_name" type="text" class="n-input" placeholder="Riya" :disabled="!isAdmin" />
-              </label>
-              <label class="n-field">
-                <span class="n-field__label">Language</span>
-                <select v-model="bulkCampaignForm.language" class="n-input" :disabled="!isAdmin">
-                  <option v-for="opt in voiceLanguageOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
-                </select>
-              </label>
-            </div>
-            <label class="n-field">
-              <span class="n-field__label">What to say / offer details <span class="n-field__sub">the offer + key facts — we turn this into the agent's script</span></span>
-              <textarea
-                v-model="bulkCampaignForm.content"
-                class="n-input"
-                rows="3"
-                placeholder="New 3BHK gated community in Kollur, ₹85L onward, ready by December. Offer: free registration this month."
-                :disabled="!isAdmin"
-              ></textarea>
-            </label>
-            <button
-              type="button"
-              class="n-btn n-btn--primary n-btn--sm"
-              :disabled="!isAdmin || isLaunchingBulkCampaign"
-              @click="startBulkCallingCampaign"
-            >
-              {{ isLaunchingBulkCampaign ? 'Starting…' : 'Upload & start calling' }}
-            </button>
-          </div>
-        </div>
 
         <div v-if="isAdmin && showCampaignCreateForm" class="outbound__create">
           <div v-if="campaignFormPreset" class="outbound__preset-banner">

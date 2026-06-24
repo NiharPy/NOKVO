@@ -104,6 +104,7 @@ def compose_rag_messages(
         conversational_memory=conversational_memory,
         business_type=business_type,
         latest_user_text=query,
+        history=history,
     )
     if outbound_section:
         campaign_rule = (
@@ -197,7 +198,12 @@ def compose_rag_messages(
             "Speak with intent. NEVER open or pad a reply with 'um', 'uh', 'mm', 'mm-hm', 'hmm', "
             "'like', 'you know', or 'let me see' — they sound hesitant and waste the prospect's time. "
             "At most ONE crisp ≤3-word acknowledgment ('Got it.', 'Perfect.'), and usually none — "
-            "lead straight with the useful next thing.\n\n"
+            "lead straight with the useful next thing. "
+            # Punctuation pacing is NOT a vocalized filler: a comma/'…' between
+            # clauses gives the voice a natural breath without sounding unsure.
+            "For natural pacing (not hesitation), you MAY add a light comma or '…' for a brief breath "
+            "between clauses — e.g. 'So… what's your timeline for moving?' — but keep numbers, prices, "
+            "dates, and confirmations crisp and unbroken.\n\n"
             + campaign_rule
             + memory_section
             + strategy_section

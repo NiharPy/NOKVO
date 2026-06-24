@@ -392,6 +392,32 @@ class Settings(BaseSettings):
     # (registered sender header + content templates) for delivery to +91 numbers.
     PLIVO_SMS_ENABLED: bool = True
     PLIVO_SMS_FROM: str = ""
+
+    # DND (NCPR) scrubbing for bulk CSV calling. Before a bulk list is dialed,
+    # numbers are checked against the National Customer Preference Register via a
+    # cheap third-party API, and opted-out numbers are dropped. Provider = nixinfo
+    # (https://nixinfo.in/dnd-checking-api — free tier; GET with query params,
+    # JSON {number,status,preference}). Fail-OPEN by default: an API error never
+    # blocks a campaign.
+    #
+    # The request param NAMES are configurable because each vendor differs and
+    # nixinfo only hands you the exact endpoint + param names after you register —
+    # fill DND_SCRUB_API_URL / *_PARAM from your nixinfo dashboard, no code change.
+    # nixinfo's free DND lookup is single-number, so DND_SCRUB_BATCH_SIZE defaults
+    # to 1 (one GET per number); raise it only for a vendor whose endpoint accepts
+    # a comma-separated batch (e.g. manthanitsolutions/easygosms — set to ~200).
+    #
+    # NOTE: this is a convenience filter, not a substitute for RTM/DLT telemarketer
+    # registration. Disabled unless creds are set.
+    DND_SCRUB_ENABLED: bool = False
+    DND_SCRUB_API_URL: str = "http://msg.msgclub.net/rest/services/sendSMS/getNdncNonNdncNumbers"
+    DND_SCRUB_API_KEY: str = ""             # msgclub "AUTH_KEY"
+    DND_SCRUB_API_PASS: str = ""            # unused for msgclub; blank → omitted
+    DND_SCRUB_KEY_PARAM: str = "AUTH_KEY"
+    DND_SCRUB_PASS_PARAM: str = ""          # msgclub needs no third param
+    DND_SCRUB_MOBILE_PARAM: str = "mobileNumbers"
+    DND_SCRUB_BATCH_SIZE: int = 200         # msgclub accepts comma-separated batches
+    DND_SCRUB_TIMEOUT_S: float = 20.0
     TELNYX_API_KEY: str = ""
     TELNYX_BASE_URL: str = "https://api.telnyx.com/v2"
     TELNYX_APP_ID: str = ""
@@ -479,6 +505,24 @@ class Settings(BaseSettings):
     VOICE_FIRST_SENTENCE_TIMEOUT_MS: int = 750    # Ceiling for the filler wait when no eos anchor exists
     VOICE_LLM_STREAM_RETRY_ATTEMPTS: int = 2
     VOICE_LLM_STREAM_MAX_RETRY_WAIT_MS: int = 350
+    # ── Outbound humanization (barge-in immunity + pace) ──────────────────────
+    # OUTBOUND only (gated on an active campaign). On a phone call the agent must
+    # not cut itself off for a cough or a background "uh-huh": a barge-in is
+    # honoured only when the caller's speech is SUSTAINED past this window. Below
+    # it, a speech_start→speech_end blip is treated as noise and the agent keeps
+    # talking. Inbound keeps the immediate cut (these don't apply).
+    VOICE_BARGE_IN_MIN_MS: int = 300       # sustained-speech gate before a real barge-in cancels the agent
+    # Slightly slower outbound delivery reads as more deliberate/human. Applied
+    # as a multiplier on the per-tone pace, composed with the per-language
+    # SARVAM_TTS_PACE_* factor. 1.0 = unchanged. Inbound is unaffected.
+    VOICE_OUTBOUND_PACE_FACTOR: float = 0.95
+    # OUTBOUND end-of-utterance tiers (default to the global values → no change
+    # unless overridden). Lets ops tune outbound turn-taking without touching
+    # inbound or the sub-1s latency budget. See _eou_completeness_tier.
+    VOICE_EOU_COMPLETE_MS_OUTBOUND: int = 400
+    VOICE_EOU_NEUTRAL_MS_OUTBOUND: int = 650
+    VOICE_EOU_DEBOUNCE_MS_OUTBOUND: int = 1200
+    VOICE_EOU_CONTINUATION_BONUS_MS_OUTBOUND: int = 1100
 
     # Billing and Usage Tracking
     ORGANIZATION_BASE_MONTHLY_COST_USD: float = 5.00
