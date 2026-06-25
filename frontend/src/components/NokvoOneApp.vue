@@ -283,6 +283,29 @@ const signup = ref({ org_name: '', admin_name: '', admin_email: '', password: ''
 const paymentToken = ref('');
 const selectedPlan = ref('inbound_only');
 const isPaying = ref(false);
+
+// Prepaid voice minutes (flat-by-bracket): the WHOLE bundle bills at the single
+// rate of the bracket it lands in. Mirrors app/services/minute_pricing.py — keep
+// in sync. Onboarding charges the platform fee + this bundle in one payment.
+const PREPAID_SLABS = [[1000, 10], [5000, 9.5], [10000, 9], [20000, 8.5], [25000, 8], [null, 5.5]];
+const MINUTES_MIN = 100;
+const PLATFORM_FEE = { inbound_only: 4499, inbound_outbound: 6499 };
+const prepaidMinutes = ref(1000);
+function flatRateForMinutes(n) {
+  const v = Math.max(0, Math.floor(Number(n) || 0));
+  for (const [upper, rate] of PREPAID_SLABS) if (upper === null || v <= upper) return rate;
+  return 5.5;
+}
+const minutesValid = computed(() => Math.floor(Number(prepaidMinutes.value) || 0) >= MINUTES_MIN);
+const minutesCost = computed(() => {
+  const n = Math.max(0, Math.floor(Number(prepaidMinutes.value) || 0));
+  return n * flatRateForMinutes(n);
+});
+const platformFee = computed(() => PLATFORM_FEE[selectedPlan.value] || 4499);
+const firstInvoiceTotal = computed(() => platformFee.value + minutesCost.value);
+function fmtINR(n) {
+  return '₹' + Math.round(Number(n) || 0).toLocaleString('en-IN');
+}
 const login = ref({ email: '', password: '' });
 const totpCode = ref('');
 const totpUri = ref('');
@@ -3394,12 +3417,18 @@ const startPayment = async (plan) => {
     return;
   }
   selectedPlan.value = plan;
+  const minutes = Math.floor(Number(prepaidMinutes.value) || 0);
+  if (minutes < MINUTES_MIN) {
+    errorMsg.value = `Enter at least ${MINUTES_MIN} prepaid minutes.`;
+    return;
+  }
   isPaying.value = true;
   try {
     await loadRazorpayCheckout();
     const { data } = await api.post('/payments/create-subscription', {
       payment_token: paymentToken.value,
       plan,
+      minutes,
     });
     const rzp = new window.Razorpay({
       key: data.key_id,
@@ -3441,6 +3470,66 @@ const startPayment = async (plan) => {
   } catch (err) {
     errorMsg.value = extractErrorMessage(err, 'Could not start the payment. Please try again.');
     isPaying.value = false;
+  }
+};
+
+// ── Prepaid-minute balance + top-up (dashboard) ───────────────────────────
+const minutesBalance = ref(null); // { remaining_rupees, consumed_rupees, purchased_rupees }
+const isToppingUp = ref(false);
+const topupNote = ref('');
+const loadMinutesBalance = async () => {
+  try {
+    const { data } = await api.get('/payments/minutes/balance', { headers: authHeader() });
+    minutesBalance.value = data;
+    return data;
+  } catch {
+    return null;
+  }
+};
+// Buy more prepaid minutes from the dashboard (one-time Razorpay Order). Flat
+// bracket pricing — the whole bundle at one rate (mirror of minute_pricing.py).
+const startTopup = async (minutes) => {
+  topupNote.value = '';
+  const n = Math.floor(Number(minutes) || 0);
+  if (n < MINUTES_MIN) { topupNote.value = `Enter at least ${MINUTES_MIN} minutes.`; return; }
+  isToppingUp.value = true;
+  try {
+    await loadRazorpayCheckout();
+    const { data } = await api.post('/payments/topup/create-order', { minutes: n }, { headers: authHeader() });
+    const rzp = new window.Razorpay({
+      key: data.key_id,
+      order_id: data.order_id,
+      amount: data.amount_paise,
+      currency: 'INR',
+      name: data.name,
+      description: data.description,
+      theme: { color: '#4f46e5' },
+      handler: async (resp) => {
+        try {
+          const { data: vr } = await api.post('/payments/topup/verify', {
+            minutes: n,
+            razorpay_order_id: resp.razorpay_order_id,
+            razorpay_payment_id: resp.razorpay_payment_id,
+            razorpay_signature: resp.razorpay_signature,
+          }, { headers: authHeader() });
+          await loadMinutesBalance();
+          topupNote.value = `Added ${n.toLocaleString('en-IN')} minutes — balance ₹${Math.round(Number(vr.remaining_rupees) || 0).toLocaleString('en-IN')}.`;
+        } catch (e) {
+          topupNote.value = extractErrorMessage(e, 'Top-up verification failed. If charged, it will be reconciled.');
+        } finally {
+          isToppingUp.value = false;
+        }
+      },
+      modal: { ondismiss: () => { isToppingUp.value = false; } },
+    });
+    rzp.on('payment.failed', (resp) => {
+      topupNote.value = resp?.error?.description || 'Payment failed. Please try again.';
+      isToppingUp.value = false;
+    });
+    rzp.open();
+  } catch (err) {
+    topupNote.value = extractErrorMessage(err, 'Could not start the top-up. Please try again.');
+    isToppingUp.value = false;
   }
 };
 
@@ -4925,7 +5014,7 @@ const loadOutboundNumber = async () => {
 const bulkCalling = ref({ plan_eligible: false, enabled: false, request_status: null, contact_number: null });
 const bulkRequestForm = ref({ contact_number: '', note: '' });
 const isSubmittingBulkRequest = ref(false);
-const bulkCampaignForm = ref({ name: '', company_name: '', caller_name: 'Riya', language: 'en', campaign_type: 'non_deterministic', content: '', file: null, intro: '', outro: '', questions: [], threshold: 1 });
+const bulkCampaignForm = ref({ name: '', company_name: '', caller_name: 'Riya', language: 'en', campaign_type: 'non_deterministic', content: '', file: null, intro: '', outro: '', questions: [], threshold: 1, working_days: 5, hours_per_day: 8 });
 const isLaunchingBulkCampaign = ref(false);
 const bulkCallingError = ref('');
 const bulkCallingNotice = ref('');
@@ -5059,6 +5148,9 @@ const startBulkCallingCampaign = async () => {
         questions: cleanedQuestions,
         threshold: clampedThreshold,
       }));
+      // Calling-capacity window (clamped: ≥1 day, 1–10 h/day — 9 AM–7 PM IST band).
+      fd.append('working_days', String(Math.max(1, Math.min(60, Math.round(Number(form.working_days) || 1)))));
+      fd.append('hours_per_day', String(Math.max(1, Math.min(10, Math.round(Number(form.hours_per_day) || 1)))));
     }
     fd.append('contacts_file', form.file);
     const { data } = await agentsApi.post('/bulk-calling/campaigns', fd, {
@@ -5078,7 +5170,7 @@ const startBulkCallingCampaign = async () => {
       const note = failed.length ? ` (${failed.length} couldn't be placed)` : '';
       bulkCallingNotice.value = `Calling started — ${data?.total_count || 0} contacts${note}${dndNote}.`;
     }
-    bulkCampaignForm.value = { name: '', company_name: '', caller_name: 'Riya', language: 'en', campaign_type: 'non_deterministic', content: '', file: null, intro: '', outro: '', questions: [], threshold: 1 };
+    bulkCampaignForm.value = { name: '', company_name: '', caller_name: 'Riya', language: 'en', campaign_type: 'non_deterministic', content: '', file: null, intro: '', outro: '', questions: [], threshold: 1, working_days: 5, hours_per_day: 8 };
     await loadCampaigns();
   } catch (err) {
     if (await handleMfaProtectedError(err)) return;
@@ -6616,6 +6708,13 @@ provideDashboardState({
   // Feature flags
   followupAgentEnabled,
 
+  // Prepaid-minute balance + top-up
+  minutesBalance,
+  loadMinutesBalance,
+  startTopup,
+  isToppingUp,
+  topupNote,
+
   // Identity / org / theme
   currentUser,
   currentOrganization,
@@ -7240,7 +7339,7 @@ provideDashboardState({
             <span>Billed monthly · cancel anytime</span>
           </div>
           <p class="login-help compact">
-            Your workspace is set up after payment. Voice minutes are billed monthly on top, at tiered usage rates.
+            Your workspace is set up after payment. Pick a plan (recurring monthly), then buy the prepaid voice minutes you need — paid once, topped up anytime.
           </p>
           <div class="pay-plans">
             <button
@@ -7264,22 +7363,48 @@ provideDashboardState({
               <span class="pay-plan__desc">Inbound + outbound calling campaigns.</span>
             </button>
           </div>
-          <div class="pay-tiers">
-            <span class="pay-tiers__head">Per-minute usage (monthly)</span>
-            <ul>
-              <li><span>0 – 1,000 min</span><strong>₹10/min</strong></li>
-              <li><span>1,000 – 10,000 min</span><strong>₹9/min</strong></li>
-              <li><span>10,000 – 25,000 min</span><strong>₹8/min</strong></li>
-              <li><span>25,000+ min</span><strong>₹6.5/min</strong></li>
-            </ul>
+          <div class="pay-minutes">
+            <label class="pay-minutes__field">
+              <span class="pay-minutes__label">Prepaid voice minutes</span>
+              <input
+                v-model.number="prepaidMinutes"
+                type="number"
+                :min="MINUTES_MIN"
+                step="100"
+                class="pay-minutes__input"
+                inputmode="numeric"
+              />
+            </label>
+            <p v-if="!minutesValid" class="pay-minutes__warn">Minimum {{ MINUTES_MIN }} minutes.</p>
+            <div v-else class="pay-minutes__calc">
+              <span>{{ Number(prepaidMinutes).toLocaleString('en-IN') }} min × {{ fmtINR(flatRateForMinutes(prepaidMinutes)) }}/min</span>
+              <strong>{{ fmtINR(minutesCost) }}</strong>
+            </div>
+            <div class="pay-tiers">
+              <span class="pay-tiers__head">Volume pricing — whole bundle at one rate</span>
+              <ul>
+                <li><span>up to 1,000 min</span><strong>₹10/min</strong></li>
+                <li><span>up to 5,000 min</span><strong>₹9.5/min</strong></li>
+                <li><span>up to 10,000 min</span><strong>₹9/min</strong></li>
+                <li><span>up to 20,000 min</span><strong>₹8.5/min</strong></li>
+                <li><span>up to 25,000 min</span><strong>₹8/min</strong></li>
+                <li><span>25,000+ min</span><strong>₹5.5/min</strong></li>
+              </ul>
+            </div>
+          </div>
+          <div class="pay-summary">
+            <div class="pay-summary__row"><span>Platform fee ({{ selectedPlan === 'inbound_outbound' ? 'Inbound + Outbound' : 'Inbound Only' }})</span><strong>{{ fmtINR(platformFee) }}<small>/mo</small></strong></div>
+            <div class="pay-summary__row"><span>Prepaid minutes (one-time)</span><strong>{{ fmtINR(minutesCost) }}</strong></div>
+            <div class="pay-summary__row pay-summary__total"><span>Pay now</span><strong>{{ fmtINR(firstInvoiceTotal) }}</strong></div>
+            <p class="pay-summary__after">Then {{ fmtINR(platformFee) }}/month. Minutes are prepaid — top up anytime.</p>
           </div>
           <button
             type="button"
             class="primary-button pay-cta"
-            :disabled="isPaying"
+            :disabled="isPaying || !minutesValid"
             @click="startPayment(selectedPlan)"
           >
-            {{ isPaying ? 'Opening secure checkout…' : `Subscribe & Pay — ${selectedPlan === 'inbound_outbound' ? '₹6,499' : '₹4,499'}/mo` }}
+            {{ isPaying ? 'Opening secure checkout…' : `Pay ${fmtINR(firstInvoiceTotal)} now` }}
           </button>
           <p class="login-help compact">Payments are processed securely by Razorpay.</p>
         </div>
@@ -10650,6 +10775,33 @@ provideDashboardState({
 .pay-tiers li { display: flex; justify-content: space-between; font-size: 0.78rem; }
 .pay-tiers li span { opacity: 0.7; }
 .pay-cta { width: 100%; }
+
+/* Prepaid minutes input + cost */
+.pay-minutes { display: grid; gap: 0.6rem; }
+.pay-minutes__field { display: grid; gap: 0.3rem; }
+.pay-minutes__label { font-size: 0.82rem; font-weight: 600; }
+.pay-minutes__input {
+  width: 100%; padding: 0.55rem 0.7rem; font-size: 1rem;
+  border: 1px solid var(--n-border, rgba(120,120,140,0.3)); border-radius: 10px;
+  background: var(--n-surface, transparent); color: inherit;
+}
+.pay-minutes__warn { margin: 0; font-size: 0.78rem; color: var(--n-danger, #c0362c); }
+.pay-minutes__calc {
+  display: flex; justify-content: space-between; align-items: baseline;
+  font-size: 0.85rem; padding: 0.4rem 0.1rem;
+}
+.pay-minutes__calc strong { font-size: 1.05rem; }
+/* Pay-now summary */
+.pay-summary {
+  border: 1px solid var(--n-border, rgba(120,120,140,0.25));
+  border-radius: 10px; padding: 0.7rem 0.85rem; display: grid; gap: 0.4rem;
+}
+.pay-summary__row { display: flex; justify-content: space-between; align-items: baseline; font-size: 0.85rem; }
+.pay-summary__row span { opacity: 0.75; }
+.pay-summary__row small { opacity: 0.6; font-weight: 400; }
+.pay-summary__total { border-top: 1px solid var(--n-border, rgba(120,120,140,0.25)); padding-top: 0.45rem; font-size: 0.95rem; }
+.pay-summary__total strong { font-size: 1.15rem; }
+.pay-summary__after { margin: 0.2rem 0 0; font-size: 0.74rem; opacity: 0.6; }
 
 .mfa-head {
   display: flex;

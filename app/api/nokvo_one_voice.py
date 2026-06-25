@@ -127,7 +127,12 @@ async def _org_for_user(db: AsyncSession, user: OrganizationUser) -> Organizatio
 
 async def _require_outbound_enabled(db: AsyncSession, user: OrganizationUser) -> Organization:
     """Gate outbound calling on the plan. Only the Inbound + Outbound plan sets
-    ``calling_enabled`` (see Razorpay payment-gated onboarding)."""
+    ``calling_enabled`` (see Razorpay payment-gated onboarding).
+
+    The prepaid-balance gate is NOT here: deterministic / bulk-questionnaire
+    campaigns are billed separately and must remain creatable + dialable with a
+    zero prepaid balance. The balance gate lives in the dialer for
+    NON-deterministic campaigns + the inbound webhook (see the prepaid overhaul)."""
     org = await _org_for_user(db, user)
     if not org.calling_enabled:
         raise HTTPException(
@@ -1528,6 +1533,21 @@ async def plivo_inbound_webhook(
         form = {}
     from_number = str(form.get("From") or form.get("from") or "").strip()
 
+    # Prepaid-minute gate: don't answer when the org is out of minutes. Both plans
+    # answer inbound, so the balance is the ONLY inbound gate. An in-progress call
+    # is unaffected (this fires before the call is bridged).
+    from app.services.minute_balance_service import has_balance as _has_balance
+
+    if not await _has_balance(db, tr.organization_id):
+        logger.info(
+            "PLIVO-INBOUND empty prepaid balance tenant=%s link_id=%s → hangup",
+            tr.tenant_id, link_id,
+        )
+        _record_webhook_event(link_id, "voice", {"from": from_number, "no_balance": True})
+        return PlainTextResponse(
+            "<Response><Hangup/></Response>", media_type="application/xml"
+        )
+
     # Per-tenant concurrency cap: reserve a slot BEFORE bridging audio. At the
     # limit, play a short busy notice and never open a media stream — the caller
     # hears a message instead of dead air. The token is handed to the media WS
@@ -1852,6 +1872,16 @@ async def plivo_outbound_media_websocket(websocket: WebSocket, call_link_id: str
             # for …, introduce yourself …"). Only ever set ``opening_message`` to
             # real, ready-to-speak opener text — never an instruction.
         }
+        # The media WS connecting IS the answer signal — Plivo's status webhook is
+        # only wired as the hangup_url, so a 'call.answered' event never arrives and
+        # the contact would otherwise hang up as status="failed". Stamp it answered
+        # now (campaign calls only; follow-ups track answered via OutgoingLead).
+        # Idempotent + isolated; best-effort, never blocks the call on a DB hiccup.
+        if campaign is not None and not is_followup:
+            try:
+                await OutboundCampaignService.mark_answered(campaign.id, call_link_id)
+            except Exception:
+                logger.exception("PLIVO-OUTBOUND: mark_answered failed (continuing)")
         try:
             await NokvoOneVoiceStreamService.run_session(
                 adapter,
@@ -2091,6 +2121,11 @@ async def create_bulk_calling_campaign(
     silence_timeout_seconds: float | None = Form(None),
     questionnaire: str | None = Form(None),
     deterministic: bool = Form(False),
+    # Deterministic-campaign calling capacity (no dialer enforcement yet — stored
+    # for planning + the capacity readout). hours_per_day is capped at 10 because
+    # outbound calling is TRAI-limited to the 9 AM–7 PM IST window.
+    working_days: int | None = Form(None),
+    hours_per_day: int | None = Form(None),
     user: OrganizationUser = Depends(_admin_dep()),
     _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
     db: AsyncSession = Depends(deps.get_db),
@@ -2151,6 +2186,16 @@ async def create_bulk_calling_campaign(
         agent_config["deterministic"] = bool(deterministic)
         if parsed_questionnaire:
             agent_config["questionnaire"] = parsed_questionnaire
+        # Calling-capacity window (deterministic campaigns). Stored on the config —
+        # no migration, surfaced via _campaign_response's agent_config passthrough.
+        # Clamped: ≥1 working day, 1–10 hours/day (9 AM–7 PM IST is a 10h band).
+        if working_days is not None or hours_per_day is not None:
+            agent_config["call_window"] = {
+                "working_days": max(1, min(60, int(working_days or 1))),
+                "hours_per_day": max(1, min(10, int(hours_per_day or 1))),
+                "timezone": "Asia/Kolkata",
+                "window_local": "09:00-19:00",
+            }
         campaign = await OutboundCampaignService.create_and_launch_bulk_campaign(
             tr,
             db,

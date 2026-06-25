@@ -93,18 +93,66 @@ class RazorpayService:
         return plan_id
 
     @staticmethod
-    async def create_subscription(plan_id: str, *, total_count: int = 120, notes: dict | None = None) -> dict[str, Any]:
-        """Create a subscription. ``total_count`` = max billing cycles (months)."""
-        return await RazorpayService._request(
-            "POST",
-            "subscriptions",
-            json_body={
-                "plan_id": plan_id,
-                "total_count": total_count,
-                "customer_notify": 1,
-                "notes": notes or {},
-            },
-        )
+    async def create_subscription(
+        plan_id: str,
+        *,
+        total_count: int = 120,
+        notes: dict | None = None,
+        addons: list[dict] | None = None,
+    ) -> dict[str, Any]:
+        """Create a subscription. ``total_count`` = max billing cycles (months).
+
+        ``addons`` are ONE-TIME line items charged on the FIRST invoice only (the
+        recurring cycles bill just the plan amount). We use this to charge the
+        prepaid-minute bundle alongside the first month's platform fee in a single
+        checkout. Shape:
+        ``[{"item": {"name": "Prepaid minutes", "amount": <paise>, "currency": "INR"}}]``.
+        """
+        body: dict[str, Any] = {
+            "plan_id": plan_id,
+            "total_count": total_count,
+            "customer_notify": 1,
+            "notes": notes or {},
+        }
+        if addons:
+            body["addons"] = addons
+        return await RazorpayService._request("POST", "subscriptions", json_body=body)
+
+    # ── one-time orders (prepaid-minute top-ups) ──────────────────────────────
+    @staticmethod
+    async def create_order(amount_paise: int, *, notes: dict | None = None, receipt: str | None = None) -> dict[str, Any]:
+        """Create a one-time Order for a minute top-up (no subscription). The
+        frontend opens checkout.js with ``order_id``; on success Razorpay returns
+        ``razorpay_order_id`` + ``razorpay_payment_id`` + ``razorpay_signature``."""
+        body: dict[str, Any] = {
+            "amount": int(amount_paise),
+            "currency": "INR",
+            "notes": notes or {},
+        }
+        if receipt:
+            body["receipt"] = receipt[:40]
+        return await RazorpayService._request("POST", "orders", json_body=body)
+
+    @staticmethod
+    async def fetch_order(order_id: str) -> dict[str, Any]:
+        """Fetch an Order — authoritative ``amount`` + ``notes`` (what was actually
+        ordered). Used at top-up verify to credit exactly what was paid, never
+        what the client claims."""
+        return await RazorpayService._request("GET", f"orders/{order_id}")
+
+    @staticmethod
+    def verify_order_signature(order_id: str, payment_id: str, signature: str) -> bool:
+        """One-time-order checkout signature: HMAC_SHA256(order_id | payment_id,
+        KEY_SECRET). NOTE the operand order is order_id|payment_id — the OPPOSITE
+        of the subscription flow's payment_id|subscription_id. Constant-time."""
+        if not (order_id and payment_id and signature and settings.RAZORPAY_KEY_SECRET):
+            return False
+        expected = hmac.new(
+            settings.RAZORPAY_KEY_SECRET.encode("utf-8"),
+            f"{order_id}|{payment_id}".encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        return hmac.compare_digest(expected, signature)
 
     @staticmethod
     async def fetch_subscription(subscription_id: str) -> dict[str, Any]:

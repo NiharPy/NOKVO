@@ -611,6 +611,9 @@ def build_agent_config(
     # agent READ path — anything not echoed into ``cfg`` here is silently
     # stripped before the agent ever sees it.
     questionnaire: Any = None,
+    # Deterministic-campaign calling-capacity window (working_days, hours_per_day).
+    # Same read-path rule as questionnaire — must be a NAMED param to survive.
+    call_window: Any = None,
     **_extra: Any,
 ) -> dict[str, Any]:
     """Normalize campaign proactive-agent config.
@@ -672,6 +675,21 @@ def build_agent_config(
     normalized_q = _coerce_questionnaire(questionnaire)
     if normalized_q:
         cfg["questionnaire"] = normalized_q
+    # Echo the calling-capacity window (clamped: ≥1 working day, 1–10 hours/day —
+    # outbound calling is limited to the 9 AM–7 PM IST band). Stored for planning
+    # + the capacity readout; not enforced by the dialer.
+    if isinstance(call_window, dict) and call_window:
+        try:
+            _wd = max(1, min(60, int(call_window.get("working_days") or 1)))
+            _hd = max(1, min(10, int(call_window.get("hours_per_day") or 1)))
+            cfg["call_window"] = {
+                "working_days": _wd,
+                "hours_per_day": _hd,
+                "timezone": "Asia/Kolkata",
+                "window_local": "09:00-19:00",
+            }
+        except (TypeError, ValueError):
+            pass
     return cfg
 
 
@@ -1085,6 +1103,47 @@ def _is_non_answer(text: str) -> bool:
     return toks.issubset(_NON_ANSWER_TOKENS)
 
 
+_INCOMPLETE_HESITATIONS = frozenset(
+    {"uh", "um", "umm", "uhm", "uhh", "er", "erm", "hmm", "hmmm", "mm", "mmm",
+     "ah", "aah", "eh", "hm", "huh"}
+)
+# Words a SHORT reply almost never genuinely ends on — prepositions / articles /
+# conjunctions, plus trailing pronoun CONTRACTIONS ("it's"→its, "I'm"→im). A
+# reply that dangles on one of these (≤3 content words, no number) is the caller
+# mid-thought. The two-word complete forms ("it is" / "I am") are deliberately
+# NOT here, so an affirmative "it is" still counts as a real answer.
+_INCOMPLETE_TAIL_WORDS = frozenset(
+    {"a", "an", "the", "and", "but", "or", "to", "of", "for", "with", "from",
+     "at", "by", "in", "on", "about", "around",
+     "its", "im", "thats", "theres", "ive", "youre"}
+)
+
+
+def _is_incomplete_answer(text: str) -> bool:
+    """The caller's latest reply is a TRAILING-OFF FRAGMENT, not a finished
+    answer — a bare hesitation ("uh", "um") or a short utterance dangling on a
+    preposition/article or a pronoun contraction ("uh, it's", "it's about",
+    "I'm"). The agent should re-ask the SAME question, never advance past it.
+
+    Precise on purpose: a real short answer ("1.8 crore", "apartment", "yes",
+    "Kollur", "it is") never trips it. Apostrophes are stripped ("it's"→"its").
+    A reply with no ASCII content (e.g. a native-script answer) returns False —
+    we never guess incompleteness across scripts."""
+    raw = (text or "").strip()
+    if not raw:
+        return False  # truly-empty silence is _is_non_answer's job
+    toks = [t.replace("'", "") for t in re.findall(r"[a-z']+|[0-9]+", raw.lower())]
+    toks = [t for t in toks if t]
+    if not toks:
+        return False  # no ASCII content — don't guess across scripts
+    if all(t in _INCOMPLETE_HESITATIONS for t in toks):
+        return True  # nothing but "uh" / "um"
+    content = [t for t in toks if t not in _INCOMPLETE_HESITATIONS]
+    if any(t.isdigit() for t in content):
+        return False  # a number = real content (budget / quantity / time)
+    return len(content) <= 3 and content[-1] in _INCOMPLETE_TAIL_WORDS
+
+
 def questionnaire_asked_state(questions: list, history: list | None) -> dict:
     """Which questionnaire questions has the agent already asked?
 
@@ -1099,6 +1158,7 @@ def questionnaire_asked_state(questions: list, history: list | None) -> dict:
         if isinstance(t, dict) and t.get("role") == "assistant"
     ]
     asked = [False] * len(qs)
+    match_counts = [0] * len(qs)
     last_asked: int | None = None
     q_tok = [_q_tokens(str(q.get("text") or "")) for q in qs]
     for turn in assistant_turns:
@@ -1114,14 +1174,89 @@ def questionnaire_asked_state(questions: list, history: list | None) -> dict:
                 best, best_i = score, i
         if best_i is not None and best >= 0.5:
             asked[best_i] = True
+            match_counts[best_i] += 1
             last_asked = best_i + 1
     return {
         "asked_count": sum(asked),
         "asked_numbers": [i + 1 for i, a in enumerate(asked) if a],
         "next_number": next((i + 1 for i, a in enumerate(asked) if not a), None),
         "last_asked_number": last_asked,
+        # How many times the LAST-asked question has been asked — caps re-asks so
+        # an unrecognised paraphrase can't loop forever.
+        "last_asked_count": match_counts[last_asked - 1] if last_asked else 0,
         "assistant_turns": len(assistant_turns),
     }
+
+
+# Affirmative / negative cues for judging whether a reply ANSWERS an intent
+# (yes/no) question. We only need to know it's a yes/no-TYPE answer — the scorer
+# decides whether it matches the required answer. Broad + multilingual (te/hi) so
+# a paraphrased "I would" / "sounds good" / "haan" still counts; a reply with NO
+# cue (e.g. the tail of a split budget answer — "crores to 2 crores" — landing on
+# the callback question) does NOT, so the agent re-asks instead of mis-scoring it.
+_AFFIRM_CUES = frozenset({
+    "yes", "yeah", "yep", "yup", "ya", "yah", "ye", "yess", "sure", "ok", "okay",
+    "okey", "okk", "alright", "absolutely", "definitely", "certainly", "please",
+    "want", "would", "id", "love", "interested", "correct", "exactly", "fine",
+    "deal", "done", "go", "ahead", "sounds", "works",
+    "haan", "han", "ha", "ji", "hanji", "sari", "sare", "avunu", "avnu", "theek",
+    "thik", "accha", "achha",
+})
+_NEGATE_CUES = frozenset({
+    "no", "nope", "nah", "naa", "not", "dont", "never", "nahi", "nai", "vaddu",
+    "beda", "leave",
+})
+_REASK_CAP = 2  # ask any one question at most twice before accepting the reply
+
+
+def _is_yes_no_answer(text: str) -> bool:
+    """The reply carries a clear affirmative OR negative cue — i.e. it actually
+    answers a yes/no (intent) question at all (the scorer judges WHICH)."""
+    toks = {t.replace("'", "") for t in re.findall(r"[a-z']+", (text or "").lower())}
+    return bool(toks & _AFFIRM_CUES) or bool(toks & _NEGATE_CUES)
+
+
+def _last_intent_unanswered(questions: list, state: dict, latest_user_text: str | None) -> bool:
+    """The LAST asked question is an INTENT (yes/no) question and the latest reply
+    does NOT answer it (no affirmative/negative cue) — so re-ask it rather than
+    closing on an unrelated reply (the bug: a split budget answer bleeding onto
+    the callback question and being scored as a 'yes'). Capped at ``_REASK_CAP``
+    so a paraphrase we don't recognise can't loop forever."""
+    last_n = state.get("last_asked_number")
+    if not last_n or last_n < 1 or last_n > len(questions):
+        return False
+    if str((questions[last_n - 1] or {}).get("type")) != "intent":
+        return False  # only guard yes/no questions; answer questions vary too much
+    if state.get("last_asked_count", 1) >= _REASK_CAP:
+        return False  # already re-asked once — accept whatever they said
+    return not _is_yes_no_answer(latest_user_text or "")
+
+
+def questionnaire_is_complete(
+    questions: list, history: list | None, latest_user_text: str | None
+) -> bool:
+    """True when the deterministic questionnaire agent should CLOSE now: EVERY
+    question has already been asked AND the caller's latest reply is a genuine
+    answer to the last one — not a re-greeting / silence (``_is_non_answer``), a
+    trailing-off fragment (``_is_incomplete_answer``), nor a reply that doesn't
+    actually answer the last INTENT question (``_last_intent_unanswered``).
+
+    The stream service calls this before each deterministic-agent turn and, when
+    True, speaks the outro + hangs up WITHOUT an LLM turn — because the model is
+    unreliable at closing (it re-asks the last question, invents a name question,
+    or loops back). Pure + unit-testable."""
+    qs = questions or []
+    if not qs:
+        return False
+    state = questionnaire_asked_state(qs, history)
+    if state.get("next_number") is not None or state.get("asked_count", 0) < len(qs):
+        return False
+    text = latest_user_text or ""
+    if _is_non_answer(text) or _is_incomplete_answer(text):
+        return False
+    if _last_intent_unanswered(qs, state, text):
+        return False
+    return True
 
 
 def _render_progress_directive(
@@ -1148,13 +1283,40 @@ def _render_progress_directive(
         "ask Q1 or any earlier question again — the conversation only moves "
         "FORWARD.",
     ]
-    if _is_non_answer(latest_user_text) and last_n is not None and _qtext(last_n):
-        parts.append(
-            "Their last reply did NOT answer the question (it was a re-greeting / "
-            "\"are you there?\" / silence). In ONE short line confirm you're still "
-            f"here, then RE-ASK Q{last_n}: \"{_qtext(last_n)}\". Do not advance "
-            "until it's genuinely answered."
-        )
+    _no_answer = _is_non_answer(latest_user_text)
+    _incomplete = (not _no_answer) and _is_incomplete_answer(latest_user_text)
+    # All questions asked, but the last (yes/no) one wasn't actually answered —
+    # their reply was unrelated (e.g. a split earlier answer landing here). Re-ask
+    # it instead of wrapping up, so it isn't mis-scored.
+    _intent_unanswered = (
+        not _no_answer
+        and not _incomplete
+        and next_n is None
+        and _last_intent_unanswered(questions, state, latest_user_text)
+    )
+    if (_no_answer or _incomplete or _intent_unanswered) and last_n is not None and _qtext(last_n):
+        if _intent_unanswered:
+            parts.append(
+                f"Their last reply did NOT answer Q{last_n} — it was about "
+                f"something else (likely the tail of an earlier answer), not a "
+                f"clear yes or no. Do NOT wrap up. RE-ASK Q{last_n}: "
+                f"\"{_qtext(last_n)}\" and wait for a clear yes or no."
+            )
+        elif _incomplete:
+            parts.append(
+                f"Their last reply TRAILED OFF mid-thought and did NOT finish "
+                f"answering Q{last_n}. Do NOT move on to the next question — they "
+                f"are still speaking. Give them a beat and gently RE-ASK Q{last_n}: "
+                f"\"{_qtext(last_n)}\", then wait for a complete answer before "
+                "advancing."
+            )
+        else:
+            parts.append(
+                "Their last reply did NOT answer the question (it was a re-greeting "
+                "/ \"are you there?\" / silence). In ONE short line confirm you're "
+                f"still here, then RE-ASK Q{last_n}: \"{_qtext(last_n)}\". Do not "
+                "advance until it's genuinely answered."
+            )
     elif next_n is not None and _qtext(next_n):
         line = (
             f"ASK THIS QUESTION NEXT — and only this one — Q{next_n}: "
@@ -1270,7 +1432,14 @@ def render_questionnaire_block(
             "Whenever the call ends for ANY reason — all questions answered, a "
             "dealbreaker gate, or they're not interested — your final spoken line "
             "must be EXACTLY this closing line, verbatim (do not translate or "
-            "rephrase it), then stop. Say nothing after it."
+            "rephrase it), then stop. Say nothing after it.\n"
+            "Say the closing line ONLY as a turn BY ITSELF, and ONLY once the call "
+            "is genuinely ending — i.e. AFTER you already have the answer to the "
+            "LAST question (or a dealbreaker/disinterest ends it early). NEVER put "
+            "the closing line in the same turn as a question: if you are still "
+            "asking anything — including the very last question — do NOT say it "
+            "yet. Ask the question, wait for their answer, and only THEN, on your "
+            "next turn, deliver the closing line."
         )
     # Deterministic progress directive goes FIRST (max salience) — it pins the
     # exact next question and forbids the restart-to-Q1 loop seen in production.

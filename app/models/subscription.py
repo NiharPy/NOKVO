@@ -43,6 +43,11 @@ class Subscription(Base):
     plan = Column(String, nullable=False)
     amount_paise = Column(Integer, nullable=False)
     currency = Column(String, nullable=False, server_default="INR")
+    # Prepaid voice-minute bundle bought alongside this subscription at onboarding
+    # (charged as a one-time Razorpay addon on the first invoice). NULL for legacy
+    # subscriptions. On payment confirmation a MinutePurchase row is created from
+    # this, idempotent on razorpay_payment_id.
+    minutes = Column(Integer, nullable=True)
 
     razorpay_plan_id = Column(String, nullable=True)
     # The idempotency anchor: verify + webhook both key off this.

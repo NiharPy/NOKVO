@@ -86,6 +86,7 @@ async def record_call_cost(
     campaign_id: Any = None,
     trace_id: str | None = None,
     usage: CallUsage | None = None,
+    deducts_prepaid: bool = False,
 ) -> CallCost | None:
     """Insert a single CallCost row for a completed session.
 
@@ -144,6 +145,26 @@ async def record_call_cost(
 
     campaign_uuid = _coerce_uuid(campaign_id)
 
+    # PREPAID usage deduction: a CONNECTED inbound / non-deterministic-outbound
+    # call depletes the prepaid rupee balance by 0.6 + rate×seconds, where the
+    # rate is set by the FIFO prepaid bundle the rupees are spent from. 0 for
+    # deterministic/bulk outbound (deducts_prepaid=False) and never-connected
+    # calls. Best-effort: a balance read hiccup must not block the ledger write
+    # (we record 0 and the call simply doesn't deplete).
+    prepaid_rupees = Decimal("0")
+    if deducts_prepaid and duration_seconds > 0:
+        try:
+            from app.services.minute_balance_service import current_bundle_minutes
+            from app.services.minute_pricing import call_usage_cost
+
+            bundle_minutes = await current_bundle_minutes(db, org_uuid)
+            prepaid_rupees = call_usage_cost(duration_seconds, bundle_minutes)
+        except Exception:
+            logger.exception(
+                "NOKVO-COST: prepaid deduction failed (call_id=%s) — recording 0", call_id
+            )
+            prepaid_rupees = Decimal("0")
+
     # Per-component COGS (STT/LLM/TTS/Plivo) in INR, when usage was captured.
     # Best-effort: a pricing hiccup must not block the (revenue) ledger write.
     cogs_values: dict[str, Any] = {}
@@ -182,6 +203,7 @@ async def record_call_cost(
             duration_seconds=billed_seconds,
             billed_minutes=billed_minutes,
             rupees=rupees,
+            prepaid_rupees=prepaid_rupees,
             rate_per_second=rate_per_second.quantize(Decimal("0.000001")),
             started_at=started_at,
             ended_at=ended_at,

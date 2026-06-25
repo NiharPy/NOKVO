@@ -9,6 +9,8 @@ import { useRouter } from 'vue-router';
 import {
   PhoneCall,
   Users,
+  UserX,
+  PhoneOff,
   ScrollText,
   Download,
   Clock,
@@ -55,6 +57,8 @@ const {
 const TABS = [
   { id: 'campaign', label: 'Campaign', icon: PhoneCall },
   { id: 'leads', label: 'Qualified Leads', icon: Users },
+  { id: 'not_interested', label: 'Not Interested', icon: UserX },
+  { id: 'no_pickup', label: "Didn't Pick Up", icon: PhoneOff },
   { id: 'logs', label: 'Call Logs', icon: ScrollText },
 ];
 const bulkTab = ref('campaign');
@@ -76,6 +80,54 @@ function campaignStatusTone(s) {
 }
 function bulkRedialCount(c) {
   return (c.contacts || []).filter((ct) => ct.status !== 'answered' && !ct.answered_at).length;
+}
+// The configured calling window (deterministic campaigns), e.g. "5d × 8h" — read
+// off agent_config.call_window (surfaced via _campaign_response). Null when unset.
+function campaignWindow(c) {
+  const w = c?.agent_config?.call_window;
+  if (!w || !w.working_days || !w.hours_per_day) return null;
+  return `${w.working_days}d × ${w.hours_per_day}h`;
+}
+
+// ── Per-number outcome category ───────────────────────────────────────────
+// Bucket every dialed number into a plain-language outcome, used to route it to
+// the Qualified Leads / Not Interested / Didn't Pick Up tabs:
+//   successful     — crossed the lead score → qualified lead (Qualified Leads tab)
+//   not_interested — connected/answered but below the lead score (Not Interested)
+//   no_pickup      — no connection formed (no answer / telephony failure)
+//   pending        — not final yet (queued, dialing, or answered-but-not-scored);
+//                    shown in NO tab until it resolves (scoring is async).
+// The "successful" test is the SAME predicate the Qualified Leads tab has always
+// used, so nothing changes for that tab.
+function leadCategory(ct, campaign) {
+  const hasQ = !!(campaign.questionnaire && (campaign.questionnaire.questions || []).length);
+  // SCORING is the ground truth and must win over the telephony status. A scored
+  // contact definitionally connected (you can't score a transcript that never
+  // happened), so decide by outcome FIRST — otherwise a qualified lead gets
+  // mislabeled "Didn't pick up" whenever the status is wrong. (It often is:
+  // Plivo's answer webhook isn't wired, so connected calls can read status=
+  // "failed" with answered_at=null even though the conversation + score happened.)
+  if (hasQ) {
+    const scored = typeof ct.lead_score === 'number' || typeof ct.qualified === 'boolean';
+    if (scored) {
+      const threshold = Number(campaign.questionnaire.threshold) || 0;
+      const successful =
+        ct.qualified === true ||
+        (typeof ct.lead_score === 'number' && ct.lead_score >= threshold);
+      return successful ? 'successful' : 'not_interested';
+    }
+  } else if (ct.interest_outcome != null && ct.interest_outcome !== '') {
+    return ct.interest_outcome === 'interested' ? 'successful' : 'not_interested';
+  }
+  // Not scored yet → fall back to the telephony signal. A connected-but-unscored
+  // contact is Pending; a terminal call that never connected is Didn't pick up;
+  // anything still queued/dialing is Pending.
+  const status = ct.status || 'pending';
+  const connected = !!ct.answered_at || status === 'answered';
+  if (!connected && (status === 'no_answer' || status === 'failed' || ct.ended)) {
+    return 'no_pickup';
+  }
+  return 'pending';
 }
 
 function goBack() {
@@ -132,45 +184,79 @@ watch(maxPoints, (mp) => {
   if (mp >= 1 && t < 1) bulkCampaignForm.value.threshold = 1;
 });
 
-const leadCampaignFilter = ref(null); // null = all bulk campaigns
-const expandedLead = ref(null); // call_link_id whose score breakdown is open
-function toggleLead(key) {
-  expandedLead.value = expandedLead.value === key ? null : key;
+// ── Estimated call time + calling capacity ────────────────────────────────
+// Rough talk-time model for the voice agent (sub-second turn pipeline): a fixed
+// opener+outro overhead plus a per-question cost — an intent (yes/no) question is
+// quicker than an open "answer" question. Deliberately approximate; it's a
+// planning aid shown live as the questionnaire is built, not a guarantee.
+const EST_OVERHEAD_S = 12; // opener (~7s) + outro (~5s)
+const EST_INTENT_S = 11; // ask + short yes/no + turn-taking latency
+const EST_ANSWER_S = 15; // ask + open-ended answer + latency
+const estCallSeconds = computed(() => {
+  const qs = bulkCampaignForm.value.questions || [];
+  if (!qs.length) return 0;
+  const perQ = qs.reduce((s, q) => s + (q.type === 'answer' ? EST_ANSWER_S : EST_INTENT_S), 0);
+  return EST_OVERHEAD_S + perQ;
+});
+function fmtDuration(totalSeconds) {
+  const s = Math.max(0, Math.round(totalSeconds));
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  if (m <= 0) return `${r}s`;
+  return r ? `${m}m ${r}s` : `${m}m`;
 }
-const qualifiedLeads = computed(() => {
-  const rows = [];
+const estCallLabel = computed(() => fmtDuration(estCallSeconds.value));
+// Calling capacity from the working-days × hours-per-day window (9 AM–7 PM IST,
+// so hours/day caps at 10). How many of these calls fit in the configured window.
+const callCapacity = computed(() => {
+  const days = Math.max(1, Math.min(60, Math.round(Number(bulkCampaignForm.value.working_days) || 1)));
+  const hours = Math.max(1, Math.min(10, Math.round(Number(bulkCampaignForm.value.hours_per_day) || 1)));
+  const totalHours = days * hours;
+  const perCall = estCallSeconds.value;
+  const calls = perCall > 0 ? Math.floor((totalHours * 3600) / perCall) : 0;
+  return { days, hours, totalHours, calls };
+});
+
+const leadCampaignFilter = ref(null); // null = all bulk campaigns
+
+// Every dialed number, grouped by its outcome category (leadCategory). One pass
+// over the campaigns/contacts builds all the tab lists, so they can never drift
+// or double-count — each contact lands in exactly one group. Respects the shared
+// campaign filter. Rows carry the score/breakdown/note where relevant; the
+// no_pickup rows just carry phone + status.
+const categorizedLeads = computed(() => {
+  const groups = { successful: [], not_interested: [], no_pickup: [], pending: [] };
   for (const c of bulkCampaigns.value) {
     if (leadCampaignFilter.value && String(c.id) !== String(leadCampaignFilter.value)) continue;
-    // Questionnaire campaigns qualify by LEAD SCORE (score ≥ threshold);
-    // campaigns without one keep the legacy "interested" verdict. For a
-    // questionnaire campaign a contact with no score yet is simply not (yet)
-    // qualified — we never fall back to the interest verdict for it.
     const hasQ = !!(c.questionnaire && (c.questionnaire.questions || []).length);
-    const threshold = hasQ ? Number(c.questionnaire.threshold) || 0 : 0;
     const maxScore = hasQ ? (c.max_score || (c.questionnaire.questions || []).length) : null;
     for (const ct of c.contacts || []) {
-      const isQualified = hasQ
-        ? (ct.qualified === true ||
-           (typeof ct.lead_score === 'number' && ct.lead_score >= threshold))
-        : ct.interest_outcome === 'interested';
-      if (!isQualified) continue;
-      rows.push({
+      const cat = leadCategory(ct, c);
+      groups[cat].push({
         name: ct.name || ct.phone,
         phone: ct.phone,
         campaign_id: c.id,
+        campaign_name: c.name,
         answered_at: ct.answered_at,
         call_link_id: ct.call_link_id,
-        lead_score: hasQ ? (typeof ct.lead_score === 'number' ? ct.lead_score : null) : null,
+        status: ct.status,
+        lead_score: hasQ && typeof ct.lead_score === 'number' ? ct.lead_score : null,
         max_score: maxScore,
         score_breakdown: hasQ ? (ct.score_breakdown || []) : null,
+        // How the number was scored — the per-question breakdown plus a one-line
+        // summary (questionnaire), or the interest verdict's reason otherwise.
+        lead_score_reason: hasQ ? (ct.lead_score_reason || null) : (ct.interest_reason || null),
         call_note: ct.call_note || null,
       });
     }
   }
-  return rows.sort((a, b) =>
-    String(b.answered_at || '').localeCompare(String(a.answered_at || '')),
-  );
+  const byRecent = (a, b) => String(b.answered_at || '').localeCompare(String(a.answered_at || ''));
+  for (const k of Object.keys(groups)) groups[k].sort(byRecent);
+  return groups;
 });
+const qualifiedLeads = computed(() => categorizedLeads.value.successful);
+const notInterestedLeads = computed(() => categorizedLeads.value.not_interested);
+const noPickupNumbers = computed(() => categorizedLeads.value.no_pickup);
 
 // ── Call Logs ───────────────────────────────────────────────────────────
 const logCampaignFilter = ref(null); // null = all bulk campaigns
@@ -548,6 +634,40 @@ async function openCall(row) {
                 <p v-else class="blc__q-empty">
                   Add at least one question — set each question's points (or graded bands) to weight the lead score.
                 </p>
+
+                <!-- Calling capacity: working window + live per-call time estimate -->
+                <div class="blc__capacity">
+                  <div class="blc__capacity-inputs">
+                    <label class="n-field blc__cap-field">
+                      <span class="n-field__label">Working days</span>
+                      <input v-model.number="bulkCampaignForm.working_days" type="number" min="1" max="60" class="n-input" :disabled="!isAdmin" />
+                    </label>
+                    <label class="n-field blc__cap-field">
+                      <span class="n-field__label">
+                        Hours / day
+                        <span class="n-field__sub">9 AM–7 PM IST · max 10</span>
+                      </span>
+                      <input v-model.number="bulkCampaignForm.hours_per_day" type="number" min="1" max="10" class="n-input" :disabled="!isAdmin" />
+                    </label>
+                  </div>
+                  <div v-if="estCallSeconds" class="blc__capacity-readout">
+                    <div class="blc__cap-stat">
+                      <span class="blc__cap-stat-val">{{ estCallLabel }}</span>
+                      <span class="blc__cap-stat-lbl">est. per call</span>
+                    </div>
+                    <div class="blc__cap-stat">
+                      <span class="blc__cap-stat-val">{{ callCapacity.totalHours }}h</span>
+                      <span class="blc__cap-stat-lbl">{{ callCapacity.days }} days × {{ callCapacity.hours }}h</span>
+                    </div>
+                    <div class="blc__cap-stat">
+                      <span class="blc__cap-stat-val">~{{ callCapacity.calls.toLocaleString() }}</span>
+                      <span class="blc__cap-stat-lbl">calls fit the window</span>
+                    </div>
+                  </div>
+                  <p class="blc__cap-note">
+                    Calls run 9 AM–7 PM IST. The per-call time is a rough estimate from your {{ (bulkCampaignForm.questions || []).length }} question(s) — it varies with how much people talk.
+                  </p>
+                </div>
               </div>
 
               <button
@@ -590,6 +710,7 @@ async function openCall(row) {
                   <span><strong>{{ c.total_count || 0 }}</strong> dialed</span>
                   <span v-if="c.answered_count"><strong>{{ c.answered_count }}</strong> answered</span>
                   <span v-if="c.failed_count"><strong>{{ c.failed_count }}</strong> failed</span>
+                  <span v-if="campaignWindow(c)" class="n-mono" title="Calling window (9 AM–7 PM IST)">{{ campaignWindow(c) }}</span>
                   <span v-if="c.created_at" class="n-mono">{{ formatRelativeDate(c.created_at) }}</span>
                   <button
                     v-if="isAdmin && bulkRedialCount(c) > 0"
@@ -659,16 +780,10 @@ async function openCall(row) {
             </thead>
             <tbody>
               <template v-for="(row, i) in qualifiedLeads" :key="row.call_link_id || i">
-                <tr
-                  :class="{ 'blc__row-clickable': row.call_note || (row.score_breakdown && row.score_breakdown.length) }"
-                  @click="(row.call_note || (row.score_breakdown && row.score_breakdown.length)) ? toggleLead(row.call_link_id) : null"
-                >
-                  <td class="blc__td-name">
-                    <strong class="n-truncate">{{ row.name }}</strong>
-                    <span v-if="row.call_note" class="blc__td-note n-truncate">{{ row.call_note }}</span>
-                  </td>
+                <tr class="blc__lead-row">
+                  <td class="blc__td-name"><strong class="n-truncate">{{ row.name }}</strong></td>
                   <td class="blc__td-phone">
-                    <a v-if="phoneHref(row.phone)" :href="phoneHref(row.phone)" @click.stop><PhoneCall :size="11" /> {{ row.phone }}</a>
+                    <a v-if="phoneHref(row.phone)" :href="phoneHref(row.phone)"><PhoneCall :size="11" /> {{ row.phone }}</a>
                     <span v-else class="n-mono">{{ row.phone }}</span>
                   </td>
                   <td class="blc__td-score">
@@ -676,23 +791,166 @@ async function openCall(row) {
                     <span v-else class="n-mono">—</span>
                   </td>
                 </tr>
+                <!-- Scoring analysis — ALWAYS visible so you can see exactly HOW
+                     each lead got its score, right beside it (no click needed). -->
                 <tr
-                  v-if="expandedLead === row.call_link_id && (row.call_note || (row.score_breakdown && row.score_breakdown.length))"
+                  v-if="(row.score_breakdown && row.score_breakdown.length) || row.lead_score_reason || row.call_note"
                   class="blc__breakdown-row"
                 >
                   <td colspan="3">
+                    <div class="blc__analysis">
+                      <div class="blc__analysis-head">
+                        <span class="blc__analysis-label">How it scored</span>
+                        <span v-if="row.lead_score_reason" class="blc__analysis-reason">{{ row.lead_score_reason }}</span>
+                      </div>
+                      <ul v-if="row.score_breakdown && row.score_breakdown.length" class="blc__breakdown">
+                        <li v-for="(b, bi) in row.score_breakdown" :key="bi" :class="b.awarded ? 'is-awarded' : 'is-missed'">
+                          <span class="blc__bk-mark">{{ b.awarded ? '✓' : '✗' }}</span>
+                          <span class="blc__bk-text">{{ b.text }}</span>
+                          <span v-if="b.awarded_points" class="blc__bk-pts">+{{ b.awarded_points }}</span>
+                          <span v-if="b.evidence" class="blc__bk-ev n-mono">“{{ b.evidence }}”</span>
+                        </li>
+                      </ul>
+                    </div>
                     <p v-if="row.call_note" class="blc__callnote"><span class="blc__callnote-label">Call note</span> {{ row.call_note }}</p>
-                    <ul v-if="row.score_breakdown && row.score_breakdown.length" class="blc__breakdown">
-                      <li v-for="(b, bi) in row.score_breakdown" :key="bi" :class="b.awarded ? 'is-awarded' : 'is-missed'">
-                        <span class="blc__bk-mark">{{ b.awarded ? '✓' : '✗' }}</span>
-                        <span class="blc__bk-text">{{ b.text }}</span>
-                        <span v-if="b.awarded_points" class="blc__bk-pts">+{{ b.awarded_points }}</span>
-                        <span v-if="b.evidence" class="blc__bk-ev n-mono">“{{ b.evidence }}”</span>
-                      </li>
-                    </ul>
                   </td>
                 </tr>
               </template>
+            </tbody>
+          </table>
+        </article>
+      </div>
+
+      <!-- ════════════ NOT INTERESTED TAB ════════════ -->
+      <div v-else-if="bulkTab === 'not_interested'" class="blc__panel">
+        <article class="n-card">
+          <header class="blc__section-head">
+            <div class="blc__section-title">
+              <strong>Not interested</strong>
+              <span class="n-tag n-tag--mono">{{ notInterestedLeads.length }}</span>
+            </div>
+            <button type="button" class="n-btn n-btn--ghost n-btn--sm" @click="loadCampaigns">
+              <RefreshCw :size="13" /> Refresh
+            </button>
+          </header>
+          <p class="blc__hint">Numbers we reached but that didn't cross the lead score (or weren't judged interested). The breakdown shows what they missed.</p>
+
+          <nav v-if="bulkCampaigns.length > 1" class="n-pillnav blc__pillnav" aria-label="Filter by campaign">
+            <button
+              type="button"
+              class="n-pillnav__btn"
+              :class="{ 'n-pillnav__btn--active': leadCampaignFilter === null }"
+              @click="leadCampaignFilter = null"
+            ><span>All</span></button>
+            <button
+              v-for="c in bulkCampaigns"
+              :key="c.id"
+              type="button"
+              class="n-pillnav__btn"
+              :class="{ 'n-pillnav__btn--active': leadCampaignFilter === c.id }"
+              @click="leadCampaignFilter = c.id"
+            ><span>{{ c.name }}</span></button>
+          </nav>
+
+          <div v-if="!notInterestedLeads.length" class="n-empty blc__empty">
+            <div class="n-empty__icon"><UserX :size="18" /></div>
+            <p class="n-empty__copy">No “not interested” numbers yet — reached contacts that don't qualify will appear here.</p>
+          </div>
+          <table v-else class="blc__table">
+            <thead>
+              <tr><th>Name</th><th>Phone</th><th>Score</th></tr>
+            </thead>
+            <tbody>
+              <template v-for="(row, i) in notInterestedLeads" :key="row.call_link_id || i">
+                <tr class="blc__lead-row">
+                  <td class="blc__td-name"><strong class="n-truncate">{{ row.name }}</strong></td>
+                  <td class="blc__td-phone">
+                    <a v-if="phoneHref(row.phone)" :href="phoneHref(row.phone)"><PhoneCall :size="11" /> {{ row.phone }}</a>
+                    <span v-else class="n-mono">{{ row.phone }}</span>
+                  </td>
+                  <td class="blc__td-score">
+                    <span v-if="row.max_score" class="n-tag n-tag--neutral">{{ row.lead_score ?? 0 }}/{{ row.max_score }}</span>
+                    <span v-else class="n-mono">—</span>
+                  </td>
+                </tr>
+                <tr
+                  v-if="(row.score_breakdown && row.score_breakdown.length) || row.lead_score_reason || row.call_note"
+                  class="blc__breakdown-row"
+                >
+                  <td colspan="3">
+                    <div class="blc__analysis">
+                      <div class="blc__analysis-head">
+                        <span class="blc__analysis-label">How it scored</span>
+                        <span v-if="row.lead_score_reason" class="blc__analysis-reason">{{ row.lead_score_reason }}</span>
+                      </div>
+                      <ul v-if="row.score_breakdown && row.score_breakdown.length" class="blc__breakdown">
+                        <li v-for="(b, bi) in row.score_breakdown" :key="bi" :class="b.awarded ? 'is-awarded' : 'is-missed'">
+                          <span class="blc__bk-mark">{{ b.awarded ? '✓' : '✗' }}</span>
+                          <span class="blc__bk-text">{{ b.text }}</span>
+                          <span v-if="b.awarded_points" class="blc__bk-pts">+{{ b.awarded_points }}</span>
+                          <span v-if="b.evidence" class="blc__bk-ev n-mono">“{{ b.evidence }}”</span>
+                        </li>
+                      </ul>
+                    </div>
+                    <p v-if="row.call_note" class="blc__callnote"><span class="blc__callnote-label">Call note</span> {{ row.call_note }}</p>
+                  </td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+        </article>
+      </div>
+
+      <!-- ════════════ DIDN'T PICK UP TAB ════════════ -->
+      <div v-else-if="bulkTab === 'no_pickup'" class="blc__panel">
+        <article class="n-card">
+          <header class="blc__section-head">
+            <div class="blc__section-title">
+              <strong>Didn't pick up</strong>
+              <span class="n-tag n-tag--mono">{{ noPickupNumbers.length }}</span>
+            </div>
+            <button type="button" class="n-btn n-btn--ghost n-btn--sm" @click="loadCampaigns">
+              <RefreshCw :size="13" /> Refresh
+            </button>
+          </header>
+          <p class="blc__hint">Numbers we couldn't reach — no answer or the call didn't connect. Re-run a campaign (Campaign tab) to try its unreached numbers again.</p>
+
+          <nav v-if="bulkCampaigns.length > 1" class="n-pillnav blc__pillnav" aria-label="Filter by campaign">
+            <button
+              type="button"
+              class="n-pillnav__btn"
+              :class="{ 'n-pillnav__btn--active': leadCampaignFilter === null }"
+              @click="leadCampaignFilter = null"
+            ><span>All</span></button>
+            <button
+              v-for="c in bulkCampaigns"
+              :key="c.id"
+              type="button"
+              class="n-pillnav__btn"
+              :class="{ 'n-pillnav__btn--active': leadCampaignFilter === c.id }"
+              @click="leadCampaignFilter = c.id"
+            ><span>{{ c.name }}</span></button>
+          </nav>
+
+          <div v-if="!noPickupNumbers.length" class="n-empty blc__empty">
+            <div class="n-empty__icon"><PhoneOff :size="18" /></div>
+            <p class="n-empty__copy">Everyone we dialed connected — unreached numbers will appear here.</p>
+          </div>
+          <table v-else class="blc__table">
+            <thead>
+              <tr><th>Name</th><th>Phone</th><th>Outcome</th></tr>
+            </thead>
+            <tbody>
+              <tr v-for="(row, i) in noPickupNumbers" :key="row.call_link_id || i">
+                <td class="blc__td-name"><strong class="n-truncate">{{ row.name }}</strong></td>
+                <td class="blc__td-phone">
+                  <a v-if="phoneHref(row.phone)" :href="phoneHref(row.phone)"><PhoneCall :size="11" /> {{ row.phone }}</a>
+                  <span v-else class="n-mono">{{ row.phone }}</span>
+                </td>
+                <td class="blc__td-score">
+                  <span class="n-tag n-tag--mono">{{ row.status === 'failed' ? 'Call failed' : 'No answer' }}</span>
+                </td>
+              </tr>
             </tbody>
           </table>
         </article>
@@ -906,6 +1164,11 @@ async function openCall(row) {
   font-size: 13px;
 }
 
+/* Outcome score tag in the Not Interested tab (below-threshold, neutral tone). */
+.blc__td-score .n-tag--neutral {
+  background: transparent; border: 1.5px solid var(--n-text-3); color: var(--n-text-3);
+}
+
 /* ── Qualified leads table ── */
 .blc__hint { margin: 0 0 12px; font-size: 13px; color: var(--n-text-3); }
 .blc__table { width: 100%; border-collapse: collapse; }
@@ -918,7 +1181,6 @@ async function openCall(row) {
 .blc__table tbody tr:last-child td { border-bottom: 0; }
 .blc__table tbody tr:hover { background: var(--n-surface); }
 .blc__td-name { max-width: 280px; }
-.blc__td-note { display: block; margin-top: 2px; font-size: 11.5px; color: var(--n-text-3); max-width: 280px; }
 .blc__td-phone a {
   display: inline-flex; align-items: center; gap: 5px;
   color: var(--n-brand, #6366f1); text-decoration: none; font-family: var(--n-font-mono); font-size: 13px;
@@ -1004,6 +1266,19 @@ async function openCall(row) {
 .blc__q-thresh-input { width: 72px; }
 .blc__q-thresh-hint { font-size: 12px; color: var(--n-text-3); }
 .blc__q-empty { font-size: 12.5px; color: var(--n-text-3); margin: 0; font-style: italic; }
+/* Calling capacity (working window + per-call estimate) */
+.blc__capacity { border-top: 2px solid var(--n-border); margin-top: 4px; padding-top: 12px; display: grid; gap: 10px; }
+.blc__capacity-inputs { display: flex; gap: 12px; flex-wrap: wrap; }
+.blc__cap-field { flex: 0 0 auto; }
+.blc__cap-field .n-input { width: 120px; }
+.blc__capacity-readout { display: flex; gap: 10px; flex-wrap: wrap; }
+.blc__cap-stat {
+  flex: 1 1 120px; display: grid; gap: 2px; padding: 8px 12px;
+  background: var(--n-surface); border: 1.5px solid var(--n-border); border-radius: 8px;
+}
+.blc__cap-stat-val { font-size: 17px; font-weight: 700; color: var(--n-text); font-family: var(--n-font-mono); }
+.blc__cap-stat-lbl { font-size: 11px; color: var(--n-text-3); }
+.blc__cap-note { margin: 0; font-size: 11.5px; color: var(--n-text-3); }
 @media (max-width: 760px) {
   .blc__q-row { flex-direction: column; align-items: stretch; }
   .blc__q-type, .blc__q-ans { flex: 1 1 auto; max-width: none; }
@@ -1011,8 +1286,14 @@ async function openCall(row) {
 
 /* ── Score column + per-question breakdown ── */
 .blc__td-score { white-space: nowrap; }
-.blc__row-clickable { cursor: pointer; }
 .blc__breakdown-row > td { padding: 0 12px 12px; }
+/* Lead row connects to its always-visible analysis row below (no divider between). */
+.blc__lead-row > td { border-bottom: 0; }
+.blc__analysis { padding: 8px 12px; margin-bottom: 8px; background: var(--n-surface); border-radius: 6px; display: grid; gap: 6px; }
+.blc__analysis-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.blc__analysis-label { font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--n-text-3); font-family: var(--n-font-mono); white-space: nowrap; }
+.blc__analysis-reason { margin: 0; font-size: 12px; color: var(--n-text-2, var(--n-text-3)); line-height: 1.45; }
+.blc__analysis .blc__breakdown { padding: 0; background: transparent; }
 .blc__callnote { margin: 0 0 8px; padding: 8px 12px; font-size: 13px; line-height: 1.5; color: var(--n-text-2, var(--n-text-3)); background: var(--n-surface); border-radius: 6px; }
 .blc__callnote-label { display: inline-block; margin-right: 6px; font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--n-text-3); font-family: var(--n-font-mono); }
 .blc__callnote--detail { margin: 12px 18px; }

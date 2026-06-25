@@ -521,9 +521,21 @@ def _answer_is_outro(answer: str | None, outro: str | None) -> bool:
     intent gate, a normal wrap, or a disinterest close) so the system can play it
     out and hang up. Pure + unit-testable. Conservative on purpose — a miss just
     means the call isn't auto-cut (the agent still wrapped), never a wrong hangup
-    on a live prospect."""
-    a = re.sub(r"[^\w\s]", " ", (answer or "").lower()).split()
-    o = re.sub(r"[^\w\s]", " ", (outro or "").lower()).split()
+    on a live prospect.
+
+    GUARD — a turn that STILL ASKS A QUESTION is never a closing turn. The model
+    sometimes bundles the closing line onto the SAME turn as the last
+    questionnaire question (e.g. "Would you like our team to reach out…? Thanks
+    for your time, our team will reach out shortly."), and that last question
+    often shares most of its words with the outro, so the overlap alone
+    false-fires. If the reply carries MORE question marks than the outro itself,
+    there is a pending question — the call must continue, so it is NOT a close."""
+    a_raw = answer or ""
+    o_raw = outro or ""
+    if a_raw.count("?") > o_raw.count("?"):
+        return False
+    a = re.sub(r"[^\w\s]", " ", a_raw.lower()).split()
+    o = re.sub(r"[^\w\s]", " ", o_raw.lower()).split()
     if not o or not a:
         return False
     aset = set(a)
@@ -775,6 +787,13 @@ _EOU_TIME_CONNECTORS = {
     "to", "after", "before",
 }
 _EOU_NUMBER_CONTEXT_WORDS = {"number", "phone", "mobile", "contact", "whatsapp"}
+# Pronoun contractions ("it's", "I'm", "that's", "you're") trail off like their
+# ROOT pronoun, but STT keeps the contraction so the continuation sets miss them
+# and the caller gets cut off mid-thought ("uh, it's…" → fragment). Judge
+# continuation on the root too. Restricted to PRONOUN roots so NEGATIVE
+# contractions ("don't", "can't") are NOT dragged into the long wait (they end a
+# complete reply far more often than they trail off).
+_EOU_PRONOUN_CONTRACTION_ROOTS = {"it", "i", "that", "this", "you", "he", "she", "we", "they"}
 
 
 def _eou_token_is_timeish(tok: str) -> bool:
@@ -808,6 +827,13 @@ def _eou_completeness_tier(text: str) -> str:
     while len(words) > 1 and words[-1] in _EOU_DISCOURSE_PARTICLES:
         words.pop()
     last = words[-1]
+    # A trailing pronoun contraction ("it's", "I'm", "that's") trails off like its
+    # root pronoun — judge continuation on the root so it isn't cut off.
+    last_base = last
+    if "'" in last:
+        _root = last.split("'", 1)[0]
+        if _root in _EOU_PRONOUN_CONTRACTION_ROOTS:
+            last_base = _root
     # 1) Clear question → complete regardless of the trailing word.
     if ended_question:
         return "fast"
@@ -819,13 +845,13 @@ def _eou_completeness_tier(text: str) -> str:
     if last.isdigit() and len(last) < 10 and any(w in _EOU_NUMBER_CONTEXT_WORDS for w in words):
         return "continuation"
     # 4) Trails off on a STRONG continuation word / filler → wait the longest.
-    if last in _EOU_STRONG_CONTINUATION:
+    if last in _EOU_STRONG_CONTINUATION or last_base in _EOU_STRONG_CONTINUATION:
         return "continuation"
     # 5) WEAK tail (auxiliary / pronoun / determiner): after substantial content
     #    it's usually COMPLETE ("…you guys have") → neutral; only a SHORT fragment
-    #    ("I have", "do you") is genuinely trailing off → continuation. (Fix for
-    #    the scan finding: complete utterances over-waiting at 2300ms.)
-    if last in _EOU_WEAK_CONTINUATION:
+    #    ("I have", "do you", "uh, it's") is genuinely trailing off → continuation.
+    #    (Fix for the scan finding: complete utterances over-waiting at 2300ms.)
+    if last in _EOU_WEAK_CONTINUATION or last_base in _EOU_WEAK_CONTINUATION:
         return "continuation" if len(words) <= _EOU_WEAK_FRAGMENT_MAXWORDS else "neutral"
     # 6) Short yes/no/acknowledgement answer.
     if len(words) <= 3 and (words[0] in _EOU_YESNO_WORDS or last in _EOU_YESNO_WORDS):
@@ -1274,6 +1300,47 @@ class NokvoOneVoiceStreamService:
                 turn_state=turn_state,
             )
             return
+        # ── Deterministic questionnaire CLOSE ─────────────────────────────────
+        # The model is unreliable at delivering the closing line once the
+        # questionnaire is done — in the field it re-asks the last question, makes
+        # up a name question, or loops back to an earlier one instead of closing.
+        # So once EVERY question has been asked AND the caller's latest reply is a
+        # genuine answer (not a fragment / re-greeting), close the call
+        # deterministically: speak the outro verbatim and hang up, with no LLM
+        # turn. One-shot per call via campaign_context["_outro_ended"]; only for a
+        # deterministic questionnaire agent that has an outro configured.
+        if (
+            outbound_context is not None
+            and call_id
+            and campaign_context is not None
+            and not campaign_context.get("_outro_ended")
+            and getattr(outbound_context, "has_questionnaire", False)
+        ):
+            _qoutro = (getattr(outbound_context, "question_outro", "") or "").strip()
+            _qs = list(getattr(outbound_context, "questions", []) or [])
+            if _qoutro and _qs:
+                try:
+                    from app.services.agent_outbound_context import (
+                        questionnaire_is_complete,
+                    )
+
+                    _hist = await AgentSessionStore.get_history(tenant_res, call_id)
+                    if questionnaire_is_complete(_qs, _hist, cleaned):
+                        campaign_context["_outro_ended"] = True
+                        await NokvoOneVoiceStreamService._speak_outro_and_end(
+                            websocket,
+                            tenant_res,
+                            outro=_qoutro,
+                            language=language,
+                            call_id=call_id,
+                            last_user_text=cleaned,
+                            campaign_context=campaign_context,
+                            arbiter=arbiter,
+                            turn_state=turn_state,
+                        )
+                        return
+                except Exception:
+                    logger.exception("NOKVO-OUTRO: deterministic close check failed")
         if outbound_context is not None and call_id and source != "proactive_silence":
             await AgentSessionStore.merge_state(
                 tenant_res,
@@ -1893,7 +1960,20 @@ class NokvoOneVoiceStreamService:
                     )
                 except Exception:
                     _tool_flow_active_for_guard = False
-            latency_guard_enabled = not _tool_flow_active_for_guard
+            # The DETERMINISTIC questionnaire agent must speak ZERO filler — no
+            # spoken latency bridge either ("Okay, just a sec…"). Its turns are
+            # tiny "ask the next question" LLM calls that finish well under the
+            # budget, so a slow turn is rare; on the odd slow one the caller hears
+            # a brief silence instead of a hold, which is the intended behaviour
+            # for this agent. Inbound + the free-form outbound agent keep the
+            # guard (a hold reads naturally there).
+            _is_deterministic_questionnaire = bool(
+                outbound_context is not None
+                and getattr(outbound_context, "has_questionnaire", False)
+            )
+            latency_guard_enabled = (
+                not _tool_flow_active_for_guard and not _is_deterministic_questionnaire
+            )
 
             def _guard_timeout_s() -> float | None:
                 """Dynamic guard wait. When end-of-speech is known, size the wait
@@ -2505,6 +2585,75 @@ class NokvoOneVoiceStreamService:
             await websocket.close()
         except Exception:
             pass
+
+    @staticmethod
+    async def _speak_outro_and_end(
+        websocket: WebSocket,
+        tenant_res: TenantResources,
+        *,
+        outro: str,
+        language: str,
+        call_id: str | None,
+        last_user_text: str = "",
+        campaign_context: dict[str, Any] | None = None,
+        arbiter: TurnArbiter | None = None,
+        turn_state: dict[str, Any] | None = None,
+    ) -> None:
+        """Deterministic questionnaire CLOSE: speak the campaign's closing line
+        verbatim, then hang up.
+
+        Used once every question has been asked and the caller has given a real
+        answer to the last one. The model is unreliable about delivering the
+        closing line itself (it re-asks the last question, invents a name
+        question, or loops back to an earlier one), so we close deterministically
+        — no LLM turn. Mirrors :meth:`_leave_voicemail_and_end`. Never raises."""
+        line = (outro or "").strip()
+        if not line:
+            with contextlib.suppress(Exception):
+                await websocket.close()
+            return
+        # Mark speaking so a racing check-in can't barge our final line.
+        if turn_state is not None:
+            turn_state["speaking"] = True
+        if arbiter is not None:
+            arbiter.mark_speaking()
+        turn_id = str(uuid.uuid4())[:8]
+        try:
+            await websocket.send_json(
+                {
+                    "type": "agent_sentence",
+                    "turn_id": turn_id,
+                    "sentence": line,
+                    "tone": "warm",
+                    "cache_hit": False,
+                    "source": "questionnaire_outro",
+                }
+            )
+            await SarvamVoiceService.stream_sentence_tts(
+                websocket,
+                tenant_res,
+                line,
+                language=language,
+                purpose="outro",
+            )
+        except Exception:
+            logger.debug("NOKVO-OUTRO: outro TTS failed", exc_info=True)
+        # Record the caller's final answer + the outro so the post-call scorer
+        # still sees the last question's answer (we paired the real reply, not a
+        # synthetic marker).
+        try:
+            await AgentSessionStore.append_turn(
+                tenant_res, call_id, (last_user_text or "").strip() or "(questionnaire complete)", line
+            )
+        except Exception:
+            pass
+        logger.info(
+            "NOKVO-OUTRO: questionnaire complete call=%s — spoke closing line, ending call",
+            call_id,
+        )
+        with contextlib.suppress(Exception):
+            await asyncio.sleep(_OUTRO_DRAIN_SECONDS)
+            await websocket.close()
 
     @staticmethod
     async def _play_opener(
@@ -3701,6 +3850,16 @@ class NokvoOneVoiceStreamService:
                             cost_campaign_id = raw_cid
                     from app.services.call_cost_recorder import record_call_cost
 
+                    # Prepaid balance deduction applies to CONNECTED inbound +
+                    # NON-deterministic outbound calls. Deterministic / bulk-
+                    # questionnaire outbound (has_questionnaire) is the operator-
+                    # gated add-on billed separately, so it never depletes this
+                    # balance; tester sessions never bill.
+                    _is_questionnaire = bool(
+                        outbound_context is not None
+                        and getattr(outbound_context, "has_questionnaire", False)
+                    )
+                    _deducts_prepaid = cost_kind in ("inbound", "outbound") and not _is_questionnaire
                     await record_call_cost(
                         db,
                         organization_id=organization_id_uuid,
@@ -3712,6 +3871,7 @@ class NokvoOneVoiceStreamService:
                         campaign_id=cost_campaign_id,
                         trace_id=_otel_trace_id,
                         usage=call_usage,
+                        deducts_prepaid=_deducts_prepaid,
                     )
                 except Exception:
                     logger.exception("NOKVO-VOICE: failed to record call cost")
@@ -4009,6 +4169,15 @@ class NokvoOneVoiceStreamService:
                                     _note = None
                                 if _note:
                                     _stamp["call_note"] = _note
+                                    _stamp["call_note_generated_at"] = datetime.now(
+                                        timezone.utc
+                                    ).isoformat()
+                                elif _bg_questions and _ls.reason:
+                                    # Short call → the condenser returned nothing,
+                                    # but a qualified ticket should never be
+                                    # note-less. Fall back to the score summary
+                                    # (e.g. "Scored 4/5 (threshold 3). Earned: …").
+                                    _stamp["call_note"] = _ls.reason
                                     _stamp["call_note_generated_at"] = datetime.now(
                                         timezone.utc
                                     ).isoformat()

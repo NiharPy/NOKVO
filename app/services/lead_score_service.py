@@ -211,6 +211,23 @@ def _resolve_tier_points(tiers: list[dict], verdict: Any) -> tuple[int, str]:
     return pts, str(chosen.get("id") or "")
 
 
+def _verdict_earned(verdict: Any) -> bool:
+    """Robustly read the model's ``earned`` field for an intent / simple-answer
+    question. The prompt asks for a JSON boolean, but small models routinely emit
+    a STRING ("false" / "none" / "no") — and ``bool("false")`` is TRUTHY, which
+    would FALSELY award the point and over-qualify the lead. Treat only genuine
+    true values as earned; everything else (False, "false", "no", "none", 0,
+    missing, non-dict) is NOT earned."""
+    if not isinstance(verdict, dict):
+        return False
+    v = verdict.get("earned")
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return v > 0
+    return str(v).strip().lower() in ("true", "yes", "y", "1", "earned")
+
+
 def _parse_verdicts(text: str, questions: list[dict], threshold: int) -> LeadScore | None:
     """Parse the model's ``{"verdicts": [...]}`` reply into a LeadScore.
 
@@ -258,7 +275,7 @@ def _parse_verdicts(text: str, questions: list[dict], threshold: int) -> LeadSco
         if tiers:
             awarded_points, chosen_tier = _resolve_tier_points(tiers, verdict)
         else:
-            earned = bool(verdict.get("earned")) if isinstance(verdict, dict) else False
+            earned = _verdict_earned(verdict)
             awarded_points = _question_points(q) if earned else 0
         awarded = awarded_points > 0
         score += awarded_points

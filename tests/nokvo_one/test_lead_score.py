@@ -208,6 +208,156 @@ def test_answer_is_outro_matching():
     assert _answer_is_outro("anything", "") is False
 
 
+def test_answer_is_outro_does_not_fire_when_turn_still_asks(_=None):
+    """REGRESSION (field call 072f59e6): the agent bundled the closing line onto
+    the SAME turn as the last question, whose words nearly equal the outro
+    ("our team will reach out…"), so token-overlap false-fired and the call hung
+    up while Q5 was still unanswered — no dealbreaker was ever tripped. A turn
+    that still poses a question (more '?' than the outro) must NOT be a close."""
+    from app.services.nokvo_one_voice_stream_service import _answer_is_outro
+    reach_outro = "Thank you so much for your time. Our team will reach out to you shortly."
+    bundled = (
+        "Would you like our team to reach out to you for this project? " + reach_outro
+    )
+    assert _answer_is_outro(bundled, reach_outro) is False        # pending question → keep call alive
+    assert _answer_is_outro(reach_outro, reach_outro) is True     # closing line ALONE still ends it
+    assert _answer_is_outro(
+        "Thank you so much for your time. Our team will reach out shortly.", reach_outro
+    ) is True
+
+
+def test_is_incomplete_answer():
+    """A trailing-off fragment ("uh, it's", "I'm") is NOT a finished answer, but a
+    real short answer ("1.8 crore", "apartment", "it is") is. Field call
+    072f59e6: "uh, it's" was treated as answered and the agent jumped ahead."""
+    from app.services.agent_outbound_context import _is_incomplete_answer as inc
+    for frag in ("uh", "um", "আহ। Uh, it's", "it's about", "I'm", "um the", "it's around"):
+        assert inc(frag) is True, frag
+    for done in ("1.8 crore", "It's about 1.8", "apartment", "yes", "Kollur",
+                 "it is", "I am", "I think so", "I'm looking for an apartment",
+                 "", "అవును"):
+        assert inc(done) is False, done
+
+
+def test_directive_reasks_on_trailing_fragment_instead_of_advancing():
+    """The deterministic progress directive must RE-ASK the current question when
+    the caller's reply trailed off — not advance to the next question (which is
+    what produced the premature Q5+outro in field call 072f59e6)."""
+    from app.services.agent_outbound_context import _render_progress_directive
+    Q = [
+        {"id": "q1", "type": "intent", "text": "Can you give us a few seconds for this survey?"},
+        {"id": "q2", "type": "intent", "text": "Are you looking to buy a house?"},
+        {"id": "q3", "type": "answer", "text": "Apartment or villa?", "desired_answer": ""},
+        {"id": "q4", "type": "answer", "text": "What is your budget range?", "desired_answer": ""},
+        {"id": "q5", "type": "intent", "text": "Would you like our team to reach out to you?"},
+    ]
+    base_hist = [
+        {"role": "user", "content": "Hello"},
+        {"role": "assistant", "content": "Can you give us a few seconds for this survey?"},
+        {"role": "user", "content": "Yeah"},
+        {"role": "assistant", "content": "Are you looking to buy a house?"},
+        {"role": "user", "content": "Yeah"},
+        {"role": "assistant", "content": "Apartment or villa?"},
+        {"role": "user", "content": "Apartment"},
+        {"role": "assistant", "content": "What is your budget range?"},
+    ]
+    # Trailing fragment → re-ask Q4 (budget), do NOT advance to Q5.
+    frag_hist = base_hist + [{"role": "user", "content": "uh, it's"}]
+    d = _render_progress_directive(Q, frag_hist, latest_user_text="uh, it's")
+    assert "RE-ASK Q4" in d and "budget" in d.lower()
+    assert "Q5" not in d  # must not tell the agent to ask the next question
+
+    # A COMPLETE budget answer advances to Q5 (no re-ask).
+    done_hist = base_hist + [{"role": "user", "content": "It's about 1.8 crore"}]
+    d2 = _render_progress_directive(Q, done_hist, latest_user_text="It's about 1.8 crore")
+    assert "Q5" in d2 and "TRAILED OFF" not in d2
+
+
+def test_questionnaire_is_complete():
+    """Deterministic CLOSE gate (field call fd8c8a77): after all questions are
+    asked and the last gets a real answer ("Yeah"), the agent must close — it was
+    instead re-asking Q5 six times, inventing a name question, and looping to Q2.
+    A fragment / re-greeting must NOT close (re-ask instead); an unasked question
+    must NOT close (keep asking)."""
+    from app.services.agent_outbound_context import questionnaire_is_complete as done
+    Q = [
+        {"id": "q1", "type": "intent", "text": "Can you give us few seconds for this survey?"},
+        {"id": "q2", "type": "intent", "text": "Are you looking to buy a house?"},
+        {"id": "q3", "type": "answer", "text": "Apartment or Villa?", "desired_answer": "apartment"},
+        {"id": "q4", "type": "answer", "text": "What is your budget range?", "desired_answer": "any"},
+        {"id": "q5", "type": "intent", "text": "Would you like our team to reach out to you for this project?"},
+    ]
+
+    def H(asked_texts):
+        h = []
+        for a in asked_texts:
+            h += [{"role": "user", "content": "x"}, {"role": "assistant", "content": a}]
+        return h
+
+    all5 = [q["text"] for q in Q]
+    four = [q["text"] for q in Q[:4]]  # Q5 not asked yet
+    assert done(Q, H(all5), "Yeah") is True       # all asked + real answer → CLOSE
+    assert done(Q, H(all5), "Yes") is True
+    assert done(Q, H(all5), "um") is False        # fragment → re-ask, don't close
+    assert done(Q, H(all5), "uh, it's") is False
+    assert done(Q, H(all5), "hello") is False     # re-greeting → don't close
+    assert done(Q, H(four), "Yeah") is False      # last question not asked yet
+    assert done([], H(all5), "Yeah") is False     # no questionnaire
+
+
+def test_last_intent_question_unanswered_does_not_close():
+    """REGRESSION (field call, lead Nihar): STT split the budget answer
+    "1.5 to 2 crores" across two turns — "1.5" answered Q4, and the tail
+    "crores to 2 crores" landed on the LAST question Q5 (an intent yes/no
+    "would you like a callback?"). The agent closed on that unrelated tail and the
+    scorer credited Q5 +100 from budget text. The close (and the directive) must
+    RE-ASK Q5 when the reply has no yes/no cue — but only up to the re-ask cap so
+    an unrecognised paraphrase can't loop forever."""
+    from app.services.agent_outbound_context import (
+        questionnaire_is_complete as done,
+        _render_progress_directive as directive,
+        _is_yes_no_answer,
+    )
+    Q = [
+        {"id": "q1", "type": "intent", "text": "Can you give us few seconds for this survey?"},
+        {"id": "q2", "type": "intent", "text": "Are you looking to buy a house?"},
+        {"id": "q3", "type": "answer", "text": "Apartment or Villa?", "desired_answer": "apartment"},
+        {"id": "q4", "type": "answer", "text": "What is your budget range?", "desired_answer": "any"},
+        {"id": "q5", "type": "intent", "text": "Would you like our team to reach out to you for this project?"},
+    ]
+
+    def H(asked_texts):
+        h = []
+        for a in asked_texts:
+            h += [{"role": "user", "content": "x"}, {"role": "assistant", "content": a}]
+        return h
+
+    all5 = [q["text"] for q in Q]
+
+    # The bug: split-budget tail on Q5 → no yes/no cue → must NOT close.
+    assert _is_yes_no_answer("crores to 2 crores") is False
+    assert done(Q, H(all5), "crores to 2 crores") is False
+    # The directive must tell the agent to re-ask Q5, not wrap up.
+    d = directive(Q, H(all5), "crores to 2 crores")
+    assert "RE-ASK Q5" in d
+
+    # A real yes/no answer (literal or paraphrased) still closes.
+    for ans in ("Yeah", "yes please", "I'd like your team to reach out", "no thanks", "sounds good"):
+        assert _is_yes_no_answer(ans) is True, ans
+        assert done(Q, H(all5), ans) is True, ans
+
+    # Re-ask CAP: once Q5 has already been asked twice, accept whatever they say
+    # (don't loop forever on a paraphrase we can't classify).
+    all5_q5_twice = all5 + [Q[4]["text"]]
+    assert done(Q, H(all5_q5_twice), "crores to 2 crores") is True
+
+    # The guard is ONLY for a trailing INTENT question — an answer-type last
+    # question (free-form) is not gated on a yes/no cue.
+    Qans_last = Q[:4] + [{"id": "q5b", "type": "answer", "text": "Which area do you prefer?", "desired_answer": "any"}]
+    all5b = [q["text"] for q in Qans_last]
+    assert done(Qans_last, H(all5b), "Kollur side") is True
+
+
 def test_outbound_post_call_targets_gate():
     """The post-call gate that decides whether a finished outbound call gets
     SCORED. The original bug: it required lead_id/customer_id, so bulk CSV
@@ -325,6 +475,42 @@ def test_parse_missing_verdict_defaults_false():
 
 def test_parse_unparseable_returns_none():
     assert ls._parse_verdicts("no json", _Q, threshold=1) is None
+
+
+def test_parse_verdicts_earned_robust_to_string_values():
+    """Small models emit ``earned`` as a STRING ("false"/"none"/"no") instead of
+    a JSON boolean. ``bool("false")`` is TRUTHY — which previously FALSELY awarded
+    the point and over-qualified the lead (creating a wrong qualified ticket).
+    Only genuine true values earn; everything else scores 0."""
+    Q = [{"id": "q1", "type": "intent", "text": "Interested?", "required": "yes"}]
+    earns = ['"true"', '"yes"', '"y"', '"1"', "true", "1"]
+    not_earns = ['"false"', '"none"', '"no"', '"0"', "false", "0", "null"]
+    for raw in earns:
+        r = ls._parse_verdicts('{"verdicts":[{"id":"q1","earned":%s}]}' % raw, Q, threshold=1)
+        assert r.score == 1 and r.qualified is True, f"earned={raw} should earn"
+    for raw in not_earns:
+        r = ls._parse_verdicts('{"verdicts":[{"id":"q1","earned":%s}]}' % raw, Q, threshold=1)
+        assert r.score == 0 and r.qualified is False, f"earned={raw} must NOT earn"
+    # a missing earned field never awards
+    assert ls._parse_verdicts('{"verdicts":[{"id":"q1"}]}', Q, threshold=1).score == 0
+    # the helper directly
+    assert ls._verdict_earned({"earned": "none"}) is False
+    assert ls._verdict_earned({"earned": "false"}) is False
+    assert ls._verdict_earned({"earned": True}) is True
+    assert ls._verdict_earned({"earned": "YES"}) is True
+    assert ls._verdict_earned({}) is False
+    assert ls._verdict_earned(None) is False
+
+
+def test_qualified_score_has_nonempty_reason_for_call_note_fallback():
+    """A qualified contact whose call is too short to condense falls back to the
+    LeadScore.reason as its Call Note, so the ticket is never note-less — verify
+    that reason is always populated and human-readable for a qualified result."""
+    txt = ('{"verdicts":[{"id":"q1","earned":true,"evidence":"yes"},'
+           '{"id":"q2","earned":true,"evidence":"Kollur"},'
+           '{"id":"q3","earned":false,"evidence":""}]}')
+    r = ls._parse_verdicts(txt, _Q, threshold=2)
+    assert r.qualified and r.reason and "Scored" in r.reason and "Earned" in r.reason
 
 
 def test_safe_default_never_overqualifies():

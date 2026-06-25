@@ -38,6 +38,7 @@ from app.models.connect_api_key import OrganizationApiKey
 from app.models.connect_session import ConnectSession
 from app.models.call_cost import CallCost
 from app.models.subscription import Subscription
+from app.models.minute_purchase import MinutePurchase
 from app.models.usage_invoice import UsageInvoice
 from app.models.llm_pool_key import LlmPoolKey
 from app.models.call_transcript import CallTranscript
@@ -76,6 +77,7 @@ __all__ = [
     "ConnectSession",
     "CallCost",
     "Subscription",
+    "MinutePurchase",
     "UsageInvoice",
     "LlmPoolKey",
     "CallTranscript",

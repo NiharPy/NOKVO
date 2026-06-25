@@ -1246,6 +1246,28 @@ class OutboundCampaignService:
         placement loop, released by the commit below) so a status webhook can't
         read a stale snapshot mid-placement and revert just-placed contacts to
         ``pending`` — which previously made the dialer re-place them forever."""
+        # Prepaid-balance gate: stop placing NEW calls once the org's prepaid
+        # rupee balance is empty (mid-campaign exhaustion). In-flight calls already
+        # placed finish normally; remaining pending contacts wait for a top-up +
+        # relaunch. ONLY non-deterministic campaigns deplete + are gated on this
+        # balance — deterministic / bulk-questionnaire campaigns are the operator-
+        # gated add-on, billed separately, so they dial regardless of the balance.
+        _cfg = campaign.agent_config or {}
+        _is_deterministic = bool(
+            _cfg.get("deterministic") or _cfg.get("questionnaire")
+        )
+        if not _is_deterministic:
+            try:
+                from app.services.minute_balance_service import has_balance
+
+                if tenant_res is not None and not await has_balance(db, tenant_res.organization_id):
+                    logger.info(
+                        "NOKVO-CAMPAIGN: empty prepaid balance — not dialing campaign %s",
+                        campaign.id,
+                    )
+                    return
+            except Exception:
+                logger.exception("NOKVO-CAMPAIGN: prepaid-balance gate check failed")
         # Lock + refresh to the latest committed batch state before deciding what
         # to dial. Without this a launch that placed calls and a webhook that ended
         # one could each write a stale ``contacts`` snapshot over the other.
@@ -1348,6 +1370,73 @@ class OutboundCampaignService:
     # ------------------------------------------------------------------
     # Call-level status updates (called from status webhook)
     # ------------------------------------------------------------------
+
+    @staticmethod
+    async def mark_answered(campaign_id: uuid.UUID, call_link_id: str) -> None:
+        """Stamp a campaign contact ANSWERED the instant its outbound media WS
+        connects — the reliable "callee picked up, audio is bridging" signal.
+
+        Plivo's outbound status webhook is wired ONLY as the ``hangup_url`` (see
+        ``initiate_outbound_call``), so a ``call.answered`` event NEVER reaches
+        ``handle_call_status``. Without this, every connected outbound call hangs
+        up with ``status="failed"`` (answered was never set) — which mislabels
+        real conversations (incl. qualified leads) and inflates ``failed_count``.
+        Marking answered here fixes the status at its source; the later hangup
+        webhook then keeps ``status="answered"`` (its guard skips the
+        already-answered branch) and just sets ``ended=True``.
+
+        Idempotent (a WS reconnect won't double-count) and runs under the
+        ``_lock_campaign`` FOR UPDATE lock in its own short-lived session, so it
+        serializes safely with the hangup webhook + the dialer. Best-effort:
+        never raises into the call-setup path."""
+        from app.db.session import AsyncSessionLocal
+
+        try:
+            async with AsyncSessionLocal() as db:
+                campaign = await OutboundCampaignService._lock_campaign(db, campaign_id)
+                if campaign is None:
+                    return
+                contacts = list(campaign.contacts or [])
+                target = next(
+                    (c for c in contacts if c.get("call_link_id") == call_link_id), None
+                )
+                # Unknown contact, or already marked → nothing to do (idempotent).
+                if target is None or target.get("status") == "answered" or target.get("answered_at"):
+                    return
+                target["status"] = "answered"
+                target["answered_at"] = datetime.now(timezone.utc).isoformat()
+                campaign.answered_count = (campaign.answered_count or 0) + 1
+                campaign.contacts = contacts
+                flag_modified(campaign, "contacts")
+                # Mirror handle_call_status: keep the join row + lead in sync.
+                cc_res = await db.execute(
+                    select(OutboundCampaignContact).where(
+                        OutboundCampaignContact.campaign_id == campaign.id,
+                        OutboundCampaignContact.call_link_id == call_link_id,
+                    )
+                )
+                cc = cc_res.scalars().first()
+                if cc is not None:
+                    cc.status = "answered"
+                    db.add(cc)
+                if target.get("lead_id"):
+                    try:
+                        lead = await db.get(OutgoingLead, uuid.UUID(str(target["lead_id"])))
+                    except (TypeError, ValueError):
+                        lead = None
+                    if lead is not None:
+                        lead.call_status = LeadCallStatus.called
+                        db.add(lead)
+                db.add(campaign)
+                await db.commit()
+                logger.info(
+                    "NOKVO-CAMPAIGN: contact answered (media connected) call_link_id=%s",
+                    call_link_id,
+                )
+        except Exception:
+            logger.exception(
+                "NOKVO-CAMPAIGN: mark_answered failed for call_link_id=%s", call_link_id
+            )
 
     @staticmethod
     async def handle_call_status(

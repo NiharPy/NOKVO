@@ -79,6 +79,15 @@ class CallCost(Base):
     # row keeps the rate it was billed at, so historical totals stay
     # reproducible even after we lift the rate to ₹10/min next quarter.
     rate_per_second = Column(Numeric(10, 6), nullable=False)
+    # PREPAID usage deduction (₹) for this call = 0.6 connection fee + per-second
+    # talk rate × seconds, where the rate is set by the FIFO prepaid bundle the
+    # rupees were spent from (see minute_pricing.call_usage_cost). This is what
+    # depletes the prepaid rupee balance. 0 (default) for calls that DON'T deplete
+    # it — deterministic / bulk-questionnaire outbound, never-connected calls, and
+    # all rows before this billing model. The balance = SUM(minute_purchases.rupees)
+    # − SUM(call_costs.prepaid_rupees). Distinct from ``rupees`` (legacy post-paid
+    # bill, kept for the SuperAdmin margin view) and the COGS columns below.
+    prepaid_rupees = Column(Numeric(14, 4), nullable=False, server_default="0")
     started_at = Column(DateTime(timezone=True), nullable=False)
     ended_at = Column(DateTime(timezone=True), nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())

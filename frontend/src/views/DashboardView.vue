@@ -1,5 +1,5 @@
 <script setup>
-import { computed } from 'vue';
+import { computed, onMounted, ref } from 'vue';
 import {
   ArrowUpRight,
   CalendarClock,
@@ -21,6 +21,12 @@ const {
   costSummary,
   isLoadingCostSummary,
   loadCostSummary,
+  // Prepaid balance + top-up
+  minutesBalance,
+  loadMinutesBalance,
+  startTopup,
+  isToppingUp,
+  topupNote,
   formatMinutes,
   memberPageLabel,
   currentOrganization,
@@ -72,6 +78,31 @@ const followupCounts = computed(() => ({
 const periodLabel = computed(() =>
   new Date().toLocaleString('en-IN', { month: 'long', year: 'numeric' }),
 );
+
+// ── Prepaid balance + top-up (flat-by-bracket; mirrors minute_pricing.py) ───
+const PREPAID_SLABS = [[1000, 10], [5000, 9.5], [10000, 9], [20000, 8.5], [25000, 8], [null, 5.5]];
+const MINUTES_MIN = 100;
+const topupMinutes = ref(1000);
+function topupRate(n) {
+  const v = Math.max(0, Math.floor(Number(n) || 0));
+  for (const [upper, r] of PREPAID_SLABS) if (upper === null || v <= upper) return r;
+  return 5.5;
+}
+const topupCost = computed(() => {
+  const n = Math.max(0, Math.floor(Number(topupMinutes.value) || 0));
+  return n * topupRate(n);
+});
+const topupValid = computed(() => Math.floor(Number(topupMinutes.value) || 0) >= MINUTES_MIN);
+function fmtINR(n) { return '₹' + Math.round(Number(n) || 0).toLocaleString('en-IN'); }
+const balRemaining = computed(() => Number(minutesBalance?.value?.remaining_rupees ?? 0));
+const balPurchased = computed(() => Number(minutesBalance?.value?.purchased_rupees ?? 0));
+// "Calls paused" only when they've actually bought minutes and run out — an org
+// that never purchased is grandfathered (not gated), so don't alarm it.
+const balLow = computed(() => balPurchased.value > 0 && balRemaining.value <= 0);
+// Hide the ₹0 balance headline for a never-purchased (grandfathered) org — show a
+// neutral "Pay as you onboard" hint instead of a scary ₹0.
+const balUnused = computed(() => minutesBalance?.value != null && balPurchased.value <= 0);
+onMounted(() => { if (typeof loadMinutesBalance === 'function') loadMinutesBalance(); });
 
 // Headline = the progressive minute-based invoice total (matches the breakdown
 // card). For go-forward calls this equals the summed per-call ledger exactly.
@@ -181,6 +212,39 @@ function initial(m) {
       </div>
     </header>
 
+    <!-- Prepaid balance + top-up -->
+    <section class="n-section n-rise" data-delay="1">
+      <article class="n-card dash__bal" :class="{ 'is-low': balLow }">
+        <div class="dash__bal-main">
+          <span class="n-page-head__eyebrow">Prepaid balance</span>
+          <strong class="dash__bal-value">{{ fmtINR(balRemaining) }}</strong>
+          <span v-if="balUnused" class="dash__bal-sub">Buy minutes to get started — your balance powers every call.</span>
+          <span v-else class="dash__bal-sub">
+            {{ fmtINR(balPurchased) }} paid · {{ fmtINR(minutesBalance?.consumed_rupees ?? 0) }} used
+            <em v-if="balLow"> · calls are paused — top up to resume</em>
+          </span>
+        </div>
+        <div v-if="isAdmin" class="dash__bal-topup">
+          <label class="dash__bal-field">
+            <span>Top up</span>
+            <input v-model.number="topupMinutes" type="number" :min="MINUTES_MIN" step="100" inputmode="numeric" />
+            <span class="dash__bal-unit">min</span>
+          </label>
+          <span v-if="topupValid" class="dash__bal-cost">{{ Number(topupMinutes).toLocaleString('en-IN') }} × {{ fmtINR(topupRate(topupMinutes)) }} = <strong>{{ fmtINR(topupCost) }}</strong></span>
+          <span v-else class="dash__bal-cost is-warn">Min {{ MINUTES_MIN }} min</span>
+          <button
+            type="button"
+            class="n-btn n-btn--brand n-btn--sm"
+            :disabled="isToppingUp || !topupValid"
+            @click="startTopup(topupMinutes)"
+          >
+            {{ isToppingUp ? 'Opening checkout…' : `Buy ${fmtINR(topupCost)}` }}
+          </button>
+        </div>
+      </article>
+      <p v-if="topupNote" class="dash__bal-note">{{ topupNote }}</p>
+    </section>
+
     <!-- Stats hero -->
     <section class="n-section n-rise" data-delay="1">
       <div class="dash__stats">
@@ -205,8 +269,9 @@ function initial(m) {
       </div>
     </section>
 
-    <!-- Tiered usage invoice -->
-    <section class="n-section n-rise" data-delay="1">
+    <!-- Tiered usage invoice — DEPRECATED under prepaid billing (kept hidden; the
+         prepaid balance card above is the live billing surface). -->
+    <section v-if="false" class="n-section n-rise" data-delay="1">
       <article class="n-card dash__invoice">
         <header class="dash__invoice-head">
           <div>
@@ -562,6 +627,28 @@ function initial(m) {
 .dash__org-edit:hover:not(:disabled) { opacity: 1; background: var(--n-bg-elev, rgba(0,0,0,0.04)); }
 .dash__org-edit:disabled { opacity: 0.4; cursor: default; }
 .dash__org-edit--save { background: var(--n-ink, #111); color: var(--n-bg, #fff); border-color: var(--n-ink, #111); opacity: 1; }
+
+/* Prepaid balance + top-up */
+.dash__bal {
+  padding: 18px 22px; display: flex; align-items: center; justify-content: space-between;
+  gap: 20px; flex-wrap: wrap;
+}
+.dash__bal.is-low { border-color: var(--n-danger, #c0362c); }
+.dash__bal-main { display: grid; gap: 2px; min-width: 0; }
+.dash__bal-value { font-size: 30px; font-weight: 800; line-height: 1.1; }
+.dash__bal.is-low .dash__bal-value { color: var(--n-danger, #c0362c); }
+.dash__bal-sub { font-size: 12.5px; color: var(--n-text-3); }
+.dash__bal-sub em { color: var(--n-danger, #c0362c); font-style: normal; font-weight: 600; }
+.dash__bal-topup { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.dash__bal-field { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 600; }
+.dash__bal-field input {
+  width: 100px; padding: 6px 8px; font-size: 14px; font-family: var(--n-font-mono);
+  border: 1.5px solid var(--n-border); border-radius: 8px; background: var(--n-surface); color: inherit;
+}
+.dash__bal-unit { color: var(--n-text-3); font-weight: 400; }
+.dash__bal-cost { font-size: 13px; color: var(--n-text-2, var(--n-text-3)); white-space: nowrap; }
+.dash__bal-cost.is-warn { color: var(--n-danger, #c0362c); }
+.dash__bal-note { margin: 8px 2px 0; font-size: 12.5px; color: var(--n-success, #1a7f37); }
 
 /* Tiered usage invoice */
 .dash__invoice { padding: 22px 24px; }

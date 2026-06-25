@@ -19,6 +19,9 @@ class Organization(Base):
     plan_type = Column(String, nullable=True)
     product_tier = Column(String, nullable=False, server_default="nokvo_prime", default="nokvo_prime")
     status = Column(String, nullable=False, server_default="active", default="active")
+    # Gates OUTBOUND (campaigns). Set from the plan: inbound_only → False,
+    # inbound_outbound → True. Both plans answer INBOUND, so there's no separate
+    # inbound direction gate — inbound is gated only on the prepaid-minute balance.
     calling_enabled = Column(Boolean, nullable=False, server_default="false", default=False)
     stores_pii = Column(Boolean, nullable=False, default=True)
     record_calls = Column(Boolean, nullable=False, default=True)

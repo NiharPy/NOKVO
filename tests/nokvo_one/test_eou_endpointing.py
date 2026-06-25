@@ -62,9 +62,26 @@ def test_neutral_tier(text):
     "my phone is 7569",         # mid-number dictation
     "I have",                   # SHORT weak-tail fragment → still waits (safe)
     "do you",                   # SHORT weak-tail fragment → still waits (safe)
+    # Field call 072f59e6: a trailing pronoun contraction is mid-thought — judge
+    # it on its root pronoun so the caller isn't cut off ("uh, it's … 1.8 crore").
+    "uh, it's",
+    "it's",
+    "I'm",
+    "that's",
 ])
 def test_continuation_tier(text):
     assert tier(text) == "continuation", text
+
+
+@pytest.mark.parametrize("text", [
+    # NEGATIVE contractions end a complete reply far more often than they trail
+    # off — they must NOT inherit the long pronoun-contraction wait.
+    "I don't",
+    "I can't",
+    "she isn't",
+])
+def test_negative_contractions_do_not_overwait(text):
+    assert tier(text) != "continuation", text
 
 
 def test_empty_is_neutral():

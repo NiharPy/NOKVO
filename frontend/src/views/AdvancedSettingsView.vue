@@ -16,7 +16,30 @@ const {
   loadWhatsAppLink,
   requestWhatsApp,
   cancelWhatsApp,
+  // Prepaid-minute balance + top-up
+  minutesBalance,
+  loadMinutesBalance,
+  startTopup,
+  isToppingUp,
+  topupNote,
 } = useDashboardState();
+
+// ── Prepaid voice minutes (flat-by-bracket; mirrors minute_pricing.py) ──────
+const PREPAID_SLABS = [[1000, 10], [5000, 9.5], [10000, 9], [20000, 8.5], [25000, 8], [null, 5.5]];
+const MINUTES_MIN = 100;
+const topupMinutes = ref(1000);
+function topupRate(n) {
+  const v = Math.max(0, Math.floor(Number(n) || 0));
+  for (const [upper, rate] of PREPAID_SLABS) if (upper === null || v <= upper) return rate;
+  return 5.5;
+}
+const topupCost = computed(() => {
+  const n = Math.max(0, Math.floor(Number(topupMinutes.value) || 0));
+  return n * topupRate(n);
+});
+const topupValid = computed(() => Math.floor(Number(topupMinutes.value) || 0) >= MINUTES_MIN);
+function fmtINR(n) { return '₹' + Math.round(Number(n) || 0).toLocaleString('en-IN'); }
+function fmtMin(n) { return (Number(n) || 0).toLocaleString('en-IN'); }
 
 // ── Business facts ────────────────────────────────────────────────────────
 // The agent's persona is a fixed, product-curated per-vertical prompt; the
@@ -34,6 +57,7 @@ onMounted(async () => {
     factsDraft.value = businessFacts?.value || '';
   }
   if (typeof loadWhatsAppLink === 'function') loadWhatsAppLink();
+  if (typeof loadMinutesBalance === 'function') loadMinutesBalance();
 });
 
 const factsDirty = computed(() => (factsDraft.value || '') !== (businessFacts?.value || ''));
@@ -115,6 +139,47 @@ const sections = computed(() => [
         </div>
       </div>
     </header>
+
+    <!-- ── Plan & prepaid voice minutes ── -->
+    <section class="n-section n-rise" data-delay="0">
+      <header class="n-section__head">
+        <div>
+          <h2 class="n-section__title">Prepaid balance</h2>
+          <p class="n-section__sub">What's left of what you've paid. Each connected inbound / outbound call deducts a connection fee + per-second rate. Calls stop at ₹0 — top up anytime.</p>
+        </div>
+      </header>
+      <div class="adv__minutes n-card">
+        <div class="adv__minutes-bal">
+          <div class="adv__minutes-stat">
+            <span class="adv__minutes-val">{{ fmtINR(minutesBalance?.remaining_rupees ?? 0) }}</span>
+            <span class="adv__minutes-lbl">remaining</span>
+          </div>
+          <div class="adv__minutes-sub">
+            <span>{{ fmtINR(minutesBalance?.purchased_rupees ?? 0) }} paid</span>
+            <span>·</span>
+            <span>{{ fmtINR(minutesBalance?.consumed_rupees ?? 0) }} used</span>
+          </div>
+        </div>
+        <div class="adv__minutes-topup">
+          <label class="adv__minutes-field">
+            <span>Top up</span>
+            <input v-model.number="topupMinutes" type="number" :min="MINUTES_MIN" step="100" class="adv__minutes-input" inputmode="numeric" />
+            <span class="adv__minutes-unit">min</span>
+          </label>
+          <span v-if="topupValid" class="adv__minutes-cost">{{ fmtMin(topupMinutes) }} × {{ fmtINR(topupRate(topupMinutes)) }} = <strong>{{ fmtINR(topupCost) }}</strong></span>
+          <span v-else class="adv__minutes-cost is-warn">Min {{ MINUTES_MIN }} minutes</span>
+          <button
+            type="button"
+            class="n-btn n-btn--brand n-btn--sm"
+            :disabled="isToppingUp || !topupValid"
+            @click="startTopup(topupMinutes)"
+          >
+            {{ isToppingUp ? 'Opening checkout…' : `Buy ${fmtINR(topupCost)}` }}
+          </button>
+        </div>
+        <p v-if="topupNote" class="adv__minutes-note">{{ topupNote }}</p>
+      </div>
+    </section>
 
     <section class="n-section n-rise" data-delay="1">
       <header class="n-section__head">
@@ -261,6 +326,23 @@ const sections = computed(() => [
 </template>
 
 <style scoped>
+/* Prepaid voice minutes */
+.adv__minutes { padding: 16px; display: grid; gap: 14px; }
+.adv__minutes-bal { display: grid; gap: 2px; }
+.adv__minutes-stat { display: flex; align-items: baseline; gap: 8px; }
+.adv__minutes-val { font-size: 28px; font-weight: 700; font-family: var(--n-font-mono); }
+.adv__minutes-lbl { font-size: 13px; color: var(--n-text-3); }
+.adv__minutes-sub { display: flex; gap: 6px; font-size: 12px; color: var(--n-text-3); }
+.adv__minutes-topup { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding-top: 12px; border-top: 2px solid var(--n-border); }
+.adv__minutes-field { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 600; }
+.adv__minutes-input {
+  width: 110px; padding: 6px 8px; font-size: 14px; font-family: var(--n-font-mono);
+  border: 1.5px solid var(--n-border); border-radius: 8px; background: var(--n-surface); color: inherit;
+}
+.adv__minutes-unit { color: var(--n-text-3); font-weight: 400; }
+.adv__minutes-cost { font-size: 13px; color: var(--n-text-2, var(--n-text-3)); }
+.adv__minutes-cost.is-warn { color: var(--n-danger, #c0362c); }
+.adv__minutes-note { margin: 0; font-size: 12.5px; color: var(--n-success, #1a7f37); }
 .adv__facts {
   padding: 16px;
   display: grid;
