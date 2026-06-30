@@ -44,6 +44,24 @@ def test_prepaid_org_gated_at_zero(monkeypatch):
     assert _run(mb.has_balance(None, "org")) is False      # overran
 
 
+def test_apex_no_grandfather_blocks_at_zero(monkeypatch):
+    # APEX passes grandfather=False — a prepaid-only product with no legacy orgs, so
+    # a never-purchased / comp-lost / bypassed org (purchased<=0) MUST be blocked,
+    # never fail open to free unmetered dialing.
+    _patch(monkeypatch, purchased=0, consumed=0)
+    assert _run(mb.has_balance(None, "org", grandfather=False)) is False
+    _patch(monkeypatch, purchased=0, consumed=500)
+    assert _run(mb.has_balance(None, "org", grandfather=False)) is False
+    # A real balance still allows; a drained one still blocks.
+    _patch(monkeypatch, purchased=54000, consumed=10000)
+    assert _run(mb.has_balance(None, "org", grandfather=False)) is True
+    _patch(monkeypatch, purchased=54000, consumed=54000)
+    assert _run(mb.has_balance(None, "org", grandfather=False)) is False
+    # The default (Nokvo One) keeps the grandfather — never-purchased is allowed.
+    _patch(monkeypatch, purchased=0, consumed=0)
+    assert _run(mb.has_balance(None, "org")) is True
+
+
 def test_balance_summary(monkeypatch):
     _patch(monkeypatch, purchased=54000, consumed=13200)
     s = _run(mb.balance_summary(None, "org"))

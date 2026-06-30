@@ -145,20 +145,39 @@ async def record_call_cost(
 
     campaign_uuid = _coerce_uuid(campaign_id)
 
-    # PREPAID usage deduction: a CONNECTED inbound / non-deterministic-outbound
-    # call depletes the prepaid rupee balance by 0.6 + rate×seconds, where the
-    # rate is set by the FIFO prepaid bundle the rupees are spent from. 0 for
-    # deterministic/bulk outbound (deducts_prepaid=False) and never-connected
-    # calls. Best-effort: a balance read hiccup must not block the ledger write
-    # (we record 0 and the call simply doesn't deplete).
+    # PREPAID usage deduction — two models, picked by the org's product:
+    #   • Nokvo One: a CONNECTED inbound / non-deterministic-outbound call depletes
+    #     the prepaid rupee balance by 0.6×started_min + rate×seconds (the rate set
+    #     by the FIFO bundle). 0 for deterministic/bulk outbound (deducts_prepaid=
+    #     False) and never-connected calls.
+    #   • NOKVO APEX: deterministic IS the product — EVERY connected call depletes
+    #     the Call Credits wallet at the SELLING rate (apex_call_cost: 1.5 once +
+    #     (slab−1.5)/60×sec), regardless of the passed deducts_prepaid flag.
+    # Both write the same CallCost.prepaid_rupees column. Best-effort: a balance
+    # read hiccup must not block the ledger write (we record 0, call doesn't deplete).
     prepaid_rupees = Decimal("0")
-    if deducts_prepaid and duration_seconds > 0:
+    try:
+        from app.models.organization import Organization
+
+        _product_tier = (
+            await db.execute(select(Organization.product_tier).where(Organization.id == org_uuid))
+        ).scalar_one_or_none()
+    except Exception:
+        _product_tier = None
+    _is_apex = (_product_tier or "") == "nokvo_apex"
+    if duration_seconds > 0 and (deducts_prepaid or _is_apex):
         try:
             from app.services.minute_balance_service import current_bundle_minutes
-            from app.services.minute_pricing import call_usage_cost
 
             bundle_minutes = await current_bundle_minutes(db, org_uuid)
-            prepaid_rupees = call_usage_cost(duration_seconds, bundle_minutes)
+            if _is_apex:
+                from app.services.minute_pricing import apex_call_cost
+
+                prepaid_rupees = apex_call_cost(duration_seconds, bundle_minutes)
+            else:
+                from app.services.minute_pricing import call_usage_cost
+
+                prepaid_rupees = call_usage_cost(duration_seconds, bundle_minutes)
         except Exception:
             logger.exception(
                 "NOKVO-COST: prepaid deduction failed (call_id=%s) — recording 0", call_id

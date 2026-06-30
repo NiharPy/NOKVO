@@ -4,6 +4,10 @@ import OrganizationPortal from '../components/OrganizationPortal.vue';
 import ConsoleLoginCard from '../components/ConsoleLoginCard.vue';
 import SuperAdminDashboard from '../components/SuperAdminDashboard.vue';
 
+// NOKVO APEX — dark product surface for deterministic outbound. Shares Nokvo
+// One's accounts + token + bulk-calling backend (frontend-only product split).
+const ApexApp = () => import('../apex/ApexApp.vue');
+
 // Dashboard views. Each view owns one page section that used to live inside
 // NokvoOneApp.vue under v-if="currentPage === '<key>'". During the migration
 // the v-if blocks remain in NokvoOneApp.vue; a route→currentPage watcher
@@ -100,6 +104,39 @@ const routes = [
     component: NokvoOneApp,
     props: { initialAuthState: 'login' },
     name: 'nokvo-one-accept-invite',
+  },
+
+  // ── NOKVO APEX (deterministic outbound, dark product) ──────────
+  {
+    path: '/nokvo-apex',
+    component: ApexApp,
+    props: { initialAuthState: 'login' },
+    name: 'nokvo-apex',
+  },
+  {
+    path: '/nokvo-apex/signin',
+    component: ApexApp,
+    props: { initialAuthState: 'login' },
+    name: 'nokvo-apex-signin',
+  },
+  {
+    path: '/nokvo-apex/signup',
+    component: ApexApp,
+    props: { initialAuthState: 'signup' },
+    name: 'nokvo-apex-signup',
+  },
+  {
+    path: '/nokvo-apex/dashboard',
+    component: ApexApp,
+    props: { initialAuthState: 'ready' },
+    name: 'nokvo-apex-dashboard',
+  },
+  {
+    // Member invite acceptance — ApexApp reads the :token and opens the invite screen.
+    path: '/nokvo-apex/invite/:token',
+    component: ApexApp,
+    props: { initialAuthState: 'invite' },
+    name: 'nokvo-apex-invite',
   },
 
   // ── Organization Portal ─────────────────────────────────────────

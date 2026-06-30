@@ -69,7 +69,10 @@ const isCalling = computed(() => !['idle', 'error'].includes(voiceStatus.value))
 
 function formatPhoneStep(text) {
   if (!text) return '';
-  return text.replace(/(\*\*\d+\*[\d\+]+#|##\d+#|\*\*\d+#)/g, '<code class="agent__ussd">$1</code>');
+  // Escape HTML FIRST (this string is rendered via v-html) so any markup in the
+  // source can never inject — then wrap USSD codes in <code> for display.
+  const esc = String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return esc.replace(/(\*\*\d+\*[\d\+]+#|##\d+#|\*\*\d+#)/g, '<code class="agent__ussd">$1</code>');
 }
 </script>
 

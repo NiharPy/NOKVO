@@ -284,11 +284,26 @@ class RequireMFACompleted:
 
 
 class RequireNokvoOneOrganization:
-    """Composite dep: active Nokvo One org user, optionally restricted to a set of org statuses."""
+    """Composite dep: active org user on an allowed PRODUCT, optionally restricted
+    to a set of org statuses + roles.
 
-    def __init__(self, allowed_statuses: list[str] | None = None, allowed_roles: list[str] | None = None):
+    Product isolation: ``allowed_product_tiers`` defaults to ``["nokvo_one"]`` so
+    Nokvo One endpoints reject APEX (``nokvo_apex``) orgs and vice-versa. The
+    SHARED bulk-calling endpoints pass ``["nokvo_one", "nokvo_apex"]`` so both
+    products reach them — data stays separate because every query is org-scoped.
+    The JWT ``product`` claim is cross-checked against the org's product_tier as
+    defense-in-depth (a token minted for one product can't drive the other), but
+    the DB ``org.product_tier`` is the authoritative gate."""
+
+    def __init__(
+        self,
+        allowed_statuses: list[str] | None = None,
+        allowed_roles: list[str] | None = None,
+        allowed_product_tiers: list[str] | None = None,
+    ):
         self.allowed_statuses = allowed_statuses or ["active"]
         self.allowed_roles = allowed_roles
+        self.allowed_product_tiers = allowed_product_tiers or ["nokvo_one"]
 
     async def __call__(
         self,
@@ -299,8 +314,16 @@ class RequireNokvoOneOrganization:
         org = result.scalars().first()
         if org is None:
             raise HTTPException(status_code=404, detail="Organization not found")
-        if (org.product_tier or "nokvo_prime") != "nokvo_one":
-            raise HTTPException(status_code=403, detail="This endpoint is only available for Nokvo One organizations")
+        tier = org.product_tier or "nokvo_prime"
+        if tier not in self.allowed_product_tiers:
+            raise HTTPException(status_code=403, detail="This endpoint is not available for your product.")
+        # Cross-check the JWT product tag against the org's product (defense in
+        # depth). Only enforced when the token carries the claim, so legacy
+        # tokens minted before this isolation landed keep working.
+        payload = getattr(user, "_jwt_payload", None) or {}
+        token_product = payload.get("product")
+        if token_product and token_product != security.org_product_claim(tier):
+            raise HTTPException(status_code=403, detail="This session belongs to a different product.")
         if org.status not in self.allowed_statuses:
             raise HTTPException(
                 status_code=403,
@@ -312,6 +335,18 @@ class RequireNokvoOneOrganization:
                 detail=f"Operation not permitted. Required organization role: {self.allowed_roles}",
             )
         return user
+
+
+class RequireApexOrganization(RequireNokvoOneOrganization):
+    """Active NOKVO APEX (``product_tier="nokvo_apex"``) org user. Rejects Nokvo
+    One orgs/tokens. Used by the APEX-only auth/me endpoints."""
+
+    def __init__(self, allowed_statuses: list[str] | None = None, allowed_roles: list[str] | None = None):
+        super().__init__(
+            allowed_statuses=allowed_statuses,
+            allowed_roles=allowed_roles,
+            allowed_product_tiers=["nokvo_apex"],
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

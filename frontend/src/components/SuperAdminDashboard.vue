@@ -17,6 +17,32 @@ const TOKEN_KEY = 'superadmin_access_token';
 const organizations = ref([]);
 const summary = ref({ count: 0, total_minutes: 0, total_revenue_inr: 0, total_cogs_inr: 0, total_margin_inr: 0 });
 const loading = ref(false);
+
+// Product separation: filter the Organizations console by product line.
+const productFilter = ref('all'); // 'all' | 'nokvo_one' | 'apex'
+const filteredOrganizations = computed(() => {
+  if (productFilter.value === 'apex') return organizations.value.filter((o) => o.is_apex);
+  if (productFilter.value === 'nokvo_one') return organizations.value.filter((o) => !o.is_apex);
+  return organizations.value;
+});
+const productCounts = computed(() => {
+  const apex = organizations.value.filter((o) => o.is_apex).length;
+  return { all: organizations.value.length, apex, nokvo_one: organizations.value.length - apex };
+});
+// Headline totals reflect the active filter: backend aggregate for "all", else
+// summed client-side from the visible rows so the strip matches the table.
+const filteredSummary = computed(() => {
+  if (productFilter.value === 'all') return summary.value;
+  const rows = filteredOrganizations.value;
+  const sum = (fn) => rows.reduce((a, o) => a + (Number(fn(o)) || 0), 0);
+  return {
+    count: rows.length,
+    total_minutes: sum((o) => o.minutes_used),
+    total_revenue_inr: sum((o) => o.revenue && o.revenue.total_inr),
+    total_cogs_inr: sum((o) => o.cogs_inr),
+    total_margin_inr: sum((o) => o.margin_inr),
+  };
+});
 const errorMsg = ref('');
 
 const detail = ref(null);
@@ -71,6 +97,13 @@ const bulkLoading = ref(false);
 const bulkBusy = ref(false);
 // Per-request grant form (auth/number the operator provisions), keyed by request id.
 const bulkGrantForms = ref({});
+// APEX bulk DIDs are provisioned MANUALLY (rent in Plivo → enable on the existing
+// sub-account). The programmatic "auto-provision" path is kept dormant (its
+// compliance-reuse buy was never proven against real Plivo); flip to true to expose
+// the button again.
+const APEX_AUTO_PROVISION_ENABLED = false;
+// Per-request "enable on the existing sub-account" form (numbers only), keyed by id.
+const grantExistingForms = ref({});
 
 const view = computed(() => {
   if (bulkView.value) return 'bulk';
@@ -326,6 +359,58 @@ const grantBulk = async (req) => {
     bulkBusy.value = false;
   }
 };
+// APEX one-click: programmatically create a dedicated sub-account + buy 5 DIDs
+// (deferred until compliance approves). No creds to paste.
+const autoProvisionBulk = async (req) => {
+  bulkBusy.value = true; errorMsg.value = '';
+  try {
+    const res = await fetch(`${SUPERADMIN_API_BASE}/tenants/bulk-calling-requests/${req.id}/auto-provision`, {
+      method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }), body: '{}',
+    });
+    if (!res.ok) {
+      let detail = `Auto-provision failed (${res.status}).`;
+      try { detail = (await res.json()).detail || detail; } catch { /* keep default */ }
+      errorMsg.value = detail;
+      return;
+    }
+    await loadBulkRequests();
+  } catch (e) {
+    errorMsg.value = 'Network error auto-provisioning.';
+  } finally {
+    bulkBusy.value = false;
+  }
+};
+// APEX manual path: rent the DIDs in Plivo by hand, then enable bulk calling on the
+// client's EXISTING account-creation sub-account here — no creds to paste. Numbers
+// optional (blank = auto-detect what's on the sub-account).
+const grantExistingForm = (id) => {
+  if (!grantExistingForms.value[id]) grantExistingForms.value[id] = { numbers: '' };
+  return grantExistingForms.value[id];
+};
+const grantExistingBulk = async (req) => {
+  const f = grantExistingForm(req.id);
+  const numbers = (f.numbers || '').split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
+  bulkBusy.value = true; errorMsg.value = '';
+  try {
+    const res = await fetch(`${SUPERADMIN_API_BASE}/tenants/bulk-calling-requests/${req.id}/grant-existing`, {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ numbers }),
+    });
+    if (!res.ok) {
+      let detail = `Enable failed (${res.status}).`;
+      try { detail = (await res.json()).detail || detail; } catch { /* keep default */ }
+      errorMsg.value = detail;
+      return;
+    }
+    delete grantExistingForms.value[req.id];
+    await loadBulkRequests();
+  } catch (e) {
+    errorMsg.value = 'Network error enabling bulk calling.';
+  } finally {
+    bulkBusy.value = false;
+  }
+};
 const denyBulk = async (req) => {
   bulkBusy.value = true; errorMsg.value = '';
   try {
@@ -455,7 +540,12 @@ function requestPlanChange(org) {
 function cancelPlanChange() { confirmTarget.value = null; compAck.value = false; }
 
 // ── Bypass payment (comp-activate a pending_payment tenant) ──
-function requestBypass(org) { bypassAck.value = false; bypassPlan.value = 'inbound_only'; bypassTarget.value = org; }
+function requestBypass(org) {
+  bypassAck.value = false;
+  // APEX orgs get the APEX plan; everything else defaults to inbound_only.
+  bypassPlan.value = org?.is_apex ? 'apex' : 'inbound_only';
+  bypassTarget.value = org;
+}
 function cancelBypass() { bypassTarget.value = null; bypassAck.value = false; }
 const confirmBypass = async () => {
   const org = bypassTarget.value;
@@ -481,6 +571,50 @@ const confirmBypass = async () => {
     if (row) row.status = updated.org_status;
   } catch (_) {
     errorMsg.value = 'Network error while bypassing payment.';
+  } finally {
+    planBusy.value = '';
+  }
+};
+
+// ── Grant APEX minutes (comp, no payment) ──
+const grantTarget = ref(null); // apex org to credit minutes
+const grantMinutesInput = ref(1000);
+const grantAck = ref(false);
+function requestGrantMinutes(org) { grantTarget.value = org; grantMinutesInput.value = 1000; grantAck.value = false; }
+function cancelGrant() { grantTarget.value = null; grantAck.value = false; }
+const confirmGrantMinutes = async () => {
+  const org = grantTarget.value;
+  const minutes = Math.floor(Number(grantMinutesInput.value) || 0);
+  if (!org || !grantAck.value || minutes <= 0) return;
+  const orgId = org.organization_id;
+  planBusy.value = orgId;
+  grantTarget.value = null;
+  try {
+    const res = await fetch(`${SUPERADMIN_API_BASE}/tenants/${orgId}/grant-minutes`, {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ minutes, acknowledge_comp: true }),
+    });
+    if (res.status === 401) { emit('logout'); return; }
+    if (!res.ok) {
+      const d = await res.json().catch(() => ({}));
+      errorMsg.value = d.detail || `Grant failed (${res.status}).`;
+      return;
+    }
+    const updated = await res.json();
+    // Reflect the LIVE wallet the grant credited (estimated minutes + credits).
+    const liveBal = {
+      remaining_minutes: updated.remaining_minutes,
+      credits_remaining: updated.credits_remaining,
+      credits_used: updated.credits_used,
+    };
+    const row = organizations.value.find((o) => o.organization_id === orgId);
+    if (row) row.apex_minutes = { ...(row.apex_minutes || {}), ...liveBal };
+    if (detail.value && detail.value.organization_id === orgId && detail.value.apex_minutes) {
+      Object.assign(detail.value.apex_minutes, liveBal);
+    }
+  } catch (_) {
+    errorMsg.value = 'Network error while granting minutes.';
   } finally {
     planBusy.value = '';
   }
@@ -661,15 +795,21 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
           </button>
         </div>
 
-        <div class="summary-strip">
-          <div class="summary-chip"><span class="summary-label">ORGS</span><strong>{{ summary.count }}</strong></div>
-          <div class="summary-chip"><span class="summary-label">MINUTES</span><strong>{{ minutes(summary.total_minutes) }}</strong></div>
-          <div class="summary-chip"><span class="summary-label">REVENUE</span><strong>{{ inr(summary.total_revenue_inr) }}</strong></div>
-          <div class="summary-chip"><span class="summary-label">COGS</span><strong>{{ inr(summary.total_cogs_inr) }}</strong></div>
-          <div class="summary-chip"><span class="summary-label">MARGIN</span><strong :class="summary.total_margin_inr < 0 ? 'neg' : 'pos'">{{ inr(summary.total_margin_inr) }}</strong></div>
+        <div class="product-filter">
+          <button type="button" class="pf-btn" :class="{ 'is-on': productFilter === 'all' }" @click="productFilter = 'all'">All <span class="pf-count">{{ productCounts.all }}</span></button>
+          <button type="button" class="pf-btn" :class="{ 'is-on': productFilter === 'nokvo_one' }" @click="productFilter = 'nokvo_one'">Nokvo One <span class="pf-count">{{ productCounts.nokvo_one }}</span></button>
+          <button type="button" class="pf-btn pf-btn--apex" :class="{ 'is-on': productFilter === 'apex' }" @click="productFilter = 'apex'">APEX <span class="pf-count">{{ productCounts.apex }}</span></button>
         </div>
 
-        <div v-if="organizations.length" class="table-wrap">
+        <div class="summary-strip">
+          <div class="summary-chip"><span class="summary-label">ORGS</span><strong>{{ filteredSummary.count }}</strong></div>
+          <div class="summary-chip"><span class="summary-label">MINUTES</span><strong>{{ minutes(filteredSummary.total_minutes) }}</strong></div>
+          <div class="summary-chip"><span class="summary-label">REVENUE</span><strong>{{ inr(filteredSummary.total_revenue_inr) }}</strong></div>
+          <div class="summary-chip"><span class="summary-label">COGS</span><strong>{{ inr(filteredSummary.total_cogs_inr) }}</strong></div>
+          <div class="summary-chip"><span class="summary-label">MARGIN</span><strong :class="filteredSummary.total_margin_inr < 0 ? 'neg' : 'pos'">{{ inr(filteredSummary.total_margin_inr) }}</strong></div>
+        </div>
+
+        <div v-if="filteredOrganizations.length" class="table-wrap">
           <table class="org-table">
             <thead>
               <tr>
@@ -683,7 +823,7 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
               </tr>
             </thead>
             <tbody>
-              <tr v-for="org in organizations" :key="org.organization_id">
+              <tr v-for="org in filteredOrganizations" :key="org.organization_id">
                 <td>
                   <button class="org-name-btn" @click="openDetail(org.organization_id)">{{ org.organization_name }}</button>
                   <div class="row-sub">
@@ -692,11 +832,13 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
                   </div>
                 </td>
                 <td>
-                  <span class="plan-pill" :class="org.calling_enabled ? 'plan-out' : 'plan-in'">{{ org.plan_label }}</span>
+                  <span v-if="org.is_apex" class="plan-pill plan-apex">APEX</span>
+                  <span v-else class="plan-pill" :class="org.calling_enabled ? 'plan-out' : 'plan-in'">{{ org.plan_label }}</span>
                 </td>
                 <td class="num">
                   {{ minutes(org.minutes_used) }}
                   <span class="row-sub muted">MTD {{ minutes(org.minutes_used_mtd) }}</span>
+                  <span v-if="org.is_apex && org.apex_minutes" class="row-sub apex-bal">{{ (org.apex_minutes.remaining_minutes || 0).toLocaleString('en-IN') }} min left</span>
                 </td>
                 <td class="num">
                   {{ inr(org.revenue.total_inr) }}
@@ -705,7 +847,22 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
                 <td class="num">{{ inr(org.cogs_inr) }}</td>
                 <td class="num" :class="org.margin_inr < 0 ? 'neg' : 'pos'">{{ inr(org.margin_inr) }}</td>
                 <td class="actions-col">
+                  <!-- APEX: payment bypass (when pending) + comp minutes grant. -->
+                  <template v-if="org.is_apex">
+                    <button
+                      v-if="org.status === 'pending_payment'"
+                      class="plan-btn upgrade"
+                      :disabled="planBusy === org.organization_id"
+                      @click="requestBypass(org)"
+                    >Bypass payment</button>
+                    <button
+                      class="plan-btn"
+                      :disabled="planBusy === org.organization_id"
+                      @click="requestGrantMinutes(org)"
+                    >+ Add minutes</button>
+                  </template>
                   <button
+                    v-else
                     class="plan-btn"
                     :class="org.calling_enabled ? 'downgrade' : 'upgrade'"
                     :disabled="planBusy === org.organization_id"
@@ -720,9 +877,13 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
           </table>
         </div>
 
-        <div v-else-if="!loading" class="empty-orgs">
+        <div v-else-if="!loading && !organizations.length" class="empty-orgs">
           <span class="stage-eyebrow">NO ORGANIZATIONS YET</span>
           <p>Organizations appear here once they sign up and pay.</p>
+        </div>
+        <div v-else-if="!loading" class="empty-orgs">
+          <span class="stage-eyebrow">NO {{ productFilter === 'apex' ? 'NOKVO APEX' : 'NOKVO ONE' }} ORGANIZATIONS</span>
+          <p>Switch the filter above to view other products.</p>
         </div>
         <div v-else class="empty-orgs"><p>Loading organizations…</p></div>
       </div>
@@ -882,7 +1043,7 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
               <tr v-for="f in feedback" :key="f.id">
                 <td>{{ fmtDate(f.created_at) }}</td>
                 <td><span class="fb-tag" :class="f.category === 'feature' ? 'is-feature' : 'is-feedback'">{{ f.category === 'feature' ? 'Feature' : 'Feedback' }}</span></td>
-                <td>{{ f.organization_name }}</td>
+                <td>{{ f.organization_name }} <span v-if="f.is_apex" class="plan-pill plan-apex">APEX</span></td>
                 <td>{{ f.submitted_by_email }}</td>
                 <td class="fb-msg">{{ f.message }}</td>
                 <td><button type="button" class="ghost-btn sm" @click="todoFromFeedback(f)">+ To-do</button></td>
@@ -924,8 +1085,26 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
                 :class="req.enabled ? 'is-feature' : (req.status === 'denied' ? 'is-feedback' : 'is-feedback')"
               >{{ req.enabled ? 'Enabled' : req.status }}</span>
             </div>
-            <div v-if="req.enabled" class="bulk-enabled">Calling from <strong>{{ req.bulk_number }}</strong></div>
-            <div v-else class="bulk-grant">
+            <div v-if="req.enabled" class="bulk-enabled">
+              Calling from <strong>{{ req.bulk_number }}</strong><span v-if="req.bulk_count"> · {{ req.bulk_count }} number(s) in pool</span>
+            </div>
+            <div v-if="req.bulk_status === 'provisioning'" class="bulk-meta">
+              Auto-provisioning {{ req.bulk_count }}/5 DIDs — buying the rest once Plivo compliance is approved.
+            </div>
+            <div v-if="!req.enabled" class="bulk-grant">
+              <!-- APEX: rent the DIDs in Plivo by hand, then enable on the client's
+                   EXISTING account-creation sub-account — no creds to paste. -->
+              <template v-if="req.is_apex">
+                <p class="bulk-grant-hint">Rent the DIDs in Plivo, then enable on the client's existing sub-account. Leave numbers blank to auto-detect what's on it.</p>
+                <input class="bulk-input" placeholder="Numbers rented (+91…, comma-separated) — optional" v-model="grantExistingForm(req.id).numbers" />
+                <button type="button" class="plan-btn" :disabled="bulkBusy" @click="grantExistingBulk(req)">ENABLE · EXISTING SUB-ACCOUNT</button>
+                <!-- Dormant programmatic buy (compliance-reuse unproven on real Plivo). -->
+                <button
+                  v-if="APEX_AUTO_PROVISION_ENABLED"
+                  type="button" class="plan-btn" :disabled="bulkBusy" @click="autoProvisionBulk(req)"
+                >{{ req.bulk_status === 'provisioning' ? 'RETRY AUTO-PROVISION' : 'AUTO-PROVISION 5 NUMBERS' }}</button>
+                <span class="bulk-or">or paste dedicated credentials</span>
+              </template>
               <input class="bulk-input" placeholder="Plivo Auth ID" v-model="bulkGrantForm(req.id).auth_id" />
               <input class="bulk-input" placeholder="Plivo Auth Token" type="password" v-model="bulkGrantForm(req.id).auth_token" />
               <input class="bulk-input" placeholder="DID / number (+91…)" v-model="bulkGrantForm(req.id).number" />
@@ -1269,13 +1448,14 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
           moving it out of <strong>pending&nbsp;payment</strong> straight into onboarding.
           No Razorpay charge is made.
         </p>
-        <label class="comp-field">
+        <label v-if="!bypassTarget.is_apex" class="comp-field">
           Plan to grant
           <select v-model="bypassPlan" class="todo-input">
             <option value="inbound_only">Inbound only</option>
             <option value="inbound_outbound">Inbound + Outbound</option>
           </select>
         </label>
+        <p v-else class="muted">Plan: <strong>NOKVO APEX</strong> (₹6,499/mo).</p>
         <p class="comp-warn">
           ⚠ This is a <strong>manual comp activation</strong> — payment is skipped and the
           action is recorded in the audit log.
@@ -1287,6 +1467,35 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
         <div class="modal-actions">
           <button class="ghost-btn" @click="cancelBypass">CANCEL</button>
           <button class="plan-btn upgrade" :disabled="!bypassAck" @click="confirmBypass">ACTIVATE (COMP)</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Grant APEX minutes (comp) ─────────────────────────────── -->
+    <div v-if="grantTarget" class="modal-overlay" @click.self="cancelGrant">
+      <div class="modal-card">
+        <span class="stage-eyebrow">ADD APEX MINUTES</span>
+        <h4>{{ grantTarget.organization_name }}</h4>
+        <p class="muted" v-if="grantTarget.apex_minutes">
+          Current balance: <strong>{{ (grantTarget.apex_minutes.remaining_minutes || 0).toLocaleString('en-IN') }}</strong> min
+        </p>
+        <label class="comp-ack" style="display:block;">
+          Minutes to credit
+          <input v-model.number="grantMinutesInput" type="number" min="1" step="100" class="todo-input" style="margin-top:0.4rem;" />
+        </label>
+        <p class="comp-warn">
+          ⚠ <strong>Comp grant</strong> — these minutes are added with no payment, straight to the
+          APEX balance, and the action is recorded in the audit log.
+        </p>
+        <label class="comp-ack">
+          <input type="checkbox" v-model="grantAck" />
+          I understand this credits paid minutes for free (no payment will be charged).
+        </label>
+        <div class="modal-actions">
+          <button class="ghost-btn" @click="cancelGrant">CANCEL</button>
+          <button class="plan-btn upgrade" :disabled="!grantAck || !(grantMinutesInput > 0)" @click="confirmGrantMinutes">
+            ADD {{ (Number(grantMinutesInput) || 0).toLocaleString('en-IN') }} MIN
+          </button>
         </div>
       </div>
     </div>
@@ -1434,6 +1643,17 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
 .back-btn { margin-bottom: 1rem; }
 .spin { animation: spin 0.9s linear infinite; }
 
+.product-filter { display: flex; gap: 0.4rem; margin-bottom: 1rem; }
+.pf-btn {
+  display: inline-flex; align-items: center; gap: 0.4rem;
+  border: 1px solid var(--border-color); border-radius: 8px;
+  padding: 0.4rem 0.85rem; background: var(--bg-input); color: var(--text-muted);
+  font-size: 0.72rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; cursor: pointer;
+}
+.pf-btn:hover { color: var(--text-primary); }
+.pf-btn.is-on { color: var(--text-primary); border-color: var(--text-primary); background: var(--bg-hover, rgba(127,127,127,0.12)); }
+.pf-btn--apex.is-on { color: #E62630; border-color: rgba(230, 38, 48, 0.6); background: rgba(230, 38, 48, 0.08); }
+.pf-count { font-size: 0.68rem; opacity: 0.75; }
 .summary-strip { display: flex; flex-wrap: wrap; gap: 0.6rem; margin-bottom: 1.25rem; }
 .summary-chip {
   display: flex; flex-direction: column; gap: 0.2rem;
@@ -1483,6 +1703,8 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
 }
 .plan-pill.plan-out { color: var(--success-color); border-color: rgba(52, 211, 153, 0.45); background: rgba(52, 211, 153, 0.08); }
 .plan-pill.plan-in { color: var(--text-secondary); }
+.plan-pill.plan-apex { color: #E62630; border-color: rgba(230, 38, 48, 0.5); background: rgba(230, 38, 48, 0.08); font-weight: 700; }
+.row-sub.apex-bal { color: #E62630; }
 
 .plan-btn {
   display: inline-flex; align-items: center; gap: 0.3rem;
@@ -1547,6 +1769,8 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
 .bulk-note { font-style: italic; color: var(--text-secondary, #9aa); margin: 6px 0 0; font-size: 0.8rem; }
 .bulk-enabled { margin-top: 10px; font-size: 0.85rem; }
 .bulk-grant { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; align-items: center; }
+.bulk-grant-hint { flex-basis: 100%; margin: 0; font-size: 0.75rem; color: var(--text-secondary, #9aa); line-height: 1.45; }
+.bulk-or { flex-basis: 100%; margin: 2px 0; font-size: 0.66rem; letter-spacing: 0.09em; text-transform: uppercase; color: var(--text-secondary, #9aa); opacity: 0.6; }
 .bulk-input {
   flex: 1 1 160px; min-width: 140px; padding: 0.45rem 0.6rem; border-radius: 8px;
   border: 1px solid var(--border-color, rgba(255,255,255,0.15)); background: var(--input-bg, rgba(0,0,0,0.2));

@@ -72,6 +72,17 @@ def _admin_dep():
     )
 
 
+def _feedback_dep():
+    """Feedback submission is shared across products — both Nokvo One AND NOKVO
+    APEX org users can send feedback / feature requests (surfaced together in the
+    SuperAdmin Feedback tab)."""
+    return deps.RequireNokvoOneOrganization(
+        allowed_statuses=["active"],
+        allowed_roles=["admin", "manager", "member"],
+        allowed_product_tiers=["nokvo_one", "nokvo_apex"],
+    )
+
+
 # ── Cost summary ────────────────────────────────────────────────────────────
 
 
@@ -232,11 +243,11 @@ class FeedbackSubmitRequest(BaseModel):
 @router.post("/feedback", status_code=status.HTTP_201_CREATED)
 async def submit_feedback(
     payload: FeedbackSubmitRequest,
-    user: OrganizationUser = Depends(_viewer_dep()),
+    user: OrganizationUser = Depends(_feedback_dep()),
     db: AsyncSession = Depends(deps.get_db),
 ):
-    """Any org user can submit feedback or a feature request. Stored for the
-    SuperAdmin console's Feedback tab."""
+    """Any Nokvo One OR NOKVO APEX org user can submit feedback or a feature
+    request. Stored for the SuperAdmin console's Feedback tab."""
     message = payload.message.strip()
     if not message:
         raise HTTPException(status_code=400, detail="Message cannot be empty.")

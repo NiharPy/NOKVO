@@ -27,7 +27,11 @@ class Settings(BaseSettings):
     ORGANIZATION_JWT_SECRET_KEY: str = ""
     NOKVO_ONE_SETUP_JWT_SECRET_KEY: str = ""
     OAUTH_STATE_SECRET_KEY: str = ""
-    JWT_LEGACY_SECRET_FALLBACK: bool = True
+    # Accept raw-SECRET_KEY-signed tokens on any tier (pre-tier-migration legacy).
+    # Default OFF: per-tier secrets are HMAC-derived + isolated, so the only thing
+    # this enabled was decoding old tokens that have since expired. Set True via env
+    # only as a temporary rollback if legacy tokens are somehow still in flight.
+    JWT_LEGACY_SECRET_FALLBACK: bool = False
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
     REFRESH_TOKEN_EXPIRE_HOURS: int = 4
@@ -346,6 +350,7 @@ class Settings(BaseSettings):
     # the id per-process. Pin these in production so restarts don't make plans.
     RAZORPAY_PLAN_INBOUND_ONLY: str = ""
     RAZORPAY_PLAN_INBOUND_OUTBOUND: str = ""
+    RAZORPAY_PLAN_APEX: str = ""
     # Public base used to build Application answer_url / media WS (defaults to the
     # request host when empty). e.g. https://api.nokvo.example
     PLIVO_WEBHOOK_BASE_URL: str = ""
@@ -355,11 +360,12 @@ class Settings(BaseSettings):
     # Plivo status webhook), so we never fire hundreds of simultaneous calls.
     OUTBOUND_DIAL_CONCURRENCY: int = 5
     # X-Plivo-Signature-V2 validation on the Plivo webhook endpoints.
-    # off | warn | enforce. Default "warn": log mismatches (with which token
-    # matched) without rejecting, so the first real call confirms whether
-    # Plivo signs with the master or subaccount token before we enforce.
-    # Auto-off when PLIVO_AUTH_TOKEN is unset.
-    PLIVO_VALIDATE_SIGNATURES: str = "warn"
+    # off | warn | enforce. Default "enforce": reject forged/unsigned call
+    # webhooks. Auto-off when PLIVO_AUTH_TOKEN is unset (so local dev without a
+    # token still works). A mismatch under enforce logs the COMPUTED signing URL
+    # so a public_base_url/PLIVO_WEBHOOK_BASE_URL contract error is one-env-var
+    # fixable; set to "warn" locally for tunneled dev if the signed URL differs.
+    PLIVO_VALIDATE_SIGNATURES: str = "enforce"
     # Startup auto-repair of stale Application answer_urls. Default off —
     # the superadmin resync endpoint is the deliberate repair path; silent
     # mutation on boot is risky with rotating tunnels / multiple instances.
@@ -374,6 +380,14 @@ class Settings(BaseSettings):
     # (so even already-pending rows stay put), and the UI hides all follow-up
     # surfaces. Flip to True to bring the feature back.
     FOLLOWUP_AGENT_ENABLED: bool = False
+    # Master kill switch for NOKVO ONE outbound calling. Outbound has moved to the
+    # dedicated NOKVO APEX product, so Nokvo One is inbound-only. Default OFF:
+    # Nokvo One orgs (product_tier="nokvo_one") cannot create/launch lead campaigns
+    # or bulk-calling campaigns and the dialer never places a call for them; the UI
+    # hides every outbound surface. APEX orgs (product_tier="nokvo_apex") share the
+    # bulk-calling backend and are NOT affected — they keep dialing. Flip to True to
+    # restore Nokvo One outbound.
+    NOKVO_ONE_OUTBOUND_ENABLED: bool = False
     # Request 16 kHz from Plivo's <Stream> (its highest L16 rate): preserves HD/VoLTE
     # audio when present, and matches Sarvam STT's native 16 kHz input so there's no
     # lossy 8k→16k upsample. Better recognition, especially for spoken digits.
@@ -643,3 +657,37 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=True, extra="ignore")
 
 settings = Settings()
+
+
+def validate_security_config() -> list[str]:
+    """Deploy-time security warnings (PRODUCTION only). Returned, not raised, so
+    startup logs loudly without refusing to boot — mirrors
+    ``app.services.public_url.validate_public_base_url``. Surfaces the fail-open
+    knobs that must be set/closed in prod."""
+    warnings: list[str] = []
+    if not settings.is_production:
+        return warnings
+    if not (settings.RAZORPAY_WEBHOOK_SECRET or "").strip():
+        warnings.append(
+            "RAZORPAY_WEBHOOK_SECRET is not set — the payment webhook is fail-closed "
+            "(503) in prod, so payments can't confirm via webhook. Set the secret."
+        )
+    if (settings.PLIVO_VALIDATE_SIGNATURES or "").strip().lower() != "enforce":
+        warnings.append(
+            f"PLIVO_VALIDATE_SIGNATURES is '{settings.PLIVO_VALIDATE_SIGNATURES}', not "
+            "'enforce' — forged Plivo call webhooks would be accepted. Set it to 'enforce'."
+        )
+    origin = settings.EXPECTED_ORIGIN or ""
+    if "localhost" in origin or "127.0.0.1" in origin or not origin.strip():
+        warnings.append(
+            f"EXPECTED_ORIGIN '{origin}' is localhost/empty — CORS will reject the real "
+            "frontend. Set it to the production origin."
+        )
+    if settings.JWT_LEGACY_SECRET_FALLBACK:
+        warnings.append(
+            "JWT_LEGACY_SECRET_FALLBACK is on — raw-SECRET_KEY tokens are accepted on any "
+            "tier. Turn it off once legacy (pre-tier-migration) tokens have expired."
+        )
+    if (settings.SECRET_KEY or "").strip().lower() in {"", "changeme", "secret", "dev", "development", "test"}:
+        warnings.append("SECRET_KEY is empty or a known dev value — set a strong, unique secret in prod.")
+    return warnings

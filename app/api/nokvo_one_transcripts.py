@@ -21,7 +21,12 @@ router = APIRouter()
 
 
 def _org_user():
-    return deps.RequireNokvoOneOrganization(allowed_statuses=["active"])
+    # Accept BOTH Nokvo One and NOKVO APEX orgs — transcripts are org-scoped
+    # (_load filters by organization_id), so each product only reads its own.
+    return deps.RequireNokvoOneOrganization(
+        allowed_statuses=["active"],
+        allowed_product_tiers=["nokvo_one", "nokvo_apex"],
+    )
 
 
 @router.get("/transcripts")

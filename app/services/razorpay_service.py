@@ -31,6 +31,8 @@ class RazorpayError(RuntimeError):
 PLAN_CATALOG: dict[str, dict[str, Any]] = {
     "inbound_only": {"amount_paise": 449900, "label": "Inbound Only", "outbound": False},
     "inbound_outbound": {"amount_paise": 649900, "label": "Inbound + Outbound", "outbound": True},
+    # NOKVO APEX — its single plan (deterministic outbound product). ₹6499/mo.
+    "apex": {"amount_paise": 649900, "label": "NOKVO APEX", "outbound": True},
 }
 
 # Per-process cache of lazily-created Razorpay plan ids, keyed by plan key.
@@ -65,10 +67,12 @@ class RazorpayService:
         spec = PLAN_CATALOG.get(plan_key)
         if spec is None:
             raise RazorpayError(f"Unknown plan: {plan_key}")
-        pinned = (
-            settings.RAZORPAY_PLAN_INBOUND_ONLY if plan_key == "inbound_only"
-            else settings.RAZORPAY_PLAN_INBOUND_OUTBOUND
-        )
+        if plan_key == "inbound_only":
+            pinned = settings.RAZORPAY_PLAN_INBOUND_ONLY
+        elif plan_key == "apex":
+            pinned = settings.RAZORPAY_PLAN_APEX
+        else:
+            pinned = settings.RAZORPAY_PLAN_INBOUND_OUTBOUND
         if pinned:
             return pinned
         if plan_key in _PLAN_CACHE:

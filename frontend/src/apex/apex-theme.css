@@ -1,0 +1,75 @@
+/* NOKVO APEX shared dark theme — GLOBAL classes (namespaced .ax-* so they never
+   collide with Nokvo One's light theme). Imported once by ApexApp.vue so the tab
+   components can share cards/tables/forms/pills without per-component duplication. */
+
+@keyframes axFadeG { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+.ax-anim { animation: axFadeG .35s ease; }
+
+.ax-card { background: rgba(255,255,255,0.025); border: 1px solid rgba(255,255,255,0.09); border-radius: 8px; }
+.ax-card-pad { padding: 34px 36px; }
+
+/* section heads */
+.ax-card-head { display: flex; justify-content: space-between; align-items: center; }
+.ax-h2 { font-size: 20px; font-weight: 600; margin: 0; }
+.ax-muted { font-size: 13.5px; color: rgba(255,255,255,0.48); margin: 9px 0 22px; line-height: 1.5; }
+.ax-count { font-family: 'JetBrains Mono', monospace; font-size: 13px; border-radius: 5px; padding: 3px 11px; }
+.ax-count--green { color: #7FD9A8; background: rgba(74,200,140,0.1); }
+.ax-count--grey { color: rgba(255,255,255,0.5); background: rgba(255,255,255,0.05); }
+
+/* buttons */
+.ax-btn2 { border-radius: 4px; font-family: 'Sora', sans-serif; cursor: pointer; transition: all .15s; }
+.ax-btn2--ghost { background: transparent; border: 1px solid rgba(255,255,255,0.14); color: rgba(255,255,255,0.7); font-size: 12.5px; padding: 8px 15px; }
+.ax-btn2--accent { background: #E62630; color: #fff; border: none; font-weight: 600; letter-spacing: 0.02em; padding: 14px 26px; font-size: 14px; }
+.ax-btn2--accent:disabled { opacity: 0.55; cursor: default; }
+.ax-btn2--sm { padding: 8px 14px; font-size: 12.5px; }
+
+/* forms */
+.ax-grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; }
+.ax-field-label { display: block; font-size: 12px; color: rgba(255,255,255,0.55); margin-bottom: 9px; }
+.ax-field-hint { color: rgba(255,255,255,0.3); }
+.ax-text { width: 100%; background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.1); border-radius: 4px; padding: 13px 15px; color: #F3F2F0; font-family: 'Sora', sans-serif; font-size: 14px; outline: none; transition: border-color .15s; }
+.ax-text::placeholder { color: rgba(255,255,255,0.26); }
+.ax-text:focus { border-color: rgba(255,255,255,0.32); }
+textarea.ax-text { resize: vertical; line-height: 1.5; }
+.ax-file { display: flex; align-items: center; gap: 13px; border: 1px solid rgba(255,255,255,0.1); border-radius: 4px; padding: 8px 9px; background: rgba(255,255,255,0.02); }
+.ax-file-btn { background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.13); border-radius: 3px; padding: 7px 14px; font-size: 13px; color: #F3F2F0; cursor: pointer; }
+.ax-file-name { color: rgba(255,255,255,0.4); font-size: 13px; }
+
+/* filter pills */
+.ax-filters { display: flex; gap: 4px; padding: 5px; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); border-radius: 10px; width: fit-content; flex-wrap: wrap; }
+.ax-chip { padding: 7px 16px; border-radius: 7px; font-size: 12.5px; cursor: pointer; border: none; background: transparent; color: rgba(255,255,255,0.45); font-weight: 500; font-family: 'Sora', sans-serif; transition: all .15s; }
+.ax-chip.is-active { background: rgba(255,255,255,0.08); color: #F3F2F0; font-weight: 600; }
+
+/* tables */
+.ax-thead { display: grid; padding: 18px 4px 13px; border-bottom: 1px solid rgba(255,255,255,0.08); font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: rgba(255,255,255,0.34); font-weight: 600; }
+.ax-trow { display: grid; align-items: center; padding: 20px 4px; border-bottom: 1px solid rgba(255,255,255,0.06); }
+.ax-trow--click { cursor: pointer; }
+.ax-cell-name { font-size: 16px; font-weight: 600; }
+.ax-cell-phone { font-family: 'JetBrains Mono', monospace; font-size: 13.5px; color: #E62630; }
+.ax-score { font-family: 'JetBrains Mono', monospace; font-size: 13px; color: #7FD9A8; background: rgba(74,200,140,0.1); border-radius: 5px; padding: 4px 12px; justify-self: start; }
+.ax-score--grey { color: rgba(255,255,255,0.6); background: rgba(255,255,255,0.05); }
+.ax-outcome { font-family: 'JetBrains Mono', monospace; font-size: 12px; color: rgba(255,255,255,0.55); border: 1px solid rgba(255,255,255,0.14); border-radius: 4px; padding: 5px 11px; justify-self: start; }
+
+/* empty state */
+.ax-empty { border: 1px dashed rgba(255,255,255,0.12); border-radius: 8px; padding: 64px 20px; text-align: center; }
+.ax-empty-icon { width: 44px; height: 44px; border: 1px solid rgba(255,255,255,0.14); border-radius: 9px; display: flex; align-items: center; justify-content: center; margin: 0 auto 18px; color: rgba(255,255,255,0.3); font-size: 20px; }
+.ax-empty-text { font-size: 14px; color: rgba(255,255,255,0.4); margin: 0; line-height: 1.5; }
+
+/* score breakdown */
+.ax-break { background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.07); border-radius: 8px; padding: 26px 28px; margin: 14px 0; }
+.ax-break-label { font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase; color: rgba(255,255,255,0.34); font-weight: 600; margin-bottom: 14px; }
+.ax-break-reason { font-size: 13.5px; color: rgba(255,255,255,0.55); line-height: 1.55; margin: 0 0 12px; }
+.ax-break-row { display: flex; align-items: flex-start; gap: 14px; padding: 14px 0; border-top: 1px solid rgba(255,255,255,0.05); }
+.ax-break-mark { width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; margin-top: 2px; }
+.ax-break-mark--ok { background: rgba(74,200,140,0.14); color: #7FD9A8; }
+.ax-break-mark--miss { background: rgba(255,255,255,0.06); color: rgba(255,255,255,0.4); }
+.ax-break-q { font-size: 14.5px; color: #F3F2F0; line-height: 1.4; }
+.ax-break-a { font-family: 'JetBrains Mono', monospace; font-size: 12.5px; color: rgba(255,255,255,0.42); margin-top: 6px; }
+.ax-break-pts { font-family: 'JetBrains Mono', monospace; font-size: 14px; color: #7FD9A8; font-weight: 500; }
+.ax-callnote { margin-top: 20px; padding-top: 18px; border-top: 1px solid rgba(255,255,255,0.05); }
+.ax-callnote-label { font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase; color: rgba(255,255,255,0.34); font-weight: 600; }
+.ax-callnote-text { font-size: 13.5px; color: rgba(255,255,255,0.6); line-height: 1.6; }
+
+.ax-notice { font-size: 13px; margin: 14px 0 0; }
+.ax-notice--ok { color: #7FD9A8; }
+.ax-notice--err { color: #ff8b8b; }

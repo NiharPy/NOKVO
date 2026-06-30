@@ -107,6 +107,31 @@ def _admin_dep():
     )
 
 
+# SHARED bulk-calling deps — accept BOTH Nokvo One and NOKVO APEX orgs. The
+# deterministic bulk-calling surface is shared between the two products (APEX is
+# the deterministic product, Nokvo One the non-deterministic), but every query is
+# org-scoped so each product only ever sees its own campaigns/contacts. Used ONLY
+# on the bulk-calling + transcript endpoints; every other Nokvo One endpoint stays
+# nokvo_one-only via _admin_dep/_viewer_dep.
+_BULK_PRODUCT_TIERS = ["nokvo_one", "nokvo_apex"]
+
+
+def _bulk_admin_dep():
+    return deps.RequireNokvoOneOrganization(
+        allowed_statuses=_ALLOWED_STATUSES,
+        allowed_roles=["admin"],
+        allowed_product_tiers=_BULK_PRODUCT_TIERS,
+    )
+
+
+def _bulk_viewer_dep():
+    return deps.RequireNokvoOneOrganization(
+        allowed_statuses=_ALLOWED_STATUSES,
+        allowed_roles=["admin", "manager"],
+        allowed_product_tiers=_BULK_PRODUCT_TIERS,
+    )
+
+
 async def _tenant_for_user(db: AsyncSession, user: OrganizationUser) -> TenantResources:
     res = await db.execute(
         select(TenantResources).where(TenantResources.organization_id == user.organization_id)
@@ -125,15 +150,39 @@ async def _org_for_user(db: AsyncSession, user: OrganizationUser) -> Organizatio
     return org
 
 
+# Shown when a Nokvo One org hits an outbound surface while the kill switch is
+# off — outbound has moved to the dedicated NOKVO APEX product.
+_NOKVO_ONE_OUTBOUND_DISABLED_DETAIL = (
+    "Outbound calling is no longer available on Nokvo One. It has moved to "
+    "NOKVO APEX, our dedicated outbound product."
+)
+
+
+def _nokvo_one_outbound_blocked(org: Organization) -> bool:
+    """True when this org is blocked from outbound by the Nokvo One kill switch.
+
+    Outbound calling has moved to the dedicated NOKVO APEX product, so Nokvo One
+    (``product_tier="nokvo_one"``) is inbound-only when ``NOKVO_ONE_OUTBOUND_ENABLED``
+    is off (the default). APEX orgs (``product_tier="nokvo_apex"``) share the
+    bulk-calling endpoints and are explicitly EXEMPT — they keep dialing."""
+    return (
+        (org.product_tier or "nokvo_one") == "nokvo_one"
+        and not settings.NOKVO_ONE_OUTBOUND_ENABLED
+    )
+
+
 async def _require_outbound_enabled(db: AsyncSession, user: OrganizationUser) -> Organization:
-    """Gate outbound calling on the plan. Only the Inbound + Outbound plan sets
-    ``calling_enabled`` (see Razorpay payment-gated onboarding).
+    """Gate outbound calling. First the product kill switch (Nokvo One outbound
+    has moved to NOKVO APEX), then the plan: only the Inbound + Outbound plan
+    sets ``calling_enabled`` (see Razorpay payment-gated onboarding).
 
     The prepaid-balance gate is NOT here: deterministic / bulk-questionnaire
     campaigns are billed separately and must remain creatable + dialable with a
     zero prepaid balance. The balance gate lives in the dialer for
     NON-deterministic campaigns + the inbound webhook (see the prepaid overhaul)."""
     org = await _org_for_user(db, user)
+    if _nokvo_one_outbound_blocked(org):
+        raise HTTPException(status_code=403, detail=_NOKVO_ONE_OUTBOUND_DISABLED_DETAIL)
     if not org.calling_enabled:
         raise HTTPException(
             status_code=403,
@@ -1427,9 +1476,13 @@ async def _check_plivo_signature(request: Request, *, tenant_token: str | None =
     if matched:
         logger.debug("PLIVO-SIG ok (%s token) %s", matched, request.url.path)
         return True
+    # Log the COMPUTED signing URL we validated against — a mismatch here is almost
+    # always a public_base_url / PLIVO_WEBHOOK_BASE_URL contract error (the signed
+    # URL Plivo used differs from what we reconstruct). With this, "enforce broke
+    # our calls" is diagnosable + one-env-var fixable (or set the mode to warn).
     logger.warning(
-        "PLIVO-SIG %s: signature mismatch path=%s nonce=%s sig_present=%s",
-        mode, request.url.path, bool(nonce), bool(signature),
+        "PLIVO-SIG %s: signature mismatch path=%s nonce=%s sig_present=%s computed_url=%s request_url=%s",
+        mode, request.url.path, bool(nonce), bool(signature), public_url, str(request.url),
     )
     return mode != "enforce"
 
@@ -2042,7 +2095,7 @@ async def _latest_bulk_request(db: AsyncSession, organization_id):
 
 @router.get("/bulk-calling/status")
 async def bulk_calling_status(
-    user: OrganizationUser = Depends(_viewer_dep()),
+    user: OrganizationUser = Depends(_bulk_viewer_dep()),
     db: AsyncSession = Depends(deps.get_db),
 ):
     """Gate state for the Bulk CSV Calling card:
@@ -2121,12 +2174,14 @@ async def create_bulk_calling_campaign(
     silence_timeout_seconds: float | None = Form(None),
     questionnaire: str | None = Form(None),
     deterministic: bool = Form(False),
-    # Deterministic-campaign calling capacity (no dialer enforcement yet — stored
-    # for planning + the capacity readout). hours_per_day is capped at 10 because
-    # outbound calling is TRAI-limited to the 9 AM–7 PM IST window.
+    # Deterministic-campaign calling schedule. The dialer ENFORCES this: it only
+    # places calls inside 09:00–19:00 IST (TRAI), on the first ``working_days``
+    # weekdays (5→Mon–Fri), and stops at ``calls_per_day`` placements/day.
+    # ``hours_per_day`` is kept for the capacity readout (capped at 10 = the band).
     working_days: int | None = Form(None),
     hours_per_day: int | None = Form(None),
-    user: OrganizationUser = Depends(_admin_dep()),
+    calls_per_day: int | None = Form(None),
+    user: OrganizationUser = Depends(_bulk_admin_dep()),
     _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
     db: AsyncSession = Depends(deps.get_db),
 ):
@@ -2186,16 +2241,21 @@ async def create_bulk_calling_campaign(
         agent_config["deterministic"] = bool(deterministic)
         if parsed_questionnaire:
             agent_config["questionnaire"] = parsed_questionnaire
-        # Calling-capacity window (deterministic campaigns). Stored on the config —
-        # no migration, surfaced via _campaign_response's agent_config passthrough.
-        # Clamped: ≥1 working day, 1–10 hours/day (9 AM–7 PM IST is a 10h band).
-        if working_days is not None or hours_per_day is not None:
+        # Calling schedule. Stored on the config (no migration), surfaced via
+        # _campaign_response's agent_config passthrough. For NOKVO APEX the dialer
+        # ENFORCES it (09:00–19:00 IST window + weekday gate from working_days +
+        # calls_per_day daily cap); for Nokvo One it stays a capacity readout only.
+        # working_days/hours_per_day keep their existing clamps so Nokvo One is
+        # unchanged; the APEX weekday map treats working_days as days/week (1–7).
+        if working_days is not None or hours_per_day is not None or calls_per_day is not None:
             agent_config["call_window"] = {
                 "working_days": max(1, min(60, int(working_days or 1))),
                 "hours_per_day": max(1, min(10, int(hours_per_day or 1))),
                 "timezone": "Asia/Kolkata",
                 "window_local": "09:00-19:00",
             }
+            if calls_per_day:
+                agent_config["call_window"]["calls_per_day"] = max(1, int(calls_per_day))
         campaign = await OutboundCampaignService.create_and_launch_bulk_campaign(
             tr,
             db,
@@ -2216,7 +2276,7 @@ async def create_bulk_calling_campaign(
 async def rerun_bulk_calling_campaign(
     campaign_id: uuid.UUID,
     request: Request,
-    user: OrganizationUser = Depends(_admin_dep()),
+    user: OrganizationUser = Depends(_bulk_admin_dep()),
     _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
     db: AsyncSession = Depends(deps.get_db),
 ):
@@ -2250,7 +2310,7 @@ async def rerun_bulk_calling_campaign(
 
 @router.get("/campaigns")
 async def list_campaigns(
-    user: OrganizationUser = Depends(_viewer_dep()),
+    user: OrganizationUser = Depends(_bulk_viewer_dep()),
     db: AsyncSession = Depends(deps.get_db),
 ):
     tr = await _tenant_for_user(db, user)
@@ -2301,6 +2361,10 @@ async def create_campaign(
     the leads-list page size.
     """
     tr = await _tenant_for_user(db, user)
+    # Outbound has moved to NOKVO APEX — Nokvo One can't create outbound campaigns
+    # at all (not even drafts). APEX uses the /bulk-calling endpoints, not this one.
+    if _nokvo_one_outbound_blocked(await _org_for_user(db, user)):
+        raise HTTPException(status_code=403, detail=_NOKVO_ONE_OUTBOUND_DISABLED_DETAIL)
     # "Create & call" (launch=true): gate on the plan BEFORE creating, so we never
     # leave a campaign that can't be launched.
     if launch:

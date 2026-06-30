@@ -68,8 +68,12 @@ onMounted(() => {
 });
 
 // Only the bulk-CSV campaigns (agent_config.bulk_csv === true).
+// Nokvo One shows ONLY non-deterministic (pitch) bulk campaigns. Deterministic
+// (scored questionnaire) campaigns live in NOKVO APEX, so they're filtered out of
+// every Nokvo One bulk surface (list + Qualified/Not-Interested/Didn't-Pick-Up/
+// Call-Logs tabs all derive from this one computed).
 const bulkCampaigns = computed(() =>
-  (campaigns?.value || []).filter((c) => c?.agent_config?.bulk_csv),
+  (campaigns?.value || []).filter((c) => c?.agent_config?.bulk_csv && !c.deterministic),
 );
 
 // Local copies of helpers that live (scoped) inside OutgoingAgentView.
@@ -448,28 +452,14 @@ async function openCall(row) {
 
             <!-- Granted → upload CSV + start calling -->
             <div v-else class="outbound__bulk-launch">
-              <!-- ── Campaign type ── -->
-              <div class="blc__type">
-                <button
-                  type="button"
-                  class="blc__type-card"
-                  :class="{ 'is-active': bulkCampaignForm.campaign_type === 'deterministic' }"
-                  :disabled="!isAdmin"
-                  @click="bulkCampaignForm.campaign_type = 'deterministic'"
-                >
-                  <strong>Deterministic</strong>
-                  <span>Structured questionnaire — intro + scored questions, auto-qualify by lead score.</span>
-                </button>
-                <button
-                  type="button"
-                  class="blc__type-card"
-                  :class="{ 'is-active': bulkCampaignForm.campaign_type === 'non_deterministic' }"
-                  :disabled="!isAdmin"
-                  @click="bulkCampaignForm.campaign_type = 'non_deterministic'"
-                >
-                  <strong>Non-deterministic</strong>
-                  <span>Free-form pitch — give the offer details and the agent improvises the call.</span>
-                </button>
+              <!-- Deterministic (scored questionnaire) campaigns moved to NOKVO
+                   APEX. Nokvo One runs the free-form pitch campaigns only. -->
+              <div class="blc__apex-note">
+                <div>
+                  <strong>Free-form pitch campaigns</strong>
+                  <span>Give the offer details and the agent improvises the call. Need a scored questionnaire with lead-scoring? That now lives in NOKVO APEX.</span>
+                </div>
+                <a class="blc__apex-link" href="/nokvo-apex" target="_blank" rel="noopener">Open NOKVO APEX →</a>
               </div>
 
               <div class="outbound__bulk-row">
@@ -500,175 +490,18 @@ async function openCall(row) {
               </div>
               <label class="n-field">
                 <span class="n-field__label">
-                  {{ bulkCampaignForm.campaign_type === 'deterministic' ? 'Background / context' : 'What to say / offer details' }}
-                  <span class="n-field__sub">{{ bulkCampaignForm.campaign_type === 'deterministic' ? 'optional — extra info the agent can lean on if the prospect goes off-script' : "the offer + key facts — we turn this into the agent's script" }}</span>
+                  What to say / offer details
+                  <span class="n-field__sub">the offer + key facts — we turn this into the agent's script</span>
                 </span>
                 <textarea
                   v-model="bulkCampaignForm.content"
                   class="n-input"
                   rows="3"
-                  :placeholder="bulkCampaignForm.campaign_type === 'deterministic' ? 'Optional: e.g. Raghava Estates — gated community in Kollur, ready December, ₹85L onward. The agent can reference this if asked.' : 'New 3BHK gated community in Kollur, ₹85L onward, ready by December. Offer: free registration this month.'"
+                  placeholder="New 3BHK gated community in Kollur, ₹85L onward, ready by December. Offer: free registration this month."
                   :disabled="!isAdmin"
                 ></textarea>
               </label>
 
-              <!-- ── Deterministic: intro + lead-capture questionnaire ── -->
-              <div v-if="bulkCampaignForm.campaign_type === 'deterministic'" class="blc__qbuild">
-                <div class="blc__qbuild-head">
-                  <span class="n-field__label">
-                    Lead qualification questionnaire
-                    <span class="n-field__sub">the agent asks these, scores each, and auto-qualifies by lead score</span>
-                  </span>
-                  <button type="button" class="n-btn n-btn--ghost n-btn--sm" :disabled="!isAdmin" @click="addQuestion">
-                    + Add question
-                  </button>
-                </div>
-                <label class="n-field blc__q-intro">
-                  <span class="n-field__label">
-                    Intro line
-                    <span class="n-field__sub">how the agent opens the call before the questions — said first, in the campaign language</span>
-                  </span>
-                  <textarea
-                    v-model="bulkCampaignForm.intro"
-                    class="n-input"
-                    rows="2"
-                    placeholder="Hi, this is Riya from Raghava Estates — I'm calling about our new gated community in Kollur. Do you have a quick minute?"
-                    :disabled="!isAdmin"
-                  ></textarea>
-                </label>
-                <label class="n-field blc__q-intro">
-                  <span class="n-field__label">
-                    Outro line
-                    <span class="n-field__sub">how the agent closes — spoken to end every call, and immediately when a dealbreaker question fails</span>
-                  </span>
-                  <textarea
-                    v-model="bulkCampaignForm.outro"
-                    class="n-input"
-                    rows="2"
-                    placeholder="Thanks so much for your time — have a great day!"
-                    :disabled="!isAdmin"
-                  ></textarea>
-                </label>
-                <div v-if="bulkCampaignForm.questions.length" class="blc__qlist">
-                  <div v-for="(q, i) in bulkCampaignForm.questions" :key="q.id" class="blc__q">
-                    <div class="blc__q-row">
-                      <span class="blc__q-num">{{ i + 1 }}</span>
-                      <select v-model="q.type" class="n-input blc__q-type" :disabled="!isAdmin">
-                        <option value="intent">Intent detection (yes/no)</option>
-                        <option value="answer">Desired answer (match)</option>
-                      </select>
-                      <input
-                        v-model="q.text"
-                        type="text"
-                        class="n-input blc__q-text"
-                        placeholder="e.g. Are you looking to buy in the next 3 months?"
-                        :disabled="!isAdmin"
-                      />
-                      <input
-                        v-if="q.type === 'answer' && !q.graded"
-                        v-model="q.desired_answer"
-                        type="text"
-                        class="n-input blc__q-ans"
-                        placeholder="expected answer e.g. Kollur"
-                        :disabled="!isAdmin"
-                      />
-                      <select
-                        v-else-if="q.type === 'intent'"
-                        v-model="q.required"
-                        class="n-input blc__q-ans"
-                        title="The Yes/No answer needed to qualify"
-                        :disabled="!isAdmin"
-                      >
-                        <option value="yes">Required: Yes</option>
-                        <option value="no">Required: No</option>
-                      </select>
-                      <label
-                        v-if="!(q.type === 'answer' && q.graded)"
-                        class="blc__q-pts"
-                        title="Points earned when this question is answered correctly"
-                      >
-                        <input v-model.number="q.points" type="number" min="1" max="100" class="n-input" :disabled="!isAdmin" />
-                        <span>pts</span>
-                      </label>
-                      <button type="button" class="blc__q-del" :disabled="!isAdmin" title="Remove question" @click="removeQuestion(i)">×</button>
-                    </div>
-                    <label v-if="q.type === 'answer'" class="blc__q-graded">
-                      <input type="checkbox" v-model="q.graded" :disabled="!isAdmin" @change="onGradedToggle(q)" />
-                      <span>Graded scoring — different answers earn different points (e.g. budget bands)</span>
-                    </label>
-                    <div v-if="q.type === 'answer' && q.graded" class="blc__tiers">
-                      <div v-for="(t, ti) in q.tiers" :key="t.id" class="blc__tier">
-                        <input
-                          v-model="t.label"
-                          type="text"
-                          class="n-input blc__tier-label"
-                          placeholder="band, e.g. above 1 crore"
-                          :disabled="!isAdmin"
-                        />
-                        <label class="blc__q-pts" title="Points for this band">
-                          <input v-model.number="t.points" type="number" min="1" max="100" class="n-input" :disabled="!isAdmin" />
-                          <span>pts</span>
-                        </label>
-                        <button type="button" class="blc__q-del" :disabled="!isAdmin" title="Remove band" @click="removeTier(q, ti)">×</button>
-                      </div>
-                      <button type="button" class="n-btn n-btn--ghost n-btn--sm blc__tier-add" :disabled="!isAdmin" @click="addTier(q)">+ Add band</button>
-                    </div>
-                    <label v-if="!(q.type === 'answer' && q.graded)" class="blc__q-gate">
-                      <input type="checkbox" v-model="q.gate" :disabled="!isAdmin" />
-                      <span>Dealbreaker — if this isn't answered correctly, go to the outro and cut the call</span>
-                    </label>
-                  </div>
-                  <div class="blc__q-thresh">
-                    <span class="blc__q-thresh-label">Qualify when score ≥</span>
-                    <input
-                      v-model.number="bulkCampaignForm.threshold"
-                      type="number"
-                      class="n-input blc__q-thresh-input"
-                      :min="1"
-                      :max="maxPoints"
-                      :disabled="!isAdmin"
-                    />
-                    <span class="blc__q-thresh-hint">of {{ maxPoints }} point(s) available</span>
-                  </div>
-                </div>
-                <p v-else class="blc__q-empty">
-                  Add at least one question — set each question's points (or graded bands) to weight the lead score.
-                </p>
-
-                <!-- Calling capacity: working window + live per-call time estimate -->
-                <div class="blc__capacity">
-                  <div class="blc__capacity-inputs">
-                    <label class="n-field blc__cap-field">
-                      <span class="n-field__label">Working days</span>
-                      <input v-model.number="bulkCampaignForm.working_days" type="number" min="1" max="60" class="n-input" :disabled="!isAdmin" />
-                    </label>
-                    <label class="n-field blc__cap-field">
-                      <span class="n-field__label">
-                        Hours / day
-                        <span class="n-field__sub">9 AM–7 PM IST · max 10</span>
-                      </span>
-                      <input v-model.number="bulkCampaignForm.hours_per_day" type="number" min="1" max="10" class="n-input" :disabled="!isAdmin" />
-                    </label>
-                  </div>
-                  <div v-if="estCallSeconds" class="blc__capacity-readout">
-                    <div class="blc__cap-stat">
-                      <span class="blc__cap-stat-val">{{ estCallLabel }}</span>
-                      <span class="blc__cap-stat-lbl">est. per call</span>
-                    </div>
-                    <div class="blc__cap-stat">
-                      <span class="blc__cap-stat-val">{{ callCapacity.totalHours }}h</span>
-                      <span class="blc__cap-stat-lbl">{{ callCapacity.days }} days × {{ callCapacity.hours }}h</span>
-                    </div>
-                    <div class="blc__cap-stat">
-                      <span class="blc__cap-stat-val">~{{ callCapacity.calls.toLocaleString() }}</span>
-                      <span class="blc__cap-stat-lbl">calls fit the window</span>
-                    </div>
-                  </div>
-                  <p class="blc__cap-note">
-                    Calls run 9 AM–7 PM IST. The per-call time is a rough estimate from your {{ (bulkCampaignForm.questions || []).length }} question(s) — it varies with how much people talk.
-                  </p>
-                </div>
-              </div>
 
               <button
                 type="button"
@@ -704,7 +537,7 @@ async function openCall(row) {
                   <PhoneCall :size="14" />
                   <strong class="n-truncate">{{ c.name }}</strong>
                   <span class="n-tag" :class="campaignStatusTone(c.status)">{{ c.status }}</span>
-                  <span class="n-tag n-tag--mono">{{ c.deterministic ? 'Deterministic' : 'Pitch' }}</span>
+                  <span class="n-tag n-tag--mono">Pitch</span>
                 </div>
                 <div class="blc__camp-meta">
                   <span><strong>{{ c.total_count || 0 }}</strong> dialed</span>
@@ -1223,17 +1056,15 @@ async function openCall(row) {
 .blc__turn-text { font-size: 13.5px; line-height: 1.5; color: var(--n-text); white-space: pre-wrap; font-family: var(--n-font-mono); }
 
 /* ── Campaign type selector ── */
-.blc__type { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-.blc__type-card {
-  appearance: none; text-align: left; cursor: pointer;
+.blc__apex-note {
+  display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap;
   border: 2px solid var(--n-border); border-radius: var(--n-r-md, 8px);
-  background: var(--n-bg); padding: 12px 14px; display: grid; gap: 4px;
+  background: var(--n-surface); padding: 14px 16px;
 }
-.blc__type-card:hover { background: var(--n-surface); }
-.blc__type-card.is-active { border-color: var(--n-text); box-shadow: 3px 3px 0 var(--n-brand); }
-.blc__type-card strong { font-size: 14px; color: var(--n-text); }
-.blc__type-card span { font-size: 12px; color: var(--n-text-3); line-height: 1.4; }
-.blc__type-card:disabled { opacity: 0.6; cursor: not-allowed; }
+.blc__apex-note strong { display: block; font-size: 14px; color: var(--n-text); }
+.blc__apex-note span { font-size: 12.5px; color: var(--n-text-3); line-height: 1.45; }
+.blc__apex-link { white-space: nowrap; font-size: 13px; font-weight: 600; color: var(--n-brand, #6366f1); text-decoration: none; }
+.blc__apex-link:hover { text-decoration: underline; }
 @media (max-width: 760px) { .blc__type { grid-template-columns: 1fr; } }
 
 /* ── Questionnaire builder ── */

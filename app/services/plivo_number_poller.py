@@ -93,6 +93,19 @@ async def _poll_tenant(db, tr: TenantResources) -> bool:
     return True
 
 
+async def _poll_tenant_bulk(db, tr: TenantResources) -> None:
+    """Top up an APEX tenant's AUTO-PROVISIONED bulk DID pool once its onboarding
+    compliance is approved. No-op unless ``bulk_calling.status == 'provisioning'``
+    (only the APEX one-click auto-provision sets that), so this is naturally scoped
+    to APEX and idle for everyone else."""
+    bulk = dict((tr.provider_status or {}).get("bulk_calling") or {})
+    if bulk.get("status") != "provisioning" or not bulk.get("auto_provisioned"):
+        return
+    from app.services.plivo_bulk_provisioning_service import PlivoBulkProvisioningService
+
+    await PlivoBulkProvisioningService._buy_pending_numbers(tr, db)
+
+
 async def _poll_once() -> None:
     if not (settings.PLIVO_AUTH_ID and settings.PLIVO_AUTH_TOKEN):
         return  # Plivo not configured — nothing to poll.
@@ -103,6 +116,13 @@ async def _poll_once() -> None:
                 await _poll_tenant(db, tr)
             except Exception:
                 logger.exception("PLIVO-POLLER: unexpected error for tenant=%s", tr.tenant_id)
+                with suppress(Exception):
+                    await db.rollback()
+            # Independent of the per-tenant inbound number: top up the bulk pool.
+            try:
+                await _poll_tenant_bulk(db, tr)
+            except Exception:
+                logger.exception("PLIVO-POLLER: bulk top-up failed for tenant=%s", tr.tenant_id)
                 with suppress(Exception):
                     await db.rollback()
 

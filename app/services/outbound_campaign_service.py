@@ -29,6 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.models.outgoing_lead import LeadCallStatus, OutboundCampaignContact, OutgoingLead
 from app.models.outbound_campaign import CampaignStatus, OutboundCampaign
+from app.models.organization import Organization
 from app.models.tenant_resources import TenantResources
 from app.services.plivo_service import PlivoService
 from app.services.agent_outbound_context import build_agent_config, invalidate as invalidate_outbound_context
@@ -193,6 +194,77 @@ def _doc_to_chunks(text: str, words_per_chunk: int = 350) -> list[dict[str, Any]
                 "metadata": {},
             })
     return chunks
+
+
+# ---------------------------------------------------------------------------
+# Scheduled-dialer window (TRAI-compliant outbound pacing)
+# ---------------------------------------------------------------------------
+# Deterministic / APEX campaigns carry a ``call_window`` on agent_config:
+#   {working_days: N, hours_per_day: H, calls_per_day: C,
+#    timezone: "Asia/Kolkata", window_local: "09:00-19:00",
+#    dialed_today: {date: "YYYY-MM-DD", count: N}}   # runtime counter
+# India commercial calling is restricted to ~09:00–19:00 IST; we also let the
+# customer pick how many weekdays and how many calls/day. These pure helpers make
+# the gate decision (the dialer enforces it; the wake-tick poller resumes paused
+# campaigns when the window reopens).
+
+_IST_TZ = "Asia/Kolkata"
+
+
+def _ist_now() -> datetime:
+    """Current time in Asia/Kolkata (tz-aware)."""
+    try:
+        from zoneinfo import ZoneInfo
+
+        return datetime.now(ZoneInfo(_IST_TZ))
+    except Exception:  # pragma: no cover — zoneinfo always present on 3.9+
+        return datetime.now(timezone.utc)
+
+
+def _allowed_weekdays(working_days) -> set[int]:
+    """Map a days/week COUNT to weekday indexes (Mon=0). 5→Mon–Fri, 6→Mon–Sat,
+    7→all; clamped to 1..7; the first N starting Monday."""
+    try:
+        n = int(working_days)
+    except (TypeError, ValueError):
+        n = 7
+    n = max(1, min(7, n))
+    return set(range(n))  # 0..n-1  (Mon, Tue, …)
+
+
+def _parse_window_hours(window_local) -> tuple[int, int]:
+    """Parse "HH:MM-HH:MM" → (start_hour, end_hour); default (9, 19)."""
+    try:
+        start_s, end_s = str(window_local).split("-", 1)
+        return int(start_s.split(":")[0]), int(end_s.split(":")[0])
+    except Exception:
+        return 9, 19
+
+
+def call_window_allows(call_window: dict | None, now: datetime) -> tuple[bool, str]:
+    """Pure: may a campaign dial at ``now`` (tz-aware, IST)? Returns
+    (allowed, reason). No window → always allowed (legacy / Nokvo One). The hour
+    band is 09:00–19:00 by default; the day is gated by ``working_days``."""
+    if not call_window:
+        return True, "no_window"
+    start_h, end_h = _parse_window_hours(call_window.get("window_local"))
+    if now.hour < start_h or now.hour >= end_h:
+        return False, "outside_hours"
+    if now.weekday() not in _allowed_weekdays(call_window.get("working_days")):
+        return False, "outside_days"
+    return True, "open"
+
+
+def _dialed_today_count(call_window: dict | None, today_str: str) -> int:
+    """Today's placement count from the runtime counter, 0 on an IST date
+    rollover (the counter resets each day)."""
+    d = (call_window or {}).get("dialed_today") or {}
+    if d.get("date") == today_str:
+        try:
+            return int(d.get("count") or 0)
+        except (TypeError, ValueError):
+            return 0
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -1246,33 +1318,102 @@ class OutboundCampaignService:
         placement loop, released by the commit below) so a status webhook can't
         read a stale snapshot mid-placement and revert just-placed contacts to
         ``pending`` — which previously made the dialer re-place them forever."""
-        # Prepaid-balance gate: stop placing NEW calls once the org's prepaid
-        # rupee balance is empty (mid-campaign exhaustion). In-flight calls already
-        # placed finish normally; remaining pending contacts wait for a top-up +
-        # relaunch. ONLY non-deterministic campaigns deplete + are gated on this
-        # balance — deterministic / bulk-questionnaire campaigns are the operator-
-        # gated add-on, billed separately, so they dial regardless of the balance.
         _cfg = campaign.agent_config or {}
-        _is_deterministic = bool(
-            _cfg.get("deterministic") or _cfg.get("questionnaire")
-        )
-        if not _is_deterministic:
+        _is_deterministic = bool(_cfg.get("deterministic") or _cfg.get("questionnaire"))
+        # Resolve the org product tier once — it drives both the Nokvo One outbound
+        # kill switch and the prepaid-balance gate below.
+        _org_tier: str | None = None
+        _tier_resolved = False
+        if tenant_res is not None:
+            try:
+                _org_tier = (
+                    await db.execute(
+                        select(Organization.product_tier).where(
+                            Organization.id == tenant_res.organization_id
+                        )
+                    )
+                ).scalar_one_or_none()
+                _tier_resolved = True
+            except Exception:
+                logger.exception("NOKVO-CAMPAIGN: product-tier lookup failed for %s", campaign.id)
+
+        # Nokvo One outbound kill switch — checked FIRST. Outbound has moved to the
+        # dedicated NOKVO APEX product, so a non-APEX org never places a call while
+        # NOKVO_ONE_OUTBOUND_ENABLED is off. This stops already-running campaigns and
+        # webhook-driven refills, not just new launches (those are blocked at the
+        # API). APEX is the SOLE exempt tier and is always tagged
+        # product_tier="nokvo_apex"; we fail OPEN when the tier can't be read, so a
+        # transient DB error can never silence a live APEX campaign.
+        if (
+            not settings.NOKVO_ONE_OUTBOUND_ENABLED
+            and _tier_resolved
+            and (_org_tier or "nokvo_one") != "nokvo_apex"
+        ):
+            logger.info("NOKVO-CAMPAIGN: Nokvo One outbound disabled — not dialing %s", campaign.id)
+            return
+
+        # Prepaid-balance gate (product-aware). Stop placing NEW calls once the
+        # org's balance is empty (mid-campaign exhaustion); in-flight calls finish.
+        #   • NOKVO APEX (product_tier=nokvo_apex): deterministic IS the product —
+        #     gate on the MINUTES balance (apex_has_minutes).
+        #   • Nokvo One: only NON-deterministic campaigns deplete the rupee balance;
+        #     deterministic stays exempt (billed separately).
+        if tenant_res is not None and _tier_resolved:
             try:
                 from app.services.minute_balance_service import has_balance
 
-                if tenant_res is not None and not await has_balance(db, tenant_res.organization_id):
-                    logger.info(
-                        "NOKVO-CAMPAIGN: empty prepaid balance — not dialing campaign %s",
-                        campaign.id,
+                # APEX: deterministic IS the product and depletes the Call Credits
+                # wallet, so gate EVERY APEX campaign on the wallet — and WITHOUT the
+                # grandfather (APEX is prepaid-only with no legacy orgs, so a zero
+                # balance must block, never fail open to free dialing). Nokvo One:
+                # only NON-deterministic campaigns deplete the rupee balance
+                # (deterministic stays exempt, billed separately) and keeps the
+                # legacy grandfather.
+                _blocked = False
+                if _org_tier == "nokvo_apex":
+                    _blocked = not await has_balance(
+                        db, tenant_res.organization_id, grandfather=False
                     )
+                elif not _is_deterministic:
+                    _blocked = not await has_balance(db, tenant_res.organization_id)
+                if _blocked:
+                    logger.info("NOKVO-CAMPAIGN: empty prepaid balance — not dialing %s", campaign.id)
                     return
             except Exception:
                 logger.exception("NOKVO-CAMPAIGN: prepaid-balance gate check failed")
+
+        # Scheduled-dialer window — NOKVO APEX only (the scheduled-outbound product).
+        # An APEX campaign with a call_window dials only inside 09:00–19:00 IST on its
+        # allowed weekdays; outside → pause (return) and the wake-tick poller resumes
+        # it when the window reopens. (The per-day cap is enforced under the row lock
+        # below.) Nokvo One campaigns — even deterministic ones that carry a
+        # call_window for the capacity readout — are NOT schedule-gated.
+        _apex_scheduled = _org_tier == "nokvo_apex" and bool(_cfg.get("call_window"))
+        if _apex_scheduled:
+            _allowed, _reason = call_window_allows(_cfg.get("call_window"), _ist_now())
+            if not _allowed:
+                logger.info("NOKVO-CAMPAIGN: %s paused (%s) — outside call window", campaign.id, _reason)
+                return
         # Lock + refresh to the latest committed batch state before deciding what
         # to dial. Without this a launch that placed calls and a webhook that ended
         # one could each write a stale ``contacts`` snapshot over the other.
         campaign = await OutboundCampaignService._lock_campaign(db, campaign.id)
         if campaign is None:
+            return
+        # Per-day cap (calls_per_day) — APEX scheduled campaigns only. The runtime
+        # counter lives on the LOCKED campaign's call_window and resets on the IST
+        # date rollover. Stop placing once today's placements reach the cap; the
+        # wake-tick poller resumes it the next allowed day. 0/absent → no cap.
+        _lock_cw = (campaign.agent_config or {}).get("call_window") or {}
+        try:
+            _calls_per_day = int(_lock_cw.get("calls_per_day") or 0) if _apex_scheduled else 0
+        except (TypeError, ValueError):
+            _calls_per_day = 0
+        _today_str = _ist_now().strftime("%Y-%m-%d") if _calls_per_day > 0 else ""
+        _today_count = _dialed_today_count(_lock_cw, _today_str) if _calls_per_day > 0 else 0
+        if _calls_per_day > 0 and _today_count >= _calls_per_day:
+            logger.info("NOKVO-CAMPAIGN: %s hit daily cap %d — not dialing", campaign.id, _calls_per_day)
+            await db.commit()  # release the FOR UPDATE lock
             return
         # Bulk CSV campaigns always fan out up to BULK_DIAL_CONCURRENCY (5) lines
         # at once, independent of the global per-tenant dial concurrency.
@@ -1297,9 +1438,13 @@ class OutboundCampaignService:
             and not c.get("ended")
         }
         placed_any = False
+        placed_count = 0
         if pool:
             for contact in contacts:
                 if OutboundCampaignService._inflight_count(contacts) >= cap:
+                    break
+                # Stop at the per-day cap (today's prior placements + this tick's).
+                if _calls_per_day > 0 and (_today_count + placed_count) >= _calls_per_day:
                     break
                 # Only place a genuinely-undialed contact: pending, with no call
                 # already placed and not already ended. The call_id / ended checks
@@ -1322,12 +1467,21 @@ class OutboundCampaignService:
                     )
                     in_flight_numbers.add(chosen)
                     placed_any = True
+                    placed_count += 1
         if placed_any:
             campaign.contacts = contacts
             # MUST flag — plain JSONB + in-place dict mutation means SQLAlchemy's
             # old==new check skips the UPDATE; without this the placement (call_id,
             # status=calling) never persists and the dialer re-dials forever.
             flag_modified(campaign, "contacts")
+            # Advance the per-day counter so the cap holds across ticks + webhooks.
+            if _calls_per_day > 0 and _today_str:
+                _ac = campaign.agent_config or {}
+                _cw = dict(_ac.get("call_window") or {})
+                _cw["dialed_today"] = {"date": _today_str, "count": _today_count + placed_count}
+                _ac["call_window"] = _cw
+                campaign.agent_config = _ac
+                flag_modified(campaign, "agent_config")
             db.add(campaign)
             await db.commit()
             await db.refresh(campaign)

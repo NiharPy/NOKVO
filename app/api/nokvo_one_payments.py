@@ -22,6 +22,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api import deps
@@ -36,8 +37,10 @@ from app.models.tenant_resources import TenantResources
 from app.services.email_service import EmailService
 from app.services.minute_pricing import (
     MINUTES_MIN,
+    apex_wallet_credit,
     cost_for_minutes,
     cost_paise,
+    credited_minutes,
     flat_rate_for_minutes,
 )
 from app.services.nokvo_one_provisioning_service import NokvoOneProvisioningService
@@ -87,11 +90,18 @@ async def _record_minute_purchase(
     source: str,
     razorpay_payment_id: str | None,
     razorpay_ref: str | None,
+    rupees=None,
+    rate_per_minute=None,
 ) -> None:
     """Credit a paid minute bundle to the org, EXACTLY ONCE. Idempotent on
     ``razorpay_payment_id`` (the payment can't double-credit on a verify+webhook
     race or a Razorpay retry). A purchase with no payment id is skipped — we only
-    credit confirmed payments."""
+    credit confirmed payments.
+
+    ``minutes`` is the CREDITED amount. ``rupees``/``rate_per_minute`` default to
+    the flat-bracket price of ``minutes`` (Nokvo One: credited == billed), but
+    APEX overrides them — it BILLS on the selected minutes while crediting
+    floor(1.5×) minutes, so it passes the selected-minutes price explicitly."""
     if not minutes or minutes <= 0 or not razorpay_payment_id:
         return
     existing = (
@@ -106,14 +116,20 @@ async def _record_minute_purchase(
             id=uuid.uuid4(),
             organization_id=organization_id,
             minutes=int(minutes),
-            rupees=cost_for_minutes(minutes),
-            rate_per_minute=flat_rate_for_minutes(minutes),
+            rupees=cost_for_minutes(minutes) if rupees is None else rupees,
+            rate_per_minute=flat_rate_for_minutes(minutes) if rate_per_minute is None else rate_per_minute,
             source=source,
             razorpay_payment_id=razorpay_payment_id,
             razorpay_ref=razorpay_ref,
         )
     )
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        # Concurrent verify+webhook race: the other path inserted this payment id
+        # first. UNIQUE(razorpay_payment_id) guarantees no double-credit, so the
+        # loser just rolls back and treats the bundle as already credited.
+        await db.rollback()
 
 
 class VerifyPaymentRequest(BaseModel):
@@ -244,18 +260,44 @@ async def activate_and_provision(db: AsyncSession, organization_id: uuid.UUID) -
     }
 
 
+def _purchase_args_for_sub(sub) -> dict:
+    """Credit args for a paid subscription's minute bundle. NOKVO APEX (plan=
+    "apex") BILLS on the selected minutes and credits a CALL CREDITS wallet of
+    ``cost × 1.5`` (the 50% bonus as spendable credits), tagged to the SELECTED-
+    minute bundle so the FIFO slab the wallet deducts at is the bracket bought.
+    Nokvo One credits exactly what was billed (rupees == cost)."""
+    selected = int(getattr(sub, "minutes", 0) or 0)
+    if getattr(sub, "plan", None) == "apex":
+        return {
+            "minutes": selected,
+            "rupees": apex_wallet_credit(selected),
+            "rate_per_minute": flat_rate_for_minutes(selected),
+        }
+    return {"minutes": selected}
+
+
+def _subscription_is_paid(remote: dict) -> bool:
+    """True when Razorpay's subscription object says it's genuinely paid/live.
+    The single source of truth for granting service — used by the webhook's
+    background activation AND the /payments/status resume so a forged/replayed
+    webhook can never grant anything Razorpay hasn't confirmed."""
+    return str((remote or {}).get("status") or "") in {"active", "authenticated"}
+
+
 async def _bg_activate(organization_id: uuid.UUID) -> None:
     """Webhook's background activation on a fresh session — never blocks the 200.
 
     Failure-safe twin of ``verify``: provisions AND credits the prepaid-minute
-    bundle (idempotent) in case the client-side verify was lost."""
+    bundle (idempotent) in case the client-side verify was lost.
+
+    DEFENSE IN DEPTH: the subscription is re-verified against the Razorpay API
+    (the source of truth) BEFORE anything is granted — so a forged or replayed
+    webhook, even one that somehow slipped past signature validation, can never
+    activate an org or credit minutes. Mirrors the gate in ``/payments/status``."""
     from app.db.session import AsyncSessionLocal
 
     try:
         async with AsyncSessionLocal() as db:
-            await activate_and_provision(db, organization_id)
-            # Credit the onboarding minutes once the webhook has stamped the
-            # subscription's payment id. Idempotent on the payment id.
             sub = (
                 await db.execute(
                     select(Subscription)
@@ -263,14 +305,35 @@ async def _bg_activate(organization_id: uuid.UUID) -> None:
                     .order_by(Subscription.created_at.desc())
                 )
             ).scalars().first()
-            if sub is not None and sub.minutes and sub.razorpay_payment_id:
+            if sub is None or not sub.razorpay_subscription_id:
+                logger.info("RAZORPAY: bg-activate skipped — no subscription for org %s", organization_id)
+                return
+            # Razorpay must confirm the subscription is genuinely paid/live.
+            try:
+                remote = await RazorpayService.fetch_subscription(sub.razorpay_subscription_id)
+            except RazorpayError:
+                logger.warning(
+                    "RAZORPAY: bg-activate — could not verify subscription %s; NOT granting",
+                    sub.razorpay_subscription_id,
+                )
+                return
+            if not _subscription_is_paid(remote):
+                logger.warning(
+                    "RAZORPAY: bg-activate — subscription %s status=%r not paid; NOT granting",
+                    sub.razorpay_subscription_id, remote.get("status"),
+                )
+                return
+            await activate_and_provision(db, organization_id)
+            # Credit the onboarding minutes once the webhook has stamped the
+            # subscription's payment id. Idempotent on the payment id.
+            if sub.minutes and sub.razorpay_payment_id:
                 await _record_minute_purchase(
                     db,
                     organization_id=organization_id,
-                    minutes=int(sub.minutes),
                     source="onboarding",
                     razorpay_payment_id=sub.razorpay_payment_id,
                     razorpay_ref=sub.razorpay_subscription_id,
+                    **_purchase_args_for_sub(sub),
                 )
     except Exception:
         logger.exception("RAZORPAY: background activation failed for org %s", organization_id)
@@ -330,6 +393,8 @@ async def create_subscription(payload: CreateSubscriptionRequest, db: AsyncSessi
         )
     )
     await db.commit()
+    _is_apex = payload.plan == "apex"
+    _credited = credited_minutes(minutes) if _is_apex else minutes
     return {
         "subscription_id": razorpay_subscription_id,
         "key_id": settings.RAZORPAY_KEY_ID,
@@ -337,10 +402,14 @@ async def create_subscription(payload: CreateSubscriptionRequest, db: AsyncSessi
         "amount_paise": spec["amount_paise"],
         # First-invoice total the customer pays now (platform fee + minutes bundle).
         "minutes": minutes,
+        "credited_minutes": _credited,  # ≈ minutes display (APEX: credits ÷ slab)
+        # APEX wallet grant in Call Credits (cost × 1.5); null for Nokvo One (rupee
+        # balance == amount paid, no bonus).
+        "credits": float(apex_wallet_credit(minutes)) if _is_apex else None,
         "minutes_amount_paise": minutes_paise,
         "first_invoice_paise": spec["amount_paise"] + minutes_paise,
-        "name": "Nokvo One",
-        "description": f"{spec['label']} — ₹{spec['amount_paise'] // 100}/mo + {minutes} min",
+        "name": "NOKVO APEX" if _is_apex else "Nokvo One",
+        "description": f"{spec['label']} — ₹{spec['amount_paise'] // 100}/mo + {_credited} min",
     }
 
 
@@ -371,14 +440,15 @@ async def verify_payment(
     result = await activate_and_provision(db, organization_id)
 
     # Credit the prepaid-minute bundle bought with this subscription (idempotent
-    # on the payment id, so a verify+webhook race can't double-credit).
+    # on the payment id, so a verify+webhook race can't double-credit). APEX
+    # credits floor(1.5×) the billed minutes via _purchase_args_for_sub.
     await _record_minute_purchase(
         db,
         organization_id=organization_id,
-        minutes=int(sub.minutes or 0),
         source="onboarding",
         razorpay_payment_id=payload.razorpay_payment_id,
         razorpay_ref=payload.razorpay_subscription_id,
+        **_purchase_args_for_sub(sub),
     )
 
     # Issue a session so the now-active admin can drive the onboarding wizard
@@ -406,9 +476,13 @@ async def verify_payment(
 async def razorpay_webhook(request: Request, db: AsyncSession = Depends(deps.get_db)):
     raw_body = await request.body()
     signature = request.headers.get("x-razorpay-signature")
-    # When a webhook secret is configured, enforce the signature. (Without it the
-    # endpoint still works for local/test, but is unauthenticated — set the
-    # secret in prod.)
+    # Fail CLOSED in production: never process an unsigned payment webhook in prod
+    # (an unauthenticated webhook + the activation path = free service). Dev/test
+    # without a secret still works.
+    if settings.is_production and not settings.RAZORPAY_WEBHOOK_SECRET:
+        logger.error("RAZORPAY: webhook hit in production with no RAZORPAY_WEBHOOK_SECRET set — rejecting.")
+        raise HTTPException(status_code=503, detail="Webhook not configured")
+    # When a webhook secret is configured, enforce the signature.
     if settings.RAZORPAY_WEBHOOK_SECRET and not RazorpayService.verify_webhook_signature(raw_body, signature):
         raise HTTPException(status_code=403, detail="Invalid webhook signature")
 
@@ -466,8 +540,22 @@ async def payment_status(payment_token: str, db: AsyncSession = Depends(deps.get
     ):
         try:
             remote = await RazorpayService.fetch_subscription(sub.razorpay_subscription_id)
-            if str(remote.get("status") or "") in {"active", "authenticated"}:
+            if _subscription_is_paid(remote):
                 await activate_and_provision(db, organization_id)
+                # Credit the onboarding bundle too (idempotent on the payment id), so a
+                # resume that lost BOTH the client verify AND the webhook's _bg_activate
+                # doesn't leave an ACTIVE org with an empty wallet. Needs the payment id
+                # the webhook stamps; absent that there's nothing confirmed to credit
+                # and the webhook will do it when it lands.
+                if sub.minutes and sub.razorpay_payment_id:
+                    await _record_minute_purchase(
+                        db,
+                        organization_id=organization_id,
+                        source="onboarding",
+                        razorpay_payment_id=sub.razorpay_payment_id,
+                        razorpay_ref=sub.razorpay_subscription_id,
+                        **_purchase_args_for_sub(sub),
+                    )
                 org = (await db.execute(select(Organization).where(Organization.id == organization_id))).scalars().first()
         except RazorpayError:
             pass
@@ -587,7 +675,7 @@ async def topup_verify(
     # paid order can't be replayed to credit a different organization.
     if str(notes.get("organization_id") or "") != str(user.organization_id):
         raise HTTPException(status_code=403, detail="This order does not belong to your organization.")
-    if str(order.get("status") or "") not in {"paid", "attempted"}:
+    if str(order.get("status") or "") != "paid":
         raise HTTPException(status_code=400, detail="Order is not paid.")
 
     minutes = _validate_minutes(int(notes.get("minutes") or 0))
@@ -614,4 +702,116 @@ async def topup_verify(
         "ok": True,
         "minutes": minutes,
         "remaining_rupees": float(await balance_rupees(db, user.organization_id)),
+    }
+
+
+# ─────────── NOKVO APEX top-ups + balance (MINUTES model) ───────────
+# APEX is a separate product: balance is in MINUTES, and every purchase BILLS on
+# the selected minutes (flat slabs) but CREDITS floor(1.5×) minutes. These mirror
+# the Nokvo One top-up endpoints but credit the bonus + report a minutes balance.
+def _apex_topup_dep():
+    return deps.RequireApexOrganization(allowed_statuses=["active", "onboarding"], allowed_roles=["admin"])
+
+
+@router.get("/apex/payments/minutes/balance")
+async def apex_minutes_balance_endpoint(
+    user: OrganizationUser = Depends(_apex_topup_dep()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """APEX Call Credits wallet (purchased / used / remaining credits +
+    estimated minutes remaining) + the slab ladder for the top-up calculator.
+    Credits are rupee-valued (1 ≡ ₹1) but the UI labels them 'Call Credits'."""
+    from app.services.minute_balance_service import apex_credit_summary
+    from app.services.minute_pricing import slab_ladder
+
+    summary = await apex_credit_summary(db, user.organization_id)
+    return {
+        **summary,
+        "minutes_min": MINUTES_MIN,
+        "bonus_pct": 50,
+        "slabs": [
+            {"from_minute": s["from_minute"], "to_minute": s["to_minute"], "rupees_per_minute": str(s["rupees_per_minute"])}
+            for s in slab_ladder()
+        ],
+    }
+
+
+@router.post("/apex/payments/topup/create-order")
+async def apex_topup_create_order(
+    payload: TopupOrderRequest,
+    user: OrganizationUser = Depends(_apex_topup_dep()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    selected = _validate_minutes(payload.minutes)
+    amount_paise = cost_paise(selected)  # BILL on selected (slabs)
+    try:
+        order = await RazorpayService.create_order(
+            amount_paise,
+            notes={"organization_id": str(user.organization_id), "minutes": str(selected), "kind": "apex_minute_topup"},
+            receipt=f"apextop-{user.organization_id.hex[:16]}",
+        )
+    except RazorpayError as exc:
+        logger.error("RAZORPAY: APEX top-up create-order failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Could not start the top-up. Please try again.")
+    order_id = str(order.get("id") or "")
+    if not order_id:
+        raise HTTPException(status_code=500, detail="Razorpay returned no order id")
+    return {
+        "order_id": order_id,
+        "key_id": settings.RAZORPAY_KEY_ID,
+        "minutes": selected,
+        "credits": float(apex_wallet_credit(selected)),  # Call Credits that land in the wallet
+        "credited_minutes": credited_minutes(selected),  # ≈ minutes display (credits ÷ slab)
+        "amount_paise": amount_paise,
+        "name": "NOKVO APEX",
+        "description": f"{float(apex_wallet_credit(selected)):,.0f} Call Credits (incl. 50% bonus)",
+    }
+
+
+@router.post("/apex/payments/topup/verify")
+async def apex_topup_verify(
+    payload: TopupVerifyRequest,
+    user: OrganizationUser = Depends(_apex_topup_dep()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Verify an APEX top-up order and credit the Call Credits wallet (cost×1.5).
+    The selected quantity + amount come from the SERVER-SIDE order (strict — the
+    client can't inflate the credit)."""
+    if not RazorpayService.verify_order_signature(
+        payload.razorpay_order_id, payload.razorpay_payment_id, payload.razorpay_signature
+    ):
+        raise HTTPException(status_code=400, detail="Payment signature verification failed")
+    try:
+        order = await RazorpayService.fetch_order(payload.razorpay_order_id)
+    except RazorpayError as exc:
+        logger.error("RAZORPAY: APEX top-up order fetch failed: %s", exc)
+        raise HTTPException(status_code=502, detail="Could not confirm the order. Please try again.")
+
+    notes = order.get("notes") or {}
+    if str(notes.get("organization_id") or "") != str(user.organization_id):
+        raise HTTPException(status_code=403, detail="This order does not belong to your organization.")
+    if str(order.get("status") or "") != "paid":
+        raise HTTPException(status_code=400, detail="Order is not paid.")
+    selected = _validate_minutes(int(notes.get("minutes") or 0))
+    if int(order.get("amount") or -1) != cost_paise(selected):
+        raise HTTPException(status_code=400, detail="Order amount mismatch.")
+
+    await _record_minute_purchase(
+        db,
+        organization_id=user.organization_id,
+        minutes=selected,
+        source="topup",
+        razorpay_payment_id=payload.razorpay_payment_id,
+        razorpay_ref=payload.razorpay_order_id,
+        rupees=apex_wallet_credit(selected),
+        rate_per_minute=flat_rate_for_minutes(selected),
+    )
+    from app.services.minute_balance_service import apex_credit_summary
+
+    summary = await apex_credit_summary(db, user.organization_id)
+    return {
+        "ok": True,
+        "credits_added": float(apex_wallet_credit(selected)),
+        "credited_minutes": credited_minutes(selected),
+        **summary,
     }

@@ -69,6 +69,36 @@ def cost_display(minutes: int) -> Decimal:
     return cost_for_minutes(minutes).quantize(_DISPLAY_Q, rounding=ROUND_HALF_UP)
 
 
+# NOKVO APEX bonus: the customer is BILLED on the selected minutes (at the flat
+# slab rate, ``cost_for_minutes``) but CREDITED 50% extra minutes at no extra
+# cost. e.g. select 25001 → bill 25001×₹5.5 = ₹137,505.5, credit floor(25001×1.5)
+# = 37,501 min. Integer math (×3//2) so a half-minute is dropped, never rounded
+# up — the credit is never more generous than 1.5×.
+def credited_minutes(selected_minutes: int) -> int:
+    """Minutes CREDITED to an APEX account for a purchase of ``selected_minutes``
+    (the billed quantity): ``floor(selected × 1.5)``.
+
+    NOTE: APEX now holds a Call CREDITS wallet (rupee-valued), not a minutes
+    balance — this stays only for the DISPLAY "≈N minutes". It equals
+    ``floor(apex_wallet_credit(selected) / slab_rate)`` so the credits figure and
+    the minutes figure reconcile on screen."""
+    n = max(int(selected_minutes), 0)
+    return (n * 3) // 2
+
+
+def apex_wallet_credit(selected_minutes: int) -> Decimal:
+    """Call Credits granted for an APEX purchase of ``selected_minutes`` — the
+    amount BILLED (``cost_for_minutes``) plus the 50% bonus, i.e. ``cost × 1.5``.
+    The customer is charged ``cost_for_minutes`` (real ₹ via Razorpay) but the
+    wallet receives 1.5× that in spendable Call Credits (1 credit ≡ ₹1).
+    Quantised to the 4-dp ledger.
+
+    e.g. select 25001 → bill ₹137,505.5 → credit 206,258.25 Call Credits."""
+    return (cost_for_minutes(selected_minutes) * Decimal("1.5")).quantize(
+        _LEDGER_Q, rounding=ROUND_HALF_UP
+    )
+
+
 def cost_paise(minutes: int) -> int:
     """Integer paise for Razorpay (amount fields are paise). The bundle cost is a
     whole-rupee-or-half product of int minutes × a ≤1-dp rate, so the 2-dp
@@ -112,6 +142,40 @@ def call_usage_cost(seconds, bundle_minutes: int) -> Decimal:
         return Decimal("0").quantize(_LEDGER_Q)
     started_minutes = minutes_for_seconds(s)  # ceil(seconds / 60)
     cost = PER_MINUTE_FEE * Decimal(started_minutes) + usage_rate_per_second(bundle_minutes) * s
+    return cost.quantize(_LEDGER_Q, rounding=ROUND_HALF_UP)
+
+
+# ── NOKVO APEX per-call USAGE (depletes the Call Credits wallet) ─────────────
+# APEX is the deterministic-outbound product; EVERY connected call (incl. the
+# questionnaire) bills the Call Credits wallet at the SELLING rate. Unlike the
+# Nokvo One usage above, the connection fee is charged ONCE per connected call
+# (NOT per started minute):
+#     cost = APEX_CONNECT_FEE + (slab − APEX_CONNECT_FEE)/60 × seconds
+# so a full 60s call costs exactly the bundle's slab (one "slab-minute"), and a
+# 30s call at the ₹5.5 slab costs 1.5 + 30×(4/60) = 3.5 credits; a 90s call costs
+# 1.5 + 90×(4/60) = 7.5 (the fee does NOT recur). The slab is the bracket the
+# bundle was BOUGHT at (FIFO), so usable-minutes ≈ credited-minutes.
+APEX_CONNECT_FEE = Decimal("1.5")
+
+
+def apex_usage_rate_per_second(bundle_minutes: int) -> Decimal:
+    """APEX per-second talk rate for a call billed against a bundle of
+    ``bundle_minutes`` (its flat bracket): ``(slab − 1.5) / 60`` Call Credits.
+    Full precision (no quantize) — the caller quantises the final call cost."""
+    return (flat_rate_for_minutes(bundle_minutes) - APEX_CONNECT_FEE) / Decimal("60")
+
+
+def apex_call_cost(seconds, bundle_minutes: int) -> Decimal:
+    """Call Credits consumed by ONE connected APEX call:
+        ``1.5 + rate × seconds``
+    where ``rate`` is set by ``bundle_minutes``' bracket and the 1.5 connect fee
+    is charged ONCE (not per minute). A full 60s call equals the slab exactly; a
+    non-positive duration (never connected) costs 0 — no fee for a call that
+    didn't connect. Quantised to the 4-dp ledger."""
+    s = Decimal(str(seconds))
+    if s <= 0:
+        return Decimal("0").quantize(_LEDGER_Q)
+    cost = APEX_CONNECT_FEE + apex_usage_rate_per_second(bundle_minutes) * s
     return cost.quantize(_LEDGER_Q, rounding=ROUND_HALF_UP)
 
 

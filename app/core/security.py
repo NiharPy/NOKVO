@@ -17,6 +17,18 @@ JWT_TIER_SUPERADMIN = "superadmin"
 JWT_TIER_ORGANIZATION = "organization"
 JWT_TIER_NOKVO_ONE_SETUP = "nokvo_one_setup"
 
+# Product isolation. Org access tokens carry a ``product`` claim so a session can
+# be scoped to one product. NOKVO APEX (product_tier="nokvo_apex") → "apex";
+# everything else → "nokvo_one". The org deps cross-check this claim against the
+# org's product_tier, isolating APEX and Nokvo One sessions from each other.
+PRODUCT_APEX = "apex"
+PRODUCT_NOKVO_ONE = "nokvo_one"
+
+
+def org_product_claim(product_tier: str | None) -> str:
+    """Map an Organization.product_tier to its JWT ``product`` isolation tag."""
+    return PRODUCT_APEX if (product_tier or "") == "nokvo_apex" else PRODUCT_NOKVO_ONE
+
 _JWT_TIER_ENV = {
     JWT_TIER_SUPERADMIN: "SUPERADMIN_JWT_SECRET_KEY",
     JWT_TIER_ORGANIZATION: "ORGANIZATION_JWT_SECRET_KEY",

@@ -168,6 +168,21 @@ async def list_tenants(
     mtd = await _callcost_rollup(db, _month_start_utc())
     subs = await _subscription_map(db)
 
+    # APEX balances for the apex orgs, in one pass. Read the LIVE Call Credits wallet
+    # (rupee-valued) — NOT the dead Phase-3 minutes ledger — and surface its estimated
+    # minutes as ``remaining_minutes`` so the console shows the real spendable balance
+    # (incl. the 50% bonus on paid bundles).
+    from app.services.minute_balance_service import apex_credit_summary
+    apex_balances: dict[str, dict] = {}
+    for _org in organizations:
+        if (_org.product_tier or "") == "nokvo_apex":
+            _s = await apex_credit_summary(db, _org.id)
+            apex_balances[str(_org.id)] = {
+                "remaining_minutes": _s["estimated_minutes_remaining"],
+                "credits_remaining": _s["credits_remaining"],
+                "credits_used": _s["credits_used"],
+            }
+
     items = []
     tot_minutes = tot_revenue = tot_cogs = tot_margin = 0.0
     for org in organizations:
@@ -188,6 +203,9 @@ async def list_tenants(
             "organization_name": org.name,
             "admin_email": org.admin_email,
             "status": org.status,
+            "product_tier": org.product_tier,  # "nokvo_one" | "nokvo_apex" | "nokvo_prime"
+            "is_apex": (org.product_tier or "") == "nokvo_apex",
+            "apex_minutes": apex_balances.get(oid),  # {credited,used,remaining} for apex; else None
             "plan_type": org.plan_type,
             "plan_label": _plan_label(org.plan_type),
             "calling_enabled": bool(org.calling_enabled),
@@ -262,14 +280,14 @@ async def list_feedback(
     """All tenant-submitted feedback / feature requests, newest first."""
     limit = max(1, min(int(limit or 500), 2000))
     rows = await db.execute(
-        select(TenantFeedback, Organization.name, OrganizationUser.email)
+        select(TenantFeedback, Organization.name, OrganizationUser.email, Organization.product_tier)
         .join(Organization, Organization.id == TenantFeedback.organization_id, isouter=True)
         .join(OrganizationUser, OrganizationUser.id == TenantFeedback.submitted_by_user_id, isouter=True)
         .order_by(TenantFeedback.created_at.desc())
         .limit(limit)
     )
     items = []
-    for fb, org_name, user_email in rows.all():
+    for fb, org_name, user_email, product_tier in rows.all():
         items.append({
             "id": str(fb.id),
             "organization_id": str(fb.organization_id),
@@ -278,6 +296,8 @@ async def list_feedback(
             "category": fb.category,
             "message": fb.message,
             "status": fb.status,
+            "product_tier": product_tier,
+            "is_apex": (product_tier or "") == "nokvo_apex",
             "created_at": fb.created_at.isoformat() if fb.created_at else None,
         })
     return {"items": items}
@@ -674,7 +694,10 @@ async def delete_llm_key(
 # means provisioning a dedicated Plivo number/auth onto their TenantResources.
 
 
-def _bulk_request_dict(req, org_name, user_email, enabled: bool, number: str | None) -> dict:
+def _bulk_request_dict(
+    req, org_name, user_email, enabled: bool, number: str | None,
+    *, is_apex: bool = False, bulk_status: str | None = None, bulk_count: int = 0,
+) -> dict:
     return {
         "id": str(req.id),
         "organization_id": str(req.organization_id),
@@ -686,6 +709,11 @@ def _bulk_request_dict(req, org_name, user_email, enabled: bool, number: str | N
         "status": req.status,
         "enabled": enabled,
         "bulk_number": number,
+        # APEX rows offer one-click auto-provisioning; bulk_status/bulk_count show
+        # live progress of the 5-DID pool ("provisioning" → "active").
+        "is_apex": is_apex,
+        "bulk_status": bulk_status,
+        "bulk_count": bulk_count,
         "created_at": req.created_at.isoformat() if req.created_at else None,
         "reviewed_at": req.reviewed_at.isoformat() if req.reviewed_at else None,
     }
@@ -703,7 +731,7 @@ async def list_bulk_calling_requests(
 
     limit = max(1, min(int(limit or 500), 2000))
     rows = await db.execute(
-        select(BulkCallingRequest, Organization.name, OrganizationUser.email)
+        select(BulkCallingRequest, Organization.name, OrganizationUser.email, Organization.product_tier)
         .join(Organization, Organization.id == BulkCallingRequest.organization_id, isouter=True)
         .join(OrganizationUser, OrganizationUser.id == BulkCallingRequest.requested_by_user_id, isouter=True)
         .order_by(BulkCallingRequest.created_at.desc())
@@ -719,11 +747,19 @@ async def list_bulk_calling_requests(
         )
         tr_by_tid = {tr.tenant_id: tr for tr in tr_rows.scalars().all()}
     items = []
-    for req, org_name, user_email in rows:
+    for req, org_name, user_email, product_tier in rows:
         tr = tr_by_tid.get(req.tenant_id) if req.tenant_id else None
         enabled = PlivoService.bulk_calling_enabled(tr) if tr else False
         number = PlivoService.bulk_calling_caller_id(tr) if tr else None
-        items.append(_bulk_request_dict(req, org_name, user_email, enabled, number))
+        bulk_cfg = (tr.provider_status or {}).get("bulk_calling") or {} if tr else {}
+        items.append(
+            _bulk_request_dict(
+                req, org_name, user_email, enabled, number,
+                is_apex=(product_tier == "nokvo_apex"),
+                bulk_status=bulk_cfg.get("status"),
+                bulk_count=len(bulk_cfg.get("numbers") or []),
+            )
+        )
     return {"items": items}
 
 
@@ -816,6 +852,171 @@ async def grant_bulk_calling_request(
     )
     await db.commit()
     return {"id": str(req.id), "status": req.status, "enabled": True, "bulk_number": number}
+
+
+@router.post("/bulk-calling-requests/{request_id}/auto-provision")
+async def auto_provision_bulk_calling(
+    request_id: uuid.UUID,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: SuperAdminUser = Depends(RequireRole(_WRITE_ROLES)),
+):
+    """APEX one-click: programmatically create a dedicated Plivo sub-account, reuse
+    the tenant's onboarding compliance application, and buy 5 DIDs against it
+    (deferred via the number poller until compliance approves). Replaces the manual
+    auth/token/number paste for APEX; non-APEX orgs must use ``/grant``."""
+    from app.models.bulk_calling_request import BulkCallingRequest
+    from app.services.plivo_bulk_provisioning_service import (
+        BULK_DID_COUNT,
+        PlivoBulkProvisioningService,
+    )
+
+    req = (
+        await db.execute(select(BulkCallingRequest).where(BulkCallingRequest.id == request_id))
+    ).scalars().first()
+    if req is None:
+        raise HTTPException(status_code=404, detail="Request not found")
+
+    # APEX-only — auto-provisioning is gated to the deterministic-outbound product.
+    org = (
+        await db.execute(select(Organization).where(Organization.id == req.organization_id))
+    ).scalars().first()
+    if org is None or (org.product_tier or "") != "nokvo_apex":
+        raise HTTPException(
+            status_code=409,
+            detail="Auto-provisioning is for NOKVO APEX organizations only — use the manual grant for others.",
+        )
+
+    # Resolve the tenant to provision onto (denormalized tenant_id, else via org).
+    tr = None
+    if req.tenant_id:
+        tr = (
+            await db.execute(select(TenantResources).where(TenantResources.tenant_id == req.tenant_id))
+        ).scalars().first()
+    if tr is None:
+        tr = (
+            await db.execute(
+                select(TenantResources).where(TenantResources.organization_id == req.organization_id)
+            )
+        ).scalars().first()
+    if tr is None:
+        raise HTTPException(status_code=404, detail="Tenant resources not found for this organization")
+
+    cfg = await PlivoBulkProvisioningService.start_auto_provision(
+        tr, db, superadmin_id=str(current_user.id)
+    )
+
+    req.status = "approved"
+    req.reviewed_at = datetime.now(timezone.utc)
+    req.reviewed_by_superadmin_id = current_user.id
+    db.add(req)
+    db.add(
+        SuperAdminAuditLog(
+            superadmin_id=current_user.id,
+            action="bulk_auto_provisioned",
+            risk_level="high",  # programmatically buys outbound DIDs (recurring cost)
+            target_type="organization",
+            target_id=str(req.organization_id),
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            request_id=request.headers.get("x-request-id"),
+            metadata_={"tenant_id": tr.tenant_id, "target_count": BULK_DID_COUNT, "auth_id": cfg.get("auth_id")},
+        )
+    )
+    await db.commit()
+    return {
+        "id": str(req.id),
+        "status": req.status,
+        "bulk_status": cfg.get("status"),
+        "enabled": bool(cfg.get("enabled")),
+        "numbers": cfg.get("numbers") or [],
+        "target_count": BULK_DID_COUNT,
+        "error": cfg.get("error"),
+    }
+
+
+class GrantExistingSubaccountPayload(BaseModel):
+    # The DIDs the operator rented (by hand) on the client's sub-account. Optional —
+    # blank means "auto-detect every number on the sub-account".
+    numbers: list[str] = Field(default_factory=list)
+
+
+@router.post("/bulk-calling-requests/{request_id}/grant-existing")
+async def grant_bulk_existing_subaccount(
+    request_id: uuid.UUID,
+    payload: GrantExistingSubaccountPayload,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: SuperAdminUser = Depends(RequireRole(_WRITE_ROLES)),
+):
+    """APEX manual provisioning: the operator rents the DIDs in Plivo by hand, then
+    enables bulk calling on the client's EXISTING account-creation sub-account here —
+    no auth token to paste (the stored encrypted creds are reused). ``numbers`` is
+    optional (blank = auto-detect what's on the sub-account). APEX-only; non-APEX
+    orgs use the manual ``/grant`` with their own dedicated credentials."""
+    from app.models.bulk_calling_request import BulkCallingRequest
+    from app.services.plivo_bulk_provisioning_service import PlivoBulkProvisioningService
+
+    req = (
+        await db.execute(select(BulkCallingRequest).where(BulkCallingRequest.id == request_id))
+    ).scalars().first()
+    if req is None:
+        raise HTTPException(status_code=404, detail="Request not found")
+
+    org = (
+        await db.execute(select(Organization).where(Organization.id == req.organization_id))
+    ).scalars().first()
+    if org is None or (org.product_tier or "") != "nokvo_apex":
+        raise HTTPException(
+            status_code=409,
+            detail="Existing-sub-account grant is for NOKVO APEX organizations only — use the manual grant for others.",
+        )
+
+    tr = None
+    if req.tenant_id:
+        tr = (
+            await db.execute(select(TenantResources).where(TenantResources.tenant_id == req.tenant_id))
+        ).scalars().first()
+    if tr is None:
+        tr = (
+            await db.execute(
+                select(TenantResources).where(TenantResources.organization_id == req.organization_id)
+            )
+        ).scalars().first()
+    if tr is None:
+        raise HTTPException(status_code=404, detail="Tenant resources not found for this organization")
+
+    cfg = await PlivoBulkProvisioningService.grant_with_existing_subaccount(
+        tr, db, numbers=payload.numbers, superadmin_id=str(current_user.id)
+    )
+    if cfg.get("error"):
+        raise HTTPException(status_code=400, detail=cfg["error"])
+
+    req.status = "approved"
+    req.reviewed_at = datetime.now(timezone.utc)
+    req.reviewed_by_superadmin_id = current_user.id
+    db.add(req)
+    db.add(
+        SuperAdminAuditLog(
+            superadmin_id=current_user.id,
+            action="bulk_granted_existing_subaccount",
+            risk_level="high",  # enables outbound DIDs (recurring cost) on the client's sub-account
+            target_type="organization",
+            target_id=str(req.organization_id),
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            request_id=request.headers.get("x-request-id"),
+            metadata_={"tenant_id": tr.tenant_id, "pool": cfg.get("numbers"), "auth_id": cfg.get("auth_id")},
+        )
+    )
+    await db.commit()
+    return {
+        "id": str(req.id),
+        "status": req.status,
+        "enabled": bool(cfg.get("enabled")),
+        "numbers": cfg.get("numbers") or [],
+        "bulk_status": cfg.get("status"),
+    }
 
 
 @router.post("/bulk-calling-requests/{request_id}/deny")
@@ -1179,6 +1380,107 @@ async def bypass_payment(
         "org_status": result.get("org_status"),
         "onboarding_step": result.get("onboarding_step"),
         "idempotent": bool(result.get("idempotent", False)),
+    }
+
+
+class GrantMinutesPayload(BaseModel):
+    # Crediting minutes without a payment is a comp/manual grant — require an
+    # explicit acknowledgement (recorded in the audit log).
+    minutes: int
+    acknowledge_comp: bool = False
+
+
+@router.post("/{organization_id}/grant-minutes")
+async def grant_apex_minutes(
+    organization_id: str,
+    payload: GrantMinutesPayload,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: SuperAdminUser = Depends(RequireRole(_WRITE_ROLES)),
+):
+    """Credit a NOKVO APEX org's Call Credits wallet WITHOUT a payment — a manual
+    comp grant of ``minutes`` minutes of talk time. The credit lands in the SAME
+    rupee-valued wallet a paid bundle does (``minute_purchases.rupees``, which the
+    live dialer gate + dashboard read), valued at ``minutes × slab rate`` so the
+    org sees +``minutes`` estimated minutes. (The dead Phase-3 ``minutes``-only
+    ledger is NOT what the wallet reads — crediting ₹0 there added nothing.)
+    APEX-only. High-risk, acknowledged + audited."""
+    import uuid as _uuid
+    from app.models.minute_purchase import MinutePurchase
+    from app.services.minute_balance_service import apex_credit_summary
+    from app.services.minute_pricing import flat_rate_for_minutes
+
+    if not payload.acknowledge_comp:
+        raise HTTPException(
+            status_code=409,
+            detail="Crediting minutes without a payment is a comp grant. Confirm to proceed (acknowledge_comp=true).",
+        )
+    try:
+        minutes = int(payload.minutes)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Enter a whole number of minutes.")
+    if minutes <= 0:
+        raise HTTPException(status_code=400, detail="Minutes must be a positive number.")
+    if minutes > 10_000_000:
+        raise HTTPException(status_code=400, detail="That's over the 10,000,000-minute per-grant limit.")
+
+    org = (
+        await db.execute(select(Organization).where(Organization.id == organization_id))
+    ).scalars().first()
+    if org is None:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    if (org.product_tier or "") != "nokvo_apex":
+        raise HTTPException(status_code=409, detail="Minute grants apply only to NOKVO APEX organizations.")
+
+    # Value the comp at the bundle's slab rate so it credits the LIVE wallet and the
+    # bundle's FIFO slab matches (minutes × ₹/min). 1 Call Credit ≡ ₹1.
+    rate = flat_rate_for_minutes(minutes)
+    credits = rate * minutes
+    before = await apex_credit_summary(db, org.id)
+    db.add(
+        MinutePurchase(
+            id=_uuid.uuid4(),
+            organization_id=org.id,
+            minutes=minutes,
+            rupees=credits,            # ← lands in the live Call Credits wallet
+            rate_per_minute=rate,
+            source="comp_grant",
+            # Synthetic unique id so the row is durable + idempotent-safe (the
+            # purchases table is unique on razorpay_payment_id).
+            razorpay_payment_id=f"comp:{_uuid.uuid4()}",
+            razorpay_ref=f"superadmin:{current_user.id}",
+        )
+    )
+    db.add(
+        SuperAdminAuditLog(
+            superadmin_id=current_user.id,
+            action="apex_minutes_granted",
+            risk_level="high",
+            target_type="organization",
+            target_id=str(org.id),
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            request_id=request.headers.get("x-request-id"),
+            before_state={"credits_remaining": before["credits_remaining"]},
+            after_state={"credits_remaining": before["credits_remaining"] + float(credits)},
+            metadata_={
+                "minutes_granted": minutes,
+                "credits_granted": float(credits),
+                "comp_grant": True,
+                "acknowledged": True,
+            },
+        )
+    )
+    await db.commit()
+    after = await apex_credit_summary(db, org.id)
+    return {
+        "organization_id": str(org.id),
+        "minutes_granted": minutes,
+        "credits_granted": float(credits),
+        # ``remaining_minutes`` mirrors the console row's live estimate so the
+        # optimistic update + reload agree.
+        "remaining_minutes": after["estimated_minutes_remaining"],
+        **after,
     }
 
 

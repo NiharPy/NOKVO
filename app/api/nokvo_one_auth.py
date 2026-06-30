@@ -128,7 +128,9 @@ def _decode_setup_token(token: str, expected_stage: str) -> dict:
     return payload
 
 
-def _issue_login_temp_token(user: OrganizationUser, organization_id: uuid.UUID) -> str:
+def _issue_login_temp_token(
+    user: OrganizationUser, organization_id: uuid.UUID, product: str = "nokvo_one"
+) -> str:
     return security.create_access_token(
         subject=user.id,
         mfa_completed=False,
@@ -139,6 +141,10 @@ def _issue_login_temp_token(user: OrganizationUser, organization_id: uuid.UUID) 
             "organization_id": str(organization_id),
             "role": user.role,
             "nokvo_one_login": True,
+            # Product isolation tag — "apex" vs "nokvo_one". The deps cross-check
+            # this against the org's product_tier so a token minted for one product
+            # can't be presented to the other.
+            "product": product,
         },
     )
 
@@ -213,6 +219,11 @@ async def _issue_full_session(
             "organization_id": str(organization.id),
             "role": user.role,
             "product_tier": organization.product_tier or "nokvo_one",
+            # Product isolation tag derived from the org's product_tier. APEX orgs
+            # (product_tier="nokvo_apex") get product="apex"; everything else
+            # "nokvo_one". The deps reject a token whose product ≠ the endpoint's
+            # product, so APEX and Nokvo One sessions can't cross over.
+            "product": security.org_product_claim(organization.product_tier),
         },
     )
     return NokvoOneSessionResponse(

@@ -583,21 +583,57 @@ def _language(language: str | None) -> str:
     return (language or "en").split("-")[0].lower()
 
 
-def _last_assistant_offered_visit(history: list[dict[str, str]]) -> bool:
-    for turn in reversed((history or [])[-4:]):
+def _last_assistant_offered_visit(history: list[dict[str, str]], *, lookback: int = 4) -> bool:
+    for turn in reversed((history or [])[-lookback:]):
         if turn.get("role") != "assistant":
             continue
         text = str(turn.get("content") or "")
-        if _VISIT_INTENT_RE.search(text) or re.search(r"\b(schedule|book).{0,30}\bvisit\b", text, re.IGNORECASE):
+        if _VISIT_INTENT_RE.search(text) or re.search(
+            r"\b(schedule|book|arrange|set\s+up|fix).{0,30}\bvisit\b", text, re.IGNORECASE
+        ):
             return True
     return False
 
 
+# Non-committal / declining replies that must NOT be read as visit acceptance
+# even when they carry a date ("maybe later") or a time. Without this guard a
+# hesitant enquiry caller who happens to mention a month would be misfiled as a
+# booked site visit. Only gates the weaker date/time acceptance signal below —
+# an explicit "yes" after a visit offer is still honoured.
+_VISIT_NONCOMMIT_RE = re.compile(
+    r"\b("
+    r"just\s+(?:exploring|looking|browsing|checking)|"
+    r"not\s+sure|don'?t\s+know|haven'?t\s+decided|"
+    r"maybe\s+(?:later|some\s+other|another\s+time|next\s+time)|some\s+other\s+time|"
+    r"thinking\s+about\s+it|need\s+to\s+(?:think|check|discuss|talk)|"
+    r"no\s+(?:thanks?|thank\s+you)|"
+    r"not\s+(?:now|today|interested|right\s+now|at\s+the\s+(?:moment|time))|"
+    r"can'?t\s+(?:come|make\s+it)|won'?t\s+be\s+able|"
+    # Telugu / Hindi declines.
+    r"వద్దు|ఇప్పుడు\s*కాదు|रहने\s*दो|अभी\s*नहीं|नहीं\s*चाहिए"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _turn_proposes_datetime(text: str) -> bool:
+    """True when the caller's turn carries a concrete date or time — the natural
+    way to accept "when would you like to come?" without saying "yes". Reuses the
+    shared (multilingual) entity extractor so te/hi booking turns count too."""
+    try:
+        entities = extract_turn_entities(text, expected_slot=None)
+    except Exception:
+        return False
+    return bool(entities.get("date_text") or entities.get("time_text"))
+
+
 def caller_agreed_to_site_visit(history: list[dict[str, str]]) -> bool:
     """True when a caller turn signals intent to come for a site visit — an
-    explicit visit phrase, or a yes/affirmation right after the agent offered a
-    visit. Same matchers the (inbound-disabled) flow-start used, so the
-    end-of-call hook can create a minimal site visit from the same signal."""
+    explicit visit phrase, OR an acceptance of a visit the agent offered. The
+    acceptance can be a "yes"/affirmation OR a concrete date/time ("Saturday
+    around 4"), since a caller naturally accepts "when would you like to come?"
+    by naming a slot rather than saying "yes". Without the date/time path the
+    booking was being misfiled as an enquiry lead instead of a Site Visit."""
     turns = history or []
     for idx, turn in enumerate(turns):
         if turn.get("role") != "user":
@@ -605,9 +641,19 @@ def caller_agreed_to_site_visit(history: list[dict[str, str]]) -> bool:
         text = str(turn.get("content") or "")
         if not text.strip():
             continue
+        # (a) The caller names a visit themselves — agreement regardless of offer.
         if _VISIT_INTENT_RE.search(text):
             return True
-        if _YES_RE.search(text) and _last_assistant_offered_visit(turns[:idx]):
+        # (b) The caller accepts a visit the agent offered in the run-up to this
+        # turn. A wider look-back than the live flow-start (6 vs 4) tolerates a
+        # clarifying exchange between the offer and the acceptance.
+        if not _last_assistant_offered_visit(turns[:idx], lookback=6):
+            continue
+        if _YES_RE.search(text):
+            return True
+        # A concrete date/time IS the acceptance, unless the same turn reads as
+        # non-committal / a deferral.
+        if _turn_proposes_datetime(text) and not _VISIT_NONCOMMIT_RE.search(text):
             return True
     return False
 

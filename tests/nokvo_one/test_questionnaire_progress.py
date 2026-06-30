@@ -40,6 +40,12 @@ def _ctx() -> OutboundCampaignContext:
     return OutboundCampaignContext(
         campaign_id="c1",
         name="My Home",
+        goal="Qualify home buyers.",
+        agent_prompt="",
+        objectives=[],
+        exit_conditions=[],
+        tone=None,
+        doc_text=None,
         caller_name="Riya",
         company_name="My Home constructions",
         questions=QUESTIONS,

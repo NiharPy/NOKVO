@@ -908,9 +908,19 @@ const currentBusinessTemplate = computed(() =>
   || null,
 );
 const businessTypeLabel = computed(() => currentBusinessTemplate.value?.label || 'Not selected');
-// Outbound + follow-up are only on the Inbound+Outbound plan (calling_enabled).
-// On "Inbound Only" those tabs are hidden.
-const outboundEnabled = computed(() => Boolean(currentOrganization.value?.calling_enabled));
+// Master switch for NOKVO ONE outbound calling UI. Mirrors the backend
+// NOKVO_ONE_OUTBOUND_ENABLED kill switch (default OFF): outbound has moved to the
+// dedicated NOKVO APEX product, so Nokvo One is inbound-only. When false every
+// outbound surface (the Outbound + Bulk Leads pages/nav, the outbound tester, the
+// dashboard readiness tile) is hidden. Flip to true in lockstep with the backend
+// flag to bring Nokvo One outbound back.
+const outboundCallingEnabled = false;
+// Outbound + follow-up tabs require BOTH the Inbound+Outbound plan
+// (calling_enabled) AND the product kill switch above. On "Inbound Only" — or
+// while outbound is disabled — those tabs are hidden.
+const outboundEnabled = computed(
+  () => outboundCallingEnabled && Boolean(currentOrganization.value?.calling_enabled),
+);
 // Master switch for the Follow-up agent UI. Mirrors the backend
 // FOLLOWUP_AGENT_ENABLED kill switch (default OFF): when false, every follow-up
 // surface (nav item, page, per-campaign toggle, rules block, dashboard tile,
@@ -1059,16 +1069,19 @@ const organizationHealth = computed(() => {
       state: runtimeHasBadStatus ? 'blocked' : (runtimeStatus.value ? 'good' : 'warn'),
       detail: runtimeHasBadStatus ? 'One or more voice services are reporting errors.' : (runtimeStatus.value ? 'STT, LLM, and TTS status checked.' : 'Runtime status has not reported yet.'),
     },
-    {
-      key: 'outbound',
-      label: 'Outbound readiness',
-      state: currentOrganization.value?.calling_enabled
-        ? (leadConnections.value.length && callableLeadCount ? 'good' : 'warn')
-        : 'blocked',
-      detail: currentOrganization.value?.calling_enabled
-        ? (leadConnections.value.length ? `${callableLeadCount} callable lead${callableLeadCount === 1 ? '' : 's'} available.` : 'Connect a consented lead source before outbound campaigns.')
-        : 'Calling is still gated for this organization.',
-    },
+    // Outbound readiness only matters when outbound is actually available. With
+    // Nokvo One outbound disabled (moved to NOKVO APEX) the org is inbound-only,
+    // so the check is omitted rather than dragging the health score to "blocked".
+    ...(outboundEnabled.value
+      ? [{
+          key: 'outbound',
+          label: 'Outbound readiness',
+          state: leadConnections.value.length && callableLeadCount ? 'good' : 'warn',
+          detail: leadConnections.value.length
+            ? `${callableLeadCount} callable lead${callableLeadCount === 1 ? '' : 's'} available.`
+            : 'Connect a consented lead source before outbound campaigns.',
+        }]
+      : []),
     {
       key: 'provisioning',
       label: 'Provisioning',
@@ -1123,8 +1136,12 @@ const switchPage = (page) => {
   if (page === 'leads' && isClinicTemplate.value) return;
   if (page === 'customers' && !isClinicTemplate.value) return;
   // Outbound + Follow-up surfaces are only on the Inbound+Outbound plan
-  // (calling_enabled). Swallow deep-links / programmatic nav on Inbound Only.
-  if ((page === 'outgoing_agent' || page === 'followups') && !outboundEnabled.value) return;
+  // (calling_enabled) AND require the outbound kill switch to be on. Swallow
+  // deep-links / programmatic nav on Inbound Only or while outbound is disabled.
+  if (
+    (page === 'outgoing_agent' || page === 'bulk_leads' || page === 'followups')
+    && !outboundEnabled.value
+  ) return;
   // Follow-up agent is globally disabled — swallow any nav/deep-link to its page.
   if (page === 'followups' && !followupAgentEnabled) return;
   // Nokvo Connect is feature-flagged. When disabled, swallow any attempt to
@@ -5014,6 +5031,10 @@ const loadOutboundNumber = async () => {
 const bulkCalling = ref({ plan_eligible: false, enabled: false, request_status: null, contact_number: null });
 const bulkRequestForm = ref({ contact_number: '', note: '' });
 const isSubmittingBulkRequest = ref(false);
+// Nokvo One runs ONLY non-deterministic (pitch) bulk campaigns — the
+// deterministic (scored questionnaire) flow moved to NOKVO APEX. campaign_type is
+// pinned to 'non_deterministic'; the questionnaire fields stay in the shape for
+// API compatibility but are never populated here.
 const bulkCampaignForm = ref({ name: '', company_name: '', caller_name: 'Riya', language: 'en', campaign_type: 'non_deterministic', content: '', file: null, intro: '', outro: '', questions: [], threshold: 1, working_days: 5, hours_per_day: 8 });
 const isLaunchingBulkCampaign = ref(false);
 const bulkCallingError = ref('');

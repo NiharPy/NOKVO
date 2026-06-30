@@ -51,6 +51,46 @@ def test_enquiry_only_is_not_agreement():
     assert caller_agreed_to_site_visit(hist) is False
 
 
+def test_detects_datetime_acceptance_after_visit_offer():
+    """The caller accepts "when would you like to come?" by naming a slot, not
+    by saying "yes" — this must still file a site visit (the reported bug)."""
+    hist = [
+        {"role": "assistant", "content": "Sure! When would you like to come and see the project?"},
+        {"role": "user", "content": "Saturday around 4 works"},
+    ]
+    assert caller_agreed_to_site_visit(hist) is True
+
+
+def test_datetime_acceptance_tolerates_a_clarifying_exchange():
+    hist = [
+        {"role": "assistant", "content": "Would you like to book a site visit?"},
+        {"role": "user", "content": "what's the price first?"},
+        {"role": "assistant", "content": "It starts at 2.45 crore."},
+        {"role": "user", "content": "okay tomorrow evening"},
+    ]
+    assert caller_agreed_to_site_visit(hist) is True
+
+
+def test_noncommittal_reply_after_offer_is_not_agreement():
+    """A hesitant caller who mentions a timeframe but is "just exploring" stays
+    an enquiry lead, not a booked visit."""
+    hist = [
+        {"role": "assistant", "content": "Would you like to schedule a site visit?"},
+        {"role": "user", "content": "Maybe next month, I'm just exploring for now"},
+    ]
+    assert caller_agreed_to_site_visit(hist) is False
+
+
+def test_date_without_a_visit_offer_is_not_agreement():
+    """A date mentioned during a pure enquiry (no visit was offered) must not
+    trigger a site visit — preserves the two-intents split."""
+    hist = [
+        {"role": "assistant", "content": "When are you looking to buy?"},
+        {"role": "user", "content": "maybe in the next couple of months"},
+    ]
+    assert caller_agreed_to_site_visit(hist) is False
+
+
 # ── minimal inbound site-visit record ───────────────────────────────────────
 
 

@@ -51,18 +51,24 @@ async def balance_rupees(db: AsyncSession, organization_id: uuid.UUID) -> Decima
     return (await purchased_rupees(db, organization_id)) - (await consumed_rupees(db, organization_id))
 
 
-async def has_balance(db: AsyncSession, organization_id: uuid.UUID) -> bool:
+async def has_balance(
+    db: AsyncSession, organization_id: uuid.UUID, *, grandfather: bool = True
+) -> bool:
     """The call-start gate (inbound + non-deterministic outbound). True when the
     org may place a call.
 
-    GRANDFATHER / fail-open: an org that has NEVER bought a bundle
-    (``purchased == 0``) is NOT gated — keeps every pre-billing-overhaul customer
-    working on deploy and never wrongly blocks a brand-new org whose onboarding
-    purchase failed to record. Once an org has paid for ANY minutes it's on the
-    prepaid model and is blocked at a non-positive balance."""
+    GRANDFATHER / fail-open (``grandfather=True``, the default): an org that has
+    NEVER bought a bundle (``purchased == 0``) is NOT gated — keeps every
+    pre-billing-overhaul Nokvo One customer working on deploy and never wrongly
+    blocks one whose onboarding purchase failed to record. Once an org has paid for
+    ANY minutes it's on the prepaid model and is blocked at a non-positive balance.
+
+    Pass ``grandfather=False`` for NOKVO APEX: it's a new, prepaid-only product with
+    no legacy orgs to protect, so a zero balance MUST block — otherwise a comped /
+    bypassed / credit-lost org (``purchased == 0``) would dial free and unmetered."""
     purchased = await purchased_rupees(db, organization_id)
     if purchased <= 0:
-        return True
+        return grandfather
     consumed = await consumed_rupees(db, organization_id)
     return (purchased - consumed) > 0
 
@@ -104,4 +110,96 @@ async def balance_summary(db: AsyncSession, organization_id: uuid.UUID) -> dict:
         "purchased_rupees": float(purchased),
         "consumed_rupees": float(consumed),
         "remaining_rupees": float(purchased - consumed),
+    }
+
+
+# ── NOKVO APEX: a MINUTES balance (separate product, separate model) ─────────
+# APEX bills the customer on selected minutes but CREDITS floor(1.5×) minutes
+# (``minute_purchases.minutes`` holds the CREDITED amount). Its balance is in
+# MINUTES — credited minus consumed — where consumption is the org's total
+# ``CallCost.billed_minutes`` (ceil sec/60, recorded per call at teardown). No
+# rupee deduction; APEX calls just burn whole billed minutes.
+
+async def apex_minutes_purchased(db: AsyncSession, organization_id: uuid.UUID) -> int:
+    res = await db.execute(
+        select(func.coalesce(func.sum(MinutePurchase.minutes), 0)).where(
+            MinutePurchase.organization_id == organization_id
+        )
+    )
+    return int(res.scalar_one() or 0)
+
+
+async def apex_minutes_used(db: AsyncSession, organization_id: uuid.UUID) -> int:
+    res = await db.execute(
+        select(func.coalesce(func.sum(CallCost.billed_minutes), 0)).where(
+            CallCost.organization_id == organization_id
+        )
+    )
+    return int(res.scalar_one() or 0)
+
+
+async def apex_minutes_balance(db: AsyncSession, organization_id: uuid.UUID) -> int:
+    """Remaining APEX minutes (credited − used). May read 0 / slightly negative if
+    the last call overran — callers treat ``<= 0`` as empty."""
+    return (await apex_minutes_purchased(db, organization_id)) - (await apex_minutes_used(db, organization_id))
+
+
+async def apex_has_minutes(db: AsyncSession, organization_id: uuid.UUID) -> bool:
+    """The APEX dialer gate. True when the org may place a call.
+
+    GRANDFATHER / fail-open: an org that never bought minutes (purchased==0) is
+    NOT gated — keeps a brand-new org working if its onboarding credit hasn't
+    landed yet. Once it has bought ANY minutes, it's blocked at a non-positive
+    balance."""
+    purchased = await apex_minutes_purchased(db, organization_id)
+    if purchased <= 0:
+        return True
+    used = await apex_minutes_used(db, organization_id)
+    return (purchased - used) > 0
+
+
+async def apex_balance_summary(db: AsyncSession, organization_id: uuid.UUID) -> dict:
+    """{credited_minutes, used_minutes, remaining_minutes} — APEX dashboard widget.
+
+    LEGACY (minutes model). The live APEX wallet is now Call CREDITS — use
+    ``apex_credit_summary``. Kept only so any old caller still resolves."""
+    credited = await apex_minutes_purchased(db, organization_id)
+    used = await apex_minutes_used(db, organization_id)
+    return {
+        "credited_minutes": credited,
+        "used_minutes": used,
+        "remaining_minutes": credited - used,
+    }
+
+
+# ── NOKVO APEX: the live CALL CREDITS wallet (rupee-valued, relabelled) ───────
+# APEX now holds the same rupee ledger as Nokvo One (purchases.rupees −
+# CallCost.prepaid_rupees, FIFO bundle by minutes) but the customer is CREDITED
+# 1.5× the billed amount (``apex_wallet_credit``) and EVERY connected call —
+# including the deterministic questionnaire — deducts at the APEX selling rate
+# (``apex_call_cost``). The balance/gate reuse ``balance_rupees`` / ``has_balance``;
+# this summary adds the dashboard's estimated-minutes readout.
+
+async def apex_credit_summary(db: AsyncSession, organization_id: uuid.UUID) -> dict:
+    """{credits_purchased, credits_used, credits_remaining,
+    estimated_minutes_remaining, slab_rate} — the APEX Call Credits widget.
+
+    ``estimated_minutes_remaining`` divides the remaining credits by the CURRENT
+    bundle's slab rate (FIFO); it equals the advertised credited minutes at full
+    balance, so the credits and minutes figures reconcile on screen. Floats for
+    JSON — the UI formats (no ₹; the label is 'Call Credits')."""
+    from app.services.minute_pricing import flat_rate_for_minutes
+
+    purchased = await purchased_rupees(db, organization_id)
+    consumed = await consumed_rupees(db, organization_id)
+    remaining = purchased - consumed
+    bundle = await current_bundle_minutes(db, organization_id)
+    slab = flat_rate_for_minutes(bundle)
+    est_minutes = int(remaining / slab) if slab > 0 and remaining > 0 else 0
+    return {
+        "credits_purchased": float(purchased),
+        "credits_used": float(consumed),
+        "credits_remaining": float(remaining),
+        "estimated_minutes_remaining": est_minutes,
+        "slab_rate": float(slab),
     }

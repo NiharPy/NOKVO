@@ -361,6 +361,46 @@ class EmailService:
         )
         await cls.send(to_email, subject, text, html_body=html_body, inline_images=cls._brand_inline_images())
 
+    @staticmethod
+    def build_apex_invitation_url(token: str) -> str:
+        base = settings.NOKVO_ONE_PUBLIC_BASE_URL.rstrip("/")
+        return f"{base}/nokvo-apex/invite/{token}"
+
+    @classmethod
+    async def send_apex_member_invitation_email(
+        cls,
+        to_email: str,
+        org_name: str,
+        inviter_name: str | None,
+        token: str,
+    ) -> None:
+        """APEX team invite — like the Nokvo One one, but the link lands on the APEX
+        accept page and the copy is password-only (no two-factor step)."""
+        url = cls.build_apex_invitation_url(token)
+        invited_by = (inviter_name or "your team").strip() or "your team"
+        ttl = settings.NOKVO_ONE_INVITE_TOKEN_TTL_HOURS
+        subject = f"You're invited to {org_name} on NOKVO APEX"
+        text = (
+            f"Hi,\n\n"
+            f"{invited_by} invited you to join {org_name} on NOKVO APEX.\n"
+            f"Set up your account here:\n\n{url}\n\n"
+            f"This invite expires in {ttl} hours.\n"
+        )
+        html_body = cls._branded_email_html(
+            preheader=f"{invited_by} invited you to join {org_name} on NOKVO APEX.",
+            eyebrow="Team invitation",
+            heading=f"Join {org_name}",
+            intro_html=(
+                f"<strong style=\"color:{_INK};\">{html.escape(invited_by)}</strong> "
+                f"has invited you to join <strong style=\"color:{_INK};\">{html.escape(org_name)}</strong> "
+                f"on NOKVO APEX. Accept below to set up your account — you’ll create your own password."
+            ),
+            cta_label="Accept invitation",
+            cta_url=url,
+            note_html=f"This invitation expires in {ttl} hours",
+        )
+        await cls.send(to_email, subject, text, html_body=html_body, inline_images=cls._brand_inline_images())
+
     @classmethod
     async def send_usage_invoice_email(
         cls,

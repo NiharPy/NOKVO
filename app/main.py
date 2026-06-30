@@ -44,6 +44,8 @@ from app.api import (
     organization_auth,
     superadmin_tenant_provisioning,
     nokvo_one_auth,
+    nokvo_one_apex_auth,
+    nokvo_one_apex_members,
     nokvo_one_payments,
     nokvo_one_onboarding,
     nokvo_one_members,
@@ -65,6 +67,8 @@ app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
 app.include_router(organization_auth.router, prefix="/api/org-auth", tags=["organization-auth"])
 app.include_router(superadmin_tenant_provisioning.router, prefix="/superadmin/tenants", tags=["tenant-provisioning"])
 app.include_router(nokvo_one_auth.router, prefix="/api/nokvo-one", tags=["nokvo-one"])
+app.include_router(nokvo_one_apex_auth.router, prefix="/api/nokvo-one", tags=["nokvo-apex-auth"])
+app.include_router(nokvo_one_apex_members.router, prefix="/api/nokvo-one", tags=["nokvo-apex-members"])
 app.include_router(nokvo_one_payments.router, prefix="/api/nokvo-one", tags=["nokvo-one-payments"])
 app.include_router(nokvo_one_onboarding.router, prefix="/api/nokvo-one/onboarding", tags=["nokvo-one-onboarding"])
 app.include_router(nokvo_one_requests.router, prefix="/api/nokvo-one", tags=["nokvo-one-requests"])
@@ -226,6 +230,10 @@ from app.services.plivo_number_poller import (  # noqa: E402
     start_plivo_number_poller,
     stop_plivo_number_poller,
 )
+from app.services.outbound_campaign_ticker import (  # noqa: E402
+    start_outbound_campaign_ticker,
+    stop_outbound_campaign_ticker,
+)
 from app.services.llm_pool import (  # noqa: E402
     start_llm_pool_refresher,
     stop_llm_pool_refresher,
@@ -252,6 +260,7 @@ async def _start_retry_scheduler() -> None:
     start_lead_sync_scheduler()
     start_followup_scheduler()
     start_plivo_number_poller()
+    start_outbound_campaign_ticker()
     start_llm_pool_refresher()
     # Public-URL sanity: a wrong/unset PLIVO_WEBHOOK_BASE_URL is the #1 cause
     # of "inbound calls don't connect" (Plivo can't reach the webhook or the
@@ -263,6 +272,23 @@ async def _start_retry_scheduler() -> None:
 
         for warning in validate_public_base_url():
             _logging.getLogger("app.startup").error("PUBLIC-URL: %s", warning)
+    except Exception:
+        pass
+    # Security-config sanity: loudly flag any fail-open knob left unset in prod
+    # (webhook secret, Plivo signature mode, CORS origin, legacy JWT fallback).
+    try:
+        import logging as _logging
+
+        from app.core.config import settings as _settings, validate_security_config
+
+        _logging.getLogger("app.startup").info(
+            "SECURITY-CONFIG: plivo_signature_mode=%s razorpay_webhook_secret=%s env=%s",
+            _settings.PLIVO_VALIDATE_SIGNATURES,
+            "set" if (_settings.RAZORPAY_WEBHOOK_SECRET or "").strip() else "UNSET",
+            _settings.ENVIRONMENT,
+        )
+        for warning in validate_security_config():
+            _logging.getLogger("app.startup").error("SECURITY-CONFIG: %s", warning)
     except Exception:
         pass
     # Webhook re-sync check: count tenants whose Plivo Application answer_url
@@ -290,4 +316,5 @@ async def _stop_retry_scheduler() -> None:
     await stop_lead_sync_scheduler()
     await stop_followup_scheduler()
     await stop_plivo_number_poller()
+    await stop_outbound_campaign_ticker()
     await stop_llm_pool_refresher()

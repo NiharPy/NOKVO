@@ -9,16 +9,35 @@ from __future__ import annotations
 from decimal import Decimal
 
 from app.services.minute_pricing import (
+    APEX_CONNECT_FEE,
     MINUTES_MIN,
     PER_MINUTE_FEE,
+    apex_call_cost,
+    apex_wallet_credit,
     call_usage_cost,
     cost_display,
     cost_for_minutes,
     cost_paise,
+    credited_minutes,
     flat_rate_for_minutes,
     slab_ladder,
     usage_rate_per_second,
 )
+
+
+def test_apex_bonus_credited_minutes():
+    # The user's worked example: select 25001 → bill 137505.5, credit 37501.
+    assert cost_for_minutes(25001) == Decimal("137505.5000")
+    assert cost_paise(25001) == 13750550
+    assert credited_minutes(25001) == 37501          # floor(25001 * 1.5) = 37501.5 → 37501
+    # round-number selections credit exactly 1.5×.
+    assert credited_minutes(1000) == 1500
+    assert credited_minutes(6000) == 9000
+    assert credited_minutes(10000) == 15000
+    # odd selection → floor (never rounds up).
+    assert credited_minutes(1001) == 1501            # 1501.5 → 1501
+    assert credited_minutes(0) == 0
+    assert credited_minutes(-5) == 0
 
 
 def test_user_worked_examples():
@@ -155,3 +174,42 @@ def test_call_usage_cost_examples():
     assert call_usage_cost(-3, 500) == Decimal("0.0000")
     # a 1-second connected call still pays one minute's base fee + 1s.
     assert call_usage_cost(1, 7000) == Decimal("0.7400")  # 0.6 + 0.14
+
+
+# ── NOKVO APEX: Call Credits wallet + selling-rate per-call deduction ─────────
+
+def test_apex_wallet_credit_is_cost_times_1_5():
+    # The user's worked example: select 25001 → bill 137,505.5 → credit 206,258.25.
+    assert apex_wallet_credit(25001) == Decimal("206258.2500")
+    # round example: 25000 @ ₹8 = 200,000 → credit 300,000.
+    assert apex_wallet_credit(25000) == Decimal("300000.0000")
+    # 6000 @ ₹9 = 54,000 → credit 81,000.
+    assert apex_wallet_credit(6000) == Decimal("81000.0000")
+    assert apex_wallet_credit(0) == Decimal("0.0000")
+
+
+def test_apex_call_cost_selling_rate_fee_once():
+    assert APEX_CONNECT_FEE == Decimal("1.5")
+    # 25001+ bundle (₹5.5 slab) → the user's 1.50 + sec×4/60.
+    assert apex_call_cost(60, 25001) == Decimal("5.5000")   # full minute == slab
+    assert apex_call_cost(30, 25001) == Decimal("3.5000")   # 1.5 + 30×4/60
+    assert apex_call_cost(12, 25001) == Decimal("2.3000")   # dealbreaker cut: 1.5 + 12×4/60
+    # Fee charged ONCE per call (NOT per started minute): 90s = 1.5 + 90×4/60 = 7.5 (not 9).
+    assert apex_call_cost(90, 25001) == Decimal("7.5000")
+    # never connected → 0 (no fee for a call that didn't connect).
+    assert apex_call_cost(0, 25001) == Decimal("0.0000")
+    assert apex_call_cost(-3, 25001) == Decimal("0.0000")
+
+
+def test_apex_60s_call_equals_slab_every_bracket():
+    # A full 60s APEX call always costs exactly the bundle's slab ("one slab-minute").
+    for bundle in (500, 3000, 7000, 15000, 22000, 30000):
+        assert apex_call_cost(60, bundle) == flat_rate_for_minutes(bundle)
+
+
+def test_apex_estimated_minutes_reconciles_with_credited():
+    # At full balance, estimated minutes (credits ÷ slab) == the advertised credited
+    # minutes — so the dashboard's two figures always agree.
+    for n in (1000, 6000, 25001, 30000):
+        wallet = apex_wallet_credit(n)
+        assert int(wallet / flat_rate_for_minutes(n)) == credited_minutes(n)
