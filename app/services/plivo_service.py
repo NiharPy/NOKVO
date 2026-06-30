@@ -261,17 +261,23 @@ class PlivoService:
     async def assign_number(cls, number: str, *, app_id: str | None = None, sub_auth_id: str | None = None) -> None:
         """Bind a rented DID to an Application and/or move it to a subaccount."""
         auth = cls._master_auth()
+        # Plivo addresses numbers in bare-digit E.164 — a formatted value
+        # ("+91 22 6423 3631") makes a malformed /Number/<n>/ path that 404s.
+        number = cls.normalize_number(number)
         body: dict[str, Any] = {}
         if app_id:
             body["app_id"] = app_id
         if sub_auth_id:
             body["subaccount"] = sub_auth_id
-        if body:
+        if body and number:
             await cls._request("POST", f"{cls._base(auth[0])}/Number/{number}/", auth=auth, json_body=body)
 
     @classmethod
     async def release_number(cls, number: str) -> None:
         auth = cls._master_auth()
+        number = cls.normalize_number(number)  # bare-digit E.164 (see assign_number)
+        if not number:
+            return
         await cls._request("DELETE", f"{cls._base(auth[0])}/Number/{number}/", auth=auth)
 
     @classmethod
@@ -294,7 +300,10 @@ class PlivoService:
         """
         from sqlalchemy.orm.attributes import flag_modified
 
-        number = (number or "").strip()
+        # Normalize to bare-digit E.164 BEFORE assigning or storing: Plivo's
+        # /Number/<n>/ path 404s on a formatted value, and the stored caller ID must
+        # match the bare form DIDs are kept in everywhere else.
+        number = cls.normalize_number(number)
         if not number:
             raise PlivoError("A phone number is required.")
 

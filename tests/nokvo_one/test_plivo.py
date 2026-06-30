@@ -66,6 +66,40 @@ def test_rent_number_assigns_to_app_and_subaccount(plivo_creds, monkeypatch):
     assert assign[2]["app_id"] == "APP123" and assign[2]["subaccount"] == "SUBxxx"
 
 
+def test_assign_number_normalizes_formatted_did(plivo_creds, monkeypatch):
+    # A formatted DID ("+91 22 6423 3631") must hit a BARE-digit /Number/<n>/ path —
+    # otherwise Plivo 404s ("not found"), the reported re-bind failure.
+    calls = []
+    _mock_request(monkeypatch, lambda m, u, b: calls.append((m, u, b)) or {})
+    _run(PlivoService.assign_number("+91 22 6423 3631", app_id="APP123", sub_auth_id="SUBxxx"))
+    assert calls and calls[-1][1].endswith("/Number/912264233631/")
+    assert "+" not in calls[-1][1] and " " not in calls[-1][1]
+
+
+def test_set_tenant_number_normalizes_assign_and_storage(plivo_creds, monkeypatch):
+    calls = []
+    _mock_request(monkeypatch, lambda m, u, b: calls.append((m, u, b)) or {})
+    tr = SimpleNamespace(
+        provider_status={"plivo": {"application_id": "APP123", "subaccount_auth_id": "SUBxxx", "link_id": "L1"}},
+        twilio_phone_number=None,
+        tenant_id="t1",
+    )
+
+    class _DB:
+        def add(self, *a, **k):
+            pass
+
+        async def commit(self):
+            pass
+
+    res = _run(PlivoService.set_tenant_number(tr, _DB(), number="+91 22 6423 3631", reassign=True, base=None))
+    # Stored caller ID is bare-digit, and the assign hit the bare-digit path (no 404).
+    assert res["number"] == "912264233631" and res["assigned"] is True and res.get("assign_error") is None
+    assert tr.twilio_phone_number == "912264233631"
+    assert tr.provider_status["plivo"]["number"] == "912264233631"
+    assert any(c[1].endswith("/Number/912264233631/") for c in calls)
+
+
 def test_rent_number_raises_when_no_india_inventory(plivo_creds, monkeypatch):
     # India KYC/regulatory → no instantly-rentable DID. Caller treats this as pending.
     _mock_request(monkeypatch, lambda m, u, b: {"objects": []} if "PhoneNumber/?" in u else {})
