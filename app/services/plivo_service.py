@@ -306,15 +306,27 @@ class PlivoService:
         from sqlalchemy.orm.attributes import flag_modified
 
         # Normalize → bare-digit E.164 (Plivo 404s on a formatted /Number/<n>/ path),
-        # dedupe (order-preserving), cap at 5.
+        # dedupe (order-preserving), cap at 5. Anything that normalizes to fewer than
+        # 8 digits is a fragment/typo (e.g. a formatted DID mistakenly split on its
+        # spaces) — flag it clearly instead of firing a doomed /Number/<frag>/ 404.
         clean: list[str] = []
+        invalid: list[str] = []
         for raw in numbers or []:
             num = cls.normalize_number(raw)
-            if num and num not in clean:
-                clean.append(num)
+            if not num or num in clean or num in invalid:
+                continue
+            if len(num) < 8:
+                invalid.append(num)
+                continue
+            clean.append(num)
             if len(clean) >= 5:
                 break
         if not clean:
+            if invalid:
+                raise PlivoError(
+                    "No valid phone number — these look like fragments: "
+                    f"{', '.join(invalid)}. Enter one full DID per line."
+                )
             raise PlivoError("A phone number is required.")
 
         cfg = cls._plivo_config(tenant_res)
@@ -332,6 +344,10 @@ class PlivoService:
                 except Exception as exc:  # noqa: BLE001
                     entry["error"] = str(exc)
             per_number.append(entry)
+        # Surface fragments in the per-number report so the operator sees why they
+        # weren't bound (never sent to Plivo).
+        for num in invalid:
+            per_number.append({"number": num, "assigned": False, "error": "not a valid phone number (too short)"})
 
         provider_status = dict(tenant_res.provider_status or {})
         plivo_cfg = dict(provider_status.get("plivo") or {})

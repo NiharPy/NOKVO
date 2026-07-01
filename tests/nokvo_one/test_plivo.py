@@ -140,6 +140,30 @@ def test_set_tenant_numbers_dedupes_and_caps_at_five(plivo_creds, monkeypatch):
     assert res["numbers"] == ["912264233631", "9100000001", "9100000002", "9100000003", "9100000004"]
 
 
+def test_set_tenant_numbers_rejects_short_fragments(plivo_creds, monkeypatch):
+    # A formatted DID split on its spaces ("+91 22 6423 2977" → 91/22/6423/2977) →
+    # all fragments → a clear error and NO doomed /Number/<frag>/ call.
+    calls = []
+    _mock_request(monkeypatch, lambda m, u, b: calls.append((m, u, b)) or {})
+    tr = SimpleNamespace(provider_status={"plivo": {"application_id": "A"}}, twilio_phone_number=None, tenant_id="t")
+    with pytest.raises(PlivoError) as exc:
+        _run(PlivoService.set_tenant_numbers(tr, _StubDB(), numbers=["91", "22", "6423", "2977"], reassign=True, base=None))
+    assert "fragment" in str(exc.value).lower()
+    assert not calls
+
+
+def test_set_tenant_numbers_flags_fragment_but_binds_valid(plivo_creds, monkeypatch):
+    calls = []
+    _mock_request(monkeypatch, lambda m, u, b: calls.append((m, u, b)) or {})
+    tr = SimpleNamespace(provider_status={"plivo": {"application_id": "A"}}, twilio_phone_number=None, tenant_id="t")
+    res = _run(PlivoService.set_tenant_numbers(tr, _StubDB(), numbers=["912264233631", "22"], reassign=True, base=None))
+    assert res["numbers"] == ["912264233631"] and res["assigned_count"] == 1
+    frag = next(e for e in res["per_number"] if e["number"] == "22")
+    assert "too short" in frag["error"] and frag["assigned"] is False
+    number_calls = [c for c in calls if "/Number/" in c[1]]
+    assert number_calls and all("/Number/912264233631/" in c[1] for c in number_calls)
+
+
 def test_rent_number_raises_when_no_india_inventory(plivo_creds, monkeypatch):
     # India KYC/regulatory → no instantly-rentable DID. Caller treats this as pending.
     _mock_request(monkeypatch, lambda m, u, b: {"objects": []} if "PhoneNumber/?" in u else {})

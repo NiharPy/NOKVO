@@ -702,8 +702,10 @@ function cancelPlivoChange() { plivoTarget.value = null; }
 const submitPlivoChange = async () => {
   const t = plivoTarget.value;
   if (!t) return;
-  // Accept one or many DIDs (comma / space / newline separated), up to 5.
-  const numbers = (t.number || '').split(/[\s,]+/).map((s) => s.trim()).filter(Boolean).slice(0, 5);
+  // One or many DIDs, up to 5 — split on NEWLINE or COMMA only. Never on spaces: a
+  // single formatted DID contains internal spaces ("+91 22 6423 2977") and must stay
+  // one entry (the backend strips it to bare digits).
+  const numbers = (t.number || '').split(/[\r\n,]+/).map((s) => s.trim()).filter(Boolean).slice(0, 5);
   if (!numbers.length) { errorMsg.value = 'Enter a phone number.'; return; }
   plivoBusy.value = true; errorMsg.value = '';
   try {
