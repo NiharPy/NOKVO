@@ -1183,6 +1183,26 @@ async def change_plivo_number(
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"Could not set the number: {exc}")
 
+    # APEX: adding DIDs should ALSO make the org dialable. The DIDs live on the
+    # tenant's subaccount, so enable bulk calling from it (auto-detects the live
+    # pool) — no separate grant needed. Best-effort, APEX-only.
+    org = (
+        await db.execute(select(Organization).where(Organization.id == organization_id))
+    ).scalars().first()
+    if org is not None and (org.product_tier or "") == "nokvo_apex":
+        try:
+            from app.services.plivo_bulk_provisioning_service import PlivoBulkProvisioningService
+
+            bulk = await PlivoBulkProvisioningService.grant_with_existing_subaccount(
+                tenant_res, db, numbers=None, superadmin_id=str(current_user.id)
+            )
+            result["bulk_enabled"] = bool(bulk.get("enabled"))
+            result["bulk_pool"] = bulk.get("numbers") or []
+            if bulk.get("error"):
+                result["bulk_error"] = bulk["error"]
+        except Exception as exc:  # noqa: BLE001
+            result["bulk_error"] = str(exc)
+
     db.add(
         SuperAdminAuditLog(
             superadmin_id=current_user.id,

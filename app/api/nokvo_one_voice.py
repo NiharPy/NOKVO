@@ -2093,6 +2093,30 @@ async def _latest_bulk_request(db: AsyncSession, organization_id):
     return res.scalars().first()
 
 
+async def _ensure_apex_bulk_enabled(db: AsyncSession, user: OrganizationUser, tr: TenantResources) -> bool:
+    """Auto-enable bulk calling for a NOKVO APEX org from its account-creation
+    subaccount — no manual operator grant. APEX *is* the deterministic-outbound
+    product, so its own subaccount + DIDs are its bulk telephony (reuses
+    ``grant_with_existing_subaccount``, which auto-detects the subaccount's live
+    DIDs). Idempotent + best-effort: no-op when already enabled or not APEX; when
+    the subaccount has no DIDs yet it stays disabled until they finish provisioning.
+    Returns whether the org is APEX so callers can tailor the not-yet-ready message."""
+    from app.services.plivo_service import PlivoService
+
+    org = await _org_for_user(db, user)
+    is_apex = (org.product_tier or "") == "nokvo_apex"
+    if is_apex and not PlivoService.bulk_calling_enabled(tr):
+        from app.services.plivo_bulk_provisioning_service import PlivoBulkProvisioningService
+
+        try:
+            await PlivoBulkProvisioningService.grant_with_existing_subaccount(
+                tr, db, numbers=None, superadmin_id="auto:apex"
+            )
+        except Exception:
+            logger.warning("APEX-BULK: auto-enable from subaccount failed", exc_info=True)
+    return is_apex
+
+
 @router.get("/bulk-calling/status")
 async def bulk_calling_status(
     user: OrganizationUser = Depends(_bulk_viewer_dep()),
@@ -2106,6 +2130,7 @@ async def bulk_calling_status(
     from app.services.plivo_service import PlivoService
 
     tr = await _tenant_for_user(db, user)
+    await _ensure_apex_bulk_enabled(db, user, tr)  # APEX: self-enable so the badge reflects reality
     org = await _org_for_user(db, user)
     latest = await _latest_bulk_request(db, org.id)
     return {
@@ -2197,10 +2222,13 @@ async def create_bulk_calling_campaign(
 
     await _require_outbound_enabled(db, user)
     tr = await _tenant_for_user(db, user)
+    _is_apex = await _ensure_apex_bulk_enabled(db, user, tr)  # APEX self-enables from its subaccount
     if not PlivoService.bulk_calling_enabled(tr):
         raise HTTPException(
             status_code=403,
             detail=(
+                "Your calling numbers are still being set up — please try again in a few minutes."
+                if _is_apex else
                 "Bulk calling isn't enabled yet. Request access and we'll provision "
                 "your dedicated calling number."
             ),
@@ -2287,10 +2315,15 @@ async def rerun_bulk_calling_campaign(
 
     await _require_outbound_enabled(db, user)
     tr = await _tenant_for_user(db, user)
+    _is_apex = await _ensure_apex_bulk_enabled(db, user, tr)  # APEX self-enables from its subaccount
     if not PlivoService.bulk_calling_enabled(tr):
         raise HTTPException(
             status_code=403,
-            detail="Bulk calling isn't enabled for your account.",
+            detail=(
+                "Your calling numbers are still being set up — please try again in a few minutes."
+                if _is_apex else
+                "Bulk calling isn't enabled for your account."
+            ),
         )
     campaign = await OutboundCampaignService.get_campaign(campaign_id, tr, db)
     if not campaign:

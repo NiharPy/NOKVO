@@ -1520,6 +1520,8 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
             <br /><span style="color:#e6a23c;">Not bound:</span>
             <span v-for="(n, i) in (plivoResult.per_number || []).filter((x) => x.error)" :key="i" class="ls-mono">{{ n.number }} — {{ n.error }}<br /></span>
           </template>
+          <template v-if="plivoResult.bulk_enabled"><br /><span style="color:#67c23a;">Bulk calling enabled</span> · {{ (plivoResult.bulk_pool || []).length }} DID(s) in the outbound pool.</template>
+          <template v-else-if="plivoResult.bulk_error"><br /><span style="color:#e6a23c;">Bulk not enabled:</span> {{ plivoResult.bulk_error }}</template>
         </p>
         <div class="modal-actions">
           <button class="ghost-btn" @click="cancelPlivoChange">{{ plivoResult ? 'CLOSE' : 'CANCEL' }}</button>
