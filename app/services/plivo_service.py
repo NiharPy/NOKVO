@@ -281,58 +281,86 @@ class PlivoService:
         await cls._request("DELETE", f"{cls._base(auth[0])}/Number/{number}/", auth=auth)
 
     @classmethod
-    async def set_tenant_number(
+    async def set_tenant_numbers(
         cls,
         tenant_res: TenantResources,
         db,
         *,
-        number: str,
+        numbers: list[str],
         reassign: bool = True,
         base: str | None = None,
     ) -> dict[str, Any]:
-        """Point a tenant at a different DID (operator override).
+        """Bind one or more DIDs (up to 5) to the tenant's inbound Application and
+        re-sync the answer webhook (operator override).
 
-        Persists ``provider_status.plivo.number`` (+ ``twilio_phone_number``) and,
-        when ``reassign`` and the tenant has a Plivo Application, best-effort binds
-        the DID to that Application + subaccount and re-syncs the answer webhook so
-        inbound calls route. Telephony API failures are reported, never fatal — the
-        stored number still updates so outbound caller-ID is correct.
+        Each DID is bound to the tenant's (MASTER-account) Application — we do NOT move
+        it to the tenant's subaccount. A master Application can't be assigned to a
+        subaccount number: Plivo silently drops it back to the account's Default app
+        ("This Application-id does not belong to this Account…"), which breaks inbound.
+        Routing only needs the Application's ``answer_url`` (keyed by the tenant's
+        link_id), which the master app carries — so the DID stays on master with that
+        app. The FIRST number is the primary caller ID; all are stored on
+        ``provider_status.plivo.numbers``. Telephony failures are reported PER NUMBER,
+        never fatal — the stored numbers still update.
         """
         from sqlalchemy.orm.attributes import flag_modified
 
-        # Normalize to bare-digit E.164 BEFORE assigning or storing: Plivo's
-        # /Number/<n>/ path 404s on a formatted value, and the stored caller ID must
-        # match the bare form DIDs are kept in everywhere else.
-        number = cls.normalize_number(number)
-        if not number:
+        # Normalize → bare-digit E.164 (Plivo 404s on a formatted /Number/<n>/ path),
+        # dedupe (order-preserving), cap at 5.
+        clean: list[str] = []
+        for raw in numbers or []:
+            num = cls.normalize_number(raw)
+            if num and num not in clean:
+                clean.append(num)
+            if len(clean) >= 5:
+                break
+        if not clean:
             raise PlivoError("A phone number is required.")
 
         cfg = cls._plivo_config(tenant_res)
         previous = cfg.get("number") or tenant_res.twilio_phone_number
         app_id = cfg.get("application_id")
-        sub_auth_id = cfg.get("subaccount_auth_id")
 
-        result: dict[str, Any] = {"number": number, "previous": previous, "assigned": False, "webhook": None}
-
-        if reassign and app_id:
-            try:
-                await cls.assign_number(number, app_id=str(app_id), sub_auth_id=sub_auth_id)
-                result["assigned"] = True
-            except Exception as exc:  # noqa: BLE001
-                result["assign_error"] = str(exc)
+        per_number: list[dict[str, Any]] = []
+        for num in clean:
+            entry: dict[str, Any] = {"number": num, "assigned": False}
+            if reassign and app_id:
+                try:
+                    # Bind to the master Application only — NO subaccount move (see above).
+                    await cls.assign_number(num, app_id=str(app_id))
+                    entry["assigned"] = True
+                except Exception as exc:  # noqa: BLE001
+                    entry["error"] = str(exc)
+            per_number.append(entry)
 
         provider_status = dict(tenant_res.provider_status or {})
         plivo_cfg = dict(provider_status.get("plivo") or {})
-        plivo_cfg["number"] = number
+        plivo_cfg["number"] = clean[0]      # primary caller ID
+        plivo_cfg["numbers"] = clean        # every DID bound to the tenant's app
         provider_status["plivo"] = plivo_cfg
         tenant_res.provider_status = provider_status
-        tenant_res.twilio_phone_number = number
+        tenant_res.twilio_phone_number = clean[0]
         try:
             flag_modified(tenant_res, "provider_status")
         except Exception:
             pass
         db.add(tenant_res)
         await db.commit()
+
+        webhook = None
+        assigned_count = sum(1 for e in per_number if e.get("assigned"))
+        first_error = next((e["error"] for e in per_number if e.get("error")), None)
+        result: dict[str, Any] = {
+            "number": clean[0],
+            "numbers": clean,
+            "previous": previous,
+            # ``assigned`` (bool) kept for back-compat = every DID bound.
+            "assigned": bool(reassign and app_id) and assigned_count == len(clean),
+            "assigned_count": assigned_count,
+            "per_number": per_number,
+            "assign_error": first_error,  # first failure, for the single-number display
+            "webhook": webhook,
+        }
 
         if reassign and base and app_id:
             try:
@@ -341,6 +369,15 @@ class PlivoService:
                 result["webhook"] = {"updated": False, "error": str(exc)}
 
         return result
+
+    @classmethod
+    async def set_tenant_number(
+        cls, tenant_res: TenantResources, db, *, number: str, reassign: bool = True, base: str | None = None
+    ) -> dict[str, Any]:
+        """Back-compat single-DID wrapper over :meth:`set_tenant_numbers`."""
+        return await cls.set_tenant_numbers(
+            tenant_res, db, numbers=[number], reassign=reassign, base=base
+        )
 
     # ── outbound ─────────────────────────────────────────────────────────────────
     @classmethod

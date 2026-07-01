@@ -1142,7 +1142,10 @@ async def get_tenant_detail(
 
 
 class PlivoNumberPayload(BaseModel):
-    number: str
+    # A single DID, or up to 5 at once via ``numbers`` (each bound to the tenant's
+    # inbound Application). ``number`` stays for back-compat / single-DID callers.
+    number: str | None = None
+    numbers: list[str] | None = None
     reassign: bool = True
 
 
@@ -1154,9 +1157,11 @@ async def change_plivo_number(
     db: AsyncSession = Depends(get_db),
     current_user: SuperAdminUser = Depends(RequireRole(_WRITE_ROLES)),
 ):
-    """Change the Plivo DID assigned to a tenant (operator override)."""
-    number = (payload.number or "").strip()
-    if not number:
+    """Bind one or more Plivo DIDs (up to 5) to a tenant's inbound app (operator
+    override)."""
+    raw_numbers = list(payload.numbers) if payload.numbers else ([payload.number] if payload.number else [])
+    numbers = [n.strip() for n in raw_numbers if (n or "").strip()]
+    if not numbers:
         raise HTTPException(status_code=400, detail="A phone number is required.")
     tenant_res = (
         await db.execute(select(TenantResources).where(TenantResources.organization_id == organization_id))
@@ -1172,8 +1177,8 @@ async def change_plivo_number(
         base = None
 
     try:
-        result = await PlivoService.set_tenant_number(
-            tenant_res, db, number=number, reassign=payload.reassign, base=base
+        result = await PlivoService.set_tenant_numbers(
+            tenant_res, db, numbers=numbers, reassign=payload.reassign, base=base
         )
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"Could not set the number: {exc}")
@@ -1189,8 +1194,13 @@ async def change_plivo_number(
             user_agent=request.headers.get("user-agent"),
             request_id=request.headers.get("x-request-id"),
             before_state={"number": result.get("previous")},
-            after_state={"number": result.get("number")},
-            metadata_={"reassign": payload.reassign, "assigned": result.get("assigned")},
+            after_state={"number": result.get("number"), "numbers": result.get("numbers")},
+            metadata_={
+                "reassign": payload.reassign,
+                "assigned": result.get("assigned"),
+                "assigned_count": result.get("assigned_count"),
+                "numbers": result.get("numbers"),
+            },
         )
     )
     await db.commit()

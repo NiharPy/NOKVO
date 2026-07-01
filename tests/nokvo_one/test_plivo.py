@@ -100,6 +100,46 @@ def test_set_tenant_number_normalizes_assign_and_storage(plivo_creds, monkeypatc
     assert any(c[1].endswith("/Number/912264233631/") for c in calls)
 
 
+class _StubDB:
+    def add(self, *a, **k):
+        pass
+
+    async def commit(self):
+        pass
+
+
+def test_set_tenant_numbers_binds_up_to_five_without_subaccount_move(plivo_creds, monkeypatch):
+    calls = []
+    _mock_request(monkeypatch, lambda m, u, b: calls.append((m, u, b)) or {})
+    tr = SimpleNamespace(
+        provider_status={"plivo": {"application_id": "APP123", "subaccount_auth_id": "SUBxxx", "link_id": "L1"}},
+        twilio_phone_number=None,
+        tenant_id="t1",
+    )
+    res = _run(PlivoService.set_tenant_numbers(
+        tr, _StubDB(), numbers=["+91 22 6423 3631", "919000000001", "919000000002"], reassign=True, base=None,
+    ))
+    assert res["numbers"] == ["912264233631", "919000000001", "919000000002"]
+    assert res["number"] == "912264233631"                     # primary = first
+    assert res["assigned_count"] == 3 and res["assigned"] is True
+    assert tr.provider_status["plivo"]["numbers"] == res["numbers"]
+    # Each DID is bound to the app WITHOUT a subaccount move — a master app can't be
+    # assigned to a subaccount number (the reported 400). So no "subaccount" in body.
+    number_calls = [c for c in calls if "/Number/" in c[1]]
+    assert len(number_calls) == 3
+    for _m, _u, body in number_calls:
+        assert body.get("app_id") == "APP123" and "subaccount" not in body
+
+
+def test_set_tenant_numbers_dedupes_and_caps_at_five(plivo_creds, monkeypatch):
+    _mock_request(monkeypatch, lambda m, u, b: {})
+    tr = SimpleNamespace(provider_status={"plivo": {"application_id": "A"}}, twilio_phone_number=None, tenant_id="t")
+    nums = ["+91 22 6423 3631", "912264233631", "9100000001", "9100000002", "9100000003", "9100000004", "9100000005"]
+    res = _run(PlivoService.set_tenant_numbers(tr, _StubDB(), numbers=nums, reassign=False, base=None))
+    # The formatted twin collapses onto its bare form, then capped at the first 5.
+    assert res["numbers"] == ["912264233631", "9100000001", "9100000002", "9100000003", "9100000004"]
+
+
 def test_rent_number_raises_when_no_india_inventory(plivo_creds, monkeypatch):
     # India KYC/regulatory → no instantly-rentable DID. Caller treats this as pending.
     _mock_request(monkeypatch, lambda m, u, b: {"objects": []} if "PhoneNumber/?" in u else {})

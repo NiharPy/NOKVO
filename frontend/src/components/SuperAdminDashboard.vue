@@ -702,14 +702,15 @@ function cancelPlivoChange() { plivoTarget.value = null; }
 const submitPlivoChange = async () => {
   const t = plivoTarget.value;
   if (!t) return;
-  const number = (t.number || '').trim();
-  if (!number) { errorMsg.value = 'Enter a phone number.'; return; }
+  // Accept one or many DIDs (comma / space / newline separated), up to 5.
+  const numbers = (t.number || '').split(/[\s,]+/).map((s) => s.trim()).filter(Boolean).slice(0, 5);
+  if (!numbers.length) { errorMsg.value = 'Enter a phone number.'; return; }
   plivoBusy.value = true; errorMsg.value = '';
   try {
     const res = await fetch(`${SUPERADMIN_API_BASE}/tenants/${t.org_id}/plivo-number`, {
       method: 'POST',
       headers: authHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ number, reassign: t.reassign }),
+      body: JSON.stringify({ numbers, reassign: t.reassign }),
     });
     if (res.status === 401) { emit('logout'); return; }
     if (!res.ok) {
@@ -1503,16 +1504,20 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
     <!-- ── Change Plivo number ──────────────────────────────────── -->
     <div v-if="plivoTarget" class="modal-overlay" @click.self="cancelPlivoChange">
       <div class="modal-card">
-        <span class="stage-eyebrow">CHANGE PLIVO NUMBER</span>
+        <span class="stage-eyebrow">CHANGE PLIVO NUMBER(S)</span>
         <h4>{{ plivoTarget.name }}</h4>
         <p>Current: <strong class="ls-mono">{{ plivoTarget.current || 'none' }}</strong></p>
-        <input v-model="plivoTarget.number" class="todo-input" type="text" placeholder="+9180XXXXXXXX (E.164)" />
+        <textarea v-model="plivoTarget.number" class="todo-input" rows="3" placeholder="One DID per line (or comma-separated), E.164 — up to 5. e.g. +9180XXXXXXXX"></textarea>
         <label class="ls-check" style="margin-top:0.6rem;">
           <input type="checkbox" v-model="plivoTarget.reassign" />
-          Re-bind the DID to the tenant’s Plivo app + re-sync the webhook
+          Re-bind the DID(s) to the tenant’s Plivo app + re-sync the webhook
         </label>
         <p v-if="plivoResult" class="bc-result">
-          Updated to {{ plivoResult.number }}{{ plivoResult.assigned ? ' · DID re-bound' : '' }}{{ plivoResult.assign_error ? ' · assign failed: ' + plivoResult.assign_error : '' }}.
+          Set {{ (plivoResult.numbers || [plivoResult.number]).length }} number(s) · {{ plivoResult.assigned_count ?? (plivoResult.assigned ? 1 : 0) }} re-bound to the app<template v-if="plivoResult.webhook && plivoResult.webhook.updated"> · webhook synced</template>.
+          <template v-if="(plivoResult.per_number || []).some((n) => n.error)">
+            <br /><span style="color:#e6a23c;">Not bound:</span>
+            <span v-for="(n, i) in (plivoResult.per_number || []).filter((x) => x.error)" :key="i" class="ls-mono">{{ n.number }} — {{ n.error }}<br /></span>
+          </template>
         </p>
         <div class="modal-actions">
           <button class="ghost-btn" @click="cancelPlivoChange">{{ plivoResult ? 'CLOSE' : 'CANCEL' }}</button>
