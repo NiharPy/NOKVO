@@ -6,6 +6,7 @@ logger = logging.getLogger(__name__)
 
 import asyncio
 import base64
+import hashlib
 import json
 import re
 from time import perf_counter
@@ -574,6 +575,38 @@ class SarvamVoiceService:
             "raw": payload,
         }
 
+    # ── local TTS byte-cache (Redis) ─────────────────────────────────────────────
+    # Our own store for synthesized audio of DETERMINISTIC scripted lines (opt-in via
+    # cache=True). Distinct from Sarvam's server-side ENABLE_CACHED_RESPONSES. The key
+    # is derived from the request body — every field that changes the audio bytes — so
+    # a hit is byte-identical, and it's global (cross-tenant safe: the effective
+    # speaker/model/rate are in the key, so identical text+voice legitimately share).
+    @staticmethod
+    def _tts_cache_key(body: dict[str, Any]) -> str:
+        canon = json.dumps(body, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        return "tts:v1:" + hashlib.sha256(canon.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    async def _tts_cache_get(key: str) -> dict[str, Any] | None:
+        try:
+            from app.services.agent_session_store import AgentSessionStore
+
+            raw = await AgentSessionStore.client().get(key)
+            return json.loads(raw) if raw else None
+        except Exception:
+            return None  # best-effort: a cache miss/error never blocks synthesis
+
+    @staticmethod
+    async def _tts_cache_set(key: str, value: dict[str, Any]) -> None:
+        try:
+            from app.services.agent_session_store import AgentSessionStore
+
+            await AgentSessionStore.client().setex(
+                key, settings.TTS_CACHE_TTL_SECONDS, json.dumps(value)
+            )
+        except Exception:
+            pass  # best-effort
+
     @staticmethod
     async def synthesize(
         tenant_res: TenantResources,
@@ -584,6 +617,7 @@ class SarvamVoiceService:
         pitch: float | None = None,
         loudness: float | None = None,
         enable_cached_responses: bool | None = None,
+        cache: bool = False,
     ) -> dict[str, Any]:
         if not text.strip():
             return {"audios": [], "audio_format": settings.SARVAM_TTS_AUDIO_CODEC}
@@ -621,6 +655,26 @@ class SarvamVoiceService:
             if loudness is not None:
                 prosody_body["loudness"] = max(0.1, min(3.0, float(loudness)))
         body.update(prosody_body)
+
+        # Local cache lookup (opt-in). The key is the request body sans the
+        # server-side ``enable_cached_responses`` flag (it doesn't change the bytes),
+        # so both server-cached and not requests share one entry.
+        cache_on = bool(cache and settings.TTS_CACHE_ENABLED)
+        cache_key = None
+        if cache_on:
+            cache_key = SarvamVoiceService._tts_cache_key(
+                {k: v for k, v in body.items() if k != "enable_cached_responses"}
+            )
+            hit = await SarvamVoiceService._tts_cache_get(cache_key)
+            if hit and hit.get("audios"):
+                return {
+                    "request_id": None,
+                    "audios": list(hit["audios"]),
+                    "audio_format": hit.get("audio_format") or settings.SARVAM_TTS_AUDIO_CODEC,
+                    "sample_rate": int(hit.get("sample_rate") or settings.SARVAM_TTS_SAMPLE_RATE),
+                    "cached": True,
+                }
+
         client = SarvamVoiceService.http_client()
         response = await client.post(
             endpoint,
@@ -628,6 +682,10 @@ class SarvamVoiceService:
             json=body,
             timeout=httpx.Timeout(30.0),
         )
+        # Whether the FIRST attempt succeeded — only then does the returned audio
+        # match ``cache_key`` (the 4xx retry below changes speaker/prosody, so its
+        # bytes would not correspond to the key → must NOT be cached).
+        first_attempt_ok = response.status_code < 400
         # Retry once on a 4xx: strip prosody params (older models reject
         # pace/pitch/loudness) AND reset to the global default speaker. A bad
         # per-language speaker id (a mis-configured SARVAM_TTS_SPEAKER_<LANG>)
@@ -650,12 +708,22 @@ class SarvamVoiceService:
             logger.warning(f"NOKVO-TTS: Sarvam TTS failed ({response.status_code}): {error_body!r}")
             raise RuntimeError(f"Sarvam TTS failed ({response.status_code}): {error_body}")
         payload = response.json()
+        audios = list(payload.get("audios") or [])
+        sample_rate = int(provider_status.get("tts_sample_rate") or settings.SARVAM_TTS_SAMPLE_RATE)
+        # Store for reuse — only when caching is on, the FIRST attempt produced the
+        # audio (so it matches the key), and we actually got audio.
+        if cache_on and cache_key and first_attempt_ok and audios:
+            await SarvamVoiceService._tts_cache_set(
+                cache_key,
+                {"audios": audios, "audio_format": settings.SARVAM_TTS_AUDIO_CODEC, "sample_rate": sample_rate},
+            )
         return {
             "request_id": payload.get("request_id"),
-            "audios": list(payload.get("audios") or []),
+            "audios": audios,
             "audio_format": settings.SARVAM_TTS_AUDIO_CODEC,
-            "sample_rate": int(provider_status.get("tts_sample_rate") or settings.SARVAM_TTS_SAMPLE_RATE),
+            "sample_rate": sample_rate,
             "raw": payload,
+            "cached": False,
         }
 
     @staticmethod
@@ -800,21 +868,10 @@ class SarvamVoiceService:
         pitch: float | None = None,
         loudness: float | None = None,
         enable_cached_responses: bool | None = None,
+        cache: bool = False,
     ) -> dict[str, Any]:
         stream_id = f"sarvam-tts-{int(perf_counter() * 1000)}"
         started = perf_counter()
-        # Meter TTS characters for per-call COGS (best-effort). Counted ONCE
-        # here at the single TTS entry point so the streaming→REST fallback
-        # can't double-count. Uses the normalized text (what Sarvam bills),
-        # capped at the 3500-char request limit the leaf methods enforce.
-        try:
-            from app.services.call_usage import current_call_usage
-
-            _usage = current_call_usage()
-            if _usage is not None and text and text.strip():
-                _usage.add_tts_chars(len(normalize_text_for_tts(text)[:3500]))
-        except Exception:
-            pass
         try:
             await websocket.send_json({"type": "tts_started", "stream_id": stream_id, "purpose": purpose, "provider": "sarvam"})
         except Exception:
@@ -954,7 +1011,20 @@ class SarvamVoiceService:
                 pitch=pitch,
                 loudness=loudness,
                 enable_cached_responses=enable_cached_responses,
+                cache=cache,
             )
+            # Meter TTS chars for per-call COGS (best-effort) — but NOT on a cache
+            # hit, which never billed Sarvam. Counted here (not at the top) so a hit
+            # is free; the streaming path meters separately below.
+            if not result.get("cached"):
+                try:
+                    from app.services.call_usage import current_call_usage
+
+                    _usage = current_call_usage()
+                    if _usage is not None and text and text.strip():
+                        _usage.add_tts_chars(len(normalize_text_for_tts(text)[:3500]))
+                except Exception:
+                    pass
             for audio in result.get("audios") or []:
                 if not audio:
                     continue
@@ -971,6 +1041,7 @@ class SarvamVoiceService:
                                 "audio_format": result.get("audio_format"),
                                 "sample_rate": result.get("sample_rate"),
                                 "streaming": False,
+                                "cached": bool(result.get("cached")),
                             }
                         )
                     except Exception:
@@ -990,6 +1061,18 @@ class SarvamVoiceService:
                     chunks_sent += 1
                 except Exception:
                     pass
+
+        # Streaming path meters its own chars (the REST branch above meters when it
+        # runs; kept separate so the streaming path, if re-enabled, still counts).
+        if used_streaming and chunks_sent:
+            try:
+                from app.services.call_usage import current_call_usage
+
+                _usage = current_call_usage()
+                if _usage is not None and text and text.strip():
+                    _usage.add_tts_chars(len(normalize_text_for_tts(text)[:3500]))
+            except Exception:
+                pass
 
         # Send a terminal marker so the frontend playback scheduler knows
         # this sentence is complete (streaming mode emits multiple chunks
@@ -1026,10 +1109,11 @@ class SarvamVoiceService:
         # which path actually produced audio; fell_back flags a streaming→REST
         # switch (deadline or error). This is what makes a TTS stall attributable.
         total_ms = int((perf_counter() - started) * 1000)
+        _mode = "cache" if result.get("cached") else ("stream" if used_streaming else "rest")
         logger.info(
             "NOKVO-TTS-LATENCY: purpose=%s lang=%s mode=%s fell_back=%s "
             "first_audio_ms=%s total_ms=%d chars=%d chunks=%d",
-            purpose, language or "-", "stream" if used_streaming else "rest",
+            purpose, language or "-", _mode,
             fell_back, first_audio_ms, total_ms, len(text or ""), chunks_sent,
         )
         return {"stream_id": stream_id, "first_audio_ms": first_audio_ms, **result}

@@ -325,6 +325,22 @@ class Settings(BaseSettings):
     SARVAM_TTS_SAMPLE_RATE: int = 24000
     SARVAM_TTS_AUDIO_CODEC: str = "wav"
     SARVAM_TTS_ENABLE_CACHED_RESPONSES: bool = False
+    # Local Redis byte-cache for synthesized TTS audio (our own store, distinct
+    # from Sarvam's server-side ENABLE_CACHED_RESPONSES). Opt-in per call: only the
+    # deterministic scripted lines (APEX opener/outro) pass cache=True, so the same
+    # audio is synthesized once and served from Redis on every later call — near-zero
+    # first-audio latency + ~zero TTS COGS on those lines. Keyed by the normalized
+    # text + every voice param that changes the bytes, so a hit is byte-identical.
+    TTS_CACHE_ENABLED: bool = True
+    TTS_CACHE_TTL_SECONDS: int = 604800  # 7 days
+    # APEX Phase 3: when ON, the deterministic questionnaire SPEAKS each question
+    # verbatim from its pre-translated per-language string (text_i18n) instead of
+    # letting the LLM rephrase — so the exact string recurs across calls and hits
+    # the TTS cache (huge COGS/latency win) while staying native hi/te. Behavior
+    # change: question DELIVERY is scripted, but the LLM still handles re-asks,
+    # non-answers, and off-script replies (those turns fall through to it). Default
+    # OFF so it can be A/B'd against the LLM-rephrase flow before rollout.
+    APEX_VERBATIM_QUESTIONS_ENABLED: bool = False
     # Plivo telephony (the sole provider). The MASTER account creds; each tenant
     # gets its own Plivo subaccount + DID + Application created via the API.
     PLIVO_AUTH_ID: str = ""

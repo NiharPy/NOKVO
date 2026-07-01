@@ -1,50 +1,104 @@
 <script setup>
 // APEX Members (admin) — invite teammates by email; each creates their own sign-in
-// for this workspace and claims qualified leads.
+// for this workspace and claims qualified leads. The roster reads as people (a
+// monogram tile per member) rather than a data table; an Invited member shows a
+// dashed tile + hollow dot until they accept and become Active.
 import { inject, onMounted } from 'vue';
 
 const apex = inject('apex');
 onMounted(() => apex.loadMembers());
+
+const initialOf = (m) => (m.full_name || m.email || '?').trim().charAt(0).toUpperCase();
+const primaryOf = (m) => m.full_name || m.email;
 </script>
 
 <template>
   <div class="ax-card ax-card-pad ax-anim">
     <div class="ax-card-head">
-      <h2 class="ax-h2">Members</h2>
+      <div class="mb-head-left">
+        <h2 class="ax-h2">Members</h2>
+        <span v-if="apex.members.value.length" class="ax-count ax-count--grey">{{ apex.members.value.length }}</span>
+      </div>
     </div>
-    <p class="ax-muted">Invite teammates to claim and work your qualified leads. They get their own sign-in for this workspace.</p>
+    <p class="ax-muted">Invite teammates to claim and work your qualified leads. Each gets their own sign-in for this workspace.</p>
 
-    <div class="ax-invite">
-      <input v-model="apex.inviteForm.value.email" type="email" class="ax-input ax-invite-input" placeholder="teammate@email.com" @keyup.enter="apex.submitInvite()" />
-      <input v-model="apex.inviteForm.value.full_name" type="text" class="ax-input ax-invite-input" placeholder="Name (optional)" />
-      <button type="button" class="ax-btn2 ax-btn2--accent ax-btn2--sm" :disabled="apex.inviteBusy.value" @click="apex.submitInvite()">
-        {{ apex.inviteBusy.value ? 'Sending…' : 'Send invite' }}
-      </button>
+    <!-- Invite a teammate -->
+    <div class="mb-invite">
+      <div class="mb-eyebrow">Invite a teammate</div>
+      <div class="mb-invite-row">
+        <input
+          v-model="apex.inviteForm.value.email" type="email" class="ax-text mb-invite-email"
+          placeholder="teammate@email.com" @keyup.enter="apex.submitInvite()"
+        />
+        <input
+          v-model="apex.inviteForm.value.full_name" type="text" class="ax-text mb-invite-name"
+          placeholder="Name (optional)" @keyup.enter="apex.submitInvite()"
+        />
+        <button
+          type="button" class="ax-btn2 ax-btn2--accent mb-invite-btn"
+          :disabled="apex.inviteBusy.value" @click="apex.submitInvite()"
+        >{{ apex.inviteBusy.value ? 'Sending…' : 'Send invite' }}</button>
+      </div>
+      <p v-if="apex.inviteNote.value" class="mb-note" :class="apex.inviteOk.value ? 'is-ok' : 'is-err'">
+        {{ apex.inviteNote.value }}
+      </p>
     </div>
-    <p v-if="apex.inviteNote.value" class="ax-invite-note" :class="apex.inviteOk.value ? 'is-ok' : 'is-err'">{{ apex.inviteNote.value }}</p>
 
-    <div v-if="!apex.members.value.length" class="ax-empty" style="margin-top:18px;">
-      <div class="ax-empty-icon">◷</div>
+    <!-- Roster -->
+    <div v-if="!apex.members.value.length" class="ax-empty mb-empty">
+      <div class="ax-empty-icon">◍</div>
       <p class="ax-empty-text">No members yet — invite your first teammate above.</p>
     </div>
-    <template v-else>
-      <div class="ax-thead" style="grid-template-columns:1.4fr 1.6fr auto;margin-top:16px;"><span>Name</span><span>Email</span><span>Status</span></div>
-      <div v-for="m in apex.members.value" :key="m.id" class="ax-trow" style="grid-template-columns:1.4fr 1.6fr auto;align-items:center;">
-        <span class="ax-cell-name">{{ m.full_name || '—' }}</span>
-        <span class="ax-cell-phone">{{ m.email }}</span>
-        <span class="ax-mstatus" :class="m.status === 'active' ? 'is-active' : 'is-pending'">{{ m.status === 'active' ? 'Active' : 'Invited' }}</span>
-      </div>
-    </template>
+    <ul v-else class="mb-roster">
+      <li v-for="m in apex.members.value" :key="m.id" class="mb-row">
+        <span class="mb-mono" :class="m.status === 'active' ? 'is-active' : 'is-invited'">{{ initialOf(m) }}</span>
+        <div class="mb-ident">
+          <span class="mb-name">{{ primaryOf(m) }}</span>
+          <span v-if="m.full_name" class="mb-email">{{ m.email }}</span>
+        </div>
+        <span class="mb-status" :class="m.status === 'active' ? 'is-active' : 'is-invited'">
+          <span class="mb-dot"></span>{{ m.status === 'active' ? 'Active' : 'Invited' }}
+        </span>
+      </li>
+    </ul>
   </div>
 </template>
 
 <style scoped>
-.ax-invite { display: flex; gap: 8px; flex-wrap: wrap; margin: 14px 0 4px; }
-.ax-invite-input { flex: 1 1 180px; }
-.ax-invite-note { font-size: 12.5px; margin: 8px 0 0; }
-.ax-invite-note.is-ok { color: #7FD9A8; }
-.ax-invite-note.is-err { color: #ff8b8b; }
-.ax-mstatus { font-size: 11px; font-family: 'JetBrains Mono', monospace; letter-spacing: 0.04em; }
-.ax-mstatus.is-active { color: #7FD9A8; }
-.ax-mstatus.is-pending { color: rgba(255,255,255,0.5); }
+.mb-head-left { display: flex; align-items: center; gap: 13px; }
+
+/* Invite panel — a quiet compose zone; the eyebrow labels it as its own region. */
+.mb-eyebrow { font-size: 11px; letter-spacing: 0.22em; text-transform: uppercase; color: rgba(255,255,255,0.34); font-weight: 600; margin-bottom: 15px; }
+.mb-invite { background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.08); border-radius: 10px; padding: 22px 24px; }
+.mb-invite-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: stretch; }
+.mb-invite-email { flex: 2 1 220px; }
+.mb-invite-name { flex: 1 1 150px; }
+.mb-invite-btn { flex: 0 0 auto; padding: 13px 24px; }
+.mb-note { font-size: 12.5px; margin: 13px 0 0; line-height: 1.5; }
+.mb-note.is-ok { color: #7FD9A8; }
+.mb-note.is-err { color: #ff8b8b; }
+
+.mb-empty { margin-top: 24px; }
+
+/* Roster — people, not rows. Monogram + identity + state. */
+.mb-roster { list-style: none; margin: 28px 0 0; padding: 0; }
+.mb-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 16px; padding: 15px 6px; border-top: 1px solid rgba(255,255,255,0.06); }
+
+.mb-mono { width: 40px; height: 40px; border-radius: 9px; display: flex; align-items: center; justify-content: center; font-family: 'Sora', sans-serif; font-weight: 700; font-size: 15px; }
+.mb-mono.is-active { border: 1px solid rgba(255,255,255,0.18); background: rgba(255,255,255,0.03); color: #F3F2F0; }
+/* Dashed until they accept — the tile itself signals "not yet joined". */
+.mb-mono.is-invited { border: 1px dashed rgba(255,255,255,0.2); color: rgba(255,255,255,0.4); }
+
+.mb-ident { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.mb-name { font-size: 15px; font-weight: 600; color: #F3F2F0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mb-email { font-family: 'JetBrains Mono', monospace; font-size: 12.5px; color: rgba(255,255,255,0.42); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.mb-status { display: inline-flex; align-items: center; gap: 8px; justify-self: end; font-family: 'JetBrains Mono', monospace; font-size: 11.5px; letter-spacing: 0.05em; }
+.mb-status.is-active { color: #7FD9A8; }
+.mb-status.is-invited { color: #D6A15C; }
+.mb-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; background: currentColor; }
+
+@media (max-width: 560px) {
+  .mb-invite-btn { flex: 1 1 100%; }
+}
 </style>

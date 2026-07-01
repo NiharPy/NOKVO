@@ -731,6 +731,54 @@ const submitPlivoChange = async () => {
   }
 };
 
+// ── APEX bulk-number assignment ─────────────────────────────
+// Register the DIDs rented on the APEX org's account-creation sub-account as its
+// outbound caller-ID pool (no inbound-app binding). Replaces "Change number" for
+// APEX. Blank = auto-detect every DID on the sub-account.
+const apexBulkTarget = ref(null); // { org_id, name, current: string[], numbers: '' }
+const apexBulkBusy = ref(false);
+const apexBulkResult = ref(null);
+function openApexBulk(d) {
+  apexBulkResult.value = null;
+  apexBulkTarget.value = {
+    org_id: d.organization_id,
+    name: d.organization_name,
+    current: d.telephony?.bulk_numbers || [],
+    numbers: '',
+  };
+}
+function cancelApexBulk() { apexBulkTarget.value = null; }
+const submitApexBulk = async () => {
+  const t = apexBulkTarget.value;
+  if (!t) return;
+  // Optional — blank means auto-detect. Split on NEWLINE or COMMA only (a formatted
+  // DID has internal spaces; the backend strips to bare digits). Up to 5.
+  const numbers = (t.numbers || '').split(/[\r\n,]+/).map((s) => s.trim()).filter(Boolean).slice(0, 5);
+  apexBulkBusy.value = true; errorMsg.value = '';
+  try {
+    const res = await fetch(`${SUPERADMIN_API_BASE}/tenants/${t.org_id}/apex-bulk-numbers`, {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ numbers }),
+    });
+    if (res.status === 401) { emit('logout'); return; }
+    if (!res.ok) {
+      const d = await res.json().catch(() => ({}));
+      errorMsg.value = d.detail || `Could not assign the numbers (${res.status}).`;
+      return;
+    }
+    apexBulkResult.value = await res.json();
+    if (detail.value && detail.value.organization_id === t.org_id && detail.value.telephony) {
+      detail.value.telephony.bulk_numbers = apexBulkResult.value.numbers || [];
+      detail.value.telephony.bulk_enabled = !!apexBulkResult.value.enabled;
+    }
+  } catch (_) {
+    errorMsg.value = 'Network error while assigning the numbers.';
+  } finally {
+    apexBulkBusy.value = false;
+  }
+};
+
 function handleLogout() { emit('logout'); }
 
 // COGS component bars (detail view) scale to the largest component.
@@ -950,7 +998,19 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
           </div>
 
           <div v-if="detail.telephony" class="telephony-panel">
-            <div class="telephony-info">
+            <!-- APEX dials from a POOL of DIDs on its sub-account, not an inbound
+                 number — show/manage the outbound pool instead of the inbound DID. -->
+            <div v-if="detail.is_apex" class="telephony-info">
+              <span class="stage-eyebrow">APEX OUTBOUND POOL</span>
+              <strong class="ls-mono">{{ (detail.telephony.bulk_numbers || []).length }} / 5 DID(s)</strong>
+              <span class="card-foot">
+                tenant {{ detail.telephony.tenant_id || '—' }} ·
+                {{ detail.telephony.bulk_enabled ? 'bulk enabled' : 'bulk not enabled' }}
+                <template v-if="(detail.telephony.bulk_numbers || []).length"> · <span class="ls-mono">{{ (detail.telephony.bulk_numbers || []).join(', ') }}</span></template>
+                <template v-if="detail.telephony.compliance_application_id"> · KYC filed</template>
+              </span>
+            </div>
+            <div v-else class="telephony-info">
               <span class="stage-eyebrow">PLIVO NUMBER</span>
               <strong class="ls-mono">{{ detail.telephony.number || 'Not assigned' }}</strong>
               <span class="card-foot">
@@ -962,12 +1022,13 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
             </div>
             <div class="telephony-actions">
               <button
-                v-if="!detail.telephony.number && detail.telephony.has_application"
+                v-if="!detail.is_apex && !detail.telephony.number && detail.telephony.has_application"
                 type="button" class="plan-btn upgrade"
                 :disabled="compRetryBusy === detail.organization_id"
                 @click="retryCompliance(detail)"
               >{{ compRetryBusy === detail.organization_id ? 'Retrying…' : 'Retry compliance' }}</button>
-              <button type="button" class="plan-btn" @click="openPlivoChange(detail)">Change number</button>
+              <button v-if="detail.is_apex" type="button" class="plan-btn" @click="openApexBulk(detail)">Assign bulk numbers</button>
+              <button v-else type="button" class="plan-btn" @click="openPlivoChange(detail)">Change number</button>
             </div>
           </div>
           <p v-if="detail.telephony && detail.telephony.compliance_error" class="comp-error">
@@ -1527,6 +1588,31 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
           <button class="ghost-btn" @click="cancelPlivoChange">{{ plivoResult ? 'CLOSE' : 'CANCEL' }}</button>
           <button class="plan-btn upgrade" :disabled="plivoBusy || !plivoTarget.number.trim()" @click="submitPlivoChange">
             {{ plivoBusy ? 'Saving…' : 'Set number' }}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Assign APEX bulk numbers (sub-account pool) ───────────── -->
+    <div v-if="apexBulkTarget" class="modal-overlay" @click.self="cancelApexBulk">
+      <div class="modal-card">
+        <span class="stage-eyebrow">ASSIGN APEX BULK NUMBERS</span>
+        <h4>{{ apexBulkTarget.name }}</h4>
+        <p class="muted">
+          Register the DIDs you rented on this APEX org’s Plivo sub-account as its
+          outbound caller-ID pool (up to 5). Leave blank to auto-detect every DID on
+          the sub-account.
+        </p>
+        <p v-if="apexBulkTarget.current.length">Current pool: <strong class="ls-mono">{{ apexBulkTarget.current.join(', ') }}</strong></p>
+        <textarea v-model="apexBulkTarget.numbers" class="todo-input" rows="3" placeholder="One DID per line (or comma-separated), E.164 — up to 5. Leave blank to auto-detect."></textarea>
+        <p v-if="apexBulkResult" class="bc-result">
+          <span style="color:#67c23a;">Bulk pool set</span> · {{ (apexBulkResult.numbers || []).length }} DID(s) · {{ apexBulkResult.enabled ? 'enabled' : 'not enabled' }}.
+          <template v-if="(apexBulkResult.numbers || []).length"><br /><span class="ls-mono">{{ (apexBulkResult.numbers || []).join(', ') }}</span></template>
+        </p>
+        <div class="modal-actions">
+          <button class="ghost-btn" @click="cancelApexBulk">{{ apexBulkResult ? 'CLOSE' : 'CANCEL' }}</button>
+          <button class="plan-btn upgrade" :disabled="apexBulkBusy" @click="submitApexBulk">
+            {{ apexBulkBusy ? 'Saving…' : 'Assign numbers' }}
           </button>
         </div>
       </div>

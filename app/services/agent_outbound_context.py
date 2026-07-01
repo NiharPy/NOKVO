@@ -306,6 +306,10 @@ class OutboundCampaignContext:
     # Admin-authored closing line; the agent says it to end any call and the
     # system plays-then-hangs-up when it's delivered (incl. a failed intent gate).
     question_outro: str = ""
+    # Pre-translated closing line {en,hi,te} (questionnaire_translation). When the
+    # verbatim-question flag is on, the outro is spoken from the session-language
+    # entry here so it stays native; empty falls back to ``question_outro``.
+    question_outro_i18n: dict = field(default_factory=dict)
 
     @property
     def is_proactive(self) -> bool:
@@ -555,6 +559,13 @@ def _coerce_questionnaire(value: Any, *, strict: bool = False) -> dict[str, Any]
             q["points"] = points
         if gate:
             q["gate"] = True
+        # Preserve pre-translated per-language text (en/hi/te) if present — written
+        # once at campaign creation (questionnaire_translation) and read at call
+        # time to speak the question verbatim in the caller's language. Round-trips
+        # through re-coercion so it isn't lost on reload/rerun.
+        i18n = item.get("text_i18n")
+        if isinstance(i18n, dict) and i18n:
+            q["text_i18n"] = {str(k): str(v) for k, v in i18n.items() if v}
         questions.append(q)
         if len(questions) >= _MAX_QUESTIONS:
             break
@@ -577,6 +588,10 @@ def _coerce_questionnaire(value: Any, *, strict: bool = False) -> dict[str, Any]
     outro = str(value.get("outro") or "").strip()[:600]
     if outro:
         result["outro"] = outro
+    # Pre-translated outro (en/hi/te), same round-trip rationale as text_i18n above.
+    outro_i18n = value.get("outro_i18n")
+    if isinstance(outro_i18n, dict) and outro_i18n:
+        result["outro_i18n"] = {str(k): str(v) for k, v in outro_i18n.items() if v}
     return result
 
 
@@ -713,6 +728,7 @@ def _build_context(campaign: OutboundCampaign, *, goal: str | None = None) -> Ou
         question_threshold=int((agent_config.get("questionnaire") or {}).get("threshold") or 0),
         question_intro=str((agent_config.get("questionnaire") or {}).get("intro") or ""),
         question_outro=str((agent_config.get("questionnaire") or {}).get("outro") or ""),
+        question_outro_i18n=dict((agent_config.get("questionnaire") or {}).get("outro_i18n") or {}),
     )
 
 
@@ -764,6 +780,7 @@ async def load_outbound_context(
                     question_threshold=ctx.question_threshold,
                     question_intro=ctx.question_intro,
                     question_outro=ctx.question_outro,
+                    question_outro_i18n=ctx.question_outro_i18n,
                 )
             return ctx
 
@@ -1334,6 +1351,71 @@ def _render_progress_directive(
             "do NOT loop back to any earlier question."
         )
     return "\n".join(parts) + "\n\n"
+
+
+# Off-script cues that must NOT be answered by scripted question playback — the
+# caller asked something / objected / wants out. These fall through to the LLM
+# (which clarifies / handles disinterest) instead of the verbatim advance.
+_OFF_SCRIPT_RE = re.compile(
+    r"\b("
+    r"who\s+(?:is\s+this|are\s+you|'?s\s+(?:this|calling))|what\s+(?:is\s+this|'?s\s+this)|"
+    r"what\s+(?:company|do\s+you\s+(?:want|do))|why\s+(?:are\s+you|did\s+you)|"
+    r"how\s+did\s+you\s+get|where\s+did\s+you\s+get|"
+    r"not\s+interested|no\s+thanks?|stop\s+calling|do\s+not\s+call|don'?t\s+call|"
+    r"remove\s+me|take\s+me\s+off|wrong\s+number|how\s+much|is\s+this\s+(?:a\s+)?(?:scam|spam|robot|bot|ai|recording)|"
+    r"are\s+you\s+(?:a\s+)?(?:real|human|bot|robot|ai|recording)|call\s+(?:me\s+)?later|busy\s+right\s+now"
+    r")\b|"
+    r"(ఎవరు\s*మీరు|ఎవరిది|ఆసక్తి\s*లేదు|వద్దు|కాల్\s*చేయకండి|"
+    r"कौन\s*(?:है|बोल)|क्या\s*है\s*ये|दिलचस्पी\s*नहीं|मत\s*कॉल|बाद\s*में)",
+    re.IGNORECASE,
+)
+
+
+def next_verbatim_question(
+    questions: list, history: list | None, latest_user_text: str | None
+) -> tuple[int, dict] | None:
+    """Decide the next questionnaire question to SPEAK VERBATIM (1-based index +
+    the question dict), or ``None`` to defer to the LLM.
+
+    Mirrors :func:`_render_progress_directive`'s advance/re-ask split so scripted
+    delivery and the (fallback) LLM prompt agree on where the call is. Returns the
+    question ONLY on a clean forward advance; re-asks, non-answers, trailing-off,
+    an unanswered final intent, or an off-script reply all return ``None`` so the
+    LLM handles that (conversational) turn. Requires the target question to carry
+    ``text_i18n`` — without it there's nothing to serve verbatim."""
+    qs = questions or []
+    if not qs:
+        return None
+    # Off-script (a question / objection / opt-out) → let the LLM handle it.
+    if latest_user_text and _OFF_SCRIPT_RE.search(latest_user_text):
+        return None
+    state = questionnaire_asked_state(qs, history)
+    next_n = state.get("next_number")
+    _no_answer = _is_non_answer(latest_user_text)
+    _incomplete = (not _no_answer) and _is_incomplete_answer(latest_user_text)
+    _intent_unanswered = (
+        not _no_answer
+        and not _incomplete
+        and next_n is None
+        and _last_intent_unanswered(qs, state, latest_user_text)
+    )
+    if _no_answer or _incomplete or _intent_unanswered:
+        return None  # re-ask / clarify is a conversational (LLM) turn
+    if next_n is None or next_n < 1 or next_n > len(qs):
+        return None  # all asked → the outro/close path takes over
+    q = qs[next_n - 1] or {}
+    if not isinstance(q.get("text_i18n"), dict) or not q.get("text_i18n"):
+        return None  # not pre-translated → fall back to the LLM-rephrase flow
+    return next_n, q
+
+
+def verbatim_line_for_language(i18n: dict | None, fallback: str, language: str | None) -> str:
+    """Pick the pre-translated line for the session language, degrading to English
+    then the authored fallback. ``language`` may be a BCP-47 tag (en-IN)."""
+    lang = str(language or "en").split("-")[0].lower()
+    if isinstance(i18n, dict):
+        return str(i18n.get(lang) or i18n.get("en") or fallback or "").strip()
+    return str(fallback or "").strip()
 
 
 def render_questionnaire_block(

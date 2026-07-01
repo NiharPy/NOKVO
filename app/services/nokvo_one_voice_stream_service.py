@@ -1317,6 +1317,13 @@ class NokvoOneVoiceStreamService:
             and getattr(outbound_context, "has_questionnaire", False)
         ):
             _qoutro = (getattr(outbound_context, "question_outro", "") or "").strip()
+            # Phase 3: close in the caller's language from the pre-translated outro.
+            if settings.APEX_VERBATIM_QUESTIONS_ENABLED and _qoutro:
+                from app.services.agent_outbound_context import verbatim_line_for_language
+
+                _qoutro = verbatim_line_for_language(
+                    getattr(outbound_context, "question_outro_i18n", None), _qoutro, language
+                )
             _qs = list(getattr(outbound_context, "questions", []) or [])
             if _qoutro and _qs:
                 try:
@@ -1341,6 +1348,31 @@ class NokvoOneVoiceStreamService:
                         return
                 except Exception:
                     logger.exception("NOKVO-OUTRO: deterministic close check failed")
+        # ── Verbatim per-language question delivery (APEX Phase 3, flag-gated) ──
+        # Speak the next questionnaire question from its pre-translated string
+        # (cache hit) instead of an LLM turn. Only clean forward advances are
+        # handled here; re-asks / non-answers / off-script fall through to the LLM.
+        if (
+            settings.APEX_VERBATIM_QUESTIONS_ENABLED
+            and outbound_context is not None
+            and call_id
+            and getattr(outbound_context, "has_questionnaire", False)
+        ):
+            if await NokvoOneVoiceStreamService._deliver_verbatim_question(
+                websocket,
+                tenant_res,
+                cleaned=cleaned,
+                language=language,
+                call_id=call_id,
+                outbound_context=outbound_context,
+                arbiter=arbiter,
+                turn_state=turn_state,
+            ):
+                if after_turn is not None:
+                    _r = after_turn()
+                    if asyncio.iscoroutine(_r):
+                        await _r
+                return
         if outbound_context is not None and call_id and source != "proactive_silence":
             await AgentSessionStore.merge_state(
                 tenant_res,
@@ -2635,6 +2667,7 @@ class NokvoOneVoiceStreamService:
                 line,
                 language=language,
                 purpose="outro",
+                cache=True,  # deterministic closing line — same audio every call
             )
         except Exception:
             logger.debug("NOKVO-OUTRO: outro TTS failed", exc_info=True)
@@ -2654,6 +2687,83 @@ class NokvoOneVoiceStreamService:
         with contextlib.suppress(Exception):
             await asyncio.sleep(_OUTRO_DRAIN_SECONDS)
             await websocket.close()
+
+    @staticmethod
+    async def _deliver_verbatim_question(
+        websocket: WebSocket,
+        tenant_res: TenantResources,
+        *,
+        cleaned: str,
+        language: str,
+        call_id: str,
+        outbound_context: OutboundCampaignContext,
+        arbiter: TurnArbiter | None = None,
+        turn_state: dict[str, Any] | None = None,
+    ) -> bool:
+        """APEX Phase 3: speak the next questionnaire question VERBATIM from its
+        pre-translated per-language string (cache=True → hits the TTS cache), skipping
+        the LLM for this turn. Returns True when it delivered a question; False to
+        fall through to the normal LLM turn (re-ask / non-answer / off-script / a
+        question without a translation). Never raises. Does NOT close the call — the
+        caller answers next; mirrors the opener/outro delivery but keeps the session
+        open and re-arms turn-taking (mark_done + speaking=False)."""
+        from app.services.agent_outbound_context import (
+            next_verbatim_question,
+            verbatim_line_for_language,
+        )
+
+        try:
+            qs = list(getattr(outbound_context, "questions", []) or [])
+            history = await AgentSessionStore.get_history(tenant_res, call_id)
+            plan = next_verbatim_question(qs, history, cleaned)
+            if plan is None:
+                return False
+            idx, q = plan
+            line = verbatim_line_for_language(q.get("text_i18n"), str(q.get("text") or ""), language)
+            if not line:
+                return False
+
+            if turn_state is not None:
+                turn_state["speaking"] = True
+            if arbiter is not None:
+                arbiter.mark_speaking()
+            turn_id = str(uuid.uuid4())[:8]
+            prosody = prosody_for("question")
+            try:
+                await websocket.send_json(
+                    {
+                        "type": "agent_sentence",
+                        "turn_id": turn_id,
+                        "sentence": line,
+                        "tone": "question",
+                        "cache_hit": False,
+                        "source": "questionnaire_verbatim",
+                    }
+                )
+                await SarvamVoiceService.stream_sentence_tts(
+                    websocket,
+                    tenant_res,
+                    line,
+                    language=language,
+                    purpose="question",
+                    pace=prosody.pace,
+                    pitch=prosody.pitch,
+                    loudness=prosody.loudness,
+                    cache=True,  # verbatim, pre-translated → same audio every call
+                )
+            finally:
+                if arbiter is not None:
+                    arbiter.mark_done()
+                if turn_state is not None:
+                    turn_state["speaking"] = False
+            # Record it as the assistant turn so asked-tracking advances next turn.
+            with contextlib.suppress(Exception):
+                await AgentSessionStore.append_turn(tenant_res, call_id, (cleaned or "").strip(), line)
+            logger.info("NOKVO-VERBATIM: asked Q%d verbatim call=%s lang=%s", idx, call_id, language)
+            return True
+        except Exception:
+            logger.exception("NOKVO-VERBATIM: verbatim question delivery failed")
+            return False
 
     @staticmethod
     async def _play_opener(
@@ -2715,6 +2825,7 @@ class NokvoOneVoiceStreamService:
                     pace=prosody.pace,
                     pitch=prosody.pitch,
                     loudness=prosody.loudness,
+                    cache=True,  # verbatim, zero-LLM opener — cacheable across calls
                 )
             except Exception as exc:
                 await websocket.send_json(

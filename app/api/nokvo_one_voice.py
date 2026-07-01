@@ -2240,6 +2240,14 @@ async def create_bulk_calling_campaign(
             )
         agent_config["deterministic"] = bool(deterministic)
         if parsed_questionnaire:
+            # APEX deterministic campaigns speak scripted lines every call. Pre-
+            # translate the questions + outro into en/hi/te ONCE now so call-time can
+            # serve the exact per-language string verbatim → TTS cache hit + native
+            # multilingual. Best-effort (falls back to authored text); one LLM call.
+            if deterministic and (await _org_for_user(db, user)).product_tier == "nokvo_apex":
+                from app.services.questionnaire_translation import translate_questionnaire
+
+                parsed_questionnaire = await translate_questionnaire(parsed_questionnaire)
             agent_config["questionnaire"] = parsed_questionnaire
         # Calling schedule. Stored on the config (no migration), surfaced via
         # _campaign_response's agent_config passthrough. For NOKVO APEX the dialer

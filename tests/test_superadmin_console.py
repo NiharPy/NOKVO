@@ -169,3 +169,120 @@ async def test_upgrade_rejects_unknown_plan(client):
 async def test_endpoints_require_superadmin_auth(client):
     res = await client.get("/superadmin/tenants")
     assert res.status_code in (401, 403)
+
+
+# ── APEX bulk-number assignment (sub-account pool) ──────────────────────────
+
+
+async def _seed_apex_org(*, with_subaccount: bool = True) -> tuple[uuid.UUID, str]:
+    """An APEX org whose TenantResources carries the account-creation sub-account
+    creds the bulk pool reuses (mirrors provisioning Step 4)."""
+    from app.core.secret_crypto import encrypt_secret
+
+    org_id = uuid.uuid4()
+    tenant_id = f"tenant-apex-{org_id.hex[:8]}"
+    plivo_cfg: dict = {"compliance": {"application_id": f"app-{org_id.hex[:6]}"}}
+    if with_subaccount:
+        plivo_cfg["subaccount_auth_id"] = "ACCTSUB"
+        plivo_cfg["subaccount_auth_token_enc"] = encrypt_secret("acct-token")
+    async with db_session.AsyncSessionLocal() as db:
+        db.add(Organization(
+            id=org_id, name=f"APEX Test Org {org_id.hex[:6]}",
+            admin_email="apex@test.com", admin_name="APEX Admin",
+            region="centralindia", environment="production",
+            product_tier="nokvo_apex", status="active",
+            plan_type="apex", calling_enabled=True,
+        ))
+        await db.flush()
+        db.add(TenantResources(
+            organization_id=org_id, tenant_id=tenant_id, provisioning_status="success",
+            provider_status={"plivo": plivo_cfg},
+        ))
+        await db.commit()
+    return org_id, tenant_id
+
+
+async def test_detail_reports_is_apex_and_bulk_pool(client):
+    headers = await _founder_headers()
+    org_id, _ = await _seed_apex_org()
+    try:
+        res = await client.get(f"/superadmin/tenants/{org_id}", headers=headers)
+        assert res.status_code == 200
+        body = res.json()
+        assert body["is_apex"] is True
+        assert body["product_tier"] == "nokvo_apex"
+        # No pool assigned yet → not enabled, empty list.
+        assert body["telephony"]["bulk_enabled"] is False
+        assert body["telephony"]["bulk_numbers"] == []
+    finally:
+        await _cleanup(org_id)
+
+
+async def test_apex_bulk_numbers_rejects_non_apex(client):
+    headers = await _founder_headers()
+    org_id, _ = await _seed_org()  # product_tier="nokvo_one"
+    try:
+        res = await client.post(
+            f"/superadmin/tenants/{org_id}/apex-bulk-numbers", headers=headers,
+            json={"numbers": []},
+        )
+        assert res.status_code == 409
+    finally:
+        await _cleanup(org_id)
+
+
+async def test_apex_bulk_numbers_enables_pool_from_subaccount(client, monkeypatch):
+    from app.services.plivo_service import PlivoService
+
+    owned = ["919990001000", "919990001001", "919990001002"]
+
+    async def _list(auth):
+        return list(owned)
+
+    monkeypatch.setattr(PlivoService, "list_account_numbers", staticmethod(_list))
+
+    headers = await _founder_headers()
+    org_id, tenant_id = await _seed_apex_org()
+    try:
+        # Blank numbers → auto-detect every DID on the sub-account.
+        res = await client.post(
+            f"/superadmin/tenants/{org_id}/apex-bulk-numbers", headers=headers,
+            json={"numbers": []},
+        )
+        assert res.status_code == 200, res.text
+        body = res.json()
+        assert body["enabled"] is True
+        assert body["numbers"] == owned
+        assert body["bulk_status"] == "active"
+
+        # Persisted onto the tenant's provider_status["bulk_calling"] so the dialer
+        # + the detail panel pick it up.
+        async with db_session.AsyncSessionLocal() as db:
+            tr = (await db.execute(
+                select(TenantResources).where(TenantResources.organization_id == org_id)
+            )).scalars().first()
+            bulk = (tr.provider_status or {}).get("bulk_calling") or {}
+            assert bulk.get("enabled") is True
+            assert bulk.get("numbers") == owned
+            assert bulk.get("auth_id") == "ACCTSUB"
+
+        # Detail now reflects the enabled pool.
+        detail = (await client.get(f"/superadmin/tenants/{org_id}", headers=headers)).json()
+        assert detail["telephony"]["bulk_enabled"] is True
+        assert detail["telephony"]["bulk_numbers"] == owned
+    finally:
+        await _cleanup(org_id)
+
+
+async def test_apex_bulk_numbers_errors_without_subaccount(client):
+    headers = await _founder_headers()
+    org_id, _ = await _seed_apex_org(with_subaccount=False)
+    try:
+        res = await client.post(
+            f"/superadmin/tenants/{org_id}/apex-bulk-numbers", headers=headers,
+            json={"numbers": []},
+        )
+        assert res.status_code == 400
+        assert "sub-account" in res.json()["detail"].lower()
+    finally:
+        await _cleanup(org_id)

@@ -1085,6 +1085,10 @@ async def get_tenant_detail(
     ).scalars().first()
     plivo_cfg = (tenant_res.provider_status or {}).get("plivo", {}) if tenant_res else {}
     _comp = (plivo_cfg.get("compliance") or {}) if isinstance(plivo_cfg, dict) else {}
+    # APEX orgs dial from a POOL of DIDs on their account-creation sub-account
+    # (provider_status["bulk_calling"]), not the inbound number — surface it so the
+    # console can show/manage the outbound pool instead of the inbound DID.
+    _bulk = (tenant_res.provider_status or {}).get("bulk_calling") or {} if tenant_res else {}
     telephony = {
         "tenant_id": tenant_res.tenant_id if tenant_res else None,
         "number": (plivo_cfg.get("number") if isinstance(plivo_cfg, dict) else None)
@@ -1094,6 +1098,9 @@ async def get_tenant_detail(
         "number_status": plivo_cfg.get("number_status") if isinstance(plivo_cfg, dict) else None,
         "compliance_application_id": _comp.get("application_id"),
         "compliance_error": _comp.get("error"),
+        "bulk_enabled": PlivoService.bulk_calling_enabled(tenant_res) if tenant_res else False,
+        "bulk_numbers": _bulk.get("numbers") or [],
+        "bulk_status": _bulk.get("status"),
     }
 
     subscription_inr = sub.get("monthly_inr", 0.0)
@@ -1107,6 +1114,8 @@ async def get_tenant_detail(
         "admin_email": org.admin_email,
         "admin_name": org.admin_name,
         "status": org.status,
+        "product_tier": org.product_tier,
+        "is_apex": (org.product_tier or "") == "nokvo_apex",
         "plan_type": org.plan_type,
         "plan_label": _plan_label(org.plan_type),
         "calling_enabled": bool(org.calling_enabled),
@@ -1225,6 +1234,73 @@ async def change_plivo_number(
     )
     await db.commit()
     return result
+
+
+class ApexBulkNumbersPayload(BaseModel):
+    # DIDs the operator rented (by hand) on this APEX org's account-creation Plivo
+    # sub-account. Optional — blank means "auto-detect every DID on the sub-account".
+    # Up to 5 (the fixed bulk caller-ID pool size).
+    numbers: list[str] = Field(default_factory=list)
+
+
+@router.post("/{organization_id}/apex-bulk-numbers")
+async def assign_apex_bulk_numbers(
+    organization_id: str,
+    payload: ApexBulkNumbersPayload,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: SuperAdminUser = Depends(RequireRole(_WRITE_ROLES)),
+):
+    """APEX: register the DIDs rented on this org's account-creation Plivo sub-account
+    as its outbound bulk caller-ID pool — no inbound-app binding, no auth token to
+    paste (the stored sub-account creds are reused). ``numbers`` is optional (blank =
+    auto-detect what the sub-account owns). This is the org-keyed twin of
+    ``/bulk-calling-requests/{id}/grant-existing`` for APEX orgs that auto-provisioned
+    at signup (so have no request row). APEX-only; Nokvo One orgs use ``/plivo-number``
+    to bind an inbound DID."""
+    org = (
+        await db.execute(select(Organization).where(Organization.id == organization_id))
+    ).scalars().first()
+    if org is None:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    if (org.product_tier or "") != "nokvo_apex":
+        raise HTTPException(
+            status_code=409,
+            detail="Bulk-number assignment is for NOKVO APEX organizations only — use Change number for others.",
+        )
+    tenant_res = (
+        await db.execute(select(TenantResources).where(TenantResources.organization_id == organization_id))
+    ).scalars().first()
+    if tenant_res is None:
+        raise HTTPException(status_code=404, detail="Tenant resources not found — provision the tenant first.")
+
+    from app.services.plivo_bulk_provisioning_service import PlivoBulkProvisioningService
+
+    cfg = await PlivoBulkProvisioningService.grant_with_existing_subaccount(
+        tenant_res, db, numbers=payload.numbers, superadmin_id=str(current_user.id)
+    )
+    if cfg.get("error"):
+        raise HTTPException(status_code=400, detail=cfg["error"])
+
+    db.add(
+        SuperAdminAuditLog(
+            superadmin_id=current_user.id,
+            action="apex_bulk_numbers_assigned",
+            risk_level="high",  # enables outbound DIDs (recurring cost) on the client's sub-account
+            target_type="organization",
+            target_id=str(organization_id),
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            request_id=request.headers.get("x-request-id"),
+            metadata_={"tenant_id": tenant_res.tenant_id, "pool": cfg.get("numbers"), "auth_id": cfg.get("auth_id")},
+        )
+    )
+    await db.commit()
+    return {
+        "enabled": bool(cfg.get("enabled")),
+        "numbers": cfg.get("numbers") or [],
+        "bulk_status": cfg.get("status"),
+    }
 
 
 class PlanChangePayload(BaseModel):

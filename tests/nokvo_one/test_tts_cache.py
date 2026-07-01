@@ -1,0 +1,131 @@
+"""TTS Redis byte-cache in SarvamVoiceService.synthesize (opt-in via cache=True).
+
+Pins: a hit returns cached audio with NO HTTP call; a miss stores; the key changes
+when any byte-affecting input changes; a Redis error falls through to live synth;
+caching is skipped when cache=False or TTS_CACHE_ENABLED=False. HTTP + Redis are
+mocked so this is fast and offline.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+from types import SimpleNamespace
+
+import pytest
+
+from app.core.config import settings
+from app.services.sarvam_voice_service import SarvamVoiceService
+import app.services.agent_session_store as ass
+
+
+def _run(coro):
+    return asyncio.new_event_loop().run_until_complete(coro)
+
+
+class _FakeRedis:
+    def __init__(self):
+        self.store: dict[str, str] = {}
+        self.raise_on = None  # "get" | "set" to simulate redis errors
+
+    async def get(self, key):
+        if self.raise_on == "get":
+            raise RuntimeError("redis down")
+        return self.store.get(key)
+
+    async def setex(self, key, ttl, value):
+        if self.raise_on == "set":
+            raise RuntimeError("redis down")
+        self.store[key] = value
+
+
+class _FakeResp:
+    def __init__(self, status_code, payload):
+        self.status_code = status_code
+        self._payload = payload
+        self.text = json.dumps(payload)
+
+    def json(self):
+        return self._payload
+
+
+class _FakeHTTP:
+    def __init__(self, payload):
+        self.payload = payload
+        self.calls = 0
+
+    async def post(self, url, **kwargs):
+        self.calls += 1
+        return _FakeResp(200, self.payload)
+
+
+def _patch(monkeypatch, http_payload=None):
+    fake_redis = _FakeRedis()
+    monkeypatch.setattr(ass.AgentSessionStore, "_client", fake_redis, raising=False)
+    monkeypatch.setattr(ass.AgentSessionStore, "client", classmethod(lambda cls: fake_redis))
+    http = _FakeHTTP(http_payload or {"audios": ["QUJD"], "request_id": "r1"})
+    monkeypatch.setattr(SarvamVoiceService, "http_client", staticmethod(lambda: http))
+
+    async def fake_key(tenant_res, kind):
+        return "k"
+
+    monkeypatch.setattr(SarvamVoiceService, "api_key", staticmethod(fake_key))
+    monkeypatch.setattr(settings, "TTS_CACHE_ENABLED", True)
+    return fake_redis, http
+
+
+def _tr():
+    return SimpleNamespace(provider_status={})
+
+
+def test_miss_calls_http_and_stores(monkeypatch):
+    redis, http = _patch(monkeypatch)
+    res = _run(SarvamVoiceService.synthesize(_tr(), "Hello there", language="en", cache=True))
+    assert http.calls == 1 and res["cached"] is False and res["audios"] == ["QUJD"]
+    assert len(redis.store) == 1  # stored for reuse
+
+
+def test_hit_returns_cached_without_http(monkeypatch):
+    redis, http = _patch(monkeypatch)
+    _run(SarvamVoiceService.synthesize(_tr(), "Hello there", language="en", cache=True))  # populate
+    http.calls = 0
+    res = _run(SarvamVoiceService.synthesize(_tr(), "Hello there", language="en", cache=True))
+    assert http.calls == 0                # served from cache, no Sarvam call
+    assert res["cached"] is True and res["audios"] == ["QUJD"]
+
+
+def test_cache_off_never_caches(monkeypatch):
+    redis, http = _patch(monkeypatch)
+    _run(SarvamVoiceService.synthesize(_tr(), "Hello", language="en", cache=False))
+    assert http.calls == 1 and redis.store == {}   # cache=False → no store
+    # cache=True but the global flag off → also no store
+    monkeypatch.setattr(settings, "TTS_CACHE_ENABLED", False)
+    _run(SarvamVoiceService.synthesize(_tr(), "Hello", language="en", cache=True))
+    assert redis.store == {}
+
+
+def test_key_changes_with_language_and_prosody(monkeypatch):
+    redis, http = _patch(monkeypatch)
+    _run(SarvamVoiceService.synthesize(_tr(), "Hi", language="en", cache=True))
+    _run(SarvamVoiceService.synthesize(_tr(), "Hi", language="hi", cache=True))       # diff lang
+    _run(SarvamVoiceService.synthesize(_tr(), "Hi", language="en", pace=1.5, cache=True))  # diff pace
+    assert len(redis.store) == 3          # three distinct keys
+
+
+def test_same_text_same_key_dedupes(monkeypatch):
+    redis, http = _patch(monkeypatch)
+    _run(SarvamVoiceService.synthesize(_tr(), "Same line", language="en", cache=True))
+    _run(SarvamVoiceService.synthesize(_tr(), "Same line", language="en", cache=True))
+    assert len(redis.store) == 1          # identical inputs → one entry
+
+
+def test_redis_get_error_falls_through_to_http(monkeypatch):
+    redis, http = _patch(monkeypatch)
+    redis.raise_on = "get"
+    res = _run(SarvamVoiceService.synthesize(_tr(), "Hello", language="en", cache=True))
+    assert http.calls == 1 and res["audios"] == ["QUJD"]  # error never breaks synth
+
+
+def test_empty_audios_not_cached(monkeypatch):
+    redis, http = _patch(monkeypatch, http_payload={"audios": [], "request_id": "r"})
+    _run(SarvamVoiceService.synthesize(_tr(), "Hello", language="en", cache=True))
+    assert redis.store == {}               # nothing to serve later
