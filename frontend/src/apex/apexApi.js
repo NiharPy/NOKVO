@@ -160,6 +160,12 @@ export async function rerunCampaign(campaignId) {
   return data;
 }
 
+// Hard-delete a campaign (org-scoped; APEX only ever deletes its own). Running
+// campaigns are protected server-side → 409, surfaced to the user.
+export async function deleteCampaign(campaignId) {
+  await agentsApi.delete(`/campaigns/${campaignId}`, { headers: authHeader() });
+}
+
 export async function fetchTranscript(callId) {
   // Transcripts live on the nokvo-one base (not /agents), keyed by call_id.
   const { data } = await api.get(`/transcripts/${encodeURIComponent(callId)}`, { headers: authHeader() });

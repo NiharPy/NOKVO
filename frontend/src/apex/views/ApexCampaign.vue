@@ -110,6 +110,25 @@ async function rerun(id) {
     rerunning.value = null;
   }
 }
+
+const deleting = ref(null);
+async function remove(id, name) {
+  if (!id || deleting.value) return;
+  if (!window.confirm(`Delete campaign "${name || 'this campaign'}"? This can't be undone. Leads already captured are kept.`)) return;
+  deleting.value = id;
+  errorMsg.value = ''; notice.value = '';
+  try {
+    await apex.deleteCampaign(id);
+    await apex.reload();
+  } catch (e) {
+    // Running campaigns are protected server-side (409).
+    errorMsg.value = e?.response?.status === 409
+      ? 'Cancel the campaign before deleting it — running campaigns are protected.'
+      : apex.extractError(e, 'Could not delete the campaign.');
+  } finally {
+    deleting.value = null;
+  }
+}
 </script>
 
 <template>
@@ -258,6 +277,9 @@ async function rerun(id) {
           <button v-if="redialCount(c) > 0" type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" :disabled="rerunning === c.id" @click="rerun(c.id)">
             ↻ {{ rerunning === c.id ? 'Re-running…' : `Re-run (${redialCount(c)})` }}
           </button>
+          <button type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm ax-camp-del" :disabled="deleting === c.id" @click="remove(c.id, c.name)" title="Delete campaign">
+            {{ deleting === c.id ? 'Deleting…' : '🗑 Delete' }}
+          </button>
         </div>
       </div>
     </div>
@@ -308,4 +330,5 @@ async function rerun(id) {
 .ax-camp-status.is-run { background: rgba(74,200,140,0.1); color: #7FD9A8; } .ax-camp-status.is-done { background: rgba(255,255,255,0.05); color: rgba(255,255,255,0.5); } .ax-camp-status.is-off { background: rgba(255,255,255,0.04); color: rgba(255,255,255,0.34); }
 .ax-camp-mode { font-family: 'JetBrains Mono', monospace; font-size: 11px; padding: 4px 9px; border: 1px solid rgba(255,255,255,0.14); border-radius: 4px; color: rgba(255,255,255,0.55); }
 .ax-camp-meta { display: flex; align-items: center; gap: 18px; font-family: 'JetBrains Mono', monospace; font-size: 12.5px; flex-wrap: wrap; }
+.ax-camp-del:hover:not(:disabled) { color: #E62630; border-color: rgba(230,38,48,0.4); background: rgba(230,38,48,0.08); }
 </style>

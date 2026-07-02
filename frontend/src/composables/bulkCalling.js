@@ -44,6 +44,7 @@ export function categorizeContacts(campaigns) {
       const cat = leadCategory(ct, c);
       groups[cat].push({
         name: ct.name || ct.phone,
+        raw_name: ct.name || '',   // true name (no phone fallback) — for CSV export
         phone: ct.phone,
         campaign_id: c.id,
         campaign_name: c.name,
@@ -129,6 +130,32 @@ export function scheduleEstimate({ listSize, callsPerDay, workingDays, perCallSe
     dailySpend: C > 0 ? C * perCall : null,
     maxSpend: L > 0 ? L * perCall : null,
   };
+}
+
+// Build + download a CSV of categorized contacts: phone in column A, name (only
+// when a real one exists — uses raw_name, not the phone fallback) in column B.
+// RFC-4180 quoting so names with commas/quotes/newlines stay in one cell. Rows
+// with no phone are skipped. Triggers a browser download of `filename`.
+export function exportContactsCsv(rows, filename = 'contacts.csv') {
+  const esc = (v) => {
+    const s = String(v ?? '').trim();
+    return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const lines = ['Phone,Name'];
+  for (const r of rows || []) {
+    const phone = esc(r?.phone);
+    if (!phone) continue;
+    lines.push(`${phone},${esc(r?.raw_name)}`);
+  }
+  const blob = new Blob([lines.join('\r\n')], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
 }
 
 // Best-effort CSV row count (data rows, minus a header) for the estimation widget.

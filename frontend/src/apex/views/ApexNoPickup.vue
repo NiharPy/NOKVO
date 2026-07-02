@@ -1,7 +1,7 @@
 <script setup>
 // APEX Didn't Pick Up — no connection (no answer / telephony failure).
 import { inject, ref, computed } from 'vue';
-import { categorizeContacts } from '../../composables/bulkCalling.js';
+import { categorizeContacts, exportContactsCsv } from '../../composables/bulkCalling.js';
 
 const apex = inject('apex');
 const filter = ref(null);
@@ -10,6 +10,10 @@ const scoped = computed(() => {
   return filter.value ? all.filter((c) => String(c.id) === String(filter.value)) : all;
 });
 const rows = computed(() => categorizeContacts(scoped.value).no_pickup);
+
+function downloadCsv() {
+  exportContactsCsv(rows.value, `apex-didnt-pick-up-${new Date().toISOString().slice(0, 10)}.csv`);
+}
 </script>
 
 <template>
@@ -19,7 +23,10 @@ const rows = computed(() => categorizeContacts(scoped.value).no_pickup);
         <h2 class="ax-h2">Didn't pick up</h2>
         <span class="ax-count ax-count--grey">{{ rows.length }}</span>
       </div>
-      <button type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" @click="apex.reload()">↻ Refresh</button>
+      <div style="display:flex;align-items:center;gap:8px;">
+        <button type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" :disabled="!rows.length" @click="downloadCsv">⇩ Generate CSV</button>
+        <button type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" @click="apex.reload()">↻ Refresh</button>
+      </div>
     </div>
     <p class="ax-muted">Numbers we couldn't reach — no answer or the call didn't connect. Re-run a campaign to try its unreached numbers again.</p>
 

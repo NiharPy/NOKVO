@@ -2620,15 +2620,17 @@ async def set_campaign_followup(
 @router.delete("/campaigns/{campaign_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_campaign(
     campaign_id: uuid.UUID,
-    user: OrganizationUser = Depends(_admin_dep()),
+    user: OrganizationUser = Depends(_bulk_admin_dep()),
     _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
     db: AsyncSession = Depends(deps.get_db),
 ):
     """Hard-delete a campaign and its contact join rows.
 
-    Running campaigns are protected — operators must cancel them first.
-    Lead records and call-cost rows are NOT touched (leads outlive campaigns;
-    cost ledger remains as a billing audit trail).
+    Shared bulk-calling surface (``_bulk_admin_dep`` — Nokvo One AND NOKVO APEX,
+    org-scoped so each product only deletes its own). Running campaigns are
+    protected → 409; operators must cancel them first. Lead records and call-cost
+    rows are NOT touched (leads outlive campaigns; the cost ledger remains as a
+    billing audit trail).
     """
     tr = await _tenant_for_user(db, user)
     campaign = await OutboundCampaignService.get_campaign(campaign_id, tr, db)

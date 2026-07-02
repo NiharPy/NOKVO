@@ -1,8 +1,8 @@
 """Nokvo Connect — admin-side API key management.
 
-Mounted under ``/api/org-auth/connect`` and authenticated with the standard
-organization JWT. Lets an admin mint / revoke / inspect API keys without
-needing one to begin with.
+Mounted under ``/api/nokvo-one/connect`` and authenticated with the standard
+NOKVO ONE organization JWT (deps.RequireNokvoOneOrganization). Lets an admin
+mint / revoke / inspect API keys without needing one to begin with.
 """
 from __future__ import annotations
 

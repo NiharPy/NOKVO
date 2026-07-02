@@ -790,7 +790,7 @@ class OutboundCampaignService:
         db: AsyncSession,
         *,
         public_base_url: str,
-        path_prefix: str = "/api/org-auth/agent",
+        path_prefix: str = "/api/nokvo-one/agents",
         tenant_res: TenantResources | None = None,
     ) -> OutboundCampaign:
         if campaign.status == CampaignStatus.cancelled:

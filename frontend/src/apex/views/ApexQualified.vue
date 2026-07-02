@@ -2,11 +2,15 @@
 // APEX Qualified Leads — deterministic campaigns' contacts that crossed the lead
 // score. Dark table + per-question score breakdown + call note (design 215-261).
 import { inject, ref, computed } from 'vue';
-import { categorizeContacts } from '../../composables/bulkCalling.js';
+import { categorizeContacts, exportContactsCsv } from '../../composables/bulkCalling.js';
 
 const apex = inject('apex');
 const filter = ref(null); // null = all
 const expanded = ref(null); // call_link_id
+
+function downloadCsv() {
+  exportContactsCsv(rows.value, `apex-qualified-leads-${new Date().toISOString().slice(0, 10)}.csv`);
+}
 
 const scoped = computed(() => {
   const all = apex.deterministicCampaigns.value;
@@ -23,7 +27,10 @@ function toggle(key) { expanded.value = expanded.value === key ? null : key; }
         <h2 class="ax-h2">Qualified leads</h2>
         <span class="ax-count ax-count--green">{{ rows.length }}</span>
       </div>
-      <button type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" @click="apex.reload()">↻ Refresh</button>
+      <div style="display:flex;align-items:center;gap:8px;">
+        <button type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" :disabled="!rows.length" @click="downloadCsv">⇩ Generate CSV</button>
+        <button type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" @click="apex.reload()">↻ Refresh</button>
+      </div>
     </div>
     <p class="ax-muted">Contacts that qualified — by lead score where a questionnaire is set. Click a scored row to see the per-question breakdown.</p>
 

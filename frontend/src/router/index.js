@@ -1,6 +1,5 @@
 import { createRouter, createWebHistory } from 'vue-router';
 import NokvoOneApp from '../components/NokvoOneApp.vue';
-import OrganizationPortal from '../components/OrganizationPortal.vue';
 import ConsoleLoginCard from '../components/ConsoleLoginCard.vue';
 import SuperAdminDashboard from '../components/SuperAdminDashboard.vue';
 
@@ -137,26 +136,6 @@ const routes = [
     component: ApexApp,
     props: { initialAuthState: 'invite' },
     name: 'nokvo-apex-invite',
-  },
-
-  // ── Organization Portal ─────────────────────────────────────────
-  {
-    path: '/organization',
-    component: OrganizationPortal,
-    props: { initialAuthState: 'login' },
-    name: 'organization',
-  },
-  {
-    path: '/organization/signin',
-    component: OrganizationPortal,
-    props: { initialAuthState: 'login' },
-    name: 'organization-signin',
-  },
-  {
-    path: '/organization/dashboard',
-    component: OrganizationPortal,
-    props: { initialAuthState: 'ready' },
-    name: 'organization-dashboard',
   },
 
   // ── Console / Super-Admin ───────────────────────────────────────

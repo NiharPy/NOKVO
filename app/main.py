@@ -41,7 +41,6 @@ app.add_middleware(
 
 from app.api import (
     auth,
-    organization_auth,
     superadmin_tenant_provisioning,
     nokvo_one_auth,
     nokvo_one_apex_auth,
@@ -64,7 +63,6 @@ from app.api import (
 )
 
 app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
-app.include_router(organization_auth.router, prefix="/api/org-auth", tags=["organization-auth"])
 app.include_router(superadmin_tenant_provisioning.router, prefix="/superadmin/tenants", tags=["tenant-provisioning"])
 app.include_router(nokvo_one_auth.router, prefix="/api/nokvo-one", tags=["nokvo-one"])
 app.include_router(nokvo_one_apex_auth.router, prefix="/api/nokvo-one", tags=["nokvo-apex-auth"])
