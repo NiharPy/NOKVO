@@ -16,6 +16,7 @@ from urllib import parse as urllib_parse
 import httpx
 from fastapi import WebSocket
 from websockets.asyncio.client import connect
+from websockets.exceptions import ConnectionClosed
 
 from app.core.config import settings
 from app.models.tenant_resources import TenantResources
@@ -726,6 +727,188 @@ class SarvamVoiceService:
             "cached": False,
         }
 
+    # ── WebSocket streaming TTS (the real streaming path) ────────────────────────
+    # Sarvam's HTTP /stream returns 0 chunks for this account; the WS API actually
+    # streams audio as it synthesizes. Mirrors the STT WS helpers (connect_stt /
+    # stt_websocket_url / parse_stt_message) and yields the SAME chunk shape as
+    # synthesize_streaming so stream_sentence_tts consumes it unchanged.
+    @staticmethod
+    def tts_websocket_url(tenant_res: TenantResources, *, model: str | None = None) -> str:
+        provider_status = dict(tenant_res.provider_status or {})
+        base = provider_status.get("sarvam_tts_ws_url") or settings.SARVAM_TTS_WEBSOCKET_URL
+        model = (
+            model
+            or provider_status.get("sarvam_tts_model")
+            or provider_status.get("tts_model")
+            or settings.SARVAM_TTS_MODEL
+        )
+        separator = "&" if "?" in base else "?"
+        return f"{base}{separator}{urllib_parse.urlencode({'model': model})}"
+
+    @staticmethod
+    async def connect_tts_ws(tenant_res: TenantResources, *, model: str | None = None):
+        api_key = await SarvamVoiceService.api_key(tenant_res, "tts")
+        return await connect(
+            SarvamVoiceService.tts_websocket_url(tenant_res, model=model),
+            additional_headers={"api-subscription-key": api_key},
+            max_size=8 * 1024 * 1024,
+        )
+
+    @staticmethod
+    def _parse_tts_ws_message(raw: str | bytes) -> dict[str, Any] | None:
+        """Tolerant extractor for a Sarvam TTS WS frame (mirrors parse_stt_message).
+        Pulls base64 audio from whatever shape the server uses (``data.audio`` /
+        ``audio`` / ``audios[]``) and flags a terminal marker so the reader stops.
+        Returns ``{"type","audios":[b64,...],"done":bool,"error":...}`` or ``None``
+        for an unparseable frame (skipped)."""
+        try:
+            payload = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        mtype = str(payload.get("type") or "").lower()
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        audios: list[str] = []
+        seen: set[str] = set()
+        for src in (data, payload):
+            if not isinstance(src, dict):
+                continue
+            candidate = src.get("audio")
+            if isinstance(candidate, str) and candidate and candidate not in seen:
+                seen.add(candidate)
+                audios.append(candidate)
+            for item in src.get("audios") or []:
+                if isinstance(item, str) and item and item not in seen:
+                    seen.add(item)
+                    audios.append(item)
+        done = mtype in ("done", "flushed", "complete", "end", "eof", "finished") or bool(
+            isinstance(data, dict) and data.get("done")
+        )
+        error = payload.get("error") or (data.get("error") if isinstance(data, dict) else None)
+        return {"type": mtype, "audios": audios, "done": done, "error": error}
+
+    @staticmethod
+    async def synthesize_streaming_ws(
+        tenant_res: TenantResources,
+        text: str,
+        *,
+        language: str | None = None,
+        pace: float | None = None,
+        pitch: float | None = None,
+        loudness: float | None = None,
+        enable_cached_responses: bool | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """WebSocket variant of :meth:`synthesize_streaming` — the REAL streaming
+        path. Opens a per-sentence WS, sends config→text→flush, and yields audio
+        frames as they synthesize (``{"audio_base64","sample_rate","audio_format"}``;
+        the FIRST chunk also carries ``connect_ms``). Barge-in safe: the ``finally``
+        closes the socket when the consumer ``aclose()``s on cancellation.
+
+        Raises on connect/protocol error so ``stream_sentence_tts`` falls back to
+        REST — a WS hiccup never silences the agent. The wrong flush shape would
+        hang the socket, so it's pinned by scripts/probe_sarvam_tts_ws.py."""
+        if not text.strip():
+            return
+        text = normalize_text_for_tts(text)
+        provider_status = dict(tenant_res.provider_status or {})
+        model = provider_status.get("sarvam_tts_model") or provider_status.get("tts_model") or settings.SARVAM_TTS_MODEL
+        sample_rate = int(provider_status.get("tts_sample_rate") or settings.SARVAM_TTS_SAMPLE_RATE)
+        output_codec = settings.SARVAM_TTS_WS_OUTPUT_CODEC
+
+        # Config carries every non-text param (same body logic as synthesize).
+        cfg: dict[str, Any] = {
+            "target_language_code": SarvamVoiceService.to_bcp47(language),
+            "speaker": SarvamVoiceService.tts_speaker_for(language, provider_status),
+            "model": model,
+            "speech_sample_rate": sample_rate,
+            "output_audio_codec": output_codec,
+            "enable_cached_responses": (
+                bool(settings.SARVAM_TTS_ENABLE_CACHED_RESPONSES)
+                if enable_cached_responses is None
+                else bool(enable_cached_responses)
+            ),
+        }
+        if model == "bulbul:v3":
+            cfg["temperature"] = float(provider_status.get("sarvam_tts_temperature") or 0.6)
+        pace = SarvamVoiceService.pace_for(language, pace)
+        if pace is not None:
+            cfg["pace"] = max(0.3, min(3.0, float(pace)))
+        # Bulbul V3 supports ONLY pace — it rejects pitch/loudness.
+        if model != "bulbul:v3":
+            if pitch is not None:
+                cfg["pitch"] = max(-0.75, min(0.75, float(pitch)))
+            if loudness is not None:
+                cfg["loudness"] = max(0.1, min(3.0, float(loudness)))
+
+        t0 = perf_counter()
+        connect_timeout = max(0.1, settings.SARVAM_TTS_WS_CONNECT_TIMEOUT_MS / 1000)
+        ws = await asyncio.wait_for(
+            SarvamVoiceService.connect_tts_ws(tenant_res, model=model), timeout=connect_timeout
+        )
+        connect_ms = int((perf_counter() - t0) * 1000)
+        # Sarvam sends no end-of-utterance marker and keeps the session OPEN after
+        # a flush (verified by scripts/probe_sarvam_tts_ws.py: frames arrive with a
+        # max ~54ms gap, then the socket idles). So end-of-utterance = an idle gap
+        # after the first audio frame; a server-initiated close also ends it.
+        idle_gap_s = max(0.05, settings.SARVAM_TTS_WS_IDLE_EOU_MS / 1000)
+        got_audio = False
+        try:
+            # config → text → flush. The flush tells Sarvam "no more text,
+            # synthesize the rest"; `{"type":"flush"}` is the probe-confirmed shape
+            # (the other shapes make the server close with zero audio).
+            await ws.send(json.dumps({"type": "config", "data": cfg}))
+            await ws.send(json.dumps({"type": "text", "data": {"text": text[:3500]}}))
+            await ws.send(json.dumps({"type": "flush"}))
+            while True:
+                try:
+                    # Before the first frame, wait unbounded — the outer first-audio
+                    # watchdog in stream_sentence_tts bounds it. After audio starts,
+                    # an idle gap means the utterance is complete.
+                    if got_audio:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=idle_gap_s)
+                    else:
+                        raw = await ws.recv()
+                except asyncio.TimeoutError:
+                    break  # idle gap after audio → end of utterance
+                except ConnectionClosed:
+                    if got_audio:
+                        break  # server closed after delivering audio → clean end
+                    raise RuntimeError("Sarvam TTS WS closed before any audio")
+                msg = SarvamVoiceService._parse_tts_ws_message(raw)
+                if msg is None:
+                    continue
+                if msg.get("error"):
+                    if got_audio:
+                        # Error after audio already streamed — end cleanly rather
+                        # than raise (a raise would trigger a REST re-synth on top
+                        # of the audio the caller already heard = duplicate speech).
+                        logger.warning("NOKVO-TTS: WS error after audio: %r", msg["error"])
+                        break
+                    raise RuntimeError(f"Sarvam TTS WS error: {msg['error']!r}")
+                for audio_b64 in msg.get("audios") or []:
+                    chunk: dict[str, Any] = {
+                        "audio_base64": audio_b64,
+                        "sample_rate": sample_rate,
+                        "audio_format": output_codec,
+                    }
+                    if not got_audio:
+                        got_audio = True
+                        chunk["connect_ms"] = connect_ms
+                        logger.info(
+                            "NOKVO-TTS: WS connect=%dms first_audio=%dms",
+                            connect_ms,
+                            int((perf_counter() - t0) * 1000),
+                        )
+                    yield chunk
+                if msg.get("done"):
+                    break
+        finally:
+            try:
+                await ws.close()
+            except Exception:
+                pass
+
     @staticmethod
     async def synthesize_streaming(
         tenant_res: TenantResources,
@@ -897,23 +1080,23 @@ class SarvamVoiceService:
             0.1, settings.VOICE_TTS_STREAM_FIRST_AUDIO_DEADLINE_MS / 1000
         )
 
-        # Streaming TTS is GATED OFF by default (SARVAM_TTS_STREAMING_ENABLED).
-        # The HTTP /text-to-speech/stream endpoint returns ZERO audio chunks for
-        # this account/model (verified by direct probe) while still taking ~2s —
-        # pure wasted latency, since every sentence fell through to REST anyway.
-        # When disabled we hand the loop an empty generator so REST runs at once.
-        # The streaming loop + its first-audio watchdog stay intact for when a
-        # working stream path (Sarvam's WebSocket API) is wired up.
+        # Streaming source selection, in preference order:
+        #   1. WebSocket (SARVAM_TTS_WS_ENABLED) — the REAL streaming path; audio
+        #      arrives as it synthesizes (~80-180ms first-audio).
+        #   2. HTTP /text-to-speech/stream (SARVAM_TTS_STREAMING_ENABLED) — kept as
+        #      a fallback rung, but returns ZERO chunks for this account (verified),
+        #      so it's off; each sentence would fall through to REST anyway.
+        #   3. neither → an empty generator so REST runs at once (today's default).
+        # The loop below + its first-audio watchdog + REST fallback wrap whichever
+        # source is chosen, unchanged.
         async def _no_stream() -> AsyncIterator[dict[str, Any]]:
             return
             yield  # pragma: no cover — makes this an (empty) async generator
 
-        # Try the streaming endpoint first — push each chunk to the WS as it
-        # arrives so the caller hears the start of the sentence ~150-300ms
-        # earlier than the REST path. Fall back to REST on any streaming error,
-        # OR if first audio doesn't arrive within the deadline (degraded stream).
-        _stream_gen = (
-            SarvamVoiceService.synthesize_streaming(
+        streaming_provider = "sarvam"
+        if settings.SARVAM_TTS_WS_ENABLED:
+            streaming_provider = "sarvam_ws"
+            _stream_gen = SarvamVoiceService.synthesize_streaming_ws(
                 tenant_res,
                 text,
                 language=language,
@@ -922,9 +1105,18 @@ class SarvamVoiceService:
                 loudness=loudness,
                 enable_cached_responses=enable_cached_responses,
             )
-            if settings.SARVAM_TTS_STREAMING_ENABLED
-            else _no_stream()
-        )
+        elif settings.SARVAM_TTS_STREAMING_ENABLED:
+            _stream_gen = SarvamVoiceService.synthesize_streaming(
+                tenant_res,
+                text,
+                language=language,
+                pace=pace,
+                pitch=pitch,
+                loudness=loudness,
+                enable_cached_responses=enable_cached_responses,
+            )
+        else:
+            _stream_gen = _no_stream()
         try:
             while True:
                 if first_audio_ms is None:
@@ -946,10 +1138,13 @@ class SarvamVoiceService:
                                 "stream_id": stream_id,
                                 "purpose": purpose,
                                 "first_audio_latency_ms": first_audio_ms,
-                                "provider": "sarvam",
+                                "provider": streaming_provider,
                                 "audio_format": chunk.get("audio_format", audio_format),
                                 "sample_rate": chunk.get("sample_rate", sample_rate),
                                 "streaming": True,
+                                # WS-only: TLS/handshake cost, split from synth time,
+                                # so the Phase-2 persistent-connection call is data-driven.
+                                "connect_ms": chunk.get("connect_ms"),
                             }
                         )
                     except Exception:

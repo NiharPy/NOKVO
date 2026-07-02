@@ -301,9 +301,32 @@ class Settings(BaseSettings):
     # probe showed it returns ZERO audio chunks for this account/model while
     # still taking ~2s, so it was pure wasted latency on every sentence (each
     # then fell through to REST anyway). With it off we go straight to REST.
-    # Re-enable only once a working streaming path (Sarvam's WebSocket API,
-    # SARVAM_TTS_WEBSOCKET_URL) is wired into synthesize_streaming.
+    # The working streaming path is the WebSocket API below
+    # (SARVAM_TTS_WS_ENABLED); this HTTP-stream flag is kept only as a fallback
+    # rung and stays off.
     SARVAM_TTS_STREAMING_ENABLED: bool = False
+    # WebSocket streaming TTS (SARVAM_TTS_WEBSOCKET_URL) — the REAL streaming path.
+    # When ON, stream_sentence_tts opens a per-sentence WS, streams audio as it's
+    # synthesized (~360-390ms first-audio incl. ~150ms TLS connect, vs REST's full-
+    # synthesis wait of ~1-2s), and falls back to REST on any error / first-audio-
+    # deadline miss. Takes precedence over the dead HTTP stream. Protocol + output
+    # rate (24kHz PCM16) + clean idle-gap termination verified against live Sarvam
+    # (scripts/probe_sarvam_tts_ws.py). Rollback = set False (instant, no data change).
+    SARVAM_TTS_WS_ENABLED: bool = True
+    # Raw PCM16 @ SARVAM_TTS_SAMPLE_RATE so headerless streamed frames decode via
+    # _parse_tts_audio's raw-PCM fallback with no bridge change (must match the
+    # rate Sarvam actually emits — verified by the probe).
+    SARVAM_TTS_WS_OUTPUT_CODEC: str = "linear16"
+    # Bound on the WS connect/handshake so a hung connect trips the first-audio
+    # watchdog and REST takes over instead of stalling the turn.
+    SARVAM_TTS_WS_CONNECT_TIMEOUT_MS: int = 1500
+    # End-of-utterance idle gap. The live probe (scripts/probe_sarvam_tts_ws.py)
+    # showed Sarvam streams audio frames with a max inter-frame gap of ~54ms and
+    # then keeps the session OPEN with NO terminal marker and NO close. So an idle
+    # gap this long after the last frame IS the end-of-utterance signal (~5x the
+    # observed max gap → won't cut synthesis short; adds only this much tail
+    # latency before the next batch/socket-close).
+    SARVAM_TTS_WS_IDLE_EOU_MS: int = 250
     SARVAM_TTS_MODEL: str = "bulbul:v3"
     SARVAM_TTS_SPEAKER: str = "ritu"
     # Per-language native speaker overrides (bulbul:v3). Empty = use
