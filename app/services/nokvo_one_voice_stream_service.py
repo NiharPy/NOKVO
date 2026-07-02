@@ -1300,14 +1300,18 @@ class NokvoOneVoiceStreamService:
                 turn_state=turn_state,
             )
             return
-        # ── Deterministic questionnaire CLOSE ─────────────────────────────────
+        # ── Deterministic questionnaire CLOSE (gate-fail OR all-answered) ──────
         # The model is unreliable at delivering the closing line once the
         # questionnaire is done — in the field it re-asks the last question, makes
         # up a name question, or loops back to an earlier one instead of closing.
-        # So once EVERY question has been asked AND the caller's latest reply is a
-        # genuine answer (not a fragment / re-greeting), close the call
-        # deterministically: speak the outro verbatim and hang up, with no LLM
-        # turn. One-shot per call via campaign_context["_outro_ended"]; only for a
+        # Two deterministic close triggers, both handled here with NO LLM turn:
+        #   1. gate-fail: the last-asked DEALBREAKER gate question just got its
+        #      disqualifying answer. Once questions are asked verbatim there is no
+        #      LLM turn to notice the dealbreaker, so we enforce it here (also a
+        #      strict improvement for the LLM path — it can't miss the gate).
+        #   2. all-answered: EVERY question asked AND the latest reply is a genuine
+        #      answer (not a fragment / re-greeting).
+        # One-shot per call via campaign_context["_outro_ended"]; only for a
         # deterministic questionnaire agent that has an outro configured.
         if (
             outbound_context is not None
@@ -1328,11 +1332,12 @@ class NokvoOneVoiceStreamService:
             if _qoutro and _qs:
                 try:
                     from app.services.agent_outbound_context import (
+                        gate_failed,
                         questionnaire_is_complete,
                     )
 
                     _hist = await AgentSessionStore.get_history(tenant_res, call_id)
-                    if questionnaire_is_complete(_qs, _hist, cleaned):
+                    if gate_failed(_qs, _hist, cleaned) or questionnaire_is_complete(_qs, _hist, cleaned):
                         campaign_context["_outro_ended"] = True
                         await NokvoOneVoiceStreamService._speak_outro_and_end(
                             websocket,

@@ -36,6 +36,13 @@ function addQuestion() {
 function removeQuestion(i) { form.value.questions.splice(i, 1); }
 function addTier(q) { if (!Array.isArray(q.tiers)) q.tiers = []; q.tiers.push({ label: '', points: 10 }); }
 function removeTier(q, ti) { q.tiers.splice(ti, 1); }
+// Catch-all / else band: exactly one per question (radio semantics). Clicking the
+// current default clears it; clicking another moves it. The scorer awards this band
+// server-side for any answer that matches no specific band.
+function setCatchAll(q, ti) {
+  const cur = !!(q.tiers && q.tiers[ti] && q.tiers[ti].default);
+  (q.tiers || []).forEach((t, i) => { t.default = (!cur && i === ti); });
+}
 
 const maxPoints = computed(() => maxPointsFor(form.value.questions));
 const estSeconds = computed(() => estCallSeconds(form.value.questions));
@@ -185,10 +192,14 @@ async function rerun(id) {
             </div>
             <label v-if="q.type === 'answer'" class="ax-q-check"><input type="checkbox" v-model="q.graded" /> <span>Graded scoring — different answers earn different points</span></label>
             <div v-if="q.type === 'answer' && q.graded" class="ax-tiers">
-              <div v-for="(t, ti) in q.tiers" :key="ti" class="ax-tier">
-                <input v-model="t.label" type="text" class="ax-text ax-tier-label" placeholder="band, e.g. above 1 crore" />
-                <label class="ax-q-pts"><input v-model.number="t.points" type="number" min="1" class="ax-text" /><span>pts</span></label>
-                <button type="button" class="ax-q-del" @click="removeTier(q, ti)">×</button>
+              <div v-for="(t, ti) in q.tiers" :key="ti" class="ax-tier-wrap">
+                <div class="ax-tier" :class="{ 'ax-tier--default': t.default }">
+                  <input v-model="t.label" type="text" class="ax-text ax-tier-label" :placeholder="t.default ? 'Any other answer (label ignored by scoring)' : 'band, e.g. above 1 crore'" :disabled="t.default" />
+                  <label class="ax-q-pts"><input v-model.number="t.points" type="number" min="1" class="ax-text" /><span>pts</span></label>
+                  <label class="ax-tier-catchall" title="Earns these points for any answer that matches no other band"><input type="checkbox" :checked="!!t.default" @change="setCatchAll(q, ti)" /> <span>Catch-all</span></label>
+                  <button type="button" class="ax-q-del" @click="removeTier(q, ti)">×</button>
+                </div>
+                <div v-if="t.default" class="ax-field-hint ax-tier-hint">Earns these points for any answer that doesn't match the other bands — the label above is for your reference only, scoring ignores it.</div>
               </div>
               <button type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" @click="addTier(q)">+ Add band</button>
             </div>
@@ -272,8 +283,12 @@ async function rerun(id) {
 .ax-q-del { background: transparent; border: 1px solid rgba(255,255,255,0.14); color: rgba(255,255,255,0.55); border-radius: 4px; width: 30px; height: 30px; cursor: pointer; font-size: 16px; }
 .ax-q-check { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: rgba(255,255,255,0.55); }
 .ax-tiers { display: grid; gap: 8px; padding-left: 8px; }
+.ax-tier-wrap { display: grid; gap: 4px; }
 .ax-tier { display: flex; align-items: center; gap: 8px; }
+.ax-tier--default .ax-tier-label { opacity: 0.5; font-style: italic; }
 .ax-tier-label { flex: 1 1 auto; }
+.ax-tier-catchall { display: inline-flex; align-items: center; gap: 5px; color: rgba(255,255,255,0.6); font-size: 12px; white-space: nowrap; cursor: pointer; }
+.ax-tier-hint { padding-left: 2px; }
 .ax-thresh { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
 .ax-thresh-label { font-size: 12.5px; font-weight: 600; }
 .ax-thresh-input { width: 72px; }

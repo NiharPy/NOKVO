@@ -399,18 +399,26 @@ def _coerce_tiers(
     raw_tiers: Any, *, strict: bool = False, idx: int = 0, qtext: str = ""
 ) -> list[dict[str, Any]]:
     """Normalize a graded answer's ``tiers`` (scoring bands) to
-    ``[{id, label, points}]``.
+    ``[{id, label, points, default?}]``.
 
     Each tier needs a non-empty ``label`` (the band the scorer matches against,
     e.g. "above 1 crore") and ``points`` (floored at 1, default 1; no upper cap).
     Blank-label tiers are dropped (lenient even in strict — same as blank-text
     questions). ``id`` is a stable join key for the scorer's verdict; assigned
     when missing/duplicate. Capped at ``_MAX_TIERS``. Non-list → ``[]``.
+
+    ONE band may carry ``default: true`` — the CATCH-ALL band. The post-call
+    scorer awards it SERVER-SIDE when the caller answered but matched no specific
+    band (see ``lead_score_service._resolve_tier_points``), so the model never has
+    to reason about "anything apart from X". At most one default survives (first
+    wins; the flag is stripped from the rest). A default band's ``label`` is for
+    admin display only — scoring ignores it and matches every non-specific answer.
     """
     if not isinstance(raw_tiers, list):
         return []
     tiers: list[dict[str, Any]] = []
     seen: set[str] = set()
+    default_seen = False
     for t in raw_tiers:
         if not isinstance(t, dict):
             continue
@@ -426,7 +434,13 @@ def _coerce_tiers(
         if not tid or tid in seen:
             tid = uuid.uuid4().hex[:6]
         seen.add(tid)
-        tiers.append({"id": tid, "label": label, "points": pts})
+        entry: dict[str, Any] = {"id": tid, "label": label, "points": pts}
+        # Only the FIRST band flagged default becomes the catch-all; later ones
+        # keep their points but lose the flag (they stay specific bands).
+        if bool(t.get("default")) and not default_seen:
+            entry["default"] = True
+            default_seen = True
+        tiers.append(entry)
         if len(tiers) >= _MAX_TIERS:
             break
     return tiers
@@ -1277,6 +1291,38 @@ def questionnaire_is_complete(
     return True
 
 
+def gate_failed(questions: list, history: list | None, latest_user_text: str | None) -> bool:
+    """True when the LAST-asked question is a DEALBREAKER ``gate`` intent AND the
+    caller's latest reply CLEARLY gives the disqualifying answer (the opposite of
+    ``required``) — the deterministic replacement for the LLM-driven gate, needed
+    once questions are asked verbatim (no LLM turn to notice the dealbreaker).
+
+    CONSERVATIVE by design: only an UNAMBIGUOUS yes/no cue closes the call. A
+    reply carrying BOTH an affirmative and a negative cue ("yeah no", "not sure"
+    — where "sure" is affirmative and "not" is negative and they cancel), or
+    NEITHER (a clarifying question, "maybe", "why do you ask?", silence), returns
+    False so the normal re-ask / LLM path handles it — never a wrongful hang-up.
+    Pure + unit-testable. Mirrors ``_last_intent_unanswered``'s cue vocabulary."""
+    qs = questions or []
+    if not qs:
+        return False
+    state = questionnaire_asked_state(qs, history)
+    last_n = state.get("last_asked_number")
+    if not last_n or last_n < 1 or last_n > len(qs):
+        return False
+    q = qs[last_n - 1] or {}
+    if str(q.get("type")) != "intent" or not q.get("gate"):
+        return False
+    toks = {t.replace("'", "") for t in re.findall(r"[a-z']+", (latest_user_text or "").lower())}
+    affirm = bool(toks & _AFFIRM_CUES)
+    negate = bool(toks & _NEGATE_CUES)
+    if affirm == negate:
+        return False  # neither, or both (ambiguous) → defer, don't close
+    required = str(q.get("required") or "yes").strip().lower()
+    # required "yes" → the dealbreaker is a NEGATIVE reply; required "no" → positive.
+    return negate if required == "yes" else affirm
+
+
 def _render_progress_directive(
     questions: list, history: list | None, latest_user_text: str | None
 ) -> str:
@@ -1372,6 +1418,32 @@ _OFF_SCRIPT_RE = re.compile(
 )
 
 
+# A reply that is itself a QUESTION / clarification request ("where is that?",
+# "what do you mean?", "can you repeat?") is NOT an answer — it must be handled by
+# the LLM (which answers it), never treated as an advance. Broad on purpose: a
+# leading interrogative word or a trailing "?" both defer. te/hi question words
+# included so a native-script clarifier also defers.
+_CLARIFY_RE = re.compile(
+    r"^\s*(?:"
+    r"what|where|why|how|when|which|who|whom|whose|"
+    r"can|could|would|will|do|does|did|is|are|sorry|pardon|repeat|"
+    r"come\s+again|say\s+(?:that\s+)?again|meaning|"
+    r"ఏమిటి|ఏంటి|ఎక్కడ|ఎందుకు|ఎలా|ఎప్పుడు|ఏది|మళ్ళీ|అర్థం|"
+    r"क्या|कहाँ|कहां|क्यों|कैसे|कब|कौन|कौनसा|फिर\s+से|मतलब"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _is_clarifying_question(text: str | None) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    if t.rstrip().endswith("?") or "؟" in t:
+        return True
+    return bool(_CLARIFY_RE.match(t))
+
+
 def next_verbatim_question(
     questions: list, history: list | None, latest_user_text: str | None
 ) -> tuple[int, dict] | None:
@@ -1381,14 +1453,18 @@ def next_verbatim_question(
     Mirrors :func:`_render_progress_directive`'s advance/re-ask split so scripted
     delivery and the (fallback) LLM prompt agree on where the call is. Returns the
     question ONLY on a clean forward advance; re-asks, non-answers, trailing-off,
-    an unanswered final intent, or an off-script reply all return ``None`` so the
-    LLM handles that (conversational) turn. Requires the target question to carry
-    ``text_i18n`` — without it there's nothing to serve verbatim."""
+    an unanswered final intent, a clarifying question, or an off-script reply all
+    return ``None`` so the LLM handles that (conversational) turn. Requires the
+    target question to carry ``text_i18n`` — without it there's nothing to serve
+    verbatim."""
     qs = questions or []
     if not qs:
         return None
-    # Off-script (a question / objection / opt-out) → let the LLM handle it.
-    if latest_user_text and _OFF_SCRIPT_RE.search(latest_user_text):
+    # Off-script (a question / objection / opt-out) or the caller asking their OWN
+    # clarifying question → let the LLM handle it (it answers, it does not advance).
+    if latest_user_text and (
+        _OFF_SCRIPT_RE.search(latest_user_text) or _is_clarifying_question(latest_user_text)
+    ):
         return None
     state = questionnaire_asked_state(qs, history)
     next_n = state.get("next_number")

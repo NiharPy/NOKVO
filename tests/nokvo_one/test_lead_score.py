@@ -641,6 +641,64 @@ def test_normalizer_tiers_normalized_capped_and_deduped():
     assert len(ids) == len(set(ids))  # all unique (dup reassigned)
 
 
+# ── Deterministic catch-all / default band ─────────────────────────────────
+
+def test_coerce_tiers_keeps_single_default():
+    q = _coerce_questionnaire({"questions": [
+        {"type": "answer", "text": "Location?", "tiers": [
+            {"label": "Kokapet", "points": 50},
+            {"label": "any other", "points": 10, "default": True},
+            {"label": "second default", "points": 5, "default": True},  # only first survives
+        ]},
+    ]})
+    tiers = q["questions"][0]["tiers"]
+    defaults = [t for t in tiers if t.get("default")]
+    assert len(defaults) == 1 and defaults[0]["label"] == "any other"
+    assert tiers[2].get("default") is None  # later default flag stripped
+    # max score counts the highest band regardless of default status
+    assert questionnaire_max_points(q["questions"]) == 50
+
+
+def test_resolve_tier_points_awards_default_when_answered_no_match():
+    tiers = [
+        {"id": "kk", "label": "Kokapet", "points": 50},
+        {"id": "el", "label": "any other", "points": 10, "default": True},
+    ]
+    # answered but fits no specific band -> catch-all awarded server-side
+    pts, tid = ls._resolve_tier_points(tiers, {"tier": "none", "answered": True, "evidence": "Bachupally"})
+    assert pts == 10 and tid == "el"
+    # never answered -> 0 even though a default exists
+    assert ls._resolve_tier_points(tiers, {"tier": "none", "answered": False, "evidence": ""}) == (0, "")
+    # specific match still beats the default
+    assert ls._resolve_tier_points(tiers, {"tier": "kk", "answered": True}) == (50, "kk")
+
+
+def test_resolve_tier_points_no_default_is_backcompat():
+    tiers = [{"id": "kk", "label": "Kokapet", "points": 50}]
+    # no default band -> "none" scores 0 exactly as before, regardless of answered
+    assert ls._resolve_tier_points(tiers, {"tier": "none", "answered": True, "evidence": "x"}) == (0, "")
+
+
+def test_verdict_answered_backcompat_proxies_evidence():
+    # field absent -> proxy on evidence presence
+    assert ls._verdict_answered({"tier": "none", "evidence": "Bachupally"}) is True
+    assert ls._verdict_answered({"tier": "none", "evidence": ""}) is False
+    # explicit values win over the proxy
+    assert ls._verdict_answered({"answered": False, "evidence": "x"}) is False
+    assert ls._verdict_answered({"answered": "true"}) is True
+
+
+def test_default_band_hidden_from_model():
+    # _format_questions must not leak the catch-all band's id/label to the model
+    qs = [{"id": "q1", "type": "answer", "text": "Location?", "tiers": [
+        {"id": "kk", "label": "Kokapet", "points": 50},
+        {"id": "el", "label": "secret catchall", "points": 10, "default": True},
+    ]}]
+    rendered = ls._format_questions(qs)
+    assert "Kokapet" in rendered
+    assert "secret catchall" not in rendered and "el" not in rendered.split("bands:")[1]
+
+
 def test_graded_answer_needs_no_desired_answer():
     raw = {"questions": [{"type": "answer", "text": "Budget?", "tiers": [
         {"label": "high", "points": 50}]}]}

@@ -85,31 +85,33 @@ _LEAD_SCORE_SYSTEM = (
     "or is absent.\n"
     "  - answer (GRADED): the question lists scoring bands, each with a band id "
     "and a description. Pick the SINGLE band whose description best fits what the "
-    "caller actually said and return its band id as \"tier\". Some bands are "
-    "CATCH-ALL / negation bands — their description names everything OTHER than a "
-    "specific value (e.g. 'anything apart from Kokapet', 'other', 'any other "
-    "location', 'anything else', 'none of the above'). When the caller gives a "
-    "concrete answer that does NOT fit the more specific bands, it MATCHES the "
-    "catch-all band — return that band, do NOT return \"none\" (e.g. bands "
-    "'Kokapet' vs 'anything apart from Kokapet': a caller who says any other place "
-    "like 'Bachupally' matches 'anything apart from Kokapet'). Only return "
-    "tier=\"none\" when the caller genuinely gave NO answer to this question or the "
-    "answer is unintelligible AND there is no catch-all band. Choose exactly one "
-    "band; never combine bands.\n\n"
+    "caller actually said and return its band id as \"tier\"; if the caller's "
+    "answer fits NONE of the listed bands, return tier=\"none\". Do NOT invent a "
+    "catch-all — an answer that fits no listed band is scored server-side, so just "
+    "return \"none\". Choose exactly one band; never combine bands. SEPARATELY, "
+    "for every graded question set \"answered\": true if the caller gave ANY real "
+    "answer to THIS question (even one that fits no band), false otherwise.\n"
+    "    CRITICAL — what is NOT an answer (set answered=false, tier=\"none\"): the "
+    "caller asking their OWN question or for clarification instead of answering "
+    "(e.g. 'Where exactly is that?', 'What do you mean?', 'Can you repeat that?'), "
+    "'I don't know', a deflection, silence, or a non-reply. A clarifying question "
+    "is NEVER an answer — never set answered=true for it.\n\n"
     "MULTILINGUAL: the call may be in English, Telugu, or Hindi (often in native "
     "script). Treat these as affirmative: yes, yeah, sure, ok, interested, "
     "avunu / అవును, sare / సరే, haan / हाँ, ji / जी, theek hai / ठीक है. Match "
     "answers and bands across languages by meaning (e.g. a Telugu place name "
     "equals its English spelling).\n\n"
     "If a question was never asked or the caller never answered it, earned=false "
-    "/ tier=\"none\". Never invent caller statements.\n\n"
+    "/ tier=\"none\" / answered=false. Never invent caller statements.\n\n"
     'Output STRICT JSON only: {"verdicts": [{"id": "<question id>", "earned": '
     'true|false, "tier": "<band id for a graded question, else \\"none\\">", '
+    '"answered": true|false, '
     '"evidence": "<short quote of the deciding caller turn, <=160 chars; empty if '
     'none>"}]}\n'
-    "For intent and simple-answer questions set \"earned\" (\"tier\" is ignored). "
-    "For graded questions set \"tier\" (\"earned\" is ignored). Emit exactly one "
-    "verdict per question, using the given id. Output nothing but the JSON."
+    "For intent and simple-answer questions set \"earned\" (\"tier\"/\"answered\" "
+    "ignored). For graded questions set \"tier\" AND \"answered\" (\"earned\" is "
+    "ignored). Emit exactly one verdict per question, using the given id. Output "
+    "nothing but the JSON."
 )
 
 
@@ -162,14 +164,28 @@ def _format_questions(questions: list[dict]) -> str:
         text = str(q.get("text") or "").strip()
         tiers = q.get("tiers") if isinstance(q.get("tiers"), list) else None
         if qtype == "answer" and tiers:
-            bands = "; ".join(
-                f'[{t.get("id")}] "{str(t.get("label") or "").strip()}" = {int(t.get("points") or 0)} pts'
-                for t in tiers
-            )
-            lines.append(
-                f'[{qid}] (answer, GRADED) "{text}" — return the id of the SINGLE '
-                f"best-matching band, else \"none\". bands: {bands}"
-            )
+            # The default (catch-all) band is NEVER shown to the model — the server
+            # awards it deterministically when the caller answered but matched no
+            # specific band. Showing only the specific bands removes the negation-
+            # reasoning failure mode ("is Bachupally 'not Kokapet'?").
+            specific = [t for t in tiers if not t.get("default")]
+            if specific:
+                bands = "; ".join(
+                    f'[{t.get("id")}] "{str(t.get("label") or "").strip()}" = {int(t.get("points") or 0)} pts'
+                    for t in specific
+                )
+                lines.append(
+                    f'[{qid}] (answer, GRADED) "{text}" — return the id of the SINGLE '
+                    f"best-matching band, else \"none\". Also report whether the caller "
+                    f"answered at all. bands: {bands}"
+                )
+            else:
+                # Only a catch-all band exists → nothing specific to match; just
+                # report whether the caller answered.
+                lines.append(
+                    f'[{qid}] (answer, GRADED) "{text}" — return tier="none" and just '
+                    f"report whether the caller answered this question."
+                )
         elif qtype == "answer":
             desired = str(q.get("desired_answer") or "").strip()
             pts = _question_points(q)
@@ -207,29 +223,62 @@ def _safe_default(questions: list[dict], threshold: int, reason: str) -> LeadSco
     )
 
 
+def _tier_points(tier: dict) -> int:
+    try:
+        return max(0, int(tier.get("points") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _verdict_answered(verdict: Any) -> bool:
+    """Did the caller give ANY answer to a graded question? Read the model's
+    ``answered`` flag robustly (same string-boolean hazard as ``earned``). When
+    the field is ABSENT (older model output that predates the schema), fall back
+    to ``bool(evidence)`` — a quoted deciding caller turn implies they answered —
+    so nothing regresses. Only gates the SERVER-SIDE default band, never a
+    specific match."""
+    if not isinstance(verdict, dict):
+        return False
+    v = verdict.get("answered")
+    if v is None:
+        return bool(str(verdict.get("evidence") or "").strip())  # back-compat proxy
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return v > 0
+    return str(v).strip().lower() in ("true", "yes", "y", "1")
+
+
 def _resolve_tier_points(tiers: list[dict], verdict: Any) -> tuple[int, str]:
     """Map the model's chosen band to its admin-set points (computed SERVER-SIDE
     — never trust the model's arithmetic). Tolerates the model returning a band
-    id, its label, or a 1-based index. Returns ``(points, tier_id)``, or
-    ``(0, "")`` for no match / ``"none"`` / an absent verdict."""
+    id, its label, or a 1-based index.
+
+    The CATCH-ALL band (``default: true``) is never offered to the model; it is
+    awarded HERE, deterministically, when the caller answered (``answered=true``)
+    but matched no SPECIFIC band. Resolution order: specific match → its points;
+    else answered + a default band exists → the default's points; else 0.
+    Returns ``(points, tier_id)``. Back-compatible: no default band → ``(0, "")``
+    on a ``"none"`` / no-match, exactly as before."""
     if not isinstance(verdict, dict):
         return 0, ""
     raw = str(verdict.get("tier") or "").strip()
-    if not raw or raw.lower() == "none":
-        return 0, ""
-    chosen = {str(t.get("id")): t for t in tiers}.get(raw)
-    if chosen is None:
-        by_label = {str(t.get("label") or "").strip().lower(): t for t in tiers}
-        chosen = by_label.get(raw.lower())
-    if chosen is None and raw.isdigit() and 1 <= int(raw) <= len(tiers):
-        chosen = tiers[int(raw) - 1]
-    if not isinstance(chosen, dict):
-        return 0, ""
-    try:
-        pts = max(0, int(chosen.get("points") or 0))
-    except (TypeError, ValueError):
-        pts = 0
-    return pts, str(chosen.get("id") or "")
+    chosen: dict | None = None
+    if raw and raw.lower() != "none":
+        chosen = {str(t.get("id")): t for t in tiers}.get(raw)
+        if chosen is None:
+            by_label = {str(t.get("label") or "").strip().lower(): t for t in tiers}
+            chosen = by_label.get(raw.lower())
+        if chosen is None and raw.isdigit() and 1 <= int(raw) <= len(tiers):
+            chosen = tiers[int(raw) - 1]
+    # A SPECIFIC (non-default) band matched → award it (a match implies answered).
+    if isinstance(chosen, dict) and not chosen.get("default"):
+        return _tier_points(chosen), str(chosen.get("id") or "")
+    # No specific match → award the catch-all IFF the caller actually answered.
+    default_tier = next((t for t in tiers if t.get("default")), None)
+    if default_tier is not None and _verdict_answered(verdict):
+        return _tier_points(default_tier), str(default_tier.get("id") or "")
+    return 0, ""
 
 
 def _verdict_earned(verdict: Any) -> bool:

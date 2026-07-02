@@ -8,6 +8,7 @@ verbatim_line_for_language() picks the session-language string with fallback.
 from __future__ import annotations
 
 from app.services.agent_outbound_context import (
+    gate_failed,
     next_verbatim_question,
     verbatim_line_for_language,
 )
@@ -74,3 +75,76 @@ def test_language_selection_with_fallback():
     assert verbatim_line_for_language(_I18N, "fallback", "en-IN") == _I18N["en"]
     assert verbatim_line_for_language({"en": "only-en"}, "fallback", "hi") == "only-en"  # missing lang → en
     assert verbatim_line_for_language(None, "fallback", "hi") == "fallback"             # no i18n → authored
+
+
+# ── Clarifying-question deferral (live counterpart of the scorer's answered=false) ──
+
+def test_clarifying_question_defers_to_llm():
+    qs = _qs()
+    hist = _hist("Are you looking to buy?")  # Q1 asked; caller responds with a question
+    for clarifier in (
+        "where exactly is that?",
+        "what do you mean?",
+        "can you repeat that?",
+        "sorry?",
+        "ఎక్కడ ఉంది?",     # te "where is it?"
+        "क्या मतलब?",       # hi "what do you mean?"
+    ):
+        assert next_verbatim_question(qs, hist, clarifier) is None, clarifier
+
+
+def test_genuine_answer_resumes_after_clarifier():
+    # After a clarifier defers, the NEXT real answer advances to Q2 verbatim.
+    hist = _hist("Are you looking to buy?")
+    plan = next_verbatim_question(_qs(), hist, "yes I am")
+    assert plan is not None and plan[0] == 2 and plan[1]["id"] == "q2"
+
+
+# ── Deterministic dealbreaker gate (gate_failed) ──
+
+def _gate_qs():
+    return [
+        {"id": "g1", "type": "intent", "text": "Can you spare a few seconds for a survey?",
+         "required": "yes", "gate": True},
+        {"id": "q2", "type": "answer", "text": "What is your budget?", "desired_answer": "any"},
+    ]
+
+
+def test_gate_failed_on_clear_dealbreaker():
+    hist = _hist("Can you spare a few seconds for a survey?")  # gate question asked
+    assert gate_failed(_gate_qs(), hist, "no, I'm busy") is True
+    assert gate_failed(_gate_qs(), hist, "nope") is True
+
+
+def test_gate_not_failed_on_required_answer():
+    hist = _hist("Can you spare a few seconds for a survey?")
+    assert gate_failed(_gate_qs(), hist, "yes sure") is False  # required=yes → advance, not close
+
+
+def test_gate_conservative_on_ambiguous_replies():
+    # Ambiguous / sarcastic / non-committal / clarifying → must NOT hang up.
+    hist = _hist("Can you spare a few seconds for a survey?")
+    for reply in (
+        "maybe",
+        "hmm not sure",     # "sure"(affirm) + "not"(negate) cancel → ambiguous
+        "why do you ask?",
+        "yeah no",          # both cues → ambiguous
+        "no yeah",
+        "",                 # silence
+        "the weather is nice",  # no yes/no cue at all
+    ):
+        assert gate_failed(_gate_qs(), hist, reply) is False, reply
+
+
+def test_gate_ignores_non_gate_and_non_intent():
+    # required="no" gate → the POSITIVE reply is the dealbreaker.
+    no_gate = [{"id": "g1", "type": "intent", "text": "Are you on the do-not-call list?",
+                "required": "no", "gate": True}]
+    hist = _hist("Are you on the do-not-call list?")
+    assert gate_failed(no_gate, hist, "yes I am") is True
+    assert gate_failed(no_gate, hist, "no") is False
+    # A non-gate intent never closes here.
+    plain = [{"id": "g1", "type": "intent", "text": "Interested?", "required": "yes"}]
+    assert gate_failed(plain, _hist("Interested?"), "no") is False
+    # Empty questions.
+    assert gate_failed([], _hist(), "no") is False

@@ -338,9 +338,13 @@ class Settings(BaseSettings):
     # letting the LLM rephrase — so the exact string recurs across calls and hits
     # the TTS cache (huge COGS/latency win) while staying native hi/te. Behavior
     # change: question DELIVERY is scripted, but the LLM still handles re-asks,
-    # non-answers, and off-script replies (those turns fall through to it). Default
-    # OFF so it can be A/B'd against the LLM-rephrase flow before rollout.
-    APEX_VERBATIM_QUESTIONS_ENABLED: bool = False
+    # non-answers, clarifying questions, and off-script replies (those turns fall
+    # through to it). The dealbreaker gate is enforced deterministically
+    # (agent_outbound_context.gate_failed) so verbatim delivery can't skip it. ON
+    # by default; rollback = set False (instant, no data change). Campaigns whose
+    # questions lack text_i18n degrade gracefully to the LLM-rephrase flow, so run
+    # the translation backfill (scripts/backfill_apex_questionnaire_i18n.py) first.
+    APEX_VERBATIM_QUESTIONS_ENABLED: bool = True
     # Plivo telephony (the sole provider). The MASTER account creds; each tenant
     # gets its own Plivo subaccount + DID + Application created via the API.
     PLIVO_AUTH_ID: str = ""
