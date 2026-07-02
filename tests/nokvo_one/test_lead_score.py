@@ -603,18 +603,20 @@ def test_max_points_helper():
     assert questionnaire_max_points(None) == 0
 
 
-def test_normalizer_points_clamped_and_stored_only_when_nondefault():
+def test_normalizer_points_floored_and_stored_only_when_nondefault():
     q = _coerce_questionnaire({"questions": [
         {"type": "intent", "text": "a", "points": 1},      # default -> not stored
         {"type": "intent", "text": "b", "points": 5},
-        {"type": "intent", "text": "c", "points": 9999},   # clamp to 100
+        {"type": "intent", "text": "c", "points": 200},    # no upper cap -> kept
+        {"type": "intent", "text": "e", "points": 0},      # floored up to 1 -> not stored
         {"type": "intent", "text": "d"},                   # missing -> 1, not stored
     ]})
     qs = q["questions"]
     assert "points" not in qs[0]
     assert qs[1]["points"] == 5
-    assert qs[2]["points"] == 100
-    assert "points" not in qs[3]
+    assert qs[2]["points"] == 200          # weights above 100 are allowed now
+    assert "points" not in qs[3]           # floored to the 1 default -> not stored
+    assert "points" not in qs[4]
 
 
 def test_normalizer_tiers_normalized_capped_and_deduped():
@@ -622,8 +624,8 @@ def test_normalizer_tiers_normalized_capped_and_deduped():
         {"type": "answer", "text": "Budget?", "tiers": [
             {"label": "high", "points": 50},
             {"label": "   ", "points": 10},            # blank label dropped
-            {"label": "mid", "points": 0},             # clamp up to 1
-            {"label": "x", "points": 999},             # clamp down to 100
+            {"label": "mid", "points": 0},             # floored up to 1
+            {"label": "x", "points": 999},             # no upper cap -> kept
             {"id": "dup", "label": "y", "points": 5},
             {"id": "dup", "label": "z", "points": 5},  # dup id reassigned
             {"label": "a", "points": 5},
@@ -633,8 +635,8 @@ def test_normalizer_tiers_normalized_capped_and_deduped():
     tiers = q["questions"][0]["tiers"]
     assert len(tiers) == ctx_mod._MAX_TIERS  # capped at 6
     assert [t["label"] for t in tiers][:3] == ["high", "mid", "x"]  # blank dropped
-    assert tiers[1]["points"] == 1    # "mid" clamped up
-    assert tiers[2]["points"] == 100  # "x" clamped down
+    assert tiers[1]["points"] == 1    # "mid" floored up
+    assert tiers[2]["points"] == 999  # "x" kept (no upper cap)
     ids = [t["id"] for t in tiers]
     assert len(ids) == len(set(ids))  # all unique (dup reassigned)
 

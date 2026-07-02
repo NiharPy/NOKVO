@@ -180,14 +180,14 @@ async function rerun(id) {
                 <option value="yes">Required: Yes</option>
                 <option value="no">Required: No</option>
               </select>
-              <label v-if="!(q.type === 'answer' && q.graded)" class="ax-q-pts"><input v-model.number="q.points" type="number" min="1" max="100" class="ax-text" /><span>pts</span></label>
+              <label v-if="!(q.type === 'answer' && q.graded)" class="ax-q-pts"><input v-model.number="q.points" type="number" min="1" class="ax-text" /><span>pts</span></label>
               <button type="button" class="ax-q-del" title="Remove" @click="removeQuestion(i)">×</button>
             </div>
             <label v-if="q.type === 'answer'" class="ax-q-check"><input type="checkbox" v-model="q.graded" /> <span>Graded scoring — different answers earn different points</span></label>
             <div v-if="q.type === 'answer' && q.graded" class="ax-tiers">
               <div v-for="(t, ti) in q.tiers" :key="ti" class="ax-tier">
                 <input v-model="t.label" type="text" class="ax-text ax-tier-label" placeholder="band, e.g. above 1 crore" />
-                <label class="ax-q-pts"><input v-model.number="t.points" type="number" min="1" max="100" class="ax-text" /><span>pts</span></label>
+                <label class="ax-q-pts"><input v-model.number="t.points" type="number" min="1" class="ax-text" /><span>pts</span></label>
                 <button type="button" class="ax-q-del" @click="removeTier(q, ti)">×</button>
               </div>
               <button type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" @click="addTier(q)">+ Add band</button>

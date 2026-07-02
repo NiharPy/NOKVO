@@ -389,9 +389,10 @@ _MAX_QUESTIONS = 10
 _MAX_QUESTION_TEXT = 300
 # Weighted / graded scoring caps (a question may carry a single `points` weight,
 # or — for answer questions — a list of graded `tiers`/bands each worth points).
+# Points themselves are only floored at 1 — there is no upper cap, so an admin can
+# weight one question (e.g. a callback ask) far above the rest of the rubric.
 _MAX_TIERS = 6
 _MAX_TIER_LABEL = 120
-_MAX_POINTS = 100
 
 
 def _coerce_tiers(
@@ -401,7 +402,7 @@ def _coerce_tiers(
     ``[{id, label, points}]``.
 
     Each tier needs a non-empty ``label`` (the band the scorer matches against,
-    e.g. "above 1 crore") and ``points`` (clamped ``1.._MAX_POINTS``, default 1).
+    e.g. "above 1 crore") and ``points`` (floored at 1, default 1; no upper cap).
     Blank-label tiers are dropped (lenient even in strict — same as blank-text
     questions). ``id`` is a stable join key for the scorer's verdict; assigned
     when missing/duplicate. Capped at ``_MAX_TIERS``. Non-list → ``[]``.
@@ -420,7 +421,7 @@ def _coerce_tiers(
             pts = int(t.get("points"))
         except (TypeError, ValueError):
             pts = 1
-        pts = max(1, min(_MAX_POINTS, pts))
+        pts = max(1, pts)
         tid = str(t.get("id") or "").strip()[:32]
         if not tid or tid in seen:
             tid = uuid.uuid4().hex[:6]
@@ -471,9 +472,9 @@ def _coerce_questionnaire(value: Any, *, strict: bool = False) -> dict[str, Any]
       * ``text`` stripped + capped; blank-text questions dropped.
       * ``desired_answer`` is non-empty IFF ``type == "answer"`` AND the question
         is not graded; for ``"intent"`` it is forced to ``""``.
-      * ``points`` is an optional per-question weight (``1.._MAX_POINTS``, default
-        1), stored only when ``> 1``; ignored for graded answers (their tiers
-        carry the points).
+      * ``points`` is an optional per-question weight (floored at 1, default 1,
+        no upper cap), stored only when ``> 1``; ignored for graded answers (their
+        tiers carry the points).
       * ``tiers`` (answer questions only) is a graded rubric — the post-call
         scorer awards the points of the single best-matching band. A graded
         answer needs no ``desired_answer``. Graded questions can't be live
@@ -541,7 +542,7 @@ def _coerce_questionnaire(value: Any, *, strict: bool = False) -> dict[str, Any]
         # Per-question weight (single-band questions); graded answers carry their
         # points on the tiers instead.
         try:
-            points = max(1, min(_MAX_POINTS, int(item.get("points"))))
+            points = max(1, int(item.get("points")))
         except (TypeError, ValueError):
             points = 1
         qid = str(item.get("id") or "").strip()[:32]
