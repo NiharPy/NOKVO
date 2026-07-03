@@ -77,7 +77,7 @@ def test_build_agent_config_defaults_make_campaign_proactive():
     assert config["agent_prompt"]
     assert config["objectives"] == DEFAULT_OBJECTIVES
     assert config["exit_conditions"]
-    assert config["silence_timeout_seconds"] == 12.0
+    assert config["silence_timeout_seconds"] == 10.0  # nudge→cut silence window
 
 
 def test_outbound_system_section_includes_pending_objectives_only():

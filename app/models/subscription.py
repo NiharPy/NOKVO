@@ -12,6 +12,7 @@ from __future__ import annotations
 import uuid
 
 from sqlalchemy import (
+    Boolean,
     Column,
     DateTime,
     ForeignKey,
@@ -56,6 +57,11 @@ class Subscription(Base):
 
     # "created" | "active" | "halted" | "cancelled".
     status = Column(String, nullable=False, server_default="created")
+    # True once the customer has asked to cancel at cycle end: the subscription is
+    # still ``active`` and service continues until ``current_period_end``, then
+    # Razorpay stops billing (no renewal). Reset to False when it actually ends
+    # (the ``subscription.cancelled`` webhook flips status to "cancelled").
+    cancel_at_period_end = Column(Boolean, nullable=False, server_default="false", default=False)
     # Set when resources are provisioned (NULL = paid-but-not-yet-provisioned,
     # which the resume/webhook-retry path re-attempts).
     provisioned_at = Column(DateTime(timezone=True), nullable=True)

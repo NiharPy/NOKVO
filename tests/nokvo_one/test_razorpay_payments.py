@@ -7,6 +7,7 @@ brackets.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 from decimal import Decimal
@@ -14,6 +15,10 @@ from decimal import Decimal
 import pytest
 
 from app.core.config import settings
+
+
+def _run(coro):
+    return asyncio.new_event_loop().run_until_complete(coro)
 from app.services.call_cost_calculator import (
     CostBreakdown,
     RATE_TIERS,
@@ -66,6 +71,44 @@ def test_webhook_signature_good_bad(monkeypatch):
 def test_webhook_signature_requires_secret(monkeypatch):
     monkeypatch.setattr(settings, "RAZORPAY_WEBHOOK_SECRET", "")
     assert RazorpayService.verify_webhook_signature(b"x", "anything") is False
+
+
+# ─────────── cancel subscription (cancel at cycle end) ───────────
+def test_cancel_subscription_posts_cycle_end(monkeypatch):
+    captured = {}
+
+    async def fake_request(method, path, *, json_body=None):
+        captured.update(method=method, path=path, body=json_body)
+        return {"id": "sub_1", "status": "active", "current_end": 1750000000}
+
+    monkeypatch.setattr(RazorpayService, "_request", staticmethod(fake_request))
+    out = _run(RazorpayService.cancel_subscription("sub_1"))
+    assert captured["method"] == "POST"
+    assert captured["path"] == "subscriptions/sub_1/cancel"
+    assert captured["body"] == {"cancel_at_cycle_end": 1}  # keep the paid month
+    assert out["current_end"] == 1750000000
+
+
+def test_cancel_subscription_immediate(monkeypatch):
+    captured = {}
+
+    async def fake_request(method, path, *, json_body=None):
+        captured["body"] = json_body
+        return {}
+
+    monkeypatch.setattr(RazorpayService, "_request", staticmethod(fake_request))
+    _run(RazorpayService.cancel_subscription("sub_2", cancel_at_cycle_end=False))
+    assert captured["body"] == {"cancel_at_cycle_end": 0}  # unpaid sub → cancel now
+
+
+def test_unix_to_dt_helper():
+    from app.api.nokvo_one_payments import _unix_to_dt
+
+    assert _unix_to_dt(0) is None
+    assert _unix_to_dt(None) is None
+    assert _unix_to_dt("bad") is None
+    dt = _unix_to_dt(1750000000)
+    assert dt is not None and dt.tzinfo is not None  # aware UTC datetime
 
 
 # ─────────── tiered per-minute rates (per calendar month) ───────────

@@ -218,9 +218,13 @@ export async function submitFeedback(message, category = 'feedback') {
 }
 
 // ── Payment (one plan ₹6499/mo + minutes bundle, billed on selected, credited 1.5×) ──
-export async function createSubscription(paymentToken, minutes) {
+export async function createSubscription(paymentToken, minutes, legal = {}) {
   const { data } = await api.post('/payments/create-subscription', {
     payment_token: paymentToken, plan: 'apex', minutes,
+    // Server-side consent audit — required for APEX (see cancel/terms flow).
+    terms_accepted: !!legal.termsAccepted,
+    terms_version: legal.termsVersion || null,
+    privacy_version: legal.privacyVersion || null,
   });
   return data;
 }

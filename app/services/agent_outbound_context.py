@@ -45,7 +45,10 @@ from app.models.outbound_campaign import OutboundCampaign
 
 _CAMPAIGN_TTL_SECONDS = 120.0
 _CAMPAIGN_CACHE_MAX = 256
-_DEFAULT_SILENCE_TIMEOUT_SECONDS = 12.0
+# Silence window after an agent turn (per-campaign tunable via
+# agent_config.silence_timeout_seconds). Drives the no-response ladder: one nudge
+# at this interval, then a brief goodbye + hang up at ~2× if still silent.
+_DEFAULT_SILENCE_TIMEOUT_SECONDS = 10.0
 
 
 # ── Leading-filler scrub ────────────────────────────────────────────────────

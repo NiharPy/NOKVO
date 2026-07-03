@@ -54,8 +54,14 @@ router = APIRouter()
 # ─────────── request bodies ───────────
 class CreateSubscriptionRequest(BaseModel):
     payment_token: str
-    plan: str  # "inbound_only" | "inbound_outbound"
+    plan: str  # "inbound_only" | "inbound_outbound" | "apex"
     minutes: int  # prepaid voice-minute bundle (flat-by-bracket), charged as a one-time addon
+    # Legal acceptance recorded server-side for a defensible consent audit. Required
+    # for APEX (its only terms gate is the payment step); optional/ignored for other
+    # plans, which stamp terms via their own onboarding flow.
+    terms_accepted: bool = False
+    terms_version: str | None = None
+    privacy_version: str | None = None
 
 
 # Upper bound on a single purchase — a sanity cap so a fat-fingered / malicious
@@ -349,6 +355,21 @@ async def create_subscription(payload: CreateSubscriptionRequest, db: AsyncSessi
     if org is None:
         raise HTTPException(status_code=404, detail="Organization not found")
 
+    # APEX: legal acceptance is MANDATORY and recorded server-side, so a
+    # subscription can never be created for APEX without a stamped, versioned
+    # consent — even if the client-side gate is bypassed. Committed together with
+    # the Subscription row below.
+    if payload.plan == "apex":
+        if not payload.terms_accepted:
+            raise HTTPException(
+                status_code=400,
+                detail="You must accept the Terms & Conditions and Privacy Policy to continue.",
+            )
+        org.terms_accepted_at = datetime.now(timezone.utc)
+        org.terms_version = (
+            f"terms={(payload.terms_version or '?')};privacy={(payload.privacy_version or '?')}"
+        )[:64]
+
     spec = PLAN_CATALOG[payload.plan]
     minutes = _validate_minutes(payload.minutes)
     minutes_paise = cost_paise(minutes)
@@ -514,6 +535,32 @@ async def razorpay_webhook(request: Request, db: AsyncSession = Depends(deps.get
             # Provision in the background so we return 200 fast (Razorpay retries
             # on slow/failed deliveries; our activation is idempotent).
             asyncio.create_task(_bg_activate(sub.organization_id))
+    elif event_type in {"subscription.cancelled", "subscription.completed", "subscription.halted"} and razorpay_subscription_id:
+        # The subscription has truly ENDED: a cancel-at-cycle-end reached its cycle
+        # end (the operative event for our perpetual plans), a fixed-term ran its
+        # course (`completed` — a harmless safety net that likely never fires here),
+        # or repeated payment failure `halted` it. Mark it cancelled and SUSPEND
+        # service so a cancelled account can't keep using paid voice features.
+        # Idempotent. NOTE: the activation branch above never clears
+        # cancel_at_period_end / un-cancels, so a renewal webhook racing a manual
+        # cancel converges safely rather than resurrecting a cancelling sub.
+        sub = (
+            await db.execute(
+                select(Subscription).where(Subscription.razorpay_subscription_id == razorpay_subscription_id)
+            )
+        ).scalars().first()
+        if sub is not None:
+            sub.status = "cancelled"
+            sub.cancel_at_period_end = False  # no longer merely "scheduled" — it's over
+            sub.raw_event = event
+            org = await db.get(Organization, sub.organization_id)
+            if org is not None:
+                org.calling_enabled = False  # shared kill for the voice path
+            await db.commit()
+            logger.info(
+                "RAZORPAY: subscription %s ended (%s) — service suspended for org %s",
+                razorpay_subscription_id, event_type, sub.organization_id,
+            )
     return {"ok": True}
 
 
@@ -574,6 +621,16 @@ async def payment_status(payment_token: str, db: AsyncSession = Depends(deps.get
 def _topup_admin_dep():
     return deps.RequireNokvoOneOrganization(
         allowed_statuses=["active", "onboarding"], allowed_roles=["admin"]
+    )
+
+
+def _subscription_admin_dep():
+    # Subscription management is shared by BOTH products (Nokvo One + NOKVO APEX),
+    # org-scoped so an admin only ever touches their own org's subscription.
+    return deps.RequireNokvoOneOrganization(
+        allowed_statuses=["active", "onboarding"],
+        allowed_roles=["admin"],
+        allowed_product_tiers=["nokvo_one", "nokvo_apex"],
     )
 
 
@@ -815,3 +872,96 @@ async def apex_topup_verify(
         "credited_minutes": credited_minutes(selected),
         **summary,
     }
+
+
+# ─────────── cancel subscription ───────────
+class CancelSubscriptionResponse(BaseModel):
+    status: str
+    cancel_at_period_end: bool
+    current_period_end: str | None
+    message: str
+
+
+def _unix_to_dt(ts) -> datetime | None:
+    try:
+        ts = int(ts)
+    except (TypeError, ValueError):
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc) if ts > 0 else None
+
+
+@router.post("/payments/cancel-subscription", response_model=CancelSubscriptionResponse)
+async def cancel_subscription_endpoint(
+    user: OrganizationUser = Depends(_subscription_admin_dep()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Cancel the org's Razorpay subscription AT CYCLE END: service continues
+    until ``current_period_end`` (the month already paid), then billing stops —
+    they're never charged again. Idempotent: a second call returns the already-
+    scheduled state without re-hitting Razorpay. Reactivation = re-subscribe."""
+    # Latest subscription for this org, preferring an active one. Row-locked so a
+    # renewal webhook can't interleave with the cancel (see the webhook race note).
+    row = (
+        await db.execute(
+            select(Subscription)
+            .where(Subscription.organization_id == user.organization_id)
+            .order_by(
+                (Subscription.status == "active").desc(),
+                Subscription.created_at.desc(),
+            )
+            .with_for_update()
+            .limit(1)
+        )
+    ).scalars().first()
+    if row is None or row.status not in ("active", "created"):
+        raise HTTPException(status_code=409, detail="No active subscription to cancel.")
+
+    def _resp(msg: str) -> CancelSubscriptionResponse:
+        return CancelSubscriptionResponse(
+            status=row.status,
+            cancel_at_period_end=row.cancel_at_period_end,
+            current_period_end=row.current_period_end.isoformat() if row.current_period_end else None,
+            message=msg,
+        )
+
+    # Already scheduled / ended → idempotent no-op (don't re-hit Razorpay).
+    if row.cancel_at_period_end or row.status == "cancelled":
+        return _resp("Cancellation is already scheduled — you won't be charged again.")
+
+    # An active sub cancels at cycle end (keep the paid month); an unpaid `created`
+    # sub was never charged, so cancel it immediately.
+    at_cycle_end = row.status == "active"
+    try:
+        remote = await RazorpayService.cancel_subscription(
+            row.razorpay_subscription_id, cancel_at_cycle_end=at_cycle_end
+        )
+    except RazorpayError as exc:
+        msg = str(exc).lower()
+        if "(400)" in msg and ("cancel" in msg or "already" in msg):
+            remote = {}  # already cancelled on Razorpay's side → converge local state
+        else:
+            logger.warning("RAZORPAY: cancel failed for sub %s: %r", row.razorpay_subscription_id, exc)
+            raise HTTPException(
+                status_code=502,
+                detail="Could not cancel the subscription with the payment provider. Please try again.",
+            ) from exc
+
+    row.cancel_at_period_end = True
+    period_end = _unix_to_dt(remote.get("current_end") or remote.get("end_at"))
+    if period_end is not None:
+        row.current_period_end = period_end
+    if str(remote.get("status") or "").lower() == "cancelled":
+        # Immediate cancellation (unpaid `created` sub) — it's over now; suspend.
+        row.status = "cancelled"
+        row.cancel_at_period_end = False
+        org = await db.get(Organization, row.organization_id)
+        if org is not None:
+            org.calling_enabled = False
+    if remote:
+        row.raw_event = remote
+    await db.commit()
+
+    if row.status == "cancelled":
+        return _resp("Your subscription has been cancelled.")
+    end_txt = row.current_period_end.date().isoformat() if row.current_period_end else "the end of your current billing cycle"
+    return _resp(f"Subscription will end on {end_txt}; you won't be charged again.")

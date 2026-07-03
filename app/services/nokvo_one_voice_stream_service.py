@@ -609,6 +609,25 @@ def _voicemail_message(
     )
 
 
+def _no_response_goodbye_text(language: str | None) -> str:
+    """One short line spoken when a picked-up caller has gone silent through a
+    nudge and we're about to hang up. Native script for hi/te (Sarvam TTS
+    pronunciation), English fallback. Frames it as "not a good time" + a callback,
+    NOT disinterest."""
+    lang = (language or "en")[:2]
+    if lang == "hi":
+        return (
+            "लगता है अभी सही समय नहीं है — हम आपको बाद में दोबारा कॉल करेंगे। "
+            "धन्यवाद!"
+        )
+    if lang == "te":
+        return (
+            "ఇప్పుడు సరైన సమయం కాదు అనిపిస్తోంది — మేము మిమ్మల్ని తర్వాత మళ్ళీ కాల్ చేస్తాం. "
+            "ధన్యవాదాలు!"
+        )
+    return "Seems like now isn't a good time — I'll try you again later. Goodbye!"
+
+
 def _site_visit_confirm_text(language: str | None, when: str = "") -> str:
     """Deterministic, per-language confirmation for the moment a caller agrees
     to a site visit and gives a date/time. Replaces free-generated Telugu/Hindi
@@ -2624,6 +2643,59 @@ class NokvoOneVoiceStreamService:
             pass
 
     @staticmethod
+    async def _end_call_no_response(
+        websocket: WebSocket,
+        tenant_res: TenantResources,
+        *,
+        language: str,
+        call_id: str | None,
+        campaign_context: dict[str, Any] | None = None,
+        arbiter: TurnArbiter | None = None,
+        turn_state: dict[str, Any] | None = None,
+    ) -> None:
+        """Picked-up caller went silent through a nudge: speak ONE short goodbye,
+        then hang up. Closing the media WS ends the Plivo ``<Stream>`` and drops
+        the call; the ``call.hangup`` status webhook closes the contact out as
+        usual. Mirrors :meth:`_leave_voicemail_and_end`. Never raises — a TTS
+        hiccup must still let us hang up."""
+        line = _no_response_goodbye_text(language)
+        # Mark speaking so a racing check-in can't barge our final line.
+        if turn_state is not None:
+            turn_state["speaking"] = True
+        if arbiter is not None:
+            arbiter.mark_speaking()
+        turn_id = str(uuid.uuid4())[:8]
+        try:
+            await websocket.send_json(
+                {
+                    "type": "agent_sentence",
+                    "turn_id": turn_id,
+                    "sentence": line,
+                    "tone": "warm",
+                    "cache_hit": False,
+                    "source": "no_response_end",
+                }
+            )
+            await SarvamVoiceService.stream_sentence_tts(
+                websocket, tenant_res, line, language=language, purpose="answer"
+            )
+        except Exception:
+            logger.debug("NOKVO-VOICE: no-response goodbye TTS failed", exc_info=True)
+        # Leave a clear marker so the post-call note reflects a silent abandon
+        # (caller answered but never engaged) rather than a stated disinterest.
+        with contextlib.suppress(Exception):
+            await AgentSessionStore.append_turn(
+                tenant_res, call_id, "(no response — caller silent)", line
+            )
+        logger.info(
+            "NOKVO-VOICE: no caller response after nudge call=%s — ending call", call_id
+        )
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+    @staticmethod
     async def _speak_outro_and_end(
         websocket: WebSocket,
         tenant_res: TenantResources,
@@ -3027,7 +3099,25 @@ class NokvoOneVoiceStreamService:
                     return
                 state = await AgentSessionStore.get_state(tenant_res, call_id) or {}
                 nudge_count = int(state.get("proactive_silence_nudges") or 0)
+                # Escalation ladder: nudge ONCE, then CUT. The caller answered but
+                # stayed silent through the nudge → speak a brief goodbye and hang
+                # up rather than holding the line (and slot) open indefinitely.
                 if nudge_count >= 1:
+                    if campaign_context is not None and campaign_context.get("_no_response_ended"):
+                        return  # already cut (one-shot)
+                    if campaign_context is not None:
+                        campaign_context["_no_response_ended"] = True
+                    if proactive_watchdog is not None:
+                        proactive_watchdog.cancel()
+                    await NokvoOneVoiceStreamService._end_call_no_response(
+                        websocket,
+                        tenant_res,
+                        language=session_locked_language[0] or language,
+                        call_id=call_id,
+                        campaign_context=campaign_context,
+                        arbiter=robustness.arbiter,
+                        turn_state=turn_state,
+                    )
                     return
                 await AgentSessionStore.merge_state(
                     tenant_res,

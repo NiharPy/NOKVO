@@ -162,6 +162,23 @@ class RazorpayService:
     async def fetch_subscription(subscription_id: str) -> dict[str, Any]:
         return await RazorpayService._request("GET", f"subscriptions/{subscription_id}")
 
+    @staticmethod
+    async def cancel_subscription(
+        subscription_id: str, *, cancel_at_cycle_end: bool = True
+    ) -> dict[str, Any]:
+        """Cancel a Razorpay subscription.
+
+        ``cancel_at_cycle_end=True`` (default) lets the current PAID billing cycle
+        run out and then stops — the customer keeps service for the month already
+        paid and is never charged again. ``False`` cancels immediately (used for an
+        unpaid ``created`` subscription that was never charged). Returns the updated
+        subscription entity (its ``status`` / ``current_end`` / ``end_at``)."""
+        return await RazorpayService._request(
+            "POST",
+            f"subscriptions/{subscription_id}/cancel",
+            json_body={"cancel_at_cycle_end": 1 if cancel_at_cycle_end else 0},
+        )
+
     # ── signature verification ────────────────────────────────────────────────
     @staticmethod
     def verify_checkout_signature(payment_id: str, subscription_id: str, signature: str) -> bool:

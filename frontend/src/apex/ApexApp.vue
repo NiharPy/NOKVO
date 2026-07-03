@@ -52,6 +52,7 @@ import ApexAvailableLeads from './views/ApexAvailableLeads.vue';
 import ApexMyLeads from './views/ApexMyLeads.vue';
 import ApexMembers from './views/ApexMembers.vue';
 import nokvoMark from '../assets/nokvo-logo.png';  // the real NOKVO mark (header logo)
+import { APEX_TERMS_OF_SERVICE_HTML, APEX_PRIVACY_POLICY_HTML, APEX_LEGAL_VERSIONS } from '../content/apexLegalDocs.js';
 import './apex-theme.css';
 
 const props = defineProps({ initialAuthState: { type: String, default: 'login' } });
@@ -61,6 +62,12 @@ const route = useRoute();
 const screen = ref('login'); // login | signup | mfa | app
 const tab = ref('campaign'); // campaign | qualified | notint | didnt | logs
 const busy = ref(false);
+// Mandatory legal acceptance at the (pre-charge) payment step — every new org
+// must tick before it can be billed. `legalModal` shows the doc inline (v-html).
+const termsAccepted = ref(false);
+const legalModal = ref(null); // 'terms' | 'privacy' | null
+const APEX_TERMS_HTML = APEX_TERMS_OF_SERVICE_HTML;
+const APEX_PRIVACY_HTML = APEX_PRIVACY_POLICY_HTML;
 const errorMsg = ref('');
 
 // ── auth ──
@@ -450,12 +457,21 @@ function retryGoogle() {
 // ── payment ──
 async function startPayment() {
   errorMsg.value = '';
+  // Hard gate: no payment without accepting the Terms & Privacy Policy.
+  if (!termsAccepted.value) {
+    errorMsg.value = 'Please read and accept the Terms & Conditions and Privacy Policy to continue.';
+    return;
+  }
   const minutes = Math.floor(Number(payMinutes.value) || 0);
   if (minutes < 100) { errorMsg.value = 'Enter at least 100 minutes.'; return; }
   busy.value = true;
   try {
     const Rzp = await loadRazorpay();
-    const data = await createSubscription(paymentToken.value, minutes);
+    const data = await createSubscription(paymentToken.value, minutes, {
+      termsAccepted: termsAccepted.value,
+      termsVersion: APEX_LEGAL_VERSIONS.terms,
+      privacyVersion: APEX_LEGAL_VERSIONS.privacy,
+    });
     const rzp = new Rzp({
       key: data.key_id,
       subscription_id: data.subscription_id,
@@ -775,8 +791,16 @@ watch(screen, async (s) => {
           <div class="ax-pay-row"><span>{{ fmtMin(payMinutes) }} minutes (one-time)</span><span>{{ fmtINR(payBill) }}</span></div>
           <div class="ax-pay-row ax-pay-row--total"><span>Pay now</span><span>{{ fmtINR(PLATFORM_FEE + payBill) }}</span></div>
         </div>
+        <label class="ax-terms">
+          <input type="checkbox" v-model="termsAccepted" class="ax-terms-box" />
+          <span>I have read and agree to the
+            <span class="ax-link" @click.stop.prevent="legalModal = 'terms'">Terms &amp; Conditions</span>
+            and
+            <span class="ax-link" @click.stop.prevent="legalModal = 'privacy'">Privacy Policy</span>,
+            including that all fees are non-refundable.</span>
+        </label>
         <p v-if="errorMsg" class="ax-error ax-error--center">{{ errorMsg }}</p>
-        <button type="button" class="ax-btn ax-btn--accent ax-btn--full" :disabled="busy" @click="startPayment">
+        <button type="button" class="ax-btn ax-btn--accent ax-btn--full" :disabled="busy || !termsAccepted" @click="startPayment">
           {{ busy ? 'Opening checkout…' : `Pay ${fmtINR(PLATFORM_FEE + payBill)}` }}
         </button>
         <div class="ax-back"><span class="ax-link" @click="backToLogin">← Back to sign in / sign up</span></div>
@@ -974,6 +998,18 @@ watch(screen, async (s) => {
         <component :is="activeTab.is" />
       </main>
     </div>
+
+    <!-- ============ LEGAL DOC MODAL ============ -->
+    <div v-if="legalModal" class="ax-legal-overlay" @click.self="legalModal = null">
+      <div class="ax-legal-modal">
+        <button type="button" class="ax-legal-close" aria-label="Close" @click="legalModal = null">×</button>
+        <div class="ax-legal-body" v-html="legalModal === 'terms' ? APEX_TERMS_HTML : APEX_PRIVACY_HTML"></div>
+        <div class="ax-legal-actions">
+          <button type="button" class="ax-btn ax-btn--ghost" @click="legalModal = null">Close</button>
+          <button type="button" class="ax-btn ax-btn--accent" @click="termsAccepted = true; legalModal = null">I agree</button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -1031,6 +1067,25 @@ watch(screen, async (s) => {
 /* Feedback modal */
 .ax-modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.62); display: flex; align-items: center; justify-content: center; z-index: 1000; padding: 20px; }
 .ax-modal { background: #121214; border: 1px solid rgba(255,255,255,0.12); border-radius: 14px; padding: 26px; width: 100%; max-width: 460px; box-shadow: 0 24px 60px rgba(0,0,0,0.5); }
+
+/* Mandatory legal acceptance (payment step) */
+.ax-terms { display: flex; align-items: flex-start; gap: 10px; margin-top: 22px; font-size: 12.5px; line-height: 1.55; color: rgba(255,255,255,0.6); cursor: pointer; }
+.ax-terms-box { margin-top: 2px; width: 16px; height: 16px; accent-color: #E62630; cursor: pointer; flex: 0 0 auto; }
+/* Legal doc modal */
+.ax-legal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.7); display: flex; align-items: center; justify-content: center; z-index: 1100; padding: 20px; }
+.ax-legal-modal { position: relative; background: #121214; border: 1px solid rgba(255,255,255,0.12); border-radius: 14px; width: 100%; max-width: 720px; max-height: 84vh; display: flex; flex-direction: column; box-shadow: 0 24px 60px rgba(0,0,0,0.5); }
+.ax-legal-close { position: absolute; top: 12px; right: 14px; background: none; border: none; color: rgba(255,255,255,0.5); font-size: 22px; line-height: 1; cursor: pointer; }
+.ax-legal-body { overflow-y: auto; padding: 30px 30px 10px; color: rgba(255,255,255,0.78); font-size: 13px; line-height: 1.6; }
+.ax-legal-actions { display: flex; justify-content: flex-end; gap: 10px; padding: 14px 24px; border-top: 1px solid rgba(255,255,255,0.08); }
+.ax-legal-actions .ax-btn { margin-top: 0; width: auto; }
+.ax-legal-body :deep(h3) { font-family: 'Sora', sans-serif; font-size: 18px; color: #F3F2F0; margin: 0 0 4px; }
+.ax-legal-body :deep(h4) { font-family: 'Sora', sans-serif; font-size: 14px; color: #F3F2F0; margin: 20px 0 6px; }
+.ax-legal-body :deep(.legal-meta) { font-size: 11.5px; color: rgba(255,255,255,0.4); margin: 0 0 14px; }
+.ax-legal-body :deep(p) { margin: 0 0 10px; }
+.ax-legal-body :deep(ul) { margin: 0 0 10px; padding-left: 20px; }
+.ax-legal-body :deep(li) { margin: 0 0 5px; }
+.ax-legal-body :deep(a) { color: #E88; text-decoration: underline; }
+.ax-legal-body :deep(strong) { color: rgba(255,255,255,0.92); }
 .ax-modal-title { font-family: 'Sora', sans-serif; font-size: 22px; font-weight: 600; margin: 4px 0 16px; color: #F3F2F0; }
 .ax-fb-cats { display: flex; gap: 8px; margin: 0 0 12px; }
 .ax-fb-cat { flex: 1; padding: 9px 12px; font-size: 13px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.14); background: transparent; color: rgba(255,255,255,0.6); cursor: pointer; }
