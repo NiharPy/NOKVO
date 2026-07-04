@@ -19,6 +19,7 @@ import json
 import logging
 import sys
 import uuid
+from datetime import datetime
 
 import asyncpg
 
@@ -48,6 +49,17 @@ def _row_status(ct: dict) -> str:
     return st or "pending"
 
 
+def _dt(v):
+    """Parse an ISO-8601 string (blob stores timestamps as strings) to a datetime,
+    or pass through an existing datetime; None on anything unparseable."""
+    if v is None or isinstance(v, datetime):
+        return v
+    try:
+        return datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
 def _to_row(campaign_id, ct: dict) -> tuple:
     result = {k: ct[k] for k in _RESULT_KEYS if ct.get(k) is not None}
     claimed_by = ct.get("claimed_by")
@@ -67,7 +79,7 @@ def _to_row(campaign_id, ct: dict) -> tuple:
         str(ct.get("call_link_id") or uuid.uuid4()),
         bool(ct.get("qualified")) if ct.get("qualified") is not None else False,
         int(ct["lead_score"]) if isinstance(ct.get("lead_score"), (int, float)) else None,
-        ct.get("answered_at"), dur, claimed_by, ct.get("claimed_at"),
+        _dt(ct.get("answered_at")), dur, claimed_by, _dt(ct.get("claimed_at")),
         json.dumps(result),
     )
 
