@@ -9,6 +9,7 @@ from app.models.audit import SuperAdminAuditLog
 from app.schemas.user import LoginRequest, TOTPVerifyRequest
 from app.schemas.token import Token, RefreshRequest
 from app.core import security
+from app.core.config import settings
 from app.core.rate_limit import limiter
 from app.core.totp_crypto import (
     TOTPDecryptionError,
@@ -95,6 +96,7 @@ async def login(request: Request, login_data: LoginRequest, db: AsyncSession = D
             subject=user.id,
             mfa_completed=True,
             session_id=str(session.id),
+            expires_delta=timedelta(minutes=settings.SUPERADMIN_ACCESS_TOKEN_EXPIRE_MINUTES),
             extra_claims={"principal_type": "superadmin", "role": user.role},
             token_tier=security.JWT_TIER_SUPERADMIN,
         )
@@ -157,6 +159,7 @@ async def verify_totp(request: Request, data: TOTPVerifyRequest, current_user: S
         subject=current_user.id,
         mfa_completed=True,
         session_id=str(session.id),
+        expires_delta=timedelta(minutes=settings.SUPERADMIN_ACCESS_TOKEN_EXPIRE_MINUTES),
         extra_claims={"principal_type": "superadmin", "role": current_user.role},
         token_tier=security.JWT_TIER_SUPERADMIN,
     )
@@ -210,6 +213,7 @@ async def refresh_token(request: Request, data: RefreshRequest, db: AsyncSession
         subject=session.superadmin_id,
         mfa_completed=True,
         session_id=str(new_session.id),
+        expires_delta=timedelta(minutes=settings.SUPERADMIN_ACCESS_TOKEN_EXPIRE_MINUTES),
         extra_claims={"principal_type": "superadmin", "role": user.role if user else None},
         token_tier=security.JWT_TIER_SUPERADMIN,
     )

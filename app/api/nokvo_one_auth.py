@@ -209,11 +209,19 @@ async def _issue_full_session(
     await db.commit()
     await db.refresh(user)
 
+    product = security.org_product_claim(organization.product_tier)
     access_token = security.create_access_token(
         subject=user.id,
         mfa_completed=mfa_completed,
         session_id=str(session.id),
         token_tier=security.JWT_TIER_ORGANIZATION,
+        # APEX has no silent-refresh in the frontend, so the access token's
+        # lifetime IS the login duration — give it the 30-minute window.
+        expires_delta=(
+            timedelta(minutes=settings.APEX_ACCESS_TOKEN_EXPIRE_MINUTES)
+            if product == "apex"
+            else None
+        ),
         extra_claims={
             "principal_type": "organization_user",
             "organization_id": str(organization.id),
@@ -223,7 +231,7 @@ async def _issue_full_session(
             # (product_tier="nokvo_apex") get product="apex"; everything else
             # "nokvo_one". The deps reject a token whose product ≠ the endpoint's
             # product, so APEX and Nokvo One sessions can't cross over.
-            "product": security.org_product_claim(organization.product_tier),
+            "product": product,
         },
     )
     return NokvoOneSessionResponse(

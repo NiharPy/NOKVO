@@ -34,6 +34,11 @@ class Settings(BaseSettings):
     JWT_LEGACY_SECRET_FALLBACK: bool = False
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
+    # APEX + SuperAdmin console sessions live 30 minutes. Neither frontend silently
+    # refreshes (APEX stores no refresh token; the console stores one but logs out
+    # on any 401), so the access-token lifetime IS the login duration there.
+    APEX_ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    SUPERADMIN_ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     REFRESH_TOKEN_EXPIRE_HOURS: int = 4
 
     # Nokvo One TOTP encryption (Fernet key; if unset, derived from SECRET_KEY).
