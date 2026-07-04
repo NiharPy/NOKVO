@@ -289,6 +289,7 @@ const isPaying = ref(false);
 // in sync. Onboarding charges the platform fee + this bundle in one payment.
 const PREPAID_SLABS = [[1000, 10], [5000, 9.5], [10000, 9], [20000, 8.5], [25000, 8], [null, 5.5]];
 const MINUTES_MIN = 100;
+const MINUTES_MAX = 100000; // per-purchase cap — mirrors the server's _MINUTES_MAX
 const PLATFORM_FEE = { inbound_only: 4499, inbound_outbound: 6499 };
 const prepaidMinutes = ref(1000);
 function flatRateForMinutes(n) {
@@ -296,7 +297,10 @@ function flatRateForMinutes(n) {
   for (const [upper, rate] of PREPAID_SLABS) if (upper === null || v <= upper) return rate;
   return 5.5;
 }
-const minutesValid = computed(() => Math.floor(Number(prepaidMinutes.value) || 0) >= MINUTES_MIN);
+const minutesValid = computed(() => {
+  const m = Math.floor(Number(prepaidMinutes.value) || 0);
+  return m >= MINUTES_MIN && m <= MINUTES_MAX;
+});
 const minutesCost = computed(() => {
   const n = Math.max(0, Math.floor(Number(prepaidMinutes.value) || 0));
   return n * flatRateForMinutes(n);
@@ -3439,6 +3443,10 @@ const startPayment = async (plan) => {
     errorMsg.value = `Enter at least ${MINUTES_MIN} prepaid minutes.`;
     return;
   }
+  if (minutes > MINUTES_MAX) {
+    errorMsg.value = `Maximum ${MINUTES_MAX.toLocaleString('en-IN')} minutes per purchase.`;
+    return;
+  }
   isPaying.value = true;
   try {
     await loadRazorpayCheckout();
@@ -3509,6 +3517,7 @@ const startTopup = async (minutes) => {
   topupNote.value = '';
   const n = Math.floor(Number(minutes) || 0);
   if (n < MINUTES_MIN) { topupNote.value = `Enter at least ${MINUTES_MIN} minutes.`; return; }
+  if (n > MINUTES_MAX) { topupNote.value = `Maximum ${MINUTES_MAX.toLocaleString('en-IN')} minutes per purchase.`; return; }
   isToppingUp.value = true;
   try {
     await loadRazorpayCheckout();
@@ -7391,12 +7400,13 @@ provideDashboardState({
                 v-model.number="prepaidMinutes"
                 type="number"
                 :min="MINUTES_MIN"
+                :max="MINUTES_MAX"
                 step="100"
                 class="pay-minutes__input"
                 inputmode="numeric"
               />
             </label>
-            <p v-if="!minutesValid" class="pay-minutes__warn">Minimum {{ MINUTES_MIN }} minutes.</p>
+            <p v-if="!minutesValid" class="pay-minutes__warn">{{ MINUTES_MIN }} – {{ MINUTES_MAX.toLocaleString('en-IN') }} minutes per purchase.</p>
             <div v-else class="pay-minutes__calc">
               <span>{{ Number(prepaidMinutes).toLocaleString('en-IN') }} min × {{ fmtINR(flatRateForMinutes(prepaidMinutes)) }}/min</span>
               <strong>{{ fmtINR(minutesCost) }}</strong>

@@ -250,4 +250,10 @@ async def record_call_cost(
     if row is None:
         # ON CONFLICT path — already recorded. Treat as success.
         return None
+    if prepaid_rupees > 0:
+        # This call depleted the prepaid balance — drop the cached gate sums so
+        # the very next dial refill sees it (matters at the zero boundary).
+        from app.services.minute_balance_service import invalidate_balance_cache
+
+        await invalidate_balance_cache(org_uuid)
     return CallCost(**dict(row._mapping))

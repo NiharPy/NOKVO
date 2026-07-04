@@ -27,6 +27,7 @@ const {
 // ── Prepaid voice minutes (flat-by-bracket; mirrors minute_pricing.py) ──────
 const PREPAID_SLABS = [[1000, 10], [5000, 9.5], [10000, 9], [20000, 8.5], [25000, 8], [null, 5.5]];
 const MINUTES_MIN = 100;
+const MINUTES_MAX = 100000; // per-purchase cap — mirrors the server's _MINUTES_MAX
 const topupMinutes = ref(1000);
 function topupRate(n) {
   const v = Math.max(0, Math.floor(Number(n) || 0));
@@ -37,7 +38,10 @@ const topupCost = computed(() => {
   const n = Math.max(0, Math.floor(Number(topupMinutes.value) || 0));
   return n * topupRate(n);
 });
-const topupValid = computed(() => Math.floor(Number(topupMinutes.value) || 0) >= MINUTES_MIN);
+const topupValid = computed(() => {
+  const m = Math.floor(Number(topupMinutes.value) || 0);
+  return m >= MINUTES_MIN && m <= MINUTES_MAX;
+});
 function fmtINR(n) { return '₹' + Math.round(Number(n) || 0).toLocaleString('en-IN'); }
 function fmtMin(n) { return (Number(n) || 0).toLocaleString('en-IN'); }
 
@@ -163,11 +167,11 @@ const sections = computed(() => [
         <div class="adv__minutes-topup">
           <label class="adv__minutes-field">
             <span>Top up</span>
-            <input v-model.number="topupMinutes" type="number" :min="MINUTES_MIN" step="100" class="adv__minutes-input" inputmode="numeric" />
+            <input v-model.number="topupMinutes" type="number" :min="MINUTES_MIN" :max="MINUTES_MAX" step="100" class="adv__minutes-input" inputmode="numeric" />
             <span class="adv__minutes-unit">min</span>
           </label>
           <span v-if="topupValid" class="adv__minutes-cost">{{ fmtMin(topupMinutes) }} × {{ fmtINR(topupRate(topupMinutes)) }} = <strong>{{ fmtINR(topupCost) }}</strong></span>
-          <span v-else class="adv__minutes-cost is-warn">Min {{ MINUTES_MIN }} minutes</span>
+          <span v-else class="adv__minutes-cost is-warn">{{ MINUTES_MIN }} – {{ MINUTES_MAX.toLocaleString('en-IN') }} minutes</span>
           <button
             type="button"
             class="n-btn n-btn--brand n-btn--sm"

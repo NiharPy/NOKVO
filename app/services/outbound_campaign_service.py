@@ -821,6 +821,37 @@ class OutboundCampaignService:
     # ------------------------------------------------------------------
 
     @staticmethod
+    async def _assert_no_other_active_campaign(
+        db: AsyncSession, tenant_id: str, *, exclude_id: uuid.UUID | None = None
+    ) -> None:
+        """ONE campaign per tenant at a time. Raises ValueError (→ 4xx at the API)
+        when another of the tenant's campaigns is running or ingesting.
+
+        Serialized by a tenant-scoped advisory lock taken in the CALLER's
+        transaction: the lock is held until the caller's status-flipping commit,
+        so two simultaneous launches can't both pass the check — the second
+        blocks here, then sees the first's committed active status. Relaunching /
+        resuming / appending to the SAME campaign passes ``exclude_id``."""
+        await db.execute(
+            _sql_text("SELECT pg_advisory_xact_lock(hashtext(:k))"),
+            {"k": f"campaign-slot:{tenant_id}"},
+        )
+        conditions = [
+            OutboundCampaign.tenant_id == tenant_id,
+            OutboundCampaign.status.in_((CampaignStatus.running, CampaignStatus.ingesting)),
+        ]
+        if exclude_id is not None:
+            conditions.append(OutboundCampaign.id != exclude_id)
+        name = (
+            await db.execute(select(OutboundCampaign.name).where(*conditions).limit(1))
+        ).scalar_one_or_none()
+        if name is not None:
+            raise ValueError(
+                f"'{name}' is still running. Only one campaign can run at a time — "
+                "wait for it to finish or cancel it before starting another."
+            )
+
+    @staticmethod
     async def launch_campaign(
         campaign: OutboundCampaign,
         db: AsyncSession,
@@ -831,6 +862,9 @@ class OutboundCampaignService:
     ) -> OutboundCampaign:
         if campaign.status == CampaignStatus.cancelled:
             raise ValueError("This campaign was cancelled — create a new one to call leads.")
+        await OutboundCampaignService._assert_no_other_active_campaign(
+            db, campaign.tenant_id, exclude_id=campaign.id
+        )
         # Relaunch: a running/completed campaign can be launched again to dial the
         # leads added since (only the undialed contacts get called — see below).
         is_relaunch = campaign.status in (CampaignStatus.running, CampaignStatus.completed)
@@ -941,6 +975,7 @@ class OutboundCampaignService:
                 "Bulk calling isn't enabled for this account yet. It unlocks once "
                 "the team provisions your dedicated calling number."
             )
+        await OutboundCampaignService._assert_no_other_active_campaign(db, tenant_res.tenant_id)
         cfg = build_agent_config(**dict(agent_config or {}))
         cfg["bulk_csv"] = True
         # Bulk campaigns never auto-call a lead back: a CSV list is dialed once,
@@ -1068,6 +1103,9 @@ class OutboundCampaignService:
                 "Bulk calling isn't enabled for this account. It unlocks once the "
                 "team provisions your dedicated calling number."
             )
+        await OutboundCampaignService._assert_no_other_active_campaign(
+            db, campaign.tenant_id, exclude_id=campaign.id
+        )
         caller_id = PlivoService.bulk_calling_caller_id(tenant_res)
         if not caller_id or not PlivoService.bulk_calling_auth(tenant_res):
             raise ValueError(
@@ -1347,6 +1385,11 @@ class OutboundCampaignService:
                 "Adding contacts to this campaign isn't supported. Create a new bulk "
                 "campaign with the combined list."
             )
+        # Appending resumes THIS campaign to running, so it too must respect the
+        # tenant's single active slot (another campaign mid-flight → 409).
+        await OutboundCampaignService._assert_no_other_active_campaign(
+            db, tenant_res.tenant_id, exclude_id=campaign.id
+        )
         task = asyncio.create_task(
             OutboundCampaignService._ingest_and_dial_v2(
                 campaign.id, raw, filename, tenant_res.tenant_id,
@@ -1557,6 +1600,22 @@ class OutboundCampaignService:
             logger.info("NOKVO-CAMPAIGN: Nokvo One outbound disabled — not dialing %s", campaign.id)
             return
 
+        # Scheduled-dialer window — NOKVO APEX only (the scheduled-outbound product).
+        # An APEX campaign with a call_window dials only inside 09:00–19:00 IST on its
+        # allowed weekdays; outside → pause (return) and the wake-tick poller resumes
+        # it when the window reopens. (The per-day cap is enforced under the row lock
+        # below.) Nokvo One campaigns — even deterministic ones that carry a
+        # call_window for the capacity readout — are NOT schedule-gated.
+        # Checked BEFORE the balance gate: this is pure computation, so a paused
+        # campaign's every-10-min tick (all night, all weekend) costs nothing —
+        # the balance gate's ledger reads only run when we might actually dial.
+        _apex_scheduled = _org_tier == "nokvo_apex" and bool(_cfg.get("call_window"))
+        if _apex_scheduled:
+            _allowed, _reason = call_window_allows(_cfg.get("call_window"), _ist_now())
+            if not _allowed:
+                logger.info("NOKVO-CAMPAIGN: %s paused (%s) — outside call window", campaign.id, _reason)
+                return
+
         # Prepaid-balance gate (product-aware). Stop placing NEW calls once the
         # org's balance is empty (mid-campaign exhaustion); in-flight calls finish.
         #   • NOKVO APEX (product_tier=nokvo_apex): deterministic IS the product —
@@ -1586,19 +1645,6 @@ class OutboundCampaignService:
                     return
             except Exception:
                 logger.exception("NOKVO-CAMPAIGN: prepaid-balance gate check failed")
-
-        # Scheduled-dialer window — NOKVO APEX only (the scheduled-outbound product).
-        # An APEX campaign with a call_window dials only inside 09:00–19:00 IST on its
-        # allowed weekdays; outside → pause (return) and the wake-tick poller resumes
-        # it when the window reopens. (The per-day cap is enforced under the row lock
-        # below.) Nokvo One campaigns — even deterministic ones that carry a
-        # call_window for the capacity readout — are NOT schedule-gated.
-        _apex_scheduled = _org_tier == "nokvo_apex" and bool(_cfg.get("call_window"))
-        if _apex_scheduled:
-            _allowed, _reason = call_window_allows(_cfg.get("call_window"), _ist_now())
-            if not _allowed:
-                logger.info("NOKVO-CAMPAIGN: %s paused (%s) — outside call window", campaign.id, _reason)
-                return
 
         # ── V2 scale path: advisory-locked indexed claim (no blob, no whole-row
         # lock, network I/O OUTSIDE the lock). All the gates above (kill switch,
@@ -1751,6 +1797,9 @@ class OutboundCampaignService:
 
         claimed = await v2.claim_pending(campaign.id, cap, max_rows=max_rows)
         if not claimed:
+            # Nothing left to claim and nothing live → the list is drained; flip
+            # to completed so the tenant's single campaign slot frees up.
+            await v2.maybe_complete(db, campaign.id)
             return
 
         # Phase 2 — dial-time DND scrub (only the claimed batch), then place. NO lock.
@@ -1798,6 +1847,10 @@ class OutboundCampaignService:
                 await db.commit()
             except Exception:
                 logger.exception("NOKVO-DIAL-V2: counter update failed for %s", campaign.id)
+        else:
+            # Every claimed row was DND-dropped or failed at placement — those are
+            # terminal with no webhook coming, so run the drain check here.
+            await v2.maybe_complete(db, campaign.id)
 
     @staticmethod
     async def _handle_call_status_v2(
@@ -1844,6 +1897,9 @@ class OutboundCampaignService:
             if final in ("failed", "no_answer"):
                 await v2.bump_campaign_counter(db, campaign.id, "failed_count")
             await db.commit()
+            # Last call in the list just ended → completed (frees the tenant's
+            # single campaign slot). No-op while anything is pending or live.
+            await v2.maybe_complete(db, campaign.id)
 
     @staticmethod
     async def dial_next_pending(

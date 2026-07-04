@@ -165,8 +165,12 @@ const topupOk = ref(false);  // true = success note (green), false = error note 
 // Top-up quick-picks + a live cost/credit preview (mirrors the payment screen's
 // breakdown) so the user sees what they get AND what they'll pay before checkout.
 const TOPUP_PRESETS = [500, 1000, 2500, 5000];
+const MINUTES_MAX = 100000; // per-purchase cap — mirrors the server's _MINUTES_MAX
 const fmtKMin = (m) => (m >= 1000 ? `${(m / 1000).toFixed(m % 1000 ? 1 : 0)}K` : `${m}`);
-const topupValid = computed(() => Math.floor(Number(topupMinutes.value) || 0) >= 100);
+const topupValid = computed(() => {
+  const m = Math.floor(Number(topupMinutes.value) || 0);
+  return m >= 100 && m <= MINUTES_MAX;
+});
 const topupBill = computed(() => billFor(topupMinutes.value));            // ₹ charged now
 const topupCredits = computed(() => apexCreditFor(topupMinutes.value));   // Call Credits granted
 const topupCreditedMin = computed(() => creditedFor(topupMinutes.value)); // ≈ minutes incl. 50% bonus
@@ -314,6 +318,7 @@ async function startTopup() {
   topupNote.value = '';
   const minutes = Math.floor(Number(topupMinutes.value) || 0);
   if (minutes < 100) { setTopupNote('Enter at least 100 minutes.', false); return; }
+  if (minutes > MINUTES_MAX) { setTopupNote(`Maximum ${MINUTES_MAX.toLocaleString('en-IN')} minutes per purchase.`, false); return; }
   isToppingUp.value = true;
   try {
     const Rzp = await loadRazorpay();
@@ -488,6 +493,7 @@ async function startPayment() {
   }
   const minutes = Math.floor(Number(payMinutes.value) || 0);
   if (minutes < 100) { errorMsg.value = 'Enter at least 100 minutes.'; return; }
+  if (minutes > MINUTES_MAX) { errorMsg.value = `Maximum ${MINUTES_MAX.toLocaleString('en-IN')} minutes per purchase.`; return; }
   busy.value = true;
   try {
     const Rzp = await loadRazorpay();
@@ -814,7 +820,7 @@ watch(screen, async (s) => {
           <div class="ax-pay-price">{{ fmtINR(PLATFORM_FEE) }}<small>/mo</small></div>
         </div>
         <label class="ax-label" style="margin-top:22px;">Prepaid voice minutes</label>
-        <input v-model.number="payMinutes" type="number" min="100" step="100" class="ax-input" inputmode="numeric" />
+        <input v-model.number="payMinutes" type="number" min="100" :max="MINUTES_MAX" step="100" class="ax-input" inputmode="numeric" />
         <div class="ax-pay-credit">You're credited <strong>{{ fmtCredits(payCredits) }}</strong> Call Credits — that's {{ fmtMin(payMinutes) }} min + 50% bonus (≈{{ fmtMin(payCredited) }} min), at {{ fmtINR(slabRate(payMinutes)) }}/min.</div>
         <div class="ax-pay-summary">
           <div class="ax-pay-row"><span>Platform fee</span><span>{{ fmtINR(PLATFORM_FEE) }}/mo</span></div>
@@ -990,7 +996,7 @@ watch(screen, async (s) => {
             <div class="ax-topup">
               <div class="ax-topup-label">Add minutes</div>
               <div class="ax-topup-field">
-                <input v-model.number="topupMinutes" type="number" min="100" step="100" class="ax-topup-input" inputmode="numeric" aria-label="Minutes to add" />
+                <input v-model.number="topupMinutes" type="number" min="100" :max="MINUTES_MAX" step="100" class="ax-topup-input" inputmode="numeric" aria-label="Minutes to add" />
                 <span class="ax-topup-unit">min</span>
               </div>
               <div class="ax-topup-chips">
@@ -1009,7 +1015,7 @@ watch(screen, async (s) => {
                 {{ isToppingUp ? 'Opening checkout…' : `Top up · pay ${fmtINR(topupBill)}` }}
               </button>
               <div v-if="topupNote" class="ax-topup-note" :class="topupOk ? 'is-ok' : 'is-err'">{{ topupNote }}</div>
-              <div v-else-if="!topupValid" class="ax-topup-hint">Minimum 100 minutes.</div>
+              <div v-else-if="!topupValid" class="ax-topup-hint">100 – {{ MINUTES_MAX.toLocaleString('en-IN') }} minutes per purchase.</div>
             </div>
           </div>
         </div>

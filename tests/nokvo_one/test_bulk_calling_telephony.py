@@ -14,6 +14,20 @@ import pytest
 from app.services.plivo_service import PlivoError, PlivoService
 
 
+def _stub_single_campaign_guard(monkeypatch):
+    """These are DB-less service units — skip the one-campaign-per-tenant guard
+    (it needs a real session for its advisory lock + status query; it has its
+    own tests in test_single_active_campaign.py)."""
+    from app.services.outbound_campaign_service import OutboundCampaignService
+
+    async def _no_guard(db, tenant_id, *, exclude_id=None):
+        return None
+
+    monkeypatch.setattr(
+        OutboundCampaignService, "_assert_no_other_active_campaign", staticmethod(_no_guard)
+    )
+
+
 def test_normalize_number_strips_formatting():
     assert PlivoService.normalize_number("+91 22 6423 2977") == "912264232977"
     assert PlivoService.normalize_number("918031321315") == "918031321315"
@@ -84,6 +98,7 @@ async def test_rerun_redials_unreached_but_not_answered_leads(monkeypatch):
     from app.models.outbound_campaign import CampaignStatus, OutboundCampaign
     from app.services.outbound_campaign_service import OutboundCampaignService
 
+    _stub_single_campaign_guard(monkeypatch)
     monkeypatch.setattr(PlivoService, "bulk_calling_enabled", staticmethod(lambda tr: True))
     monkeypatch.setattr(PlivoService, "bulk_calling_caller_id", staticmethod(lambda tr: "912264232977"))
     monkeypatch.setattr(PlivoService, "bulk_calling_auth", staticmethod(lambda tr: ("SAid", "tok")))
@@ -136,6 +151,7 @@ async def test_rerun_noop_when_everyone_reached(monkeypatch):
     from app.models.outbound_campaign import CampaignStatus, OutboundCampaign
     from app.services.outbound_campaign_service import OutboundCampaignService
 
+    _stub_single_campaign_guard(monkeypatch)
     monkeypatch.setattr(PlivoService, "bulk_calling_enabled", staticmethod(lambda tr: True))
     monkeypatch.setattr(PlivoService, "bulk_calling_caller_id", staticmethod(lambda tr: "912264232977"))
     monkeypatch.setattr(PlivoService, "bulk_calling_auth", staticmethod(lambda tr: ("SAid", "tok")))
@@ -157,6 +173,7 @@ async def test_rerun_noop_when_everyone_reached(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_rerun_canonicalizes_and_dedupes_old_raw_contacts(monkeypatch):
+    _stub_single_campaign_guard(monkeypatch)
     """Re-running a campaign created before canonicalization must fix the stored raw
     numbers: a bare 10-digit mobile (Plivo 403s these as a foreign region) gets 91
     prepended, and the same person listed bare AND as +91 collapses to one dial —

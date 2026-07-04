@@ -64,9 +64,9 @@ class CreateSubscriptionRequest(BaseModel):
     privacy_version: str | None = None
 
 
-# Upper bound on a single purchase — a sanity cap so a fat-fingered / malicious
-# request can't create an absurd order. 10,000,000 minutes ≈ ₹55L at the top rate.
-_MINUTES_MAX = 10_000_000
+# Upper bound on a single purchase — a fat-fingered / malicious request can't
+# create an absurd order. 100,000 minutes ≈ ₹5.5L at the top rate.
+_MINUTES_MAX = 100_000
 
 
 def _validate_minutes(minutes: int) -> int:
@@ -136,6 +136,12 @@ async def _record_minute_purchase(
         # first. UNIQUE(razorpay_payment_id) guarantees no double-credit, so the
         # loser just rolls back and treats the bundle as already credited.
         await db.rollback()
+        return
+    # New rupees landed — drop the cached gate sums so a just-topped-up org can
+    # dial immediately instead of waiting out the cache TTL.
+    from app.services.minute_balance_service import invalidate_balance_cache
+
+    await invalidate_balance_cache(organization_id)
 
 
 class VerifyPaymentRequest(BaseModel):
@@ -659,6 +665,7 @@ async def minutes_balance_endpoint(
     return {
         **summary,
         "minutes_min": MINUTES_MIN,
+        "minutes_max": _MINUTES_MAX,
         "slabs": [
             {
                 "from_minute": s["from_minute"],
@@ -785,6 +792,7 @@ async def apex_minutes_balance_endpoint(
     return {
         **summary,
         "minutes_min": MINUTES_MIN,
+        "minutes_max": _MINUTES_MAX,
         "bonus_pct": 50,
         "slabs": [
             {"from_minute": s["from_minute"], "to_minute": s["to_minute"], "rupees_per_minute": str(s["rupees_per_minute"])}

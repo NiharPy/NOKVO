@@ -17,6 +17,8 @@ teardown — no separate decrement path.
 """
 from __future__ import annotations
 
+import json
+import logging
 import uuid
 from decimal import Decimal
 
@@ -25,6 +27,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.call_cost import CallCost
 from app.models.minute_purchase import MinutePurchase
+
+logger = logging.getLogger(__name__)
 
 
 async def purchased_rupees(db: AsyncSession, organization_id: uuid.UUID) -> Decimal:
@@ -51,11 +55,64 @@ async def balance_rupees(db: AsyncSession, organization_id: uuid.UUID) -> Decima
     return (await purchased_rupees(db, organization_id)) - (await consumed_rupees(db, organization_id))
 
 
+# The gate runs on EVERY dial refill (each ended call re-triggers the dialer) and
+# on every campaign-ticker pass, and the two SUMs it needs scan the org's whole
+# call_costs history — linear in lifetime calls. Cache the (purchased, consumed)
+# pair per org for a few seconds so the steady-state gate is one Redis GET; the
+# write paths (call-cost recorded, bundle purchased) invalidate so a just-emptied
+# or just-topped-up balance is seen immediately. Staleness within the TTL only
+# lets a call or two through at the zero boundary — the same tolerance the ledger
+# already has ("balance can read slightly negative"). Best-effort: any Redis
+# hiccup falls back to the direct SUMs.
+_GATE_CACHE_TTL_S = 30
+
+
+def _gate_cache_key(organization_id: uuid.UUID) -> str:
+    return f"mbal:sums:{organization_id}"
+
+
+async def invalidate_balance_cache(organization_id: uuid.UUID) -> None:
+    """Drop the cached gate sums for an org. Called after a CallCost that depletes
+    the balance is written and after a minute-bundle purchase is credited."""
+    try:
+        from app.services.agent_session_store import AgentSessionStore
+
+        await AgentSessionStore.client().delete(_gate_cache_key(organization_id))
+    except Exception:
+        logger.debug("NOKVO-BALANCE: cache invalidation failed (best-effort)", exc_info=True)
+
+
+async def _gate_sums(db: AsyncSession, organization_id: uuid.UUID) -> tuple[Decimal, Decimal]:
+    """(purchased, consumed) for the call-start gate, Redis-cached."""
+    key = _gate_cache_key(organization_id)
+    try:
+        from app.services.agent_session_store import AgentSessionStore
+
+        cached = await AgentSessionStore.client().get(key)
+        if cached:
+            data = json.loads(cached)
+            return Decimal(data["p"]), Decimal(data["c"])
+    except Exception:
+        pass
+    purchased = await purchased_rupees(db, organization_id)
+    consumed = await consumed_rupees(db, organization_id)
+    try:
+        from app.services.agent_session_store import AgentSessionStore
+
+        await AgentSessionStore.client().setex(
+            key, _GATE_CACHE_TTL_S, json.dumps({"p": str(purchased), "c": str(consumed)})
+        )
+    except Exception:
+        pass
+    return purchased, consumed
+
+
 async def has_balance(
     db: AsyncSession, organization_id: uuid.UUID, *, grandfather: bool = True
 ) -> bool:
     """The call-start gate (inbound + non-deterministic outbound). True when the
-    org may place a call.
+    org may place a call. Reads through the short-TTL gate cache (see above) so
+    the per-call hot path never re-aggregates the org's full call history.
 
     GRANDFATHER / fail-open (``grandfather=True``, the default): an org that has
     NEVER bought a bundle (``purchased == 0``) is NOT gated — keeps every
@@ -66,10 +123,9 @@ async def has_balance(
     Pass ``grandfather=False`` for NOKVO APEX: it's a new, prepaid-only product with
     no legacy orgs to protect, so a zero balance MUST block — otherwise a comped /
     bypassed / credit-lost org (``purchased == 0``) would dial free and unmetered."""
-    purchased = await purchased_rupees(db, organization_id)
+    purchased, consumed = await _gate_sums(db, organization_id)
     if purchased <= 0:
         return grandfather
-    consumed = await consumed_rupees(db, organization_id)
     return (purchased - consumed) > 0
 
 

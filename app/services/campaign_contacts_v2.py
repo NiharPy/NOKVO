@@ -177,6 +177,29 @@ async def update_status_by_link(db, call_link_id: str, status: str, **fields: An
     return (res.rowcount or 0) > 0
 
 
+async def maybe_complete(db, campaign_id: uuid.UUID) -> bool:
+    """Flip a drained V2 campaign ``running`` → ``completed``: no rows left
+    pending and none on a live line. One indexed count + a status-guarded UPDATE
+    (never touches cancelled/ingesting), so it's cheap and idempotent. Without
+    this a finished V2 campaign stayed ``running`` forever — which also held the
+    tenant's one-campaign-at-a-time slot. An append (add-contacts) resumes a
+    completed campaign back to ``running`` after its ingest."""
+    remaining = (await db.execute(
+        text("SELECT count(*) FROM outbound_campaign_contacts "
+             "WHERE campaign_id = :c AND status = ANY(:s)"),
+        {"c": str(campaign_id), "s": ["pending", *_LIVE_STATUSES]},
+    )).scalar_one()
+    if int(remaining) > 0:
+        return False
+    res = await db.execute(
+        text("UPDATE outbound_campaigns SET status = 'completed', completed_at = now() "
+             "WHERE id = :c AND status = 'running'"),
+        {"c": str(campaign_id)},
+    )
+    await db.commit()
+    return (res.rowcount or 0) > 0
+
+
 async def bump_campaign_counter(db, campaign_id: uuid.UUID, field: str, n: int = 1) -> None:
     """Atomic counter increment (answered_count / failed_count / contacts_dialed)."""
     if field not in ("answered_count", "failed_count", "contacts_dialed", "total_count"):
