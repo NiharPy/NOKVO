@@ -16,13 +16,13 @@
  */
 
 export const APEX_LEGAL_VERSIONS = {
-  terms: '2026-07-03',
-  privacy: '2026-07-03',
+  terms: '2026-07-04',
+  privacy: '2026-07-04',
 };
 
 export const APEX_TERMS_OF_SERVICE_HTML = `
 <h3>NOKVO APEX — Terms &amp; Conditions</h3>
-<p class="legal-meta">Last Updated: July 3, 2026</p>
+<p class="legal-meta">Last Updated: July 4, 2026</p>
 
 <p>These Terms &amp; Conditions ("Terms") govern your access to and use of NOKVO APEX ("APEX," the "Service"), an automated outbound AI voice-calling and lead-qualification platform provided by NEEDLES COUTURE AND COLLECTIVE PRIVATE LIMITED ("Nokvo," "we," "us," or "our").</p>
 <p>By creating an APEX account, making payment, or otherwise accessing or using the Service, you ("Customer," "you," or "your") agree to be bound by these Terms. If you are accepting on behalf of a business, you represent that you are authorised to bind that business. If you do not agree, do not use the Service.</p>
@@ -31,6 +31,7 @@ export const APEX_TERMS_OF_SERVICE_HTML = `
 <p><strong>1.1 What APEX does.</strong> APEX places automated outbound telephone calls on your behalf to contact lists you provide, speaks with the person using an AI voice agent, asks a fixed questionnaire you configure, scores and qualifies the response, and records the call and its transcript so you can review, claim, and follow up on leads.</p>
 <p><strong>1.2 Licence.</strong> Subject to these Terms and payment of applicable fees, we grant you a limited, non-exclusive, non-transferable, revocable right to use the Service for your internal business purposes.</p>
 <p><strong>1.3 Changes to the Service.</strong> We may modify, update, or discontinue features at any time and will give reasonable notice of any material change to core functionality.</p>
+<p><strong>1.4 Operational limits.</strong> To protect call quality, carrier relationships, and telecom compliance, the Service enforces operational limits. These include: <strong>one calling campaign per account runs at a time</strong> — a new campaign can be started once the current campaign completes or you cancel it; dialling is restricted to the 9:00 AM–7:00 PM IST window on your configured working days; and any per-day call caps you configure are applied to placements. We may adjust operational limits from time to time and will give reasonable notice of material changes.</p>
 
 <h4>2. Eligibility, Account &amp; Members</h4>
 <p><strong>2.1 Business use only.</strong> APEX is offered strictly for lawful business use by persons aged 18 or over. You must provide accurate registration and business verification (KYC) information and keep it current.</p>
@@ -51,9 +52,10 @@ export const APEX_TERMS_OF_SERVICE_HTML = `
 
 <h4>5. Fees, Subscription &amp; Call Credits</h4>
 <p><strong>5.1 Subscription.</strong> APEX is offered on a recurring monthly subscription of ₹6,499 per month (plus applicable taxes), billed automatically to your payment method through our payment processor (Razorpay) on each billing cycle until cancelled.</p>
-<p><strong>5.2 Call Credits (prepaid).</strong> Outbound calling consumes prepaid Call Credits from your APEX wallet. Credits are purchased in advance (at onboarding and via top-ups) at the applicable slab rate, where one credit is valued at ₹1. Every connected call deducts credits at the then-current selling rate; calls that are not answered/connected are not charged. Credits have no cash value, are not a deposit, are non-transferable, and are consumed on a first-purchased-first-used basis.</p>
+<p><strong>5.2 Call Credits (prepaid).</strong> Outbound calling consumes prepaid Call Credits from your APEX wallet. Credits are purchased in advance (at onboarding and via top-ups) at the applicable slab rate, where one credit is valued at ₹1. Every connected call deducts credits at the then-current selling rate; calls that are not answered/connected are not charged. Credits have no cash value, are not a deposit, are non-transferable, and are consumed on a first-purchased-first-used basis. Each purchase (onboarding or top-up) is subject to a per-transaction limit — currently a minimum of 100 minutes and a maximum of 100,000 minutes' worth of credits per purchase — which we may adjust from time to time.</p>
 <p><strong>5.3 Authorisation to charge.</strong> By providing a payment method you authorise us and our payment processor to charge the subscription fee each cycle and any top-ups you initiate. Taxes are your responsibility except taxes on Nokvo's net income.</p>
 <p><strong>5.4 Non-payment.</strong> If a subscription payment fails, or if your Call Credit balance is exhausted, we may suspend calling and other paid functions until payment succeeds or credits are topped up.</p>
+<p><strong>5.5 Balance timing.</strong> Your Call Credit balance is checked when each call is placed. Calls already in progress — or placed in the brief interval before an exhausted balance is registered — are allowed to complete and are charged in full, which may take your balance marginally below zero. You remain responsible for that usage; any negative amount is recovered from your next top-up.</p>
 
 <h4>6. No Refunds</h4>
 <p><strong>6.1 All fees are non-refundable.</strong> ALL PAYMENTS TO NOKVO FOR APEX — INCLUDING MONTHLY SUBSCRIPTION FEES, PREPAID CALL CREDITS, AND TOP-UPS — ARE FINAL AND NON-REFUNDABLE, IN WHOLE OR IN PART, EXCEPT WHERE A REFUND IS REQUIRED BY APPLICABLE LAW.</p>
@@ -96,7 +98,7 @@ export const APEX_TERMS_OF_SERVICE_HTML = `
 
 export const APEX_PRIVACY_POLICY_HTML = `
 <h3>NOKVO APEX — Privacy Policy</h3>
-<p class="legal-meta">Last Updated: July 3, 2026</p>
+<p class="legal-meta">Last Updated: July 4, 2026</p>
 
 <p>This Privacy Policy explains how NEEDLES COUTURE AND COLLECTIVE PRIVATE LIMITED ("Nokvo," "we," "us") collects, uses, and protects information in connection with NOKVO APEX ("APEX"), our automated outbound AI voice-calling and lead-qualification service. It distinguishes between data we collect about our direct business customers (Account Data) and data we process on our customers' behalf about the people they call (Customer Data).</p>
 
@@ -153,6 +155,7 @@ export const APEX_PRIVACY_POLICY_HTML = `
 <ul>
   <li><strong>Transcripts &amp; recordings:</strong> retained on a rolling basis (call transcripts are automatically deleted after approximately 30 days), subject to your settings and our legal obligations.</li>
   <li><strong>In-call memory:</strong> live conversational state is held only for the call and a short window after it, then discarded.</li>
+  <li><strong>Operational caches:</strong> transient service lookups (such as the wallet-balance figures used to gate dialling) are held in short-lived caches that expire automatically within seconds and are not separately retained.</li>
   <li><strong>Lead &amp; account records:</strong> retained while your account is active and as needed for billing, audit, and legal compliance.</li>
 </ul>
 

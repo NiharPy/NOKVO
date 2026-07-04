@@ -9,13 +9,13 @@
  */
 
 export const LEGAL_VERSIONS = {
-  terms: '2026-06-20',
-  privacy: '2026-06-20',
+  terms: '2026-07-04',
+  privacy: '2026-07-04',
 };
 
 export const TERMS_OF_SERVICE_HTML = `
 <h3>Nokvo Terms of Service</h3>
-<p class="legal-meta">Last Updated: June 20, 2026</p>
+<p class="legal-meta">Last Updated: July 4, 2026</p>
 
 <p>Welcome to Nokvo! These Terms of Service ("Terms") govern your access to and use of the Nokvo One platform, website, APIs, and related services (collectively, the "Services") provided by NEEDLES COUTURE AND COLLECTIVE PRIVATE LIMITED ("Nokvo," "we," "us," or "our").</p>
 
@@ -60,8 +60,9 @@ export const TERMS_OF_SERVICE_HTML = `
 
 <h4>6. Fees and Payment</h4>
 <p><strong>6.1 Subscription and Usage Fees.</strong> The Services are billed on a subscription basis and/or a usage-based model (e.g., per-minute of voice processing, telephony costs, LLM tokens), as set out in your selected plan or applicable Order Form.</p>
-<p><strong>6.2 Invoicing and Payment.</strong> You agree to provide a valid payment method. By providing payment information, you authorize Nokvo to automatically charge all applicable fees. If your payment fails, we may suspend your access to the Services until payment is successfully processed.</p>
-<p><strong>6.3 Taxes.</strong> Fees are exclusive of all taxes, levies, or duties imposed by taxing authorities. You are responsible for payment of all such taxes (excluding taxes based on Nokvo's net income).</p>
+<p><strong>6.2 Prepaid Voice Minutes.</strong> Voice minutes are purchased in advance as prepaid bundles (at onboarding or via top-ups) at the applicable bracket rate, and eligible calls consume the resulting prepaid balance. Each bundle purchase is subject to a per-transaction limit — currently a minimum of 100 and a maximum of 100,000 minutes per purchase — which we may adjust from time to time. Prepaid balances have no cash value, are non-transferable, and are consumed on a first-purchased-first-used basis. The balance is checked when a call starts; calls already in progress when the balance is exhausted are allowed to complete and are charged in full, which may take the balance marginally below zero — such usage remains payable and is recovered from your next purchase.</p>
+<p><strong>6.3 Invoicing and Payment.</strong> You agree to provide a valid payment method. By providing payment information, you authorize Nokvo to automatically charge all applicable fees. If your payment fails, we may suspend your access to the Services until payment is successfully processed.</p>
+<p><strong>6.4 Taxes.</strong> Fees are exclusive of all taxes, levies, or duties imposed by taxing authorities. You are responsible for payment of all such taxes (excluding taxes based on Nokvo's net income).</p>
 
 <h4>7. Intellectual Property</h4>
 <p><strong>7.1 Nokvo Ownership.</strong> Nokvo and its licensors retain all rights, title, and interest in and to the Services, including all software, algorithms, user interfaces, branding, and underlying technology.</p>
@@ -113,7 +114,7 @@ export const TERMS_OF_SERVICE_HTML = `
 
 export const PRIVACY_POLICY_HTML = `
 <h3>Nokvo Privacy Policy</h3>
-<p class="legal-meta">Last Updated: June 20, 2026</p>
+<p class="legal-meta">Last Updated: July 4, 2026</p>
 
 <p>Welcome to Nokvo ("we," "our," or "us"). We provide Nokvo One, an enterprise-grade AI voice agent platform designed to automate and enhance business communications.</p>
 <p>This Privacy Policy explains how we collect, use, disclose, and safeguard your information when you visit our website, use our application, or interact with our services. As a B2B Software-as-a-Service (SaaS) provider, it is critical to distinguish between data we collect for our own purposes (Account Data) and data we process on behalf of our business customers (Customer Data).</p>
@@ -180,6 +181,7 @@ export const PRIVACY_POLICY_HTML = `
 <ul>
   <li><strong>Agent Memory:</strong> High-fidelity, temporary conversational state is held in active memory only for the duration of the session (TTL of 10 minutes post-call). Extracted conversational summaries and transcripts are persisted according to the customer's configured retention settings.</li>
   <li><strong>Account Data:</strong> Retained for as long as your account is active, or as needed to comply with legal and billing obligations.</li>
+  <li><strong>Operational Caches:</strong> Transient service lookups (such as the prepaid-balance figures used to gate calling) are held in short-lived caches that expire automatically within seconds and are not separately retained.</li>
 </ul>
 
 <h4>11. Data Security and Incident Notification</h4>

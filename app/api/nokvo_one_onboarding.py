@@ -38,7 +38,7 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 # Version stamped on the org when the user accepts the legal docs.
-TERMS_VERSION = "2026-06-20"
+TERMS_VERSION = "2026-07-04"
 
 _STEP_ORDER = ["business_details", "documents", "working_hours", "projects", "agent", "terms", "done"]
 # NOKVO APEX onboarding is just the two KYC screens (business details + docs),
