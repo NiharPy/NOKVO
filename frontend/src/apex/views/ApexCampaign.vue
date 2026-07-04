@@ -138,6 +138,34 @@ async function remove(id, name) {
     deleting.value = null;
   }
 }
+
+// Add a new CSV to an existing campaign, then resume dialing the new numbers.
+const addFileInput = ref(null);
+const addTarget = ref(null);   // campaign id the picked file will be added to
+const addingTo = ref(null);
+function pickAddCsv(id) {
+  if (addingTo.value) return;
+  addTarget.value = id;
+  addFileInput.value && addFileInput.value.click();
+}
+async function onAddFile(e) {
+  const file = e.target.files && e.target.files[0];
+  e.target.value = ''; // allow re-picking the same file
+  const id = addTarget.value;
+  if (!file || !id) return;
+  addingTo.value = id;
+  errorMsg.value = ''; notice.value = '';
+  try {
+    await apex.addCampaignContacts(id, file);
+    notice.value = 'Adding contacts… new numbers will start dialing shortly.';
+    setTimeout(() => apex.reload(), 3000);
+  } catch (err) {
+    errorMsg.value = apex.extractError(err, 'Could not add contacts.');
+  } finally {
+    addingTo.value = null;
+    addTarget.value = null;
+  }
+}
 </script>
 
 <template>
@@ -286,12 +314,17 @@ async function remove(id, name) {
           <button v-if="redialCount(c) > 0" type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" :disabled="rerunning === c.id" @click="rerun(c.id)">
             ↻ {{ rerunning === c.id ? 'Re-running…' : `Re-run (${redialCount(c)})` }}
           </button>
+          <button type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" :disabled="addingTo === c.id || c.status === 'ingesting'" @click="pickAddCsv(c.id)" title="Add a CSV of new numbers and resume dialing">
+            {{ addingTo === c.id ? 'Adding…' : '＋ Add CSV' }}
+          </button>
           <button type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm ax-camp-del" :disabled="deleting === c.id" @click="remove(c.id, c.name)" title="Delete campaign">
             {{ deleting === c.id ? 'Deleting…' : '🗑 Delete' }}
           </button>
         </div>
       </div>
     </div>
+    <!-- shared hidden picker for "Add CSV" (one per list; target set on click) -->
+    <input ref="addFileInput" type="file" accept=".csv,.xlsx" style="display:none" @change="onAddFile" />
   </div>
 </template>
 

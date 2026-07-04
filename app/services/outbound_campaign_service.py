@@ -1258,24 +1258,40 @@ class OutboundCampaignService:
         tenant_id: str,
         base: str,
         prefix: str,
+        append: bool = False,
     ) -> None:
-        """Background: COPY-ingest the file into per-row storage, flip the campaign
-        to ``running``, and kick the dialer. Its own DB session; never raises."""
+        """Background: COPY-ingest the file into per-row storage, set the campaign
+        ``running``, and kick the dialer. ``append=True`` ADDS to an existing
+        campaign (new numbers only — ON CONFLICT dedupe): ``total_count`` is
+        incremented (not overwritten) and the campaign is resumed to ``running``.
+        Its own DB session; never raises."""
         from app.db.session import AsyncSessionLocal
         from app.services import campaign_contacts_v2 as v2
 
         try:
             inserted = await v2.ingest_rows(campaign_id, _iter_parsed_contacts(filename, raw))
             async with AsyncSessionLocal() as db:
-                await db.execute(
-                    _sql_text(
-                        "UPDATE outbound_campaigns SET total_count = :n, status = "
-                        "CASE WHEN :n > 0 THEN 'running' ELSE 'completed' END WHERE id = :c"
-                    ),
-                    {"n": inserted, "c": str(campaign_id)},
-                )
+                if append:
+                    # Add to the running total + resume dialing the new pending rows.
+                    await db.execute(
+                        _sql_text(
+                            "UPDATE outbound_campaigns SET total_count = total_count + :n, "
+                            "status = CASE WHEN status = 'cancelled' THEN status ELSE 'running' END "
+                            "WHERE id = :c"
+                        ),
+                        {"n": inserted, "c": str(campaign_id)},
+                    )
+                else:
+                    await db.execute(
+                        _sql_text(
+                            "UPDATE outbound_campaigns SET total_count = :n, status = "
+                            "CASE WHEN :n > 0 THEN 'running' ELSE 'completed' END WHERE id = :c"
+                        ),
+                        {"n": inserted, "c": str(campaign_id)},
+                    )
                 await db.commit()
-            logger.info("NOKVO-INGEST-V2: campaign %s ingested %d contacts", campaign_id, inserted)
+            logger.info("NOKVO-INGEST-V2: campaign %s %s %d contacts",
+                        campaign_id, "appended" if append else "ingested", inserted)
         except Exception:
             logger.exception("NOKVO-INGEST-V2: ingestion failed for campaign %s", campaign_id)
             try:
@@ -1307,6 +1323,38 @@ class OutboundCampaignService:
                     )
         except Exception:
             logger.exception("NOKVO-INGEST-V2: initial dial kick failed for %s (ingest OK)", campaign_id)
+
+    @staticmethod
+    async def add_contacts_to_campaign(
+        campaign: OutboundCampaign,
+        db: AsyncSession,
+        *,
+        raw: bytes,
+        filename: str | None,
+        tenant_res: TenantResources,
+        public_base_url: str,
+        path_prefix: str = "/api/nokvo-one/agents",
+    ) -> None:
+        """Add a new CSV/XLSX of contacts to an EXISTING bulk campaign and resume
+        dialing. New numbers only — ``unique(campaign_id, phone)`` + ON CONFLICT
+        dedupe means re-uploading numbers already on the list is a harmless no-op.
+        V2 only (the per-row store); returns immediately, ingest runs in the
+        background."""
+        if campaign.status == CampaignStatus.cancelled:
+            raise ValueError("This campaign was cancelled — create a new one instead.")
+        if not settings.CAMPAIGN_CONTACTS_V2 or campaign.contacts is not None:
+            raise ValueError(
+                "Adding contacts to this campaign isn't supported. Create a new bulk "
+                "campaign with the combined list."
+            )
+        task = asyncio.create_task(
+            OutboundCampaignService._ingest_and_dial_v2(
+                campaign.id, raw, filename, tenant_res.tenant_id,
+                public_base_url.rstrip("/"), path_prefix.rstrip("/"), append=True,
+            )
+        )
+        _ingest_tasks.add(task)
+        task.add_done_callback(_ingest_tasks.discard)
 
     # ---- throttled dialer (place up to the cap, refill as calls end) ----------
     @staticmethod

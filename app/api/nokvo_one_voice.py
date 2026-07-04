@@ -2320,6 +2320,39 @@ async def rerun_bulk_calling_campaign(
     return _campaign_response(campaign)
 
 
+@router.post("/bulk-calling/campaigns/{campaign_id}/add-contacts")
+async def add_bulk_calling_contacts(
+    campaign_id: uuid.UUID,
+    request: Request,
+    contacts_file: UploadFile = File(...),
+    user: OrganizationUser = Depends(_bulk_admin_dep()),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Add a new CSV/XLSX of contacts to an EXISTING bulk campaign and resume
+    dialing. Only genuinely-new numbers are added (dedupe on phone); the ingest
+    runs in the background, so this returns immediately."""
+    from app.services.plivo_service import PlivoService
+    from app.services.public_url import public_base_url as _pub
+
+    await _require_outbound_enabled(db, user)
+    tr = await _tenant_for_user(db, user)
+    if not PlivoService.bulk_calling_enabled(tr):
+        raise HTTPException(status_code=403, detail="Bulk calling isn't enabled for your account.")
+    campaign = await OutboundCampaignService.get_campaign(campaign_id, tr, db)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    raw = await contacts_file.read()
+    try:
+        await OutboundCampaignService.add_contacts_to_campaign(
+            campaign, db, raw=raw, filename=contacts_file.filename, tenant_res=tr,
+            public_base_url=_pub(request), path_prefix="/api/nokvo-one/agents",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=_safe_detail(exc)) from exc
+    return {"ok": True, "campaign_id": str(campaign.id), "status": "adding"}
+
+
 @router.get("/campaigns")
 async def list_campaigns(
     user: OrganizationUser = Depends(_bulk_viewer_dep()),

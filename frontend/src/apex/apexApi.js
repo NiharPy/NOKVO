@@ -160,6 +160,17 @@ export async function rerunCampaign(campaignId) {
   return data;
 }
 
+// Add a new CSV/XLSX to an existing campaign and resume dialing. Only new numbers
+// are added (deduped server-side); ingest runs in the background.
+export async function addCampaignContacts(campaignId, file) {
+  const fd = new FormData();
+  fd.append('contacts_file', file);
+  const { data } = await agentsApi.post(`/bulk-calling/campaigns/${campaignId}/add-contacts`, fd, {
+    headers: { ...authHeader(), 'Content-Type': 'multipart/form-data' },
+  });
+  return data;
+}
+
 // Hard-delete a campaign (org-scoped; APEX only ever deletes its own). Running
 // campaigns are protected server-side → 409, surfaced to the user.
 export async function deleteCampaign(campaignId) {
