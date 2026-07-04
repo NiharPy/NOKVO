@@ -14,6 +14,9 @@ import {
   createCampaign as apiCreateCampaign,
   rerunCampaign,
   deleteCampaign,
+  fetchCampaignSummary,
+  fetchCampaignContacts,
+  downloadCampaignContactsCsv,
   fetchTranscript,
   submitFeedback as apiSubmitFeedback,
   fetchConfig,
@@ -120,6 +123,11 @@ const isMember = computed(() => (user.value?.role || '') === 'member');
 const visibleTabs = computed(() => (isMember.value ? MEMBER_TABS : TABS));
 const activeTab = computed(() => visibleTabs.value.find((t) => t.id === tab.value) || visibleTabs.value[0]);
 
+// Per-campaign bucket-count summaries for V2 campaigns (whose rows aren't inlined).
+const campaignSummaries = ref({}); // campaign_id -> { total, qualified, not_interested, no_pickup, pending }
+function summaryFor(id) { return campaignSummaries.value[String(id)] || null; }
+
+let _ingestPoll = null;
 async function reload() {
   loadingCampaigns.value = true;
   try {
@@ -128,6 +136,21 @@ async function reload() {
     errorMsg.value = extractError(e, 'Could not load campaigns.');
   } finally {
     loadingCampaigns.value = false;
+  }
+  // V2 campaigns don't inline their contacts — pull the cheap GROUP BY summary so
+  // the campaign rows + tab badges show counts without shipping 1M rows.
+  try {
+    const v2 = (campaigns.value || []).filter((c) => c.v2 && c.status !== 'ingesting');
+    const results = await Promise.all(v2.map((c) => fetchCampaignSummary(c.id).then((s) => [c.id, s]).catch(() => null)));
+    const map = { ...campaignSummaries.value };
+    for (const r of results) { if (r) map[String(r[0])] = r[1]; }
+    campaignSummaries.value = map;
+  } catch { /* best-effort */ }
+  // While any campaign is still ingesting (async COPY of a large upload), poll so
+  // the UI flips to "running" + shows the count without a manual refresh.
+  if (_ingestPoll) { clearTimeout(_ingestPoll); _ingestPoll = null; }
+  if ((campaigns.value || []).some((c) => c.status === 'ingesting')) {
+    _ingestPoll = setTimeout(reload, 4000);
   }
 }
 
@@ -610,6 +633,11 @@ provide('apex', {
   createCampaign: apiCreateCampaign,
   rerunCampaign,
   deleteCampaign,
+  fetchCampaignSummary,
+  fetchCampaignContacts,
+  downloadCampaignContactsCsv,
+  campaignSummaries,
+  summaryFor,
   fetchTranscript,
   extractError,
   setTab: (id) => { tab.value = id; },

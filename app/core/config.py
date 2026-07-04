@@ -402,6 +402,17 @@ class Settings(BaseSettings):
     # places this many, then refills one-for-one as each call ends (driven by the
     # Plivo status webhook), so we never fire hundreds of simultaneous calls.
     OUTBOUND_DIAL_CONCURRENCY: int = 5
+    # Scalable per-row contact storage (outbound_campaign_contacts) instead of the
+    # O(n) JSONB blob on outbound_campaigns.contacts. When ON, bulk campaigns ingest
+    # via async COPY, dial via an advisory-locked indexed claim, and update contacts
+    # with O(1) single-row writes — the path that scales to 1M contacts.
+    # DEPLOY PREREQ: run `alembic upgrade head` AND
+    # `scripts/backfill_campaign_contacts.py` before this takes effect, else the V2
+    # queries hit missing columns / legacy blob campaigns read empty. Set False to
+    # roll back to the legacy blob path instantly (no data change).
+    CAMPAIGN_CONTACTS_V2: bool = True
+    # Rows COPY-inserted per chunk during async ingestion (bounded memory).
+    CAMPAIGN_INGEST_CHUNK: int = 10000
     # X-Plivo-Signature-V2 validation on the Plivo webhook endpoints.
     # off | warn | enforce. Default "enforce": reject forged/unsigned call
     # webhooks. Auto-off when PLIVO_AUTH_TOKEN is unset (so local dev without a

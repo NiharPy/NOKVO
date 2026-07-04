@@ -4388,31 +4388,63 @@ class NokvoOneVoiceStreamService:
                                         timezone.utc
                                     ).isoformat()
 
-                            # Write the verdict onto the contact under the campaign
-                            # FOR UPDATE lock — the only safe way to touch the
-                            # contacts JSON (races with the status webhook).
-                            async with AsyncSessionLocal() as _idb:
-                                _camp = await OutboundCampaignService._lock_campaign(
-                                    _idb, _bg_campaign_id
-                                )
-                                if _camp is None:
-                                    return
-                                _contacts = list(_camp.contacts or [])
-                                _changed = False
-                                for _ct in _contacts:
-                                    if str(_ct.get("call_link_id") or "") == _bg_call_link_id:
-                                        _ct.update(_stamp)
-                                        _changed = True
-                                        break
-                                if _changed:
-                                    _camp.contacts = _contacts
-                                    flag_modified(_camp, "contacts")
-                                    _idb.add(_camp)
-                                    await _idb.commit()
-                                    logger.info(
-                                        "NOKVO-OUTBOUND-INTEREST: %s for call %s",
-                                        _log, _bg_call_id,
+                            # V2: write the verdict to the contact ROW (O(1), no
+                            # blob lock). update_status_by_link touches only a V2
+                            # row, so it's a no-op (rowcount 0) for a legacy blob
+                            # campaign → we fall back to the blob write below.
+                            _wrote_v2 = False
+                            if settings.CAMPAIGN_CONTACTS_V2:
+                                try:
+                                    from app.services import campaign_contacts_v2 as _v2
+
+                                    _qual = bool(
+                                        _stamp.get("qualified")
+                                        if _bg_questions
+                                        else (_stamp.get("interest_outcome") == "interested")
                                     )
+                                    _score = _stamp.get("lead_score")
+                                    _result = {k: v for k, v in _stamp.items()
+                                               if k not in ("qualified", "lead_score")}
+                                    async with AsyncSessionLocal() as _rdb:
+                                        _wrote_v2 = await _v2.update_status_by_link(
+                                            _rdb, _bg_call_link_id, "completed",
+                                            qualified=_qual, lead_score=_score, result=_result,
+                                        )
+                                        if _wrote_v2:
+                                            await _rdb.commit()
+                                            logger.info(
+                                                "NOKVO-OUTBOUND-INTEREST: %s for call %s (v2 row)",
+                                                _log, _bg_call_id,
+                                            )
+                                except Exception:
+                                    logger.exception("NOKVO-OUTBOUND-INTEREST: v2 row write failed")
+
+                            # Legacy blob write (only when the V2 row wasn't the
+                            # target). Under the campaign FOR UPDATE lock — the only
+                            # safe way to touch the contacts JSON.
+                            if not _wrote_v2:
+                                async with AsyncSessionLocal() as _idb:
+                                    _camp = await OutboundCampaignService._lock_campaign(
+                                        _idb, _bg_campaign_id
+                                    )
+                                    if _camp is None:
+                                        return
+                                    _contacts = list(_camp.contacts or [])
+                                    _changed = False
+                                    for _ct in _contacts:
+                                        if str(_ct.get("call_link_id") or "") == _bg_call_link_id:
+                                            _ct.update(_stamp)
+                                            _changed = True
+                                            break
+                                    if _changed:
+                                        _camp.contacts = _contacts
+                                        flag_modified(_camp, "contacts")
+                                        _idb.add(_camp)
+                                        await _idb.commit()
+                                        logger.info(
+                                            "NOKVO-OUTBOUND-INTEREST: %s for call %s",
+                                            _log, _bg_call_id,
+                                        )
                         except Exception:
                             logger.exception("NOKVO-OUTBOUND-INTEREST: classify/persist failed")
 

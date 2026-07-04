@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
 import random
 import re
@@ -23,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 from fastapi import UploadFile
 from sqlalchemy import select
+from sqlalchemy import text as _sql_text
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -162,6 +164,40 @@ async def _scrub_dnd(contacts: list[dict[str, str]]) -> tuple[list[dict[str, str
     if dropped:
         logger.info("NOKVO-DND: removed %d DND number(s) from dial list", len(dropped))
     return kept, dropped
+
+
+# Retain fire-and-forget ingestion tasks so asyncio doesn't GC them mid-run.
+_ingest_tasks: set[asyncio.Task] = set()
+
+
+def _iter_parsed_contacts(filename: str | None, content: bytes):
+    """LAZILY yield canonicalized ``{phone, name}`` from an uploaded CSV/XLSX so a
+    1M-row file never fully materializes in RAM (the V2 ingestion path). CSV is
+    streamed via ``csv.reader``; XLSX falls back to the existing list parser
+    (spreadsheets are rarely millions of rows)."""
+    name = (filename or "").lower()
+    if not name.endswith(".csv"):
+        for c in _parse_contacts(filename, content):
+            phone = _canonical_phone(c.get("phone"))
+            if phone:
+                yield {"phone": phone, "name": c.get("name") or phone}
+        return
+    import csv as _csv
+
+    text = content.decode("utf-8-sig", errors="ignore")
+    header_skipped = False
+    for row in _csv.reader(io.StringIO(text)):
+        cells = [str(c).strip() if c is not None else "" for c in row]
+        if not any(cells):
+            continue
+        first = cells[0] if cells else ""
+        if not header_skipped and not re.search(r"\d{7,}", first):
+            header_skipped = True
+            continue
+        phone = _canonical_phone(first)
+        if not phone:
+            continue
+        yield {"phone": phone, "name": (cells[1] if len(cells) > 1 else "") or phone}
 
 
 def _parse_document(filename: str, content: bytes) -> str:
@@ -923,6 +959,25 @@ class OutboundCampaignService:
             )
 
         raw = await contacts_file.read()
+
+        # ── V2 scale path: async, per-row, up to 1M contacts ────────────────────
+        # Skip the inline parse/scrub/blob (which is O(n) and request-blocking).
+        # Create the campaign in ``ingesting`` and stream-ingest in the background;
+        # DND scrub moves to dial-time. Returns immediately (no request timeout).
+        if settings.CAMPAIGN_CONTACTS_V2:
+            caller_id = PlivoService.bulk_calling_caller_id(tenant_res)
+            auth_override = PlivoService.bulk_calling_auth(tenant_res)
+            if not caller_id or not auth_override:
+                raise ValueError(
+                    "Your dedicated bulk calling number isn't fully configured. "
+                    "Contact support to finish setup."
+                )
+            return await OutboundCampaignService._create_bulk_campaign_v2(
+                tenant_res, db,
+                name=name, cfg=cfg, raw=raw, filename=contacts_file.filename,
+                caller_id=caller_id, public_base_url=public_base_url, path_prefix=path_prefix,
+            )
+
         # Canonicalize + dedupe so the same person listed twice (e.g. bare
         # ``7569672503`` and ``+917569672503``) becomes ONE contact dialed once,
         # in a form Plivo accepts.
@@ -1150,6 +1205,108 @@ class OutboundCampaignService:
         await db.refresh(campaign)
         invalidate_outbound_context(campaign.id)
         return campaign
+
+    @staticmethod
+    async def _create_bulk_campaign_v2(
+        tenant_res: TenantResources,
+        db: AsyncSession,
+        *,
+        name: str,
+        cfg: dict[str, Any],
+        raw: bytes,
+        filename: str | None,
+        caller_id: str,
+        public_base_url: str,
+        path_prefix: str,
+    ) -> OutboundCampaign:
+        """V2: create the campaign in ``ingesting`` and stream-ingest contacts into
+        per-row storage in the BACKGROUND (COPY), then flip to ``running`` and kick
+        the dialer. Returns immediately so the upload request never blocks/timeouts
+        on a 1M-row file."""
+        campaign = OutboundCampaign(
+            id=uuid.uuid4(),
+            tenant_id=tenant_res.tenant_id,
+            name=name,
+            status=CampaignStatus.ingesting,
+            agent_config=cfg,
+            from_number=caller_id,
+            total_count=0,
+            started_at=datetime.now(timezone.utc),
+        )
+        db.add(campaign)
+        await db.commit()
+        await db.refresh(campaign)
+        invalidate_outbound_context(campaign.id)
+
+        cid = campaign.id
+        base = public_base_url.rstrip("/")
+        prefix = path_prefix.rstrip("/")
+        task = asyncio.create_task(
+            OutboundCampaignService._ingest_and_dial_v2(
+                cid, raw, filename, tenant_res.tenant_id, base, prefix
+            )
+        )
+        _ingest_tasks.add(task)
+        task.add_done_callback(_ingest_tasks.discard)
+        return campaign
+
+    @staticmethod
+    async def _ingest_and_dial_v2(
+        campaign_id: uuid.UUID,
+        raw: bytes,
+        filename: str | None,
+        tenant_id: str,
+        base: str,
+        prefix: str,
+    ) -> None:
+        """Background: COPY-ingest the file into per-row storage, flip the campaign
+        to ``running``, and kick the dialer. Its own DB session; never raises."""
+        from app.db.session import AsyncSessionLocal
+        from app.services import campaign_contacts_v2 as v2
+
+        try:
+            inserted = await v2.ingest_rows(campaign_id, _iter_parsed_contacts(filename, raw))
+            async with AsyncSessionLocal() as db:
+                await db.execute(
+                    _sql_text(
+                        "UPDATE outbound_campaigns SET total_count = :n, status = "
+                        "CASE WHEN :n > 0 THEN 'running' ELSE 'completed' END WHERE id = :c"
+                    ),
+                    {"n": inserted, "c": str(campaign_id)},
+                )
+                await db.commit()
+            logger.info("NOKVO-INGEST-V2: campaign %s ingested %d contacts", campaign_id, inserted)
+        except Exception:
+            logger.exception("NOKVO-INGEST-V2: ingestion failed for campaign %s", campaign_id)
+            try:
+                async with AsyncSessionLocal() as db:
+                    await db.execute(
+                        _sql_text("UPDATE outbound_campaigns SET status='ingest_failed' WHERE id=:c"),
+                        {"c": str(campaign_id)},
+                    )
+                    await db.commit()
+            except Exception:
+                logger.exception("NOKVO-INGEST-V2: could not mark ingest_failed for %s", campaign_id)
+            return
+
+        # Kick the dialer — best-effort, SEPARATE from ingestion so a dial hiccup
+        # never flips a successfully-ingested campaign to ``ingest_failed``.
+        if inserted <= 0:
+            return
+        try:
+            async with AsyncSessionLocal() as db:
+                campaign = (
+                    await db.execute(select(OutboundCampaign).where(OutboundCampaign.id == campaign_id))
+                ).scalars().first()
+                tenant_res = (
+                    await db.execute(select(TenantResources).where(TenantResources.tenant_id == tenant_id))
+                ).scalars().first()
+                if campaign is not None and tenant_res is not None:
+                    await OutboundCampaignService._dial_pending(
+                        campaign, db, tenant_res=tenant_res, base=base, prefix=prefix
+                    )
+        except Exception:
+            logger.exception("NOKVO-INGEST-V2: initial dial kick failed for %s (ingest OK)", campaign_id)
 
     # ---- throttled dialer (place up to the cap, refill as calls end) ----------
     @staticmethod
@@ -1394,6 +1551,18 @@ class OutboundCampaignService:
             if not _allowed:
                 logger.info("NOKVO-CAMPAIGN: %s paused (%s) — outside call window", campaign.id, _reason)
                 return
+
+        # ── V2 scale path: advisory-locked indexed claim (no blob, no whole-row
+        # lock, network I/O OUTSIDE the lock). All the gates above (kill switch,
+        # balance, window) are shared and already ran. ──
+        if settings.CAMPAIGN_CONTACTS_V2 and OutboundCampaignService._is_bulk(campaign):
+            await OutboundCampaignService._dial_pending_v2(
+                campaign, db,
+                tenant_res=tenant_res, base=base, prefix=prefix,
+                call_window=(_cfg.get("call_window") if _apex_scheduled else None),
+            )
+            return
+
         # Lock + refresh to the latest committed batch state before deciding what
         # to dial. Without this a launch that placed calls and a webhook that ended
         # one could each write a stale ``contacts`` snapshot over the other.
@@ -1491,6 +1660,144 @@ class OutboundCampaignService:
             await db.commit()
 
     @staticmethod
+    async def _dial_pending_v2(
+        campaign: OutboundCampaign,
+        db: AsyncSession,
+        *,
+        tenant_res: TenantResources,
+        base: str,
+        prefix: str,
+        call_window: dict | None = None,
+    ) -> None:
+        """V2 dialer: two-phase claim. Phase 1 = advisory-locked indexed claim
+        (``campaign_contacts_v2.claim_pending``, holds no network I/O). Phase 2 =
+        dial-time DND scrub + Plivo placement, with NO lock held. Concurrency cap +
+        daily cap are enforced in the claim; per-row status is updated O(1)."""
+        from app.services import campaign_contacts_v2 as v2
+
+        cap = OutboundCampaignService.BULK_DIAL_CONCURRENCY
+        caller_id, auth_override = OutboundCampaignService._dial_params(campaign, tenant_res)
+        pool = await OutboundCampaignService._resolve_caller_pool(
+            campaign, tenant_res, auth_override=auth_override, fallback=caller_id
+        )
+        if not pool:
+            return
+
+        # Daily cap (APEX scheduled) — bound the claim by today's remaining budget.
+        max_rows: int | None = None
+        today_str = ""
+        today_count = 0
+        calls_per_day = 0
+        if call_window:
+            try:
+                calls_per_day = int(call_window.get("calls_per_day") or 0)
+            except (TypeError, ValueError):
+                calls_per_day = 0
+            if calls_per_day > 0:
+                today_str = _ist_now().strftime("%Y-%m-%d")
+                today_count = _dialed_today_count(call_window, today_str)
+                remaining = calls_per_day - today_count
+                if remaining <= 0:
+                    return
+                max_rows = remaining
+
+        claimed = await v2.claim_pending(campaign.id, cap, max_rows=max_rows)
+        if not claimed:
+            return
+
+        # Phase 2 — dial-time DND scrub (only the claimed batch), then place. NO lock.
+        result = None
+        try:
+            from app.services.dnd_scrub_service import scrub_numbers
+
+            result = await scrub_numbers([r["phone"] for r in claimed])
+        except Exception:
+            logger.exception("NOKVO-DND-V2: dial-time scrub failed — dialing un-scrubbed")
+
+        placed = 0
+        for i, row in enumerate(claimed):
+            if result is not None and result.is_blocked(row["phone"]):
+                await v2.mark_contact(row["id"], "dnd_dropped")
+                continue
+            chosen = pool[i % len(pool)]  # round-robin fan-out across the DID pool
+            contact = {"call_link_id": row["call_link_id"], "phone": row["phone"]}
+            await OutboundCampaignService._place_call(
+                contact, tenant_res=tenant_res, caller_id=chosen,
+                base=base, prefix=prefix, auth_override=auth_override,
+            )
+            if contact.get("call_id"):
+                await v2.mark_contact(row["id"], "ringing", call_id=contact["call_id"])
+                placed += 1
+            else:
+                await v2.mark_contact(row["id"], "failed")
+
+        # Advance counters (best-effort): total dialed + the per-day cap counter.
+        if placed:
+            try:
+                await db.execute(
+                    _sql_text("UPDATE outbound_campaigns SET contacts_dialed = contacts_dialed + :n WHERE id = :c"),
+                    {"n": placed, "c": str(campaign.id)},
+                )
+                if calls_per_day > 0 and today_str:
+                    _ac = dict(campaign.agent_config or {})
+                    _cw = dict(_ac.get("call_window") or {})
+                    _cw["dialed_today"] = {"date": today_str, "count": today_count + placed}
+                    _ac["call_window"] = _cw
+                    await db.execute(
+                        _sql_text("UPDATE outbound_campaigns SET agent_config = CAST(:cfg AS jsonb) WHERE id = :c"),
+                        {"cfg": json.dumps(_ac), "c": str(campaign.id)},
+                    )
+                await db.commit()
+            except Exception:
+                logger.exception("NOKVO-DIAL-V2: counter update failed for %s", campaign.id)
+
+    @staticmethod
+    async def _handle_call_status_v2(
+        campaign: OutboundCampaign,
+        call_link_id: str,
+        event_type: str,
+        payload: dict,
+        db: AsyncSession,
+    ) -> None:
+        """V2 webhook: O(1) single-row status update keyed on ``call_link_id`` +
+        atomic campaign counters. Terminal status derived from the row's current
+        state (answered → completed; else no_answer/failed by hangup cause).
+        Idempotent. The refill is triggered by the endpoint's dial_next_pending."""
+        from app.services import campaign_contacts_v2 as v2
+
+        if event_type == "call.answered":
+            if await v2.update_status_by_link(
+                db, call_link_id, "answered", answered_at=datetime.now(timezone.utc)
+            ):
+                await v2.bump_campaign_counter(db, campaign.id, "answered_count")
+            await db.commit()
+            return
+
+        if event_type in ("call.hangup", "call.failed", "call.machine.detection.ended"):
+            cur = (await db.execute(
+                _sql_text("SELECT status FROM outbound_campaign_contacts WHERE call_link_id = :c"),
+                {"c": call_link_id},
+            )).scalar_one_or_none()
+            if cur in ("completed", "no_answer", "failed", None):
+                return  # already terminal / unknown → idempotent no-op
+            if cur == "answered":
+                final = "completed"  # post-call scoring sets qualified/lead_score
+            else:
+                cause = str(payload.get("hangup_cause") or payload.get("HangupCause") or "").upper()
+                final = "failed" if any(x in cause for x in ("BUSY", "REJECT", "CONGESTION")) else "no_answer"
+            fields: dict[str, Any] = {}
+            dur = payload.get("duration") or payload.get("Duration")
+            if dur:
+                try:
+                    fields["duration_s"] = float(dur)
+                except (TypeError, ValueError):
+                    pass
+            await v2.update_status_by_link(db, call_link_id, final, **fields)
+            if final in ("failed", "no_answer"):
+                await v2.bump_campaign_counter(db, campaign.id, "failed_count")
+            await db.commit()
+
+    @staticmethod
     async def dial_next_pending(
         campaign: OutboundCampaign,
         db: AsyncSession,
@@ -1544,6 +1851,27 @@ class OutboundCampaignService:
         serializes safely with the hangup webhook + the dialer. Best-effort:
         never raises into the call-setup path."""
         from app.db.session import AsyncSessionLocal
+
+        # V2: O(1) single-row answered stamp (idempotent — the SET only counts once
+        # because the terminal webhook won't re-answer a completed row).
+        if settings.CAMPAIGN_CONTACTS_V2:
+            from app.services import campaign_contacts_v2 as v2
+
+            try:
+                async with AsyncSessionLocal() as db:
+                    cur = (await db.execute(
+                        _sql_text("SELECT status, campaign_id FROM outbound_campaign_contacts WHERE call_link_id = :c"),
+                        {"c": call_link_id},
+                    )).first()
+                    if cur is None or cur[0] in ("answered", "completed"):
+                        return  # unknown or already answered → idempotent
+                    await v2.update_status_by_link(db, call_link_id, "answered",
+                                                   answered_at=datetime.now(timezone.utc))
+                    await v2.bump_campaign_counter(db, cur[1], "answered_count")
+                    await db.commit()
+            except Exception:
+                logger.exception("NOKVO-DIAL-V2: mark_answered failed for %s", call_link_id)
+            return
 
         try:
             async with AsyncSessionLocal() as db:
@@ -1611,6 +1939,18 @@ class OutboundCampaignService:
         a campaign) and the contacts list lives in-memory only.
         """
         is_followup_synthetic = followup_contact is not None
+        # ── V2 scale path: O(1) single-row status update (no blob, no whole-row
+        # lock). The endpoint calls dial_next_pending after us for the refill. ──
+        if (
+            settings.CAMPAIGN_CONTACTS_V2
+            and campaign is not None
+            and not is_followup_synthetic
+            and OutboundCampaignService._is_bulk(campaign)
+        ):
+            await OutboundCampaignService._handle_call_status_v2(
+                campaign, call_link_id, event_type, payload, db
+            )
+            return
         if is_followup_synthetic:
             contacts: list[dict] = [followup_contact]
             target = followup_contact

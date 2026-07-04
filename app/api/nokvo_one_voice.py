@@ -47,7 +47,7 @@ from fastapi import (
     WebSocket,
     status,
 )
-from fastapi.responses import PlainTextResponse, RedirectResponse
+from fastapi.responses import PlainTextResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -1977,6 +1977,10 @@ def _campaign_response(c: OutboundCampaign) -> dict[str, Any]:
         "answered_count": c.answered_count or 0,
         "failed_count": c.failed_count or 0,
         "contacts": c.contacts or [],
+        # Per-row (V2) storage vs the legacy inline blob. When true the UI reads
+        # counts from /summary and rows from the paginated /contacts endpoint
+        # instead of the (now-empty) inline ``contacts`` array.
+        "v2": c.contacts is None,
         "agent_config": c.agent_config or {},
         # Numbers removed from the dial list because they're on the DND/NCPR
         # register (bulk CSV campaigns only). Empty when nothing was scrubbed.
@@ -2547,6 +2551,79 @@ async def get_campaign(
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
     return _campaign_response(campaign)
+
+
+# ── V2 per-row reads (summary / keyset pagination / streaming CSV) ────────────
+async def _resolve_bulk_campaign(campaign_id: uuid.UUID, user: OrganizationUser, db: AsyncSession):
+    tr = await _tenant_for_user(db, user)
+    campaign = await OutboundCampaignService.get_campaign(campaign_id, tr, db)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    return campaign
+
+
+@router.get("/campaigns/{campaign_id}/summary")
+async def campaign_summary(
+    campaign_id: uuid.UUID,
+    user: OrganizationUser = Depends(_bulk_viewer_dep()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Per-bucket contact counts via one indexed GROUP BY (never loads rows).
+    Powers the APEX dashboard tiles at any campaign size."""
+    await _resolve_bulk_campaign(campaign_id, user, db)
+    from app.services import campaign_contacts_v2 as v2
+
+    return await v2.summary(db, campaign_id)
+
+
+@router.get("/campaigns/{campaign_id}/contacts")
+async def campaign_contacts_page(
+    campaign_id: uuid.UUID,
+    bucket: str = "qualified",
+    cursor: str | None = None,
+    limit: int = 100,
+    user: OrganizationUser = Depends(_bulk_viewer_dep()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Keyset-paginated contacts for a bucket (qualified / not_interested /
+    no_pickup / pending). ``cursor`` = last row id from the previous page."""
+    await _resolve_bulk_campaign(campaign_id, user, db)
+    from app.services import campaign_contacts_v2 as v2
+
+    return await v2.page_contacts(db, campaign_id, bucket, cursor=cursor, limit=limit)
+
+
+@router.get("/campaigns/{campaign_id}/contacts.csv")
+async def campaign_contacts_csv(
+    campaign_id: uuid.UUID,
+    bucket: str = "qualified",
+    user: OrganizationUser = Depends(_bulk_viewer_dep()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Stream a bucket's contacts as CSV (phone col A, name col B) straight from
+    the DB — keyset-paged so a 1M list never lands in memory."""
+    await _resolve_bulk_campaign(campaign_id, user, db)
+
+    def _esc(v: Any) -> str:
+        s = str(v or "").strip()
+        return f'"{s.replace(chr(34), chr(34) * 2)}"' if any(ch in s for ch in ',"\n\r') else s
+
+    async def _gen():
+        # Own session — a StreamingResponse generator runs AFTER the request's db
+        # dependency is closed, so we can't reuse it for the stream.
+        from app.db.session import AsyncSessionLocal
+        from app.services import campaign_contacts_v2 as v2
+
+        yield "Phone,Name\r\n"
+        async with AsyncSessionLocal() as sdb:
+            async for phone, name in v2.iter_csv_rows(sdb, campaign_id, bucket):
+                yield f"{_esc(phone)},{_esc(name)}\r\n"
+
+    return StreamingResponse(
+        _gen(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="campaign-{bucket}.csv"'},
+    )
 
 
 @router.post("/campaigns/{campaign_id}/launch")

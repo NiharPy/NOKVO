@@ -59,16 +59,25 @@ const estimate = computed(() => scheduleEstimate({
 const fmtCr = (n) => Math.round(Number(n) || 0).toLocaleString('en-IN');
 
 // ── outcome counts per campaign (Successful / Not Interested / Didn't pick up) ──
+// V2 campaigns get counts from the server GROUP BY summary (scales to 1M); legacy
+// blob campaigns are categorized client-side.
 function counts(c) {
+  if (c.v2) {
+    const s = apex.summaryFor && apex.summaryFor(c.id);
+    if (s) return { successful: s.qualified || 0, not_interested: s.not_interested || 0, no_pickup: s.no_pickup || 0, pending: s.pending || 0 };
+    return { successful: 0, not_interested: 0, no_pickup: 0, pending: 0 };
+  }
   const g = categorizeContacts([c]);
   return { successful: g.successful.length, not_interested: g.not_interested.length, no_pickup: g.no_pickup.length, pending: g.pending.length };
 }
 function statusTone(s) {
   if (s === 'running') return 'run';
   if (s === 'completed') return 'done';
+  if (s === 'ingesting') return 'run';
   return 'off';
 }
 function redialCount(c) {
+  if (c.v2) return counts(c).pending;  // pending rows are what a relaunch would dial
   return (c.contacts || []).filter((ct) => ct.status !== 'answered' && !ct.answered_at).length;
 }
 

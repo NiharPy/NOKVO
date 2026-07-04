@@ -25,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import select
+from sqlalchemy import text as _members_sql
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -329,13 +330,20 @@ async def apex_qualified_leads(
     user: OrganizationUser = Depends(_apex_member_dep()),
     db: AsyncSession = Depends(deps.get_db),
 ):
-    """The claim pool: qualified, UNCLAIMED contacts across the org's campaigns."""
+    """The claim pool: qualified, UNCLAIMED contacts across the org's campaigns.
+    Unions the V2 per-row store (scalable) with legacy blob campaigns."""
     tr = await _tenant(db, user.organization_id)
     campaigns = await OutboundCampaignService.list_campaigns(tr, db)
     out: list[dict] = []
+    if settings.CAMPAIGN_CONTACTS_V2:
+        from app.services import campaign_contacts_v2 as _v2
+
+        out.extend(await _v2.qualified_pool(db, tr.tenant_id, claimed_by=None))
     for campaign in campaigns:
+        if not campaign.contacts:
+            continue  # V2 campaign (blob empty) — already covered above
         cfg = campaign.agent_config or {}
-        for contact in (campaign.contacts or []):
+        for contact in campaign.contacts:
             if str(contact.get("claimed_by") or "").strip():
                 continue  # already claimed
             if _is_qualified(contact, cfg):
@@ -353,8 +361,14 @@ async def apex_my_leads(
     campaigns = await OutboundCampaignService.list_campaigns(tr, db)
     me = str(user.id)
     out: list[dict] = []
+    if settings.CAMPAIGN_CONTACTS_V2:
+        from app.services import campaign_contacts_v2 as _v2
+
+        out.extend(await _v2.qualified_pool(db, tr.tenant_id, claimed_by=me))
     for campaign in campaigns:
-        for contact in (campaign.contacts or []):
+        if not campaign.contacts:
+            continue
+        for contact in campaign.contacts:
             if str(contact.get("claimed_by") or "") == me:
                 out.append(_lead_row(contact, campaign))
     return out
@@ -382,6 +396,26 @@ async def apex_claim_lead(
     lock serializes two members claiming the same contact: the first wins, the
     second gets 409."""
     tr = await _tenant(db, user.organization_id)
+    # V2: atomic claim on the row (no whole-campaign lock). None → no V2 row (fall
+    # back to the blob path below for a legacy campaign).
+    if settings.CAMPAIGN_CONTACTS_V2:
+        from app.services import campaign_contacts_v2 as _v2
+
+        # Distinguish "already claimed" (409) from "no V2 row" (fall through): a
+        # matching V2 row that's already claimed must 409, not silently fall back.
+        exists = (await db.execute(
+            _members_sql("SELECT 1 FROM outbound_campaign_contacts occ JOIN outbound_campaigns c "
+                         "ON c.id=occ.campaign_id WHERE c.tenant_id=:t AND occ.campaign_id=:cid "
+                         "AND occ.call_link_id=:clid"),
+            {"t": tr.tenant_id, "cid": str(campaign_id), "clid": call_link_id},
+        )).scalar_one_or_none()
+        if exists is not None:
+            lead = await _v2.claim_lead(db, tr.tenant_id, campaign_id, call_link_id,
+                                        str(user.id), user.full_name)
+            if lead is None:
+                raise HTTPException(status_code=409, detail="already_claimed")
+            return lead
+
     campaign = await _locked_campaign_for_org(db, campaign_id, tr)
     contacts = list(campaign.contacts or [])
     idx, contact = _find_contact(campaign, call_link_id)
@@ -420,6 +454,15 @@ async def apex_set_lead_status(
     if new_status not in _CLAIM_STATUSES:
         raise HTTPException(status_code=400, detail=f"Status must be one of {sorted(_CLAIM_STATUSES)}")
     tr = await _tenant(db, user.organization_id)
+    if settings.CAMPAIGN_CONTACTS_V2:
+        from app.services import campaign_contacts_v2 as _v2
+
+        res = await _v2.set_lead_status(db, tr.tenant_id, campaign_id, call_link_id, str(user.id), new_status)
+        if res == "forbidden":
+            raise HTTPException(status_code=403, detail="You can only update leads you claimed.")
+        if res is not None:  # None → no V2 row, fall through to blob
+            return res
+
     campaign = await _locked_campaign_for_org(db, campaign_id, tr)
     contacts = list(campaign.contacts or [])
     idx, contact = _find_contact(campaign, call_link_id)

@@ -166,6 +166,37 @@ export async function deleteCampaign(campaignId) {
   await agentsApi.delete(`/campaigns/${campaignId}`, { headers: authHeader() });
 }
 
+// ── V2 per-row reads (scalable to 1M contacts) ──────────────────────────────
+// Per-bucket counts via one indexed GROUP BY (no rows shipped to the client).
+export async function fetchCampaignSummary(campaignId) {
+  const { data } = await agentsApi.get(`/campaigns/${campaignId}/summary`, { headers: authHeader() });
+  return data;
+}
+
+// Keyset-paginated rows for a bucket. Returns { rows, next_cursor }.
+export async function fetchCampaignContacts(campaignId, bucket, cursor = null, limit = 100) {
+  const params = { bucket, limit };
+  if (cursor) params.cursor = cursor;
+  const { data } = await agentsApi.get(`/campaigns/${campaignId}/contacts`, { params, headers: authHeader() });
+  return data;
+}
+
+// Stream a bucket to CSV. Auth is header-based, so a plain <a> download can't
+// carry it — fetch the stream with the token, then trigger a blob download.
+export async function downloadCampaignContactsCsv(campaignId, bucket, filename) {
+  const { data } = await agentsApi.get(`/campaigns/${campaignId}/contacts.csv`, {
+    params: { bucket }, headers: authHeader(), responseType: 'blob',
+  });
+  const url = URL.createObjectURL(data);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename || `campaign-${bucket}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
 export async function fetchTranscript(callId) {
   // Transcripts live on the nokvo-one base (not /agents), keyed by call_id.
   const { data } = await api.get(`/transcripts/${encodeURIComponent(callId)}`, { headers: authHeader() });

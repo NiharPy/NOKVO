@@ -1,17 +1,52 @@
 <script setup>
 // APEX Not Interested — reached but below the lead score. Same table + breakdown
 // (shows what they missed); score tag neutral.
-import { inject, ref, computed } from 'vue';
+import { inject, ref, computed, watch, onMounted } from 'vue';
 import { categorizeContacts } from '../../composables/bulkCalling.js';
 
 const apex = inject('apex');
 const filter = ref(null);
 const expanded = ref(null);
+const rows = ref([]);
+const loading = ref(false);
+const cursors = ref({});
+const hasMore = computed(() => Object.values(cursors.value).some((c) => !!c));
 const scoped = computed(() => {
   const all = apex.deterministicCampaigns.value;
   return filter.value ? all.filter((c) => String(c.id) === String(filter.value)) : all;
 });
-const rows = computed(() => categorizeContacts(scoped.value).not_interested);
+
+function _mapV2(r, c) {
+  const res = typeof r.result === 'string' ? JSON.parse(r.result || '{}') : (r.result || {});
+  return {
+    call_link_id: r.id, name: r.name || r.phone, phone: r.phone, lead_score: r.lead_score,
+    max_score: c.max_score, score_breakdown: res.score_breakdown || [],
+    lead_score_reason: res.lead_score_reason || res.interest_reason || null, call_note: res.call_note || null,
+  };
+}
+async function loadRows(reset = true) {
+  loading.value = true;
+  try {
+    const legacy = scoped.value.filter((c) => !c.v2);
+    const v2 = scoped.value.filter((c) => c.v2);
+    const legacyRows = categorizeContacts(legacy).not_interested;
+    const out = reset ? [] : [...rows.value];
+    if (reset) cursors.value = {};
+    for (const c of v2) {
+      const cur = reset ? null : cursors.value[c.id];
+      if (!reset && cur === null) continue;
+      const { rows: page, next_cursor } = await apex.fetchCampaignContacts(c.id, 'not_interested', cur, 100);
+      out.push(...(page || []).map((r) => _mapV2(r, c)));
+      cursors.value[c.id] = next_cursor || null;
+    }
+    rows.value = reset ? [...out, ...legacyRows] : out;
+  } finally {
+    loading.value = false;
+  }
+}
+watch(filter, () => loadRows(true));
+watch(() => apex.deterministicCampaigns.value, () => loadRows(true));
+onMounted(() => loadRows(true));
 function toggle(key) { expanded.value = expanded.value === key ? null : key; }
 </script>
 
@@ -19,7 +54,7 @@ function toggle(key) { expanded.value = expanded.value === key ? null : key; }
   <div class="ax-card ax-card-pad ax-anim">
     <div style="display:flex;align-items:center;gap:13px;">
       <h2 class="ax-h2">Not interested</h2>
-      <span class="ax-count ax-count--grey">{{ rows.length }}</span>
+      <span class="ax-count ax-count--grey">{{ rows.length }}{{ hasMore ? '+' : '' }}</span>
     </div>
     <p class="ax-muted">Numbers we reached but that didn't cross the lead score. The breakdown shows what they missed.</p>
 
@@ -28,7 +63,7 @@ function toggle(key) { expanded.value = expanded.value === key ? null : key; }
       <button v-for="c in apex.deterministicCampaigns.value" :key="c.id" type="button" class="ax-chip" :class="{ 'is-active': filter === c.id }" @click="filter = c.id">{{ c.name }}</button>
     </div>
 
-    <div v-if="!rows.length" class="ax-empty" style="margin-top:16px;">
+    <div v-if="!rows.length && !loading" class="ax-empty" style="margin-top:16px;">
       <div class="ax-empty-icon">⃠</div>
       <p class="ax-empty-text">No "not interested" numbers yet — reached contacts that don't qualify will appear here.</p>
     </div>
@@ -58,6 +93,9 @@ function toggle(key) { expanded.value = expanded.value === key ? null : key; }
           </div>
         </div>
       </template>
+      <button v-if="hasMore" type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" style="margin-top:12px;" :disabled="loading" @click="loadRows(false)">
+        {{ loading ? 'Loading…' : 'Load more' }}
+      </button>
     </template>
   </div>
 </template>
