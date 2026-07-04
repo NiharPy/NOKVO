@@ -103,22 +103,23 @@ async function open(row) {
 <style scoped>
 .ax-logs { display: grid; grid-template-columns: 360px 1fr; gap: 22px; align-items: start; }
 .ax-logs-list { display: flex; flex-direction: column; gap: 12px; }
-.ax-call { width: 100%; text-align: left; cursor: pointer; border-radius: 9px; padding: 18px 20px; background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.08); transition: all .15s; font-family: 'Sora', sans-serif; display: block; color: #F3F2F0; }
-.ax-call.is-active { border-color: rgba(230,38,48,0.5); background: rgba(230,38,48,0.06); }
+.ax-call { width: 100%; text-align: left; cursor: pointer; border-radius: 13px; padding: 18px 20px; background: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.012)); border: 1px solid rgba(255,255,255,0.08); transition: all .18s cubic-bezier(0.22, 1, 0.36, 1); font-family: 'Sora', sans-serif; display: block; color: #F3F2F0; box-shadow: inset 0 1px 0 rgba(255,255,255,0.04); }
+.ax-call:hover:not(.is-active) { border-color: rgba(255,255,255,0.18); transform: translateY(-1px); box-shadow: inset 0 1px 0 rgba(255,255,255,0.05), 0 10px 24px -14px rgba(0,0,0,0.55); }
+.ax-call.is-active { border-color: rgba(230,38,48,0.5); background: linear-gradient(180deg, rgba(230,38,48,0.08), rgba(230,38,48,0.04)); box-shadow: inset 0 1px 0 rgba(255,255,255,0.05), 0 12px 28px -14px rgba(230,38,48,0.25); }
 .ax-call-phone { font-family: 'JetBrains Mono', monospace; font-size: 12.5px; color: rgba(255,255,255,0.45); margin-top: 11px; }
 .ax-call-time { font-family: 'JetBrains Mono', monospace; font-size: 11.5px; color: rgba(255,255,255,0.3); margin-top: 6px; }
-.ax-spill { font-family: 'JetBrains Mono', monospace; font-size: 11px; letter-spacing: 0.04em; padding: 4px 10px; border-radius: 5px; }
-.ax-spill.is-pos { color: #7FD9A8; border: 1px solid rgba(127,217,168,0.3); }
+.ax-spill { font-family: 'JetBrains Mono', monospace; font-size: 11px; letter-spacing: 0.04em; padding: 4px 11px; border-radius: 999px; }
+.ax-spill.is-pos { color: #7FD9A8; border: 1px solid rgba(127,217,168,0.3); background: rgba(74,200,140,0.06); }
 .ax-spill.is-neg { color: rgba(255,255,255,0.55); border: 1px solid rgba(255,255,255,0.16); }
-.ax-spill.is-live { color: #E62630; border: 1px solid rgba(230,38,48,0.4); background: rgba(230,38,48,0.07); }
-.ax-logs-detail { background: rgba(255,255,255,0.025); border: 1px solid rgba(255,255,255,0.09); border-radius: 8px; min-height: 420px; padding: 28px 30px; }
+.ax-spill.is-live { color: #F0666E; border: 1px solid rgba(230,38,48,0.4); background: rgba(230,38,48,0.08); box-shadow: 0 0 12px -4px rgba(230,38,48,0.4); }
+.ax-logs-detail { background: linear-gradient(180deg, rgba(255,255,255,0.035), rgba(255,255,255,0.012)); border: 1px solid rgba(255,255,255,0.085); border-radius: 16px; min-height: 420px; padding: 28px 30px; box-shadow: inset 0 1px 0 rgba(255,255,255,0.05), 0 24px 48px -24px rgba(0,0,0,0.55); }
 .ax-logs-empty { height: 360px; display: flex; align-items: center; justify-content: center; text-align: center; color: rgba(255,255,255,0.4); font-size: 14px; padding: 0 30px; line-height: 1.5; }
 .ax-logs-head { border-bottom: 1px solid rgba(255,255,255,0.08); padding-bottom: 18px; margin-bottom: 24px; }
 .ax-tline { display: flex; flex-direction: column; align-items: flex-start; margin-bottom: 16px; }
 .ax-tline.is-mine { align-items: flex-end; }
 .ax-tline-who { font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: rgba(255,255,255,0.34); margin-bottom: 7px; font-weight: 600; }
-.ax-bubble { padding: 11px 15px; font-size: 14px; line-height: 1.5; max-width: 80%; }
-.ax-bubble--agent { background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.07); color: rgba(255,255,255,0.85); border-radius: 11px 11px 11px 3px; }
-.ax-bubble--mine { background: rgba(230,38,48,0.08); border: 1px solid rgba(230,38,48,0.2); color: #F3F2F0; border-radius: 11px 11px 3px 11px; }
+.ax-bubble { padding: 11px 15px; font-size: 14px; line-height: 1.55; max-width: 80%; box-shadow: inset 0 1px 0 rgba(255,255,255,0.04), 0 4px 12px -8px rgba(0,0,0,0.4); }
+.ax-bubble--agent { background: linear-gradient(180deg, rgba(255,255,255,0.05), rgba(255,255,255,0.028)); border: 1px solid rgba(255,255,255,0.07); color: rgba(255,255,255,0.87); border-radius: 13px 13px 13px 4px; }
+.ax-bubble--mine { background: linear-gradient(180deg, rgba(230,38,48,0.11), rgba(230,38,48,0.06)); border: 1px solid rgba(230,38,48,0.22); color: #F3F2F0; border-radius: 13px 13px 4px 13px; }
 @media (max-width: 760px) { .ax-logs { grid-template-columns: 1fr; } }
 </style>

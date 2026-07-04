@@ -69,7 +69,7 @@ const primaryOf = (m) => m.full_name || m.email;
 
 /* Invite panel — a quiet compose zone; the eyebrow labels it as its own region. */
 .mb-eyebrow { font-size: 11px; letter-spacing: 0.22em; text-transform: uppercase; color: rgba(255,255,255,0.34); font-weight: 600; margin-bottom: 15px; }
-.mb-invite { background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.08); border-radius: 10px; padding: 22px 24px; }
+.mb-invite { background: linear-gradient(180deg, rgba(255,255,255,0.028), rgba(255,255,255,0.008)); border: 1px solid rgba(255,255,255,0.08); border-radius: 14px; padding: 22px 24px; box-shadow: inset 0 1px 0 rgba(255,255,255,0.04), 0 12px 28px -18px rgba(0,0,0,0.5); }
 .mb-invite-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: stretch; }
 .mb-invite-email { flex: 2 1 220px; }
 .mb-invite-name { flex: 1 1 150px; }
@@ -82,10 +82,11 @@ const primaryOf = (m) => m.full_name || m.email;
 
 /* Roster — people, not rows. Monogram + identity + state. */
 .mb-roster { list-style: none; margin: 28px 0 0; padding: 0; }
-.mb-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 16px; padding: 15px 6px; border-top: 1px solid rgba(255,255,255,0.06); }
+.mb-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 16px; padding: 15px 10px; border-top: 1px solid rgba(255,255,255,0.055); border-radius: 10px; transition: background .16s; }
+.mb-row:hover { background: rgba(255,255,255,0.025); }
 
-.mb-mono { width: 40px; height: 40px; border-radius: 9px; display: flex; align-items: center; justify-content: center; font-family: 'Sora', sans-serif; font-weight: 700; font-size: 15px; }
-.mb-mono.is-active { border: 1px solid rgba(255,255,255,0.18); background: rgba(255,255,255,0.03); color: #F3F2F0; }
+.mb-mono { width: 40px; height: 40px; border-radius: 11px; display: flex; align-items: center; justify-content: center; font-family: 'Sora', sans-serif; font-weight: 700; font-size: 15px; }
+.mb-mono.is-active { border: 1px solid rgba(255,255,255,0.16); background: linear-gradient(180deg, rgba(255,255,255,0.08), rgba(255,255,255,0.02)); color: #F3F2F0; box-shadow: inset 0 1px 0 rgba(255,255,255,0.09), 0 6px 14px -8px rgba(0,0,0,0.5); }
 /* Dashed until they accept — the tile itself signals "not yet joined". */
 .mb-mono.is-invited { border: 1px dashed rgba(255,255,255,0.2); color: rgba(255,255,255,0.4); }
 

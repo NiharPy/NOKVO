@@ -59,8 +59,11 @@ function toggle(key) { expanded.value = expanded.value === key ? null : key; }
 
 <style scoped>
 .ax-status-select {
-  background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.16); color: #F3F2F0;
-  border-radius: 7px; padding: 6px 10px; font-family: 'Sora', sans-serif; font-size: 12.5px; cursor: pointer; outline: none;
+  background: rgba(0,0,0,0.24); border: 1px solid rgba(255,255,255,0.14); color: #F3F2F0;
+  border-radius: 9px; padding: 6px 10px; font-family: 'Sora', sans-serif; font-size: 12.5px; cursor: pointer; outline: none;
+  box-shadow: inset 0 1px 3px rgba(0,0,0,0.2); transition: border-color .18s, box-shadow .18s;
 }
-.ax-status-select:focus { border-color: #E62630; }
+.ax-status-select:hover { border-color: rgba(255,255,255,0.26); }
+.ax-status-select:focus { border-color: rgba(230,38,48,0.65); box-shadow: inset 0 1px 3px rgba(0,0,0,0.2), 0 0 0 3px rgba(230,38,48,0.13); }
+.ax-status-select option { background: #141416; color: #F3F2F0; }
 </style>

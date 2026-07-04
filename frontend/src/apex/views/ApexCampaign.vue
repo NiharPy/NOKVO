@@ -329,14 +329,16 @@ async function onAddFile(e) {
 </template>
 
 <style scoped>
-.ax-status-on { display: inline-flex; align-items: center; gap: 7px; font-size: 11.5px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: #7FD9A8; background: rgba(74,200,140,0.1); padding: 5px 12px; border-radius: 5px; }
-.ax-status-dot { width: 6px; height: 6px; border-radius: 50%; background: #7FD9A8; }
-.ax-status-off { font-size: 11.5px; font-weight: 600; text-transform: uppercase; color: rgba(255,255,255,0.34); background: rgba(255,255,255,0.04); padding: 5px 12px; border-radius: 5px; }
+.ax-status-on { display: inline-flex; align-items: center; gap: 7px; font-size: 11.5px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: #7FD9A8; background: rgba(74,200,140,0.09); border: 1px solid rgba(74,200,140,0.24); padding: 5px 13px; border-radius: 999px; box-shadow: inset 0 1px 0 rgba(255,255,255,0.04); }
+@keyframes axPulse { 0% { box-shadow: 0 0 0 0 rgba(127,217,168,0.4); } 70% { box-shadow: 0 0 0 5px rgba(127,217,168,0); } 100% { box-shadow: 0 0 0 0 rgba(127,217,168,0); } }
+.ax-status-dot { width: 6px; height: 6px; border-radius: 50%; background: #7FD9A8; animation: axPulse 2.2s ease-out infinite; }
+.ax-status-off { font-size: 11.5px; font-weight: 600; text-transform: uppercase; color: rgba(255,255,255,0.34); background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.09); padding: 5px 13px; border-radius: 999px; }
 
-.ax-qbuild { border: 1px solid rgba(255,255,255,0.09); border-radius: 7px; padding: 18px 20px; margin-top: 22px; }
+.ax-qbuild { border: 1px solid rgba(255,255,255,0.08); border-radius: 14px; padding: 18px 20px; margin-top: 22px; background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.005)); box-shadow: inset 0 1px 0 rgba(255,255,255,0.035); }
 .ax-qbuild-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
 .ax-qlist { margin-top: 16px; display: grid; gap: 14px; }
-.ax-q { border: 1px solid rgba(255,255,255,0.07); border-radius: 6px; padding: 14px; display: grid; gap: 10px; }
+.ax-q { border: 1px solid rgba(255,255,255,0.07); border-radius: 11px; padding: 14px; display: grid; gap: 10px; background: rgba(0,0,0,0.14); box-shadow: inset 0 1px 3px rgba(0,0,0,0.15); transition: border-color .18s; }
+.ax-q:hover { border-color: rgba(255,255,255,0.12); }
 .ax-q-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .ax-q-num { width: 22px; height: 22px; border-radius: 50%; background: rgba(255,255,255,0.06); display: flex; align-items: center; justify-content: center; font-size: 12px; color: rgba(255,255,255,0.6); flex: none; }
 .ax-q-type { flex: 0 0 auto; max-width: 200px; }
@@ -359,18 +361,20 @@ async function onAddFile(e) {
 .ax-cap { border-top: 1px solid rgba(255,255,255,0.08); margin-top: 14px; padding-top: 14px; display: grid; gap: 12px; }
 .ax-cap-inputs { display: flex; gap: 16px; flex-wrap: wrap; }
 .ax-cap-stats { display: flex; gap: 10px; flex-wrap: wrap; }
-.ax-cap-stat { flex: 1 1 120px; display: grid; gap: 2px; padding: 8px 12px; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); border-radius: 8px; }
+.ax-cap-stat { flex: 1 1 120px; display: grid; gap: 2px; padding: 10px 13px; background: linear-gradient(180deg, rgba(255,255,255,0.045), rgba(255,255,255,0.015)); border: 1px solid rgba(255,255,255,0.08); border-radius: 11px; box-shadow: inset 0 1px 0 rgba(255,255,255,0.05), 0 8px 18px -12px rgba(0,0,0,0.5); }
 .ax-cap-val { font-size: 17px; font-weight: 700; font-family: 'JetBrains Mono', monospace; }
 .ax-cap-lbl { font-size: 11px; color: rgba(255,255,255,0.4); }
 
-.ax-camp-row { display: grid; grid-template-columns: 1fr auto; gap: 18px; align-items: center; padding: 20px 36px; border-top: 1px solid rgba(255,255,255,0.06); }
+.ax-camp-row { display: grid; grid-template-columns: 1fr auto; gap: 18px; align-items: center; padding: 20px 36px; border-top: 1px solid rgba(255,255,255,0.055); transition: background .16s; }
+.ax-camp-row:hover { background: rgba(255,255,255,0.022); }
 .ax-camp-main { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
 .ax-camp-dot { width: 8px; height: 8px; border-radius: 50%; }
-.ax-camp-dot.is-run { background: #7FD9A8; } .ax-camp-dot.is-done { background: rgba(255,255,255,0.3); } .ax-camp-dot.is-off { background: rgba(255,255,255,0.2); }
-.ax-camp-name { font-size: 16px; font-weight: 600; }
-.ax-camp-status { display: inline-flex; align-items: center; padding: 4px 11px; border-radius: 5px; font-size: 11.5px; font-weight: 600; text-transform: uppercase; }
-.ax-camp-status.is-run { background: rgba(74,200,140,0.1); color: #7FD9A8; } .ax-camp-status.is-done { background: rgba(255,255,255,0.05); color: rgba(255,255,255,0.5); } .ax-camp-status.is-off { background: rgba(255,255,255,0.04); color: rgba(255,255,255,0.34); }
-.ax-camp-mode { font-family: 'JetBrains Mono', monospace; font-size: 11px; padding: 4px 9px; border: 1px solid rgba(255,255,255,0.14); border-radius: 4px; color: rgba(255,255,255,0.55); }
+.ax-camp-dot.is-run { background: #7FD9A8; box-shadow: 0 0 8px rgba(127,217,168,0.5); animation: axPulse 2.2s ease-out infinite; }
+.ax-camp-dot.is-done { background: rgba(255,255,255,0.3); } .ax-camp-dot.is-off { background: rgba(255,255,255,0.2); }
+.ax-camp-name { font-size: 16px; font-weight: 600; letter-spacing: -0.005em; }
+.ax-camp-status { display: inline-flex; align-items: center; padding: 4px 12px; border-radius: 999px; font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; border: 1px solid transparent; }
+.ax-camp-status.is-run { background: rgba(74,200,140,0.09); color: #7FD9A8; border-color: rgba(74,200,140,0.24); } .ax-camp-status.is-done { background: rgba(255,255,255,0.045); color: rgba(255,255,255,0.5); border-color: rgba(255,255,255,0.1); } .ax-camp-status.is-off { background: rgba(255,255,255,0.035); color: rgba(255,255,255,0.34); border-color: rgba(255,255,255,0.08); }
+.ax-camp-mode { font-family: 'JetBrains Mono', monospace; font-size: 11px; padding: 4px 10px; border: 1px solid rgba(255,255,255,0.13); border-radius: 999px; color: rgba(255,255,255,0.55); background: rgba(255,255,255,0.02); }
 .ax-camp-meta { display: flex; align-items: center; gap: 18px; font-family: 'JetBrains Mono', monospace; font-size: 12.5px; flex-wrap: wrap; }
 .ax-camp-del:hover:not(:disabled) { color: #E62630; border-color: rgba(230,38,48,0.4); background: rgba(230,38,48,0.08); }
 </style>
