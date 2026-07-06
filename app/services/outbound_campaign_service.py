@@ -2548,7 +2548,14 @@ class OutboundCampaignService:
         Resolution order:
           1. Campaign contact (regular launch). The contact dict lives
              inline in ``campaign.contacts`` JSONB.
-          2. Follow-up schedule row (placed_call_id). Returns a synthetic
+          2. V2 per-row contact (``outbound_campaign_contacts``) — EVERY
+             APEX/bulk campaign since the scale migration (their blob is
+             empty). Without this branch the answer webhook can't resolve
+             the Plivo signing token (sig mismatch → <Hangup/> the moment
+             the person picks up) and the media WS closes 1008 — the
+             "answers then immediately cuts" bug. Returns a synthetic
+             contact dict shaped like a blob contact.
+          3. Follow-up schedule row (placed_call_id). Returns a synthetic
              contact dict so the rest of the webhook pipeline behaves
              identically. The synthetic dict carries ``_followup_id`` and
              ``is_followup=True`` so downstream code can detect follow-up
@@ -2563,6 +2570,32 @@ class OutboundCampaignService:
             for contact in campaign.contacts or []:
                 if contact.get("call_link_id") == call_link_id:
                     return campaign, contact
+
+        # V2 per-row contact — one indexed query on the UNIQUE call_link_id.
+        # (After the blob scan so legacy campaigns that ALSO carry OCC rows keep
+        # returning their live blob dict, which the webhook mutates in place.)
+        occ = (
+            await db.execute(
+                select(OutboundCampaignContact).where(
+                    OutboundCampaignContact.call_link_id == call_link_id
+                )
+            )
+        ).scalars().first()
+        if occ is not None:
+            v2_campaign = (
+                await db.execute(
+                    select(OutboundCampaign).where(OutboundCampaign.id == occ.campaign_id)
+                )
+            ).scalars().first()
+            if v2_campaign is not None:
+                return v2_campaign, {
+                    "call_link_id": call_link_id,
+                    "phone": occ.phone,
+                    "name": occ.name or "",
+                    "status": str(occ.status or "calling"),
+                    "call_id": occ.call_id,
+                    "_v2": True,
+                }
 
         # Fall through: follow-up table.
         from app.models.lead_followup_schedule import (

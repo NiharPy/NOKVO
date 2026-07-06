@@ -360,3 +360,54 @@ async def test_rerun_rejects_non_bulk_campaign(monkeypatch):
     with pytest.raises(ValueError, match="bulk"):
         await OutboundCampaignService.rerun_bulk_campaign(
             camp, None, tenant_res=object(), public_base_url="https://x")
+
+
+@pytest.mark.asyncio
+async def test_get_by_call_link_id_resolves_v2_row_contact():
+    """V2/APEX campaigns keep contacts in outbound_campaign_contacts (blob empty).
+    get_by_call_link_id MUST resolve them — it feeds the answer webhook's Plivo
+    signing-token lookup and the media WS's contact check. When it returned
+    (None, None), the answer webhook 403'd <Hangup/> and the WS closed 1008:
+    the call rang, the person lifted, and it cut immediately."""
+    import uuid as _uuid
+
+    from app.models.outbound_campaign import CampaignStatus, OutboundCampaign
+    from app.models.outgoing_lead import OutboundCampaignContact
+    from app.services.outbound_campaign_service import OutboundCampaignService
+
+    camp = OutboundCampaign(
+        id=_uuid.uuid4(), tenant_id="t1", name="v2", status=CampaignStatus.running,
+        agent_config={"bulk_csv": True}, contacts=None,
+    )
+    row = OutboundCampaignContact(
+        id=_uuid.uuid4(), campaign_id=camp.id, phone="917569672503",
+        name="Asha", status="ringing", call_id="CALLX", call_link_id="LINK-V2",
+    )
+
+    class _R:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def scalars(self):
+            return self
+
+        def all(self):
+            return self._rows
+
+        def first(self):
+            return self._rows[0] if self._rows else None
+
+    class _DB:
+        def __init__(self):
+            # In call order: blob scan (empty), OCC row hit, campaign load.
+            self._queue = [_R([]), _R([row]), _R([camp])]
+
+        async def execute(self, stmt):
+            return self._queue.pop(0)
+
+    got_campaign, got_contact = await OutboundCampaignService.get_by_call_link_id("LINK-V2", _DB())
+    assert got_campaign is camp
+    assert got_contact["_v2"] is True
+    assert got_contact["phone"] == "917569672503"
+    assert got_contact["call_id"] == "CALLX"
+    assert not got_contact.get("is_followup")  # never mistaken for a follow-up
