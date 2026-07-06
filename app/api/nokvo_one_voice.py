@@ -2255,6 +2255,13 @@ async def create_bulk_calling_campaign(
                 from app.services.questionnaire_translation import translate_questionnaire
 
                 parsed_questionnaire = await translate_questionnaire(parsed_questionnaire)
+            elif deterministic:
+                # No pre-translation → no text_i18n → verbatim delivery never
+                # fires and every question is LLM-rephrased. Loud, not silent.
+                logger.warning(
+                    "NOKVO-CAMPAIGN: deterministic questionnaire NOT pre-translated "
+                    "(org tier is not nokvo_apex) — verbatim delivery disabled for it"
+                )
             agent_config["questionnaire"] = parsed_questionnaire
         # Calling schedule. Stored on the config (no migration), surfaced via
         # _campaign_response's agent_config passthrough. For NOKVO APEX the dialer

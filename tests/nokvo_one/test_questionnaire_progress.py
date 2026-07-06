@@ -120,3 +120,135 @@ def test_backend_does_not_match_unasked_questions():
     state = questionnaire_asked_state(QUESTIONS, history)
     assert state["asked_numbers"] == [1]
     assert state["next_number"] == 2
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AUTHORITATIVE delivered-set tracking (2026-07-06 loop incident, call 63e263db):
+# the agent asked all 4 questions then re-asked Q4 and cycled Q2→Q3→… because
+# (a) fuzzy tracking missed LLM-paraphrased / native-script lines and (b) no
+# close existed without an outro. Delivered-union makes progress MONOTONIC.
+# ═══════════════════════════════════════════════════════════════════════════
+import inspect
+
+import pytest
+
+from app.services.agent_outbound_context import (
+    get_delivered_questions,
+    next_question_to_advance,
+    next_verbatim_question,
+    questionnaire_is_complete,
+    set_delivered_questions,
+)
+
+_QS4 = [
+    {"id": "a1", "type": "intent", "text": "Are you interested in receiving more details about the apartments?", "required": "yes", "desired_answer": ""},
+    {"id": "b2", "type": "answer", "text": "Would you prefer a brochure emailed to you or to schedule a site visit?", "desired_answer": "site visit"},
+    {"id": "c3", "type": "answer", "text": "Which configuration are you considering, three or four BHK?", "desired_answer": "3bhk"},
+    {"id": "d4", "type": "intent", "text": "Would you like our team to call you back regarding this project?", "required": "yes", "desired_answer": ""},
+]
+
+
+@pytest.fixture(autouse=True)
+def _clear_ambient_delivered():
+    set_delivered_questions(None)
+    yield
+    set_delivered_questions(None)
+
+
+def test_paraphrase_invisible_to_fuzzy_but_covered_by_delivered():
+    history = [
+        {"role": "assistant", "content": "Shall I send you our PDF or set up a quick tour?"},
+    ]
+    fuzzy_only = questionnaire_asked_state(_QS4, history)
+    assert 2 not in fuzzy_only["asked_numbers"]  # the incident's failure mode
+    with_delivered = questionnaire_asked_state(_QS4, history, delivered=[1, 2])
+    assert with_delivered["next_number"] == 3    # monotonic — never points backwards
+
+
+def test_native_script_and_evicted_history_covered_by_delivered():
+    history = [{"role": "assistant", "content": "क्या आप साइट विज़िट करना चाहेंगे?"}]
+    assert questionnaire_asked_state(_QS4, history, delivered=[1, 2, 3])["next_number"] == 4
+    # Opener/Q1 evicted by the history cap → empty history, delivered still holds.
+    state = questionnaire_asked_state(_QS4, [], delivered=[1, 2, 3, 4])
+    assert state["asked_count"] == 4 and state["next_number"] is None
+
+
+def test_ambient_contextvar_is_the_default_and_arg_overrides():
+    set_delivered_questions([1, 2])
+    assert questionnaire_asked_state(_QS4, [])["asked_numbers"] == [1, 2]
+    assert questionnaire_asked_state(_QS4, [], delivered=[1])["asked_numbers"] == [1]
+    assert sorted(get_delivered_questions()) == [1, 2]
+    # Garbage numbers are ignored.
+    assert questionnaire_asked_state(_QS4, [], delivered=[0, 99, "x", 2])["asked_numbers"] == [2]
+
+
+def test_complete_via_delivered_even_when_fuzzy_sees_nothing():
+    set_delivered_questions([1, 2, 3, 4])
+    assert questionnaire_is_complete(_QS4, [], "Yeah, sure.") is True
+    set_delivered_questions([1, 2, 3])
+    assert questionnaire_is_complete(_QS4, [], "Yeah, sure.") is False
+
+
+def test_advance_is_i18n_agnostic_but_verbatim_requires_i18n():
+    set_delivered_questions([1])
+    plan = next_question_to_advance(_QS4, [], "yes I am interested in the details")
+    assert plan is not None and plan[0] == 2
+    assert next_verbatim_question(_QS4, [], "yes I am interested in the details") is None
+    qs_i18n = [dict(q, text_i18n={"en": q["text"]}) for q in _QS4]
+    vplan = next_verbatim_question(qs_i18n, [], "yes I am interested in the details")
+    assert vplan is not None and vplan[0] == 2
+    # Clarifying replies never advance.
+    assert next_question_to_advance(_QS4, [], "what do you mean?") is None
+
+
+# ── i18n floor (verbatim delivery can always fire) ───────────────────────────
+
+@pytest.mark.asyncio
+async def test_translate_floors_on_total_failure(monkeypatch):
+    from app.services import questionnaire_translation as qt
+    from app.services.llm_pool import LLMPoolClient
+
+    async def boom(*a, **k):
+        raise RuntimeError("pool down")
+
+    monkeypatch.setattr(LLMPoolClient, "chat", staticmethod(boom))
+    q = {"questions": [{"id": "a1", "text": "Are you interested?"}], "outro": "Thanks!", "threshold": 1}
+    out = await qt.translate_questionnaire(q)
+    assert out["questions"][0]["text_i18n"] == {"en": "Are you interested?"}
+    assert out["outro_i18n"] == {"en": "Thanks!"}
+
+
+@pytest.mark.asyncio
+async def test_translate_floors_partial_rows(monkeypatch):
+    from app.services import questionnaire_translation as qt
+    from app.services.llm_pool import LLMPoolClient
+
+    async def partial(*a, **k):
+        return ('{"items":[{"id":"a1","en":"E","hi":"H","te":"T"},'
+                '{"id":"b2","en":"E2","hi":"H2","te":""}]}')
+
+    monkeypatch.setattr(LLMPoolClient, "chat", staticmethod(partial))
+    q = {"questions": [{"id": "a1", "text": "Q one?"}, {"id": "b2", "text": "Q two?"}], "threshold": 1}
+    out = await qt.translate_questionnaire(q)
+    assert out["questions"][0]["text_i18n"] == {"en": "E", "hi": "H", "te": "T"}
+    assert out["questions"][1]["text_i18n"] == {"en": "Q two?"}  # floored
+
+
+# ── classifier timeout + default outro ───────────────────────────────────────
+
+def test_digression_guard_uses_config_timeout_not_500():
+    from app.services.nokvo_one_voice_pipeline import NokvoOneVoicePipeline
+
+    src = inspect.getsource(NokvoOneVoicePipeline._llm_check_booking_digression)
+    assert "timeout_ms=500" not in src
+    assert "NOKVO_INTENT_CLASSIFIER_TIMEOUT_MS" in src
+
+
+def test_default_questionnaire_outro_languages():
+    from app.services.nokvo_one_voice_stream_service import _default_questionnaire_outro
+
+    assert "Thank you" in _default_questionnaire_outro("en")
+    assert _default_questionnaire_outro("hi-IN") != _default_questionnaire_outro("en")
+    assert _default_questionnaire_outro("te") != _default_questionnaire_outro("en")
+    assert "Thank you" in _default_questionnaire_outro(None)
+    assert "Thank you" in _default_questionnaire_outro("fr")  # unknown → en

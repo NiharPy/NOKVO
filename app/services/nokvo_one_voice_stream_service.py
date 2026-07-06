@@ -512,6 +512,21 @@ def _is_voicemail_utterance(text: str | None) -> bool:
 # drop the media WS — closing immediately can clip the last words.
 _OUTRO_DRAIN_SECONDS = 2.5
 
+# Close line for questionnaire campaigns with NO authored outro. Without this a
+# completed questionnaire either hung up with dead air or — before the close
+# stopped requiring an outro at all — never closed and looped its questions.
+# Native script for hi/te (romanised text makes Sarvam TTS mispronounce).
+_DEFAULT_QUESTIONNAIRE_OUTROS = {
+    "en": "Thank you for your time. Have a great day!",
+    "hi": "आपके समय के लिए धन्यवाद। आपका दिन शुभ हो!",
+    "te": "మీ సమయానికి ధన్యవాదాలు. మీకు శుభదినం!",
+}
+
+
+def _default_questionnaire_outro(language: str | None) -> str:
+    lang = str(language or "en").split("-")[0].lower()
+    return _DEFAULT_QUESTIONNAIRE_OUTROS.get(lang, _DEFAULT_QUESTIONNAIRE_OUTROS["en"])
+
 
 def _answer_is_outro(answer: str | None, outro: str | None) -> bool:
     """True when the agent's spoken reply IS (essentially) the campaign's outro.
@@ -1330,8 +1345,11 @@ class NokvoOneVoiceStreamService:
         #      strict improvement for the LLM path — it can't miss the gate).
         #   2. all-answered: EVERY question asked AND the latest reply is a genuine
         #      answer (not a fragment / re-greeting).
-        # One-shot per call via campaign_context["_outro_ended"]; only for a
-        # deterministic questionnaire agent that has an outro configured.
+        # One-shot per call via campaign_context["_outro_ended"]. An EMPTY outro
+        # no longer disables the close (the prod loop: no outro → no close → the
+        # model cycled the questionnaire forever) — a default per-language
+        # thank-you line closes instead.
+        _intended_q: int | None = None  # the question this turn is expected to ask (LLM path tracking)
         if (
             outbound_context is not None
             and call_id
@@ -1348,20 +1366,32 @@ class NokvoOneVoiceStreamService:
                     getattr(outbound_context, "question_outro_i18n", None), _qoutro, language
                 )
             _qs = list(getattr(outbound_context, "questions", []) or [])
-            if _qoutro and _qs:
+            if _qs:
                 try:
                     from app.services.agent_outbound_context import (
                         gate_failed,
+                        next_question_to_advance,
                         questionnaire_is_complete,
+                        set_delivered_questions,
                     )
 
+                    # Install the AUTHORITATIVE delivered set for this turn — the
+                    # loop-killer. Everything downstream (this close check, the
+                    # verbatim advance, the LLM prompt's progress directive) reads
+                    # it via questionnaire_asked_state, so a question the model
+                    # paraphrased / spoke in native script / that fell out of the
+                    # history window can never flip back to "unasked".
+                    _qstate = await AgentSessionStore.get_state(tenant_res, call_id) or {}
+                    set_delivered_questions(
+                        ((_qstate.get("questionnaire_progress") or {}).get("delivered")) or []
+                    )
                     _hist = await AgentSessionStore.get_history(tenant_res, call_id)
                     if gate_failed(_qs, _hist, cleaned) or questionnaire_is_complete(_qs, _hist, cleaned):
                         campaign_context["_outro_ended"] = True
                         await NokvoOneVoiceStreamService._speak_outro_and_end(
                             websocket,
                             tenant_res,
-                            outro=_qoutro,
+                            outro=_qoutro or _default_questionnaire_outro(language),
                             language=language,
                             call_id=call_id,
                             last_user_text=cleaned,
@@ -1370,6 +1400,12 @@ class NokvoOneVoiceStreamService:
                             turn_state=turn_state,
                         )
                         return
+                    # A clean forward advance means THIS turn (verbatim or LLM) is
+                    # expected to ask exactly this question — remember it so the
+                    # LLM path can persist it as delivered once spoken.
+                    _plan = next_question_to_advance(_qs, _hist, cleaned)
+                    if _plan is not None:
+                        _intended_q = _plan[0]
                 except Exception:
                     logger.exception("NOKVO-OUTRO: deterministic close check failed")
         # ── Verbatim per-language question delivery (APEX Phase 3, flag-gated) ──
@@ -2150,6 +2186,14 @@ class NokvoOneVoiceStreamService:
             await save_memory(tenant_res, call_id, conv_memory)
             outbound_state_patch: dict[str, Any] = {}
             if outbound_context is not None and call_id:
+                # LLM-path questionnaire tracking: this turn was a clean advance,
+                # the directive told the model to ask exactly Q{_intended_q}, and
+                # the model spoke — persist it as delivered (paraphrase-proof).
+                if _intended_q and (answer or "").strip():
+                    with contextlib.suppress(Exception):
+                        await NokvoOneVoiceStreamService._persist_question_delivered(
+                            tenant_res, call_id, _intended_q
+                        )
                 updated_memory = update_outbound_memory(
                     prompt_outbound_memory or stored_outbound_memory,
                     caller_text=cleaned,
@@ -2836,11 +2880,36 @@ class NokvoOneVoiceStreamService:
             # Record it as the assistant turn so asked-tracking advances next turn.
             with contextlib.suppress(Exception):
                 await AgentSessionStore.append_turn(tenant_res, call_id, (cleaned or "").strip(), line)
+            # AUTHORITATIVE progress: persist "Q{idx} delivered" so this question
+            # can never read as unasked again (paraphrase-, language-, and
+            # history-eviction-proof — the questionnaire-loop killer).
+            with contextlib.suppress(Exception):
+                await NokvoOneVoiceStreamService._persist_question_delivered(tenant_res, call_id, idx)
             logger.info("NOKVO-VERBATIM: asked Q%d verbatim call=%s lang=%s", idx, call_id, language)
             return True
         except Exception:
             logger.exception("NOKVO-VERBATIM: verbatim question delivery failed")
             return False
+
+    @staticmethod
+    async def _persist_question_delivered(
+        tenant_res: TenantResources, call_id: str | None, number: int | None
+    ) -> None:
+        """Merge question ``number`` into the call's authoritative delivered set
+        (session state ``questionnaire_progress.delivered``) and refresh the
+        ambient contextvar so the SAME turn's later reads see it too."""
+        if not call_id or not number:
+            return
+        from app.services.agent_outbound_context import (
+            get_delivered_questions,
+            set_delivered_questions,
+        )
+
+        merged = sorted(set(get_delivered_questions()) | {int(number)})
+        set_delivered_questions(merged)
+        await AgentSessionStore.merge_state(
+            tenant_res, call_id, {"questionnaire_progress": {"delivered": merged}}
+        )
 
     @staticmethod
     async def _play_opener(

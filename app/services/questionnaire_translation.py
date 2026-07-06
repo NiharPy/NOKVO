@@ -75,14 +75,42 @@ def _parse(raw: str) -> dict[str, dict[str, str]]:
     return out
 
 
+def _floor_missing_i18n(questionnaire: dict[str, Any]) -> int:
+    """Guarantee every question (and the outro) carries a non-empty ``text_i18n``:
+    anything the translation didn't cover is floored to ``{"en": authored_text}``.
+
+    WHY: ``next_verbatim_question`` hard-requires a non-empty ``text_i18n`` — a
+    question without one silently falls back to LLM rephrasing for EVERY call,
+    which costs latency/credits AND breaks the fuzzy asked-state tracking (the
+    prod questionnaire-loop incident). A floored question is spoken verbatim in
+    the authored language; hi/te degrade via verbatim_line_for_language's
+    lang→en→authored chain. Returns how many entries were floored."""
+    floored = 0
+    for q in questionnaire.get("questions") or []:
+        text = str(q.get("text") or "").strip()
+        i18n = q.get("text_i18n")
+        if text and not (isinstance(i18n, dict) and any(i18n.values())):
+            q["text_i18n"] = {"en": text}
+            floored += 1
+    outro = str(questionnaire.get("outro") or "").strip()
+    o_i18n = questionnaire.get("outro_i18n")
+    if outro and not (isinstance(o_i18n, dict) and any(o_i18n.values())):
+        questionnaire["outro_i18n"] = {"en": outro}
+        floored += 1
+    return floored
+
+
 async def translate_questionnaire(questionnaire: dict[str, Any]) -> dict[str, Any]:
     """Fill ``text_i18n`` / ``outro_i18n`` on a questionnaire in place (and return it).
-    Best-effort + idempotent — never raises."""
+    Best-effort + idempotent — never raises. Whatever the translation outcome,
+    every entry leaves with at least a floored ``{"en": authored}`` i18n so
+    verbatim delivery always fires."""
     if not isinstance(questionnaire, dict):
         return questionnaire
     items = _collect(questionnaire)
     if not items:
         return questionnaire
+    translated: dict[str, dict[str, str]] = {}
     try:
         from app.services.llm_pool import LLMPoolClient
 
@@ -93,12 +121,19 @@ async def translate_questionnaire(questionnaire: dict[str, Any]) -> dict[str, An
             temperature=0.0,
         )
         translated = _parse(raw)
+        if not translated:
+            logger.warning(
+                "APEX-QN-I18N: model output parsed to ZERO usable rows for %d line(s)", len(items)
+            )
+        elif len(translated) < len(items):
+            logger.warning(
+                "APEX-QN-I18N: partial translation — %d of %d line(s) usable "
+                "(rows missing a language are dropped); the rest will be floored to authored text",
+                len(translated), len(items),
+            )
     except Exception:
-        logger.warning("APEX-QN-I18N: translation failed — leaving authored text", exc_info=True)
-        return questionnaire
+        logger.warning("APEX-QN-I18N: translation failed — flooring to authored text", exc_info=True)
 
-    if not translated:
-        return questionnaire
     for q in questionnaire.get("questions") or []:
         tr = translated.get(str(q.get("id") or ""))
         if tr and _needs(q, "text_i18n"):
@@ -106,5 +141,9 @@ async def translate_questionnaire(questionnaire: dict[str, Any]) -> dict[str, An
     outro_tr = translated.get("__outro__")
     if outro_tr and _needs(questionnaire, "outro_i18n"):
         questionnaire["outro_i18n"] = outro_tr
-    logger.info("APEX-QN-I18N: translated %d line(s) into en/hi/te", len(translated))
+    if translated:
+        logger.info("APEX-QN-I18N: translated %d line(s) into en/hi/te", len(translated))
+    floored = _floor_missing_i18n(questionnaire)
+    if floored:
+        logger.info("APEX-QN-I18N: floored %d untranslated line(s) to authored text", floored)
     return questionnaire

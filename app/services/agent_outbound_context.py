@@ -31,6 +31,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 import asyncio
+import contextvars
 import re
 import time
 import uuid
@@ -1179,12 +1180,49 @@ def _is_incomplete_answer(text: str) -> bool:
     return len(content) <= 3 and content[-1] in _INCOMPLETE_TAIL_WORDS
 
 
-def questionnaire_asked_state(questions: list, history: list | None) -> dict:
+# ── Authoritative per-call questionnaire progress (ambient) ─────────────────
+# The delivered-question set for the IN-FLIGHT call, installed by the voice
+# stream service at the top of each questionnaire turn (from session state) and
+# consumed by questionnaire_asked_state as its default. A contextvar — same
+# pattern as call_usage — so it threads through the 6-layer prompt-composition
+# chain without touching every signature, and stays isolated per call task.
+_delivered_q_var: contextvars.ContextVar[frozenset | None] = contextvars.ContextVar(
+    "nokvo_delivered_questions", default=None
+)
+
+
+def set_delivered_questions(numbers: Iterable | None) -> None:
+    """Install the authoritative delivered set (1-based question numbers) for
+    the current call task. Pass None/empty to clear."""
+    clean: set[int] = set()
+    for n in numbers or ():
+        try:
+            clean.add(int(n))
+        except (TypeError, ValueError):
+            continue
+    _delivered_q_var.set(frozenset(clean) if clean else frozenset())
+
+
+def get_delivered_questions() -> frozenset:
+    return _delivered_q_var.get() or frozenset()
+
+
+def questionnaire_asked_state(
+    questions: list, history: list | None, delivered: list[int] | set[int] | None = None
+) -> dict:
     """Which questionnaire questions has the agent already asked?
 
     Matches each ASSISTANT turn to its closest question by content-token overlap
     (≥0.5 of the question's content tokens present). Question numbers are 1-based
     and align with ``render_questionnaire_block`` / ``context.questions`` order.
+
+    ``delivered`` is the AUTHORITATIVE per-call set of question numbers the
+    runtime KNOWS it delivered (persisted in session state at delivery time).
+    It is unioned with the fuzzy matches, making progress MONOTONIC: a question
+    the LLM paraphrased below the match threshold, spoke in native hi/te script
+    (which tokenizes to ∅ here), or whose turn was evicted by the history cap
+    can never flip back to "unasked" — the failure mode behind the prod
+    questionnaire loop (agent re-asked Q4 then cycled Q2→Q3→… forever).
     """
     qs = questions or []
     assistant_turns = [
@@ -1211,6 +1249,18 @@ def questionnaire_asked_state(questions: list, history: list | None) -> dict:
             asked[best_i] = True
             match_counts[best_i] += 1
             last_asked = best_i + 1
+    # Union in the authoritative delivered set (1-based numbers). Explicit arg
+    # wins; otherwise the ambient per-call contextvar installed by the stream
+    # service (empty outside a questionnaire call — pure-fuzzy behavior).
+    if delivered is None:
+        delivered = _delivered_q_var.get()
+    for n in delivered or ():
+        try:
+            i = int(n) - 1
+        except (TypeError, ValueError):
+            continue
+        if 0 <= i < len(qs):
+            asked[i] = True
     return {
         "asked_count": sum(asked),
         "asked_numbers": [i + 1 for i, a in enumerate(asked) if a],
@@ -1447,19 +1497,18 @@ def _is_clarifying_question(text: str | None) -> bool:
     return bool(_CLARIFY_RE.match(t))
 
 
-def next_verbatim_question(
+def next_question_to_advance(
     questions: list, history: list | None, latest_user_text: str | None
 ) -> tuple[int, dict] | None:
-    """Decide the next questionnaire question to SPEAK VERBATIM (1-based index +
-    the question dict), or ``None`` to defer to the LLM.
+    """The next questionnaire question on a CLEAN FORWARD ADVANCE (1-based index +
+    the question dict), or ``None`` when this turn is conversational.
 
-    Mirrors :func:`_render_progress_directive`'s advance/re-ask split so scripted
-    delivery and the (fallback) LLM prompt agree on where the call is. Returns the
-    question ONLY on a clean forward advance; re-asks, non-answers, trailing-off,
-    an unanswered final intent, a clarifying question, or an off-script reply all
-    return ``None`` so the LLM handles that (conversational) turn. Requires the
-    target question to carry ``text_i18n`` — without it there's nothing to serve
-    verbatim."""
+    Mirrors :func:`_render_progress_directive`'s advance/re-ask split. Re-asks,
+    non-answers, trailing-off, an unanswered final intent, a clarifying question,
+    or an off-script reply all return ``None`` — the LLM handles those turns.
+    This is the i18n-agnostic advance decision: the verbatim path layers the
+    ``text_i18n`` requirement on top, and the LLM path uses it to know which
+    question the model is being told to ask (for authoritative asked-tracking)."""
     qs = questions or []
     if not qs:
         return None
@@ -1483,10 +1532,22 @@ def next_verbatim_question(
         return None  # re-ask / clarify is a conversational (LLM) turn
     if next_n is None or next_n < 1 or next_n > len(qs):
         return None  # all asked → the outro/close path takes over
-    q = qs[next_n - 1] or {}
+    return next_n, (qs[next_n - 1] or {})
+
+
+def next_verbatim_question(
+    questions: list, history: list | None, latest_user_text: str | None
+) -> tuple[int, dict] | None:
+    """:func:`next_question_to_advance` plus the verbatim requirement: the target
+    question must carry ``text_i18n`` — without it there's nothing to serve
+    verbatim and the turn falls back to the LLM-rephrase flow."""
+    plan = next_question_to_advance(questions, history, latest_user_text)
+    if plan is None:
+        return None
+    _n, q = plan
     if not isinstance(q.get("text_i18n"), dict) or not q.get("text_i18n"):
         return None  # not pre-translated → fall back to the LLM-rephrase flow
-    return next_n, q
+    return plan
 
 
 def verbatim_line_for_language(i18n: dict | None, fallback: str, language: str | None) -> str:

@@ -4291,7 +4291,10 @@ class NokvoOneVoicePipeline:
                 user_text,
                 tenant_res=tenant_res,
                 history=history,
-                timeout_ms=500,
+                # The classifier's measured latency is 1.5-2.4s (non-streaming;
+                # on a reasoning-model fallback it can NEVER finish in 500ms —
+                # the hardcoded 500 here timed out on EVERY turn in prod).
+                timeout_ms=int(settings.NOKVO_INTENT_CLASSIFIER_TIMEOUT_MS or 2500),
             )
         except Exception as exc:
             logger.warning(f"NOKVO-DIGRESSION: classifier failed: {exc!r}")
