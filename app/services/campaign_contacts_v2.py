@@ -39,6 +39,8 @@ BUCKET_SQL: dict[str, str] = {
     "not_interested": "status = 'completed' AND qualified = false",
     "no_pickup": "status IN ('no_answer', 'failed', 'dnd_dropped')",
     "pending": "status IN ('pending', 'dialing', 'ringing', 'answered')",
+    # Call Logs: every contact a call was actually PLACED for (any outcome).
+    "dialed": "call_id IS NOT NULL",
 }
 _LIVE_STATUSES = ("dialing", "ringing", "answered")
 
@@ -434,7 +436,10 @@ async def page_contacts(db, campaign_id: uuid.UUID, bucket: str, *, cursor: str 
         cur = " AND id > :cursor"
         params["cursor"] = cursor
     rows = (await db.execute(
-        text(f"SELECT id, phone, name, status, lead_score, qualified, result "
+        # call_link_id is the transcript/ledger join key (the internal call id);
+        # call_id is Plivo's placement uuid — the Call Logs tab needs both.
+        text(f"SELECT id, phone, name, status, lead_score, qualified, result, "
+             f"call_id, call_link_id, answered_at, duration_s "
              f"FROM outbound_campaign_contacts "
              f"WHERE campaign_id = :c AND ({pred}){cur} ORDER BY id LIMIT :lim"),
         params,

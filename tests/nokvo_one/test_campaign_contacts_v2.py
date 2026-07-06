@@ -185,3 +185,36 @@ async def test_migrate_empty_blob_just_nulls():
     assert camp.contacts is None
     assert camp.total_count == 5
     assert db.committed
+
+
+def test_dialed_bucket_selects_placed_contacts():
+    """Call Logs reads the 'dialed' bucket — every contact a call was PLACED for.
+    Without it the APEX Call Logs tab (which used to read the empty V2 blob)
+    showed zero calls forever."""
+    assert v2.BUCKET_SQL["dialed"] == "call_id IS NOT NULL"
+
+
+@pytest.mark.asyncio
+async def test_page_contacts_returns_call_identity_columns():
+    """The page SELECT must carry call_link_id (the transcript/ledger join key)
+    and call_id/answered_at/duration_s for the Call Logs rows."""
+    captured = {}
+
+    class _R:
+        def mappings(self):
+            return self
+
+        def all(self):
+            return []
+
+    class _DB:
+        async def execute(self, stmt, params=None):
+            captured["sql"] = str(stmt)
+            return _R()
+
+    import uuid as _uuid
+
+    await v2.page_contacts(_DB(), _uuid.uuid4(), "dialed", limit=10)
+    for col in ("call_link_id", "call_id", "answered_at", "duration_s"):
+        assert col in captured["sql"], captured["sql"]
+    assert "call_id IS NOT NULL" in captured["sql"]

@@ -1,23 +1,62 @@
 <script setup>
-// APEX Call Logs — each dialed contact (call_id present) + its transcript.
-import { inject, ref, computed } from 'vue';
+// APEX Call Logs — each dialed contact + its transcript.
+// V2 campaigns keep contacts in per-row storage (the inline blob is empty), so
+// rows come from the paginated /contacts endpoint's "dialed" bucket; legacy
+// blob campaigns keep reading inline. Transcripts are keyed by call_link_id
+// (the internal call id) — NOT Plivo's call_id.
+import { inject, ref, computed, onMounted, watch } from 'vue';
 
 const apex = inject('apex');
 const filter = ref(null);
-const selected = ref(null); // { call_id, name, phone, status, time }
+const selected = ref(null); // { call_link_id, call_id, name, phone, status, time }
 const transcript = ref(null);
 const loadingT = ref(false);
+const v2Rows = ref([]);       // dialed rows fetched for V2 campaigns
+const loadingRows = ref(false);
 
 const scoped = computed(() => {
   const all = apex.deterministicCampaigns.value;
   return filter.value ? all.filter((c) => String(c.id) === String(filter.value)) : all;
 });
+
+async function loadV2Rows() {
+  const v2Camps = scoped.value.filter((c) => c.v2);
+  if (!v2Camps.length) { v2Rows.value = []; return; }
+  loadingRows.value = true;
+  try {
+    const batches = await Promise.all(v2Camps.map(async (c) => {
+      try {
+        const data = await apex.fetchCampaignContacts(c.id, 'dialed', null, 200);
+        return (data?.rows || []).map((r) => ({ ...r, _campaign: c.name }));
+      } catch { return []; }
+    }));
+    v2Rows.value = batches.flat();
+  } finally {
+    loadingRows.value = false;
+  }
+}
+onMounted(loadV2Rows);
+watch([filter, () => apex.deterministicCampaigns.value], loadV2Rows);
+
 const calls = computed(() => {
   const rows = [];
+  for (const r of v2Rows.value) {
+    rows.push({
+      call_link_id: r.call_link_id,
+      call_id: r.call_id,
+      name: r.name || r.phone,
+      phone: r.phone,
+      status: r.status,
+      answered_at: r.answered_at,
+      time: r.answered_at ? new Date(r.answered_at).toLocaleString('en-IN') : '—',
+    });
+  }
   for (const c of scoped.value) {
+    if (c.v2) continue; // covered above
     for (const ct of c.contacts || []) {
       if (!ct.call_id) continue;
       rows.push({
+        call_link_id: ct.call_link_id,
         call_id: ct.call_id,
         name: ct.name || ct.phone,
         phone: ct.phone,
@@ -31,8 +70,8 @@ const calls = computed(() => {
 });
 
 function statusType(s) {
-  if (s === 'answered') return 'pos';
-  if (s === 'calling') return 'live';
+  if (s === 'answered' || s === 'completed') return 'pos';
+  if (s === 'calling' || s === 'ringing' || s === 'dialing') return 'live';
   return 'neg';
 }
 
@@ -41,7 +80,9 @@ async function open(row) {
   transcript.value = null;
   loadingT.value = true;
   try {
-    const data = await apex.fetchTranscript(row.call_id);
+    // Transcripts are stored under the INTERNAL call id (= call_link_id for
+    // outbound). Plivo's call_id is only a fallback for ancient rows.
+    const data = await apex.fetchTranscript(row.call_link_id || row.call_id);
     // Normalize: API returns { turns:[{role,content}] } or { transcript:[...] }.
     const turns = data?.turns || data?.transcript || data?.lines || [];
     transcript.value = turns.map((t) => ({
@@ -66,8 +107,9 @@ async function open(row) {
 
     <div class="ax-logs">
       <div class="ax-logs-list">
-        <div v-if="!calls.length" class="ax-empty"><div class="ax-empty-icon">☎</div><p class="ax-empty-text">No calls yet for these campaigns.</p></div>
-        <button v-for="row in calls" :key="row.call_id" type="button" class="ax-call" :class="{ 'is-active': selected && selected.call_id === row.call_id }" @click="open(row)">
+        <div v-if="loadingRows && !calls.length" class="ax-empty"><p class="ax-empty-text">Loading calls…</p></div>
+        <div v-else-if="!calls.length" class="ax-empty"><div class="ax-empty-icon">☎</div><p class="ax-empty-text">No calls yet for these campaigns.</p></div>
+        <button v-for="row in calls" :key="row.call_link_id || row.call_id" type="button" class="ax-call" :class="{ 'is-active': selected && (selected.call_link_id || selected.call_id) === (row.call_link_id || row.call_id) }" @click="open(row)">
           <div style="display:flex;justify-content:space-between;align-items:center;">
             <span style="font-size:15px;font-weight:600;">{{ row.name }}</span>
             <span class="ax-spill" :class="`is-${statusType(row.status)}`">{{ row.status }}</span>
