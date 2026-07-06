@@ -236,8 +236,14 @@ class LLMPool:
 
     @staticmethod
     def _window_key(key_id: str, *, pool: str = "mini", now: float | None = None) -> str:
+        # The {braces} are a Redis Cluster HASH TAG: only the constant prefix is
+        # hashed, so every member's budget key lands in the SAME slot and the
+        # multi-key _RESERVE_LUA eval stays legal on clustered Redis. Without it,
+        # the moment the pool grew to 2+ members every reserve failed with
+        # ClusterCrossSlotError (swallowed → permanent "pool saturated" fallback,
+        # no TPM budgeting, no 429 failover). Single-key ops are unaffected.
         minute = int((now if now is not None else time.time()) // settings.LLM_POOL_WINDOW_SECONDS)
-        return f"{_BUDGET_PREFIX}:{pool}:{key_id}:{minute}"
+        return f"{{{_BUDGET_PREFIX}}}:{pool}:{key_id}:{minute}"
 
     # ── budget ops ─────────────────────────────────────────────────────────────
     @classmethod

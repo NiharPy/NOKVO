@@ -181,3 +181,55 @@ async def test_reap_noop_when_nothing_stale():
     db = _ReapDB(placing_ids=[], answered_ids=[])
     assert await v2.reap_stale_rows(db) == []
     assert db.committed
+
+
+# ── delete orphans follow-up schedules (the FK that 500'd deletes) ───────────
+
+class _DeleteDB:
+    def __init__(self):
+        self.sql = []
+        self.deleted = []
+        self.committed = False
+
+    async def execute(self, stmt, params=None):
+        self.sql.append(str(stmt))
+
+        class _R:
+            def scalars(self):
+                return self
+
+            def all(self):
+                return []  # no contact rows in this unit
+
+        return _R()
+
+    async def delete(self, obj):
+        self.deleted.append(obj)
+
+    async def commit(self):
+        self.committed = True
+
+
+@pytest.mark.asyncio
+async def test_delete_campaign_nulls_followup_schedule_fk():
+    """lead_followup_schedules.campaign_id has a FK with no CASCADE; deleting a
+    campaign that had follow-up rows raised IntegrityError → 500. The delete
+    must orphan those rows (NULL the fk) before removing the campaign."""
+    from app.models.outbound_campaign import CampaignStatus, OutboundCampaign
+
+    camp = OutboundCampaign(tenant_id="t1", name="del-me", status=CampaignStatus.completed)
+    db = _DeleteDB()
+    await OutboundCampaignService.delete_campaign(camp, db)
+    assert any(
+        "lead_followup_schedules" in s and "campaign_id = NULL" in s for s in db.sql
+    ), db.sql
+    assert db.deleted == [camp] and db.committed
+
+
+@pytest.mark.asyncio
+async def test_delete_campaign_still_refuses_running():
+    from app.models.outbound_campaign import CampaignStatus, OutboundCampaign
+
+    camp = OutboundCampaign(tenant_id="t1", name="live", status=CampaignStatus.running)
+    with pytest.raises(ValueError, match="Cancel the campaign"):
+        await OutboundCampaignService.delete_campaign(camp, _DeleteDB())

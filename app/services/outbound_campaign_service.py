@@ -802,6 +802,10 @@ class OutboundCampaignService:
         Contacts (``outbound_campaign_contacts``) have a FK to the campaign
         without ON DELETE CASCADE, so they must be removed first. The actual
         ``OutgoingLead`` rows are NOT touched — leads outlive campaigns.
+        ``lead_followup_schedules.campaign_id`` (nullable FK, no CASCADE) is
+        NULLed rather than deleted — follow-ups may outlive their campaign;
+        leaving it referenced was the FK violation that 500'd every delete of
+        a campaign that had follow-up rows.
 
         Cost-ledger rows reference ``campaign_id`` but as a nullable index
         (no FK), so they remain intact as a billing audit trail.
@@ -819,6 +823,15 @@ class OutboundCampaignService:
         )
         for row in contacts.scalars().all():
             await db.delete(row)
+
+        # Orphan (don't delete) the follow-up schedules that point at this
+        # campaign — the column is nullable by design.
+        await db.execute(
+            _sql_text(
+                "UPDATE lead_followup_schedules SET campaign_id = NULL WHERE campaign_id = :c"
+            ),
+            {"c": str(campaign.id)},
+        )
 
         await db.delete(campaign)
         await db.commit()

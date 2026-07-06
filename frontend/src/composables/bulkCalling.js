@@ -174,7 +174,10 @@ export function countCsvRows(file) {
 }
 
 // ── Questionnaire helpers + create-campaign payload ──────────────────────────
-const clampPts = (v) => Math.max(1, Math.min(100, Math.round(Number(v) || 1)));
+// Points are the admin's own weighting scheme — the ceiling is fat-finger
+// insurance only, NOT a product rule (a 200-pt dealbreaker question is
+// legitimate; the old 100 cap silently corrupted scores and thresholds).
+const clampPts = (v) => Math.max(1, Math.min(10000, Math.round(Number(v) || 1)));
 
 export function makeId(prefix) {
   return (

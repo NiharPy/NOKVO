@@ -50,6 +50,7 @@ from fastapi import (
 from fastapi.responses import PlainTextResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -2691,7 +2692,10 @@ async def launch_campaign(
 @router.post("/campaigns/{campaign_id}/cancel")
 async def cancel_campaign(
     campaign_id: uuid.UUID,
-    user: OrganizationUser = Depends(_admin_dep()),
+    # _bulk_admin_dep (NOT _admin_dep): cancel is part of the shared bulk-calling
+    # surface — the APEX ■ Stop button calls it, and _admin_dep's nokvo_one-only
+    # tier gate 403'd every APEX org before role/MFA were even checked.
+    user: OrganizationUser = Depends(_bulk_admin_dep()),
     _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
     db: AsyncSession = Depends(deps.get_db),
 ):
@@ -2750,6 +2754,16 @@ async def delete_campaign(
         await OutboundCampaignService.delete_campaign(campaign, db)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=_safe_detail(exc)) from exc
+    except IntegrityError as exc:
+        # A row somewhere still references the campaign (a FK this delete path
+        # doesn't know about yet). Surface a readable 409 instead of a 500 and
+        # leave the campaign intact for diagnosis.
+        await db.rollback()
+        logger.exception("NOKVO-CAMPAIGN: delete blocked by a foreign key (campaign=%s)", campaign_id)
+        raise HTTPException(
+            status_code=409,
+            detail="This campaign still has linked records and can't be deleted. Contact support.",
+        ) from exc
     return None
 
 

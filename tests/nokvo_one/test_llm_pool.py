@@ -220,3 +220,21 @@ def test_pipeline_resolves_llm_from_pool(pool):
         assert member.endpoint in url and "/chat/completions?api-version=" in url
         assert body["messages"] and "max_tokens" in body
     _run(go())
+
+
+def test_window_keys_share_a_cluster_hash_slot_tag():
+    """All members' budget keys must carry the SAME {hash tag} so the multi-key
+    _RESERVE_LUA eval is legal on clustered Redis. Without the braces, adding a
+    second pool member made every reserve throw ClusterCrossSlotError (swallowed
+    → permanent 'pool saturated' fallback, no TPM budgeting)."""
+    import re
+
+    from app.services.llm_pool import LLMPool
+
+    k1 = LLMPool._window_key("test-resource", pool="mini", now=1_783_000_000.0)
+    k2 = LLMPool._window_key("llmnihar", pool="mini", now=1_783_000_000.0)
+    tag = re.match(r"^\{[^}]+\}", k1)
+    assert tag, f"budget key has no hash tag: {k1}"
+    assert k2.startswith(tag.group(0)), (k1, k2)
+    # Distinct members still get distinct keys within the slot.
+    assert k1 != k2
