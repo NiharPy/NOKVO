@@ -1980,8 +1980,10 @@ def _campaign_response(c: OutboundCampaign) -> dict[str, Any]:
         "contacts": c.contacts or [],
         # Per-row (V2) storage vs the legacy inline blob. When true the UI reads
         # counts from /summary and rows from the paginated /contacts endpoint
-        # instead of the (now-empty) inline ``contacts`` array.
-        "v2": c.contacts is None,
+        # instead of the (now-empty) inline ``contacts`` array. ``not contacts``
+        # (not ``is None``): an EMPTY blob is V2 residue, not a legacy campaign —
+        # flagging it legacy made the UI read the empty array and show nothing.
+        "v2": not c.contacts,
         "agent_config": c.agent_config or {},
         # Numbers removed from the dial list because they're on the DND/NCPR
         # register (bulk CSV campaigns only). Empty when nothing was scrubbed.

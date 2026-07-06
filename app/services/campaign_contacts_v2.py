@@ -177,6 +177,91 @@ async def update_status_by_link(db, call_link_id: str, status: str, **fields: An
     return (res.rowcount or 0) > 0
 
 
+def _blob_row_status(ct: dict) -> str:
+    """Map a legacy blob contact's state onto the V2 status vocabulary.
+    Answered contacts are never re-dialed; in-flight placements stay live (the
+    stale-row reaper resolves them if their webhook never lands)."""
+    s = str(ct.get("status") or "pending")
+    ended = bool(ct.get("ended"))
+    if s == "answered":
+        return "completed" if ended else "answered"
+    if s in ("completed", "no_answer", "failed", "dnd_dropped", "pending"):
+        return s
+    if s in ("calling", "dialing", "ringing"):
+        return "no_answer" if ended else "ringing"
+    return "no_answer" if ct.get("call_id") else "pending"
+
+
+async def migrate_blob_campaign(db, campaign) -> int:
+    """ONE-WAY upgrade of a legacy blob campaign to the per-row store, so it can
+    accept CSV appends / rerun / claims through the V2 paths. Copies every blob
+    contact into ``outbound_campaign_contacts`` (statuses mapped, call_link_id +
+    claim state + score preserved, extras parked in ``result``), then NULLs the
+    blob — the campaign reads as V2 everywhere from here on. Idempotent-ish:
+    ON CONFLICT DO NOTHING skips contacts that already have a row (either
+    constraint), and an empty blob just NULLs. Returns rows inserted."""
+    from app.services.outbound_campaign_service import _canonical_phone
+
+    blob = list(campaign.contacts or [])
+    inserted = 0
+    _row_cols = ("phone", "name", "status", "call_id", "call_link_id", "duration_s",
+                 "answered_at", "lead_score", "qualified", "claimed_by", "claimed_at")
+    for ct in blob:
+        if not isinstance(ct, dict):
+            continue
+        phone = _canonical_phone(ct.get("phone")) or str(ct.get("phone") or "").strip()
+        if not phone:
+            continue
+        result = {k: v for k, v in ct.items() if k not in _row_cols and k != "ended"}
+        lead_score = ct.get("lead_score")
+        try:
+            lead_score = int(lead_score) if lead_score is not None else None
+        except (TypeError, ValueError):
+            lead_score = None
+        res = await db.execute(
+            text(
+                "INSERT INTO outbound_campaign_contacts "
+                "(id, campaign_id, phone, name, call_link_id, status, attempt, call_id, "
+                " answered_at, duration_s, lead_score, qualified, claimed_by, claimed_at, result, snapshot) "
+                "VALUES (:id, :cid, :phone, :name, :clid, :status, :attempt, :call_id, "
+                " CAST(:answered_at AS timestamptz), :duration_s, :lead_score, :qualified, "
+                " CAST(:claimed_by AS uuid), CAST(:claimed_at AS timestamptz), "
+                " CAST(:result AS jsonb), '{}'::jsonb) "
+                "ON CONFLICT DO NOTHING"
+            ),
+            {
+                "id": uuid.uuid4(), "cid": str(campaign.id), "phone": phone,
+                "name": ct.get("name") or None,
+                "clid": str(ct.get("call_link_id") or uuid.uuid4()),
+                "status": _blob_row_status(ct),
+                "attempt": 1 if ct.get("call_id") else 0,
+                "call_id": ct.get("call_id"),
+                "answered_at": ct.get("answered_at") or None,
+                "duration_s": ct.get("duration_s"),
+                "lead_score": lead_score,
+                "qualified": bool(ct.get("qualified")) or ct.get("interest_outcome") == "interested",
+                "claimed_by": str(ct["claimed_by"]) if ct.get("claimed_by") else None,
+                "claimed_at": ct.get("claimed_at") or None,
+                "result": json.dumps(result, default=str),
+            },
+        )
+        inserted += int(res.rowcount or 0)
+    campaign.contacts = None
+    total = (await db.execute(
+        text("SELECT count(*) FROM outbound_campaign_contacts WHERE campaign_id = :c"),
+        {"c": str(campaign.id)},
+    )).scalar_one()
+    campaign.total_count = int(total)
+    db.add(campaign)
+    await db.commit()
+    if blob:
+        logger.info(
+            "NOKVO-MIGRATE-V2: campaign %s blob → rows (%d in blob, %d inserted, %d total)",
+            campaign.id, len(blob), inserted, total,
+        )
+    return inserted
+
+
 async def rearm_unreached(db, campaign_id: uuid.UUID) -> int:
     """Re-arm every unreached terminal row for a re-run: ``no_answer``/``failed``
     → ``pending`` with a FRESH ``call_link_id`` (so a stale webhook from the

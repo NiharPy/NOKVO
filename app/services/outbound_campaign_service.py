@@ -1139,8 +1139,10 @@ class OutboundCampaignService:
         # not the blob — re-arm the unreached rows (no_answer/failed → pending,
         # fresh call_link_ids) and resume. This is also the re-run a just-appended
         # CSV takes: the new rows are already pending, so it resumes dialing them
-        # alongside any re-armed misses. Answered/completed rows stay untouched. ──
-        if settings.CAMPAIGN_CONTACTS_V2 and campaign.contacts is None:
+        # alongside any re-armed misses. Answered/completed rows stay untouched.
+        # ``not contacts`` (not ``is None``): an EMPTY blob is a V2 campaign too —
+        # its rows are the store, the [] is stray legacy residue. ──
+        if settings.CAMPAIGN_CONTACTS_V2 and not campaign.contacts:
             if campaign.status == CampaignStatus.cancelled:
                 raise ValueError("This campaign was cancelled — create a new one instead.")
             from app.services import campaign_contacts_v2 as v2
@@ -1446,11 +1448,18 @@ class OutboundCampaignService:
         background."""
         if campaign.status == CampaignStatus.cancelled:
             raise ValueError("This campaign was cancelled — create a new one instead.")
-        if not settings.CAMPAIGN_CONTACTS_V2 or campaign.contacts is not None:
+        if not settings.CAMPAIGN_CONTACTS_V2:
             raise ValueError(
                 "Adding contacts to this campaign isn't supported. Create a new bulk "
                 "campaign with the combined list."
             )
+        if campaign.contacts is not None:
+            # Legacy/empty blob → ONE-WAY upgrade into the per-row store so the
+            # exhausted campaign can accept new contacts and resume dialing
+            # (rather than telling the user to rebuild the whole campaign).
+            from app.services import campaign_contacts_v2 as v2
+
+            await v2.migrate_blob_campaign(db, campaign)
         # Appending resumes THIS campaign to running, so it too must respect the
         # tenant's single active slot (another campaign mid-flight → 409).
         await OutboundCampaignService._assert_no_other_active_campaign(
