@@ -165,6 +165,26 @@ async function rerun(id) {
   }
 }
 
+// Stop a running/ingesting campaign: dialing halts (in-flight calls finish),
+// the one-campaign slot frees, results are kept. Cancelled ≠ deleted — the
+// campaign stays in the list read-only; it can't be resumed or re-run.
+const stopping = ref(null);
+async function stop(id, name) {
+  if (!id || stopping.value) return;
+  if (!window.confirm(`Stop campaign "${name || 'this campaign'}"? Remaining contacts won't be dialed and it can't be resumed. Calls in progress finish, and everything captured so far is kept.`)) return;
+  stopping.value = id;
+  errorMsg.value = ''; notice.value = '';
+  try {
+    await apex.cancelCampaign(id);
+    notice.value = 'Campaign stopped — your campaign slot is free.';
+    await apex.reload();
+  } catch (e) {
+    errorMsg.value = apex.extractError(e, 'Could not stop the campaign.');
+  } finally {
+    stopping.value = null;
+  }
+}
+
 const deleting = ref(null);
 async function remove(id, name) {
   if (!id || deleting.value) return;
@@ -358,11 +378,14 @@ async function onAddFile(e) {
           <span style="color:rgba(255,255,255,0.55);">{{ c.total_count || 0 }} dialed</span>
           <span v-if="counts(c).successful" style="color:#7FD9A8;">{{ counts(c).successful }} qualified</span>
           <span v-if="counts(c).no_pickup" style="color:#E62630;">{{ counts(c).no_pickup }} missed</span>
-          <button v-if="redialCount(c) > 0" type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" :disabled="rerunning === c.id" @click="rerun(c.id)">
+          <button v-if="redialCount(c) > 0 && c.status !== 'cancelled'" type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" :disabled="rerunning === c.id" @click="rerun(c.id)">
             ↻ {{ rerunning === c.id ? 'Re-running…' : `Re-run (${redialCount(c)})` }}
           </button>
-          <button type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" :disabled="addingTo === c.id || c.status === 'ingesting'" @click="pickAddCsv(c.id)" title="Add a CSV of new numbers and resume dialing">
+          <button v-if="c.status !== 'cancelled'" type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" :disabled="addingTo === c.id || c.status === 'ingesting'" @click="pickAddCsv(c.id)" title="Add a CSV of new numbers and resume dialing">
             {{ addingTo === c.id ? 'Adding…' : '＋ Add CSV' }}
+          </button>
+          <button v-if="c.status === 'running' || c.status === 'ingesting'" type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm ax-camp-del" :disabled="stopping === c.id" @click="stop(c.id, c.name)" title="Stop dialing — in-flight calls finish, results are kept">
+            {{ stopping === c.id ? 'Stopping…' : '■ Stop' }}
           </button>
           <button type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm ax-camp-del" :disabled="deleting === c.id" @click="remove(c.id, c.name)" title="Delete campaign">
             {{ deleting === c.id ? 'Deleting…' : '🗑 Delete' }}

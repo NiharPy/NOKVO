@@ -773,7 +773,14 @@ class OutboundCampaignService:
     async def cancel_campaign(
         campaign: OutboundCampaign, db: AsyncSession
     ) -> OutboundCampaign:
-        if campaign.status not in (CampaignStatus.draft, CampaignStatus.running):
+        """Stop a campaign: no further contacts are dialed (in-flight calls
+        finish — webhook refills check status), and the tenant's one-campaign
+        slot frees immediately. ``ingesting`` is cancellable too — a big upload
+        holds the slot, so it needs a way out; the background ingest completion
+        respects the cancelled status (guarded UPDATE in _ingest_and_dial_v2)."""
+        if campaign.status not in (
+            CampaignStatus.draft, CampaignStatus.running, CampaignStatus.ingesting
+        ):
             raise ValueError(f"Cannot cancel a campaign with status '{campaign.status}'.")
         campaign.status = CampaignStatus.cancelled
         campaign.completed_at = datetime.now(timezone.utc)
@@ -1357,8 +1364,10 @@ class OutboundCampaignService:
                 else:
                     await db.execute(
                         _sql_text(
+                            # NEVER resurrect a campaign the user cancelled mid-ingest.
                             "UPDATE outbound_campaigns SET total_count = :n, status = "
-                            "CASE WHEN :n > 0 THEN 'running' ELSE 'completed' END WHERE id = :c"
+                            "CASE WHEN status = 'cancelled' THEN status "
+                            "WHEN :n > 0 THEN 'running' ELSE 'completed' END WHERE id = :c"
                         ),
                         {"n": inserted, "c": str(campaign_id)},
                     )
@@ -1390,7 +1399,13 @@ class OutboundCampaignService:
                 tenant_res = (
                     await db.execute(select(TenantResources).where(TenantResources.tenant_id == tenant_id))
                 ).scalars().first()
-                if campaign is not None and tenant_res is not None:
+                # Only kick a campaign that's still running — cancelled mid-ingest
+                # must stay silent (this path bypasses dial_next_pending's check).
+                if (
+                    campaign is not None
+                    and tenant_res is not None
+                    and campaign.status == CampaignStatus.running
+                ):
                     await OutboundCampaignService._dial_pending(
                         campaign, db, tenant_res=tenant_res, base=base, prefix=prefix
                     )

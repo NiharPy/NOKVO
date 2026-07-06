@@ -171,6 +171,14 @@ export async function addCampaignContacts(campaignId, file) {
   return data;
 }
 
+// Stop a running/ingesting campaign: no further contacts are dialed (in-flight
+// calls finish) and the account's one-campaign slot frees immediately. A
+// cancelled campaign can't be resumed or re-run — its leads/results are kept.
+export async function cancelCampaign(campaignId) {
+  const { data } = await agentsApi.post(`/campaigns/${campaignId}/cancel`, {}, { headers: authHeader() });
+  return data;
+}
+
 // Hard-delete a campaign (org-scoped; APEX only ever deletes its own). Running
 // campaigns are protected server-side → 409, surfaced to the user.
 export async function deleteCampaign(campaignId) {

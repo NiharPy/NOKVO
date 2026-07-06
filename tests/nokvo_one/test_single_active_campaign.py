@@ -95,3 +95,42 @@ async def test_maybe_complete_leaves_non_running_statuses_alone():
     # Drained but the guarded UPDATE matched nothing (e.g. cancelled) → False.
     db = _CompleteDB(remaining=0, update_rowcount=0)
     assert await v2.maybe_complete(db, "c1") is False
+
+
+# ── cancel frees the slot ─────────────────────────────────────────────────────
+
+class _CancelDB:
+    def __init__(self):
+        self.committed = False
+
+    def add(self, obj):
+        pass
+
+    async def commit(self):
+        self.committed = True
+
+    async def refresh(self, obj):
+        pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_name", ["draft", "running", "ingesting"])
+async def test_cancel_allowed_for_active_statuses(status_name):
+    from app.models.outbound_campaign import CampaignStatus, OutboundCampaign
+
+    camp = OutboundCampaign(tenant_id="t1", name="c", status=getattr(CampaignStatus, status_name))
+    db = _CancelDB()
+    out = await OutboundCampaignService.cancel_campaign(camp, db)
+    assert out.status == CampaignStatus.cancelled
+    assert out.completed_at is not None
+    assert db.committed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_name", ["completed", "cancelled", "failed", "ingest_failed"])
+async def test_cancel_refused_for_terminal_statuses(status_name):
+    from app.models.outbound_campaign import CampaignStatus, OutboundCampaign
+
+    camp = OutboundCampaign(tenant_id="t1", name="c", status=getattr(CampaignStatus, status_name))
+    with pytest.raises(ValueError, match="Cannot cancel"):
+        await OutboundCampaignService.cancel_campaign(camp, _CancelDB())
