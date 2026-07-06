@@ -57,6 +57,12 @@ const bypassPlan = ref('inbound_only');
 const feedbackView = ref(false);
 const feedback = ref([]);
 const feedbackLoading = ref(false);
+// APEX support tickets (raised in-product via Nova)
+const ticketsView = ref(false);
+const tickets = ref([]);
+const ticketsLoading = ref(false);
+const ticketBusy = ref('');
+const ticketDetail = ref(null); // expanded row (shows description + diagnosis)
 
 const todoView = ref(false);
 const todos = ref([]);
@@ -112,8 +118,45 @@ const view = computed(() => {
   if (broadcastView.value) return 'broadcast';
   if (todoView.value) return 'todos';
   if (feedbackView.value) return 'feedback';
+  if (ticketsView.value) return 'tickets';
   return detail.value ? 'detail' : 'list';
 });
+
+// ── APEX support tickets ────────────────────────────────────
+const loadTickets = async () => {
+  ticketsLoading.value = true;
+  errorMsg.value = '';
+  try {
+    const res = await fetch(`${SUPERADMIN_API_BASE}/tenants/apex-tickets`, { headers: authHeaders() });
+    if (res.status === 401) { emit('logout'); return; }
+    if (!res.ok) { errorMsg.value = `Failed to load tickets (${res.status}).`; return; }
+    tickets.value = (await res.json()).items || [];
+  } catch (e) {
+    errorMsg.value = 'Could not reach the server.';
+  } finally {
+    ticketsLoading.value = false;
+  }
+};
+const openTickets = () => { detail.value = null; feedbackView.value = false; todoView.value = false; ticketsView.value = true; loadTickets(); };
+const closeTickets = () => { ticketsView.value = false; ticketDetail.value = null; };
+const setTicketStatus = async (t, status) => {
+  if (ticketBusy.value) return;
+  ticketBusy.value = t.id;
+  errorMsg.value = '';
+  try {
+    const res = await fetch(`${SUPERADMIN_API_BASE}/tenants/apex-tickets/${t.id}`, {
+      method: 'PATCH',
+      headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status }),
+    });
+    if (!res.ok) { errorMsg.value = `Failed to update ticket (${res.status}).`; return; }
+    t.status = status;
+  } catch (e) {
+    errorMsg.value = 'Could not reach the server.';
+  } finally {
+    ticketBusy.value = '';
+  }
+};
 
 const loadFeedback = async () => {
   feedbackLoading.value = true;
@@ -809,14 +852,15 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
         </div>
       </div>
       <div class="header-actions">
-        <template v-if="view === 'feedback' || view === 'todos' || view === 'broadcast' || view === 'langsmith' || view === 'llm' || view === 'bulk'">
-          <button class="ghost-btn" @click="closeFeedback(); closeTodos(); closeBroadcast(); closeLangsmith(); closeLlm(); closeBulk();">← TENANTS</button>
+        <template v-if="view === 'feedback' || view === 'todos' || view === 'broadcast' || view === 'langsmith' || view === 'llm' || view === 'bulk' || view === 'tickets'">
+          <button class="ghost-btn" @click="closeFeedback(); closeTodos(); closeBroadcast(); closeLangsmith(); closeLlm(); closeBulk(); closeTickets();">← TENANTS</button>
         </template>
         <template v-else>
           <button class="ghost-btn" @click="openLlm">LLM KEYS</button>
           <button class="ghost-btn" @click="openLangsmith">LANGSMITH</button>
           <button class="ghost-btn" @click="openBroadcast">BROADCAST</button>
           <button class="ghost-btn" @click="openFeedback">FEEDBACK</button>
+          <button class="ghost-btn" @click="openTickets">TICKETS</button>
           <button class="ghost-btn" @click="openBulk">BULK CALLING</button>
           <button class="ghost-btn" @click="openTodos">TO-DO</button>
         </template>
@@ -1117,6 +1161,55 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
         </div>
         <div v-else-if="!feedbackLoading" class="empty-orgs"><p>No feedback submitted yet.</p></div>
         <div v-else class="empty-orgs"><p>Loading feedback…</p></div>
+      </div>
+
+      <!-- ── APEX SUPPORT TICKETS (raised via Nova) ──────────────── -->
+      <div v-else-if="view === 'tickets'" key="tickets" class="dashboard-content">
+        <div class="orgs-panel-header">
+          <div>
+            <span class="stage-eyebrow">APEX SUPPORT</span>
+            <h3>Tickets</h3>
+          </div>
+          <button type="button" class="ghost-btn" :disabled="ticketsLoading" @click="loadTickets">
+            <RefreshCw :size="14" :class="{ spin: ticketsLoading }" />
+            REFRESH
+          </button>
+        </div>
+        <div v-if="tickets.length" class="table-wrap">
+          <table class="org-table">
+            <thead>
+              <tr>
+                <th>Date</th><th>Organization</th><th>Raised by</th><th>Subject</th><th>Status</th><th></th>
+              </tr>
+            </thead>
+            <tbody>
+              <template v-for="t in tickets" :key="t.id">
+                <tr>
+                  <td>{{ fmtDate(t.created_at) }}</td>
+                  <td>{{ t.organization_name }} <span class="plan-pill plan-apex">APEX</span></td>
+                  <td>{{ t.requested_by_email }}</td>
+                  <td class="fb-msg">{{ t.subject }}</td>
+                  <td>
+                    <select :value="t.status" :disabled="ticketBusy === t.id" @change="setTicketStatus(t, $event.target.value)">
+                      <option value="open">open</option>
+                      <option value="in_progress">in progress</option>
+                      <option value="resolved">resolved</option>
+                    </select>
+                  </td>
+                  <td><button type="button" class="ghost-btn sm" @click="ticketDetail = ticketDetail === t.id ? null : t.id">{{ ticketDetail === t.id ? 'Hide' : 'Detail' }}</button></td>
+                </tr>
+                <tr v-if="ticketDetail === t.id">
+                  <td colspan="6">
+                    <p style="white-space:pre-wrap;margin:6px 0;">{{ t.description }}</p>
+                    <pre v-if="t.diagnosis" style="max-height:280px;overflow:auto;font-size:11px;opacity:0.8;">{{ JSON.stringify(t.diagnosis, null, 2) }}</pre>
+                  </td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+        </div>
+        <div v-else-if="!ticketsLoading" class="empty-orgs"><p>No tickets raised yet.</p></div>
+        <div v-else class="empty-orgs"><p>Loading tickets…</p></div>
       </div>
 
       <!-- ── BULK CSV CALLING REQUESTS ───────────────────────────── -->

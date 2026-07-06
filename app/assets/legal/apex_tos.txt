@@ -1,0 +1,118 @@
+# SYNCED COPY — source of truth is frontend/src/content/apexLegalDocs.js.
+# Regenerate with the snippet in tests/nokvo_one/test_nova_legal_grounding.py when the JS changes.
+
+# NOKVO APEX — Terms & Conditions
+
+Last Updated: July 6, 2026
+
+These Terms & Conditions ("Terms") govern your access to and use of NOKVO APEX ("APEX," the "Service"), an automated outbound AI voice-calling and lead-qualification platform provided by NEEDLES COUTURE AND COLLECTIVE PRIVATE LIMITED ("Nokvo," "we," "us," or "our").
+
+By creating an APEX account, making payment, or otherwise accessing or using the Service, you ("Customer," "you," or "your") agree to be bound by these Terms. If you are accepting on behalf of a business, you represent that you are authorised to bind that business. If you do not agree, do not use the Service.
+
+## 1. The Service
+
+1.1 What APEX does. APEX places automated outbound telephone calls on your behalf to contact lists you provide, speaks with the person using an AI voice agent, asks a fixed questionnaire you configure, scores and qualifies the response, and records the call and its transcript so you can review, claim, and follow up on leads.
+
+1.2 Licence. Subject to these Terms and payment of applicable fees, we grant you a limited, non-exclusive, non-transferable, revocable right to use the Service for your internal business purposes.
+
+1.3 Changes to the Service. We may modify, update, or discontinue features at any time and will give reasonable notice of any material change to core functionality.
+
+1.4 Operational limits. To protect call quality, carrier relationships, and telecom compliance, the Service enforces operational limits. These include: one calling campaign per account runs at a time — a new campaign can be started once the current campaign completes or you cancel it; dialling is restricted to the 9:00 AM–7:00 PM IST window on your configured working days; and any per-day call caps you configure are applied to placements. We may adjust operational limits from time to time and will give reasonable notice of material changes.
+
+1.5 NOVA (in-product assistant). APEX includes NOVA, an AI chat assistant that can answer questions about the Service and these Terms, summarise your recent account activity, help draft campaign configurations (including from documents you upload to it), and raise support tickets at your request. NOVA is an assistant, not an operator: it never places calls, spends Call Credits, or launches campaigns — a campaign drafted with NOVA takes effect only when you apply it to the campaign form and launch it yourself, and a support ticket is raised only after you confirm it. NOVA's descriptions or summaries of these Terms or the Privacy Policy are provided for convenience only, are not legal advice, and do not modify either document — the published text controls.
+
+## 2. Eligibility, Account & Members
+
+2.1 Business use only. APEX is offered strictly for lawful business use by persons aged 18 or over. You must provide accurate registration and business verification (KYC) information and keep it current.
+
+2.2 Account security. You are responsible for all activity under your account and for safeguarding your credentials. Notify us immediately of any unauthorised use.
+
+2.3 Members. You may invite team members to claim and work qualified leads. You are responsible for your members' access, conduct, and compliance with these Terms.
+
+## 3. Your Compliance Obligations (Outbound Calling)
+
+3.1 You are the caller. APEX makes calls at your instruction and on your behalf. You are solely responsible for the legality of your calling campaigns, your contact lists, and the consent basis for contacting each recipient.
+
+3.2 Telecom & DND compliance. You must comply with all applicable telecommunications and telemarketing laws and regulations, including the regulations of the Telecom Regulatory Authority of India (TRAI), the Telecom Commercial Communications Customer Preference Regulations (DND/NCPR), DLT registration requirements for commercial communications, and permitted calling-time windows (APEX restricts dialling to 9:00 AM–7:00 PM IST). APEX provides DND/NCPR scrubbing and time-window controls as tools to assist your compliance, but using them does not transfer legal responsibility to Nokvo — you remain the entity legally responsible for each call.
+
+3.3 Consent & lawful lists. You represent and warrant that you have a lawful basis and any legally required consent to call each number on your lists and to record and process the resulting conversation, and that your lists were obtained lawfully and do not target persons who have opted out.
+
+3.4 AI & recording disclosure. Calls are recorded, transcribed, and conducted by an automated AI agent. Where required by law, you are responsible for ensuring recipients are informed that they are speaking with an automated system and that the call is recorded. APEX can be configured to make such disclosures; enabling and maintaining them is your responsibility.
+
+3.5 Prohibited use. You must not use APEX to place fraudulent, deceptive, harassing, threatening, or unlawful calls; to spoof caller identity; to contact numbers without a lawful basis; to send content that is defamatory, obscene, or infringing; or to reverse-engineer, disrupt, overload, or build a competing product from the Service.
+
+## 4. Artificial Intelligence Disclaimers
+
+4.1 Nature of AI. APEX relies on speech recognition, large language models, and speech synthesis — for the voice agent that makes calls and for NOVA, the in-product assistant. Because these systems are probabilistic, they may mishear, misinterpret, mis-score, mis-summarise, or produce inaccurate or unintended output, and lead-qualification results are indicative, not guaranteed.
+
+4.2 Your oversight. You are responsible for reviewing call outcomes, scores, transcripts, and notes before acting on them, and for reviewing any campaign configuration NOVA drafts — including details it extracts from your uploaded documents — before you launch it. You agree that Nokvo is not liable for business losses, missed leads, wrongful qualification/disqualification, reputational harm, or claims arising from statements made or actions taken by the AI agent during calls or from NOVA's outputs you chose to act on.
+
+4.3 No results guarantee. We do not warrant any particular connection rate, answer rate, qualification rate, conversion, or business outcome.
+
+## 5. Fees, Subscription & Call Credits
+
+5.1 Subscription. APEX is offered on a recurring monthly subscription of ₹6,499 per month (plus applicable taxes), billed automatically to your payment method through our payment processor (Razorpay) on each billing cycle until cancelled.
+
+5.2 Call Credits (prepaid). Outbound calling consumes prepaid Call Credits from your APEX wallet. Credits are purchased in advance (at onboarding and via top-ups) at the applicable slab rate, where one credit is valued at ₹1. Every connected call deducts credits at the then-current selling rate; calls that are not answered/connected are not charged. Credits have no cash value, are not a deposit, are non-transferable, and are consumed on a first-purchased-first-used basis. Each purchase (onboarding or top-up) is subject to a per-transaction limit — currently a minimum of 100 minutes and a maximum of 100,000 minutes' worth of credits per purchase — which we may adjust from time to time.
+
+5.3 Authorisation to charge. By providing a payment method you authorise us and our payment processor to charge the subscription fee each cycle and any top-ups you initiate. Taxes are your responsibility except taxes on Nokvo's net income.
+
+5.4 Non-payment. If a subscription payment fails, or if your Call Credit balance is exhausted, we may suspend calling and other paid functions until payment succeeds or credits are topped up.
+
+5.5 Balance timing. Your Call Credit balance is checked when each call is placed. Calls already in progress — or placed in the brief interval before an exhausted balance is registered — are allowed to complete and are charged in full, which may take your balance marginally below zero. You remain responsible for that usage; any negative amount is recovered from your next top-up.
+
+## 6. No Refunds
+
+6.1 All fees are non-refundable. ALL PAYMENTS TO NOKVO FOR APEX — INCLUDING MONTHLY SUBSCRIPTION FEES, PREPAID CALL CREDITS, AND TOP-UPS — ARE FINAL AND NON-REFUNDABLE, IN WHOLE OR IN PART, EXCEPT WHERE A REFUND IS REQUIRED BY APPLICABLE LAW.
+
+6.2 No pro-rata on cancellation. You may cancel your subscription at any time from within the Service; cancellation takes effect at the end of your current paid billing cycle. You will not be charged again after that cycle, but the fee already paid for the current cycle is not refunded or pro-rated, and your access continues until the cycle ends.
+
+6.3 Unused Call Credits. Purchased Call Credits are non-refundable and non-redeemable for cash, including any unused balance remaining on cancellation, suspension, or termination.
+
+6.4 No refund for AI variance or downtime. Fees and consumed credits are not refunded on the basis of AI mishearing/mis-scoring, unanswered calls, recipient behaviour, third-party network or carrier issues, or service interruptions, save as required by law.
+
+6.5 Exceptional adjustments. Any goodwill credit or adjustment we may choose to grant in a specific case is at our sole discretion, is not an admission of any obligation, and does not create a right to a refund in any other case.
+
+## 7. Customer Data & Privacy
+
+7.1 Your data. You retain ownership of the contact lists, questionnaires, business information, and documents you provide — including documents you upload to NOVA and messages you exchange with it ("Customer Data"). You represent that you have all rights and consents necessary to provide it and to have it processed by APEX.
+
+7.2 Our processing. You grant us a limited right to process, transmit, and store Customer Data solely to provide the Service and maintain its security. We act as your data processor for the personal data of call recipients. Our practices are described in the APEX Privacy Policy, which you accept by using the Service.
+
+7.3 No training on your data. We do not sell Customer Data and do not use your call recordings, transcripts, phone lists, or business documents to train public foundation models. We may use aggregated, de-identified metrics to operate and improve the Service.
+
+## 8. Intellectual Property & Feedback
+
+Nokvo and its licensors own all rights in the Service, including its software, models, interfaces, and branding. If you send us feedback or suggestions, you grant us a royalty-free, worldwide, perpetual licence to use them without obligation to you.
+
+## 9. Suspension & Termination
+
+9.1 By you. You may stop using and cancel the Service at any time, subject to §6 (No Refunds).
+
+9.2 By us. We may suspend or terminate your access immediately, without refund, if you breach these Terms (including §3 Compliance), if your use creates legal, security, or reputational risk, if required fees are unpaid, or as required by law or a telecom provider.
+
+9.3 Effect. On termination your right to use the Service ends. We will make your data available for export for 30 days, after which it is deleted per our retention policy. Sections that by their nature should survive (Fees, No Refunds, IP, Disclaimers, Limitation of Liability, Indemnity, Governing Law) survive termination.
+
+## 10. Disclaimers
+
+THE SERVICE IS PROVIDED "AS IS" AND "AS AVAILABLE". TO THE MAXIMUM EXTENT PERMITTED BY LAW, NOKVO DISCLAIMS ALL WARRANTIES, EXPRESS OR IMPLIED, INCLUDING MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT, AND DOES NOT WARRANT THAT THE SERVICE WILL BE UNINTERRUPTED, ERROR-FREE, OR THAT AI OUTPUTS OR CALL OUTCOMES WILL BE ACCURATE OR RELIABLE. APEX depends on third-party telephony carriers, AI model providers, and cloud infrastructure; we are not responsible for their outages, delays, or changes.
+
+## 11. Limitation of Liability
+
+TO THE MAXIMUM EXTENT PERMITTED BY LAW, NOKVO AND ITS AFFILIATES WILL NOT BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, OR PUNITIVE DAMAGES, OR FOR LOST PROFITS, LOST LEADS, LOST DATA, OR BUSINESS INTERRUPTION. NOKVO'S TOTAL AGGREGATE LIABILITY ARISING OUT OF OR RELATING TO THE SERVICE WILL NOT EXCEED THE AMOUNTS YOU PAID TO NOKVO FOR APEX IN THE THREE (3) MONTHS PRECEDING THE EVENT GIVING RISE TO THE CLAIM.
+
+## 12. Indemnification
+
+You will indemnify and hold harmless Nokvo, its officers, employees, and agents from any claim, liability, loss, or expense (including reasonable legal fees) arising out of: your use of the Service; your calling campaigns and contact lists; your violation of these Terms or of any telecom, marketing, consumer-protection, or privacy law (including TRAI/DND/DLT); your failure to obtain required consent for calling, recording, or AI processing; or any claim by a call recipient or third party relating to a call you caused APEX to place.
+
+## 13. Governing Law & Disputes
+
+These Terms are governed by the laws of India. Any dispute will be finally resolved by arbitration in Hyderabad, Telangana, India under the Arbitration and Conciliation Act, 1996, before a sole arbitrator, in English. Subject to arbitration, the courts of Hyderabad, Telangana, India have exclusive jurisdiction.
+
+## 14. General
+
+We may update these Terms and will give reasonable notice of material changes; continued use after the effective date is acceptance. You may not assign these Terms without our consent; we may assign them in a merger or sale of assets. If any provision is unenforceable, the rest remains in effect. These Terms and the APEX Privacy Policy are the entire agreement for APEX. We may send notices electronically (email or in-product). Neither party is liable for delays caused by events beyond its reasonable control.
+
+## 15. Contact
+
+Questions about these Terms may be sent to NEEDLES COUTURE AND COLLECTIVE PRIVATE LIMITED at officialnokvo@nokvo.org.

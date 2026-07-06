@@ -44,6 +44,7 @@ from app.api import (
     superadmin_tenant_provisioning,
     nokvo_one_auth,
     nokvo_one_apex_auth,
+    nokvo_one_apex_nova,
     nokvo_one_apex_members,
     nokvo_one_payments,
     nokvo_one_onboarding,
@@ -67,6 +68,7 @@ app.include_router(superadmin_tenant_provisioning.router, prefix="/superadmin/te
 app.include_router(nokvo_one_auth.router, prefix="/api/nokvo-one", tags=["nokvo-one"])
 app.include_router(nokvo_one_apex_auth.router, prefix="/api/nokvo-one", tags=["nokvo-apex-auth"])
 app.include_router(nokvo_one_apex_members.router, prefix="/api/nokvo-one", tags=["nokvo-apex-members"])
+app.include_router(nokvo_one_apex_nova.router, prefix="/api/nokvo-one", tags=["nokvo-apex-nova"])
 app.include_router(nokvo_one_payments.router, prefix="/api/nokvo-one", tags=["nokvo-one-payments"])
 app.include_router(nokvo_one_onboarding.router, prefix="/api/nokvo-one/onboarding", tags=["nokvo-one-onboarding"])
 app.include_router(nokvo_one_requests.router, prefix="/api/nokvo-one", tags=["nokvo-one-requests"])

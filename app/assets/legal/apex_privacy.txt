@@ -1,0 +1,116 @@
+# SYNCED COPY — source of truth is frontend/src/content/apexLegalDocs.js.
+# Regenerate with the snippet in tests/nokvo_one/test_nova_legal_grounding.py when the JS changes.
+
+# NOKVO APEX — Privacy Policy
+
+Last Updated: July 6, 2026
+
+This Privacy Policy explains how NEEDLES COUTURE AND COLLECTIVE PRIVATE LIMITED ("Nokvo," "we," "us") collects, uses, and protects information in connection with NOKVO APEX ("APEX"), our automated outbound AI voice-calling and lead-qualification service. It distinguishes between data we collect about our direct business customers (Account Data) and data we process on our customers' behalf about the people they call (Customer Data).
+
+## 1. Our Roles
+
+  - Data Fiduciary / Controller: We are the controller of Account Data of our direct customers and their invited members.
+
+  - Data Processor: We are the processor of Customer Data — the personal data of call recipients — which we process only on our customer's instructions to deliver APEX.
+
+## 2. Information We Collect
+
+A. Account Data (about our customers).
+
+  - Registration & contact: name, email, phone number, company name, and account role.
+
+  - Business verification (KYC): business identity details and documents you upload for onboarding and compliance.
+
+  - Authentication: login credentials, tokens, and (where enabled) multi-factor authentication data.
+
+  - Billing: subscription and Call Credit transaction records and payment references (card/bank details are handled by our payment processor, not stored by us).
+
+  - Usage & device: IP address, log data, cookies used to keep you signed in and secure the platform, and diagnostic/latency telemetry.
+
+  - NOVA assistant data: the messages you exchange with NOVA (the in-product AI assistant), documents you upload to it for campaign drafting, and support tickets you raise through it — each ticket includes a diagnostic snapshot of your recent account activity (recent call outcomes, campaign states, dial-error causes, and wallet balance) attached so our team can help without asking you to reproduce the problem.
+
+B. Customer Data (about the people you call), processed on your behalf.
+
+  - Contact list data: recipient phone numbers and names/labels you upload.
+
+  - Call data: call audio recordings and call metadata (duration, timestamps, connection status).
+
+  - Transcripts & outcomes: speech-to-text transcripts, questionnaire answers, lead scores, call notes, and follow-up status.
+
+## 3. How We Use Information
+
+We use Account Data to provide and secure APEX, verify businesses, process subscription and Call Credit billing, send administrative and security notices, and improve reliability and performance. We process Customer Data solely to place calls you instruct, conduct and record the AI conversation, transcribe and score responses, apply DND/NCPR scrubbing and calling-time controls, and surface qualified leads and notes to you and your members. NOVA chat messages and uploaded documents are processed by AI language models solely to answer your questions, extract campaign details you asked for, and prepare tickets you confirm; ticket contents (including the diagnostic snapshot) are shared with our support team to resolve your request.
+
+## 4. Legal Bases
+
+Where applicable we rely on: performance of our contract with you; our legitimate interests in operating and securing the Service; compliance with legal obligations; and, for Customer Data, the lawful basis and consent that you (as controller) are responsible for establishing with call recipients.
+
+## 5. No Sale; No Model Training on Your Data
+
+  - We do not sell or rent personal data, and we do not use Customer Data for advertising.
+
+  - We do not use your call recordings, transcripts, contact lists, uploaded documents, or NOVA chat conversations to train public foundation models.
+
+  - We may use aggregated, de-identified metrics and non-identifiable linguistic/performance patterns to operate and improve APEX (including localisation of Indian-language speech quality).
+
+## 6. Your Compliance as Controller
+
+Because you decide whom APEX calls and why, you are responsible for having a lawful basis and any required consent to call, record, and process each recipient; for providing recipients any required notices (including AI and recording disclosures); and for ensuring your contact lists were obtained lawfully and honour opt-outs.
+
+## 7. Subprocessors
+
+To deliver APEX we use trusted third-party providers, including:
+
+  - Telephony: Plivo (outbound calling and call media).
+
+  - Speech (STT/TTS): Sarvam AI for speech-to-text and text-to-speech.
+
+  - AI models: Microsoft Azure OpenAI for language understanding, scoring, and generation.
+
+  - Cloud infrastructure: Microsoft Azure (database, cache, blob storage, key vault), hosted in designated regions.
+
+  - Payments: Razorpay for subscription and Call Credit transactions.
+
+We maintain appropriate contractual and security safeguards with subprocessors and may update this list from time to time; a current list is available on request.
+
+## 8. Data Retention
+
+  - Transcripts & recordings: retained on a rolling basis (call transcripts are automatically deleted after approximately 30 days), subject to your settings and our legal obligations.
+
+  - In-call memory: live conversational state is held only for the call and a short window after it, then discarded.
+
+  - Operational caches: transient service lookups (such as the wallet-balance figures used to gate dialling) are held in short-lived caches that expire automatically within seconds and are not separately retained.
+
+  - NOVA chat sessions: conversations with the assistant are held in short-lived session storage that expires automatically about 30 minutes after your last message. Documents you upload to NOVA are read to extract campaign details and are not retained as files; extracted details persist only in the campaign draft/configuration you choose to keep.
+
+  - Support tickets: tickets raised through NOVA (including their diagnostic snapshot) are retained as support records while your account is active and as needed for audit and legal compliance.
+
+  - Lead & account records: retained while your account is active and as needed for billing, audit, and legal compliance.
+
+## 9. Security
+
+  - Encryption in transit (TLS/HTTPS/WSS) and at rest.
+
+  - Sensitive credentials and secrets managed in Azure Key Vault.
+
+  - Role-based access control, tenant isolation, and multi-factor authentication for privileged access.
+
+  - On a confirmed security incident affecting personal data, we will notify affected customers without undue delay and as required by applicable law.
+
+## 10. Your Rights
+
+Subject to applicable law (including India's Digital Personal Data Protection Act, 2023), you may request access to, correction of, or deletion of your Account Data, and may withdraw consent or object to certain processing. To exercise these rights, contact us at the address below.
+
+Note for call recipients: if you received a call from an APEX AI agent, the business that placed the call is the controller of your data — please direct requests to that business. We will assist that business as its processor.
+
+## 11. International Transfers, Legal Requests & Business Changes
+
+Data may be processed in regions where our providers operate, protected by appropriate safeguards. We may disclose information where required by law or valid legal process, and, where permitted, will notify affected customers. If Nokvo is involved in a merger, acquisition, or asset sale, information may be transferred as part of that transaction subject to confidentiality.
+
+## 12. Changes
+
+We may update this Policy to reflect changes in the Service, providers, or law, and will notify you of significant changes by email or in-product notice.
+
+## 13. Contact & Grievances
+
+For privacy questions, requests, or grievances under the Digital Personal Data Protection Act, 2023, contact NEEDLES COUTURE AND COLLECTIVE PRIVATE LIMITED at officialnokvo@nokvo.org. We will respond within the timelines required by applicable law.

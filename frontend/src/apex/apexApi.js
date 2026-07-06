@@ -259,6 +259,31 @@ export async function submitFeedback(message, category = 'feedback') {
   return data;
 }
 
+// ── Nova — the in-product assistant (chat panel in the header) ──
+export async function novaChat(sessionId, message) {
+  const { data } = await api.post('/apex/nova/chat', { session_id: sessionId, message }, { headers: authHeader() });
+  return data; // { session_id, reply, cards, draft, tool_calls }
+}
+export async function novaConfirm(sessionId, actionId, decision) {
+  const { data } = await api.post('/apex/nova/confirm', {
+    session_id: sessionId, action_id: actionId, decision,
+  }, { headers: authHeader() });
+  return data; // { result, reply }
+}
+// Brief-document analysis is an LLM call over a possibly-large file — give it a
+// long timeout of its own; the panel shows "Analyzing document…" the whole time.
+export async function novaSession(sessionId) {
+  const { data } = await api.get(`/apex/nova/session/${sessionId}`, { headers: authHeader() });
+  return data; // { session_id, messages, draft }
+}
+export async function novaUpload(sessionId, file) {
+  const fd = new FormData();
+  fd.append('session_id', sessionId || '');
+  fd.append('file', file);
+  const { data } = await api.post('/apex/nova/upload', fd, { headers: authHeader(), timeout: 90000 });
+  return data; // { session_id, extracted, missing, truncated, reply }
+}
+
 // ── Payment (one plan ₹6499/mo + minutes bundle, billed on selected, credited 1.5×) ──
 export async function createSubscription(paymentToken, minutes, legal = {}) {
   const { data } = await api.post('/payments/create-subscription', {

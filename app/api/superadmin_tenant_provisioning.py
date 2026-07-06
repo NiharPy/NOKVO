@@ -303,6 +303,77 @@ async def list_feedback(
     return {"items": items}
 
 
+# ── APEX support tickets (raised in-product via Nova) ────────────────────────
+# Defined BEFORE "/{organization_id}" so the path word isn't treated as an id.
+
+class ApexTicketUpdateRequest(BaseModel):
+    status: str  # 'open' | 'in_progress' | 'resolved'
+    resolution_note: str | None = None
+
+
+@router.get("/apex-tickets")
+async def list_apex_tickets(
+    db: AsyncSession = Depends(get_db),
+    current_user: SuperAdminUser = Depends(RequireRole(_READ_ROLES)),
+    limit: int = 500,
+):
+    """APEX support tickets, newest first, with the Nova-attached diagnosis."""
+    from app.models.apex_support_ticket import ApexSupportTicket
+
+    limit = max(1, min(int(limit or 500), 2000))
+    rows = await db.execute(
+        select(ApexSupportTicket, Organization.name)
+        .join(Organization, Organization.id == ApexSupportTicket.organization_id, isouter=True)
+        .order_by(ApexSupportTicket.created_at.desc())
+        .limit(limit)
+    )
+    items = []
+    for t, org_name in rows.all():
+        items.append({
+            "id": str(t.id),
+            "organization_id": str(t.organization_id),
+            "organization_name": org_name or "—",
+            "requested_by_email": t.requested_by_email or "—",
+            "subject": t.subject,
+            "description": t.description,
+            "diagnosis": t.diagnosis,
+            "status": t.status,
+            "created_at": t.created_at.isoformat() if t.created_at else None,
+            "resolved_at": t.resolved_at.isoformat() if t.resolved_at else None,
+            "resolution_note": t.resolution_note,
+        })
+    return {"items": items}
+
+
+@router.patch("/apex-tickets/{ticket_id}")
+async def update_apex_ticket(
+    ticket_id: uuid.UUID,
+    payload: ApexTicketUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: SuperAdminUser = Depends(RequireRole(_WRITE_ROLES)),
+):
+    from app.models.apex_support_ticket import APEX_TICKET_STATUSES, ApexSupportTicket
+
+    status_value = (payload.status or "").strip().lower()
+    if status_value not in APEX_TICKET_STATUSES:
+        raise HTTPException(status_code=400, detail=f"status must be one of {sorted(APEX_TICKET_STATUSES)}")
+    ticket = (
+        await db.execute(select(ApexSupportTicket).where(ApexSupportTicket.id == ticket_id))
+    ).scalars().first()
+    if ticket is None:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+    ticket.status = status_value
+    if status_value == "resolved":
+        ticket.resolved_at = datetime.now(timezone.utc)
+        if payload.resolution_note:
+            ticket.resolution_note = payload.resolution_note.strip()[:4000]
+    else:
+        ticket.resolved_at = None
+    db.add(ticket)
+    await db.commit()
+    return {"id": str(ticket.id), "status": ticket.status}
+
+
 # ── SuperAdmin to-do list (optionally tagged to a feedback row) ──────────────
 # All defined BEFORE "/{organization_id}" so the path words aren't treated as ids.
 

@@ -45,6 +45,7 @@ from app.models.call_transcript import CallTranscript
 from app.models.notification import Notification
 from app.models.real_estate_project import RealEstateProject
 from app.models.bulk_calling_request import BulkCallingRequest
+from app.models.apex_support_ticket import ApexSupportTicket
 
 # For Alembic to discover all models
 __all__ = [
@@ -90,4 +91,5 @@ __all__ = [
     "TenantFeedback",
     "SuperAdminTodo",
     "BulkCallingRequest",
+    "ApexSupportTicket",
 ]

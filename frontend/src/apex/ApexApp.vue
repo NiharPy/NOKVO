@@ -55,6 +55,7 @@ import ApexCallLogs from './views/ApexCallLogs.vue';
 import ApexAvailableLeads from './views/ApexAvailableLeads.vue';
 import ApexMyLeads from './views/ApexMyLeads.vue';
 import ApexMembers from './views/ApexMembers.vue';
+import NovaPanel from './NovaPanel.vue';
 import nokvoMark from '../assets/nokvo-logo.png';  // the real NOKVO mark (header logo)
 import { APEX_TERMS_OF_SERVICE_HTML, APEX_PRIVACY_POLICY_HTML, APEX_LEGAL_VERSIONS } from '../content/apexLegalDocs.js';
 import './apex-theme.css';
@@ -339,6 +340,18 @@ async function startTopup() {
     rzp.on('payment.failed', (r) => { setTopupNote(r?.error?.description || 'Payment failed.', false); isToppingUp.value = false; });
     rzp.open();
   } catch (e) { setTopupNote(extractError(e, 'Could not start top-up.'), false); isToppingUp.value = false; }
+}
+
+// ── Nova (the in-product assistant) ──
+const novaOpen = ref(false);
+// ONE-WAY handoff of a Nova-drafted campaign into the Campaign form: set here,
+// consumed (and cleared) by ApexCampaign on mount/watch. Nova never reads the
+// form back — manual edits stay invisible to the chat by design.
+const novaDraft = ref(null);
+function onNovaApplyDraft(draft) {
+  novaDraft.value = draft || null;
+  novaOpen.value = false;
+  tab.value = 'campaign';
 }
 
 // ── Feedback / Suggest a feature ──
@@ -649,6 +662,8 @@ provide('apex', {
   fetchTranscript,
   extractError,
   setTab: (id) => { tab.value = id; },
+  novaDraft,
+  clearNovaDraft: () => { novaDraft.value = null; },
   // members + qualified-lead claim pool
   isMember,
   qualifiedLeads,
@@ -937,11 +952,17 @@ watch(screen, async (s) => {
                 <div class="ax-user-role">{{ (user?.role || 'member').toUpperCase() }}</div>
               </div>
             </div>
+            <button type="button" class="ax-btn ax-btn--nova" @click="novaOpen = true"><span class="ax-nova-star">✦</span>NOVA</button>
             <button type="button" class="ax-btn ax-btn--ghost" @click="openFeedback">Feedback</button>
             <button type="button" class="ax-btn ax-btn--ghost" @click="signOut">Sign out</button>
           </div>
         </div>
       </header>
+
+      <!-- Nova — the in-product assistant -->
+      <Transition name="nova">
+        <NovaPanel v-if="novaOpen" :role="user?.role || 'member'" @close="novaOpen = false" @apply-draft="onNovaApplyDraft" />
+      </Transition>
 
       <!-- Feedback / Suggest a feature -->
       <div v-if="feedbackOpen" class="ax-modal-overlay" @click.self="feedbackOpen = false">
@@ -1112,6 +1133,72 @@ watch(screen, async (s) => {
 .ax-link { color: #F3F2F0; cursor: pointer; background: none; border: none; padding: 0; font: inherit; text-decoration: underline; }
 .ax-google-fallback { display: flex; flex-direction: column; align-items: center; gap: 8px; margin-bottom: 26px; padding: 12px 14px; border: 1px solid rgba(255,255,255,0.12); border-radius: 8px; font-size: 12px; line-height: 1.5; color: rgba(255,255,255,0.55); text-align: center; }
 /* Feedback modal */
+/* NOVA — the assistant's launcher. Deliberately the loudest thing in the header:
+   animated gradient fill, breathing glow, a sweeping shine, and a twinkling
+   star. Everything else in the header stays ghost-quiet so this reads first. */
+.ax-btn--nova {
+  position: relative; display: inline-flex; align-items: center; gap: 8px;
+  padding: 9px 18px; border-radius: 10px; cursor: pointer; overflow: hidden;
+  font-family: inherit; font-size: 12.5px; font-weight: 700; letter-spacing: 0.18em;
+  color: #fff; border: 1px solid rgba(230,38,48,0.7);
+  background: linear-gradient(120deg, rgba(230,38,48,0.30), rgba(255,120,60,0.14) 45%, rgba(230,38,48,0.30));
+  background-size: 220% 220%;
+  box-shadow: 0 0 16px rgba(230,38,48,0.35), inset 0 0 12px rgba(230,38,48,0.14);
+  animation: axNovaSheen 3.6s ease-in-out infinite, axNovaBreathe 2.4s ease-in-out infinite;
+  transition: transform .15s ease, border-color .15s ease;
+}
+.ax-btn--nova::after {
+  content: ''; position: absolute; top: 0; left: -60%; width: 42%; height: 100%;
+  background: linear-gradient(100deg, transparent, rgba(255,255,255,0.30), transparent);
+  transform: skewX(-20deg); animation: axNovaSweep 3s ease-in-out infinite; pointer-events: none;
+}
+.ax-btn--nova:hover {
+  border-color: #E62630;
+  box-shadow: 0 0 26px rgba(230,38,48,0.6), inset 0 0 14px rgba(230,38,48,0.22);
+  transform: translateY(-1px);
+}
+/* Press: a quick sink + a light burst from the center + the star flaring —
+   the click itself carries the same energy as the idle shimmer. ::before is
+   the burst layer (::after is taken by the sweeping shine). */
+.ax-btn--nova::before {
+  content: ''; position: absolute; inset: 0; border-radius: inherit; pointer-events: none;
+  background: radial-gradient(circle at 50% 50%, rgba(255,255,255,0.4), rgba(230,38,48,0.25) 45%, transparent 75%);
+  opacity: 0; transition: opacity .3s ease;
+}
+.ax-btn--nova:active {
+  transform: translateY(0) scale(0.96);
+  border-color: #FF4B54;
+  box-shadow: 0 0 34px rgba(230,38,48,0.85), inset 0 0 18px rgba(230,38,48,0.35);
+}
+.ax-btn--nova:active::before { opacity: 1; transition: opacity .04s ease; }
+.ax-btn--nova:active .ax-nova-star {
+  animation: none;
+  transform: scale(1.55) rotate(120deg);
+  transition: transform .2s cubic-bezier(0.34, 1.56, 0.64, 1);
+  color: #fff; text-shadow: 0 0 12px rgba(255,255,255,0.9);
+}
+.ax-nova-star { font-size: 13px; line-height: 1; color: #FFD9DC; animation: axNovaTwinkle 1.8s ease-in-out infinite; transition: transform .2s ease, color .2s ease; }
+@keyframes axNovaSheen { 0%, 100% { background-position: 0% 50%; } 50% { background-position: 100% 50%; } }
+@keyframes axNovaBreathe {
+  0%, 100% { box-shadow: 0 0 14px rgba(230,38,48,0.3), inset 0 0 12px rgba(230,38,48,0.12); }
+  50% { box-shadow: 0 0 24px rgba(230,38,48,0.55), inset 0 0 12px rgba(230,38,48,0.2); }
+}
+@keyframes axNovaSweep { 0% { left: -60%; } 55%, 100% { left: 135%; } }
+@keyframes axNovaTwinkle {
+  0%, 100% { opacity: 0.75; transform: scale(1) rotate(0deg); }
+  50% { opacity: 1; transform: scale(1.3) rotate(22deg); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ax-btn--nova, .ax-btn--nova::after, .ax-nova-star { animation: none; }
+  .ax-btn--nova:active, .ax-btn--nova:active .ax-nova-star { transform: none; transition: none; }
+}
+/* Panel exit — the overlay fades while the panel glides back right, mirroring
+   the entrance so closing feels as considered as opening. (Enter is handled by
+   NovaPanel's own entrance animation.) */
+.nova-leave-active { transition: opacity .24s ease; }
+.nova-leave-active :deep(.nv-panel) { transition: transform .24s cubic-bezier(0.4, 0, 1, 1); }
+.nova-leave-to { opacity: 0; }
+.nova-leave-to :deep(.nv-panel) { transform: translateX(56px); }
 .ax-modal-overlay { position: fixed; inset: 0; background: rgba(4,4,5,0.6); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); display: flex; align-items: center; justify-content: center; z-index: 1000; padding: 20px; }
 .ax-modal { background: linear-gradient(180deg, #17171A, #101012); border: 1px solid rgba(255,255,255,0.11); border-radius: 18px; padding: 26px; width: 100%; max-width: 460px; box-shadow: inset 0 1px 0 rgba(255,255,255,0.07), 0 40px 90px -20px rgba(0,0,0,0.75); }
 

@@ -16,13 +16,13 @@
  */
 
 export const APEX_LEGAL_VERSIONS = {
-  terms: '2026-07-04',
-  privacy: '2026-07-04',
+  terms: '2026-07-06',
+  privacy: '2026-07-06',
 };
 
 export const APEX_TERMS_OF_SERVICE_HTML = `
 <h3>NOKVO APEX — Terms &amp; Conditions</h3>
-<p class="legal-meta">Last Updated: July 4, 2026</p>
+<p class="legal-meta">Last Updated: July 6, 2026</p>
 
 <p>These Terms &amp; Conditions ("Terms") govern your access to and use of NOKVO APEX ("APEX," the "Service"), an automated outbound AI voice-calling and lead-qualification platform provided by NEEDLES COUTURE AND COLLECTIVE PRIVATE LIMITED ("Nokvo," "we," "us," or "our").</p>
 <p>By creating an APEX account, making payment, or otherwise accessing or using the Service, you ("Customer," "you," or "your") agree to be bound by these Terms. If you are accepting on behalf of a business, you represent that you are authorised to bind that business. If you do not agree, do not use the Service.</p>
@@ -32,6 +32,7 @@ export const APEX_TERMS_OF_SERVICE_HTML = `
 <p><strong>1.2 Licence.</strong> Subject to these Terms and payment of applicable fees, we grant you a limited, non-exclusive, non-transferable, revocable right to use the Service for your internal business purposes.</p>
 <p><strong>1.3 Changes to the Service.</strong> We may modify, update, or discontinue features at any time and will give reasonable notice of any material change to core functionality.</p>
 <p><strong>1.4 Operational limits.</strong> To protect call quality, carrier relationships, and telecom compliance, the Service enforces operational limits. These include: <strong>one calling campaign per account runs at a time</strong> — a new campaign can be started once the current campaign completes or you cancel it; dialling is restricted to the 9:00 AM–7:00 PM IST window on your configured working days; and any per-day call caps you configure are applied to placements. We may adjust operational limits from time to time and will give reasonable notice of material changes.</p>
+<p><strong>1.5 NOVA (in-product assistant).</strong> APEX includes NOVA, an AI chat assistant that can answer questions about the Service and these Terms, summarise your recent account activity, help draft campaign configurations (including from documents you upload to it), and raise support tickets at your request. NOVA is an assistant, not an operator: it never places calls, spends Call Credits, or launches campaigns — a campaign drafted with NOVA takes effect only when you apply it to the campaign form and launch it yourself, and a support ticket is raised only after you confirm it. NOVA's descriptions or summaries of these Terms or the Privacy Policy are provided for convenience only, are not legal advice, and do not modify either document — the published text controls.</p>
 
 <h4>2. Eligibility, Account &amp; Members</h4>
 <p><strong>2.1 Business use only.</strong> APEX is offered strictly for lawful business use by persons aged 18 or over. You must provide accurate registration and business verification (KYC) information and keep it current.</p>
@@ -46,8 +47,8 @@ export const APEX_TERMS_OF_SERVICE_HTML = `
 <p><strong>3.5 Prohibited use.</strong> You must not use APEX to place fraudulent, deceptive, harassing, threatening, or unlawful calls; to spoof caller identity; to contact numbers without a lawful basis; to send content that is defamatory, obscene, or infringing; or to reverse-engineer, disrupt, overload, or build a competing product from the Service.</p>
 
 <h4>4. Artificial Intelligence Disclaimers</h4>
-<p><strong>4.1 Nature of AI.</strong> APEX relies on speech recognition, large language models, and speech synthesis. Because these systems are probabilistic, the agent may mishear, misinterpret, mis-score, or produce inaccurate or unintended output, and lead-qualification results are indicative, not guaranteed.</p>
-<p><strong>4.2 Your oversight.</strong> You are responsible for reviewing call outcomes, scores, transcripts, and notes before acting on them. You agree that Nokvo is not liable for business losses, missed leads, wrongful qualification/disqualification, reputational harm, or claims arising from statements made or actions taken by the AI agent during calls.</p>
+<p><strong>4.1 Nature of AI.</strong> APEX relies on speech recognition, large language models, and speech synthesis — for the voice agent that makes calls and for NOVA, the in-product assistant. Because these systems are probabilistic, they may mishear, misinterpret, mis-score, mis-summarise, or produce inaccurate or unintended output, and lead-qualification results are indicative, not guaranteed.</p>
+<p><strong>4.2 Your oversight.</strong> You are responsible for reviewing call outcomes, scores, transcripts, and notes before acting on them, and for reviewing any campaign configuration NOVA drafts — including details it extracts from your uploaded documents — before you launch it. You agree that Nokvo is not liable for business losses, missed leads, wrongful qualification/disqualification, reputational harm, or claims arising from statements made or actions taken by the AI agent during calls or from NOVA's outputs you chose to act on.</p>
 <p><strong>4.3 No results guarantee.</strong> We do not warrant any particular connection rate, answer rate, qualification rate, conversion, or business outcome.</p>
 
 <h4>5. Fees, Subscription &amp; Call Credits</h4>
@@ -65,7 +66,7 @@ export const APEX_TERMS_OF_SERVICE_HTML = `
 <p><strong>6.5 Exceptional adjustments.</strong> Any goodwill credit or adjustment we may choose to grant in a specific case is at our sole discretion, is not an admission of any obligation, and does not create a right to a refund in any other case.</p>
 
 <h4>7. Customer Data &amp; Privacy</h4>
-<p><strong>7.1 Your data.</strong> You retain ownership of the contact lists, questionnaires, and business information you provide ("Customer Data"). You represent that you have all rights and consents necessary to provide it and to have it processed by APEX.</p>
+<p><strong>7.1 Your data.</strong> You retain ownership of the contact lists, questionnaires, business information, and documents you provide — including documents you upload to NOVA and messages you exchange with it ("Customer Data"). You represent that you have all rights and consents necessary to provide it and to have it processed by APEX.</p>
 <p><strong>7.2 Our processing.</strong> You grant us a limited right to process, transmit, and store Customer Data solely to provide the Service and maintain its security. We act as your data processor for the personal data of call recipients. Our practices are described in the APEX Privacy Policy, which you accept by using the Service.</p>
 <p><strong>7.3 No training on your data.</strong> We do not sell Customer Data and do not use your call recordings, transcripts, phone lists, or business documents to train public foundation models. We may use aggregated, de-identified metrics to operate and improve the Service.</p>
 
@@ -98,7 +99,7 @@ export const APEX_TERMS_OF_SERVICE_HTML = `
 
 export const APEX_PRIVACY_POLICY_HTML = `
 <h3>NOKVO APEX — Privacy Policy</h3>
-<p class="legal-meta">Last Updated: July 4, 2026</p>
+<p class="legal-meta">Last Updated: July 6, 2026</p>
 
 <p>This Privacy Policy explains how NEEDLES COUTURE AND COLLECTIVE PRIVATE LIMITED ("Nokvo," "we," "us") collects, uses, and protects information in connection with NOKVO APEX ("APEX"), our automated outbound AI voice-calling and lead-qualification service. It distinguishes between data we collect about our direct business customers (Account Data) and data we process on our customers' behalf about the people they call (Customer Data).</p>
 
@@ -116,6 +117,7 @@ export const APEX_PRIVACY_POLICY_HTML = `
   <li><strong>Authentication:</strong> login credentials, tokens, and (where enabled) multi-factor authentication data.</li>
   <li><strong>Billing:</strong> subscription and Call Credit transaction records and payment references (card/bank details are handled by our payment processor, not stored by us).</li>
   <li><strong>Usage &amp; device:</strong> IP address, log data, cookies used to keep you signed in and secure the platform, and diagnostic/latency telemetry.</li>
+  <li><strong>NOVA assistant data:</strong> the messages you exchange with NOVA (the in-product AI assistant), documents you upload to it for campaign drafting, and support tickets you raise through it — each ticket includes a diagnostic snapshot of your recent account activity (recent call outcomes, campaign states, dial-error causes, and wallet balance) attached so our team can help without asking you to reproduce the problem.</li>
 </ul>
 <p><strong>B. Customer Data (about the people you call), processed on your behalf.</strong></p>
 <ul>
@@ -125,7 +127,7 @@ export const APEX_PRIVACY_POLICY_HTML = `
 </ul>
 
 <h4>3. How We Use Information</h4>
-<p>We use Account Data to provide and secure APEX, verify businesses, process subscription and Call Credit billing, send administrative and security notices, and improve reliability and performance. We process Customer Data solely to place calls you instruct, conduct and record the AI conversation, transcribe and score responses, apply DND/NCPR scrubbing and calling-time controls, and surface qualified leads and notes to you and your members.</p>
+<p>We use Account Data to provide and secure APEX, verify businesses, process subscription and Call Credit billing, send administrative and security notices, and improve reliability and performance. We process Customer Data solely to place calls you instruct, conduct and record the AI conversation, transcribe and score responses, apply DND/NCPR scrubbing and calling-time controls, and surface qualified leads and notes to you and your members. NOVA chat messages and uploaded documents are processed by AI language models solely to answer your questions, extract campaign details you asked for, and prepare tickets you confirm; ticket contents (including the diagnostic snapshot) are shared with our support team to resolve your request.</p>
 
 <h4>4. Legal Bases</h4>
 <p>Where applicable we rely on: performance of our contract with you; our legitimate interests in operating and securing the Service; compliance with legal obligations; and, for Customer Data, the lawful basis and consent that you (as controller) are responsible for establishing with call recipients.</p>
@@ -133,7 +135,7 @@ export const APEX_PRIVACY_POLICY_HTML = `
 <h4>5. No Sale; No Model Training on Your Data</h4>
 <ul>
   <li>We do not sell or rent personal data, and we do not use Customer Data for advertising.</li>
-  <li>We do not use your call recordings, transcripts, contact lists, or uploaded documents to train public foundation models.</li>
+  <li>We do not use your call recordings, transcripts, contact lists, uploaded documents, or NOVA chat conversations to train public foundation models.</li>
   <li>We may use aggregated, de-identified metrics and non-identifiable linguistic/performance patterns to operate and improve APEX (including localisation of Indian-language speech quality).</li>
 </ul>
 
@@ -156,6 +158,8 @@ export const APEX_PRIVACY_POLICY_HTML = `
   <li><strong>Transcripts &amp; recordings:</strong> retained on a rolling basis (call transcripts are automatically deleted after approximately 30 days), subject to your settings and our legal obligations.</li>
   <li><strong>In-call memory:</strong> live conversational state is held only for the call and a short window after it, then discarded.</li>
   <li><strong>Operational caches:</strong> transient service lookups (such as the wallet-balance figures used to gate dialling) are held in short-lived caches that expire automatically within seconds and are not separately retained.</li>
+  <li><strong>NOVA chat sessions:</strong> conversations with the assistant are held in short-lived session storage that expires automatically about 30 minutes after your last message. Documents you upload to NOVA are read to extract campaign details and are not retained as files; extracted details persist only in the campaign draft/configuration you choose to keep.</li>
+  <li><strong>Support tickets:</strong> tickets raised through NOVA (including their diagnostic snapshot) are retained as support records while your account is active and as needed for audit and legal compliance.</li>
   <li><strong>Lead &amp; account records:</strong> retained while your account is active and as needed for billing, audit, and legal compliance.</li>
 </ul>
 

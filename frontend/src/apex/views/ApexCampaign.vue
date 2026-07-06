@@ -2,7 +2,7 @@
 // APEX Campaign tab — DETERMINISTIC bulk create (intro + questionnaire + outro +
 // threshold + working window) and the deterministic campaign list with outcome
 // counts. Reuses the shared bulkCalling.js logic + the existing endpoints.
-import { inject, ref, computed } from 'vue';
+import { inject, onMounted, ref, computed, watch } from 'vue';
 import {
   newQuestion, maxPointsFor, estCallSeconds, fmtDuration, scheduleEstimate, countCsvRows,
   buildBulkCampaignFormData, categorizeContacts, leadCategory, campaignWindow,
@@ -21,6 +21,44 @@ const listSize = ref(null); // CSV row count (data rows), for the estimation wid
 const launching = ref(false);
 const errorMsg = ref('');
 const notice = ref('');
+
+// ── Nova draft prefill (ONE-WAY handoff) ──
+// Nova's "Apply to campaign form" parks a draft on apex.novaDraft; we copy it
+// into the form ONCE and clear it. Edits made here never flow back to the chat.
+function applyNovaDraft(draft) {
+  if (!draft) return;
+  const q = draft.questionnaire || {};
+  form.value = {
+    ...emptyForm(),
+    name: draft.name || '',
+    company_name: draft.company_name || '',
+    caller_name: draft.caller_name || 'Riya',
+    language: draft.language || 'en',
+    content: draft.content || '',
+    intro: q.intro || '',
+    outro: q.outro || '',
+    threshold: Number(q.threshold) || 1,
+    working_days: Number(draft.working_days) || 5,
+    hours_per_day: Number(draft.hours_per_day) || 10,
+    calls_per_day: Number(draft.calls_per_day) || 200,
+    questions: (q.questions || []).map((item) => ({
+      ...newQuestion(),
+      type: item.type === 'answer' ? 'answer' : 'intent',
+      text: item.text || '',
+      desired_answer: item.desired_answer || '',
+      points: Number(item.points) || 1,
+      graded: Array.isArray(item.tiers) && item.tiers.length > 0,
+      tiers: Array.isArray(item.tiers) ? item.tiers : [],
+      gate: !!item.gate,
+    })),
+  };
+  fileName.value = '';
+  listSize.value = null;
+  notice.value = 'Draft from Nova applied — add your contacts file and launch when ready.';
+  apex.clearNovaDraft && apex.clearNovaDraft();
+}
+onMounted(() => applyNovaDraft(apex.novaDraft?.value));
+watch(() => apex.novaDraft?.value, (d) => applyNovaDraft(d));
 
 const det = computed(() => apex.deterministicCampaigns.value);
 

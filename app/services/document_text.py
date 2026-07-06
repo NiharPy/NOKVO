@@ -1,4 +1,4 @@
-"""Plain-text extraction from uploaded documents (PDF / DOCX / TXT).
+"""Plain-text extraction from uploaded documents (PDF / DOCX / PPTX / TXT).
 
 Shared by the outbound-campaign reference-doc upload and the real-estate
 Brochure Analyzer. Best-effort: an unsupported / unparseable file degrades to a
@@ -55,5 +55,30 @@ def extract_document_text(filename: str, content: bytes) -> str:
             return ""
         except Exception:
             logger.warning("document_text: failed to read DOCX", exc_info=True)
+            return ""
+    if ext == "pptx":
+        try:
+            from pptx import Presentation
+
+            prs = Presentation(io.BytesIO(content))
+            parts: list[str] = []
+            for slide in prs.slides:
+                for shape in slide.shapes:
+                    if getattr(shape, "has_text_frame", False):
+                        for para in shape.text_frame.paragraphs:
+                            line = "".join(run.text for run in para.runs).strip()
+                            if line:
+                                parts.append(line)
+                    if getattr(shape, "has_table", False):
+                        for row in shape.table.rows:
+                            cells = [c.text.strip() for c in row.cells if c.text.strip()]
+                            if cells:
+                                parts.append(" | ".join(cells))
+            return "\n".join(parts)
+        except ImportError:
+            logger.warning("document_text: python-pptx not installed")
+            return ""
+        except Exception:
+            logger.warning("document_text: failed to read PPTX", exc_info=True)
             return ""
     return content.decode("utf-8", errors="replace")

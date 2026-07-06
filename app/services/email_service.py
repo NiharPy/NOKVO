@@ -466,6 +466,38 @@ class EmailService:
         await cls.send(to_email, subject, text, html_body=html_body, inline_images=cls._brand_inline_images())
 
     @classmethod
+    async def send_apex_support_ticket_email(
+        cls,
+        *,
+        ticket_id: str,
+        org_name: str,
+        requester_email: str,
+        subject: str,
+        description: str,
+        diagnosis_text: str,
+    ) -> None:
+        """Notify the support inbox of an APEX ticket raised via Nova. The
+        diagnosis snapshot rides along so the operator sees the tenant's recent
+        state without asking them to reproduce anything."""
+        to_email = "officialnokvo@nokvo.org"
+        mail_subject = f"[APEX Ticket #{ticket_id[:8]}] {subject}"
+        body_text = (
+            f"Organization: {org_name}\n"
+            f"Raised by: {requester_email}\n\n"
+            f"{description.strip()}\n\n"
+            f"— Diagnosis snapshot —\n{diagnosis_text.strip() or '(none attached)'}"
+        )
+        html_body = cls._branded_message_html(
+            preheader=f"APEX support ticket from {org_name}",
+            eyebrow="APEX Support",
+            heading=subject,
+            body_html=cls._text_to_paragraphs_html(body_text),
+            cta_label=None,
+            cta_url=None,
+        )
+        await cls.send(to_email, mail_subject, body_text, html_body=html_body, inline_images=cls._brand_inline_images())
+
+    @classmethod
     async def send_broadcast_email(
         cls,
         to_email: str,
