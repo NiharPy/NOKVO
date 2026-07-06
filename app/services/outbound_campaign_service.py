@@ -1111,6 +1111,41 @@ class OutboundCampaignService:
             raise ValueError(
                 "Your dedicated bulk calling number isn't fully configured yet."
             )
+
+        # ── V2 (per-row) campaigns: contacts live in outbound_campaign_contacts,
+        # not the blob — re-arm the unreached rows (no_answer/failed → pending,
+        # fresh call_link_ids) and resume. This is also the re-run a just-appended
+        # CSV takes: the new rows are already pending, so it resumes dialing them
+        # alongside any re-armed misses. Answered/completed rows stay untouched. ──
+        if settings.CAMPAIGN_CONTACTS_V2 and campaign.contacts is None:
+            if campaign.status == CampaignStatus.cancelled:
+                raise ValueError("This campaign was cancelled — create a new one instead.")
+            from app.services import campaign_contacts_v2 as v2
+
+            await v2.rearm_unreached(db, campaign.id)
+            if await v2.pending_count(db, campaign.id) <= 0:
+                raise ValueError(
+                    "Everyone on this list was already reached — there's no one to re-run."
+                )
+            await db.execute(
+                _sql_text(
+                    "UPDATE outbound_campaigns SET status = 'running', completed_at = NULL "
+                    "WHERE id = :c AND status <> 'cancelled'"
+                ),
+                {"c": str(campaign.id)},
+            )
+            await db.commit()
+            await db.refresh(campaign)
+            invalidate_outbound_context(campaign.id)
+            await OutboundCampaignService._dial_pending(
+                campaign,
+                db,
+                tenant_res=tenant_res,
+                base=public_base_url.rstrip("/"),
+                prefix=path_prefix.rstrip("/"),
+            )
+            return campaign
+
         # Row-lock + refresh BEFORE reading/rebuilding ``contacts``. Re-run has no
         # status guard, so the prior batch can still be in flight when the operator
         # clicks it. Reading the contacts snapshot unlocked here races each call's

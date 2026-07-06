@@ -171,6 +171,103 @@ async def test_rerun_noop_when_everyone_reached(monkeypatch):
             camp, None, tenant_res=object(), public_base_url="https://x")
 
 
+def _v2_rerun_setup(monkeypatch):
+    """Shared scaffolding for the V2 (per-row) re-run branch tests."""
+    from app.services.outbound_campaign_service import OutboundCampaignService
+
+    _stub_single_campaign_guard(monkeypatch)
+    monkeypatch.setattr(PlivoService, "bulk_calling_enabled", staticmethod(lambda tr: True))
+    monkeypatch.setattr(PlivoService, "bulk_calling_caller_id", staticmethod(lambda tr: "912264232977"))
+    monkeypatch.setattr(PlivoService, "bulk_calling_auth", staticmethod(lambda tr: ("SAid", "tok")))
+
+    dialed = {}
+
+    async def fake_dial(campaign, db, *, tenant_res, base, prefix):
+        dialed["called"] = True
+
+    monkeypatch.setattr(OutboundCampaignService, "_dial_pending", staticmethod(fake_dial))
+
+    class _FakeDB:
+        def __init__(self):
+            self.sql = []
+
+        async def execute(self, stmt, params=None):
+            self.sql.append(str(stmt))
+
+        async def commit(self):
+            pass
+
+        async def refresh(self, *_a, **_k):
+            pass
+
+    return dialed, _FakeDB()
+
+
+@pytest.mark.asyncio
+async def test_rerun_v2_rearms_and_resumes(monkeypatch):
+    """A V2 campaign (contacts=None — every APEX campaign) re-runs via the per-row
+    path: unreached rows re-armed, campaign set running, dialer kicked. This is
+    what the ↻ Re-run button does after an Add CSV."""
+    import uuid as _uuid
+
+    from app.models.outbound_campaign import CampaignStatus, OutboundCampaign
+    from app.services import campaign_contacts_v2 as v2
+    from app.services.outbound_campaign_service import OutboundCampaignService
+
+    dialed, db = _v2_rerun_setup(monkeypatch)
+    calls = {}
+
+    async def fake_rearm(_db, cid):
+        calls["rearmed"] = cid
+        return 3
+
+    async def fake_pending(_db, cid):
+        return 7  # re-armed misses + a just-appended CSV's pending rows
+
+    monkeypatch.setattr(v2, "rearm_unreached", fake_rearm)
+    monkeypatch.setattr(v2, "pending_count", fake_pending)
+
+    camp = OutboundCampaign(
+        id=_uuid.uuid4(), tenant_id="t1", name="v2 rerun",
+        status=CampaignStatus.completed, agent_config={"bulk_csv": True}, contacts=None,
+    )
+    out = await OutboundCampaignService.rerun_bulk_campaign(
+        camp, db, tenant_res=object(), public_base_url="https://x")
+
+    assert calls["rearmed"] == camp.id
+    assert dialed.get("called") is True
+    assert any("status = 'running'" in s for s in db.sql)  # campaign resumed
+    assert out is camp
+
+
+@pytest.mark.asyncio
+async def test_rerun_v2_noop_when_nothing_pending(monkeypatch):
+    import uuid as _uuid
+
+    from app.models.outbound_campaign import CampaignStatus, OutboundCampaign
+    from app.services import campaign_contacts_v2 as v2
+    from app.services.outbound_campaign_service import OutboundCampaignService
+
+    _dialed, db = _v2_rerun_setup(monkeypatch)
+
+    async def fake_rearm(_db, cid):
+        return 0
+
+    async def fake_pending(_db, cid):
+        return 0
+
+    monkeypatch.setattr(v2, "rearm_unreached", fake_rearm)
+    monkeypatch.setattr(v2, "pending_count", fake_pending)
+
+    camp = OutboundCampaign(
+        id=_uuid.uuid4(), tenant_id="t1", name="drained",
+        status=CampaignStatus.completed, agent_config={"bulk_csv": True}, contacts=None,
+    )
+    with pytest.raises(ValueError, match="already reached"):
+        await OutboundCampaignService.rerun_bulk_campaign(
+            camp, db, tenant_res=object(), public_base_url="https://x")
+
+
 @pytest.mark.asyncio
 async def test_rerun_canonicalizes_and_dedupes_old_raw_contacts(monkeypatch):
     _stub_single_campaign_guard(monkeypatch)

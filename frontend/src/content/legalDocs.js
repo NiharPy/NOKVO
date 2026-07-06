@@ -109,7 +109,7 @@ export const TERMS_OF_SERVICE_HTML = `
 <p><strong>13.9 Updates to Terms.</strong> Nokvo may modify these Terms from time to time. If we make material changes, we will provide reasonable notice through the Services, email, or other appropriate means. Continued use of the Services after the effective date of the revised Terms constitutes acceptance of the updated Terms.</p>
 
 <h4>14. Contact</h4>
-<p>Questions about these Terms may be directed to NEEDLES COUTURE AND COLLECTIVE PRIVATE LIMITED at <a href="mailto:support@nokvo.org">support@nokvo.org</a>.</p>
+<p>Questions about these Terms may be directed to NEEDLES COUTURE AND COLLECTIVE PRIVATE LIMITED at <a href="mailto:officialnokvo@nokvo.org">officialnokvo@nokvo.org</a>.</p>
 `;
 
 export const PRIVACY_POLICY_HTML = `
@@ -212,5 +212,5 @@ export const PRIVACY_POLICY_HTML = `
 <p>We may update this Privacy Policy from time to time to reflect changes in our platform infrastructure, new third-party integrations, or legal requirements. We will notify you of significant changes by emailing the primary contact on your account or displaying a prominent notice within the Nokvo One portal.</p>
 
 <h4>18. Contact &amp; Grievance Officer</h4>
-<p>For any questions, privacy requests, or grievances regarding this Privacy Policy or your personal data, please contact NEEDLES COUTURE AND COLLECTIVE PRIVATE LIMITED at <a href="mailto:privacy@nokvo.org">privacy@nokvo.org</a>. In accordance with the DPDP Act, you may address grievances to our designated point of contact at the same email; we will respond within the timelines required by applicable law.</p>
+<p>For any questions, privacy requests, or grievances regarding this Privacy Policy or your personal data, please contact NEEDLES COUTURE AND COLLECTIVE PRIVATE LIMITED at <a href="mailto:officialnokvo@nokvo.org">officialnokvo@nokvo.org</a>. In accordance with the DPDP Act, you may address grievances to our designated point of contact at the same email; we will respond within the timelines required by applicable law.</p>
 `;

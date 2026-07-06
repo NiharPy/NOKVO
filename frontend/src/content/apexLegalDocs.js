@@ -93,7 +93,7 @@ export const APEX_TERMS_OF_SERVICE_HTML = `
 <p>We may update these Terms and will give reasonable notice of material changes; continued use after the effective date is acceptance. You may not assign these Terms without our consent; we may assign them in a merger or sale of assets. If any provision is unenforceable, the rest remains in effect. These Terms and the APEX Privacy Policy are the entire agreement for APEX. We may send notices electronically (email or in-product). Neither party is liable for delays caused by events beyond its reasonable control.</p>
 
 <h4>15. Contact</h4>
-<p>Questions about these Terms may be sent to NEEDLES COUTURE AND COLLECTIVE PRIVATE LIMITED at <a href="mailto:support@nokvo.org">support@nokvo.org</a>.</p>
+<p>Questions about these Terms may be sent to NEEDLES COUTURE AND COLLECTIVE PRIVATE LIMITED at <a href="mailto:officialnokvo@nokvo.org">officialnokvo@nokvo.org</a>.</p>
 `;
 
 export const APEX_PRIVACY_POLICY_HTML = `
@@ -178,5 +178,5 @@ export const APEX_PRIVACY_POLICY_HTML = `
 <p>We may update this Policy to reflect changes in the Service, providers, or law, and will notify you of significant changes by email or in-product notice.</p>
 
 <h4>13. Contact &amp; Grievances</h4>
-<p>For privacy questions, requests, or grievances under the Digital Personal Data Protection Act, 2023, contact NEEDLES COUTURE AND COLLECTIVE PRIVATE LIMITED at <a href="mailto:privacy@nokvo.org">privacy@nokvo.org</a>. We will respond within the timelines required by applicable law.</p>
+<p>For privacy questions, requests, or grievances under the Digital Personal Data Protection Act, 2023, contact NEEDLES COUTURE AND COLLECTIVE PRIVATE LIMITED at <a href="mailto:officialnokvo@nokvo.org">officialnokvo@nokvo.org</a>. We will respond within the timelines required by applicable law.</p>
 `;

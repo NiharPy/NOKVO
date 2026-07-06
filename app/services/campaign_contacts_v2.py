@@ -177,6 +177,35 @@ async def update_status_by_link(db, call_link_id: str, status: str, **fields: An
     return (res.rowcount or 0) > 0
 
 
+async def rearm_unreached(db, campaign_id: uuid.UUID) -> int:
+    """Re-arm every unreached terminal row for a re-run: ``no_answer``/``failed``
+    → ``pending`` with a FRESH ``call_link_id`` (so a stale webhook from the
+    previous attempt can never touch the retry) and the old placement id cleared.
+    ``dnd_dropped`` stays dropped (still on the register) and answered/completed
+    rows are never re-dialed. No DND scrub here — the dialer re-scrubs each
+    claimed batch at dial time. Returns rows re-armed."""
+    res = await db.execute(
+        text(
+            "UPDATE outbound_campaign_contacts SET status = 'pending', "
+            "call_link_id = CAST(gen_random_uuid() AS text), call_id = NULL, "
+            "updated_at = now() "
+            "WHERE campaign_id = :c AND status IN ('no_answer', 'failed')"
+        ),
+        {"c": str(campaign_id)},
+    )
+    await db.commit()
+    return int(res.rowcount or 0)
+
+
+async def pending_count(db, campaign_id: uuid.UUID) -> int:
+    """Rows still waiting to dial (used by re-run to decide if there's work)."""
+    return int((await db.execute(
+        text("SELECT count(*) FROM outbound_campaign_contacts "
+             "WHERE campaign_id = :c AND status = 'pending'"),
+        {"c": str(campaign_id)},
+    )).scalar_one())
+
+
 async def maybe_complete(db, campaign_id: uuid.UUID) -> bool:
     """Flip a drained V2 campaign ``running`` → ``completed``: no rows left
     pending and none on a live line. One indexed count + a status-guarded UPDATE

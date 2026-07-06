@@ -77,7 +77,14 @@ function statusTone(s) {
   return 'off';
 }
 function redialCount(c) {
-  if (c.v2) return counts(c).pending;  // pending rows are what a relaunch would dial
+  if (c.v2) {
+    // What a re-run would dial: rows still pending (e.g. a just-added CSV) plus
+    // unreached misses it re-arms (no_answer/failed). dnd_dropped never redials.
+    const s = apex.summaryFor && apex.summaryFor(c.id);
+    if (!s) return 0;
+    const by = s.by_status || {};
+    return (s.pending || 0) + (by.no_answer || 0) + (by.failed || 0);
+  }
   return (c.contacts || []).filter((ct) => ct.status !== 'answered' && !ct.answered_at).length;
 }
 
@@ -157,8 +164,10 @@ async function onAddFile(e) {
   errorMsg.value = ''; notice.value = '';
   try {
     await apex.addCampaignContacts(id, file);
-    notice.value = 'Adding contacts… new numbers will start dialing shortly.';
-    setTimeout(() => apex.reload(), 3000);
+    notice.value = 'Adding contacts… new numbers will start dialing shortly. Use ↻ Re-run if the campaign does not resume on its own.';
+    // The append ingests in the background (no 'ingesting' status flip), so poll
+    // a few times until the new pending rows land and the ↻ Re-run option appears.
+    [2500, 7000, 15000].forEach((ms) => setTimeout(() => apex.reload(), ms));
   } catch (err) {
     errorMsg.value = apex.extractError(err, 'Could not add contacts.');
   } finally {
