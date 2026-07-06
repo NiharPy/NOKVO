@@ -366,6 +366,105 @@ async def trace_llm(
 # ──────────────────────────────────────────────────────────────────────────
 
 
+def _nova_project_name() -> str:
+    return os.environ.get("LANGSMITH_NOVA_PROJECT") or settings.LANGSMITH_NOVA_PROJECT or "nokvo-nova"
+
+
+@asynccontextmanager
+async def trace_nova(*, name: str, **meta: Any) -> AsyncIterator[Any]:
+    """Root span for one NOVA interaction (a chat turn, a brief extraction, a
+    confirm execution) in the DEDICATED nova project — never mixed into the
+    voice_call project. Sets ``tracing_context`` so every internal LLM call
+    (``AzureGroundedLLM.complete`` → :func:`trace_llm`) and any
+    :func:`trace_nova_tool` child auto-nests under it. The caller attaches the
+    turn's result via ``span.add_outputs({...})``. Best-effort: tracing
+    failures never affect the interaction."""
+    if not _enabled:
+        yield None
+        return
+    try:
+        from langsmith.run_trees import RunTree
+        from langsmith.run_helpers import tracing_context
+    except Exception:
+        logger.debug("NOKVO-LANGSMITH: SDK import failed at trace_nova")
+        yield None
+        return
+
+    meta = {k: (str(v) if v is not None else None) for k, v in meta.items()}
+    run = RunTree(
+        name=name,
+        run_type="chain",
+        inputs={k: v for k, v in meta.items() if v is not None},
+        extra={"metadata": {k: v for k, v in meta.items() if v is not None}},
+        project_name=_nova_project_name(),
+    )
+    try:
+        run.post()
+    except Exception:
+        logger.debug("NOKVO-LANGSMITH: nova root post failed", exc_info=True)
+    error: BaseException | None = None
+    try:
+        with tracing_context(parent=run):
+            yield run
+    except BaseException as exc:  # noqa: BLE001 — re-raised
+        error = exc
+        raise
+    finally:
+        try:
+            if error is not None:
+                run.end(error=repr(error)[:300])
+            else:
+                run.end()
+            run.patch()
+        except Exception:
+            logger.debug("NOKVO-LANGSMITH: nova root end/patch failed", exc_info=True)
+
+
+@asynccontextmanager
+async def trace_nova_tool(*, name: str, arguments: dict | None = None) -> AsyncIterator[Any]:
+    """Child span for one NOVA tool execution (run_type ``tool``), attached to
+    the ambient :func:`trace_nova` root. Caller adds outputs via
+    ``span.add_outputs({...})``. No-parent → silent no-op (never free-floats
+    tool runs into the default project)."""
+    if not _enabled:
+        yield None
+        return
+    try:
+        from langsmith.run_helpers import get_current_run_tree, tracing_context
+    except Exception:
+        yield None
+        return
+    parent = get_current_run_tree()
+    if parent is None:
+        yield None
+        return
+    run = parent.create_child(
+        name=f"tool:{name}",
+        run_type="tool",
+        inputs={"arguments": arguments or {}},
+    )
+    try:
+        run.post()
+    except Exception:
+        logger.debug("NOKVO-LANGSMITH: nova tool post failed", exc_info=True)
+    error: BaseException | None = None
+    try:
+        with tracing_context(parent=run):
+            yield run
+    except BaseException as exc:  # noqa: BLE001 — re-raised
+        error = exc
+        raise
+    finally:
+        try:
+            if error is not None:
+                run.end(error=repr(error)[:300])
+            else:
+                run.end()
+            run.patch()
+        except Exception:
+            logger.debug("NOKVO-LANGSMITH: nova tool end/patch failed", exc_info=True)
+
+
 def traceable_chain(name: str, **decorator_meta: Any) -> Callable:
     """Decorator wrapping ``langsmith.traceable`` with run_type=chain.
 

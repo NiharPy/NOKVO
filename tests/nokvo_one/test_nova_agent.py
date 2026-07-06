@@ -161,3 +161,32 @@ async def test_llm_failure_degrades_gracefully(monkeypatch):
     monkeypatch.setattr(nova, "_llm", boom)
     res = await nova.nova_turn(None, _FakeTenantRes(), _FakeUser(), None, "hello")
     assert "snag" in res.reply
+
+
+# ── LangSmith separation ──────────────────────────────────────────────────────
+
+def test_nova_traces_into_a_dedicated_project():
+    """NOVA chat turns must never land in the voice project."""
+    from app.services.langsmith_tracer import _nova_project_name, _project_name
+
+    assert _nova_project_name() != _project_name()
+    assert "nova" in _nova_project_name()
+
+
+@pytest.mark.asyncio
+async def test_trace_nova_noops_when_tracing_disabled():
+    from app.services.langsmith_tracer import trace_nova, trace_nova_tool
+
+    async with trace_nova(name="nova_turn", session_id="s1") as span:
+        assert span is None  # tracing disabled in tests → clean no-op
+        async with trace_nova_tool(name="lookup_legal", arguments={"query": "x"}) as tspan:
+            assert tspan is None
+
+
+@pytest.mark.asyncio
+async def test_turn_works_through_the_traced_wrapper(monkeypatch):
+    """nova_turn is now trace_nova(root) → _nova_turn_inner; behavior unchanged."""
+    _mock_store(monkeypatch)
+    _mock_llm(monkeypatch, ["APEX dials 9 AM to 7 PM IST."])
+    res = await nova.nova_turn(None, _FakeTenantRes(), _FakeUser(), None, "When do calls go out?")
+    assert "9 AM" in res.reply

@@ -110,7 +110,25 @@ async def nova_upload(
             status_code=422,
             detail="I couldn't read any text in that file — scanned/image-only documents don't work yet.",
         )
-    analysis = await analyze_campaign_brief(text, tr)
+    from app.services.langsmith_tracer import trace_nova
+
+    async with trace_nova(
+        name="nova_brief_extraction",
+        organization_id=user.organization_id,
+        tenant_id=tr.tenant_id,
+        session_id=session_id,
+        filename=file.filename,
+        chars=len(text),
+    ) as _span:
+        analysis = await analyze_campaign_brief(text, tr)
+        if _span is not None:
+            try:
+                _span.add_outputs({
+                    "extracted_fields": sorted(analysis["extracted"].keys()),
+                    "truncated": analysis["truncated"],
+                })
+            except Exception:
+                pass
     extracted = analysis["extracted"]
     if not extracted:
         raise HTTPException(
@@ -215,13 +233,26 @@ async def nova_confirm(
     if payload.decision == "cancel":
         return {"result": "cancelled", "reply": "Okay, cancelled — nothing was done."}
 
+    from app.services.langsmith_tracer import trace_nova
     from app.services.nova_agent_service import CONFIRM_EXECUTORS
 
     executor = CONFIRM_EXECUTORS.get(str(consumed.get("type") or ""))
     if executor is None:
         raise HTTPException(status_code=400, detail="This action type can't be executed.")
     try:
-        result, reply = await executor(db, tr, user, consumed.get("payload") or {})
+        async with trace_nova(
+            name="nova_confirm",
+            organization_id=user.organization_id,
+            tenant_id=tr.tenant_id,
+            session_id=payload.session_id,
+            action_type=consumed.get("type"),
+        ) as _span:
+            result, reply = await executor(db, tr, user, consumed.get("payload") or {})
+            if _span is not None:
+                try:
+                    _span.add_outputs({"result": result})
+                except Exception:
+                    pass
     except Exception:
         logger.exception("NOVA: confirm execution failed (%s)", consumed.get("type"))
         raise HTTPException(status_code=500, detail="The action failed — nothing was recorded. Please try again.")

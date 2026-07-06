@@ -700,6 +700,10 @@ class Settings(BaseSettings):
     # the SDK's implicit hooks pick up the same toggle.
     LANGSMITH_API_KEY: str = ""
     LANGSMITH_PROJECT: str = "nokvo-one"
+    # NOVA (the APEX chat assistant) traces into its OWN project so text-chat
+    # turns never mix with voice_call traces — different shape, different
+    # debugging workflow (chat sessions vs call transcripts).
+    LANGSMITH_NOVA_PROJECT: str = "nokvo-nova"
     LANGSMITH_TRACING_V2: bool = False
     # Blank → SDK defaults to LangSmith cloud (api.smith.langchain.com).
     # Override for self-hosted deployments.
