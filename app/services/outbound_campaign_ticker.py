@@ -39,6 +39,22 @@ _shutdown = asyncio.Event()
 
 async def _tick_once() -> None:
     async with AsyncSessionLocal() as db:
+        # Stuck-row reaper (ALL running campaigns, windowed or not): release
+        # contact rows whose terminal webhook never arrived, then complete any
+        # campaign that turns out to be drained. Without this, one lost webhook
+        # pins a dial slot forever and a finished list never flips to completed —
+        # i.e. the campaign never "stops and waits for more contacts".
+        try:
+            from app.services import campaign_contacts_v2 as v2
+
+            for campaign_id in await v2.reap_stale_rows(db):
+                with suppress(Exception):
+                    await v2.maybe_complete(db, campaign_id)
+        except Exception:
+            logger.exception("CAMPAIGN-TICKER: stale-row reap failed")
+            with suppress(Exception):
+                await db.rollback()
+
         try:
             rows = (
                 (

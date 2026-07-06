@@ -59,6 +59,33 @@ async def test_initiate_outbound_call_normalizes_from_and_to(monkeypatch):
     )
     assert sent["body"]["from"] == "912264232977"  # no spaces reach Plivo
     assert sent["body"]["to"] == "917569672503"
+    # Ring cap: an unanswered call is cancelled BEFORE carrier voicemail (~30-45s)
+    # picks up — never Plivo's 120s default, always inside the accepted 5-600.
+    assert 5 <= sent["body"]["ring_timeout"] <= 29
+
+
+@pytest.mark.asyncio
+async def test_ring_timeout_clamped_to_plivo_range(monkeypatch):
+    from app.core.config import settings
+
+    sent = {}
+
+    async def fake_request(method, url, *, auth, json_body=None):
+        sent["body"] = json_body
+        return {"call": {"sid": "X"}}
+
+    monkeypatch.setattr(PlivoService, "_request", staticmethod(fake_request))
+    monkeypatch.setattr(settings, "OUTBOUND_RING_TIMEOUT_S", 2, raising=False)
+
+    class _TR:
+        provider_status = {}
+        twilio_phone_number = None
+
+    await PlivoService.initiate_outbound_call(
+        _TR(), to_number="917569672503", answer_url="https://x/a",
+        from_number="912264232977", auth_override=("SAid", "tok"),
+    )
+    assert sent["body"]["ring_timeout"] == 5  # floor of Plivo's accepted range
 
 
 @pytest.mark.asyncio

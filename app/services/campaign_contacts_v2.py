@@ -206,6 +206,54 @@ async def pending_count(db, campaign_id: uuid.UUID) -> int:
     )).scalar_one())
 
 
+# Stuck-row reaper timeouts. A row leaves a "live" status only when a Plivo
+# webhook lands; a lost webhook (deploy mid-call, process restart between claim
+# and placement, callback retries exhausted) would otherwise pin the row live
+# FOREVER — permanently eating one of the 5 dial slots and, once the rest of
+# the list drains, blocking the running→completed transition (the campaign
+# would hold the tenant's one-campaign slot with nothing left to dial).
+_STALE_PLACING_MINUTES = 30    # dialing/ringing — a real ring resolves in ~1 min
+_STALE_ANSWERED_MINUTES = 240  # answered — no legitimate call runs 4 hours
+
+
+async def reap_stale_rows(db) -> list[uuid.UUID]:
+    """Sweep rows stuck in a live status on RUNNING campaigns past the timeouts:
+    ``dialing``/``ringing`` → ``no_answer`` (never actually reached — a re-run
+    re-arms them), ``answered`` → ``completed`` (the person WAS reached; only the
+    hangup webhook was lost — never re-dial them). Returns the distinct campaign
+    ids touched so the caller can run :func:`maybe_complete` on each. Called from
+    the campaign ticker every 10 minutes; idempotent and cheap (indexed status
+    scan, no-op when nothing is stale)."""
+    placing = (await db.execute(
+        text(
+            "UPDATE outbound_campaign_contacts occ SET status = 'no_answer', updated_at = now() "
+            "FROM outbound_campaigns c WHERE c.id = occ.campaign_id AND c.status = 'running' "
+            "AND occ.status IN ('dialing', 'ringing') "
+            "AND occ.updated_at < now() - make_interval(mins => :m) "
+            "RETURNING occ.campaign_id"
+        ),
+        {"m": _STALE_PLACING_MINUTES},
+    )).all()
+    answered = (await db.execute(
+        text(
+            "UPDATE outbound_campaign_contacts occ SET status = 'completed', updated_at = now() "
+            "FROM outbound_campaigns c WHERE c.id = occ.campaign_id AND c.status = 'running' "
+            "AND occ.status = 'answered' "
+            "AND occ.updated_at < now() - make_interval(mins => :m) "
+            "RETURNING occ.campaign_id"
+        ),
+        {"m": _STALE_ANSWERED_MINUTES},
+    )).all()
+    await db.commit()
+    touched = {r[0] for r in placing} | {r[0] for r in answered}
+    if touched:
+        logger.warning(
+            "NOKVO-REAPER: released %d stale contact row(s) across %d campaign(s)",
+            len(placing) + len(answered), len(touched),
+        )
+    return list(touched)
+
+
 async def maybe_complete(db, campaign_id: uuid.UUID) -> bool:
     """Flip a drained V2 campaign ``running`` → ``completed``: no rows left
     pending and none on a live line. One indexed count + a status-guarded UPDATE

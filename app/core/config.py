@@ -407,6 +407,14 @@ class Settings(BaseSettings):
     # places this many, then refills one-for-one as each call ends (driven by the
     # Plivo status webhook), so we never fire hundreds of simultaneous calls.
     OUTBOUND_DIAL_CONCURRENCY: int = 5
+    # How long an outbound call RINGS before we cancel it (Plivo ring_timeout,
+    # allowed 5-600, Plivo default 120). Kept SHORT so an unanswered call is cut
+    # BEFORE carrier voicemail engages (~30-45s in India): the contact lands in
+    # no_answer instead of "connecting" to a mailbox — which would burn Plivo
+    # minutes, deduct the customer's Call Credits, and run the whole voice
+    # pipeline against a greeting. In-call voicemail DETECTION stays as the
+    # safety net for mailboxes that answer faster than this.
+    OUTBOUND_RING_TIMEOUT_S: int = 25
     # Scalable per-row contact storage (outbound_campaign_contacts) instead of the
     # O(n) JSONB blob on outbound_campaigns.contacts. When ON, bulk campaigns ingest
     # via async COPY, dial via an advisory-locked indexed claim, and update contacts

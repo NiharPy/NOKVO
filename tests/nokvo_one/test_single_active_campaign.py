@@ -134,3 +134,50 @@ async def test_cancel_refused_for_terminal_statuses(status_name):
     camp = OutboundCampaign(tenant_id="t1", name="c", status=getattr(CampaignStatus, status_name))
     with pytest.raises(ValueError, match="Cannot cancel"):
         await OutboundCampaignService.cancel_campaign(camp, _CancelDB())
+
+
+# ── stuck-row reaper (guarantees exhausted campaigns actually complete) ──────
+
+class _ReapDB:
+    """Returns preset campaign-id rows for the two reap UPDATEs, in order."""
+
+    def __init__(self, placing_ids, answered_ids):
+        self._results = [placing_ids, answered_ids]
+        self.sql = []
+        self.committed = False
+
+    async def execute(self, stmt, params=None):
+        self.sql.append(str(stmt))
+        ids = self._results.pop(0) if self._results else []
+
+        class _R:
+            def __init__(self, rows):
+                self._rows = rows
+
+            def all(self):
+                return [(i,) for i in self._rows]
+
+        return _R(ids)
+
+    async def commit(self):
+        self.committed = True
+
+
+@pytest.mark.asyncio
+async def test_reap_returns_distinct_touched_campaigns():
+    db = _ReapDB(placing_ids=["c1", "c2", "c1"], answered_ids=["c2", "c3"])
+    touched = await v2.reap_stale_rows(db)
+    assert sorted(touched) == ["c1", "c2", "c3"]
+    assert db.committed
+    # dialing/ringing → no_answer (re-armable); answered → completed (never re-dialed).
+    assert "IN ('dialing', 'ringing')" in db.sql[0] and "'no_answer'" in db.sql[0]
+    assert "= 'answered'" in db.sql[1] and "'completed'" in db.sql[1]
+    # Only RUNNING campaigns are swept — terminal/cancelled rows stay untouched.
+    assert all("c.status = 'running'" in s for s in db.sql)
+
+
+@pytest.mark.asyncio
+async def test_reap_noop_when_nothing_stale():
+    db = _ReapDB(placing_ids=[], answered_ids=[])
+    assert await v2.reap_stale_rows(db) == []
+    assert db.committed

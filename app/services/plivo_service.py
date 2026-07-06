@@ -533,6 +533,11 @@ class PlivoService:
             "to": cls.normalize_number(to_number),
             "answer_url": answer_url,
             "answer_method": "POST",
+            # Cut an unanswered call while it's still RINGING — before carrier
+            # voicemail picks up (~30-45s). Cancelled rings land as no_answer;
+            # nothing is billed and no credits are deducted. Clamped to Plivo's
+            # accepted 5-600s range.
+            "ring_timeout": max(5, min(600, int(settings.OUTBOUND_RING_TIMEOUT_S or 25))),
         }
         if status_callback:
             body["hangup_url"] = status_callback
