@@ -76,13 +76,18 @@ jobs:
         run: |
           ACR_SERVER="$(az acr show -n "${{ vars.ACR_NAME }}" --query loginServer -o tsv)"
           IMAGE="${ACR_SERVER}/${IMAGE_NAME}:${IMAGE_TAG}"
+          # SINGLE-revision mode (set 2026-07-04 to stop stale-revision replica
+          # sprawl): the image update IS the deploy — traffic follows the new
+          # revision automatically, and `ingress traffic set` is INVALID in this
+          # mode (it fails the whole step even though the deploy already landed).
           az containerapp update -n "${{ vars.API_APP }}" -g "${{ vars.RESOURCE_GROUP }}" \
             --image "$IMAGE" -o none
-          # Multiple-revision mode: shift 100% of traffic to the newest revision.
-          NEW_REV="$(az containerapp revision list -n "${{ vars.API_APP }}" \
-            -g "${{ vars.RESOURCE_GROUP }}" --query "[?properties.active].name | [-1]" -o tsv)"
-          az containerapp ingress traffic set -n "${{ vars.API_APP }}" \
-            -g "${{ vars.RESOURCE_GROUP }}" --revision-weight "${NEW_REV}=100" -o none
+          # Verify the app converged onto the new image before calling it shipped.
+          LIVE="$(az containerapp show -n "${{ vars.API_APP }}" -g "${{ vars.RESOURCE_GROUP }}" \
+            --query "properties.template.containers[0].image" -o tsv)"
+          if [ "$LIVE" != "$IMAGE" ]; then
+            echo "live image is $LIVE, expected $IMAGE"; exit 1
+          fi
 
   frontend:
     runs-on: ubuntu-latest
