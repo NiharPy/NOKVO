@@ -195,10 +195,9 @@ async function remove(id, name) {
     await apex.deleteCampaign(id);
     await apex.reload();
   } catch (e) {
-    // Running campaigns are protected server-side (409).
-    errorMsg.value = e?.response?.status === 409
-      ? 'Cancel the campaign before deleting it — running campaigns are protected.'
-      : apex.extractError(e, 'Could not delete the campaign.');
+    // Show the SERVER's reason — a 409 can be "stop it first" (running) OR
+    // "linked records block it"; hardcoding one masked the other.
+    errorMsg.value = apex.extractError(e, 'Could not delete the campaign.');
   } finally {
     deleting.value = null;
   }

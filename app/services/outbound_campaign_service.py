@@ -815,14 +815,17 @@ class OutboundCampaignService:
                 "Cancel the campaign before deleting it. Running campaigns are protected."
             )
 
-        # Drop the join rows first so the FK constraint stays happy.
-        contacts = await db.execute(
-            select(OutboundCampaignContact).where(
-                OutboundCampaignContact.campaign_id == campaign.id
-            )
+        # Drop the join rows first so the FK constraint stays happy — as ONE bulk
+        # DELETE executed immediately on the connection. The old ORM
+        # load-and-delete loop left statement ordering to the unit of work, and
+        # with NO relationship() edge between the campaign and contact mappers
+        # the flush had no dependency to honour — prod emitted the campaign
+        # DELETE before the contact DELETEs and hit the contacts FK every time.
+        # (It also loaded every row into RAM — untenable for a V2 campaign.)
+        await db.execute(
+            _sql_text("DELETE FROM outbound_campaign_contacts WHERE campaign_id = :c"),
+            {"c": str(campaign.id)},
         )
-        for row in contacts.scalars().all():
-            await db.delete(row)
 
         # Orphan (don't delete) the follow-up schedules that point at this
         # campaign — the column is nullable by design.

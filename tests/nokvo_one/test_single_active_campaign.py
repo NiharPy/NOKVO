@@ -220,6 +220,10 @@ async def test_delete_campaign_nulls_followup_schedule_fk():
     camp = OutboundCampaign(tenant_id="t1", name="del-me", status=CampaignStatus.completed)
     db = _DeleteDB()
     await OutboundCampaignService.delete_campaign(camp, db)
+    # Contacts must go via ONE bulk raw DELETE issued BEFORE the campaign
+    # delete — the old ORM loop had no relationship() dependency edge, so the
+    # flush ordered the campaign DELETE first and hit the contacts FK in prod.
+    assert any("DELETE FROM outbound_campaign_contacts" in s for s in db.sql), db.sql
     assert any(
         "lead_followup_schedules" in s and "campaign_id = NULL" in s for s in db.sql
     ), db.sql
