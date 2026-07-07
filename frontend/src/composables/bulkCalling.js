@@ -202,6 +202,20 @@ export function maxPointsFor(questions) {
   }, 0);
 }
 
+// Non-empty pre-translated languages only ({en,hi,te} with blanks dropped).
+export function pruneI18n(i18n) {
+  const out = {};
+  for (const [k, v] of Object.entries(i18n || {})) {
+    const t = (v || '').trim();
+    if (t) out[k] = t;
+  }
+  return out;
+}
+
+export function hasI18n(i18n) {
+  return Object.keys(pruneI18n(i18n)).length > 0;
+}
+
 // Normalize the builder's questions into the API shape (drops blanks, clamps
 // points, normalizes graded tiers). Mirrors the Nokvo One bulk create exactly.
 export function cleanQuestions(questions) {
@@ -223,6 +237,9 @@ export function cleanQuestions(questions) {
         points: clampPts(q.points),
       };
       if (tiers.length) out.tiers = tiers;
+      // Reviewed/hand-edited translations (translate-preview flow) ride along;
+      // the server preserves non-empty languages and fills only the blanks.
+      if (hasI18n(q.text_i18n)) out.text_i18n = pruneI18n(q.text_i18n);
       return out;
     })
     .filter((q) => q.text);
@@ -265,12 +282,17 @@ export function buildBulkCampaignFormData(form, { deterministic }) {
   if ((form.caller_name || '').trim()) fd.append('caller_name', form.caller_name.trim());
   if (form.language) fd.append('language', form.language);
   if (deterministic) {
-    fd.append('questionnaire', JSON.stringify({
+    const questionnaire = {
       intro: (form.intro || '').trim(),
       outro: (form.outro || '').trim(),
       questions: cleaned,
       threshold: clampedThreshold,
-    }));
+    };
+    // Reviewed/hand-edited translations from the translate-preview flow. The
+    // server preserves any non-empty language and only fills the blanks.
+    if (hasI18n(form.intro_i18n)) questionnaire.intro_i18n = pruneI18n(form.intro_i18n);
+    if (hasI18n(form.outro_i18n)) questionnaire.outro_i18n = pruneI18n(form.outro_i18n);
+    fd.append('questionnaire', JSON.stringify(questionnaire));
     fd.append('working_days', String(Math.max(1, Math.min(7, Math.round(Number(form.working_days) || 5)))));
     fd.append('hours_per_day', String(Math.max(1, Math.min(10, Math.round(Number(form.hours_per_day) || 10)))));
     if (form.calls_per_day) {

@@ -307,6 +307,10 @@ class OutboundCampaignContext:
     # Admin-authored opener line for a questionnaire campaign (spoken as the
     # deterministic opener); empty falls back to the template opener.
     question_intro: str = ""
+    # Pre-translated opener {en,hi,te} (questionnaire_translation). The opener is
+    # spoken from the session-language entry here so a hi/te campaign doesn't open
+    # in English; empty falls back to ``question_intro``.
+    question_intro_i18n: dict = field(default_factory=dict)
     # Admin-authored closing line; the agent says it to end any call and the
     # system plays-then-hangs-up when it's delivered (incl. a failed intent gate).
     question_outro: str = ""
@@ -602,6 +606,10 @@ def _coerce_questionnaire(value: Any, *, strict: bool = False) -> dict[str, Any]
     intro = str(value.get("intro") or "").strip()[:600]
     if intro:
         result["intro"] = intro
+    # Pre-translated intro (en/hi/te), same round-trip rationale as text_i18n below.
+    intro_i18n = value.get("intro_i18n")
+    if isinstance(intro_i18n, dict) and intro_i18n:
+        result["intro_i18n"] = {str(k): str(v) for k, v in intro_i18n.items() if v}
     # Optional closing line. The agent says it to end ANY call; the system also
     # plays it then hangs up when an intent gate fails (see the stream service).
     outro = str(value.get("outro") or "").strip()[:600]
@@ -746,6 +754,7 @@ def _build_context(campaign: OutboundCampaign, *, goal: str | None = None) -> Ou
         questions=list((agent_config.get("questionnaire") or {}).get("questions") or []),
         question_threshold=int((agent_config.get("questionnaire") or {}).get("threshold") or 0),
         question_intro=str((agent_config.get("questionnaire") or {}).get("intro") or ""),
+        question_intro_i18n=dict((agent_config.get("questionnaire") or {}).get("intro_i18n") or {}),
         question_outro=str((agent_config.get("questionnaire") or {}).get("outro") or ""),
         question_outro_i18n=dict((agent_config.get("questionnaire") or {}).get("outro_i18n") or {}),
     )
@@ -798,6 +807,7 @@ async def load_outbound_context(
                     questions=ctx.questions,
                     question_threshold=ctx.question_threshold,
                     question_intro=ctx.question_intro,
+                    question_intro_i18n=ctx.question_intro_i18n,
                     question_outro=ctx.question_outro,
                     question_outro_i18n=ctx.question_outro_i18n,
                 )
@@ -2121,10 +2131,15 @@ def generate_outbound_opener_text(
     caller = (context.caller_name or "Riya").strip() or "Riya"
     company = (context.company_name or "").strip()
     # An admin-authored questionnaire intro overrides the template opener — the
-    # operator wrote exactly how they want the call to open (in the campaign's
-    # language). Spoken as-is; voiced warm by _play_opener when it carries no
-    # prosody tags.
-    intro = (getattr(context, "question_intro", "") or "").strip()
+    # operator wrote exactly how they want the call to open. Spoken from the
+    # pre-translated per-language entry (lang → en → authored fallback) so a
+    # hi/te campaign doesn't open in the authored language; voiced warm by
+    # _play_opener when it carries no prosody tags.
+    intro = verbatim_line_for_language(
+        getattr(context, "question_intro_i18n", None),
+        (getattr(context, "question_intro", "") or "").strip(),
+        language,
+    )
     if intro:
         return f"[warm]{intro}[/warm]"
     # Only speak a SHORT pitch — never the full content blob (it'd read the prompt

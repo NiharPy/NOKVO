@@ -1,13 +1,17 @@
 <script setup>
 // APEX Qualified Leads — contacts that crossed the lead score. V2 campaigns are
 // read PAGINATED from the server (scales to 1M); legacy blob campaigns stay
-// client-side. Per-question breakdown + call note.
+// client-side. Row click opens the slide-over drawer (score breakdown + note).
 import { inject, ref, computed, watch, onMounted } from 'vue';
 import { categorizeContacts, exportContactsCsv } from '../../composables/bulkCalling.js';
+import AxIcon from '../AxIcon.vue';
+import AxScore from '../AxScore.vue';
+import AxPhone from '../AxPhone.vue';
+import AxLeadDrawer from '../AxLeadDrawer.vue';
 
 const apex = inject('apex');
 const filter = ref(null); // null = all
-const expanded = ref(null);
+const detail = ref(null); // row shown in the drawer
 const rows = ref([]);
 const loading = ref(false);
 const cursors = ref({}); // v2 campaign_id -> next cursor (null = exhausted)
@@ -25,7 +29,7 @@ function _parseResult(r) {
 function _mapV2(r, c) {
   const res = _parseResult(r);
   return {
-    call_link_id: r.id, // unique row key for the toggle
+    call_link_id: r.id, // unique row key for the drawer
     name: r.name || r.phone,
     raw_name: r.name || '',
     phone: r.phone,
@@ -63,8 +67,6 @@ watch(filter, () => loadRows(true));
 watch(() => apex.deterministicCampaigns.value, () => loadRows(true));
 onMounted(() => loadRows(true));
 
-function toggle(key) { expanded.value = expanded.value === key ? null : key; }
-
 async function downloadCsv() {
   const name = `apex-qualified-leads-${new Date().toISOString().slice(0, 10)}.csv`;
   // A single V2 campaign selected → stream the full bucket server-side.
@@ -74,6 +76,7 @@ async function downloadCsv() {
   } else {
     exportContactsCsv(rows.value, name); // legacy / mixed: the loaded rows
   }
+  apex.toast('CSV downloaded.');
 }
 </script>
 
@@ -85,8 +88,8 @@ async function downloadCsv() {
         <span class="ax-count ax-count--green">{{ rows.length }}{{ hasMore ? '+' : '' }}</span>
       </div>
       <div style="display:flex;align-items:center;gap:8px;">
-        <button type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" :disabled="!rows.length" @click="downloadCsv">⇩ Generate CSV</button>
-        <button type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" @click="apex.reload().then(() => loadRows(true))">↻ Refresh</button>
+        <button type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" :disabled="!rows.length" @click="downloadCsv"><AxIcon name="download" :size="13" /> Generate CSV</button>
+        <button type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" @click="apex.reload().then(() => loadRows(true))"><AxIcon name="refresh" :size="13" /> Refresh</button>
       </div>
     </div>
     <p class="ax-muted">Contacts that qualified — by lead score where a questionnaire is set. Click a scored row to see the per-question breakdown.</p>
@@ -96,39 +99,36 @@ async function downloadCsv() {
       <button v-for="c in apex.deterministicCampaigns.value" :key="c.id" type="button" class="ax-chip" :class="{ 'is-active': filter === c.id }" @click="filter = c.id">{{ c.name }}</button>
     </div>
 
-    <div v-if="!rows.length && !loading" class="ax-empty" style="margin-top:16px;">
-      <div class="ax-empty-icon">★</div>
+    <div v-if="loading && !rows.length" style="margin-top:16px;">
+      <div v-for="i in 6" :key="i" class="ax-skel-row">
+        <span class="ax-skel-bar" style="width:58%"></span>
+        <span class="ax-skel-bar" style="width:44%"></span>
+        <span class="ax-skel-bar ax-skel-bar--pill"></span>
+      </div>
+    </div>
+    <div v-else-if="!rows.length" class="ax-empty" style="margin-top:16px;">
+      <div class="ax-empty-icon"><AxIcon name="star" :size="20" /></div>
       <p class="ax-empty-text">No qualified leads yet — qualified contacts from your campaigns will appear here.</p>
     </div>
     <template v-else>
       <div class="ax-thead" style="grid-template-columns:1.4fr 1.4fr auto;"><span>Name</span><span>Phone</span><span>Score</span></div>
-      <template v-for="(row, i) in rows" :key="row.call_link_id || i">
-        <div class="ax-trow ax-trow--click" style="grid-template-columns:1.4fr 1.4fr auto;" @click="toggle(row.call_link_id)">
-          <span class="ax-cell-name">{{ row.name }}</span>
-          <span class="ax-cell-phone">{{ row.phone }}</span>
-          <span v-if="row.max_score" class="ax-score">{{ row.lead_score }}/{{ row.max_score }}</span>
-          <span v-else class="ax-score ax-score--grey">—</span>
-        </div>
-        <div v-if="expanded === row.call_link_id && ((row.score_breakdown && row.score_breakdown.length) || row.call_note)" class="ax-break">
-          <div class="ax-break-label">How it scored</div>
-          <p v-if="row.lead_score_reason" class="ax-break-reason">{{ row.lead_score_reason }}</p>
-          <div v-for="(b, bi) in (row.score_breakdown || [])" :key="bi" class="ax-break-row">
-            <span class="ax-break-mark" :class="b.awarded ? 'ax-break-mark--ok' : 'ax-break-mark--miss'">{{ b.awarded ? '✓' : '✗' }}</span>
-            <div style="flex:1;">
-              <div class="ax-break-q">{{ b.text }}</div>
-              <div v-if="b.evidence" class="ax-break-a">"{{ b.evidence }}"</div>
-            </div>
-            <span v-if="b.awarded_points" class="ax-break-pts">+{{ b.awarded_points }}</span>
-          </div>
-          <div v-if="row.call_note" class="ax-callnote">
-            <span class="ax-callnote-label">Call note&nbsp;&nbsp;</span>
-            <span class="ax-callnote-text">{{ row.call_note }}</span>
-          </div>
-        </div>
-      </template>
+      <div
+        v-for="(row, i) in rows" :key="row.call_link_id || i"
+        class="ax-trow ax-trow--click ax-row-in" :style="{ '--i': Math.min(i, 14) }"
+        style="grid-template-columns:1.4fr 1.4fr auto;" @click="detail = row"
+      >
+        <span class="ax-cell-name">{{ row.name }}</span>
+        <AxPhone :phone="row.phone" />
+        <AxScore v-if="row.max_score" :score="row.lead_score" :max="row.max_score" tone="green" />
+        <span v-else class="ax-score ax-score--grey">—</span>
+      </div>
       <button v-if="hasMore" type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" style="margin-top:12px;" :disabled="loading" @click="loadRows(false)">
         {{ loading ? 'Loading…' : 'Load more' }}
       </button>
     </template>
+
+    <Transition name="axdrawer">
+      <AxLeadDrawer v-if="detail" :row="detail" tone="green" @close="detail = null" />
+    </Transition>
   </div>
 </template>

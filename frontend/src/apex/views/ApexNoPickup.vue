@@ -3,6 +3,8 @@
 // server; legacy blob campaigns stay client-side.
 import { inject, ref, computed, watch, onMounted } from 'vue';
 import { categorizeContacts, exportContactsCsv } from '../../composables/bulkCalling.js';
+import AxIcon from '../AxIcon.vue';
+import AxPhone from '../AxPhone.vue';
 
 const apex = inject('apex');
 const filter = ref(null);
@@ -45,6 +47,7 @@ async function downloadCsv() {
   const one = scoped.value.length === 1 && scoped.value[0].v2 ? scoped.value[0] : null;
   if (one) await apex.downloadCampaignContactsCsv(one.id, 'no_pickup', name);
   else exportContactsCsv(rows.value, name);
+  apex.toast('CSV downloaded.');
 }
 </script>
 
@@ -56,8 +59,8 @@ async function downloadCsv() {
         <span class="ax-count ax-count--grey">{{ rows.length }}{{ hasMore ? '+' : '' }}</span>
       </div>
       <div style="display:flex;align-items:center;gap:8px;">
-        <button type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" :disabled="!rows.length" @click="downloadCsv">⇩ Generate CSV</button>
-        <button type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" @click="apex.reload().then(() => loadRows(true))">↻ Refresh</button>
+        <button type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" :disabled="!rows.length" @click="downloadCsv"><AxIcon name="download" :size="13" /> Generate CSV</button>
+        <button type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" @click="apex.reload().then(() => loadRows(true))"><AxIcon name="refresh" :size="13" /> Refresh</button>
       </div>
     </div>
     <p class="ax-muted">Numbers we couldn't reach — no answer or the call didn't connect. Re-run a campaign to try its unreached numbers again.</p>
@@ -67,15 +70,26 @@ async function downloadCsv() {
       <button v-for="c in apex.deterministicCampaigns.value" :key="c.id" type="button" class="ax-chip" :class="{ 'is-active': filter === c.id }" @click="filter = c.id">{{ c.name }}</button>
     </div>
 
-    <div v-if="!rows.length && !loading" class="ax-empty" style="margin-top:16px;">
-      <div class="ax-empty-icon">⌀</div>
+    <div v-if="loading && !rows.length" style="margin-top:16px;">
+      <div v-for="i in 6" :key="i" class="ax-skel-row">
+        <span class="ax-skel-bar" style="width:58%"></span>
+        <span class="ax-skel-bar" style="width:44%"></span>
+        <span class="ax-skel-bar ax-skel-bar--pill"></span>
+      </div>
+    </div>
+    <div v-else-if="!rows.length" class="ax-empty" style="margin-top:16px;">
+      <div class="ax-empty-icon"><AxIcon name="phone-off" :size="20" /></div>
       <p class="ax-empty-text">Everyone we dialed connected — unreached numbers will appear here.</p>
     </div>
     <template v-else>
       <div class="ax-thead" style="grid-template-columns:1.4fr 1.4fr auto;"><span>Name</span><span>Phone</span><span>Outcome</span></div>
-      <div v-for="(row, i) in rows" :key="row.call_link_id || i" class="ax-trow" style="grid-template-columns:1.4fr 1.4fr auto;">
+      <div
+        v-for="(row, i) in rows" :key="row.call_link_id || i"
+        class="ax-trow ax-row-in" :style="{ '--i': Math.min(i, 14) }"
+        style="grid-template-columns:1.4fr 1.4fr auto;"
+      >
         <span class="ax-cell-name">{{ row.name }}</span>
-        <span class="ax-cell-phone">{{ row.phone }}</span>
+        <AxPhone :phone="row.phone" />
         <span class="ax-outcome">{{ row.status === 'failed' ? 'Call failed' : 'No answer' }}</span>
       </div>
       <button v-if="hasMore" type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" style="margin-top:12px;" :disabled="loading" @click="loadRows(false)">

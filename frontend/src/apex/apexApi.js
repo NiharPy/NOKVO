@@ -97,7 +97,9 @@ export async function fetchMe() {
 // Auth config — the shared Google OAuth client id (APEX reuses it).
 export async function fetchConfig() {
   try {
-    const { data } = await api.get('/config');
+    // Timeout matters: a hung backend otherwise leaves the Google button in a
+    // silent forever-"loading" state — no button AND no fallback/Retry.
+    const { data } = await api.get('/config', { timeout: 8000 });
     return data || {};
   } catch {
     return {};
@@ -153,6 +155,18 @@ export async function createCampaign(formData) {
     headers: { ...authHeader(), 'Content-Type': 'multipart/form-data' },
   });
   return data;
+}
+
+// Translation PREVIEW for the campaign form: returns the questionnaire with
+// text_i18n / intro_i18n / outro_i18n (en/hi/te) filled so the admin can review
+// and hand-edit the generated lines before launch. Nothing is persisted.
+export async function translateQuestionnaire(questionnaire) {
+  const { data } = await agentsApi.post(
+    '/bulk-calling/questionnaire/translate',
+    { questionnaire },
+    { headers: authHeader() },
+  );
+  return data?.questionnaire || null;
 }
 
 export async function rerunCampaign(campaignId) {

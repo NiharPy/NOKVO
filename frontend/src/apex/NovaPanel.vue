@@ -6,6 +6,7 @@
 // emits the draft up to ApexApp for a ONE-WAY handoff into the Campaign tab.
 import { nextTick, onMounted, ref, watch } from 'vue';
 import { novaChat, novaConfirm, novaSession, novaUpload, extractError } from './apexApi.js';
+import AxIcon from './AxIcon.vue';
 
 const props = defineProps({
   role: { type: String, default: 'member' },
@@ -186,7 +187,7 @@ function fmtCredits(n) {
       </div>
 
       <div class="nv-inputbar">
-        <button v-if="role === 'admin'" type="button" class="nv-attach" :disabled="analyzing" title="Attach a pitch document (PDF, DOCX, PPTX)" @click="pickFile">＋</button>
+        <button v-if="role === 'admin'" type="button" class="nv-attach" :disabled="analyzing" title="Attach a pitch document (PDF, DOCX, PPTX)" @click="pickFile"><AxIcon name="plus" :size="15" /></button>
         <input ref="fileInput" type="file" accept=".pdf,.docx,.pptx,.txt" style="display:none" @change="onFile" />
         <textarea
           v-model="input" class="nv-input" rows="1" placeholder="Ask NOVA anything…"

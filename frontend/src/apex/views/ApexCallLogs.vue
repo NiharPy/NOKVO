@@ -5,6 +5,7 @@
 // blob campaigns keep reading inline. Transcripts are keyed by call_link_id
 // (the internal call id) — NOT Plivo's call_id.
 import { inject, ref, computed, onMounted, watch } from 'vue';
+import AxIcon from '../AxIcon.vue';
 
 const apex = inject('apex');
 const filter = ref(null);
@@ -107,9 +108,15 @@ async function open(row) {
 
     <div class="ax-logs">
       <div class="ax-logs-list">
-        <div v-if="loadingRows && !calls.length" class="ax-empty"><p class="ax-empty-text">Loading calls…</p></div>
-        <div v-else-if="!calls.length" class="ax-empty"><div class="ax-empty-icon">☎</div><p class="ax-empty-text">No calls yet for these campaigns.</p></div>
-        <button v-for="row in calls" :key="row.call_link_id || row.call_id" type="button" class="ax-call" :class="{ 'is-active': selected && (selected.call_link_id || selected.call_id) === (row.call_link_id || row.call_id) }" @click="open(row)">
+        <template v-if="loadingRows && !calls.length">
+          <div v-for="i in 4" :key="i" class="ax-skel-card">
+            <span class="ax-skel-bar" style="width:55%"></span>
+            <span class="ax-skel-bar" style="width:70%"></span>
+            <span class="ax-skel-bar" style="width:40%"></span>
+          </div>
+        </template>
+        <div v-else-if="!calls.length" class="ax-empty"><div class="ax-empty-icon"><AxIcon name="phone" :size="20" /></div><p class="ax-empty-text">No calls yet for these campaigns.</p></div>
+        <button v-for="(row, i) in calls" :key="row.call_link_id || row.call_id" type="button" class="ax-call ax-row-in" :style="{ '--i': Math.min(i, 14) }" :class="{ 'is-active': selected && (selected.call_link_id || selected.call_id) === (row.call_link_id || row.call_id) }" @click="open(row)">
           <div style="display:flex;justify-content:space-between;align-items:center;">
             <span style="font-size:15px;font-weight:600;">{{ row.name }}</span>
             <span class="ax-spill" :class="`is-${statusType(row.status)}`">{{ row.status }}</span>
@@ -126,7 +133,11 @@ async function open(row) {
             <div style="font-size:17px;font-weight:600;">{{ selected.name }}</div>
             <div class="ax-call-phone" style="margin-top:6px;">{{ selected.phone }} · {{ selected.status }} · {{ selected.time }}</div>
           </div>
-          <div v-if="loadingT" class="ax-logs-empty">Loading…</div>
+          <div v-if="loadingT" style="display:grid;gap:14px;">
+            <span class="ax-skel-bar" style="width:60%;height:38px;border-radius:13px;"></span>
+            <span class="ax-skel-bar" style="width:45%;height:38px;border-radius:13px;justify-self:end;"></span>
+            <span class="ax-skel-bar" style="width:70%;height:38px;border-radius:13px;"></span>
+          </div>
           <div v-else-if="!transcript || !transcript.length" class="ax-logs-empty">
             {{ selected.status === 'failed' ? "This call didn't connect — no transcript available." : 'No transcript available — it may have expired (kept 30 days) or the call was too short.' }}
           </div>

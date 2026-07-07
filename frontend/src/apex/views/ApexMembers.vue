@@ -4,6 +4,7 @@
 // monogram tile per member) rather than a data table; an Invited member shows a
 // dashed tile + hollow dot until they accept and become Active.
 import { inject, onMounted } from 'vue';
+import AxIcon from '../AxIcon.vue';
 
 const apex = inject('apex');
 onMounted(() => apex.loadMembers());
@@ -46,11 +47,11 @@ const primaryOf = (m) => m.full_name || m.email;
 
     <!-- Roster -->
     <div v-if="!apex.members.value.length" class="ax-empty mb-empty">
-      <div class="ax-empty-icon">◍</div>
+      <div class="ax-empty-icon"><AxIcon name="users" :size="20" /></div>
       <p class="ax-empty-text">No members yet — invite your first teammate above.</p>
     </div>
     <ul v-else class="mb-roster">
-      <li v-for="m in apex.members.value" :key="m.id" class="mb-row">
+      <li v-for="(m, i) in apex.members.value" :key="m.id" class="mb-row ax-row-in" :style="{ '--i': Math.min(i, 14) }">
         <span class="mb-mono" :class="m.status === 'active' ? 'is-active' : 'is-invited'">{{ initialOf(m) }}</span>
         <div class="mb-ident">
           <span class="mb-name">{{ primaryOf(m) }}</span>

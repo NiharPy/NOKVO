@@ -1,18 +1,20 @@
 <script setup>
-// APEX My Leads — the leads this member has claimed. Expand a row for the score
-// reason / call note; move each through a working status (claimed → contacted →
-// won / lost).
+// APEX My Leads — the leads this member has claimed. Click a name for the
+// drawer (score reason / call note); move each through a working status
+// (claimed → contacted → won / lost).
 import { inject, ref } from 'vue';
+import AxIcon from '../AxIcon.vue';
+import AxPhone from '../AxPhone.vue';
+import AxLeadDrawer from '../AxLeadDrawer.vue';
 
 const apex = inject('apex');
-const expanded = ref(null);
+const detail = ref(null);
 const STATUSES = [
   { id: 'claimed', label: 'Claimed' },
   { id: 'contacted', label: 'Contacted' },
   { id: 'won', label: 'Won' },
   { id: 'lost', label: 'Lost' },
 ];
-function toggle(key) { expanded.value = expanded.value === key ? null : key; }
 </script>
 
 <template>
@@ -22,38 +24,43 @@ function toggle(key) { expanded.value = expanded.value === key ? null : key; }
         <h2 class="ax-h2">My leads</h2>
         <span class="ax-count">{{ apex.myLeads.value.length }}</span>
       </div>
-      <button type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" :disabled="apex.loadingLeads.value" @click="apex.reloadLeads()">↻ Refresh</button>
+      <button type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" :disabled="apex.loadingLeads.value" @click="apex.reloadLeads()"><AxIcon name="refresh" :size="13" /> Refresh</button>
     </div>
     <p class="ax-muted">Leads you've claimed. Click a name for its score &amp; call note; update the status as you work it.</p>
 
-    <div v-if="!apex.myLeads.value.length" class="ax-empty" style="margin-top:16px;">
-      <div class="ax-empty-icon">☆</div>
+    <div v-if="apex.loadingLeads.value && !apex.myLeads.value.length" style="margin-top:16px;">
+      <div v-for="i in 4" :key="i" class="ax-skel-row">
+        <span class="ax-skel-bar" style="width:58%"></span>
+        <span class="ax-skel-bar" style="width:44%"></span>
+        <span class="ax-skel-bar ax-skel-bar--pill"></span>
+      </div>
+    </div>
+    <div v-else-if="!apex.myLeads.value.length" class="ax-empty" style="margin-top:16px;">
+      <div class="ax-empty-icon"><AxIcon name="star" :size="20" /></div>
       <p class="ax-empty-text">You haven't claimed any leads yet — head to Available Leads to claim some.</p>
     </div>
     <template v-else>
       <div class="ax-thead" style="grid-template-columns:1.3fr 1.2fr auto;"><span>Name</span><span>Phone</span><span>Status</span></div>
-      <template v-for="(row, i) in apex.myLeads.value" :key="row.call_link_id || i">
-        <div class="ax-trow" style="grid-template-columns:1.3fr 1.2fr auto;align-items:center;">
-          <span class="ax-cell-name ax-trow--click" @click="toggle(row.call_link_id)">{{ row.name }}</span>
-          <span class="ax-cell-phone">{{ row.phone }}</span>
-          <select
-            class="ax-status-select" :value="row.claim_status || 'claimed'"
-            :disabled="apex.leadBusy.value === row.call_link_id"
-            @change="apex.setStatus(row, $event.target.value)"
-          >
-            <option v-for="s in STATUSES" :key="s.id" :value="s.id">{{ s.label }}</option>
-          </select>
-        </div>
-        <div v-if="expanded === row.call_link_id" class="ax-break">
-          <p v-if="row.lead_score_reason" class="ax-break-reason">{{ row.lead_score_reason }}</p>
-          <div v-if="row.call_note" class="ax-callnote">
-            <span class="ax-callnote-label">Call note&nbsp;&nbsp;</span>
-            <span class="ax-callnote-text">{{ row.call_note }}</span>
-          </div>
-          <p v-if="!row.lead_score_reason && !row.call_note" class="ax-muted" style="margin:0;">No notes captured for this lead.</p>
-        </div>
-      </template>
+      <div
+        v-for="(row, i) in apex.myLeads.value" :key="row.call_link_id || i"
+        class="ax-trow ax-row-in" :style="{ '--i': Math.min(i, 14) }"
+        style="grid-template-columns:1.3fr 1.2fr auto;align-items:center;"
+      >
+        <span class="ax-cell-name ax-trow--click" @click="detail = row">{{ row.name }}</span>
+        <AxPhone :phone="row.phone" />
+        <select
+          class="ax-status-select" :value="row.claim_status || 'claimed'"
+          :disabled="apex.leadBusy.value === row.call_link_id"
+          @change="apex.setStatus(row, $event.target.value)"
+        >
+          <option v-for="s in STATUSES" :key="s.id" :value="s.id">{{ s.label }}</option>
+        </select>
+      </div>
     </template>
+
+    <Transition name="axdrawer">
+      <AxLeadDrawer v-if="detail" :row="detail" @close="detail = null" />
+    </Transition>
   </div>
 </template>
 

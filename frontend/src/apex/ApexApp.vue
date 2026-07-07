@@ -1,7 +1,7 @@
 <script setup>
 // NOKVO APEX — dark product surface for DETERMINISTIC outbound. Own login + MFA
 // + dark app shell; shares Nokvo One's accounts + token + bulk-calling backend.
-import { ref, computed, onMounted, watch, nextTick, provide } from 'vue';
+import { ref, computed, onMounted, onBeforeUnmount, watch, nextTick, provide } from 'vue';
 import { useRouter, useRoute } from 'vue-router';
 import {
   login as apexLogin,
@@ -12,6 +12,7 @@ import {
   fetchCampaigns,
   fetchBulkStatus,
   createCampaign as apiCreateCampaign,
+  translateQuestionnaire as apiTranslateQuestionnaire,
   rerunCampaign,
   addCampaignContacts,
   cancelCampaign,
@@ -57,6 +58,8 @@ import ApexAvailableLeads from './views/ApexAvailableLeads.vue';
 import ApexMyLeads from './views/ApexMyLeads.vue';
 import ApexMembers from './views/ApexMembers.vue';
 import NovaPanel from './NovaPanel.vue';
+import AxIcon from './AxIcon.vue';
+import AxCount from './AxCount.vue';
 import nokvoMark from '../assets/nokvo-logo.png';  // the real NOKVO mark (header logo)
 import { APEX_TERMS_OF_SERVICE_HTML, APEX_PRIVACY_POLICY_HTML, APEX_LEGAL_VERSIONS } from '../content/apexLegalDocs.js';
 import './apex-theme.css';
@@ -126,6 +129,26 @@ const isMember = computed(() => (user.value?.role || '') === 'member');
 const visibleTabs = computed(() => (isMember.value ? MEMBER_TABS : TABS));
 const activeTab = computed(() => visibleTabs.value.find((t) => t.id === tab.value) || visibleTabs.value[0]);
 
+// ── toasts — transient action feedback (success/error), auto-dismissed ──
+const toasts = ref([]);
+let _toastSeq = 0;
+function toast(message, type = 'ok', ms = 4200) {
+  const id = ++_toastSeq;
+  toasts.value = [...toasts.value, { id, message, type }];
+  setTimeout(() => { toasts.value = toasts.value.filter((t) => t.id !== id); }, ms);
+}
+
+// ── tabs: a single sliding thumb carries the active-pill background ──
+const tabsInner = ref(null);
+const tabThumb = ref({ x: 0, y: 0, w: 0, h: 0, on: false });
+function moveTabThumb() {
+  const el = tabsInner.value && tabsInner.value.querySelector('.ax-tab.is-active');
+  if (!el) { tabThumb.value = { ...tabThumb.value, on: false }; return; }
+  tabThumb.value = { x: el.offsetLeft, y: el.offsetTop, w: el.offsetWidth, h: el.offsetHeight, on: true };
+}
+watch([tab, visibleTabs, screen], () => nextTick(moveTabThumb));
+onBeforeUnmount(() => window.removeEventListener('resize', moveTabThumb));
+
 // Per-campaign bucket-count summaries for V2 campaigns (whose rows aren't inlined).
 const campaignSummaries = ref({}); // campaign_id -> { total, qualified, not_interested, no_pickup, pending }
 function summaryFor(id) { return campaignSummaries.value[String(id)] || null; }
@@ -136,7 +159,7 @@ async function reload() {
   try {
     campaigns.value = await fetchCampaigns();
   } catch (e) {
-    errorMsg.value = extractError(e, 'Could not load campaigns.');
+    toast(extractError(e, 'Could not load campaigns.'), 'err');
   } finally {
     loadingCampaigns.value = false;
   }
@@ -177,6 +200,13 @@ const topupBill = computed(() => billFor(topupMinutes.value));            // ₹
 const topupCredits = computed(() => apexCreditFor(topupMinutes.value));   // Call Credits granted
 const topupCreditedMin = computed(() => creditedFor(topupMinutes.value)); // ≈ minutes incl. 50% bonus
 async function loadBalance() { wallet.value = await fetchMinutesBalance(); }
+// Spend meter: how much of the purchased credit pool is left (0..1). Shifts to
+// the accent red when it runs low, so a draining wallet is visible at a glance.
+const walletPct = computed(() => {
+  const bought = Number(wallet.value?.credits_purchased) || 0;
+  if (!bought) return 0;
+  return Math.max(0, Math.min(1, (Number(wallet.value?.credits_remaining) || 0) / bought));
+});
 
 // ── members + qualified-lead claim pool ──
 const qualifiedLeads = ref([]);
@@ -188,7 +218,7 @@ async function reloadLeads() {
   try {
     [qualifiedLeads.value, myLeads.value] = await Promise.all([listQualifiedLeads(), listMyLeads()]);
   } catch (e) {
-    errorMsg.value = extractError(e, 'Could not load leads.');
+    toast(extractError(e, 'Could not load leads.'), 'err');
   } finally {
     loadingLeads.value = false;
   }
@@ -198,9 +228,10 @@ async function doClaim(row) {
   leadBusy.value = row.call_link_id;
   try {
     await claimLead(row.campaign_id, row.call_link_id);
+    toast(`${row.name || 'Lead'} claimed — it's yours now.`);
     await reloadLeads();
   } catch (e) {
-    errorMsg.value = e?.response?.status === 409 ? 'Someone else just claimed that lead.' : extractError(e, 'Could not claim the lead.');
+    toast(e?.response?.status === 409 ? 'Someone else just claimed that lead.' : extractError(e, 'Could not claim the lead.'), 'err');
     await reloadLeads();
   } finally {
     leadBusy.value = '';
@@ -213,7 +244,7 @@ async function doSetStatus(row, status) {
     await setLeadStatus(row.campaign_id, row.call_link_id, status);
     await reloadLeads();
   } catch (e) {
-    errorMsg.value = extractError(e, 'Could not update the lead.');
+    toast(extractError(e, 'Could not update the lead.'), 'err');
   } finally {
     leadBusy.value = '';
   }
@@ -652,6 +683,7 @@ provide('apex', {
   wallet,
   reload,
   createCampaign: apiCreateCampaign,
+  translateQuestionnaire: apiTranslateQuestionnaire,
   rerunCampaign,
   addCampaignContacts,
   cancelCampaign,
@@ -682,9 +714,14 @@ provide('apex', {
   inviteNote,
   inviteOk,
   submitInvite,
+  toast,
 });
 
 onMounted(async () => {
+  // The tab thumb tracks the active button's box — re-measure on resize and
+  // once the webfonts land (font swap changes button widths).
+  window.addEventListener('resize', moveTabThumb);
+  if (document.fonts?.ready) document.fonts.ready.then(() => moveTabThumb());
   // Load the Sora + JetBrains Mono fonts once (idempotent).
   if (!document.getElementById('apex-fonts')) {
     const l = document.createElement('link');
@@ -954,7 +991,7 @@ watch(screen, async (s) => {
                 <div class="ax-user-role">{{ (user?.role || 'member').toUpperCase() }}</div>
               </div>
             </div>
-            <button type="button" class="ax-btn ax-btn--nova" @click="novaOpen = true"><span class="ax-nova-star">✦</span>NOVA</button>
+            <button type="button" class="ax-btn ax-btn--nova" @click="novaOpen = true"><span class="ax-nova-star"><AxIcon name="sparkles" :size="13" filled /></span>NOVA</button>
             <button type="button" class="ax-btn ax-btn--ghost" @click="openFeedback">Feedback</button>
             <button type="button" class="ax-btn ax-btn--ghost" @click="signOut">Sign out</button>
           </div>
@@ -1007,13 +1044,16 @@ watch(screen, async (s) => {
           <div v-if="wallet && !isMember" class="ax-wallet">
             <div class="ax-wallet-head">
               <div>
-                <div class="ax-wallet-num">{{ fmtCredits(wallet.credits_remaining) }}</div>
+                <div class="ax-wallet-num"><AxCount :value="Number(wallet.credits_remaining) || 0" :format="fmtCredits" /></div>
                 <div class="ax-wallet-lbl">Call Credits left</div>
               </div>
               <div class="ax-wallet-meta">
-                <div class="ax-wallet-min">≈ {{ fmtMin(wallet.estimated_minutes_remaining) }} min</div>
-                <div class="ax-wallet-used">{{ fmtCredits(wallet.credits_used) }} used</div>
+                <div class="ax-wallet-min">≈ <AxCount :value="Number(wallet.estimated_minutes_remaining) || 0" :format="fmtMin" /> min</div>
+                <div class="ax-wallet-used"><AxCount :value="Number(wallet.credits_used) || 0" :format="fmtCredits" /> used</div>
               </div>
+            </div>
+            <div class="ax-wallet-meter" :class="{ 'is-low': walletPct < 0.15 }">
+              <span class="ax-wallet-meter-fill" :style="{ width: (walletPct * 100).toFixed(1) + '%' }"></span>
             </div>
 
             <div class="ax-topup">
@@ -1045,7 +1085,11 @@ watch(screen, async (s) => {
         <div class="ax-hr"></div>
 
         <nav class="ax-tabs">
-          <div class="ax-tabs-inner">
+          <div ref="tabsInner" class="ax-tabs-inner">
+            <span
+              v-if="tabThumb.on" class="ax-tab-thumb"
+              :style="{ transform: `translate(${tabThumb.x}px, ${tabThumb.y}px)`, width: tabThumb.w + 'px', height: tabThumb.h + 'px' }"
+            ></span>
             <button
               v-for="t in visibleTabs" :key="t.id" type="button"
               class="ax-tab" :class="{ 'is-active': tab === t.id }"
@@ -1054,20 +1098,32 @@ watch(screen, async (s) => {
           </div>
         </nav>
 
-        <component :is="activeTab.is" />
+        <Transition name="axtab" mode="out-in">
+          <component :is="activeTab.is" :key="activeTab.id" />
+        </Transition>
       </main>
     </div>
 
     <!-- ============ LEGAL DOC MODAL ============ -->
     <div v-if="legalModal" class="ax-legal-overlay" @click.self="legalModal = null">
       <div class="ax-legal-modal">
-        <button type="button" class="ax-legal-close" aria-label="Close" @click="legalModal = null">×</button>
+        <button type="button" class="ax-legal-close" aria-label="Close" @click="legalModal = null"><AxIcon name="x" :size="18" /></button>
         <div class="ax-legal-body" v-html="legalModal === 'terms' ? APEX_TERMS_HTML : APEX_PRIVACY_HTML"></div>
         <div class="ax-legal-actions">
           <button type="button" class="ax-btn ax-btn--ghost" @click="legalModal = null">Close</button>
           <button type="button" class="ax-btn ax-btn--accent" @click="termsAccepted = true; legalModal = null">I agree</button>
         </div>
       </div>
+    </div>
+
+    <!-- ============ TOASTS ============ -->
+    <div class="ax-toasts">
+      <TransitionGroup name="axtoast">
+        <div v-for="t in toasts" :key="t.id" class="ax-toast" :class="`is-${t.type}`">
+          <AxIcon :name="t.type === 'err' ? 'alert' : 'check'" :size="15" />
+          <span>{{ t.message }}</span>
+        </div>
+      </TransitionGroup>
     </div>
   </div>
 </template>
@@ -1255,6 +1311,10 @@ watch(screen, async (s) => {
 .ax-wallet-meta { text-align: right; font-family: 'JetBrains Mono', monospace; line-height: 1.5; }
 .ax-wallet-min { font-size: 13px; color: rgba(255,255,255,0.6); }
 .ax-wallet-used { font-size: 11px; color: rgba(255,255,255,0.3); }
+/* spend meter — remaining share of the purchased pool; reddens when low */
+.ax-wallet-meter { height: 5px; border-radius: 999px; background: rgba(255,255,255,0.07); overflow: hidden; margin-top: 15px; box-shadow: inset 0 1px 2px rgba(0,0,0,0.3); }
+.ax-wallet-meter-fill { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #4AC88C, #7FD9A8); transition: width .7s cubic-bezier(0.22, 1, 0.36, 1); }
+.ax-wallet-meter.is-low .ax-wallet-meter-fill { background: linear-gradient(90deg, #D91F29, #F03540); box-shadow: 0 0 10px rgba(230,38,48,0.5); }
 .ax-topup { margin-top: 18px; padding-top: 16px; border-top: 1px solid rgba(255,255,255,0.08); }
 .ax-topup-label { font-size: 10.5px; letter-spacing: 0.1em; text-transform: uppercase; color: rgba(255,255,255,0.4); margin-bottom: 11px; }
 .ax-topup-field { position: relative; display: flex; align-items: center; }
@@ -1304,8 +1364,31 @@ watch(screen, async (s) => {
 .ax-page-sub { font-size: 15px; color: rgba(255,255,255,0.5); max-width: 560px; line-height: 1.55; margin: 0; }
 .ax-hr { height: 1px; background: linear-gradient(90deg, rgba(230,38,48,0.35), rgba(255,255,255,0.09) 22%, rgba(255,255,255,0.05) 70%, transparent); margin-top: 34px; }
 .ax-tabs { display: flex; justify-content: center; margin: 32px 0 46px; }
-.ax-tabs-inner { display: inline-flex; gap: 4px; padding: 6px; background: rgba(0,0,0,0.32); border: 1px solid rgba(255,255,255,0.08); border-radius: 15px; flex-wrap: wrap; box-shadow: inset 0 1px 4px rgba(0,0,0,0.35), 0 1px 0 rgba(255,255,255,0.04); }
-.ax-tab { padding: 11px 22px; border-radius: 10px; font-size: 13.5px; cursor: pointer; border: none; background: transparent; color: rgba(255,255,255,0.5); font-weight: 500; font-family: 'Sora', sans-serif; white-space: nowrap; transition: all .18s cubic-bezier(0.22, 1, 0.36, 1); }
+.ax-tabs-inner { position: relative; display: inline-flex; gap: 4px; padding: 6px; background: rgba(0,0,0,0.32); border: 1px solid rgba(255,255,255,0.08); border-radius: 15px; flex-wrap: wrap; box-shadow: inset 0 1px 4px rgba(0,0,0,0.35), 0 1px 0 rgba(255,255,255,0.04); }
+.ax-tab { position: relative; z-index: 1; padding: 11px 22px; border-radius: 10px; font-size: 13.5px; cursor: pointer; border: none; background: transparent; color: rgba(255,255,255,0.5); font-weight: 500; font-family: 'Sora', sans-serif; white-space: nowrap; transition: color .18s cubic-bezier(0.22, 1, 0.36, 1), background .18s cubic-bezier(0.22, 1, 0.36, 1); }
 .ax-tab:hover:not(.is-active) { color: rgba(255,255,255,0.82); background: rgba(255,255,255,0.045); }
-.ax-tab.is-active { background: linear-gradient(180deg, #FFFFFF, #E9E7E4); color: #0A0A0B; font-weight: 600; box-shadow: inset 0 1px 0 rgba(255,255,255,0.8), 0 3px 10px -2px rgba(0,0,0,0.55); }
+.ax-tab.is-active { color: #0A0A0B; font-weight: 600; }
+/* mobile shell */
+@media (max-width: 720px) {
+  .ax-header-inner { padding: 0 18px; }
+  .ax-header-right { gap: 12px; }
+  .ax-user-meta { display: none; }
+  .ax-main { padding: 34px 18px 72px; }
+  .ax-title { font-size: 30px; }
+  .ax-wallet { min-width: 0; width: 100%; max-width: none; }
+  .ax-tab { padding: 10px 14px; font-size: 12.5px; }
+}
+/* the single sliding pill behind the active tab — glides between buttons */
+.ax-tab-thumb {
+  position: absolute; top: 0; left: 0; z-index: 0; border-radius: 10px;
+  background: linear-gradient(180deg, #FFFFFF, #E9E7E4);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.8), 0 3px 10px -2px rgba(0,0,0,0.55);
+  transition: transform .28s cubic-bezier(0.22, 1, 0.36, 1), width .28s cubic-bezier(0.22, 1, 0.36, 1), height .28s cubic-bezier(0.22, 1, 0.36, 1);
+}
+@media (prefers-reduced-motion: reduce) { .ax-tab-thumb { transition: none; } }
+/* tab content swap */
+.axtab-enter-active { transition: opacity .18s ease, transform .18s cubic-bezier(0.22, 1, 0.36, 1); }
+.axtab-leave-active { transition: opacity .12s ease; }
+.axtab-enter-from { opacity: 0; transform: translateY(8px); }
+.axtab-leave-to { opacity: 0; }
 </style>

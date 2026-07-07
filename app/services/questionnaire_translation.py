@@ -1,11 +1,12 @@
 """One-time pre-translation of an APEX deterministic questionnaire.
 
 The deterministic flow speaks scripted lines. To make each line cacheable AND
-multilingual, we translate every question ``text`` and the ``outro`` into en/hi/te
-ONCE at campaign creation (not per call) and store the static strings on the
-questionnaire (``text_i18n`` per question, ``outro_i18n``). At call time the flow
-can then speak the exact per-language string verbatim → it recurs across calls →
-TTS cache hit, while hi/te stay native.
+multilingual, we translate every question ``text``, the ``intro`` (the opener the
+agent leads the call with) and the ``outro`` into en/hi/te ONCE at campaign
+creation (not per call) and store the static strings on the questionnaire
+(``text_i18n`` per question, ``intro_i18n``, ``outro_i18n``). At call time the
+flow can then speak the exact per-language string verbatim → it recurs across
+calls → TTS cache hit, while hi/te stay native.
 
 Best-effort: any failure (no LLM pool, malformed JSON, timeout) leaves the string
 un-translated — the call-time flow falls back to the authored ``text``. Idempotent:
@@ -30,16 +31,28 @@ def _needs(entry: dict[str, Any], key: str) -> bool:
 
 
 def _collect(questionnaire: dict[str, Any]) -> list[dict[str, str]]:
-    """The {id, text} strings still needing translation (questions + outro)."""
+    """The {id, text} strings still needing translation (questions + intro + outro)."""
     items: list[dict[str, str]] = []
     for q in questionnaire.get("questions") or []:
         text = str(q.get("text") or "").strip()
         if text and _needs(q, "text_i18n"):
             items.append({"id": str(q.get("id") or ""), "text": text})
+    intro = str(questionnaire.get("intro") or "").strip()
+    if intro and _needs(questionnaire, "intro_i18n"):
+        items.append({"id": "__intro__", "text": intro})
     outro = str(questionnaire.get("outro") or "").strip()
     if outro and _needs(questionnaire, "outro_i18n"):
         items.append({"id": "__outro__", "text": outro})
     return items
+
+
+def _merge_i18n(existing: Any, tr: dict[str, str]) -> dict[str, str]:
+    """Fill missing languages from the fresh translation WITHOUT overwriting a
+    non-empty existing value. An admin who hand-edited one language (leaving
+    another blank) re-enters translation via ``_needs`` — the edit must survive,
+    only the blanks get filled."""
+    keep = {k: v for k, v in existing.items() if v} if isinstance(existing, dict) else {}
+    return {**tr, **keep}
 
 
 def _build_prompt(items: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -76,8 +89,9 @@ def _parse(raw: str) -> dict[str, dict[str, str]]:
 
 
 def _floor_missing_i18n(questionnaire: dict[str, Any]) -> int:
-    """Guarantee every question (and the outro) carries a non-empty ``text_i18n``:
-    anything the translation didn't cover is floored to ``{"en": authored_text}``.
+    """Guarantee every question (and the intro/outro) carries a non-empty i18n
+    dict: anything the translation didn't cover is floored to
+    ``{"en": authored_text}``.
 
     WHY: ``next_verbatim_question`` hard-requires a non-empty ``text_i18n`` — a
     question without one silently falls back to LLM rephrasing for EVERY call,
@@ -92,16 +106,17 @@ def _floor_missing_i18n(questionnaire: dict[str, Any]) -> int:
         if text and not (isinstance(i18n, dict) and any(i18n.values())):
             q["text_i18n"] = {"en": text}
             floored += 1
-    outro = str(questionnaire.get("outro") or "").strip()
-    o_i18n = questionnaire.get("outro_i18n")
-    if outro and not (isinstance(o_i18n, dict) and any(o_i18n.values())):
-        questionnaire["outro_i18n"] = {"en": outro}
-        floored += 1
+    for key, i18n_key in (("intro", "intro_i18n"), ("outro", "outro_i18n")):
+        line = str(questionnaire.get(key) or "").strip()
+        i18n = questionnaire.get(i18n_key)
+        if line and not (isinstance(i18n, dict) and any(i18n.values())):
+            questionnaire[i18n_key] = {"en": line}
+            floored += 1
     return floored
 
 
 async def translate_questionnaire(questionnaire: dict[str, Any]) -> dict[str, Any]:
-    """Fill ``text_i18n`` / ``outro_i18n`` on a questionnaire in place (and return it).
+    """Fill ``text_i18n`` / ``intro_i18n`` / ``outro_i18n`` on a questionnaire in place (and return it).
     Best-effort + idempotent — never raises. Whatever the translation outcome,
     every entry leaves with at least a floored ``{"en": authored}`` i18n so
     verbatim delivery always fires."""
@@ -137,10 +152,11 @@ async def translate_questionnaire(questionnaire: dict[str, Any]) -> dict[str, An
     for q in questionnaire.get("questions") or []:
         tr = translated.get(str(q.get("id") or ""))
         if tr and _needs(q, "text_i18n"):
-            q["text_i18n"] = tr
-    outro_tr = translated.get("__outro__")
-    if outro_tr and _needs(questionnaire, "outro_i18n"):
-        questionnaire["outro_i18n"] = outro_tr
+            q["text_i18n"] = _merge_i18n(q.get("text_i18n"), tr)
+    for line_id, i18n_key in (("__intro__", "intro_i18n"), ("__outro__", "outro_i18n")):
+        tr = translated.get(line_id)
+        if tr and _needs(questionnaire, i18n_key):
+            questionnaire[i18n_key] = _merge_i18n(questionnaire.get(i18n_key), tr)
     if translated:
         logger.info("APEX-QN-I18N: translated %d line(s) into en/hi/te", len(translated))
     floored = _floor_missing_i18n(questionnaire)

@@ -2246,12 +2246,18 @@ async def create_bulk_calling_campaign(
                 "question. Add a question or switch to a non-deterministic campaign."
             )
         agent_config["deterministic"] = bool(deterministic)
+        _apex_deterministic = False
         if parsed_questionnaire:
             # APEX deterministic campaigns speak scripted lines every call. Pre-
-            # translate the questions + outro into en/hi/te ONCE now so call-time can
-            # serve the exact per-language string verbatim → TTS cache hit + native
-            # multilingual. Best-effort (falls back to authored text); one LLM call.
-            if deterministic and (await _org_for_user(db, user)).product_tier == "nokvo_apex":
+            # translate the intro + questions + outro into en/hi/te ONCE now so
+            # call-time can serve the exact per-language string verbatim → TTS
+            # cache hit + native multilingual. Best-effort (falls back to authored
+            # text); one LLM call. Already-filled languages (admin hand-edits from
+            # the translate-preview flow) are preserved — only blanks are filled.
+            _apex_deterministic = (
+                deterministic and (await _org_for_user(db, user)).product_tier == "nokvo_apex"
+            )
+            if _apex_deterministic:
                 from app.services.questionnaire_translation import translate_questionnaire
 
                 parsed_questionnaire = await translate_questionnaire(parsed_questionnaire)
@@ -2291,7 +2297,53 @@ async def create_bulk_calling_campaign(
         raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
+    if _apex_deterministic and parsed_questionnaire:
+        # Fire-and-forget TTS pre-warm: synthesize every scripted line (intro /
+        # questions / outro × en/hi/te) into the byte-cache now, so even the
+        # campaign's FIRST call in each language plays cached audio. Best-effort —
+        # it must never delay or fail the creation response.
+        try:
+            from app.services.apex_tts_prewarm import prewarm_campaign_tts
+
+            asyncio.create_task(prewarm_campaign_tts(tr, parsed_questionnaire))
+        except Exception:
+            logger.debug("APEX-TTS-PREWARM: failed to schedule", exc_info=True)
     return _campaign_response(campaign)
+
+
+class QuestionnaireTranslatePayload(BaseModel):
+    questionnaire: dict
+
+
+@router.post("/bulk-calling/questionnaire/translate")
+async def translate_bulk_questionnaire(
+    payload: QuestionnaireTranslatePayload,
+    user: OrganizationUser = Depends(_bulk_admin_dep()),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Translation PREVIEW for the campaign form: coerce the draft questionnaire
+    and fill ``text_i18n`` / ``intro_i18n`` / ``outro_i18n`` (en/hi/te) so the
+    admin can review and hand-edit the generated lines before launching. Nothing
+    is persisted — the form submits the (possibly edited) i18n back with the
+    campaign, and creation-time translation skips complete entries / fills only
+    the blanks (see translate_questionnaire's merge), so edits survive."""
+    from app.services.agent_outbound_context import _coerce_questionnaire
+    from app.services.questionnaire_translation import translate_questionnaire
+
+    await _require_outbound_enabled(db, user)
+    try:
+        questionnaire = _coerce_questionnaire(payload.questionnaire, strict=True)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=_safe_detail(exc)) from exc
+    if not questionnaire:
+        raise HTTPException(
+            status_code=422,
+            detail="Add at least one question before translating the questionnaire.",
+        )
+    if (await _org_for_user(db, user)).product_tier == "nokvo_apex":
+        questionnaire = await translate_questionnaire(questionnaire)
+    return {"questionnaire": questionnaire}
 
 
 @router.post("/bulk-calling/campaigns/{campaign_id}/rerun")

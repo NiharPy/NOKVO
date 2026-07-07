@@ -549,6 +549,36 @@ def test_opener_personalises_in_hindi_and_telugu():
     assert "Asha" in te and "Gachibowli" in te
 
 
+def test_opener_speaks_pretranslated_intro_for_session_language():
+    """An admin-authored intro is spoken from its pre-translated per-language
+    entry — a hi/te campaign must not open in the authored (English) line."""
+    import dataclasses
+
+    i18n = {
+        "en": "Hi, this is Riya from Raghava — got a minute?",
+        "hi": "नमस्ते, मैं रिया बोल रही हूँ — एक मिनट है?",
+        "te": "హాయ్, నేను రియా — ఒక్క నిమిషం ఉందా?",
+    }
+    ctx = dataclasses.replace(
+        _opener_context(), question_intro=i18n["en"], question_intro_i18n=i18n
+    )
+    assert generate_outbound_opener_text(ctx, language="te") == f"[warm]{i18n['te']}[/warm]"
+    assert generate_outbound_opener_text(ctx, language="hi") == f"[warm]{i18n['hi']}[/warm]"
+    # Unsupported session language degrades to the English entry.
+    assert generate_outbound_opener_text(ctx, language="ta") == f"[warm]{i18n['en']}[/warm]"
+
+
+def test_opener_intro_without_i18n_falls_back_to_authored():
+    """A legacy (pre-i18n) intro still opens the call — spoken as authored."""
+    import dataclasses
+
+    ctx = dataclasses.replace(_opener_context(), question_intro="Hi, quick call from Raghava.")
+    assert (
+        generate_outbound_opener_text(ctx, language="te")
+        == "[warm]Hi, quick call from Raghava.[/warm]"
+    )
+
+
 # ── Follow-up preamble: call notes are the single source of prior-call context ──
 
 

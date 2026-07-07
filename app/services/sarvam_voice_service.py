@@ -212,6 +212,10 @@ SARVAM_LANGUAGE_OPTIONS = [
 _SHORT_TO_BCP47 = {item["code"]: item["bcp47"] for item in SARVAM_LANGUAGE_OPTIONS}
 _BCP47_TO_SHORT = {item["bcp47"].lower(): item["code"] for item in SARVAM_LANGUAGE_OPTIONS}
 
+# The TTS request-body keys that carry prosody — stripped on the 4xx retry
+# (older models reject them) and used to detect whether a body has prosody.
+_TTS_PROSODY_KEYS = ("pace", "pitch", "loudness")
+
 
 class SarvamVoiceService:
     # Shared httpx client for Sarvam REST endpoints (STT + TTS). The previous
@@ -609,7 +613,7 @@ class SarvamVoiceService:
             pass  # best-effort
 
     @staticmethod
-    async def synthesize(
+    def _tts_request_body(
         tenant_res: TenantResources,
         text: str,
         *,
@@ -618,17 +622,16 @@ class SarvamVoiceService:
         pitch: float | None = None,
         loudness: float | None = None,
         enable_cached_responses: bool | None = None,
-        cache: bool = False,
     ) -> dict[str, Any]:
-        if not text.strip():
-            return {"audios": [], "audio_format": settings.SARVAM_TTS_AUDIO_CODEC}
-        text = normalize_text_for_tts(text)
+        """The exact Sarvam TTS REST request body for these args — the ONE
+        builder, shared by :meth:`synthesize` (which POSTs it) and the local
+        cache probe (which only needs its key). Any drift between builders
+        would silently break cache-hit parity, so there is exactly one.
+        Normalizes ``text`` itself — callers always pass the RAW line."""
         provider_status = dict(tenant_res.provider_status or {})
-        api_key = await SarvamVoiceService.api_key(tenant_res, "tts")
-        endpoint = provider_status.get("sarvam_tts_rest_url") or provider_status.get("tts_rest_endpoint") or settings.SARVAM_TTS_REST_URL
         model = provider_status.get("sarvam_tts_model") or provider_status.get("tts_model") or settings.SARVAM_TTS_MODEL
         body: dict[str, Any] = {
-            "text": text[:3500],
+            "text": normalize_text_for_tts(text)[:3500],
             "target_language_code": SarvamVoiceService.to_bcp47(language),
             "speaker": SarvamVoiceService.tts_speaker_for(language, provider_status),
             "model": model,
@@ -644,18 +647,74 @@ class SarvamVoiceService:
         # Per-tone prosody modulation. Sarvam Bulbul accepts pace (0.3-3.0),
         # pitch (-0.75-0.75), loudness (0.1-3.0); we clamp defensively. Older
         # bulbul versions / non-bulbul models may not accept these params,
-        # so we add them and gracefully retry without them on 400.
-        prosody_body: dict[str, Any] = {}
+        # so synthesize adds them and gracefully retries without them on 400.
         pace = SarvamVoiceService.pace_for(language, pace)
         if pace is not None:
-            prosody_body["pace"] = max(0.3, min(3.0, float(pace)))
+            body["pace"] = max(0.3, min(3.0, float(pace)))
         # Bulbul V3 supports ONLY pace — it rejects pitch/loudness with a 400.
         if model != "bulbul:v3":
             if pitch is not None:
-                prosody_body["pitch"] = max(-0.75, min(0.75, float(pitch)))
+                body["pitch"] = max(-0.75, min(0.75, float(pitch)))
             if loudness is not None:
-                prosody_body["loudness"] = max(0.1, min(3.0, float(loudness)))
-        body.update(prosody_body)
+                body["loudness"] = max(0.1, min(3.0, float(loudness)))
+        return body
+
+    @staticmethod
+    async def tts_cached_audio_available(
+        tenant_res: TenantResources,
+        text: str,
+        *,
+        language: str | None = None,
+        pace: float | None = None,
+        pitch: float | None = None,
+        loudness: float | None = None,
+    ) -> bool:
+        """True when the local Redis byte-cache already holds audio for EXACTLY
+        this request (the key :meth:`synthesize` would compute). Lets
+        stream_sentence_tts skip the streaming provider for a scripted line and
+        serve the cached bytes via its REST branch instead."""
+        if not settings.TTS_CACHE_ENABLED or not (text or "").strip():
+            return False
+        try:
+            body = SarvamVoiceService._tts_request_body(
+                tenant_res, text, language=language, pace=pace, pitch=pitch, loudness=loudness
+            )
+            key = SarvamVoiceService._tts_cache_key(
+                {k: v for k, v in body.items() if k != "enable_cached_responses"}
+            )
+            from app.services.agent_session_store import AgentSessionStore
+
+            return bool(await AgentSessionStore.client().exists(key))
+        except Exception:
+            return False  # best-effort: probe failure just means "stream as usual"
+
+    @staticmethod
+    async def synthesize(
+        tenant_res: TenantResources,
+        text: str,
+        *,
+        language: str | None = None,
+        pace: float | None = None,
+        pitch: float | None = None,
+        loudness: float | None = None,
+        enable_cached_responses: bool | None = None,
+        cache: bool = False,
+    ) -> dict[str, Any]:
+        if not text.strip():
+            return {"audios": [], "audio_format": settings.SARVAM_TTS_AUDIO_CODEC}
+        provider_status = dict(tenant_res.provider_status or {})
+        api_key = await SarvamVoiceService.api_key(tenant_res, "tts")
+        endpoint = provider_status.get("sarvam_tts_rest_url") or provider_status.get("tts_rest_endpoint") or settings.SARVAM_TTS_REST_URL
+        body = SarvamVoiceService._tts_request_body(
+            tenant_res,
+            text,
+            language=language,
+            pace=pace,
+            pitch=pitch,
+            loudness=loudness,
+            enable_cached_responses=enable_cached_responses,
+        )
+        prosody_body = {k: body[k] for k in _TTS_PROSODY_KEYS if k in body}
 
         # Local cache lookup (opt-in). The key is the request body sans the
         # server-side ``enable_cached_responses`` flag (it doesn't change the bytes),
@@ -1093,8 +1152,23 @@ class SarvamVoiceService:
             return
             yield  # pragma: no cover — makes this an (empty) async generator
 
+        # Local-cache short-circuit: a cacheable (scripted/verbatim) line whose
+        # audio already sits in Redis skips the streaming provider entirely — the
+        # REST branch below serves the cached bytes at once via synthesize's own
+        # cache hit (no Sarvam bill, no COGS metering). Without this, the WS
+        # streaming path would re-synthesize the same deterministic line every
+        # call and the byte-cache (incl. campaign-creation pre-warm) would only
+        # ever be read when streaming happened to fail.
+        cached_ready = False
+        if cache:
+            cached_ready = await SarvamVoiceService.tts_cached_audio_available(
+                tenant_res, text, language=language, pace=pace, pitch=pitch, loudness=loudness
+            )
+
         streaming_provider = "sarvam"
-        if settings.SARVAM_TTS_WS_ENABLED:
+        if cached_ready:
+            _stream_gen = _no_stream()
+        elif settings.SARVAM_TTS_WS_ENABLED:
             streaming_provider = "sarvam_ws"
             _stream_gen = SarvamVoiceService.synthesize_streaming_ws(
                 tenant_res,

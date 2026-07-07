@@ -32,6 +32,11 @@ class _FakeRedis:
             raise RuntimeError("redis down")
         return self.store.get(key)
 
+    async def exists(self, key):
+        if self.raise_on == "get":
+            raise RuntimeError("redis down")
+        return 1 if key in self.store else 0
+
     async def setex(self, key, ttl, value):
         if self.raise_on == "set":
             raise RuntimeError("redis down")
@@ -129,3 +134,72 @@ def test_empty_audios_not_cached(monkeypatch):
     redis, http = _patch(monkeypatch, http_payload={"audios": [], "request_id": "r"})
     _run(SarvamVoiceService.synthesize(_tr(), "Hello", language="en", cache=True))
     assert redis.store == {}               # nothing to serve later
+
+
+# ── cache probe + streaming short-circuit ──
+# stream_sentence_tts consults the local cache BEFORE picking a streaming source:
+# a warm scripted line skips WS streaming and is served from Redis via the REST
+# branch (synthesize's own hit). The probe must compute the SAME key synthesize
+# does, or the short-circuit never fires / fires wrongly.
+
+
+def test_probe_matches_synthesize_key(monkeypatch):
+    redis, http = _patch(monkeypatch)
+    probe = SarvamVoiceService.tts_cached_audio_available
+    assert _run(probe(_tr(), "Hello there", language="en")) is False
+    _run(SarvamVoiceService.synthesize(_tr(), "Hello there", language="en", cache=True))
+    assert _run(probe(_tr(), "Hello there", language="en")) is True
+    # Any byte-affecting difference is a different key — no false hit.
+    assert _run(probe(_tr(), "Hello there", language="en", pace=1.5)) is False
+    assert _run(probe(_tr(), "Hello there", language="hi")) is False
+
+
+def test_probe_error_or_flag_off_is_false(monkeypatch):
+    redis, http = _patch(monkeypatch)
+    probe = SarvamVoiceService.tts_cached_audio_available
+    _run(SarvamVoiceService.synthesize(_tr(), "Hello", language="en", cache=True))
+    redis.raise_on = "get"
+    assert _run(probe(_tr(), "Hello", language="en")) is False  # redis error → stream as usual
+    redis.raise_on = None
+    monkeypatch.setattr(settings, "TTS_CACHE_ENABLED", False)
+    assert _run(probe(_tr(), "Hello", language="en")) is False
+
+
+class _FakeWS:
+    def __init__(self):
+        self.sent = []
+
+    async def send_json(self, obj):
+        self.sent.append(obj)
+
+
+def test_stream_sentence_short_circuits_streaming_on_cache_hit(monkeypatch):
+    redis, http = _patch(monkeypatch)
+    _run(SarvamVoiceService.synthesize(_tr(), "Scripted line", language="en", cache=True))  # warm
+    http.calls = 0
+    monkeypatch.setattr(settings, "SARVAM_TTS_WS_ENABLED", True)
+
+    def _no_ws(*args, **kwargs):
+        raise AssertionError("streaming must not run when the line is cached")
+
+    monkeypatch.setattr(SarvamVoiceService, "synthesize_streaming_ws", staticmethod(_no_ws))
+    ws = _FakeWS()
+    _run(SarvamVoiceService.stream_sentence_tts(ws, _tr(), "Scripted line", language="en", cache=True))
+    audio = [m for m in ws.sent if m.get("type") == "tts_audio"]
+    assert audio and audio[0]["audio_base64"] == "QUJD"  # served from the cache
+    assert http.calls == 0                               # no live Sarvam call
+
+
+def test_stream_sentence_streams_on_cache_miss(monkeypatch):
+    redis, http = _patch(monkeypatch)
+    monkeypatch.setattr(settings, "SARVAM_TTS_WS_ENABLED", True)
+
+    async def _ws_stream(*args, **kwargs):
+        yield {"audio_base64": "V1M=", "audio_format": "wav", "sample_rate": 8000}
+
+    monkeypatch.setattr(SarvamVoiceService, "synthesize_streaming_ws", staticmethod(_ws_stream))
+    ws = _FakeWS()
+    _run(SarvamVoiceService.stream_sentence_tts(ws, _tr(), "Never cached", language="en", cache=True))
+    audio = [m for m in ws.sent if m.get("type") == "tts_audio"]
+    assert audio and audio[0]["audio_base64"] == "V1M="  # streamed, not REST
+    assert http.calls == 0

@@ -124,6 +124,127 @@ textarea.ax-text { resize: vertical; line-height: 1.5; }
 .ax-notice--ok { color: #7FD9A8; }
 .ax-notice--err { color: #ff8b8b; }
 
+/* ── skeleton loaders — shimmer rows in the table's shape, never a blank card ── */
+@keyframes axShimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+.ax-skel-row { display: grid; grid-template-columns: 1.4fr 1.4fr auto; gap: 14px; align-items: center; padding: 19px 14px; border-bottom: 1px solid rgba(255,255,255,0.045); }
+.ax-skel-bar {
+  height: 13px; border-radius: 6px;
+  background: linear-gradient(90deg, rgba(255,255,255,0.05) 25%, rgba(255,255,255,0.11) 50%, rgba(255,255,255,0.05) 75%);
+  background-size: 200% 100%; animation: axShimmer 1.4s linear infinite;
+}
+.ax-skel-bar--pill { width: 72px; height: 24px; border-radius: 999px; justify-self: start; }
+.ax-skel-card { border: 1px solid rgba(255,255,255,0.07); border-radius: 13px; padding: 18px 20px; display: grid; gap: 12px; }
+
+/* ── staggered row entrance ── */
+@keyframes axRowIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+.ax-row-in { animation: axRowIn .38s cubic-bezier(0.22, 1, 0.36, 1) both; animation-delay: calc(var(--i, 0) * 24ms); }
+
+/* ── score visualization — number + graded fill bar ── */
+.ax-scoreviz {
+  display: inline-flex; align-items: center; gap: 9px; padding: 4px 13px; border-radius: 999px;
+  justify-self: start; box-shadow: inset 0 1px 0 rgba(255,255,255,0.04);
+}
+.ax-scoreviz-num { font-family: 'JetBrains Mono', monospace; font-size: 13px; font-variant-numeric: tabular-nums; }
+.ax-scoreviz-track { width: 42px; height: 4px; border-radius: 999px; background: rgba(255,255,255,0.09); overflow: hidden; }
+.ax-scoreviz-fill { display: block; height: 100%; border-radius: inherit; transition: width .5s cubic-bezier(0.22, 1, 0.36, 1); }
+.ax-scoreviz.is-green { color: #7FD9A8; background: rgba(74,200,140,0.08); border: 1px solid rgba(74,200,140,0.22); }
+.ax-scoreviz.is-green .ax-scoreviz-fill { background: linear-gradient(90deg, #4AC88C, #7FD9A8); }
+.ax-scoreviz.is-green.is-high .ax-scoreviz-fill { box-shadow: 0 0 8px rgba(127,217,168,0.55); }
+.ax-scoreviz.is-grey { color: rgba(255,255,255,0.6); background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.1); }
+.ax-scoreviz.is-grey .ax-scoreviz-fill { background: rgba(255,255,255,0.35); }
+
+/* ── copy-to-clipboard (AxPhone) — hover-reveal on pointer devices ── */
+.ax-phone { display: inline-flex; align-items: center; gap: 7px; }
+.ax-copy {
+  display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px;
+  border-radius: 6px; border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.03);
+  color: rgba(255,255,255,0.5); cursor: pointer; opacity: 0; transition: all .16s ease;
+}
+.ax-trow:hover .ax-copy, .ax-drawer .ax-copy, .ax-copy:focus-visible { opacity: 1; }
+.ax-copy:hover { color: #F3F2F0; border-color: rgba(255,255,255,0.28); }
+.ax-copy.is-done { opacity: 1; color: #7FD9A8; border-color: rgba(74,200,140,0.4); background: rgba(74,200,140,0.08); }
+@media (hover: none) { .ax-copy { opacity: 1; } }
+
+/* ── slide-over lead drawer ── */
+.ax-drawer-overlay { position: fixed; inset: 0; z-index: 900; background: rgba(4,4,5,0.55); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); }
+.ax-drawer {
+  position: absolute; top: 0; right: 0; bottom: 0; width: min(440px, 100%);
+  background: linear-gradient(180deg, #141416, #0E0E10); border-left: 1px solid rgba(255,255,255,0.09);
+  box-shadow: -30px 0 80px -30px rgba(0,0,0,0.8); padding: 30px 30px 44px; overflow-y: auto;
+}
+.ax-drawer-close {
+  position: absolute; top: 16px; right: 16px; width: 32px; height: 32px; border-radius: 9px;
+  display: flex; align-items: center; justify-content: center; cursor: pointer;
+  background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.12); color: rgba(255,255,255,0.55);
+  transition: all .16s ease;
+}
+.ax-drawer-close:hover { color: #F3F2F0; border-color: rgba(255,255,255,0.28); }
+.ax-drawer-head { padding-right: 40px; }
+.ax-drawer-name { font-size: 21px; font-weight: 600; letter-spacing: -0.01em; margin-bottom: 9px; }
+.ax-drawer-score { display: flex; align-items: center; gap: 12px; margin-top: 20px; padding-top: 20px; border-top: 1px solid rgba(255,255,255,0.07); }
+.ax-drawer-score-lbl { font-size: 10.5px; letter-spacing: 0.16em; text-transform: uppercase; color: rgba(255,255,255,0.34); font-weight: 600; }
+.axdrawer-enter-active { transition: opacity .22s ease; }
+.axdrawer-enter-active .ax-drawer { transition: transform .3s cubic-bezier(0.22, 1, 0.36, 1); }
+.axdrawer-enter-from { opacity: 0; }
+.axdrawer-enter-from .ax-drawer { transform: translateX(64px); }
+.axdrawer-leave-active { transition: opacity .18s ease; }
+.axdrawer-leave-active .ax-drawer { transition: transform .18s cubic-bezier(0.4, 0, 1, 1); }
+.axdrawer-leave-to { opacity: 0; }
+.axdrawer-leave-to .ax-drawer { transform: translateX(48px); }
+
+/* ── toasts ── */
+.ax-toasts { position: fixed; right: 22px; bottom: 22px; z-index: 1300; display: flex; flex-direction: column; gap: 10px; align-items: flex-end; pointer-events: none; }
+.ax-toast {
+  display: inline-flex; align-items: center; gap: 10px; max-width: 380px; padding: 12px 17px;
+  border-radius: 12px; font-size: 13px; line-height: 1.45; color: #F3F2F0; pointer-events: auto;
+  background: linear-gradient(180deg, #1A1A1D, #121214); border: 1px solid rgba(255,255,255,0.12);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.07), 0 20px 44px -16px rgba(0,0,0,0.75);
+}
+.ax-toast.is-ok { border-color: rgba(74,200,140,0.3); }
+.ax-toast.is-ok .ax-ic { color: #7FD9A8; }
+.ax-toast.is-err { border-color: rgba(230,38,48,0.4); }
+.ax-toast.is-err .ax-ic { color: #F0666E; }
+.axtoast-enter-active { transition: all .28s cubic-bezier(0.22, 1, 0.36, 1); }
+.axtoast-leave-active { transition: all .2s ease; }
+.axtoast-enter-from { opacity: 0; transform: translateY(10px) scale(0.97); }
+.axtoast-leave-to { opacity: 0; transform: translateY(6px); }
+.axtoast-move { transition: transform .28s cubic-bezier(0.22, 1, 0.36, 1); }
+
+/* ── slim campaign progress ── */
+.ax-progress { position: relative; height: 5px; border-radius: 999px; background: rgba(255,255,255,0.06); overflow: hidden; }
+.ax-progress-fill {
+  position: absolute; top: 0; left: 0; bottom: 0; border-radius: inherit; overflow: hidden;
+  background: linear-gradient(90deg, #4AC88C, #7FD9A8);
+  transition: width .6s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.ax-progress--live .ax-progress-fill::after {
+  content: ''; position: absolute; inset: 0;
+  background: linear-gradient(90deg, transparent 30%, rgba(255,255,255,0.4) 50%, transparent 70%);
+  background-size: 200% 100%; animation: axShimmer 1.8s linear infinite;
+}
+
+/* ── tables: sticky header under the app header + steady numerals ── */
+.ax-thead { position: sticky; top: 66px; z-index: 4; background: rgba(13,13,15,0.86); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); }
+.ax-root { font-variant-numeric: tabular-nums; }
+
+/* ── mobile: rows reflow into stacked cards ── */
+@media (max-width: 720px) {
+  .ax-card-pad { padding: 24px 18px; }
+  .ax-thead { display: none; }
+  .ax-trow {
+    grid-template-columns: minmax(0, 1fr) auto !important;
+    row-gap: 6px; align-items: start;
+    border: 1px solid rgba(255,255,255,0.07); border-bottom: 1px solid rgba(255,255,255,0.07);
+    border-radius: 12px; margin: 0 0 10px; padding: 15px 16px;
+    background: linear-gradient(180deg, rgba(255,255,255,0.028), rgba(255,255,255,0.01));
+  }
+  .ax-trow .ax-cell-name, .ax-trow .ax-cell-phone { grid-column: 1; }
+  .ax-trow .ax-score, .ax-trow .ax-scoreviz, .ax-trow .ax-outcome { grid-column: 2; grid-row: 1 / span 2; align-self: center; justify-self: end; }
+  .ax-trow > .ax-btn2, .ax-trow > select { grid-column: 1 / -1; justify-self: stretch; margin-top: 4px; }
+  .ax-skel-row { grid-template-columns: 1fr auto; }
+  .ax-skel-row .ax-skel-bar:nth-child(2) { display: none; }
+}
+
 /* dark scrollbars + selection, scoped to the APEX shell */
 .ax-root { scrollbar-color: rgba(255,255,255,0.18) transparent; }
 .ax-root ::-webkit-scrollbar { width: 10px; height: 10px; }
