@@ -4321,6 +4321,16 @@ class NokvoOneVoiceStreamService:
                         # bucket. Surfaced by GET /campaigns → "Qualified Leads".
                         if not (_bg_campaign_id and _bg_call_link_id):
                             return
+                        # COGS: this task runs AFTER the CallCost row committed and
+                        # the session sink was torn down — its LLM calls (scorer /
+                        # outcome classifier / bulk-path condenser) meter into a
+                        # fresh sink that flushes onto the row as an atomic delta.
+                        from app.services.call_cost_recorder import post_call_llm_attribution
+
+                        async with post_call_llm_attribution(_bg_call_id):
+                            await _classify_and_persist_interest_inner()
+
+                    async def _classify_and_persist_interest_inner():
                         try:
                             from app.services.outbound_call_outcome_classifier import (
                                 classify_outbound_outcome,
@@ -4523,6 +4533,14 @@ class NokvoOneVoiceStreamService:
                             logger.exception("NOKVO-OUTBOUND-INTEREST: classify/persist failed")
 
                     async def _condense_and_persist():
+                        # COGS: post-teardown task — meter its LLM calls into a
+                        # fresh sink, flushed onto the CallCost row as a delta.
+                        from app.services.call_cost_recorder import post_call_llm_attribution
+
+                        async with post_call_llm_attribution(_bg_call_id):
+                            await _condense_and_persist_inner()
+
+                    async def _condense_and_persist_inner():
                         try:
                             from app.services.call_condenser_service import condense_call
                             from app.models.outgoing_lead import OutgoingLead
@@ -4774,6 +4792,18 @@ class NokvoOneVoiceStreamService:
                             cb_phone=_cb_phone,
                             cb_tenant_id=tenant_id_str,
                             site_visit_id=_site_visit_id_in,
+                        ):
+                            # COGS: post-teardown task — meter its LLM calls into
+                            # a fresh sink, flushed onto the CallCost row.
+                            from app.services.call_cost_recorder import post_call_llm_attribution
+
+                            async with post_call_llm_attribution(_bg_call_id_in):
+                                await _condense_and_persist_inbound_inner(
+                                    record_ids, lead_name, cb_phone, cb_tenant_id, site_visit_id
+                                )
+
+                        async def _condense_and_persist_inbound_inner(
+                            record_ids, lead_name, cb_phone, cb_tenant_id, site_visit_id
                         ):
                             try:
                                 from app.services.call_condenser_service import condense_call

@@ -20,13 +20,15 @@ We commit our own short transaction, rollback on error, and log.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any
+from typing import Any, AsyncIterator
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -36,7 +38,13 @@ from app.services.call_cost_calculator import (
     rupees_for_minute_span,
     rupees_per_minute_for,
 )
-from app.services.call_usage import CallUsage, compute_cogs_inr
+from app.services.call_usage import (
+    CallUsage,
+    begin_call_usage,
+    compute_cogs_inr,
+    end_call_usage,
+    llm_cost_inr,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -204,6 +212,9 @@ async def record_call_cost(
                 "cost_tts_inr": cogs.cost_tts_inr,
                 "cost_telephony_inr": cogs.cost_telephony_inr,
                 "cost_total_inr": cogs.cost_total_inr,
+                "llm_requests": cogs.llm_requests,
+                "tts_cache_hits": cogs.tts_cache_hits,
+                "tts_cache_chars": cogs.tts_cache_chars,
             }
         except Exception:
             logger.exception(
@@ -260,3 +271,105 @@ async def record_call_cost(
 
         await invalidate_balance_cache(org_uuid)
     return CallCost(**dict(row._mapping))
+
+
+# ── Post-call LLM attribution ────────────────────────────────────────────────
+# The lead scorer / call condensers run in background tasks spawned AFTER the
+# session's CallCost row is committed and its usage sink torn down — their LLM
+# tokens would otherwise vanish (added to a dead sink, or no sink at all).
+# These helpers give each post-call task its own fresh sink and flush the
+# accumulated usage back onto the already-written row as an atomic delta.
+
+
+async def attribute_post_call_llm(
+    call_id: str,
+    usage: CallUsage,
+    *,
+    attempts: int = 4,
+    retry_delay_s: float = 2.0,
+) -> bool:
+    """Fold post-call LLM usage into the call's committed CallCost row.
+
+    ONE atomic UPDATE: COALESCE-increments the token/request counters and adds
+    the priced delta (``llm_cost_inr`` — the same tariff ``compute_cogs_inr``
+    uses, so the two can never diverge) to BOTH ``cost_llm_inr`` and
+    ``cost_total_inr``. Guarded by ``cost_total_inr IS NOT NULL`` so a legacy
+    "total-only" row is never half-instrumented. The retry is insurance for a
+    recorder that hasn't committed yet (shouldn't happen — the row is written
+    before the tasks spawn); rowcount 0 after the retries → warn and drop
+    (matching the recorder's own best-effort posture). Never raises."""
+    if not call_id or usage is None:
+        return False
+    if not (usage.llm_input_tokens or usage.llm_output_tokens or usage.llm_requests):
+        return False
+    from app.db.session import AsyncSessionLocal
+
+    delta = llm_cost_inr(
+        usage.llm_input_tokens, usage.llm_output_tokens, usage.llm_cached_tokens
+    )
+    stmt = (
+        update(CallCost.__table__)
+        .where(
+            CallCost.call_id == str(call_id),
+            CallCost.cost_total_inr.is_not(None),
+        )
+        .values(
+            llm_input_tokens=func.coalesce(CallCost.llm_input_tokens, 0)
+            + int(usage.llm_input_tokens),
+            llm_output_tokens=func.coalesce(CallCost.llm_output_tokens, 0)
+            + int(usage.llm_output_tokens),
+            llm_cached_tokens=func.coalesce(CallCost.llm_cached_tokens, 0)
+            + int(usage.llm_cached_tokens),
+            llm_requests=func.coalesce(CallCost.llm_requests, 0)
+            + int(usage.llm_requests),
+            cost_llm_inr=func.coalesce(CallCost.cost_llm_inr, 0) + delta,
+            cost_total_inr=func.coalesce(CallCost.cost_total_inr, 0) + delta,
+        )
+    )
+    try:
+        for attempt in range(max(1, int(attempts))):
+            async with AsyncSessionLocal() as db:
+                result = await db.execute(stmt)
+                await db.commit()
+                if (result.rowcount or 0) > 0:
+                    logger.info(
+                        "NOKVO-COST: post-call LLM attributed call_id=%s "
+                        "(+%d in / +%d out tokens, +₹%s)",
+                        call_id, usage.llm_input_tokens, usage.llm_output_tokens, delta,
+                    )
+                    return True
+            if attempt + 1 < attempts:
+                await asyncio.sleep(retry_delay_s)
+        logger.warning(
+            "NOKVO-COST: post-call LLM attribution dropped — no instrumented "
+            "row for call_id=%s (+%d/%d tokens unbilled)",
+            call_id, usage.llm_input_tokens, usage.llm_output_tokens,
+        )
+    except Exception:
+        logger.exception(
+            "NOKVO-COST: post-call LLM attribution failed (call_id=%s)", call_id
+        )
+    return False
+
+
+@asynccontextmanager
+async def post_call_llm_attribution(call_id: str) -> AsyncIterator[CallUsage]:
+    """Give a post-call background task its own usage sink and flush it onto
+    the call's CallCost row on exit.
+
+    Two hard guarantees:
+      * NO CONTEXTVAR BLEED — the reset token is consumed in the ``finally``,
+        unconditionally, BEFORE anything else: even when the body runs
+        synchronously in the caller's context (tests) or crashes, the sink can
+        never leak past the ``with`` block.
+      * FLUSH ON CRASH — the flush also lives in the ``finally``: a task that
+        dies halfway through its LLM calls still attributes the tokens consumed
+        before the crash (Azure bills for failed attempts too). The body's
+        exception propagates (no swallow); the flush itself never raises."""
+    usage, token = begin_call_usage()
+    try:
+        yield usage
+    finally:
+        end_call_usage(token)
+        if usage.llm_input_tokens or usage.llm_output_tokens or usage.llm_requests:
+            await attribute_post_call_llm(call_id, usage)

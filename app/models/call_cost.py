@@ -117,6 +117,12 @@ class CallCost(Base):
     cost_tts_inr = Column(Numeric(12, 4), nullable=True)
     cost_telephony_inr = Column(Numeric(12, 4), nullable=True)
     cost_total_inr = Column(Numeric(12, 4), nullable=True)
+    # ₹0 visibility counters: LLM completion count (main turns + aux + the
+    # post-call attribution increments) and TTS byte-cache efficiency (hits
+    # never billed Sarvam, so they carry no cost — only these counters).
+    llm_requests = Column(Integer, nullable=True)
+    tts_cache_hits = Column(Integer, nullable=True)
+    tts_cache_chars = Column(Integer, nullable=True)
 
     __table_args__ = (
         UniqueConstraint("call_id", name="uq_call_costs_call_id"),

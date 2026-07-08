@@ -824,6 +824,64 @@ const submitApexBulk = async () => {
 
 function handleLogout() { emit('logout'); }
 
+// ── USD→INR FX rate (per-call COGS pricing) ─────────────────────────────
+// The rate every COGS calculation converts vendor USD list prices with.
+// Editable here; applies to newly recorded calls (historical rows keep the
+// rate they were priced at).
+const fx = ref(null);            // { usd_to_inr, default, is_override, updated_at, updated_by }
+const fxEditing = ref(false);
+const fxInput = ref('');
+const fxBusy = ref(false);
+const fxError = ref('');
+
+const loadFx = async () => {
+  try {
+    const res = await fetch(`${SUPERADMIN_API_BASE}/tenants/fx-rate`, { headers: authHeaders() });
+    if (res.ok) fx.value = await res.json();
+  } catch { /* chip just stays hidden */ }
+};
+
+const openFxEditor = () => {
+  fxInput.value = String(fx.value?.usd_to_inr ?? '');
+  fxError.value = '';
+  fxEditing.value = true;
+};
+
+const saveFx = async () => {
+  if (fxBusy.value) return;
+  fxBusy.value = true;
+  fxError.value = '';
+  try {
+    const res = await fetch(`${SUPERADMIN_API_BASE}/tenants/fx-rate`, {
+      method: 'PUT',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ usd_to_inr: Number(fxInput.value) }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) { fxError.value = data.detail || `Save failed (${res.status}).`; return; }
+    fx.value = data;
+    fxEditing.value = false;
+  } catch {
+    fxError.value = 'Could not reach the server.';
+  } finally {
+    fxBusy.value = false;
+  }
+};
+
+const resetFx = async () => {
+  if (fxBusy.value) return;
+  fxBusy.value = true;
+  fxError.value = '';
+  try {
+    const res = await fetch(`${SUPERADMIN_API_BASE}/tenants/fx-rate`, {
+      method: 'DELETE', headers: authHeaders(),
+    });
+    if (res.ok) { fx.value = await res.json(); fxEditing.value = false; }
+  } catch { /* keep editor open */ } finally {
+    fxBusy.value = false;
+  }
+};
+
 // COGS component bars (detail view) scale to the largest component.
 function cogsBars(cogs) {
   if (!cogs) return [];
@@ -837,7 +895,7 @@ function cogsBars(cogs) {
   return parts.map((p) => ({ ...p, pct: Math.round((p.value / max) * 100) }));
 }
 
-onMounted(loadOrganizations);
+onMounted(() => { loadOrganizations(); loadFx(); });
 watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos(); loadOrganizations(); });
 </script>
 
@@ -902,6 +960,23 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
           <div class="summary-chip"><span class="summary-label">REVENUE</span><strong>{{ inr(filteredSummary.total_revenue_inr) }}</strong></div>
           <div class="summary-chip"><span class="summary-label">COGS</span><strong>{{ inr(filteredSummary.total_cogs_inr) }}</strong></div>
           <div class="summary-chip"><span class="summary-label">MARGIN</span><strong :class="filteredSummary.total_margin_inr < 0 ? 'neg' : 'pos'">{{ inr(filteredSummary.total_margin_inr) }}</strong></div>
+          <!-- USD→INR FX: the rate COGS converts vendor USD prices with. Editable;
+               applies to newly recorded calls (history keeps its frozen rate). -->
+          <div v-if="fx" class="summary-chip fx-chip" :title="fx.is_override ? `Override set by ${fx.updated_by || '?'} (default ${fx.default})` : `Config default (${fx.default})`">
+            <span class="summary-label">FX ₹/$</span>
+            <template v-if="!fxEditing">
+              <strong>{{ fx.usd_to_inr }}<span v-if="fx.is_override" class="fx-dot" title="override active">•</span></strong>
+              <button type="button" class="fx-btn" @click="openFxEditor">Edit</button>
+            </template>
+            <template v-else>
+              <input v-model="fxInput" class="fx-input" type="number" step="0.1" min="10" max="500"
+                     :disabled="fxBusy" @keyup.enter="saveFx" @keyup.esc="fxEditing = false" />
+              <button type="button" class="fx-btn" :disabled="fxBusy" @click="saveFx">{{ fxBusy ? '…' : 'Save' }}</button>
+              <button v-if="fx.is_override" type="button" class="fx-btn ghost" :disabled="fxBusy" @click="resetFx">Reset</button>
+              <button type="button" class="fx-btn ghost" :disabled="fxBusy" @click="fxEditing = false">Cancel</button>
+              <span v-if="fxError" class="fx-error">{{ fxError }}</span>
+            </template>
+          </div>
         </div>
 
         <div v-if="filteredOrganizations.length" class="table-wrap">
@@ -1101,6 +1176,7 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
                     <th class="num">STT</th>
                     <th class="num">LLM</th>
                     <th class="num">TTS</th>
+                    <th class="num" title="TTS lines served free from the byte-cache (hits × / chars)">Cache</th>
                     <th class="num">Plivo</th>
                     <th class="num">COGS</th>
                     <th class="num">Billed</th>
@@ -1114,13 +1190,16 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
                     </td>
                     <td class="num">{{ minutes(call.minutes) }}</td>
                     <td class="num" :class="{ dim: !call.instrumented }">{{ call.instrumented ? inr(call.cost_stt_inr) : '—' }}</td>
-                    <td class="num" :class="{ dim: !call.instrumented }">{{ call.instrumented ? inr(call.cost_llm_inr) : '—' }}</td>
+                    <td class="num" :class="{ dim: !call.instrumented }"
+                        :title="call.instrumented ? `${call.llm_input_tokens ?? 0} in / ${call.llm_output_tokens ?? 0} out / ${call.llm_cached_tokens ?? 0} cached · ${call.llm_requests ?? 0} req` : ''">
+                      {{ call.instrumented ? inr(call.cost_llm_inr) : '—' }}</td>
                     <td class="num" :class="{ dim: !call.instrumented }">{{ call.instrumented ? inr(call.cost_tts_inr) : '—' }}</td>
+                    <td class="num" :class="{ dim: !call.tts_cache_hits }">{{ call.tts_cache_hits ? `${call.tts_cache_hits}× / ${call.tts_cache_chars || 0} ch` : '—' }}</td>
                     <td class="num" :class="{ dim: !call.instrumented }">{{ call.instrumented ? inr(call.cost_telephony_inr) : '—' }}</td>
                     <td class="num">{{ call.instrumented ? inr(call.cost_total_inr) : '—' }}</td>
                     <td class="num">{{ inr(call.revenue_inr) }}</td>
                   </tr>
-                  <tr v-if="!detail.recent_calls.length"><td colspan="8" class="muted center">No calls recorded yet.</td></tr>
+                  <tr v-if="!detail.recent_calls.length"><td colspan="9" class="muted center">No calls recorded yet.</td></tr>
                 </tbody>
               </table>
             </div>
@@ -1850,6 +1929,26 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
 }
 .summary-label { font-size: 0.58rem; letter-spacing: 1.5px; color: var(--text-muted); }
 .summary-chip strong { font-size: 0.95rem; color: var(--text-primary); }
+
+/* USD→INR FX chip: value + inline editor in the summary strip. */
+.fx-chip { flex-direction: row; align-items: center; gap: 0.55rem; }
+.fx-chip .summary-label { align-self: center; }
+.fx-dot { color: var(--accent-color); margin-left: 0.25rem; }
+.fx-btn {
+  border: 1px solid var(--border-color); border-radius: 6px; cursor: pointer;
+  background: var(--bg-input); color: var(--text-primary);
+  font-size: 0.62rem; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+  padding: 0.25rem 0.55rem;
+}
+.fx-btn:hover { border-color: var(--accent-color); color: var(--accent-color); }
+.fx-btn:disabled { opacity: 0.5; cursor: default; }
+.fx-btn.ghost { color: var(--text-muted); }
+.fx-input {
+  width: 72px; border: 1px solid var(--border-color); border-radius: 6px;
+  background: var(--bg-input); color: var(--text-primary);
+  font-size: 0.85rem; padding: 0.25rem 0.45rem;
+}
+.fx-error { color: #e5484d; font-size: 0.68rem; }
 
 .table-wrap { overflow-x: auto; border: 1px solid var(--border-color); border-radius: 10px; }
 .org-table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }

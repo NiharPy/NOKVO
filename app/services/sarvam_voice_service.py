@@ -1284,16 +1284,21 @@ class SarvamVoiceService:
             )
             # Meter TTS chars for per-call COGS (best-effort) — but NOT on a cache
             # hit, which never billed Sarvam. Counted here (not at the top) so a hit
-            # is free; the streaming path meters separately below.
-            if not result.get("cached"):
-                try:
-                    from app.services.call_usage import current_call_usage
+            # is free; the streaming path meters separately below. Cache hits are
+            # counted as ₹0 visibility (hits + chars served free) so the console
+            # can show cache efficiency — this ONE point covers both hit paths
+            # (the WS short-circuit funnels into this REST branch's result).
+            try:
+                from app.services.call_usage import current_call_usage
 
-                    _usage = current_call_usage()
-                    if _usage is not None and text and text.strip():
+                _usage = current_call_usage()
+                if _usage is not None and text and text.strip():
+                    if not result.get("cached"):
                         _usage.add_tts_chars(len(normalize_text_for_tts(text)[:3500]))
-                except Exception:
-                    pass
+                    else:
+                        _usage.add_tts_cache_hit(len(normalize_text_for_tts(text)[:3500]))
+            except Exception:
+                pass
             for audio in result.get("audios") or []:
                 if not audio:
                     continue

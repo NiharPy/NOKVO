@@ -265,6 +265,10 @@ def _call_row(cc: CallCost) -> dict:
         "llm_cached_tokens": cc.llm_cached_tokens,
         "stt_seconds": float(cc.stt_seconds) if cc.stt_seconds is not None else None,
         "tts_characters": cc.tts_characters,
+        # ₹0 visibility counters: completion count + TTS byte-cache efficiency.
+        "llm_requests": cc.llm_requests,
+        "tts_cache_hits": cc.tts_cache_hits,
+        "tts_cache_chars": cc.tts_cache_chars,
         "trace_id": cc.trace_id,
     }
 
@@ -403,6 +407,55 @@ class TodoUpdateRequest(BaseModel):
     title: str | None = None
     notes: str | None = None
     status: str | None = None  # 'open' | 'done'
+
+
+# ── USD→INR FX rate (per-call COGS pricing) ──────────────────────────────────
+# NOTE: like /feedback, these are defined BEFORE the "/{organization_id}" route
+# so FastAPI doesn't read "fx-rate" as an organization id.
+
+
+class FxRateRequest(BaseModel):
+    usd_to_inr: float
+
+
+@router.get("/fx-rate")
+async def get_fx_rate(
+    db: AsyncSession = Depends(get_db),
+    current_user: SuperAdminUser = Depends(RequireRole(_READ_ROLES)),
+):
+    """The USD→INR rate every per-call COGS calculation converts vendor USD
+    list prices with, plus override metadata."""
+    from app.services.platform_settings import get_usd_to_inr
+
+    return await get_usd_to_inr(db)
+
+
+@router.put("/fx-rate")
+async def set_fx_rate(
+    payload: FxRateRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: SuperAdminUser = Depends(RequireRole(_WRITE_ROLES)),
+):
+    """Change the platform FX rate. Applies to THIS instance immediately and
+    reaches every other replica via its refresher within ~a minute; historical
+    call_costs rows keep the rate they were priced at (ledger freezes per row)."""
+    from app.services.platform_settings import set_usd_to_inr
+
+    try:
+        return await set_usd_to_inr(db, payload.usd_to_inr, updated_by=current_user.email)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.delete("/fx-rate")
+async def clear_fx_rate(
+    db: AsyncSession = Depends(get_db),
+    current_user: SuperAdminUser = Depends(RequireRole(_WRITE_ROLES)),
+):
+    """Remove the override — pricing returns to the config default."""
+    from app.services.platform_settings import clear_usd_to_inr
+
+    return await clear_usd_to_inr(db, updated_by=current_user.email)
 
 
 @router.get("/todos")

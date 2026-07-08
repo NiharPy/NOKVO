@@ -6,7 +6,7 @@ A single voice call burns four metered vendor resources:
   * **LLM**  — Azure gpt-5-mini (shared pool), priced per 1K tokens (input /
     output / cached-input at distinct rates).
   * **TTS**  — Sarvam text-to-speech, priced per 1K characters.
-  * **Plivo** — telephony, priced per call-minute.
+  * **Plivo** — telephony, a FLAT fee per CONNECTED call (INR-native).
 
 The voice pipeline accumulates the raw counters into a :class:`CallUsage`
 over the life of a session; at teardown the recorder converts them into the
@@ -18,6 +18,8 @@ Why INR: the rest of the call ledger is rupee-denominated, so the SuperAdmin
 console can show revenue (₹) − COGS (₹) = margin (₹) without mixing units.
 The per-unit vendor rates live in ``settings`` as USD list prices; we convert
 with ``settings.USD_TO_INR`` (hardcoded MVP FX — see the config comment).
+Telephony is the exception: Plivo bills a rupee-denominated flat connect fee,
+so it's INR-native and never touches the FX.
 """
 from __future__ import annotations
 
@@ -57,6 +59,12 @@ class CallUsage:
     llm_cached_tokens: int = 0
     stt_seconds: float = 0.0
     tts_characters: int = 0
+    # Visibility counters (₹0 cost): how many LLM completions the call made
+    # (main turns + aux classifiers + post-call attribution), and how much TTS
+    # was served free from the byte-cache instead of billed to Sarvam.
+    llm_requests: int = 0
+    tts_cache_hits: int = 0
+    tts_cache_chars: int = 0
 
     def add_llm(
         self,
@@ -68,8 +76,12 @@ class CallUsage:
         """Accumulate one LLM turn's usage chunk.
 
         ``prompt_tokens`` is the *total* input (cached + uncached) as Azure
-        reports it; ``cached_tokens`` is the discounted-rate subset.
+        reports it; ``cached_tokens`` is the discounted-rate subset. An
+        all-empty call stays a complete no-op (doesn't count a request).
         """
+        if not (prompt_tokens or completion_tokens or cached_tokens):
+            return
+        self.llm_requests += 1
         if prompt_tokens:
             self.llm_input_tokens += int(prompt_tokens)
         if completion_tokens:
@@ -88,6 +100,13 @@ class CallUsage:
     def add_tts_chars(self, count) -> None:
         if count and count > 0:
             self.tts_characters += int(count)
+
+    def add_tts_cache_hit(self, chars) -> None:
+        """One TTS line served from the byte-cache: free (never billed to
+        Sarvam, contributes ₹0) but counted so cache efficiency is visible."""
+        self.tts_cache_hits += 1
+        if chars and chars > 0:
+            self.tts_cache_chars += int(chars)
 
 
 # ── Ambient per-call usage sink ───────────────────────────────────────────
@@ -141,43 +160,68 @@ class CogsBreakdown:
     llm_cached_tokens: int
     stt_seconds: Decimal
     tts_characters: int
+    # ₹0 visibility counters (appended last so the dataclass stays
+    # backward-constructible for older positional callers).
+    llm_requests: int = 0
+    tts_cache_hits: int = 0
+    tts_cache_chars: int = 0
 
 
-def compute_cogs_inr(usage: CallUsage, telephony_seconds) -> CogsBreakdown:
-    """Price a call's accumulated usage into per-component INR COGS.
+def llm_cost_inr(input_tokens, output_tokens, cached_tokens) -> Decimal:
+    """Price one LLM token bundle into quantized INR.
 
-    ``telephony_seconds`` is the billable Plivo duration (the call's
-    ``duration_seconds``) — telephony has no separate counter on
-    :class:`CallUsage` because the call duration already is the meter.
+    The ONE place the LLM tariff lives: input billed at the standard rate for
+    the *uncached* portion and the discounted rate for the cached subset;
+    output at its own rate; USD list prices × the MVP FX. Shared by
+    :func:`compute_cogs_inr` (session teardown) and the post-call attribution
+    delta (``call_cost_recorder.attribute_post_call_llm``) so the two can
+    never price differently.
     """
-    fx = _d(settings.USD_TO_INR)
-
-    # STT: per audio-minute.
-    stt_usd = (_d(usage.stt_seconds) / Decimal("60")) * _d(settings.COST_PER_STT_MINUTE_USD)
-
-    # LLM: input billed at the standard rate for the *uncached* portion and
-    # the discounted rate for the cached portion; output at its own rate.
-    cached = _d(usage.llm_cached_tokens)
-    total_input = _d(usage.llm_input_tokens)
+    cached = _d(cached_tokens)
+    total_input = _d(input_tokens)
     uncached_input = total_input - cached
     if uncached_input < 0:
         uncached_input = Decimal("0")
     llm_usd = (
         (uncached_input / Decimal("1000")) * _d(settings.COST_PER_LLM_INPUT_1K_TOKENS_USD)
         + (cached / Decimal("1000")) * _d(settings.COST_PER_LLM_CACHED_INPUT_1K_TOKENS_USD)
-        + (_d(usage.llm_output_tokens) / Decimal("1000")) * _d(settings.COST_PER_LLM_OUTPUT_1K_TOKENS_USD)
+        + (_d(output_tokens) / Decimal("1000")) * _d(settings.COST_PER_LLM_OUTPUT_1K_TOKENS_USD)
+    )
+    return _q(llm_usd * _d(settings.USD_TO_INR))
+
+
+def compute_cogs_inr(usage: CallUsage, telephony_seconds) -> CogsBreakdown:
+    """Price a call's accumulated usage into per-component INR COGS.
+
+    ``telephony_seconds`` is the call's billable duration and doubles as the
+    CONNECTIVITY signal: Plivo COGS is a flat INR fee per *connected* call
+    (``COST_PLIVO_PER_CONNECTED_CALL_INR``, no FX), charged iff the duration
+    is positive — a call that never connected costs ₹0. Telephony has no
+    separate counter on :class:`CallUsage` because the duration already is
+    the meter.
+    """
+    fx = _d(settings.USD_TO_INR)
+
+    # STT: per audio-minute.
+    stt_usd = (_d(usage.stt_seconds) / Decimal("60")) * _d(settings.COST_PER_STT_MINUTE_USD)
+
+    # LLM: the shared tariff helper (uncached/cached input + output).
+    cost_llm = llm_cost_inr(
+        usage.llm_input_tokens, usage.llm_output_tokens, usage.llm_cached_tokens
     )
 
-    # TTS: per 1K characters synthesized.
+    # TTS: per 1K characters synthesized (cache hits contribute nothing here).
     tts_usd = (_d(usage.tts_characters) / Decimal("1000")) * _d(settings.COST_PER_TTS_1K_CHARS_USD)
 
-    # Telephony (Plivo): per call-minute.
-    telephony_usd = (_d(telephony_seconds) / Decimal("60")) * _d(settings.COST_PER_TWILIO_MINUTE_USD)
+    # Telephony (Plivo): FLAT fee per CONNECTED call, INR-native (no FX).
+    cost_telephony = (
+        _q(_d(settings.COST_PLIVO_PER_CONNECTED_CALL_INR))
+        if _d(telephony_seconds) > 0
+        else Decimal("0.0000")
+    )
 
     cost_stt = _q(stt_usd * fx)
-    cost_llm = _q(llm_usd * fx)
     cost_tts = _q(tts_usd * fx)
-    cost_telephony = _q(telephony_usd * fx)
     cost_total = _q(cost_stt + cost_llm + cost_tts + cost_telephony)
 
     return CogsBreakdown(
@@ -191,4 +235,7 @@ def compute_cogs_inr(usage: CallUsage, telephony_seconds) -> CogsBreakdown:
         llm_cached_tokens=int(usage.llm_cached_tokens),
         stt_seconds=_q(_d(usage.stt_seconds)),
         tts_characters=int(usage.tts_characters),
+        llm_requests=int(usage.llm_requests),
+        tts_cache_hits=int(usage.tts_cache_hits),
+        tts_cache_chars=int(usage.tts_cache_chars),
     )

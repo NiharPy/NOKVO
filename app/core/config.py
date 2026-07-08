@@ -619,6 +619,12 @@ class Settings(BaseSettings):
     COST_PER_STT_MINUTE_USD: float = 0.0120
     COST_PER_TWILIO_MINUTE_USD: float = 0.0130
     COST_PER_TTS_1K_CHARS_USD: float = 0.0180
+    # Plivo telephony COGS: a FLAT fee per CONNECTED call (duration > 0), in
+    # rupees — INR-NATIVE, never multiplied by USD_TO_INR. This replaces the
+    # old per-minute telephony pricing in per-call COGS (compute_cogs_inr);
+    # COST_PER_TWILIO_MINUTE_USD above remains only for the legacy monthly
+    # estimator in tenant_billing_service.
+    COST_PLIVO_PER_CONNECTED_CALL_INR: float = 0.6
     # GPT-5-mini list price (the shared pool model): $0.25/1M input, $2.00/1M
     # output, cached input ~$0.025/1M. The previous $3.00 / $12.00 per-1M
     # placeholders overstated LLM cost by ~8-12x. Confirm against the actual
@@ -626,11 +632,12 @@ class Settings(BaseSettings):
     COST_PER_LLM_INPUT_1K_TOKENS_USD: float = 0.00025
     COST_PER_LLM_OUTPUT_1K_TOKENS_USD: float = 0.0020
     COST_PER_LLM_CACHED_INPUT_1K_TOKENS_USD: float = 0.000025
-    # Per-call COGS components (STT/LLM/TTS/Plivo) are persisted in INR on
-    # CallCost. The per-unit rates above are vendor list prices in USD, so we
-    # convert with this FX rate. NOTE: COST_PER_TWILIO_MINUTE_USD is the Plivo
-    # telephony rate (the constant name is legacy — Plivo is the sole telephony
-    # provider) and the STT/TTS rates price Sarvam (saaras:v3 / bulbul:v3).
+    # Per-call COGS components (STT/LLM/TTS) are persisted in INR on CallCost.
+    # The per-unit rates above are vendor list prices in USD, so we convert
+    # with this FX rate. NOTE: COST_PER_TWILIO_MINUTE_USD is the legacy Plivo
+    # per-minute rate — NO LONGER used for per-call COGS (telephony is now the
+    # flat INR connect fee above); it survives only for tenant_billing_service's
+    # monthly estimate. The STT/TTS rates price Sarvam (saaras:v3 / bulbul:v3).
     # The FX rate is hardcoded for this MVP: a static rate means the INR margin
     # figures shown in the SuperAdmin console slowly decouple from the actual
     # USD Azure/Sarvam/Plivo invoices as the rate drifts. Revisit with a live

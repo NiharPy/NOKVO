@@ -11,6 +11,10 @@ def _meter_call_llm(usage: dict | None) -> None:
     Best-effort + null-safe: no-op outside a voice session (the contextvar is
     unset) or when the provider didn't return a usage block. ``cached_tokens``
     is the discounted-rate subset of ``prompt_tokens`` (Azure prompt cache).
+    Accepts BOTH usage shapes: chat-completions (``prompt_tokens`` /
+    ``completion_tokens`` / ``prompt_tokens_details``) and the Responses API
+    (``input_tokens`` / ``output_tokens`` / ``input_tokens_details``) — a pool
+    member configured with a /responses endpoint would otherwise meter zero.
     """
     if not usage:
         return
@@ -19,10 +23,14 @@ def _meter_call_llm(usage: dict | None) -> None:
 
         sink = current_call_usage()
         if sink is not None:
-            details = usage.get("prompt_tokens_details") or {}
+            details = (
+                usage.get("prompt_tokens_details")
+                or usage.get("input_tokens_details")
+                or {}
+            )
             sink.add_llm(
-                prompt_tokens=usage.get("prompt_tokens"),
-                completion_tokens=usage.get("completion_tokens"),
+                prompt_tokens=usage.get("prompt_tokens") or usage.get("input_tokens"),
+                completion_tokens=usage.get("completion_tokens") or usage.get("output_tokens"),
                 cached_tokens=details.get("cached_tokens"),
             )
     except Exception:
@@ -673,6 +681,12 @@ class AzureGroundedLLM:
             payload = resp.json()
             actual = int(((payload.get("usage") or {}).get("total_tokens")) or est)
             await LLMPool.reconcile(member, est, actual, pool="nano")
+            # COGS: nano completions (intent classifier, in-call summary, …)
+            # were the ONE unmetered LLM path — every other entry point
+            # (complete / complete_global / stream) already meters. No-op
+            # outside a call (contextvar unset), so campaign-creation /
+            # scheduler uses stay free of side effects.
+            _meter_call_llm(payload.get("usage"))
             return AzureGroundedLLM.extract_text(payload)
         except Exception:
             await LLMPool.reconcile(member, est, 0, pool="nano")
@@ -799,6 +813,13 @@ class AzureGroundedLLM:
                                 continue
                             if event.get("usage"):
                                 _usage = event["usage"]  # final stream_options usage chunk
+                                _meter_call_llm(_usage)
+                            elif event.get("type") == "response.completed":
+                                # Responses-API streams carry the final usage on
+                                # the completed event, nested under "response" —
+                                # a /responses pool member would otherwise meter
+                                # zero for every streamed turn.
+                                _usage = (event.get("response") or {}).get("usage")
                                 _meter_call_llm(_usage)
                             if event.get("type") == "response.output_text.delta":
                                 token = event.get("delta") or ""

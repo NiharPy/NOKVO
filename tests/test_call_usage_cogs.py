@@ -7,7 +7,7 @@ test tracks rate/FX changes instead of hardcoding a frozen number.
 from decimal import Decimal
 
 from app.core.config import settings
-from app.services.call_usage import CallUsage, compute_cogs_inr
+from app.services.call_usage import CallUsage, compute_cogs_inr, llm_cost_inr
 
 
 def _expected_inr(usd: Decimal) -> Decimal:
@@ -46,7 +46,6 @@ def test_component_values_match_rates():
 
     stt_usd = (Decimal("120") / 60) * Decimal(str(settings.COST_PER_STT_MINUTE_USD))
     tts_usd = (Decimal("600") / 1000) * Decimal(str(settings.COST_PER_TTS_1K_CHARS_USD))
-    tel_usd = (Decimal("120") / 60) * Decimal(str(settings.COST_PER_TWILIO_MINUTE_USD))
     # 800 uncached input + 200 cached + 500 output.
     llm_usd = (
         (Decimal("800") / 1000) * Decimal(str(settings.COST_PER_LLM_INPUT_1K_TOKENS_USD))
@@ -56,7 +55,10 @@ def test_component_values_match_rates():
 
     assert cogs.cost_stt_inr == _expected_inr(stt_usd)
     assert cogs.cost_tts_inr == _expected_inr(tts_usd)
-    assert cogs.cost_telephony_inr == _expected_inr(tel_usd)
+    # Telephony: FLAT INR fee per connected call (no FX, no per-minute).
+    assert cogs.cost_telephony_inr == Decimal(
+        str(settings.COST_PLIVO_PER_CONNECTED_CALL_INR)
+    ).quantize(Decimal("0.0001"))
     assert cogs.cost_llm_inr == _expected_inr(llm_usd)
 
 
@@ -94,3 +96,46 @@ def test_cogs_carries_raw_counters():
     assert cogs.llm_cached_tokens == 2
     assert cogs.stt_seconds == Decimal("3.0000")
     assert cogs.tts_characters == 7
+
+
+def test_flat_plivo_fee_edges():
+    """Telephony is a FLAT fee per CONNECTED call: any positive duration costs
+    exactly the fee; a never-connected call costs 0. Never scales with length."""
+    fee = Decimal(str(settings.COST_PLIVO_PER_CONNECTED_CALL_INR)).quantize(Decimal("0.0001"))
+    assert compute_cogs_inr(CallUsage(), telephony_seconds=0).cost_telephony_inr == Decimal("0.0000")
+    assert compute_cogs_inr(CallUsage(), telephony_seconds=1).cost_telephony_inr == fee
+    assert compute_cogs_inr(CallUsage(), telephony_seconds=600).cost_telephony_inr == fee
+    # Total-is-sum invariant holds with the flat fee in the mix.
+    usage = CallUsage(llm_input_tokens=1000, llm_output_tokens=500, stt_seconds=60, tts_characters=400)
+    cogs = compute_cogs_inr(usage, telephony_seconds=60)
+    assert cogs.cost_total_inr == (
+        cogs.cost_stt_inr + cogs.cost_llm_inr + cogs.cost_tts_inr + cogs.cost_telephony_inr
+    )
+
+
+def test_llm_cost_inr_matches_compute():
+    """The extracted tariff helper and compute_cogs_inr can never diverge —
+    the post-call attribution delta uses the same function."""
+    usage = CallUsage(llm_input_tokens=1000, llm_output_tokens=500, llm_cached_tokens=200)
+    assert compute_cogs_inr(usage, telephony_seconds=0).cost_llm_inr == llm_cost_inr(1000, 500, 200)
+    assert llm_cost_inr(0, 0, 0) == Decimal("0.0000")
+    assert llm_cost_inr(100, 0, 500) >= 0  # cached > input clamps, never negative
+
+
+def test_tts_cache_counters_and_llm_requests():
+    """Cache hits and request counts are ₹0 visibility: they ride the breakdown
+    but never move a cost column; paid tts_characters is untouched by hits."""
+    usage = CallUsage()
+    usage.add_tts_cache_hit(120)
+    usage.add_tts_cache_hit(None)  # chars null-safe, hit still counts
+    usage.add_llm(prompt_tokens=100, completion_tokens=50)
+    usage.add_llm(prompt_tokens=None, completion_tokens=None, cached_tokens=None)  # full no-op
+    assert usage.tts_cache_hits == 2
+    assert usage.tts_cache_chars == 120
+    assert usage.llm_requests == 1          # the all-None call counted nothing
+    assert usage.tts_characters == 0        # hits never touch the PAID counter
+
+    cogs = compute_cogs_inr(usage, telephony_seconds=0)
+    assert cogs.tts_cache_hits == 2 and cogs.tts_cache_chars == 120
+    assert cogs.llm_requests == 1
+    assert cogs.cost_tts_inr == Decimal("0.0000")  # cache hits are free
