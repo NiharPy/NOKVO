@@ -4,12 +4,16 @@
 // client-side. Row click opens the slide-over drawer (score breakdown + note).
 import { inject, ref, computed, watch, onMounted } from 'vue';
 import { categorizeContacts, exportContactsCsv } from '../../composables/bulkCalling.js';
+import { useNewRows } from '../../composables/axMotion.js';
 import AxIcon from '../AxIcon.vue';
+import AxCount from '../AxCount.vue';
 import AxScore from '../AxScore.vue';
 import AxPhone from '../AxPhone.vue';
 import AxLeadDrawer from '../AxLeadDrawer.vue';
 
 const apex = inject('apex');
+// Flash rows that ARRIVED on a refresh — a lead just landed.
+const newRows = useNewRows((r) => r.call_link_id || r.phone);
 const filter = ref(null); // null = all
 const detail = ref(null); // row shown in the drawer
 const rows = ref([]);
@@ -57,6 +61,7 @@ async function loadRows(reset = true) {
       cursors.value[c.id] = next_cursor || null;
     }
     rows.value = reset ? [...out, ...legacyRows] : out;
+    newRows.track(rows.value);
   } catch (e) {
     console.error('[APEX] load qualified failed', e);
   } finally {
@@ -85,7 +90,7 @@ async function downloadCsv() {
     <div class="ax-card-head">
       <div style="display:flex;align-items:center;gap:13px;">
         <h2 class="ax-h2">Qualified leads</h2>
-        <span class="ax-count ax-count--green">{{ rows.length }}{{ hasMore ? '+' : '' }}</span>
+        <span class="ax-count ax-count--green"><AxCount :value="rows.length" />{{ hasMore ? '+' : '' }}</span>
       </div>
       <div style="display:flex;align-items:center;gap:8px;">
         <button type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" :disabled="!rows.length" @click="downloadCsv"><AxIcon name="download" :size="13" /> Generate CSV</button>
@@ -112,16 +117,19 @@ async function downloadCsv() {
     </div>
     <template v-else>
       <div class="ax-thead" style="grid-template-columns:1.4fr 1.4fr auto;"><span>Name</span><span>Phone</span><span>Score</span></div>
-      <div
-        v-for="(row, i) in rows" :key="row.call_link_id || i"
-        class="ax-trow ax-trow--click ax-row-in" :style="{ '--i': Math.min(i, 14) }"
-        style="grid-template-columns:1.4fr 1.4fr auto;" @click="detail = row"
-      >
-        <span class="ax-cell-name">{{ row.name }}</span>
-        <AxPhone :phone="row.phone" />
-        <AxScore v-if="row.max_score" :score="row.lead_score" :max="row.max_score" tone="green" />
-        <span v-else class="ax-score ax-score--grey">—</span>
-      </div>
+      <TransitionGroup name="axlist">
+        <div
+          v-for="(row, i) in rows" :key="row.call_link_id || row.phone"
+          class="ax-trow ax-trow--click ax-row-in" :class="{ 'is-new': newRows.isNew(row) }"
+          :style="{ '--i': Math.min(i, 14) }"
+          style="grid-template-columns:1.4fr 1.4fr auto;" @click="detail = row"
+        >
+          <span class="ax-cell-name">{{ row.name }}</span>
+          <AxPhone :phone="row.phone" />
+          <AxScore v-if="row.max_score" :score="row.lead_score" :max="row.max_score" tone="green" />
+          <span v-else class="ax-score ax-score--grey">—</span>
+        </div>
+      </TransitionGroup>
       <button v-if="hasMore" type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" style="margin-top:12px;" :disabled="loading" @click="loadRows(false)">
         {{ loading ? 'Loading…' : 'Load more' }}
       </button>

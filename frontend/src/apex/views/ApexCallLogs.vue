@@ -5,9 +5,12 @@
 // blob campaigns keep reading inline. Transcripts are keyed by call_link_id
 // (the internal call id) — NOT Plivo's call_id.
 import { inject, ref, computed, onMounted, watch } from 'vue';
+import { useNewRows } from '../../composables/axMotion.js';
 import AxIcon from '../AxIcon.vue';
 
 const apex = inject('apex');
+// Flash calls that arrived on a refresh — the dialer just finished someone.
+const newRows = useNewRows((r) => r.call_link_id || r.call_id);
 const filter = ref(null);
 const selected = ref(null); // { call_link_id, call_id, name, phone, status, time }
 const transcript = ref(null);
@@ -69,6 +72,7 @@ const calls = computed(() => {
   }
   return rows.sort((a, b) => String(b.answered_at || '').localeCompare(String(a.answered_at || '')));
 });
+watch(calls, (rows) => newRows.track(rows || []), { immediate: true });
 
 function statusType(s) {
   if (s === 'answered' || s === 'completed') return 'pos';
@@ -116,7 +120,7 @@ async function open(row) {
           </div>
         </template>
         <div v-else-if="!calls.length" class="ax-empty"><div class="ax-empty-icon"><AxIcon name="phone" :size="20" /></div><p class="ax-empty-text">No calls yet for these campaigns.</p></div>
-        <button v-for="(row, i) in calls" :key="row.call_link_id || row.call_id" type="button" class="ax-call ax-row-in" :style="{ '--i': Math.min(i, 14) }" :class="{ 'is-active': selected && (selected.call_link_id || selected.call_id) === (row.call_link_id || row.call_id) }" @click="open(row)">
+        <button v-for="(row, i) in calls" :key="row.call_link_id || row.call_id" type="button" class="ax-call ax-row-in" :style="{ '--i': Math.min(i, 14) }" :class="{ 'is-active': selected && (selected.call_link_id || selected.call_id) === (row.call_link_id || row.call_id), 'is-new': newRows.isNew(row) }" @click="open(row)">
           <div style="display:flex;justify-content:space-between;align-items:center;">
             <span style="font-size:15px;font-weight:600;">{{ row.name }}</span>
             <span class="ax-spill" :class="`is-${statusType(row.status)}`">{{ row.status }}</span>
@@ -156,7 +160,7 @@ async function open(row) {
 <style scoped>
 .ax-logs { display: grid; grid-template-columns: 360px 1fr; gap: 22px; align-items: start; }
 .ax-logs-list { display: flex; flex-direction: column; gap: 12px; }
-.ax-call { width: 100%; text-align: left; cursor: pointer; border-radius: 13px; padding: 18px 20px; background: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.012)); border: 1px solid rgba(255,255,255,0.08); transition: all .18s cubic-bezier(0.22, 1, 0.36, 1); font-family: 'Sora', sans-serif; display: block; color: #F3F2F0; box-shadow: inset 0 1px 0 rgba(255,255,255,0.04); }
+.ax-call { position: relative; width: 100%; text-align: left; cursor: pointer; border-radius: 13px; padding: 18px 20px; background: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.012)); border: 1px solid rgba(255,255,255,0.08); transition: all .18s var(--ax-out); font-family: 'Sora', sans-serif; display: block; color: #F3F2F0; box-shadow: inset 0 1px 0 rgba(255,255,255,0.04); overflow: hidden; }
 .ax-call:hover:not(.is-active) { border-color: rgba(255,255,255,0.18); transform: translateY(-1px); box-shadow: inset 0 1px 0 rgba(255,255,255,0.05), 0 10px 24px -14px rgba(0,0,0,0.55); }
 .ax-call.is-active { border-color: rgba(230,38,48,0.5); background: linear-gradient(180deg, rgba(230,38,48,0.08), rgba(230,38,48,0.04)); box-shadow: inset 0 1px 0 rgba(255,255,255,0.05), 0 12px 28px -14px rgba(230,38,48,0.25); }
 .ax-call-phone { font-family: 'JetBrains Mono', monospace; font-size: 12.5px; color: rgba(255,255,255,0.45); margin-top: 11px; }
@@ -168,7 +172,15 @@ async function open(row) {
 .ax-logs-detail { background: linear-gradient(180deg, rgba(255,255,255,0.035), rgba(255,255,255,0.012)); border: 1px solid rgba(255,255,255,0.085); border-radius: 16px; min-height: 420px; padding: 28px 30px; box-shadow: inset 0 1px 0 rgba(255,255,255,0.05), 0 24px 48px -24px rgba(0,0,0,0.55); }
 .ax-logs-empty { height: 360px; display: flex; align-items: center; justify-content: center; text-align: center; color: rgba(255,255,255,0.4); font-size: 14px; padding: 0 30px; line-height: 1.5; }
 .ax-logs-head { border-bottom: 1px solid rgba(255,255,255,0.08); padding-bottom: 18px; margin-bottom: 24px; }
-.ax-tline { display: flex; flex-direction: column; align-items: flex-start; margin-bottom: 16px; }
+/* transcript lines land like a conversation replaying — quick, capped stagger */
+.ax-tline { display: flex; flex-direction: column; align-items: flex-start; margin-bottom: 16px; animation: axCasIn var(--ax-t) var(--ax-out) both; }
+.ax-tline:nth-child(1) { animation-delay: 0ms; }
+.ax-tline:nth-child(2) { animation-delay: 40ms; }
+.ax-tline:nth-child(3) { animation-delay: 80ms; }
+.ax-tline:nth-child(4) { animation-delay: 120ms; }
+.ax-tline:nth-child(5) { animation-delay: 160ms; }
+.ax-tline:nth-child(6) { animation-delay: 200ms; }
+.ax-tline:nth-child(n+7) { animation-delay: 240ms; }
 .ax-tline.is-mine { align-items: flex-end; }
 .ax-tline-who { font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: rgba(255,255,255,0.34); margin-bottom: 7px; font-weight: 600; }
 .ax-bubble { padding: 11px 15px; font-size: 14px; line-height: 1.55; max-width: 80%; box-shadow: inset 0 1px 0 rgba(255,255,255,0.04), 0 4px 12px -8px rgba(0,0,0,0.4); }

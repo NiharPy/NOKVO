@@ -6,8 +6,51 @@
    JetBrains Mono) but layered — gradient surfaces with an inset top-light, deep
    soft shadows, accent glow, hover lifts and focus rings. Class names unchanged. */
 
+/* ── motion tokens — the whole system speaks one dialect: enters ease OUT,
+   exits ease IN at ~60% of the enter time, staggers step 24ms capped at 14.
+   --ax-spring is reserved for SUCCESS pops only (ticks, stamps, toasts). ── */
+.ax-root {
+  --ax-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --ax-in: cubic-bezier(0.4, 0, 1, 1);
+  --ax-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --ax-fast: 140ms; --ax-t: 240ms; --ax-slow: 480ms; --ax-cine: 900ms;
+}
+
 @keyframes axFadeG { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
-.ax-anim { animation: axFadeG .45s cubic-bezier(0.22, 1, 0.36, 1); }
+.ax-anim { animation: axFadeG .45s var(--ax-out); }
+
+/* ── shared motion vocabulary ── */
+/* cascade-in: rise + fade; delay via --d (inline) or nth-child rules */
+@keyframes axCasIn { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: none; } }
+.ax-cas { opacity: 0; animation: axCasIn var(--ax-slow) var(--ax-out) both; animation-delay: var(--d, 0ms); }
+/* wallet & side panels arrive from the right instead */
+@keyframes axCasInX { from { opacity: 0; transform: translateX(24px); } to { opacity: 1; transform: none; } }
+.ax-cas--x { opacity: 0; animation: axCasInX var(--ax-slow) var(--ax-out) both; animation-delay: var(--d, 0ms); }
+/* the title alone may afford a blur settle (one element, one shot) */
+@keyframes axCasInBlur { from { opacity: 0; transform: translateY(14px); filter: blur(6px); } to { opacity: 1; transform: none; filter: blur(0); } }
+.ax-cas--blur { opacity: 0; animation: axCasInBlur var(--ax-slow) var(--ax-out) both; animation-delay: var(--d, 0ms); }
+/* a rule that draws itself left → right */
+@keyframes axDrawLine { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+.ax-draw { transform-origin: left center; animation: axDrawLine var(--ax-cine) var(--ax-out) both; animation-delay: var(--d, 0ms); }
+/* radar ping — an expanding, fading ring (the house "live" motif) */
+@keyframes axPing { from { transform: scale(1); opacity: 0.7; } to { transform: scale(3.2); opacity: 0; } }
+/* success pop — spring-scaled entrance for ticks / stamps */
+@keyframes axPop { 0% { transform: scale(0.4); opacity: 0; } 100% { transform: scale(1); opacity: 1; } }
+/* error shake — one short burst, never looped */
+@keyframes axShake { 0%, 100% { transform: translateX(0); } 20%, 60% { transform: translateX(-4px); } 40%, 80% { transform: translateX(4px); } }
+/* ambient float for empty-state icons */
+@keyframes axFloat { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-3px); } }
+/* radar sweep — a conic sliver rotating behind empty states */
+@keyframes axSpin { to { transform: rotate(360deg); } }
+
+/* ── signal equalizer — 3 bars = "this line is dialing RIGHT NOW".
+   Rendered only beside a running status; absent everywhere else. ── */
+.ax-eq { display: inline-flex; align-items: flex-end; gap: 2px; height: 11px; }
+.ax-eq span { width: 2.5px; border-radius: 1px; background: #7FD9A8; transform-origin: bottom; animation: axEqBar .9s ease-in-out infinite; }
+.ax-eq span:nth-child(1) { height: 60%; animation-delay: 0ms; }
+.ax-eq span:nth-child(2) { height: 100%; animation-delay: 150ms; }
+.ax-eq span:nth-child(3) { height: 75%; animation-delay: 320ms; }
+@keyframes axEqBar { 0%, 100% { transform: scaleY(0.4); } 50% { transform: scaleY(1); } }
 
 /* cards — layered surface: vertical sheen + hairline + inset top-light + deep shadow */
 .ax-card {
@@ -36,15 +79,30 @@
   box-shadow: inset 0 1px 0 rgba(255,255,255,0.05);
 }
 .ax-btn2--ghost:hover:not(:disabled) { border-color: rgba(255,255,255,0.28); color: #F3F2F0; background: linear-gradient(180deg, rgba(255,255,255,0.07), rgba(255,255,255,0.03)); transform: translateY(-1px); }
-.ax-btn2--ghost:active:not(:disabled) { transform: translateY(0); }
+.ax-btn2--ghost:active:not(:disabled) { transform: translateY(0) scale(0.97); }
 .ax-btn2--accent {
+  position: relative; overflow: hidden;
   background: linear-gradient(180deg, #F03540, #D91F29);
   color: #fff; border: none; font-weight: 600; letter-spacing: 0.02em; padding: 14px 26px; font-size: 14px;
   box-shadow: inset 0 1px 0 rgba(255,255,255,0.22), 0 10px 26px -10px rgba(230,38,48,0.55), 0 2px 6px rgba(0,0,0,0.3);
 }
 .ax-btn2--accent:hover:not(:disabled) { transform: translateY(-1px); box-shadow: inset 0 1px 0 rgba(255,255,255,0.25), 0 14px 32px -10px rgba(230,38,48,0.65), 0 3px 8px rgba(0,0,0,0.3); }
-.ax-btn2--accent:active:not(:disabled) { transform: translateY(0); }
+.ax-btn2--accent:active:not(:disabled) { transform: translateY(0) scale(0.98); }
 .ax-btn2--accent:disabled { opacity: 0.55; cursor: default; }
+/* press burst — the Nova press language at 30% volume */
+.ax-btn2--accent::after {
+  content: ''; position: absolute; inset: 0; border-radius: inherit; pointer-events: none;
+  background: radial-gradient(circle at 50% 50%, rgba(255,255,255,0.35), transparent 70%);
+  opacity: 0; transition: opacity .22s ease;
+}
+.ax-btn2--accent:active:not(:disabled)::after { opacity: 1; transition: opacity .04s ease; }
+/* arming — the launch button while the request is in flight: a breathing red
+   glow that says "working", replacing dead disabled time */
+@keyframes axArm {
+  0%, 100% { box-shadow: inset 0 1px 0 rgba(255,255,255,0.22), 0 0 12px rgba(230,38,48,0.35); }
+  50% { box-shadow: inset 0 1px 0 rgba(255,255,255,0.22), 0 0 28px rgba(230,38,48,0.75); }
+}
+.ax-btn2--accent.is-arming:disabled { opacity: 0.92; animation: axArm 1.2s ease-in-out infinite; }
 .ax-btn2--sm { padding: 8px 14px; font-size: 12.5px; }
 .ax-btn2:focus-visible { outline: none; box-shadow: 0 0 0 3px rgba(230,38,48,0.28); }
 
@@ -79,8 +137,19 @@ textarea.ax-text { resize: vertical; line-height: 1.5; }
 
 /* tables */
 .ax-thead { display: grid; padding: 18px 14px 13px; border-bottom: 1px solid rgba(255,255,255,0.08); font-size: 10.5px; letter-spacing: 0.16em; text-transform: uppercase; color: rgba(255,255,255,0.32); font-weight: 600; }
-.ax-trow { display: grid; align-items: center; padding: 19px 14px; border-bottom: 1px solid rgba(255,255,255,0.055); border-radius: 10px; transition: background .16s; }
+.ax-trow { position: relative; display: grid; align-items: center; padding: 19px 14px; border-bottom: 1px solid rgba(255,255,255,0.055); border-radius: 10px; transition: background .16s; }
 .ax-trow:hover { background: rgba(255,255,255,0.028); }
+/* a row that ARRIVED on this refresh — one cooling green flash, then it's an
+   ordinary row. On Qualified this is the money moment: a lead just landed. */
+@keyframes axFlashNew { from { opacity: 1; } to { opacity: 0; } }
+.is-new::after {
+  content: ''; position: absolute; inset: 0; border-radius: inherit; pointer-events: none;
+  background: linear-gradient(90deg, rgba(74,200,140,0.2), rgba(74,200,140,0.06) 45%, transparent 80%);
+  box-shadow: inset 3px 0 0 rgba(74,200,140,0.75);
+  animation: axFlashNew 1.6s var(--ax-out) both;
+}
+/* list reflow — rows glide when a refresh reorders/removes them */
+.axlist-move { transition: transform var(--ax-t) var(--ax-out); }
 .ax-trow--click { cursor: pointer; }
 .ax-trow--click:hover { background: rgba(255,255,255,0.04); }
 .ax-cell-name { font-size: 15.5px; font-weight: 600; letter-spacing: -0.005em; }
@@ -89,15 +158,24 @@ textarea.ax-text { resize: vertical; line-height: 1.5; }
 .ax-score--grey { color: rgba(255,255,255,0.6); background: rgba(255,255,255,0.04); border-color: rgba(255,255,255,0.1); }
 .ax-outcome { font-family: 'JetBrains Mono', monospace; font-size: 12px; color: rgba(255,255,255,0.55); border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.02); border-radius: 999px; padding: 5px 12px; justify-self: start; }
 
-/* empty state */
+/* empty state — a slow radar sweep behind the icon: "scanning for leads" */
 .ax-empty { position: relative; border: 1px dashed rgba(255,255,255,0.12); border-radius: 14px; padding: 64px 20px; text-align: center; background: radial-gradient(ellipse 60% 80% at 50% 0%, rgba(255,255,255,0.02), transparent); overflow: hidden; }
+.ax-empty::before {
+  content: ''; position: absolute; left: 50%; top: 50%; width: 420px; height: 420px;
+  margin: -210px 0 0 -210px; border-radius: 50%; pointer-events: none;
+  background: conic-gradient(from 0deg, rgba(230,38,48,0.09), transparent 14%);
+  animation: axSpin 8s linear infinite;
+}
 .ax-empty-icon {
+  position: relative;
   width: 46px; height: 46px; border: 1px solid rgba(255,255,255,0.13); border-radius: 12px;
   display: flex; align-items: center; justify-content: center; margin: 0 auto 18px;
   color: rgba(255,255,255,0.35); font-size: 20px;
   background: linear-gradient(180deg, rgba(255,255,255,0.05), rgba(255,255,255,0.01));
   box-shadow: inset 0 1px 0 rgba(255,255,255,0.07), 0 8px 20px -8px rgba(0,0,0,0.5);
+  animation: axFloat 5s ease-in-out infinite;
 }
+.ax-empty-text { position: relative; }
 .ax-empty-text { font-size: 14px; color: rgba(255,255,255,0.4); margin: 0; line-height: 1.55; }
 
 /* score breakdown */
@@ -146,7 +224,13 @@ textarea.ax-text { resize: vertical; line-height: 1.5; }
 }
 .ax-scoreviz-num { font-family: 'JetBrains Mono', monospace; font-size: 13px; font-variant-numeric: tabular-nums; }
 .ax-scoreviz-track { width: 42px; height: 4px; border-radius: 999px; background: rgba(255,255,255,0.09); overflow: hidden; }
-.ax-scoreviz-fill { display: block; height: 100%; border-radius: inherit; transition: width .5s cubic-bezier(0.22, 1, 0.36, 1); }
+/* scores FILL as their row lands (inherits the row's --i stagger) */
+@keyframes axFillIn { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+.ax-scoreviz-fill {
+  display: block; height: 100%; border-radius: inherit; transform-origin: left center;
+  transition: width .5s var(--ax-out);
+  animation: axFillIn .6s var(--ax-out) both; animation-delay: calc(var(--i, 0) * 24ms + 200ms);
+}
 .ax-scoreviz.is-green { color: #7FD9A8; background: rgba(74,200,140,0.08); border: 1px solid rgba(74,200,140,0.22); }
 .ax-scoreviz.is-green .ax-scoreviz-fill { background: linear-gradient(90deg, #4AC88C, #7FD9A8); }
 .ax-scoreviz.is-green.is-high .ax-scoreviz-fill { box-shadow: 0 0 8px rgba(127,217,168,0.55); }
@@ -183,6 +267,20 @@ textarea.ax-text { resize: vertical; line-height: 1.5; }
 .ax-drawer-name { font-size: 21px; font-weight: 600; letter-spacing: -0.01em; margin-bottom: 9px; }
 .ax-drawer-score { display: flex; align-items: center; gap: 12px; margin-top: 20px; padding-top: 20px; border-top: 1px solid rgba(255,255,255,0.07); }
 .ax-drawer-score-lbl { font-size: 10.5px; letter-spacing: 0.16em; text-transform: uppercase; color: rgba(255,255,255,0.34); font-weight: 600; }
+/* drawer contents cascade in behind the slide — 40ms apart, capped */
+.ax-drawer > * { animation: axCasIn var(--ax-t) var(--ax-out) both; }
+.ax-drawer > *:nth-child(1) { animation-delay: 40ms; }
+.ax-drawer > *:nth-child(2) { animation-delay: 80ms; }
+.ax-drawer > *:nth-child(3) { animation-delay: 120ms; }
+.ax-drawer > *:nth-child(4) { animation-delay: 160ms; }
+.ax-drawer > *:nth-child(5) { animation-delay: 200ms; }
+.ax-drawer > *:nth-child(6) { animation-delay: 240ms; }
+.ax-drawer > *:nth-child(7) { animation-delay: 280ms; }
+.ax-drawer > *:nth-child(8) { animation-delay: 320ms; }
+.ax-drawer > *:nth-child(9) { animation-delay: 360ms; }
+.ax-drawer > *:nth-child(n+10) { animation-delay: 400ms; }
+/* awarded ticks pop with the success spring as their row lands */
+.ax-break-mark--ok { animation: axPop .32s var(--ax-spring) both; animation-delay: inherit; }
 .axdrawer-enter-active { transition: opacity .22s ease; }
 .axdrawer-enter-active .ax-drawer { transition: transform .3s cubic-bezier(0.22, 1, 0.36, 1); }
 .axdrawer-enter-from { opacity: 0; }
@@ -204,11 +302,11 @@ textarea.ax-text { resize: vertical; line-height: 1.5; }
 .ax-toast.is-ok .ax-ic { color: #7FD9A8; }
 .ax-toast.is-err { border-color: rgba(230,38,48,0.4); }
 .ax-toast.is-err .ax-ic { color: #F0666E; }
-.axtoast-enter-active { transition: all .28s cubic-bezier(0.22, 1, 0.36, 1); }
-.axtoast-leave-active { transition: all .2s ease; }
-.axtoast-enter-from { opacity: 0; transform: translateY(10px) scale(0.97); }
+.axtoast-enter-active { transition: all .32s var(--ax-spring); }
+.axtoast-leave-active { transition: all .2s var(--ax-in); }
+.axtoast-enter-from { opacity: 0; transform: translateY(14px) scale(0.96); }
 .axtoast-leave-to { opacity: 0; transform: translateY(6px); }
-.axtoast-move { transition: transform .28s cubic-bezier(0.22, 1, 0.36, 1); }
+.axtoast-move { transition: transform .28s var(--ax-out); }
 
 /* ── slim campaign progress ── */
 .ax-progress { position: relative; height: 5px; border-radius: 999px; background: rgba(255,255,255,0.06); overflow: hidden; }
@@ -252,3 +350,14 @@ textarea.ax-text { resize: vertical; line-height: 1.5; }
 .ax-root ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.24); }
 .ax-root ::-webkit-scrollbar-track { background: transparent; }
 .ax-root ::selection { background: rgba(230,38,48,0.35); color: #fff; }
+
+/* ── accessibility kill-switch: motion collapses to instant state changes.
+   Everything lands on its final frame; nothing loops. ── */
+@media (prefers-reduced-motion: reduce) {
+  .ax-root *, .ax-root *::before, .ax-root *::after {
+    animation-duration: 0.01ms !important;
+    animation-delay: 0ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

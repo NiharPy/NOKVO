@@ -1,12 +1,17 @@
 <script setup>
 // APEX Available Leads — the claim pool: qualified, UNCLAIMED leads from the team's
 // campaigns that any member can take. Claiming is exclusive (first-come).
-import { inject } from 'vue';
+import { inject, watch } from 'vue';
+import { useNewRows } from '../../composables/axMotion.js';
 import AxIcon from '../AxIcon.vue';
+import AxCount from '../AxCount.vue';
 import AxScore from '../AxScore.vue';
 import AxPhone from '../AxPhone.vue';
 
 const apex = inject('apex');
+// Flash leads that ARRIVED on a refresh — someone new just qualified.
+const newRows = useNewRows((r) => r.call_link_id || r.phone);
+watch(() => apex.qualifiedLeads.value, (rows) => newRows.track(rows || []), { immediate: true });
 </script>
 
 <template>
@@ -14,7 +19,7 @@ const apex = inject('apex');
     <div class="ax-card-head">
       <div style="display:flex;align-items:center;gap:13px;">
         <h2 class="ax-h2">Available leads</h2>
-        <span class="ax-count ax-count--green">{{ apex.qualifiedLeads.value.length }}</span>
+        <span class="ax-count ax-count--green"><AxCount :value="apex.qualifiedLeads.value.length" /></span>
       </div>
       <button type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" :disabled="apex.loadingLeads.value" @click="apex.reloadLeads()"><AxIcon name="refresh" :size="13" /> Refresh</button>
     </div>
@@ -33,21 +38,23 @@ const apex = inject('apex');
     </div>
     <template v-else>
       <div class="ax-thead" style="grid-template-columns:1.4fr 1.3fr auto auto;"><span>Name</span><span>Phone</span><span>Score</span><span></span></div>
-      <div
-        v-for="(row, i) in apex.qualifiedLeads.value" :key="row.call_link_id || i"
-        class="ax-trow ax-row-in" :style="{ '--i': Math.min(i, 14) }"
-        style="grid-template-columns:1.4fr 1.3fr auto auto;align-items:center;"
-      >
-        <span class="ax-cell-name">{{ row.name }}</span>
-        <AxPhone :phone="row.phone" />
-        <AxScore v-if="row.max_score" :score="row.lead_score" :max="row.max_score" tone="green" />
-        <span v-else class="ax-score ax-score--grey">—</span>
-        <button
-          type="button" class="ax-btn2 ax-btn2--accent ax-btn2--sm"
-          :disabled="apex.leadBusy.value === row.call_link_id"
-          @click="apex.claim(row)"
-        >{{ apex.leadBusy.value === row.call_link_id ? '…' : 'Claim' }}</button>
-      </div>
+      <TransitionGroup name="axlist">
+        <div
+          v-for="(row, i) in apex.qualifiedLeads.value" :key="row.call_link_id || row.phone"
+          class="ax-trow ax-row-in" :class="{ 'is-new': newRows.isNew(row) }" :style="{ '--i': Math.min(i, 14) }"
+          style="grid-template-columns:1.4fr 1.3fr auto auto;align-items:center;"
+        >
+          <span class="ax-cell-name">{{ row.name }}</span>
+          <AxPhone :phone="row.phone" />
+          <AxScore v-if="row.max_score" :score="row.lead_score" :max="row.max_score" tone="green" />
+          <span v-else class="ax-score ax-score--grey">—</span>
+          <button
+            type="button" class="ax-btn2 ax-btn2--accent ax-btn2--sm"
+            :disabled="apex.leadBusy.value === row.call_link_id"
+            @click="apex.claim(row)"
+          >{{ apex.leadBusy.value === row.call_link_id ? '…' : 'Claim' }}</button>
+        </div>
+      </TransitionGroup>
     </template>
   </div>
 </template>

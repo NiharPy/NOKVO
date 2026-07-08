@@ -2,13 +2,18 @@
 // APEX My Leads — the leads this member has claimed. Click a name for the
 // drawer (score reason / call note); move each through a working status
 // (claimed → contacted → won / lost).
-import { inject, ref } from 'vue';
+import { inject, ref, watch } from 'vue';
+import { useNewRows } from '../../composables/axMotion.js';
 import AxIcon from '../AxIcon.vue';
+import AxCount from '../AxCount.vue';
 import AxPhone from '../AxPhone.vue';
 import AxLeadDrawer from '../AxLeadDrawer.vue';
 
 const apex = inject('apex');
 const detail = ref(null);
+// Flash rows that arrived on a refresh (a claim just landed in your list).
+const newRows = useNewRows((r) => r.call_link_id || r.phone);
+watch(() => apex.myLeads.value, (rows) => newRows.track(rows || []), { immediate: true });
 const STATUSES = [
   { id: 'claimed', label: 'Claimed' },
   { id: 'contacted', label: 'Contacted' },
@@ -22,7 +27,7 @@ const STATUSES = [
     <div class="ax-card-head">
       <div style="display:flex;align-items:center;gap:13px;">
         <h2 class="ax-h2">My leads</h2>
-        <span class="ax-count">{{ apex.myLeads.value.length }}</span>
+        <span class="ax-count ax-count--grey"><AxCount :value="apex.myLeads.value.length" /></span>
       </div>
       <button type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" :disabled="apex.loadingLeads.value" @click="apex.reloadLeads()"><AxIcon name="refresh" :size="13" /> Refresh</button>
     </div>
@@ -41,21 +46,23 @@ const STATUSES = [
     </div>
     <template v-else>
       <div class="ax-thead" style="grid-template-columns:1.3fr 1.2fr auto;"><span>Name</span><span>Phone</span><span>Status</span></div>
-      <div
-        v-for="(row, i) in apex.myLeads.value" :key="row.call_link_id || i"
-        class="ax-trow ax-row-in" :style="{ '--i': Math.min(i, 14) }"
-        style="grid-template-columns:1.3fr 1.2fr auto;align-items:center;"
-      >
-        <span class="ax-cell-name ax-trow--click" @click="detail = row">{{ row.name }}</span>
-        <AxPhone :phone="row.phone" />
-        <select
-          class="ax-status-select" :value="row.claim_status || 'claimed'"
-          :disabled="apex.leadBusy.value === row.call_link_id"
-          @change="apex.setStatus(row, $event.target.value)"
+      <TransitionGroup name="axlist">
+        <div
+          v-for="(row, i) in apex.myLeads.value" :key="row.call_link_id || row.phone"
+          class="ax-trow ax-row-in" :class="{ 'is-new': newRows.isNew(row) }" :style="{ '--i': Math.min(i, 14) }"
+          style="grid-template-columns:1.3fr 1.2fr auto;align-items:center;"
         >
-          <option v-for="s in STATUSES" :key="s.id" :value="s.id">{{ s.label }}</option>
-        </select>
-      </div>
+          <span class="ax-cell-name ax-trow--click" @click="detail = row">{{ row.name }}</span>
+          <AxPhone :phone="row.phone" />
+          <select
+            class="ax-status-select" :value="row.claim_status || 'claimed'"
+            :disabled="apex.leadBusy.value === row.call_link_id"
+            @change="apex.setStatus(row, $event.target.value)"
+          >
+            <option v-for="s in STATUSES" :key="s.id" :value="s.id">{{ s.label }}</option>
+          </select>
+        </div>
+      </TransitionGroup>
     </template>
 
     <Transition name="axdrawer">

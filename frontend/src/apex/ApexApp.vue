@@ -81,6 +81,18 @@ const APEX_TERMS_HTML = APEX_TERMS_OF_SERVICE_HTML;
 const APEX_PRIVACY_HTML = APEX_PRIVACY_POLICY_HTML;
 const errorMsg = ref('');
 
+// A verify failure shakes the MFA digit row once. Toggled off→on across a
+// frame so a repeat of the same error message still re-fires the animation.
+const mfaShake = ref(false);
+watch(errorMsg, (v) => {
+  if (!v || screen.value !== 'mfa') return;
+  mfaShake.value = false;
+  requestAnimationFrame(() => {
+    mfaShake.value = true;
+    setTimeout(() => { mfaShake.value = false; }, 450);
+  });
+});
+
 // ── auth ──
 const form = ref({ email: '', password: '' });
 const signupForm = ref({ org_name: '', admin_name: '', admin_email: '', password: '' });
@@ -847,10 +859,10 @@ watch(screen, async (s) => {
         <div class="ax-eyebrow">Two-factor</div>
         <h1 class="ax-h1">Enter your code</h1>
         <p class="ax-mfa-hint">Enter the 6-digit code from your authenticator app.</p>
-        <div class="ax-mfa-row" @paste="onMfaPaste">
+        <div class="ax-mfa-row" :class="{ 'is-shake': mfaShake }" @paste="onMfaPaste">
           <input
             v-for="(d, i) in mfaDigits" :key="i" :id="`ax-mfa-${i}`"
-            class="ax-mfa-box" inputmode="numeric" maxlength="1"
+            class="ax-mfa-box" :class="{ 'is-filled': d }" inputmode="numeric" maxlength="1"
             :value="d" @input="onMfaInput(i, $event)" @keydown="onMfaKey(i, $event)"
           />
         </div>
@@ -981,7 +993,7 @@ watch(screen, async (s) => {
     <!-- ============ APP ============ -->
     <div v-else>
       <header class="ax-header">
-        <div class="ax-header-inner">
+        <div class="ax-header-inner ax-cas" style="--d:0ms;">
           <div class="ax-brand-inline">
             <img :src="nokvoMark" class="ax-brand-img" alt="NOKVO" />
             <span class="ax-brand-name ax-brand-name--sm">NOKVO</span>
@@ -1008,6 +1020,7 @@ watch(screen, async (s) => {
       </Transition>
 
       <!-- Feedback / Suggest a feature -->
+      <Transition name="axmodal">
       <div v-if="feedbackOpen" class="ax-modal-overlay" @click.self="feedbackOpen = false">
         <div class="ax-modal">
           <template v-if="feedbackSent">
@@ -1037,15 +1050,16 @@ watch(screen, async (s) => {
           </template>
         </div>
       </div>
+      </Transition>
 
       <main class="ax-main">
         <div class="ax-page-head ax-page-head--row">
           <div>
-            <div class="ax-eyebrow">{{ isMember ? 'Leads' : 'Outbound' }}</div>
-            <h1 class="ax-title">{{ isMember ? 'Your leads' : 'Apex Engine' }}</h1>
-            <p class="ax-page-sub">{{ isMember ? 'Claim qualified leads from the pool and work each one through to a result.' : 'Upload a contact list, let the agent dial it, and track the leads and calls it produces.' }}</p>
+            <div class="ax-eyebrow ax-cas" style="--d:60ms;">{{ isMember ? 'Leads' : 'Outbound' }}</div>
+            <h1 class="ax-title ax-cas--blur" style="--d:120ms;">{{ isMember ? 'Your leads' : 'Apex Engine' }}</h1>
+            <p class="ax-page-sub ax-cas" style="--d:180ms;">{{ isMember ? 'Claim qualified leads from the pool and work each one through to a result.' : 'Upload a contact list, let the agent dial it, and track the leads and calls it produces.' }}</p>
           </div>
-          <div v-if="wallet && !isMember" class="ax-wallet">
+          <div v-if="wallet && !isMember" class="ax-wallet ax-cas--x" style="--d:220ms;">
             <div class="ax-wallet-head">
               <div>
                 <div class="ax-wallet-num"><AxCount :value="Number(wallet.credits_remaining) || 0" :format="fmtCredits" /></div>
@@ -1056,7 +1070,7 @@ watch(screen, async (s) => {
                 <div class="ax-wallet-used"><AxCount :value="Number(wallet.credits_used) || 0" :format="fmtCredits" /> used</div>
               </div>
             </div>
-            <div class="ax-wallet-meter" :class="{ 'is-low': walletPct < 0.15 }">
+            <div class="ax-wallet-meter" :class="{ 'is-low': walletPct < 0.15, 'is-busy': isToppingUp }">
               <span class="ax-wallet-meter-fill" :style="{ width: (walletPct * 100).toFixed(1) + '%' }"></span>
             </div>
 
@@ -1086,9 +1100,9 @@ watch(screen, async (s) => {
             </div>
           </div>
         </div>
-        <div class="ax-hr"></div>
+        <div class="ax-hr ax-draw" style="--d:320ms;"></div>
 
-        <nav class="ax-tabs">
+        <nav class="ax-tabs ax-cas" style="--d:380ms;">
           <div ref="tabsInner" class="ax-tabs-inner">
             <span
               v-if="tabThumb.on" class="ax-tab-thumb"
@@ -1109,6 +1123,7 @@ watch(screen, async (s) => {
     </div>
 
     <!-- ============ LEGAL DOC MODAL ============ -->
+    <Transition name="axmodal">
     <div v-if="legalModal" class="ax-legal-overlay" @click.self="legalModal = null">
       <div class="ax-legal-modal">
         <button type="button" class="ax-legal-close" aria-label="Close" @click="legalModal = null"><AxIcon name="x" :size="18" /></button>
@@ -1119,6 +1134,7 @@ watch(screen, async (s) => {
         </div>
       </div>
     </div>
+    </Transition>
 
     <!-- ============ TOASTS ============ -->
     <div class="ax-toasts">
@@ -1390,9 +1406,88 @@ watch(screen, async (s) => {
   transition: transform .28s cubic-bezier(0.22, 1, 0.36, 1), width .28s cubic-bezier(0.22, 1, 0.36, 1), height .28s cubic-bezier(0.22, 1, 0.36, 1);
 }
 @media (prefers-reduced-motion: reduce) { .ax-tab-thumb { transition: none; } }
-/* tab content swap */
-.axtab-enter-active { transition: opacity .18s ease, transform .18s cubic-bezier(0.22, 1, 0.36, 1); }
-.axtab-leave-active { transition: opacity .12s ease; }
-.axtab-enter-from { opacity: 0; transform: translateY(8px); }
+/* tab content swap — a rise + clip wipe, like a panel powering on */
+.axtab-enter-active { transition: opacity .28s ease, transform .28s var(--ax-out), clip-path .28s var(--ax-out); }
+.axtab-leave-active { transition: opacity .14s var(--ax-in); }
+.axtab-enter-from { opacity: 0; transform: translateY(10px); clip-path: inset(0 0 12% 0 round 16px); }
+.axtab-enter-to { clip-path: inset(0 0 0 0 round 16px); }
 .axtab-leave-to { opacity: 0; }
+
+/* ── motion: login timeline ──
+   The door introduces the house motif: the mark lands and broadcasts ONE radar
+   ring; the wordmark's tracking settles; the red rules draw outward; then the
+   form cascades in. */
+.ax-brand-stack { position: relative; }
+.ax-brand-stack::before {
+  content: ''; position: absolute; top: 23px; left: 50%; width: 72px; height: 72px;
+  margin: -36px 0 0 -36px; border-radius: 50%; pointer-events: none;
+  border: 1.5px solid rgba(230,38,48,0.5); opacity: 0;
+  animation: axRingIn 1.1s var(--ax-out) 0.4s both;
+}
+@keyframes axRingIn { 0% { opacity: 0; transform: scale(0.5); } 18% { opacity: 0.8; } 100% { opacity: 0; transform: scale(2.4); } }
+.ax-brand-img--lg { animation: axMarkIn .7s var(--ax-out) both; }
+@keyframes axMarkIn { from { opacity: 0; transform: scale(0.7); } to { opacity: 1; transform: scale(1); } }
+.ax-brand-stack .ax-brand-name { animation: axNameIn .65s var(--ax-out) .15s both; }
+@keyframes axNameIn { from { opacity: 0; letter-spacing: 0.5em; } to { opacity: 1; letter-spacing: 0.36em; } }
+.ax-brand-apex .ax-rule { animation: axRuleIn .5s var(--ax-out) .5s both; }
+.ax-brand-apex .ax-rule:first-child { transform-origin: right center; }
+.ax-brand-apex .ax-rule:last-child { transform-origin: left center; }
+@keyframes axRuleIn { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+.ax-brand-apex .ax-apex-text { animation: axCasIn .5s var(--ax-out) .55s both; }
+.ax-form > * { animation: axCasIn var(--ax-slow) var(--ax-out) both; }
+.ax-form > *:nth-child(1) { animation-delay: 240ms; }
+.ax-form > *:nth-child(2) { animation-delay: 280ms; }
+.ax-form > *:nth-child(3) { animation-delay: 320ms; }
+.ax-form > *:nth-child(4) { animation-delay: 360ms; }
+.ax-form > *:nth-child(5) { animation-delay: 400ms; }
+.ax-form > *:nth-child(6) { animation-delay: 440ms; }
+.ax-form > *:nth-child(7) { animation-delay: 480ms; }
+.ax-form > *:nth-child(8) { animation-delay: 520ms; }
+.ax-form > *:nth-child(9) { animation-delay: 560ms; }
+.ax-form > *:nth-child(n+10) { animation-delay: 600ms; }
+
+/* ambient: the glow breathes, the grid drifts — alive, not busy */
+.ax-glow { animation: axGlowBreathe 9s ease-in-out infinite; }
+@keyframes axGlowBreathe {
+  0%, 100% { opacity: 0.85; transform: translateX(-50%) scale(1); }
+  50% { opacity: 1; transform: translateX(-50%) scale(1.06); }
+}
+.ax-grid { animation: axGridDrift 60s linear infinite; }
+@keyframes axGridDrift { from { background-position: 0 0; } to { background-position: 0 64px; } }
+
+/* ── motion: MFA ── */
+.ax-mfa-box.is-filled { animation: axDigitPop .18s var(--ax-out); }
+@keyframes axDigitPop { from { transform: scale(1.08); } to { transform: scale(1); } }
+.ax-mfa-row.is-shake { animation: axShake .35s ease; }
+
+/* ── motion: modals — card scales up under an easing veil ── */
+.axmodal-enter-active { transition: opacity var(--ax-t) ease; }
+.axmodal-enter-active :is(.ax-modal, .ax-legal-modal) { transition: transform var(--ax-t) var(--ax-out); }
+.axmodal-enter-from { opacity: 0; }
+.axmodal-enter-from :is(.ax-modal, .ax-legal-modal) { transform: scale(0.96) translateY(8px); }
+.axmodal-leave-active { transition: opacity .15s var(--ax-in); }
+.axmodal-leave-active :is(.ax-modal, .ax-legal-modal) { transition: transform .15s var(--ax-in); }
+.axmodal-leave-to { opacity: 0; }
+.axmodal-leave-to :is(.ax-modal, .ax-legal-modal) { transform: scale(0.97) translateY(4px); }
+
+/* ── motion: wallet meter — shimmer only while a top-up is applying; low
+   balance breathes as a warning, never celebrates ── */
+.ax-wallet-meter.is-busy .ax-wallet-meter-fill { position: relative; overflow: hidden; }
+.ax-wallet-meter.is-busy .ax-wallet-meter-fill::after {
+  content: ''; position: absolute; inset: 0;
+  background: linear-gradient(90deg, transparent 30%, rgba(255,255,255,0.4) 50%, transparent 70%);
+  background-size: 200% 100%; animation: axShimmer 1.8s linear infinite;
+}
+.ax-wallet-meter.is-low .ax-wallet-meter-fill { animation: axLowBreath 2.4s ease-in-out infinite; }
+@keyframes axLowBreath { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
+
+/* ── motion: auth accent button press burst ── */
+.ax-btn--accent { position: relative; overflow: hidden; }
+.ax-btn--accent::after {
+  content: ''; position: absolute; inset: 0; border-radius: inherit; pointer-events: none;
+  background: radial-gradient(circle at 50% 50%, rgba(255,255,255,0.35), transparent 70%);
+  opacity: 0; transition: opacity .22s ease;
+}
+.ax-btn--accent:active:not(:disabled)::after { opacity: 1; transition: opacity .04s ease; }
+.ax-btn--ghost:active:not(:disabled) { transform: scale(0.97); }
 </style>

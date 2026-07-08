@@ -3,10 +3,13 @@
 // server; legacy blob campaigns stay client-side.
 import { inject, ref, computed, watch, onMounted } from 'vue';
 import { categorizeContacts, exportContactsCsv } from '../../composables/bulkCalling.js';
+import { useNewRows } from '../../composables/axMotion.js';
 import AxIcon from '../AxIcon.vue';
+import AxCount from '../AxCount.vue';
 import AxPhone from '../AxPhone.vue';
 
 const apex = inject('apex');
+const newRows = useNewRows((r) => r.call_link_id || r.phone);
 const filter = ref(null);
 const rows = ref([]);
 const loading = ref(false);
@@ -34,6 +37,7 @@ async function loadRows(reset = true) {
       cursors.value[c.id] = next_cursor || null;
     }
     rows.value = reset ? [...out, ...legacyRows] : out;
+    newRows.track(rows.value);
   } finally {
     loading.value = false;
   }
@@ -56,7 +60,7 @@ async function downloadCsv() {
     <div class="ax-card-head">
       <div style="display:flex;align-items:center;gap:13px;">
         <h2 class="ax-h2">Didn't pick up</h2>
-        <span class="ax-count ax-count--grey">{{ rows.length }}{{ hasMore ? '+' : '' }}</span>
+        <span class="ax-count ax-count--grey"><AxCount :value="rows.length" />{{ hasMore ? '+' : '' }}</span>
       </div>
       <div style="display:flex;align-items:center;gap:8px;">
         <button type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" :disabled="!rows.length" @click="downloadCsv"><AxIcon name="download" :size="13" /> Generate CSV</button>
@@ -83,15 +87,17 @@ async function downloadCsv() {
     </div>
     <template v-else>
       <div class="ax-thead" style="grid-template-columns:1.4fr 1.4fr auto;"><span>Name</span><span>Phone</span><span>Outcome</span></div>
-      <div
-        v-for="(row, i) in rows" :key="row.call_link_id || i"
-        class="ax-trow ax-row-in" :style="{ '--i': Math.min(i, 14) }"
-        style="grid-template-columns:1.4fr 1.4fr auto;"
-      >
-        <span class="ax-cell-name">{{ row.name }}</span>
-        <AxPhone :phone="row.phone" />
-        <span class="ax-outcome">{{ row.status === 'failed' ? 'Call failed' : 'No answer' }}</span>
-      </div>
+      <TransitionGroup name="axlist">
+        <div
+          v-for="(row, i) in rows" :key="row.call_link_id || row.phone"
+          class="ax-trow ax-row-in" :class="{ 'is-new': newRows.isNew(row) }" :style="{ '--i': Math.min(i, 14) }"
+          style="grid-template-columns:1.4fr 1.4fr auto;"
+        >
+          <span class="ax-cell-name">{{ row.name }}</span>
+          <AxPhone :phone="row.phone" />
+          <span class="ax-outcome">{{ row.status === 'failed' ? 'Call failed' : 'No answer' }}</span>
+        </div>
+      </TransitionGroup>
       <button v-if="hasMore" type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" style="margin-top:12px;" :disabled="loading" @click="loadRows(false)">
         {{ loading ? 'Loading…' : 'Load more' }}
       </button>

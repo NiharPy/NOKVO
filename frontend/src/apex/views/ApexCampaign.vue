@@ -9,7 +9,10 @@ import {
   buildBulkCampaignFormData, buildBulkCampaignUpdatePayload, categorizeContacts, leadCategory,
   campaignWindow, cleanQuestions,
 } from '../../composables/bulkCalling.js';
+import { useNewRows } from '../../composables/axMotion.js';
 import AxIcon from '../AxIcon.vue';
+import AxCount from '../AxCount.vue';
+import AxLaunchFx from '../AxLaunchFx.vue';
 
 const apex = inject('apex');
 
@@ -31,11 +34,24 @@ const STEPS = ['Details', 'Script & questions', 'Review & launch'];
 const canNext = computed(() => (step.value === 1 ? !!form.value.name.trim() : true));
 // Editing doesn't need a contacts file — the list is managed via Add CSV.
 const canLaunch = computed(() => !!form.value.name.trim() && (!!editingId.value || !!form.value.file));
+// Direction-aware step transition: forward slides in from the right, back from
+// the left — the wizard reads as a physical strip you move along.
+const stepDir = ref('fwd');
 function goStep(n) {
   if (n === step.value) return;
+  stepDir.value = n < step.value ? 'back' : 'fwd';
   if (n < step.value) { step.value = n; return; }
   if (form.value.name.trim()) step.value = n; // forward needs at least a name
 }
+function stepBack() { stepDir.value = 'back'; step.value -= 1; }
+function stepNext() { stepDir.value = 'fwd'; step.value += 1; }
+
+// ── launch ceremony + new-row flash ──
+// launchFx holds the contact count while the "LINE LIVE" overlay plays after a
+// successful create. The campaign list flashes rows that arrived on a reload.
+const launchFx = ref(null);
+const newRows = useNewRows((c) => c.id);
+watch(() => apex.deterministicCampaigns.value, (list) => newRows.track(list || []), { immediate: true });
 
 // ── Nova draft prefill (ONE-WAY handoff) ──
 // Nova's "Apply to campaign form" parks a draft on apex.novaDraft; we copy it
@@ -294,7 +310,10 @@ async function submit() {
       launchError.value = `Calls couldn't be placed: ${failed[0]?.error || 'check the dedicated number setup'}.`;
     } else {
       const note = failed.length ? ` (${failed.length} couldn't be placed)` : '';
-      apex.toast(`Calling started — ${data?.total_count || 0} contacts${note}.`);
+      // The launch ceremony: total_count may still be 0 while the CSV ingests in
+      // the background, so fall back to the client-side row count.
+      launchFx.value = { contacts: Number(data?.total_count) || Number(listSize.value) || 0 };
+      apex.toast(`Calling started — ${data?.total_count || listSize.value || 0} contacts${note}.`);
       form.value = emptyForm();
       fileName.value = '';
       listSize.value = null;
@@ -440,7 +459,7 @@ async function onAddFile(e) {
         </template>
       </div>
 
-      <Transition name="axstep" mode="out-in">
+      <Transition :name="'axstep-' + stepDir" mode="out-in">
         <!-- STEP 1 · Details -->
         <div v-if="step === 1" key="s1">
           <div class="ax-grid2" style="margin-top:8px;">
@@ -622,11 +641,11 @@ async function onAddFile(e) {
 
       <!-- wizard nav -->
       <div class="ax-step-nav">
-        <button v-if="step > 1" type="button" class="ax-btn2 ax-btn2--ghost" style="padding:13px 22px;" @click="step--"><AxIcon name="arrow-left" :size="14" /> Back</button>
+        <button v-if="step > 1" type="button" class="ax-btn2 ax-btn2--ghost" style="padding:13px 22px;" @click="stepBack"><AxIcon name="arrow-left" :size="14" /> Back</button>
         <button v-if="editingId" type="button" class="ax-btn2 ax-btn2--ghost" style="padding:13px 22px;" @click="cancelEdit"><AxIcon name="x" :size="14" /> Cancel edit</button>
         <span style="flex:1;"></span>
-        <button v-if="step < 3" type="button" class="ax-btn2 ax-btn2--accent" :disabled="!canNext" @click="step++">Continue <AxIcon name="arrow-right" :size="14" /></button>
-        <button v-else type="button" class="ax-btn2 ax-btn2--accent" :disabled="launching || !canLaunch" @click="submit">
+        <button v-if="step < 3" type="button" class="ax-btn2 ax-btn2--accent" :disabled="!canNext" @click="stepNext">Continue <AxIcon name="arrow-right" :size="14" /></button>
+        <button v-else type="button" class="ax-btn2 ax-btn2--accent" :class="{ 'is-arming': launching }" :disabled="launching || !canLaunch" @click="submit">
           {{ launching ? (editingId ? 'Saving…' : 'Starting…') : (editingId ? 'Save changes' : 'Upload & start calling') }}
         </button>
       </div>
@@ -639,17 +658,18 @@ async function onAddFile(e) {
         <button type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" @click="apex.reload()"><AxIcon name="refresh" :size="13" /> Refresh</button>
       </div>
       <div v-if="!det.length" style="padding:0 36px 30px;color:rgba(255,255,255,0.4);font-size:14px;">No deterministic campaigns yet — create one above.</div>
-      <div v-for="(c, ci) in det" :key="c.id" class="ax-camp-row ax-row-in" :style="{ '--i': Math.min(ci, 14) }">
+      <div v-for="(c, ci) in det" :key="c.id" class="ax-camp-row ax-row-in" :class="{ 'is-new': newRows.isNew(c) }" :style="{ '--i': Math.min(ci, 14) }">
         <div class="ax-camp-main">
           <span class="ax-camp-dot" :class="`is-${statusTone(c.status)}`"></span>
           <span class="ax-camp-name">{{ c.name }}</span>
           <span class="ax-camp-status" :class="`is-${statusTone(c.status)}`">{{ c.status }}</span>
+          <span v-if="c.status === 'running'" class="ax-eq" aria-hidden="true"><span></span><span></span><span></span></span>
           <span class="ax-camp-mode">Deterministic</span>
           <span v-if="campaignWindow(c)" class="ax-camp-mode">{{ campaignWindow(c) }}</span>
         </div>
         <div class="ax-camp-meta">
-          <span v-if="counts(c).successful" style="color:#7FD9A8;">{{ counts(c).successful }} qualified</span>
-          <span v-if="counts(c).no_pickup" style="color:#E62630;">{{ counts(c).no_pickup }} missed</span>
+          <span v-if="counts(c).successful" style="color:#7FD9A8;"><AxCount :value="counts(c).successful" /> qualified</span>
+          <span v-if="counts(c).no_pickup" style="color:#E62630;"><AxCount :value="counts(c).no_pickup" /> missed</span>
           <button type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" :disabled="editingId === c.id" @click="startEdit(c)" title="Edit the script, details and calling schedule">
             <AxIcon name="edit" :size="12" /> Edit
           </button>
@@ -680,6 +700,11 @@ async function onAddFile(e) {
     </div>
     <!-- shared hidden picker for "Add CSV" (one per list; target set on click) -->
     <input ref="addFileInput" type="file" accept=".csv,.xlsx" style="display:none" @change="onAddFile" />
+
+    <!-- "LINE LIVE" — the launch ceremony after a successful create -->
+    <Transition name="axlfx">
+      <AxLaunchFx v-if="launchFx" :contacts="launchFx.contacts" @done="launchFx = null" />
+    </Transition>
   </div>
 </template>
 
@@ -704,16 +729,26 @@ async function onAddFile(e) {
 .ax-step.is-on .ax-step-num { border-color: rgba(230,38,48,0.75); background: rgba(230,38,48,0.14); color: #fff; box-shadow: 0 0 14px -4px rgba(230,38,48,0.6); }
 .ax-step.is-on .ax-step-lbl { font-weight: 600; }
 .ax-step.is-done { color: rgba(255,255,255,0.62); }
-.ax-step.is-done .ax-step-num { border-color: rgba(74,200,140,0.4); background: rgba(74,200,140,0.1); color: #7FD9A8; }
-.ax-step-line { flex: 1 1 24px; min-width: 24px; height: 1px; background: rgba(255,255,255,0.09); }
-.ax-step-line.is-done { background: rgba(74,200,140,0.35); }
+.ax-step.is-done .ax-step-num { border-color: rgba(74,200,140,0.4); background: rgba(74,200,140,0.1); color: #7FD9A8; animation: axPop .32s var(--ax-spring); }
+.ax-step-line { position: relative; flex: 1 1 24px; min-width: 24px; height: 1px; background: rgba(255,255,255,0.09); overflow: hidden; }
+/* a completed step's connector FILLS toward the next step */
+.ax-step-line::after { content: ''; position: absolute; inset: 0; background: rgba(74,200,140,0.4); transform: scaleX(0); transform-origin: left center; transition: transform .4s var(--ax-out); }
+.ax-step-line.is-done::after { transform: scaleX(1); }
 .ax-step-nav { display: flex; align-items: center; gap: 10px; margin-top: 30px; }
 .ax-step-nav .ax-btn2--accent { padding: 14px 26px; font-size: 14px; }
-/* step swap */
-.axstep-enter-active { transition: opacity .18s ease, transform .18s cubic-bezier(0.22, 1, 0.36, 1); }
-.axstep-leave-active { transition: opacity .12s ease; }
-.axstep-enter-from { opacity: 0; transform: translateY(8px); }
-.axstep-leave-to { opacity: 0; }
+/* step swap — direction-aware: forward arrives from the right, back from the
+   left, so the wizard reads as a strip you move along */
+.axstep-fwd-enter-active, .axstep-back-enter-active { transition: opacity .22s ease, transform .22s var(--ax-out); }
+.axstep-fwd-leave-active, .axstep-back-leave-active { transition: opacity .12s var(--ax-in); }
+.axstep-fwd-enter-from { opacity: 0; transform: translateX(16px); }
+.axstep-back-enter-from { opacity: 0; transform: translateX(-16px); }
+.axstep-fwd-leave-to, .axstep-back-leave-to { opacity: 0; }
+
+/* launch ceremony exit — veil lifts, stage rises away */
+.axlfx-leave-active { transition: opacity .3s var(--ax-in); }
+.axlfx-leave-active :deep(.ax-lfx-stage) { transition: transform .3s var(--ax-in); }
+.axlfx-leave-to { opacity: 0; }
+.axlfx-leave-to :deep(.ax-lfx-stage) { transform: translateY(-8px); }
 
 /* ── review ── */
 .ax-review-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin-top: 8px; }
@@ -769,11 +804,17 @@ async function onAddFile(e) {
 .ax-cap-lbl { font-size: 11px; color: rgba(255,255,255,0.4); }
 
 /* ── campaign list rows ── */
-.ax-camp-row { display: grid; grid-template-columns: 1fr auto; gap: 12px 18px; align-items: center; padding: 20px 36px; border-top: 1px solid rgba(255,255,255,0.055); transition: background .16s; }
+.ax-camp-row { position: relative; display: grid; grid-template-columns: 1fr auto; gap: 12px 18px; align-items: center; padding: 20px 36px; border-top: 1px solid rgba(255,255,255,0.055); transition: background .16s; }
 .ax-camp-row:hover { background: rgba(255,255,255,0.022); }
 .ax-camp-main { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
-.ax-camp-dot { width: 8px; height: 8px; border-radius: 50%; }
-.ax-camp-dot.is-run { background: #7FD9A8; box-shadow: 0 0 8px rgba(127,217,168,0.5); animation: axPulse 2.2s ease-out infinite; }
+.ax-camp-dot { position: relative; width: 8px; height: 8px; border-radius: 50%; }
+.ax-camp-dot.is-run { background: #7FD9A8; box-shadow: 0 0 8px rgba(127,217,168,0.5); }
+/* radar ping — a RUNNING campaign broadcasts an expanding ring */
+.ax-camp-dot.is-run::after {
+  content: ''; position: absolute; inset: 0; border-radius: 50%;
+  border: 1px solid rgba(127,217,168,0.7);
+  animation: axPing 2.2s var(--ax-out) infinite;
+}
 .ax-camp-dot.is-done { background: rgba(255,255,255,0.3); } .ax-camp-dot.is-off { background: rgba(255,255,255,0.2); }
 .ax-camp-name { font-size: 16px; font-weight: 600; letter-spacing: -0.005em; }
 .ax-camp-status { display: inline-flex; align-items: center; padding: 4px 12px; border-radius: 999px; font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; border: 1px solid transparent; }

@@ -3,11 +3,16 @@
 // for this workspace and claims qualified leads. The roster reads as people (a
 // monogram tile per member) rather than a data table; an Invited member shows a
 // dashed tile + hollow dot until they accept and become Active.
-import { inject, onMounted } from 'vue';
+import { inject, onMounted, watch } from 'vue';
+import { useNewRows } from '../../composables/axMotion.js';
 import AxIcon from '../AxIcon.vue';
+import AxCount from '../AxCount.vue';
 
 const apex = inject('apex');
 onMounted(() => apex.loadMembers());
+// Flash rows that arrived on a refresh (an invite just landed / was accepted).
+const newRows = useNewRows((m) => m.id);
+watch(() => apex.members.value, (rows) => newRows.track(rows || []), { immediate: true });
 
 const initialOf = (m) => (m.full_name || m.email || '?').trim().charAt(0).toUpperCase();
 const primaryOf = (m) => m.full_name || m.email;
@@ -18,7 +23,7 @@ const primaryOf = (m) => m.full_name || m.email;
     <div class="ax-card-head">
       <div class="mb-head-left">
         <h2 class="ax-h2">Members</h2>
-        <span v-if="apex.members.value.length" class="ax-count ax-count--grey">{{ apex.members.value.length }}</span>
+        <span v-if="apex.members.value.length" class="ax-count ax-count--grey"><AxCount :value="apex.members.value.length" /></span>
       </div>
     </div>
     <p class="ax-muted">Invite teammates to claim and work your qualified leads. Each gets their own sign-in for this workspace.</p>
@@ -50,8 +55,8 @@ const primaryOf = (m) => m.full_name || m.email;
       <div class="ax-empty-icon"><AxIcon name="users" :size="20" /></div>
       <p class="ax-empty-text">No members yet — invite your first teammate above.</p>
     </div>
-    <ul v-else class="mb-roster">
-      <li v-for="(m, i) in apex.members.value" :key="m.id" class="mb-row ax-row-in" :style="{ '--i': Math.min(i, 14) }">
+    <TransitionGroup v-else tag="ul" name="axlist" class="mb-roster">
+      <li v-for="(m, i) in apex.members.value" :key="m.id" class="mb-row ax-row-in" :class="{ 'is-new': newRows.isNew(m) }" :style="{ '--i': Math.min(i, 14) }">
         <span class="mb-mono" :class="m.status === 'active' ? 'is-active' : 'is-invited'">{{ initialOf(m) }}</span>
         <div class="mb-ident">
           <span class="mb-name">{{ primaryOf(m) }}</span>
@@ -61,7 +66,7 @@ const primaryOf = (m) => m.full_name || m.email;
           <span class="mb-dot"></span>{{ m.status === 'active' ? 'Active' : 'Invited' }}
         </span>
       </li>
-    </ul>
+    </TransitionGroup>
   </div>
 </template>
 
@@ -83,7 +88,7 @@ const primaryOf = (m) => m.full_name || m.email;
 
 /* Roster — people, not rows. Monogram + identity + state. */
 .mb-roster { list-style: none; margin: 28px 0 0; padding: 0; }
-.mb-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 16px; padding: 15px 10px; border-top: 1px solid rgba(255,255,255,0.055); border-radius: 10px; transition: background .16s; }
+.mb-row { position: relative; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 16px; padding: 15px 10px; border-top: 1px solid rgba(255,255,255,0.055); border-radius: 10px; transition: background .16s; }
 .mb-row:hover { background: rgba(255,255,255,0.025); }
 
 .mb-mono { width: 40px; height: 40px; border-radius: 11px; display: flex; align-items: center; justify-content: center; font-family: 'Sora', sans-serif; font-weight: 700; font-size: 15px; }
