@@ -322,7 +322,16 @@ class LLMPoolClient:
         if "/openai/deployments/" in member.endpoint:
             sep = "" if "api-version=" in member.endpoint else f"?api-version={api_version}"
             return f"{member.endpoint}{sep}"
-        return f"{member.endpoint}/openai/deployments/{deployment}/chat/completions?api-version={api_version}"
+        # Tolerate a pasted full "Target URI" (Azure AI Foundry shows e.g.
+        # https://<res>.cognitiveservices.azure.com/openai/responses?api-version=…):
+        # only scheme+host matter for the chat-completions path composed below.
+        # Without this, the path/query is kept and the appended path 404s —
+        # which silently killed EVERY pool call in prod (2026-07-08).
+        parsed = urllib_parse.urlsplit(member.endpoint)
+        endpoint = member.endpoint
+        if parsed.scheme and parsed.netloc and (parsed.path.strip("/") or parsed.query):
+            endpoint = f"{parsed.scheme}://{parsed.netloc}"
+        return f"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version={api_version}"
 
     @classmethod
     async def chat(

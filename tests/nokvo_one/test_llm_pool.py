@@ -238,3 +238,26 @@ def test_window_keys_share_a_cluster_hash_slot_tag():
     assert k2.startswith(tag.group(0)), (k1, k2)
     # Distinct members still get distinct keys within the slot.
     assert k1 != k2
+
+
+def test_url_normalizes_pasted_target_uri():
+    """A pool endpoint pasted as a full Azure AI Foundry "Target URI"
+    (…/openai/responses?api-version=…) must be reduced to scheme+host before
+    the chat-completions path is composed. Keeping the path/query produced a
+    garbage URL that 404'd EVERY pool call in prod (2026-07-08)."""
+    from app.services.llm_pool import LLMPoolClient, PoolMember
+
+    def member(endpoint):
+        return PoolMember(key_id="k", endpoint=endpoint, api_key="x", deployment="gpt-5-mini", tpm=200000)
+
+    api_v = settings.AZURE_OPENAI_POOL_API_VERSION.strip()
+    want = f"https://res.cognitiveservices.azure.com/openai/deployments/gpt-5-mini/chat/completions?api-version={api_v}"
+    # The prod incident shape: full Responses-API target URI.
+    assert LLMPoolClient._url(
+        member("https://res.cognitiveservices.azure.com/openai/responses?api-version=2025-04-01-preview")
+    ) == want
+    # A bare resource endpoint is untouched.
+    assert LLMPoolClient._url(member("https://res.cognitiveservices.azure.com")) == want
+    # A full deployments URL still passes through verbatim (documented shape).
+    full = "https://res.cognitiveservices.azure.com/openai/deployments/my-dep/chat/completions?api-version=2024-06-01"
+    assert LLMPoolClient._url(member(full)) == full

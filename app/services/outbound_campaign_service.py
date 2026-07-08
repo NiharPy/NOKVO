@@ -1672,7 +1672,7 @@ class OutboundCampaignService:
             and _tier_resolved
             and (_org_tier or "nokvo_one") != "nokvo_apex"
         ):
-            logger.info("NOKVO-CAMPAIGN: Nokvo One outbound disabled — not dialing %s", campaign.id)
+            logger.warning("NOKVO-CAMPAIGN: Nokvo One outbound disabled — not dialing %s", campaign.id)
             return
 
         # Scheduled-dialer window — NOKVO APEX only (the scheduled-outbound product).
@@ -1688,7 +1688,7 @@ class OutboundCampaignService:
         if _apex_scheduled:
             _allowed, _reason = call_window_allows(_cfg.get("call_window"), _ist_now())
             if not _allowed:
-                logger.info("NOKVO-CAMPAIGN: %s paused (%s) — outside call window", campaign.id, _reason)
+                logger.warning("NOKVO-CAMPAIGN: %s paused (%s) — outside call window", campaign.id, _reason)
                 return
 
         # Prepaid-balance gate (product-aware). Stop placing NEW calls once the
@@ -1716,7 +1716,7 @@ class OutboundCampaignService:
                 elif not _is_deterministic:
                     _blocked = not await has_balance(db, tenant_res.organization_id)
                 if _blocked:
-                    logger.info("NOKVO-CAMPAIGN: empty prepaid balance — not dialing %s", campaign.id)
+                    logger.warning("NOKVO-CAMPAIGN: empty prepaid balance — not dialing %s", campaign.id)
                     return
             except Exception:
                 logger.exception("NOKVO-CAMPAIGN: prepaid-balance gate check failed")
@@ -1750,7 +1750,7 @@ class OutboundCampaignService:
         _today_str = _ist_now().strftime("%Y-%m-%d") if _calls_per_day > 0 else ""
         _today_count = _dialed_today_count(_lock_cw, _today_str) if _calls_per_day > 0 else 0
         if _calls_per_day > 0 and _today_count >= _calls_per_day:
-            logger.info("NOKVO-CAMPAIGN: %s hit daily cap %d — not dialing", campaign.id, _calls_per_day)
+            logger.warning("NOKVO-CAMPAIGN: %s hit daily cap %d — not dialing", campaign.id, _calls_per_day)
             await db.commit()  # release the FOR UPDATE lock
             return
         # Bulk CSV campaigns always fan out up to BULK_DIAL_CONCURRENCY (5) lines
