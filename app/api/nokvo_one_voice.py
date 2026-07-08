@@ -1512,6 +1512,17 @@ async def _outbound_signing_token(call_link_id: str, db: AsyncSession) -> str | 
         return None
 
 
+# Retain fire-and-forget tasks — the event loop holds only weak refs, so an
+# untracked create_task can be GC'd mid-flight (same pattern as the campaign
+# service's _ingest_tasks and the stream service's _background_tasks).
+_bg_tasks: set[asyncio.Task] = set()
+
+
+def _retain_task(task: asyncio.Task) -> None:
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
+
 # ── Webhook observability ──────────────────────────────────────────────
 # Best-effort Redis breadcrumbs (TTL 7 days) so /phone-link can answer the
 # two diagnostic questions for "inbound calls don't connect": did Plivo's
@@ -1542,7 +1553,7 @@ def _record_webhook_event(link_id: str, kind: str, data: dict) -> None:
             logger.debug("PLIVO webhook event record failed", exc_info=True)
 
     try:
-        _asyncio.get_running_loop().create_task(_write())
+        _retain_task(_asyncio.get_running_loop().create_task(_write()))
     except RuntimeError:
         pass
 
@@ -1886,9 +1897,12 @@ async def plivo_outbound_media_websocket(websocket: WebSocket, call_link_id: str
                 if not followup_handoff_note:
                     from app.models.nokvo_one_tool_record import NokvoOneToolRecord as _TR
 
-                    tr = await db.get(_TR, _lead_uuid)
-                    if tr is not None:
-                        _tr_note = (tr.data or {}).get("handoff_note")
+                    # NEVER name this ``tr`` — that's the TenantResources bound
+                    # above, still used by run_session and the slot release below;
+                    # shadowing it crashed every follow-up without a handoff note.
+                    _note_rec = await db.get(_TR, _lead_uuid)
+                    if _note_rec is not None:
+                        _tr_note = (_note_rec.data or {}).get("handoff_note")
                         if _tr_note:
                             followup_handoff_note = str(_tr_note).strip() or None
         elif is_followup and contact.get("customer_id"):
@@ -2273,11 +2287,11 @@ async def create_bulk_calling_campaign(
         # _campaign_response's agent_config passthrough. For NOKVO APEX the dialer
         # ENFORCES it (09:00–19:00 IST window + weekday gate from working_days +
         # calls_per_day daily cap); for Nokvo One it stays a capacity readout only.
-        # working_days/hours_per_day keep their existing clamps so Nokvo One is
-        # unchanged; the APEX weekday map treats working_days as days/week (1–7).
+        # working_days is days/week (1–7, matching the PATCH clamp and the
+        # dialer's weekday map).
         if working_days is not None or hours_per_day is not None or calls_per_day is not None:
             agent_config["call_window"] = {
-                "working_days": max(1, min(60, int(working_days or 1))),
+                "working_days": max(1, min(7, int(working_days or 1))),
                 "hours_per_day": max(1, min(10, int(hours_per_day or 1))),
                 "timezone": "Asia/Kolkata",
                 "window_local": "09:00-19:00",
@@ -2305,7 +2319,7 @@ async def create_bulk_calling_campaign(
         try:
             from app.services.apex_tts_prewarm import prewarm_campaign_tts
 
-            asyncio.create_task(prewarm_campaign_tts(tr, parsed_questionnaire))
+            _retain_task(asyncio.create_task(prewarm_campaign_tts(tr, parsed_questionnaire)))
         except Exception:
             logger.debug("APEX-TTS-PREWARM: failed to schedule", exc_info=True)
     return _campaign_response(campaign)

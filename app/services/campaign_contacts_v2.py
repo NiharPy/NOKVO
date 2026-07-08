@@ -108,26 +108,92 @@ async def ingest_rows(campaign_id: uuid.UUID, rows: Iterable[dict[str, str]]) ->
 
 
 # ── dial claim (advisory-locked, no network I/O under the lock) ──────────────
-async def claim_pending(campaign_id: uuid.UUID, cap: int, *, max_rows: int | None = None) -> list[dict[str, Any]]:
-    """Phase 1: under a short ``pg_advisory_xact_lock`` transaction, compute the
-    concurrency headroom and atomically mark up to ``k`` pending rows ``dialing``.
-    Commits (releasing the lock) before returning. Returns [{id, phone,
-    call_link_id}] for the caller to DND-scrub + place OUTSIDE any lock.
+async def _bump_dialed_today(db, campaign_id: uuid.UUID, today: str, n: int) -> None:
+    """Atomically advance the per-day placement counter on ``agent_config``,
+    resetting on an IST date rollover. A targeted ``jsonb_set`` — NEVER a
+    whole-blob write, which raced concurrent campaign edits / other refills and
+    lost updates. Self-sufficient: creates ``call_window``/``dialed_today`` if a
+    concurrent whole-blob write clobbered them (jsonb_set can't create
+    intermediate paths, so the outer set floors call_window to {})."""
+    await db.execute(
+        text(
+            "UPDATE outbound_campaigns SET agent_config = jsonb_set("
+            " jsonb_set(agent_config, '{call_window}',"
+            "           COALESCE(agent_config->'call_window', '{}'::jsonb), true),"
+            " '{call_window,dialed_today}',"
+            " CASE WHEN agent_config#>>'{call_window,dialed_today,date}' = :today"
+            "      THEN jsonb_build_object('date', :today, 'count',"
+            "           COALESCE((agent_config#>>'{call_window,dialed_today,count}')::int, 0) + :n)"
+            "      ELSE jsonb_build_object('date', :today, 'count', :n) END, true) "
+            "WHERE id = :c"
+        ),
+        {"today": today, "n": int(n), "c": str(campaign_id)},
+    )
 
-    ``max_rows`` further bounds ``k`` (e.g. the remaining daily-cap budget)."""
+
+async def refund_dialed_today(db, campaign_id: uuid.UUID, today: str, n: int) -> None:
+    """Give back daily-cap budget for claims that never became placements
+    (DND-dropped / failed at placement). The claim charges the counter up front
+    (inside its locked txn, so concurrent refills can't overshoot the cap); this
+    refunds the difference afterwards. Clamped at 0; only today's counter (a
+    crashed refund under-counts tomorrow never, undershoots today at worst —
+    the conservative failure). Caller commits."""
+    if n <= 0:
+        return
+    await db.execute(
+        text(
+            "UPDATE outbound_campaigns SET agent_config = jsonb_set(agent_config,"
+            " '{call_window,dialed_today,count}',"
+            " to_jsonb(GREATEST(COALESCE((agent_config#>>'{call_window,dialed_today,count}')::int, 0) - :n, 0))) "
+            "WHERE id = :c AND agent_config#>>'{call_window,dialed_today,date}' = :today"
+        ),
+        {"n": int(n), "c": str(campaign_id), "today": today},
+    )
+
+
+async def claim_pending(
+    campaign_id: uuid.UUID, cap: int, *, daily_cap: int | None = None, today: str = ""
+) -> list[dict[str, Any]]:
+    """Phase 1: under a short ``pg_advisory_xact_lock`` transaction, verify the
+    campaign is still RUNNING, compute the concurrency headroom AND the daily-cap
+    budget from a FRESH ``dialed_today`` read, atomically mark up to ``k`` pending
+    rows ``dialing``, and charge ``dialed_today`` by the claimed count — all in
+    the same locked txn, so concurrent refills (webhook + ticker + other replicas)
+    can never overshoot ``daily_cap``. Commits (releasing the lock) before
+    returning. Returns [{id, phone, call_link_id}] for the caller to DND-scrub +
+    place OUTSIDE any lock; the caller REFUNDS the counter for claims that didn't
+    become placements (:func:`refund_dialed_today`).
+
+    The status check kills the cancel-vs-refill race: a cancel that committed
+    after the caller loaded its campaign snapshot wins here (``cancel_campaign``
+    takes the same advisory key), so a stale refill claims nothing."""
     async with AsyncSessionLocal() as db:
         async with db.begin():  # single short txn; advisory lock auto-releases on commit
             await db.execute(
                 text("SELECT pg_advisory_xact_lock(hashtext(:c))"), {"c": str(campaign_id)}
             )
+            row = (await db.execute(
+                text(
+                    "SELECT status, agent_config#>>'{call_window,dialed_today,date}', "
+                    "agent_config#>>'{call_window,dialed_today,count}' "
+                    "FROM outbound_campaigns WHERE id = :c"
+                ),
+                {"c": str(campaign_id)},
+            )).first()
+            if row is None or str(row[0]) != "running":
+                return []  # cancelled/completed since the caller's snapshot — claim nothing
             live = (await db.execute(
                 text("SELECT count(*) FROM outbound_campaign_contacts "
                      "WHERE campaign_id = :c AND status = ANY(:s)"),
                 {"c": str(campaign_id), "s": list(_LIVE_STATUSES)},
             )).scalar_one()
             k = max(0, int(cap) - int(live))
-            if max_rows is not None:
-                k = min(k, max(0, int(max_rows)))
+            if daily_cap is not None and daily_cap > 0:
+                try:
+                    today_count = int(row[2]) if (row[1] == today and row[2] is not None) else 0
+                except (TypeError, ValueError):
+                    today_count = 0  # junk counter → same tolerance as _dialed_today_count
+                k = min(k, max(0, int(daily_cap) - today_count))
             if k <= 0:
                 return []
             rows = (await db.execute(
@@ -141,7 +207,12 @@ async def claim_pending(campaign_id: uuid.UUID, cap: int, *, max_rows: int | Non
                 ),
                 {"c": str(campaign_id), "k": k},
             )).mappings().all()
-            return [dict(r) for r in rows]
+            claimed = [dict(r) for r in rows]
+            # Charge the daily counter for the whole claim NOW, inside the lock —
+            # the caller refunds whatever doesn't get placed.
+            if claimed and daily_cap is not None and daily_cap > 0 and today:
+                await _bump_dialed_today(db, campaign_id, today, len(claimed))
+            return claimed
 
 
 async def mark_contact(contact_id: uuid.UUID, status: str, **fields: Any) -> None:
@@ -177,6 +248,51 @@ async def update_status_by_link(db, call_link_id: str, status: str, **fields: An
         params,
     )
     return (res.rowcount or 0) > 0
+
+
+async def stamp_answered_by_link(db, call_link_id: str, ts: datetime) -> uuid.UUID | None:
+    """GUARDED answered stamp: transitions only a live pre-answer row. Returns the
+    campaign_id when THIS call did the transition, else None — so the caller bumps
+    ``answered_count`` exactly once. A duplicate/late answered event matches
+    nothing (idempotent) and, unlike the old unguarded write, can never re-open a
+    ``completed`` row and re-bump the counter. Caller commits."""
+    row = (await db.execute(
+        text(
+            "UPDATE outbound_campaign_contacts "
+            "SET status = 'answered', answered_at = COALESCE(answered_at, CAST(:ts AS timestamptz)), "
+            "updated_at = now() "
+            "WHERE call_link_id = :clid AND status IN ('dialing', 'ringing') "
+            "RETURNING campaign_id"
+        ),
+        {"clid": call_link_id, "ts": ts.isoformat()},
+    )).first()
+    return row[0] if row else None
+
+
+async def finalize_terminal_by_link(
+    db, call_link_id: str, final: str, duration_s: float | None = None
+) -> tuple[str, uuid.UUID] | None:
+    """GUARDED terminal transition, one statement: an ``answered`` row completes;
+    a still-live pre-answer row lands on ``final`` (failed/no_answer). Race-safe
+    under READ COMMITTED — the SET's CASE reads the pre-update status, and a
+    concurrent duplicate's WHERE is re-checked against the winner's committed
+    tuple (now terminal) so the loser matches nothing. (NOT a self-join UPDATE …
+    FROM: EvalPlanQual re-reads only the target tuple, the FROM side keeps the
+    stale snapshot — a self-join loser would double-transition.) Replaces the
+    SELECT-then-UPDATE that let concurrent Plivo retries double-bump counters.
+    Returns (new_status, campaign_id) when this call transitioned the row, else
+    None (already terminal / unknown). Caller commits."""
+    row = (await db.execute(
+        text(
+            "UPDATE outbound_campaign_contacts "
+            "SET status = CASE WHEN status = 'answered' THEN 'completed' ELSE :final END, "
+            "duration_s = COALESCE(CAST(:dur AS numeric), duration_s), updated_at = now() "
+            "WHERE call_link_id = :clid AND status IN ('dialing', 'ringing', 'answered') "
+            "RETURNING status, campaign_id"
+        ),
+        {"final": final, "dur": duration_s, "clid": call_link_id},
+    )).first()
+    return (str(row[0]), row[1]) if row else None
 
 
 def _blob_row_status(ct: dict) -> str:
@@ -455,6 +571,8 @@ async def page_contacts(db, campaign_id: uuid.UUID, bucket: str, *, cursor: str 
 # ── APEX claim pool (qualified leads, on the row) ────────────────────────────
 def _lead_row_from_rec(rec: dict) -> dict:
     """Map a joined contact+campaign row to the API's lead-row shape."""
+    from app.services.agent_outbound_context import questionnaire_max_points
+
     cfg = rec.get("agent_config") or {}
     q = (cfg.get("questionnaire") or {})
     has_q = bool(q.get("questions"))
@@ -468,7 +586,10 @@ def _lead_row_from_rec(rec: dict) -> dict:
         "name": rec.get("name") or rec.get("phone"),
         "phone": rec.get("phone"),
         "lead_score": rec.get("lead_score"),
-        "max_score": cfg.get("max_score") or (len(q.get("questions") or []) if has_q else None),
+        # Weighted/graded points via the ONE shared helper, so the denominator
+        # never drifts from the scorer (len(questions) broke on weighted tiers).
+        "max_score": cfg.get("max_score")
+        or (questionnaire_max_points(q.get("questions")) if has_q else None),
         "score_breakdown": result.get("score_breakdown") or [],
         "lead_score_reason": result.get("lead_score_reason") or result.get("interest_reason"),
         "call_note": result.get("call_note"),

@@ -535,7 +535,7 @@ async def _nova_turn_inner(
     message: str,
 ) -> NovaTurnResult:
     sid = session_id or store.new_session_id()
-    ns = store.AgentSessionStore.namespace(tenant_res)
+    ns = store.user_namespace(tenant_res, user)
     message = (message or "").strip()[:_MAX_MESSAGE_CHARS]
     if not message:
         return NovaTurnResult(session_id=sid, reply="Tell me what you need — a question, a campaign, or a problem to look into.")

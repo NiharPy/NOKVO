@@ -4068,6 +4068,11 @@ class NokvoOneVoiceStreamService:
                         if event_type == "stop":
                             break
             finally:
+                # Billing clock: the call ENDS when the media loop exits — stamp
+                # it before the drains/lead-creation/logging below, whose
+                # (variable, sometimes seconds-long) teardown time otherwise
+                # inflated the wallet deduction for every connected call.
+                _session_ended_at = datetime.now(timezone.utc)
                 # Drain every task that may still be touching the shared
                 # ``db`` AsyncSession before ``_log_voice_call`` runs its own
                 # query against it.
@@ -4141,7 +4146,7 @@ class NokvoOneVoiceStreamService:
                         tenant_id=tenant_id_str,
                         call_id=str(call_id),
                         started_at=session_started_at,
-                        ended_at=datetime.now(timezone.utc),
+                        ended_at=_session_ended_at,
                         kind=cost_kind,
                         campaign_id=cost_campaign_id,
                         trace_id=_otel_trace_id,

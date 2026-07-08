@@ -538,3 +538,13 @@ def test_list_account_numbers_empty_on_error(monkeypatch):
         raise PlivoError("boom")
     _mock_request(monkeypatch, handler)
     assert _run(PlivoService.list_account_numbers(("SUBacct", "tok"))) == []
+
+
+def test_list_account_numbers_strict_raises(monkeypatch):
+    """strict=True re-raises — the DID auto-provisioner must never read a
+    listing failure as "pool empty" (that's what re-bought paid DIDs)."""
+    def handler(method, url, body):
+        raise PlivoError("boom")
+    _mock_request(monkeypatch, handler)
+    with pytest.raises(PlivoError):
+        _run(PlivoService.list_account_numbers(("SUBacct", "tok"), strict=True))

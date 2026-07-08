@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import io
-import json
 import logging
 import random
 import re
@@ -782,6 +781,15 @@ class OutboundCampaignService:
             CampaignStatus.draft, CampaignStatus.running, CampaignStatus.ingesting
         ):
             raise ValueError(f"Cannot cancel a campaign with status '{campaign.status}'.")
+        # Serialize with the V2 dialer's claim (same advisory key, held until this
+        # commit): a claim in flight either commits first — its ≤5 placements
+        # proceed, matching "in-flight calls finish" — or runs after and sees
+        # status=cancelled, claiming nothing. Without this the flip could land
+        # mid-claim unnoticed and a stale refill kept dialing.
+        await db.execute(
+            _sql_text("SELECT pg_advisory_xact_lock(hashtext(:c))"),
+            {"c": str(campaign.id)},
+        )
         campaign.status = CampaignStatus.cancelled
         campaign.completed_at = datetime.now(timezone.utc)
         db.add(campaign)
@@ -1522,6 +1530,21 @@ class OutboundCampaignService:
         await OutboundCampaignService._assert_no_other_active_campaign(
             db, tenant_res.tenant_id, exclude_id=campaign.id
         )
+        # Take the slot NOW, in the SAME transaction as the check above (the
+        # tenant advisory lock is held until this commit). Deferring the running
+        # flip to the background ingest left a minutes-long window where a second
+        # launch passed the guard and ran alongside — breaking the
+        # one-campaign-per-tenant invariant. The cancelled guard covers a cancel
+        # racing this request; the background append UPDATE stays (idempotent),
+        # and an ingest failure still marks ingest_failed, freeing the slot.
+        await db.execute(
+            _sql_text(
+                "UPDATE outbound_campaigns SET status = 'running', completed_at = NULL "
+                "WHERE id = :c AND status <> 'cancelled'"
+            ),
+            {"c": str(campaign.id)},
+        )
+        await db.commit()
         task = asyncio.create_task(
             OutboundCampaignService._ingest_and_dial_v2(
                 campaign.id, raw, filename, tenant_res.tenant_id,
@@ -1700,19 +1723,24 @@ class OutboundCampaignService:
         ``pending`` — which previously made the dialer re-place them forever."""
         _cfg = campaign.agent_config or {}
         _is_deterministic = bool(_cfg.get("deterministic") or _cfg.get("questionnaire"))
-        # Resolve the org product tier once — it drives both the Nokvo One outbound
-        # kill switch and the prepaid-balance gate below.
+        # Resolve the org product tier + calling flag once — the tier drives the
+        # Nokvo One outbound kill switch and the prepaid-balance gate below; the
+        # calling flag is the subscription-end gate.
         _org_tier: str | None = None
+        _calling_enabled = True
         _tier_resolved = False
         if tenant_res is not None:
             try:
-                _org_tier = (
+                _org_row = (
                     await db.execute(
-                        select(Organization.product_tier).where(
+                        select(Organization.product_tier, Organization.calling_enabled).where(
                             Organization.id == tenant_res.organization_id
                         )
                     )
-                ).scalar_one_or_none()
+                ).first()
+                if _org_row is not None:
+                    _org_tier = _org_row[0]
+                    _calling_enabled = bool(_org_row[1])
                 _tier_resolved = True
             except Exception:
                 logger.exception("NOKVO-CAMPAIGN: product-tier lookup failed for %s", campaign.id)
@@ -1730,6 +1758,19 @@ class OutboundCampaignService:
             and (_org_tier or "nokvo_one") != "nokvo_apex"
         ):
             logger.warning("NOKVO-CAMPAIGN: Nokvo One outbound disabled — not dialing %s", campaign.id)
+            return
+
+        # Subscription-end gate: the Razorpay cancelled/halted webhook flips
+        # calling_enabled off to suspend service — that must stop RUNNING
+        # campaigns too (webhook refills + the ticker), not just new launches.
+        # Credits are untouched; re-subscribing re-enables and dialing resumes.
+        # Fail-open like the tier gate: a read error never silences a live
+        # campaign.
+        if _tier_resolved and not _calling_enabled:
+            logger.warning(
+                "NOKVO-CAMPAIGN: calling disabled for org (subscription ended?) — not dialing %s",
+                campaign.id,
+            )
             return
 
         # Scheduled-dialer window — NOKVO APEX only (the scheduled-outbound product).
@@ -1909,10 +1950,10 @@ class OutboundCampaignService:
         if not pool:
             return
 
-        # Daily cap (APEX scheduled) — bound the claim by today's remaining budget.
-        max_rows: int | None = None
+        # Daily cap (APEX scheduled): enforced INSIDE the claim's advisory-locked
+        # txn on a FRESH dialed_today read — bounding it here from the caller's
+        # possibly-stale campaign snapshot let concurrent refills overshoot.
         today_str = ""
-        today_count = 0
         calls_per_day = 0
         if call_window:
             try:
@@ -1921,16 +1962,18 @@ class OutboundCampaignService:
                 calls_per_day = 0
             if calls_per_day > 0:
                 today_str = _ist_now().strftime("%Y-%m-%d")
-                today_count = _dialed_today_count(call_window, today_str)
-                remaining = calls_per_day - today_count
-                if remaining <= 0:
-                    return
-                max_rows = remaining
 
-        claimed = await v2.claim_pending(campaign.id, cap, max_rows=max_rows)
+        claimed = await v2.claim_pending(
+            campaign.id,
+            cap,
+            daily_cap=calls_per_day if calls_per_day > 0 else None,
+            today=today_str,
+        )
         if not claimed:
-            # Nothing left to claim and nothing live → the list is drained; flip
-            # to completed so the tenant's single campaign slot frees up.
+            # Nothing claimable: drained, cap-hit, or cancelled mid-refill. The
+            # drain check flips a finished campaign to completed (frees the
+            # tenant's single slot); it's a no-op while rows are pending (cap)
+            # and its status guard skips cancelled campaigns.
             await v2.maybe_complete(db, campaign.id)
             return
 
@@ -1944,6 +1987,7 @@ class OutboundCampaignService:
             logger.exception("NOKVO-DND-V2: dial-time scrub failed — dialing un-scrubbed")
 
         placed = 0
+        failures = 0
         for i, row in enumerate(claimed):
             if result is not None and result.is_blocked(row["phone"]):
                 await v2.mark_contact(row["id"], "dnd_dropped")
@@ -1959,27 +2003,30 @@ class OutboundCampaignService:
                 placed += 1
             else:
                 await v2.mark_contact(row["id"], "failed")
+                failures += 1
 
-        # Advance counters (best-effort): total dialed + the per-day cap counter.
-        if placed:
-            try:
+        # Counters (best-effort): total dialed, placement failures (terminal with
+        # no webhook coming, so they'd never be counted otherwise), and the
+        # daily-cap REFUND for claims that never became placements — the claim
+        # charged the counter up front inside its locked txn. Targeted
+        # statements only; the old whole-agent_config overwrite here raced
+        # campaign edits and other refills (lost updates).
+        try:
+            if placed:
                 await db.execute(
                     _sql_text("UPDATE outbound_campaigns SET contacts_dialed = contacts_dialed + :n WHERE id = :c"),
                     {"n": placed, "c": str(campaign.id)},
                 )
-                if calls_per_day > 0 and today_str:
-                    _ac = dict(campaign.agent_config or {})
-                    _cw = dict(_ac.get("call_window") or {})
-                    _cw["dialed_today"] = {"date": today_str, "count": today_count + placed}
-                    _ac["call_window"] = _cw
-                    await db.execute(
-                        _sql_text("UPDATE outbound_campaigns SET agent_config = CAST(:cfg AS jsonb) WHERE id = :c"),
-                        {"cfg": json.dumps(_ac), "c": str(campaign.id)},
-                    )
-                await db.commit()
-            except Exception:
-                logger.exception("NOKVO-DIAL-V2: counter update failed for %s", campaign.id)
-        else:
+            if failures:
+                await v2.bump_campaign_counter(db, campaign.id, "failed_count", n=failures)
+            unplaced = len(claimed) - placed
+            if calls_per_day > 0 and today_str and unplaced > 0:
+                await v2.refund_dialed_today(db, campaign.id, today_str, unplaced)
+            await db.commit()
+        except Exception:
+            logger.exception("NOKVO-DIAL-V2: counter update failed for %s", campaign.id)
+
+        if not placed:
             # Every claimed row was DND-dropped or failed at placement — those are
             # terminal with no webhook coming, so run the drain check here.
             await v2.maybe_complete(db, campaign.id)
@@ -1992,42 +2039,40 @@ class OutboundCampaignService:
         payload: dict,
         db: AsyncSession,
     ) -> None:
-        """V2 webhook: O(1) single-row status update keyed on ``call_link_id`` +
-        atomic campaign counters. Terminal status derived from the row's current
-        state (answered → completed; else no_answer/failed by hangup cause).
-        Idempotent. The refill is triggered by the endpoint's dial_next_pending."""
+        """V2 webhook: O(1) GUARDED single-row transition keyed on ``call_link_id``
+        + atomic campaign counters. Terminal status derived from the row's
+        pre-update state in ONE statement (answered → completed; else
+        no_answer/failed by hangup cause) so concurrent Plivo retries can't
+        double-transition or double-bump — only the webhook that actually flips
+        the row bumps a counter. The refill is triggered by the endpoint's
+        dial_next_pending."""
         from app.services import campaign_contacts_v2 as v2
 
         if event_type == "call.answered":
-            if await v2.update_status_by_link(
-                db, call_link_id, "answered", answered_at=datetime.now(timezone.utc)
-            ):
-                await v2.bump_campaign_counter(db, campaign.id, "answered_count")
+            camp_id = await v2.stamp_answered_by_link(
+                db, call_link_id, datetime.now(timezone.utc)
+            )
+            if camp_id is not None:
+                await v2.bump_campaign_counter(db, camp_id, "answered_count")
             await db.commit()
             return
 
         if event_type in ("call.hangup", "call.failed", "call.machine.detection.ended"):
-            cur = (await db.execute(
-                _sql_text("SELECT status FROM outbound_campaign_contacts WHERE call_link_id = :c"),
-                {"c": call_link_id},
-            )).scalar_one_or_none()
-            if cur in ("completed", "no_answer", "failed", None):
-                return  # already terminal / unknown → idempotent no-op
-            if cur == "answered":
-                final = "completed"  # post-call scoring sets qualified/lead_score
-            else:
-                cause = str(payload.get("hangup_cause") or payload.get("HangupCause") or "").upper()
-                final = "failed" if any(x in cause for x in ("BUSY", "REJECT", "CONGESTION")) else "no_answer"
-            fields: dict[str, Any] = {}
+            cause = str(payload.get("hangup_cause") or payload.get("HangupCause") or "").upper()
+            final = "failed" if any(x in cause for x in ("BUSY", "REJECT", "CONGESTION")) else "no_answer"
+            dur_val: float | None = None
             dur = payload.get("duration") or payload.get("Duration")
             if dur:
                 try:
-                    fields["duration_s"] = float(dur)
+                    dur_val = float(dur)
                 except (TypeError, ValueError):
-                    pass
-            await v2.update_status_by_link(db, call_link_id, final, **fields)
-            if final in ("failed", "no_answer"):
-                await v2.bump_campaign_counter(db, campaign.id, "failed_count")
+                    dur_val = None
+            outcome = await v2.finalize_terminal_by_link(db, call_link_id, final, duration_s=dur_val)
+            if outcome is None:
+                return  # already terminal / unknown → idempotent no-op
+            new_status, camp_id = outcome
+            if new_status in ("failed", "no_answer"):
+                await v2.bump_campaign_counter(db, camp_id, "failed_count")
             await db.commit()
             # Last call in the list just ended → completed (frees the tenant's
             # single campaign slot). No-op while anything is pending or live.
@@ -2088,26 +2133,42 @@ class OutboundCampaignService:
         never raises into the call-setup path."""
         from app.db.session import AsyncSessionLocal
 
-        # V2: O(1) single-row answered stamp (idempotent — the SET only counts once
-        # because the terminal webhook won't re-answer a completed row).
+        # V2: O(1) GUARDED single-row answered stamp — only a row-backed (V2)
+        # campaign takes this branch. Legacy campaigns MUST fall through to the
+        # blob path below: a blob-only bulk campaign has no OCC row (the old
+        # early-return left it un-stamped → the hangup mislabelled it failed),
+        # and a legacy LEAD campaign carries BOTH stores under the same
+        # call_link_id (stamping only the row left the blob un-answered →
+        # failed_count double-bump + wrong UI status). The blob branch already
+        # syncs the OCC join row, so both stores stay consistent.
         if settings.CAMPAIGN_CONTACTS_V2:
             from app.services import campaign_contacts_v2 as v2
 
             try:
                 async with AsyncSessionLocal() as db:
                     cur = (await db.execute(
-                        _sql_text("SELECT status, campaign_id FROM outbound_campaign_contacts WHERE call_link_id = :c"),
+                        _sql_text(
+                            "SELECT occ.status, occ.campaign_id, "
+                            "(c.contacts IS NOT NULL AND COALESCE(jsonb_array_length(c.contacts), 0) > 0) AS legacy "
+                            "FROM outbound_campaign_contacts occ "
+                            "JOIN outbound_campaigns c ON c.id = occ.campaign_id "
+                            "WHERE occ.call_link_id = :c"
+                        ),
                         {"c": call_link_id},
                     )).first()
-                    if cur is None or cur[0] in ("answered", "completed"):
-                        return  # unknown or already answered → idempotent
-                    await v2.update_status_by_link(db, call_link_id, "answered",
-                                                   answered_at=datetime.now(timezone.utc))
-                    await v2.bump_campaign_counter(db, cur[1], "answered_count")
-                    await db.commit()
+                    if cur is not None and not cur[2]:
+                        camp_id = await v2.stamp_answered_by_link(
+                            db, call_link_id, datetime.now(timezone.utc)
+                        )
+                        if camp_id is not None:
+                            await v2.bump_campaign_counter(db, camp_id, "answered_count")
+                            await db.commit()
+                        return
             except Exception:
                 logger.exception("NOKVO-DIAL-V2: mark_answered failed for %s", call_link_id)
-            return
+                return
+            # cur is None (no OCC row: blob-only legacy) or legacy blob present →
+            # fall through to the blob path.
 
         try:
             async with AsyncSessionLocal() as db:
@@ -2211,29 +2272,51 @@ class OutboundCampaignService:
         hangup_cause = ""
 
         if event_type == "call.answered":
-            target["status"] = "answered"
-            target["answered_at"] = datetime.now(timezone.utc).isoformat()
-            if campaign is not None:
-                campaign.answered_count = (campaign.answered_count or 0) + 1
-            if target.get("lead_id"):
-                lead_res = await db.execute(select(OutgoingLead).where(OutgoingLead.id == uuid.UUID(str(target["lead_id"]))))
-                lead = lead_res.scalars().first()
-                if lead:
-                    lead.call_status = LeadCallStatus.called
-                    db.add(lead)
+            # Idempotent: the media-WS ``mark_answered`` usually stamped this
+            # already — a late/duplicate answered event must never double-count
+            # answered_count (mirrors mark_answered's guard).
+            if not (target.get("status") == "answered" or target.get("answered_at")):
+                target["status"] = "answered"
+                target["answered_at"] = datetime.now(timezone.utc).isoformat()
+                if campaign is not None:
+                    campaign.answered_count = (campaign.answered_count or 0) + 1
+                if target.get("lead_id"):
+                    lead_res = await db.execute(select(OutgoingLead).where(OutgoingLead.id == uuid.UUID(str(target["lead_id"]))))
+                    lead = lead_res.scalars().first()
+                    if lead:
+                        lead.call_status = LeadCallStatus.called
+                        db.add(lead)
 
         elif is_terminal:
-            hangup_cause = payload.get("hangup_cause", "")
+            # Plivo posts HangupCause/Duration (capitalised); the lowercase keys
+            # come from other normalizers — accept both, or every legacy contact
+            # recorded duration 0 and classified failed.
+            hangup_cause = str(payload.get("hangup_cause") or payload.get("HangupCause") or "")
             # Terminal: the call no longer occupies a line. ``ended`` is what the
             # throttled dialer counts (an answered-then-hung-up call keeps
             # status="answered", so status alone can't signal "slot free").
             target["ended"] = True
             if target["status"] not in ("answered",):
-                target["status"] = "no_answer" if "no_answer" in hangup_cause.lower() else "failed"
+                # Same cause mapping as the V2 path: an active reject/busy is a
+                # failure; everything else (incl. ring-timeout) is no_answer.
+                _cause_up = hangup_cause.upper()
+                target["status"] = (
+                    "failed"
+                    if any(x in _cause_up for x in ("BUSY", "REJECT", "CONGESTION"))
+                    else "no_answer"
+                )
                 if campaign is not None:
                     campaign.failed_count = (campaign.failed_count or 0) + 1
-            duration = payload.get("duration_seconds") or 0
-            target["duration_s"] = int(duration)
+            duration = (
+                payload.get("duration_seconds")
+                or payload.get("Duration")
+                or payload.get("duration")
+                or 0
+            )
+            try:
+                target["duration_s"] = int(float(duration))
+            except (TypeError, ValueError):
+                target["duration_s"] = 0
 
         # ── Persist the campaign-contact mutation ATOMICALLY, under the lock ──
         # For a regular campaign this is the ONLY write of ``campaign.contacts``;
@@ -2627,35 +2710,30 @@ class OutboundCampaignService:
     ) -> tuple[OutboundCampaign | None, dict | None]:
         """Return (campaign, contact) matching the call_link_id.
 
-        Resolution order:
-          1. Campaign contact (regular launch). The contact dict lives
-             inline in ``campaign.contacts`` JSONB.
-          2. V2 per-row contact (``outbound_campaign_contacts``) — EVERY
-             APEX/bulk campaign since the scale migration (their blob is
-             empty). Without this branch the answer webhook can't resolve
-             the Plivo signing token (sig mismatch → <Hangup/> the moment
-             the person picks up) and the media WS closes 1008 — the
-             "answers then immediately cuts" bug. Returns a synthetic
-             contact dict shaped like a blob contact.
+        Resolution order — each step is ONE indexed query. This runs up to four
+        times per call event (signing-token resolution for the answer AND status
+        webhooks, the status handler, the media WS), including BEFORE signature
+        validation, so it must never scan every campaign (the old
+        load-everything Python scan grew with lifetime campaign count and was a
+        pre-auth DoS lever):
+          1. V2 per-row contact (``outbound_campaign_contacts``, UNIQUE
+             call_link_id) — every APEX/bulk campaign since the scale
+             migration. Without this the answer webhook can't resolve the
+             Plivo signing token (sig mismatch → <Hangup/> the moment the
+             person picks up). When the owning campaign ALSO carries a
+             non-empty legacy blob (lead-based campaigns write BOTH stores
+             with the same call_link_id), the LIVE blob dict is returned so
+             the webhook keeps mutating the blob in place; otherwise a
+             synthetic contact dict shaped like a blob contact.
+          2. Blob-only legacy campaigns (no OCC row): one JSONB containment
+             query (``contacts @> [{"call_link_id": …}]``, GIN-indexed via
+             campaign_blob_gin_v1) over running/completed campaigns.
           3. Follow-up schedule row (placed_call_id). Returns a synthetic
              contact dict so the rest of the webhook pipeline behaves
              identically. The synthetic dict carries ``_followup_id`` and
              ``is_followup=True`` so downstream code can detect follow-up
              state without an extra DB hit.
         """
-        result = await db.execute(
-            select(OutboundCampaign).where(
-                OutboundCampaign.status.in_([CampaignStatus.running, CampaignStatus.completed])
-            )
-        )
-        for campaign in result.scalars().all():
-            for contact in campaign.contacts or []:
-                if contact.get("call_link_id") == call_link_id:
-                    return campaign, contact
-
-        # V2 per-row contact — one indexed query on the UNIQUE call_link_id.
-        # (After the blob scan so legacy campaigns that ALSO carry OCC rows keep
-        # returning their live blob dict, which the webhook mutates in place.)
         occ = (
             await db.execute(
                 select(OutboundCampaignContact).where(
@@ -2670,6 +2748,11 @@ class OutboundCampaignService:
                 )
             ).scalars().first()
             if v2_campaign is not None:
+                # Legacy lead campaigns carry the SAME call_link_id in their
+                # blob — return the live dict so in-place mutation persists.
+                for contact in v2_campaign.contacts or []:
+                    if contact.get("call_link_id") == call_link_id:
+                        return v2_campaign, contact
                 return v2_campaign, {
                     "call_link_id": call_link_id,
                     "phone": occ.phone,
@@ -2678,6 +2761,23 @@ class OutboundCampaignService:
                     "call_id": occ.call_id,
                     "_v2": True,
                 }
+
+        # Blob-only legacy campaign: JSONB containment (GIN-indexed) picks the
+        # ONE owning campaign instead of loading them all. Same status filter as
+        # the old scan.
+        result = await db.execute(
+            select(OutboundCampaign)
+            .where(
+                OutboundCampaign.status.in_([CampaignStatus.running, CampaignStatus.completed]),
+                OutboundCampaign.contacts.contains([{"call_link_id": call_link_id}]),
+            )
+            .limit(1)
+        )
+        blob_campaign = result.scalars().first()
+        if blob_campaign is not None:
+            for contact in blob_campaign.contacts or []:
+                if contact.get("call_link_id") == call_link_id:
+                    return blob_campaign, contact
 
         # Fall through: follow-up table.
         from app.models.lead_followup_schedule import (

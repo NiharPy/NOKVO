@@ -218,3 +218,209 @@ async def test_page_contacts_returns_call_identity_columns():
     for col in ("call_link_id", "call_id", "answered_at", "duration_s"):
         assert col in captured["sql"], captured["sql"]
     assert "call_id IS NOT NULL" in captured["sql"]
+
+
+# ── guarded transitions (stamp_answered / finalize_terminal) ──────────────────
+# One-statement guarded UPDATEs: only the call that actually flips the row gets
+# a non-None return, so counters bump exactly once under concurrent webhooks.
+
+
+class _GuardDB:
+    """Captures the statement + params; returns a configured .first() row."""
+
+    def __init__(self, row=None):
+        self.row = row
+        self.sql = ""
+        self.params = None
+
+    async def execute(self, stmt, params=None):
+        self.sql = str(stmt)
+        self.params = params
+
+        class _R:
+            def __init__(self, row):
+                self._row = row
+
+            def first(self):
+                return self._row
+
+        return _R(self.row)
+
+
+@pytest.mark.asyncio
+async def test_stamp_answered_guarded_and_idempotent():
+    import uuid as _uuid
+    from datetime import datetime, timezone
+
+    camp_id = _uuid.uuid4()
+    db = _GuardDB(row=(camp_id,))
+    got = await v2.stamp_answered_by_link(db, "L1", datetime.now(timezone.utc))
+    assert got == camp_id
+    # Guard: only a live pre-answer row transitions; answered_at never overwritten.
+    assert "status IN ('dialing', 'ringing')" in db.sql
+    assert "COALESCE(answered_at" in db.sql
+    # Late/duplicate event → no row matched → None (no counter bump).
+    assert await v2.stamp_answered_by_link(_GuardDB(row=None), "L1", datetime.now(timezone.utc)) is None
+
+
+@pytest.mark.asyncio
+async def test_finalize_terminal_completes_answered_and_reports_old_state():
+    import uuid as _uuid
+
+    camp_id = _uuid.uuid4()
+    # Row was 'answered' → the CASE lands it on 'completed' (returned status).
+    db = _GuardDB(row=("completed", camp_id))
+    got = await v2.finalize_terminal_by_link(db, "L1", "no_answer", duration_s=12.0)
+    assert got == ("completed", camp_id)
+    assert "CASE WHEN status = 'answered' THEN 'completed'" in db.sql
+    assert "status IN ('dialing', 'ringing', 'answered')" in db.sql  # terminal rows excluded
+    # Never-answered row → lands on the hangup-cause status.
+    db2 = _GuardDB(row=("no_answer", camp_id))
+    assert (await v2.finalize_terminal_by_link(db2, "L2", "no_answer")) == ("no_answer", camp_id)
+    # Already terminal (duplicate webhook) → None, caller skips counters.
+    assert await v2.finalize_terminal_by_link(_GuardDB(row=None), "L3", "failed") is None
+
+
+# ── claim_pending: status guard + daily-cap budget inside the locked txn ──────
+
+
+class _ClaimSession:
+    """Fake AsyncSession for claim_pending: dispatches on statement text."""
+
+    def __init__(self, *, status="running", date=None, count=None, live=0, pending_rows=()):
+        self._status = status
+        self._date = date
+        self._count = count
+        self._live = live
+        self._pending = list(pending_rows)
+        self.bumped = None  # (today, n) when _bump_dialed_today ran
+
+    def begin(self):
+        session = self
+
+        class _Tx:
+            async def __aenter__(self):
+                return session
+
+            async def __aexit__(self, *exc):
+                return False
+
+        return _Tx()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def execute(self, stmt, params=None):
+        s = str(stmt)
+        outer = self
+
+        class _R:
+            def __init__(self, first=None, scalar=None, rows=()):
+                self._first = first
+                self._scalar = scalar
+                self._rows = rows
+
+            def first(self):
+                return self._first
+
+            def scalar_one(self):
+                return self._scalar
+
+            def mappings(self):
+                return self
+
+            def all(self):
+                return self._rows
+
+        if "pg_advisory_xact_lock" in s:
+            return _R()
+        if "SELECT status" in s:
+            return _R(first=(outer._status, outer._date, outer._count))
+        if "count(*)" in s:
+            return _R(scalar=outer._live)
+        if "SET status='dialing'" in s:
+            k = params["k"]
+            return _R(rows=outer._pending[:k])
+        if "dialed_today" in s and "jsonb_set" in s:
+            outer.bumped = (params["today"], params["n"])
+            return _R()
+        raise AssertionError(f"unexpected stmt: {s[:80]}")
+
+
+def _patch_claim_session(monkeypatch, session):
+    class _Factory:
+        def __call__(self):
+            return session
+
+    monkeypatch.setattr(v2, "AsyncSessionLocal", _Factory())
+
+
+@pytest.mark.asyncio
+async def test_claim_pending_returns_nothing_for_non_running(monkeypatch):
+    """Cancel-vs-refill race: a cancel that committed after the caller's stale
+    snapshot wins — the claim sees status!=running and claims nothing."""
+    import uuid as _uuid
+
+    session = _ClaimSession(status="cancelled", pending_rows=[{"id": 1, "phone": "919", "call_link_id": "a"}])
+    _patch_claim_session(monkeypatch, session)
+    assert await v2.claim_pending(_uuid.uuid4(), 5) == []
+
+
+@pytest.mark.asyncio
+async def test_claim_pending_daily_cap_budget_and_upfront_charge(monkeypatch):
+    """The cap budget is computed from the FRESH in-txn counter (not the caller's
+    snapshot) and the claim charges dialed_today up front — concurrent refills
+    can never overshoot calls_per_day."""
+    import uuid as _uuid
+
+    rows = [{"id": i, "phone": f"91{i}", "call_link_id": f"L{i}"} for i in range(5)]
+    session = _ClaimSession(status="running", date="2026-07-08", count="198", live=0, pending_rows=rows)
+    _patch_claim_session(monkeypatch, session)
+    claimed = await v2.claim_pending(_uuid.uuid4(), 5, daily_cap=200, today="2026-07-08")
+    assert len(claimed) == 2                       # 200 − 198 remaining, not the cap of 5
+    assert session.bumped == ("2026-07-08", 2)     # charged inside the locked txn
+
+
+@pytest.mark.asyncio
+async def test_claim_pending_cap_exhausted_claims_nothing(monkeypatch):
+    import uuid as _uuid
+
+    session = _ClaimSession(status="running", date="2026-07-08", count="200",
+                            pending_rows=[{"id": 1, "phone": "919", "call_link_id": "a"}])
+    _patch_claim_session(monkeypatch, session)
+    assert await v2.claim_pending(_uuid.uuid4(), 5, daily_cap=200, today="2026-07-08") == []
+    assert session.bumped is None
+
+
+@pytest.mark.asyncio
+async def test_claim_pending_date_rollover_resets_budget(monkeypatch):
+    """Yesterday's counter doesn't constrain today (junk counters tolerated too)."""
+    import uuid as _uuid
+
+    rows = [{"id": i, "phone": f"91{i}", "call_link_id": f"L{i}"} for i in range(5)]
+    session = _ClaimSession(status="running", date="2026-07-07", count="200", pending_rows=rows)
+    _patch_claim_session(monkeypatch, session)
+    claimed = await v2.claim_pending(_uuid.uuid4(), 3, daily_cap=200, today="2026-07-08")
+    assert len(claimed) == 3
+    assert session.bumped == ("2026-07-08", 3)
+
+
+# ── weighted max_score in the member pool row ─────────────────────────────────
+
+
+def test_lead_row_from_rec_weighted_max_score_without_stored_max():
+    """No stored max_score → the weighted helper, never len(questions) (which
+    showed impossible '7/4' scores on weighted questionnaires)."""
+    rec = {
+        "campaign_id": "c1", "campaign_name": "W", "call_link_id": "abc",
+        "phone": "919000000001", "name": "Zoya", "lead_score": 7,
+        "agent_config": {"questionnaire": {"questions": [
+            {"points": 5}, {"tiers": [{"points": 1}, {"points": 3}]}, {},
+        ]}},
+        "result": {},
+        "claimed_at": None,
+    }
+    assert v2._lead_row_from_rec(rec)["max_score"] == 9  # 5 + 3 + 1

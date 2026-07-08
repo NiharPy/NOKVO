@@ -50,6 +50,10 @@ from app.services.tool_flow_questions import ensure_tool_flow_questions
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+# Retain fire-and-forget activation tasks — the loop holds only weak refs, so an
+# untracked create_task can be GC'd mid-flight (losing a webhook's activation).
+_bg_tasks: set[asyncio.Task] = set()
+
 
 # ─────────── request bodies ───────────
 class CreateSubscriptionRequest(BaseModel):
@@ -296,11 +300,17 @@ def _subscription_is_paid(remote: dict) -> bool:
     return str((remote or {}).get("status") or "") in {"active", "authenticated"}
 
 
-async def _bg_activate(organization_id: uuid.UUID) -> None:
+async def _bg_activate(
+    organization_id: uuid.UUID, razorpay_subscription_id: str | None = None
+) -> None:
     """Webhook's background activation on a fresh session — never blocks the 200.
 
     Failure-safe twin of ``verify``: provisions AND credits the prepaid-minute
     bundle (idempotent) in case the client-side verify was lost.
+
+    ``razorpay_subscription_id`` pins the subscription the webhook was actually
+    about — selecting latest-by-created_at silently no-op'd when the user opened
+    checkout twice and paid the OLDER subscription.
 
     DEFENSE IN DEPTH: the subscription is re-verified against the Razorpay API
     (the source of truth) BEFORE anything is granted — so a forged or replayed
@@ -310,12 +320,15 @@ async def _bg_activate(organization_id: uuid.UUID) -> None:
 
     try:
         async with AsyncSessionLocal() as db:
-            sub = (
-                await db.execute(
-                    select(Subscription)
-                    .where(Subscription.organization_id == organization_id)
-                    .order_by(Subscription.created_at.desc())
+            _sub_q = select(Subscription).where(
+                Subscription.organization_id == organization_id
+            )
+            if razorpay_subscription_id:
+                _sub_q = _sub_q.where(
+                    Subscription.razorpay_subscription_id == razorpay_subscription_id
                 )
+            sub = (
+                await db.execute(_sub_q.order_by(Subscription.created_at.desc()))
             ).scalars().first()
             if sub is None or not sub.razorpay_subscription_id:
                 logger.info("RAZORPAY: bg-activate skipped — no subscription for org %s", organization_id)
@@ -539,8 +552,13 @@ async def razorpay_webhook(request: Request, db: AsyncSession = Depends(deps.get
                 sub.razorpay_payment_id = pay_entity["id"]
             await db.commit()
             # Provision in the background so we return 200 fast (Razorpay retries
-            # on slow/failed deliveries; our activation is idempotent).
-            asyncio.create_task(_bg_activate(sub.organization_id))
+            # on slow/failed deliveries; our activation is idempotent). Retained
+            # in a module set — an untracked task can be GC'd mid-flight.
+            _task = asyncio.create_task(
+                _bg_activate(sub.organization_id, razorpay_subscription_id)
+            )
+            _bg_tasks.add(_task)
+            _task.add_done_callback(_bg_tasks.discard)
     elif event_type in {"subscription.cancelled", "subscription.completed", "subscription.halted"} and razorpay_subscription_id:
         # The subscription has truly ENDED: a cancel-at-cycle-end reached its cycle
         # end (the operative event for our perpetual plans), a fixed-term ran its

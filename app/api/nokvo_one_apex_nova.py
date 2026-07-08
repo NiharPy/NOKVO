@@ -139,7 +139,7 @@ async def nova_upload(
     from app.services.nova_agent_service import draft_missing, merge_draft_fields
 
     sid = session_id or store.new_session_id()
-    ns = store.AgentSessionStore.namespace(tr)
+    ns = store.user_namespace(tr, user)
     merged: dict = {}
 
     def _merge(state: dict) -> None:
@@ -189,10 +189,11 @@ async def nova_session(
     user: OrganizationUser = Depends(_apex_user_dep()),
     db: AsyncSession = Depends(deps.get_db),
 ):
-    """Restore a chat session (panel reopen). Tenant-namespaced key — another
-    org's session id resolves to an empty session, never to data."""
+    """Restore a chat session (panel reopen). Tenant+user-namespaced key — another
+    org's (or another user's) session id resolves to an empty session, never to
+    data."""
     tr = await _tenant(db, user)
-    ns = store.AgentSessionStore.namespace(tr)
+    ns = store.user_namespace(tr, user)
     state = await store.load(ns, session_id[:64])
     return {
         "session_id": session_id[:64],
@@ -216,7 +217,7 @@ async def nova_confirm(
     """Consume the session's pending_action (atomic under the session lock) and
     execute it on confirm. Executors are registered per action type."""
     tr = await _tenant(db, user)
-    ns = store.AgentSessionStore.namespace(tr)
+    ns = store.user_namespace(tr, user)
 
     consumed: dict = {}
 

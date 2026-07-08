@@ -468,18 +468,23 @@ class PlivoService:
             return None
 
     @classmethod
-    async def list_account_numbers(cls, auth: tuple[str, str]) -> list[str]:
+    async def list_account_numbers(cls, auth: tuple[str, str], *, strict: bool = False) -> list[str]:
         """Every voice-capable DID rented on the (sub)account identified by ``auth``,
         in bare-digit form. Reads ``GET /Number/`` — the owned-number list, same
         ``objects`` envelope as the DID search. Used to rotate a campaign's outbound
         caller ID across all of a bulk sub-account's numbers instead of hammering
         one. Returns ``[]`` on any error so callers fall back to a single configured
-        caller ID. Pools are tiny, so the first page (limit 20) suffices."""
+        caller ID — EXCEPT under ``strict=True``, which re-raises: the DID
+        auto-provisioner must never read a listing failure as "pool empty" (that's
+        what made it re-buy paid DIDs). Pools are tiny, so the first page
+        (limit 20) suffices."""
         try:
             resp = await cls._request(
                 "GET", f"{cls._base(auth[0])}/Number/?limit=20", auth=auth
             )
         except Exception:
+            if strict:
+                raise
             return []
         out: list[str] = []
         seen: set[str] = set()

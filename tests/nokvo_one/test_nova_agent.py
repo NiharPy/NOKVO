@@ -13,6 +13,7 @@ from app.services import nova_session_store as store
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 class _FakeUser:
+    id = "00000000-0000-0000-0000-0000000000aa"
     organization_id = "00000000-0000-0000-0000-000000000001"
     role = "admin"
 
@@ -111,7 +112,9 @@ async def test_plain_reply_persists_history(monkeypatch):
     _mock_llm(monkeypatch, ["APEX dials 9 AM to 7 PM IST."])
     res = await nova.nova_turn(None, _FakeTenantRes(), _FakeUser(), None, "When do calls go out?")
     assert "9 AM" in res.reply
-    state = sessions[f"tenant:t1:{res.session_id}"]
+    # Sessions are tenant+USER namespaced (another user's session id must never
+    # resolve to someone else's chat/draft).
+    state = sessions[f"tenant:t1:u{_FakeUser.id}:{res.session_id}"]
     assert [h["role"] for h in state["history"]] == ["user", "assistant"]
 
 

@@ -82,7 +82,9 @@ async def test_ticket_tool_mints_card_without_persisting(monkeypatch):
     assert card["subject"] == "Calls failing since morning"
     assert "NO_ANSWER" in card["diagnosis_summary"]
     # Parked, not persisted: pending_action holds the payload incl. FULL diagnosis.
-    state = sessions[f"tenant:t1:{res.session_id}"]
+    # Sessions are tenant+USER namespaced (another user's session id must never
+    # resolve to someone else's chat/draft).
+    state = sessions[f"tenant:t1:u{_FakeUser.id}:{res.session_id}"]
     pending = state["pending_action"]
     assert pending["action_id"] == card["action_id"]
     assert pending["type"] == "create_ticket"

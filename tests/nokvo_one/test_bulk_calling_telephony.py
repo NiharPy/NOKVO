@@ -399,8 +399,9 @@ async def test_get_by_call_link_id_resolves_v2_row_contact():
 
     class _DB:
         def __init__(self):
-            # In call order: blob scan (empty), OCC row hit, campaign load.
-            self._queue = [_R([]), _R([row]), _R([camp])]
+            # In call order: OCC row hit FIRST (the indexed lookup now leads —
+            # the all-campaigns blob scan is gone), then the campaign load.
+            self._queue = [_R([row]), _R([camp])]
 
         async def execute(self, stmt):
             return self._queue.pop(0)
@@ -559,3 +560,62 @@ async def test_rerun_resurrects_a_cancelled_v2_campaign(monkeypatch):
     # The status flip no longer excludes cancelled — that's the resurrect.
     flip = next(s for s in executed if "status = 'running'" in s)
     assert "cancelled" not in flip
+
+
+# ── subscription-end gate: calling_enabled=False stops RUNNING campaigns ─────
+
+
+@pytest.mark.asyncio
+async def test_dial_pending_stops_when_calling_disabled(monkeypatch):
+    """The Razorpay cancelled/halted webhook flips calling_enabled off to suspend
+    service — that must stop webhook refills + ticker dials on RUNNING campaigns,
+    not just new launches. Credits stay; re-subscribe resumes."""
+    import uuid as _uuid
+    from types import SimpleNamespace
+
+    from app.models.outbound_campaign import CampaignStatus, OutboundCampaign
+    from app.services.outbound_campaign_service import OutboundCampaignService
+
+    called = {"v2": 0}
+
+    async def fake_v2(campaign, db, **kw):
+        called["v2"] += 1
+
+    monkeypatch.setattr(OutboundCampaignService, "_dial_pending_v2", staticmethod(fake_v2))
+
+    class _OrgDB:
+        def __init__(self, calling_enabled):
+            self._row = ("nokvo_apex", calling_enabled)
+
+        async def execute(self, stmt, params=None):
+            row = self._row
+
+            class _R:
+                def first(self):
+                    return row
+
+            return _R()
+
+    camp = OutboundCampaign(
+        id=_uuid.uuid4(), tenant_id="t1", name="c", status=CampaignStatus.running,
+        agent_config={"bulk_csv": True}, contacts=None,
+    )
+    tr = SimpleNamespace(tenant_id="t1", organization_id=_uuid.uuid4(), provider_status={})
+
+    # Disabled → returns before ANY dial path (no V2 claim, no balance read).
+    await OutboundCampaignService._dial_pending(
+        camp, _OrgDB(False), tenant_res=tr, base="https://x", prefix="/api"
+    )
+    assert called["v2"] == 0
+
+    # Enabled → proceeds to the V2 dial path (balance gate stubbed to pass).
+    async def _has_balance(db, org_id, **kw):
+        return True
+
+    import app.services.minute_balance_service as _mb
+
+    monkeypatch.setattr(_mb, "has_balance", _has_balance)
+    await OutboundCampaignService._dial_pending(
+        camp, _OrgDB(True), tenant_res=tr, base="https://x", prefix="/api"
+    )
+    assert called["v2"] == 1

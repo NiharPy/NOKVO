@@ -71,26 +71,52 @@ async def _poll_tenant(db, tr: TenantResources) -> bool:
         return False
 
     # Approved → rent + assign, linking the approved compliance application.
-    try:
-        rented = await PlivoService.rent_number(
-            country=settings.PLIVO_NUMBER_COUNTRY,
-            app_id=plivo.get("application_id"),
-            sub_auth_id=plivo.get("subaccount_auth_id"),
-            compliance_application_id=str(compliance_app_id),
-        )
-    except PlivoError as exc:
-        logger.info("PLIVO-POLLER: approved but not yet rentable for tenant=%s: %s", tr.tenant_id, exc)
-        return False
-    number = rented.get("number")
-    if not number:
-        return False
+    # Under the per-tenant provisioning lock: every replica runs this poller, and
+    # without single-flight two replicas both see "no number yet" and each rent a
+    # paid DID. Locked out (or Redis down) → defer to the next tick.
+    from app.services.plivo_bulk_provisioning_service import (
+        _acquire_provision_lock,
+        _release_provision_lock,
+    )
 
-    PlivoComplianceService._save(tr, compliance=compliance, number=number, number_status="active")
-    flag_modified(tr, "provider_status")
-    db.add(tr)
-    await db.commit()
-    logger.info("PLIVO-POLLER: allotted number %s for tenant=%s", number, tr.tenant_id)
-    return True
+    lock_token = await _acquire_provision_lock(tr.tenant_id)
+    if lock_token is None:
+        return False
+    try:
+        # Re-check on a FRESH row once locked — this tenant snapshot can be
+        # minutes old (the poll loads every tenant up front) and another replica
+        # may have just allotted the number.
+        try:
+            await db.refresh(tr)
+        except Exception:
+            pass  # non-ORM stand-in (tests) — proceed on the given snapshot
+        plivo = dict((tr.provider_status or {}).get("plivo") or {})
+        if plivo.get("number"):
+            return False
+        compliance = dict(plivo.get("compliance") or {})
+
+        try:
+            rented = await PlivoService.rent_number(
+                country=settings.PLIVO_NUMBER_COUNTRY,
+                app_id=plivo.get("application_id"),
+                sub_auth_id=plivo.get("subaccount_auth_id"),
+                compliance_application_id=str(compliance_app_id),
+            )
+        except PlivoError as exc:
+            logger.info("PLIVO-POLLER: approved but not yet rentable for tenant=%s: %s", tr.tenant_id, exc)
+            return False
+        number = rented.get("number")
+        if not number:
+            return False
+
+        PlivoComplianceService._save(tr, compliance=compliance, number=number, number_status="active")
+        flag_modified(tr, "provider_status")
+        db.add(tr)
+        await db.commit()
+        logger.info("PLIVO-POLLER: allotted number %s for tenant=%s", number, tr.tenant_id)
+        return True
+    finally:
+        await _release_provision_lock(tr.tenant_id, lock_token)
 
 
 async def _poll_tenant_bulk(db, tr: TenantResources) -> None:

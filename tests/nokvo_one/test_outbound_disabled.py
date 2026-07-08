@@ -24,21 +24,27 @@ def _run(coro):
 
 
 class _Result:
-    def __init__(self, val):
+    def __init__(self, val, calling_enabled=True):
         self._val = val
+        self._calling = calling_enabled
 
     def scalar_one_or_none(self):
         return self._val
+
+    def first(self):
+        # The dialer's org probe reads (product_tier, calling_enabled).
+        return (self._val, self._calling)
 
 
 class _DB:
     """Minimal async DB stub: every execute() yields the configured tier."""
 
-    def __init__(self, tier):
+    def __init__(self, tier, calling_enabled=True):
         self._tier = tier
+        self._calling = calling_enabled
 
     async def execute(self, *a, **k):
-        return _Result(self._tier)
+        return _Result(self._tier, self._calling)
 
 
 # ── API helper ────────────────────────────────────────────────────────────────

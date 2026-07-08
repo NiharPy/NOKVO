@@ -43,14 +43,16 @@ def _tr(app_id="app-123", bulk=None, sub_auth="ACCTSUB", sub_token="acct-token")
 
 @pytest.fixture
 def plivo(monkeypatch):
-    """Mock the Plivo primitives + a configurable compliance status / sell behaviour."""
+    """Mock the Plivo primitives + a configurable compliance status / sell behaviour.
+    The cross-replica Redis provision lock is stubbed to always-acquired (these
+    tests pin the buy logic, not the lock)."""
     state = {"owned": [], "compliance_status": "approved", "rent_calls": 0, "create_calls": 0, "rent_raises": False}
 
     async def create_subaccount(name):
         state["create_calls"] += 1
         return {"auth_id": "SUBAUTH", "auth_token": "subtoken"}
 
-    async def list_account_numbers(auth):
+    async def list_account_numbers(auth, *, strict=False):
         return list(state["owned"])
 
     async def rent_number(**kwargs):
@@ -64,12 +66,22 @@ def plivo(monkeypatch):
     async def _request(method, url, **kwargs):
         return {"status": state["compliance_status"]}
 
+    async def _lock_ok(tenant_id):
+        return "test-lock-token"
+
+    async def _unlock(tenant_id, token):
+        return None
+
     monkeypatch.setattr(PlivoService, "create_subaccount", staticmethod(create_subaccount))
     monkeypatch.setattr(PlivoService, "list_account_numbers", staticmethod(list_account_numbers))
     monkeypatch.setattr(PlivoService, "rent_number", staticmethod(rent_number))
     monkeypatch.setattr(PlivoService, "_master_auth", staticmethod(lambda: ("M", "T")))
     monkeypatch.setattr(PlivoService, "_base", staticmethod(lambda a: "https://api.plivo.test"))
     monkeypatch.setattr(PlivoService, "_request", staticmethod(_request))
+    import app.services.plivo_bulk_provisioning_service as _bulk_mod
+
+    monkeypatch.setattr(_bulk_mod, "_acquire_provision_lock", _lock_ok)
+    monkeypatch.setattr(_bulk_mod, "_release_provision_lock", _unlock)
     return state
 
 
@@ -151,6 +163,54 @@ async def test_partial_then_retry_tops_up_without_exceeding(plivo):
     before = plivo["rent_calls"]
     cfg3 = await PlivoBulkProvisioningService._buy_pending_numbers(tr, _FakeDB())
     assert plivo["rent_calls"] == before and len(cfg3["numbers"]) == 5
+
+
+@pytest.mark.asyncio
+async def test_listing_failure_defers_buy_never_rebuys(plivo, monkeypatch):
+    """A failed owned-numbers listing must NEVER read as "pool empty → buy 5"
+    (that re-bought paid DIDs). Strict mode defers: no rents, error recorded,
+    status stays provisioning for the next poll tick."""
+    async def boom(auth, *, strict=False):
+        raise PlivoError("listing down")
+
+    monkeypatch.setattr(PlivoService, "list_account_numbers", staticmethod(boom))
+    cfg = await PlivoBulkProvisioningService.start_auto_provision(_tr(), _FakeDB(), superadmin_id="sa")
+    assert plivo["rent_calls"] == 0
+    assert cfg["status"] == "provisioning"
+    assert "list" in (cfg.get("error") or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_lock_not_acquired_skips_buy(plivo, monkeypatch):
+    """Another replica holds the per-tenant provision lock (or Redis is down) →
+    this run buys nothing and defers — single-flight is what stops two replicas
+    each buying the "missing" DIDs."""
+    import app.services.plivo_bulk_provisioning_service as _bulk_mod
+
+    async def _locked_out(tenant_id):
+        return None
+
+    monkeypatch.setattr(_bulk_mod, "_acquire_provision_lock", _locked_out)
+    cfg = await PlivoBulkProvisioningService.start_auto_provision(_tr(), _FakeDB(), superadmin_id="sa")
+    assert plivo["rent_calls"] == 0
+    assert cfg["status"] == "provisioning"
+
+
+@pytest.mark.asyncio
+async def test_listing_lag_unions_persisted_numbers(plivo):
+    """A just-bought DID can lag the live listing — the persisted record is
+    unioned in so the remainder never re-buys a number already paid for."""
+    tr = _tr(bulk={
+        "auth_id": "ACCTSUB",
+        "auth_token_enc": encrypt_secret("acct-token"),
+        "numbers": ["919990009001", "919990009002"],  # paid for, not yet listing
+        "status": "provisioning",
+        "auto_provisioned": True,
+    })
+    plivo["owned"] = ["919990009001"]  # listing lags: shows only 1 of the 2
+    cfg = await PlivoBulkProvisioningService._buy_pending_numbers(tr, _FakeDB())
+    assert plivo["rent_calls"] == 3  # tops up 5 − 2 (union), NOT 5 − 1
+    assert len(cfg["numbers"]) == 5
 
 
 # ── manual path: enable on the existing sub-account (no buying, no creds pasted) ──

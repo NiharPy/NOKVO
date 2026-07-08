@@ -20,8 +20,19 @@ def _run(coro):
 
 
 class _DB:
+    """Fake session: the V2 pre-checks (`exists` probe / v2.set_lead_status owner
+    read) resolve to "no V2 row" so the endpoints exercise the legacy blob path
+    these tests pin."""
+
     async def commit(self):
         pass
+
+    async def execute(self, stmt, params=None):
+        class _R:
+            def scalar_one_or_none(self):
+                return None
+
+        return _R()
 
 
 def _campaign(contacts, cfg=None):
@@ -85,7 +96,7 @@ def _lock_returns(monkeypatch, camp):
 
 
 def test_claim_sets_owner_then_second_claim_409(patched):
-    camp = _campaign([{"call_link_id": "a", "phone": "+919", "name": "N"}])
+    camp = _campaign([{"call_link_id": "a", "phone": "+919", "name": "N", "lead_score": 1}])
     _lock_returns(patched, camp)
     user = _user()
     row = _run(m.apex_claim_lead(camp.id, "a", user=user, db=_DB()))
@@ -95,6 +106,17 @@ def test_claim_sets_owner_then_second_claim_409(patched):
     with pytest.raises(m.HTTPException) as exc:
         _run(m.apex_claim_lead(camp.id, "a", user=_user(), db=_DB()))
     assert exc.value.status_code == 409
+
+
+def test_claim_rejects_unqualified_contact(patched):
+    """Only QUALIFIED contacts are claimable — a guessed call_link_id must not
+    let a member claim an unscored/failed contact (V2 enforces this in SQL; the
+    blob path mirrors it)."""
+    camp = _campaign([{"call_link_id": "a", "phone": "+919", "name": "N"}])  # unscored
+    _lock_returns(patched, camp)
+    with pytest.raises(m.HTTPException) as exc:
+        _run(m.apex_claim_lead(camp.id, "a", user=_user(), db=_DB()))
+    assert exc.value.status_code == 404
 
 
 def test_claim_unknown_contact_404(patched):
@@ -123,3 +145,59 @@ def test_status_rejects_bad_value(patched):
     with pytest.raises(m.HTTPException) as exc:
         _run(m.apex_set_lead_status(camp.id, "a", m.ApexLeadStatusRequest(status="bogus"), user=owner, db=_DB()))
     assert exc.value.status_code == 400
+
+
+# ── max_score uses the weighted helper (never len(questions)) ────────────────────
+
+
+def test_lead_row_max_score_weighted():
+    """A weighted questionnaire (points/tiers) must show the weighted maximum —
+    len(questions) rendered impossible '7/4' member-pool scores."""
+    camp = _campaign(
+        [],
+        cfg={"questionnaire": {"questions": [
+            {"points": 5}, {"tiers": [{"points": 1}, {"points": 3}]}, {},
+        ], "threshold": 4}},
+    )
+    row = m._lead_row({"call_link_id": "a", "phone": "+919", "lead_score": 7}, camp)
+    assert row["max_score"] == 9  # 5 + 3 + 1, not 3
+
+
+# ── invite guard: one APEX account per email, product-wide ────────────────────────
+
+
+def test_invite_rejects_email_owned_by_another_apex_org(patched):
+    """Login resolves by email across ALL APEX orgs, so a second org's seat makes
+    sign-in ambiguous (and invite-accept would overwrite the other org's row)."""
+    org = SimpleNamespace(id=uuid.uuid4(), name="Org A", product_tier="nokvo_apex")
+    other_org = SimpleNamespace(id=uuid.uuid4(), name="Org B", product_tier="nokvo_apex")
+    other_user = SimpleNamespace(id=uuid.uuid4(), organization_id=other_org.id)
+
+    class _InviteDB:
+        def __init__(self):
+            # In call order: _org (scalars().first() → inviter org), then
+            # _resolve_apex_user (.first() → (user, OTHER org)) → 409.
+            self._queue = [("scalars", org), ("first", (other_user, other_org))]
+
+        async def execute(self, stmt, params=None):
+            kind, value = self._queue.pop(0)
+
+            class _R:
+                def scalars(self):
+                    return self
+
+                def first(self):
+                    return value
+
+            return _R()
+
+    inviter = SimpleNamespace(id=uuid.uuid4(), organization_id=org.id, full_name="Admin")
+    with pytest.raises(m.HTTPException) as exc:
+        _run(m.apex_invite_member(
+            m.ApexMemberInviteRequest(email="dup@example.com"),
+            background=SimpleNamespace(add_task=lambda *a, **k: None),
+            inviter=inviter,
+            db=_InviteDB(),
+        ))
+    assert exc.value.status_code == 409
+    assert "another organization" in str(exc.value.detail)

@@ -376,6 +376,12 @@ def _evict_stale(now: float) -> None:
         _cache.pop(cid, None)
     while len(_cache) > _CAMPAIGN_CACHE_MAX:
         _cache.pop(next(iter(_cache)), None)
+    # Trim the lock table with the cache — it grew one entry per campaign ever
+    # loaded, forever. A load awaiting an evicted lock still holds its reference;
+    # a new caller minting a fresh lock costs at most one duplicate DB fetch.
+    if len(_locks) > _CAMPAIGN_CACHE_MAX:
+        for cid in [c for c in _locks if c not in _cache]:
+            _locks.pop(cid, None)
 
 
 def _coerce_str_list(value: Any) -> list[str]:
@@ -717,12 +723,17 @@ def build_agent_config(
     normalized_q = _coerce_questionnaire(questionnaire)
     if normalized_q:
         cfg["questionnaire"] = normalized_q
-    # Echo the calling-capacity window (clamped: ≥1 working day, 1–10 hours/day —
-    # outbound calling is limited to the 9 AM–7 PM IST band). Stored for planning
-    # + the capacity readout; not enforced by the dialer.
+    # Echo the calling schedule (clamped: 1–7 days/week, 1–10 hours/day —
+    # outbound calling is limited to the 9 AM–7 PM IST band). For NOKVO APEX the
+    # dialer ENFORCES it (hour/weekday window + the calls_per_day daily cap), so
+    # ``calls_per_day`` and the runtime ``dialed_today`` counter MUST be echoed
+    # here: this normalizer re-runs on every create path, and anything it doesn't
+    # echo is silently stripped from the stored config — dropping calls_per_day
+    # here is exactly what disabled the daily cap for form-created campaigns.
+    # ``hours_per_day`` stays a capacity readout (it does not narrow the window).
     if isinstance(call_window, dict) and call_window:
         try:
-            _wd = max(1, min(60, int(call_window.get("working_days") or 1)))
+            _wd = max(1, min(7, int(call_window.get("working_days") or 1)))
             _hd = max(1, min(10, int(call_window.get("hours_per_day") or 1)))
             cfg["call_window"] = {
                 "working_days": _wd,
@@ -730,6 +741,15 @@ def build_agent_config(
                 "timezone": "Asia/Kolkata",
                 "window_local": "09:00-19:00",
             }
+            try:
+                _cpd = int(call_window.get("calls_per_day") or 0)
+            except (TypeError, ValueError):
+                _cpd = 0
+            if _cpd > 0:
+                cfg["call_window"]["calls_per_day"] = _cpd
+            _dialed = call_window.get("dialed_today")
+            if isinstance(_dialed, dict):
+                cfg["call_window"]["dialed_today"] = _dialed
         except (TypeError, ValueError):
             pass
     return cfg

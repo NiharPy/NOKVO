@@ -118,3 +118,72 @@ def test_current_bundle_minutes_no_purchases(monkeypatch):
     monkeypatch.setattr(mb, "consumed_rupees", _consumed)
     # legacy/no-purchase → safe default 1000 (the ₹10 entry rate)
     assert _run(mb.current_bundle_minutes(_DB(), "org")) == 1000
+
+
+# ── APEX tester calls never deplete the wallet ────────────────────────────────
+
+
+def test_apex_tester_call_never_deducts(monkeypatch):
+    """record_call_cost deducts for EVERY connected APEX call — except browser
+    tester sessions (kind="tester"): the stream service deliberately passes
+    deducts_prepaid=False for those and the tier override must not undo it."""
+    import uuid
+    from datetime import datetime, timedelta, timezone
+
+    import app.services.call_cost_recorder as rec
+
+    priced = {"apex": 0}
+
+    async def _bundle(db, org):
+        return 1000
+
+    def _apex_cost(seconds, bundle_minutes):
+        priced["apex"] += 1
+        from decimal import Decimal
+
+        return Decimal("3.5")
+
+    monkeypatch.setattr(mb, "current_bundle_minutes", _bundle)
+    import app.services.minute_pricing as mp
+
+    monkeypatch.setattr(mp, "apex_call_cost", _apex_cost)
+
+    async def _mtd(db, org, now):
+        return 0
+
+    monkeypatch.setattr(rec, "_month_to_date_billed_minutes", _mtd)
+
+    class _DB:
+        async def execute(self, stmt, params=None):
+            class _R:
+                def scalar_one_or_none(self):
+                    return "nokvo_apex"  # the org-tier probe
+
+                def first(self):
+                    return None  # insert: ON CONFLICT path → early return
+
+            return _R()
+
+        async def commit(self):
+            pass
+
+        async def rollback(self):
+            pass
+
+    start = datetime.now(timezone.utc)
+
+    # Tester session on an APEX org: the deduction pricing must never run.
+    _run(rec.record_call_cost(
+        _DB(), organization_id=uuid.uuid4(), tenant_id="t1", call_id="tester:1",
+        started_at=start, ended_at=start + timedelta(seconds=60),
+        kind="tester", deducts_prepaid=False,
+    ))
+    assert priced["apex"] == 0
+
+    # A real outbound APEX call DOES price the deduction (tier override).
+    _run(rec.record_call_cost(
+        _DB(), organization_id=uuid.uuid4(), tenant_id="t1", call_id="call:1",
+        started_at=start, ended_at=start + timedelta(seconds=60),
+        kind="outbound", deducts_prepaid=False,
+    ))
+    assert priced["apex"] == 1

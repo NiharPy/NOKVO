@@ -53,11 +53,16 @@ APEX_TIER = "nokvo_apex"
 async def _resolve_apex_user(db: AsyncSession, email: str) -> tuple[OrganizationUser, Organization] | None:
     """Find the (user, org) for ``email`` within the APEX product, or None.
     Scoped to ``product_tier="nokvo_apex"`` so a Nokvo One account with the same
-    email is never matched."""
+    email is never matched. Deterministic (oldest seat wins) in the historical
+    case where the same email got seats in two APEX orgs — the member-invite
+    guard now prevents new ones, but an unordered ``.first()`` made which
+    account you logged into arbitrary."""
     res = await db.execute(
         select(OrganizationUser, Organization)
         .join(Organization, Organization.id == OrganizationUser.organization_id)
         .where(OrganizationUser.email == email, Organization.product_tier == APEX_TIER)
+        .order_by(OrganizationUser.created_at.asc())
+        .limit(1)
     )
     row = res.first()
     if row is None:

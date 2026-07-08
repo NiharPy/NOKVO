@@ -24,6 +24,7 @@ captured into ``bulk_calling["error"]`` and retried on the next poll.
 from __future__ import annotations
 
 import logging
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
@@ -38,6 +39,49 @@ logger = logging.getLogger(__name__)
 
 # The fixed size of the bulk caller-ID pool. NOT operator-configurable.
 BULK_DID_COUNT = 5
+
+# Cross-replica serialization of DID buying. Every replica runs the number
+# poller, and a count-then-buy spans several Plivo round-trips — two replicas
+# interleaving it each buy the "missing" DIDs (paid duplicates). A short Redis
+# NX lock keyed by tenant makes the buy section single-flight across replicas
+# (Postgres session-level advisory locks are NOT an option here: the pooled
+# AsyncSession swaps connections at each commit, stranding the lock). Fail
+# CLOSED on Redis errors — not buying is the cost-safe failure; the poller
+# retries next tick.
+_PROVISION_LOCK_TTL_S = 600  # ≥ worst case (≤16 Plivo calls × 30s); self-clears within one poll tick
+
+
+def _provision_lock_key(tenant_id: str) -> str:
+    return f"lock:plivo-provision:{tenant_id}"
+
+
+async def _acquire_provision_lock(tenant_id: str) -> str | None:
+    """SET NX a per-tenant token; None when another replica holds it (or Redis
+    is down — cost-safe skip). Mirrors nova_session_store's lock discipline."""
+    from app.services.agent_session_store import AgentSessionStore
+
+    token = uuid.uuid4().hex
+    try:
+        ok = await AgentSessionStore.client().set(
+            _provision_lock_key(tenant_id), token, nx=True, ex=_PROVISION_LOCK_TTL_S
+        )
+        return token if ok else None
+    except Exception:
+        return None
+
+
+async def _release_provision_lock(tenant_id: str, token: str) -> None:
+    """Delete the lock only if we still own it (token match) — never clobber a
+    successor's lock after our TTL lapsed. Best-effort."""
+    try:
+        from app.services.agent_session_store import AgentSessionStore
+
+        client = AgentSessionStore.client()
+        key = _provision_lock_key(tenant_id)
+        if (await client.get(key)) == token:
+            await client.delete(key)
+    except Exception:
+        pass
 
 
 class PlivoBulkProvisioningService:
@@ -231,36 +275,75 @@ class PlivoBulkProvisioningService:
             await db.commit()
             return cfg
 
-        # Re-count what the sub-account already owns (idempotency + cost safety) and
-        # only buy the remainder up to the fixed 5.
-        owned = await PlivoService.list_account_numbers(bulk_auth)
-        buy_error: str | None = None
-        for _ in range(max(0, BULK_DID_COUNT - len(owned))):
+        # Single-flight across replicas: the count-then-buy below spans several
+        # Plivo round-trips, so two concurrent runs would each buy the "missing"
+        # DIDs. Locked out (or Redis down) → defer to the next tick.
+        lock_token = await _acquire_provision_lock(tenant_res.tenant_id)
+        if lock_token is None:
+            return cfg
+        try:
+            # Re-read under the lock: this tenant snapshot can be minutes old
+            # (the poller loads every tenant up front), and another replica may
+            # have just completed the pool — the lock serializes, the refresh
+            # freshens.
             try:
-                rented = await PlivoService.rent_number(
-                    sub_auth_id=str(bulk_auth_id),
-                    compliance_application_id=compliance_app_id,
-                )
-            except PlivoError as exc:
-                buy_error = str(exc)[:300]
-                break  # stop; the poller retries on the next tick
-            num = PlivoService.normalize_number(rented.get("number"))
-            if num and num not in owned:
-                owned.append(num)
+                await db.refresh(tenant_res)
+            except Exception:
+                pass  # non-ORM stand-in (tests) — proceed on the given snapshot
+            cfg = cls._bulk_config(tenant_res)
+            if cfg.get("status") == "active":
+                return cfg
 
-        cfg["numbers"] = owned
-        if owned:
-            cfg["number"] = owned[0]
-            cfg["enabled"] = True
-        cfg["status"] = "active" if len(owned) >= BULK_DID_COUNT else "provisioning"
-        if buy_error and len(owned) < BULK_DID_COUNT:
-            cfg["error"] = buy_error
-        else:
-            cfg.pop("error", None)
-        cls._save(tenant_res, cfg)
-        await db.commit()
-        logger.info(
-            "PLIVO-BULK: tenant=%s pool=%d/%d status=%s",
-            tenant_res.tenant_id, len(owned), BULK_DID_COUNT, cfg["status"],
-        )
-        return cfg
+            # Re-count what the sub-account already owns (idempotency + cost
+            # safety) and only buy the remainder up to the fixed 5. STRICT: a
+            # failed listing must never read as "pool empty" (that's what
+            # re-bought paid DIDs) — defer instead.
+            try:
+                owned = await PlivoService.list_account_numbers(bulk_auth, strict=True)
+            except Exception as exc:
+                cfg["error"] = f"could not list owned numbers: {str(exc)[:200]}"
+                cfg["status"] = "provisioning"
+                cls._save(tenant_res, cfg)
+                await db.commit()
+                return cfg
+            # Union with the persisted record — a just-bought DID can lag the
+            # live listing ("a moment to settle"), and a lagging listing must
+            # never trigger a re-buy of a number we already paid for.
+            owned = list(dict.fromkeys([*owned, *(cfg.get("numbers") or [])]))
+            buy_error: str | None = None
+            for _ in range(max(0, BULK_DID_COUNT - len(owned))):
+                try:
+                    rented = await PlivoService.rent_number(
+                        sub_auth_id=str(bulk_auth_id),
+                        compliance_application_id=compliance_app_id,
+                    )
+                except PlivoError as exc:
+                    buy_error = str(exc)[:300]
+                    break  # stop; the poller retries on the next tick
+                num = PlivoService.normalize_number(rented.get("number"))
+                if num and num not in owned:
+                    owned.append(num)
+                    # Persist each purchase immediately — a crash mid-loop must
+                    # never lose a paid DID from the record.
+                    cfg["numbers"] = owned
+                    cls._save(tenant_res, cfg)
+                    await db.commit()
+
+            cfg["numbers"] = owned
+            if owned:
+                cfg["number"] = owned[0]
+                cfg["enabled"] = True
+            cfg["status"] = "active" if len(owned) >= BULK_DID_COUNT else "provisioning"
+            if buy_error and len(owned) < BULK_DID_COUNT:
+                cfg["error"] = buy_error
+            else:
+                cfg.pop("error", None)
+            cls._save(tenant_res, cfg)
+            await db.commit()
+            logger.info(
+                "PLIVO-BULK: tenant=%s pool=%d/%d status=%s",
+                tenant_res.tenant_id, len(owned), BULK_DID_COUNT, cfg["status"],
+            )
+            return cfg
+        finally:
+            await _release_provision_lock(tenant_res.tenant_id, lock_token)

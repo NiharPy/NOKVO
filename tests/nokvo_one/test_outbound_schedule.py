@@ -64,3 +64,42 @@ def test_daily_counter_reset_on_rollover():
     assert _dialed_today_count(cw, "2026-06-27") == 0     # new day → reset
     assert _dialed_today_count({}, "2026-06-27") == 0     # never dialed → 0
     assert _dialed_today_count({"dialed_today": {"date": "2026-06-27", "count": "x"}}, "2026-06-27") == 0
+
+
+# ── build_agent_config echoes the FULL call_window ────────────────────────────
+# The normalizer re-runs on every create path; anything it doesn't echo is
+# silently stripped from the stored config. Dropping calls_per_day here is
+# exactly what disabled the daily cap for every form-created APEX campaign.
+
+
+def test_build_agent_config_echoes_calls_per_day_and_dialed_today():
+    from app.services.agent_outbound_context import build_agent_config
+
+    cfg = build_agent_config(
+        agent_prompt="pitch",
+        call_window={
+            "working_days": 5,
+            "hours_per_day": 10,
+            "calls_per_day": 200,
+            "dialed_today": {"date": "2026-07-08", "count": 37},
+        },
+    )
+    w = cfg["call_window"]
+    assert w["calls_per_day"] == 200           # the daily cap SURVIVES normalization
+    assert w["dialed_today"] == {"date": "2026-07-08", "count": 37}  # runtime counter too
+    assert w["working_days"] == 5 and w["hours_per_day"] == 10
+    assert w["window_local"] == "09:00-19:00"
+
+
+def test_build_agent_config_call_window_clamps_and_omits_zero_cap():
+    from app.services.agent_outbound_context import build_agent_config
+
+    cfg = build_agent_config(
+        agent_prompt="pitch",
+        call_window={"working_days": 99, "hours_per_day": 24, "calls_per_day": 0},
+    )
+    w = cfg["call_window"]
+    assert w["working_days"] == 7              # days/week clamp (was min(60) — a bug)
+    assert w["hours_per_day"] == 10            # 9AM–7PM band
+    assert "calls_per_day" not in w            # 0/absent → no cap key
+    assert "dialed_today" not in w

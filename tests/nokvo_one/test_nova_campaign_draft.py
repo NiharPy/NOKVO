@@ -118,7 +118,8 @@ async def test_set_fields_merges_and_reports_next(monkeypatch):
     monkeypatch.setattr(nova, "_llm", fake_llm)
     res = await nova.nova_turn(None, _FakeTenantRes(), _FakeUser(), None, "we sell 3BHKs at Skyline Heights")
     assert res.tool_calls == ["set_campaign_fields"]
-    state = sessions[f"tenant:t1:{res.session_id}"]
+    # Sessions are tenant+USER namespaced.
+    state = sessions[f"tenant:t1:u{_FakeUser.id}:{res.session_id}"]
     assert "Skyline Heights" in state["draft"]["content"]
 
 

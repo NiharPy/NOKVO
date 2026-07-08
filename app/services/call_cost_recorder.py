@@ -165,7 +165,10 @@ async def record_call_cost(
     except Exception:
         _product_tier = None
     _is_apex = (_product_tier or "") == "nokvo_apex"
-    if duration_seconds > 0 and (deducts_prepaid or _is_apex):
+    # APEX deducts for EVERY connected call — but never a browser tester session
+    # (kind="tester"): the stream service deliberately passes deducts_prepaid=
+    # False for those, and the tier override must not undo that.
+    if duration_seconds > 0 and (deducts_prepaid or (_is_apex and kind != "tester")):
         try:
             from app.services.minute_balance_service import current_bundle_minutes
 

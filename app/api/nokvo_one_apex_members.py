@@ -103,10 +103,17 @@ def _is_qualified(contact: dict, cfg: dict) -> bool:
 
 
 def _lead_row(contact: dict, campaign) -> dict:
+    from app.services.agent_outbound_context import questionnaire_max_points
+
     cfg = campaign.agent_config or {}
     q = cfg.get("questionnaire") or {}
     has_q = bool(q.get("questions"))
-    max_score = cfg.get("max_score") or (len(q.get("questions") or []) if has_q else None)
+    # Weighted/graded points via the ONE shared helper — len(questions) showed
+    # members impossible "7/4" scores on any weighted questionnaire (the campaign
+    # endpoints already use this denominator).
+    max_score = cfg.get("max_score") or (
+        questionnaire_max_points(q.get("questions")) if has_q else None
+    )
     score = contact.get("lead_score")
     return {
         "campaign_id": str(campaign.id),
@@ -154,6 +161,19 @@ async def apex_invite_member(
     organization = await _org(db, inviter.organization_id)
     email = normalize_email(payload.email)
     now = datetime.now(timezone.utc)
+
+    # One APEX account per email, PRODUCT-wide: login resolves by email across
+    # all APEX orgs, so a second org's seat makes sign-in ambiguous — and the
+    # invite-accept below overwrites password_hash/status on whichever row it
+    # points at. Same-org re-invites are handled by the recycle logic below.
+    from app.api.nokvo_one_apex_auth import _resolve_apex_user
+
+    _other = await _resolve_apex_user(db, email)
+    if _other is not None and _other[1].id != organization.id:
+        raise HTTPException(
+            status_code=409,
+            detail="This email already has an APEX account with another organization.",
+        )
 
     existing = (
         await db.execute(
@@ -420,6 +440,10 @@ async def apex_claim_lead(
     contacts = list(campaign.contacts or [])
     idx, contact = _find_contact(campaign, call_link_id)
     if idx is None:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    # Only QUALIFIED contacts are claimable — a guessed link id must not let a
+    # member claim an unqualified contact (the V2 path enforces this in SQL).
+    if not _is_qualified(contact, campaign.agent_config or {}):
         raise HTTPException(status_code=404, detail="Lead not found")
     if str(contact.get("claimed_by") or "").strip():
         raise HTTPException(status_code=409, detail="already_claimed")

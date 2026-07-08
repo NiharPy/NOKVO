@@ -25,9 +25,19 @@ import uuid
 
 import pytest
 
+from app.core.config import settings
 from app.models.outbound_campaign import CampaignStatus, OutboundCampaign
 from app.services.outbound_campaign_service import OutboundCampaignService as S
 from app.services.plivo_service import PlivoService
+
+
+@pytest.fixture(autouse=True)
+def _legacy_blob_path(monkeypatch):
+    """These tests pin the LEGACY blob dialer/webhook races. With the V2 flag on
+    (the default) a bulk campaign routes to the per-row claim path, which opens a
+    real AsyncSessionLocal — force the blob path these were written for. The V2
+    claim/webhook races have their own tests in test_campaign_contacts_v2.py."""
+    monkeypatch.setattr(settings, "CAMPAIGN_CONTACTS_V2", False)
 
 
 class _FakeResult:
@@ -48,7 +58,7 @@ class _FakeDB:
         self.commits = 0
         self.added = []
 
-    async def execute(self, _stmt):
+    async def execute(self, _stmt, _params=None):
         return _FakeResult()
 
     def add(self, obj):
@@ -204,9 +214,10 @@ async def test_handle_hangup_marks_ended_without_reverting_siblings(monkeypatch)
     await S.handle_call_status(stale, "L1", "call.hangup", {"hangup_cause": "NORMAL_CLEARING"}, db)
 
     by = {c["phone"]: c for c in fresh.contacts}
-    # L1 ended/failed …
+    # L1 ended, classified no_answer (NORMAL_CLEARING isn't an active
+    # busy/reject — the mapping now matches the V2 path) …
     assert by["911"].get("ended") is True
-    assert by["911"]["status"] == "failed"
+    assert by["911"]["status"] == "no_answer"
     # … and crucially L2 is left exactly as it was — NOT reverted to "pending".
     assert by["922"]["status"] == "calling"
     assert not by["922"].get("ended")

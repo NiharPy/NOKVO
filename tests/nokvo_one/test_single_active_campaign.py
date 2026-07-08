@@ -102,9 +102,17 @@ async def test_maybe_complete_leaves_non_running_statuses_alone():
 class _CancelDB:
     def __init__(self):
         self.committed = False
+        self.lock_taken = False
 
     def add(self, obj):
         pass
+
+    async def execute(self, stmt, params=None):
+        # cancel takes the per-campaign advisory lock (same key as the V2
+        # claim) so a cancel can't land unnoticed mid-claim.
+        if "pg_advisory_xact_lock" in str(stmt):
+            self.lock_taken = True
+        return _Result()
 
     async def commit(self):
         self.committed = True

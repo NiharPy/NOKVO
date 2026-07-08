@@ -36,6 +36,15 @@ def new_session_id() -> str:
     return uuid.uuid4().hex
 
 
+def user_namespace(tenant_res: Any, user: Any) -> str:
+    """Tenant+USER session namespace. Sessions are keyed per user, not just per
+    tenant — a session id alone must never let another user in the same org read
+    or continue someone else's chat (and history/drafts are role-scoped: a
+    member must not inherit an admin's campaign draft). Sessions are 30-min-TTL
+    ephemeral, so the keying change just orphans old ones."""
+    return f"{AgentSessionStore.namespace(tenant_res)}:u{getattr(user, 'id', '')}"
+
+
 def _key(tenant_namespace: str, session_id: str) -> str:
     return f"nova:{tenant_namespace}:{session_id}"
 
