@@ -46,6 +46,26 @@ def _collect(questionnaire: dict[str, Any]) -> list[dict[str, str]]:
     return items
 
 
+def drop_stale_i18n(new_q: dict[str, Any], old_q: dict[str, Any] | None) -> None:
+    """Campaign EDIT support: when a line's authored text changed, its
+    pre-translated languages describe the OLD text — speaking them would say the
+    wrong thing in hi/te. Drop the i18n for exactly those lines (matched by
+    question ``id``; intro/outro by value) so ``translate_questionnaire`` refills
+    them, while unchanged lines keep their (possibly hand-edited) translations."""
+    old_by_id = {
+        str(q.get("id") or ""): q for q in ((old_q or {}).get("questions") or [])
+    }
+    for q in new_q.get("questions") or []:
+        old = old_by_id.get(str(q.get("id") or ""))
+        if old is not None and (
+            str(old.get("text") or "").strip() != str(q.get("text") or "").strip()
+        ):
+            q.pop("text_i18n", None)
+    for key, i18n_key in (("intro", "intro_i18n"), ("outro", "outro_i18n")):
+        if str((old_q or {}).get(key) or "").strip() != str(new_q.get(key) or "").strip():
+            new_q.pop(i18n_key, None)
+
+
 def _merge_i18n(existing: Any, tr: dict[str, str]) -> dict[str, str]:
     """Fill missing languages from the fresh translation WITHOUT overwriting a
     non-empty existing value. An admin who hand-edited one language (leaving

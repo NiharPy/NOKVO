@@ -509,3 +509,53 @@ async def test_resume_v2_refuses_when_nothing_pending(monkeypatch):
         await OutboundCampaignService.resume_campaign(
             camp, _ResumeFakeDB(), tenant_res=object(), public_base_url="https://x"
         )
+
+
+@pytest.mark.asyncio
+async def test_rerun_resurrects_a_cancelled_v2_campaign(monkeypatch):
+    """Stop → Re-run must work: re-arm the unreached and flip cancelled →
+    running (the operator explicitly asked; the one-campaign guard already
+    ensured the slot is free)."""
+    from app.core.config import settings
+    from app.models.outbound_campaign import CampaignStatus
+    from app.services import campaign_contacts_v2 as v2
+    from app.services.outbound_campaign_service import OutboundCampaignService
+
+    _stub_single_campaign_guard(monkeypatch)
+    monkeypatch.setattr(PlivoService, "bulk_calling_enabled", staticmethod(lambda tr: True))
+    monkeypatch.setattr(PlivoService, "bulk_calling_caller_id", staticmethod(lambda tr: "912264232977"))
+    monkeypatch.setattr(PlivoService, "bulk_calling_auth", staticmethod(lambda tr: ("SAid", "tok")))
+    monkeypatch.setattr(settings, "CAMPAIGN_CONTACTS_V2", True)
+
+    async def fake_rearm(db, cid):
+        return 2
+
+    async def fake_pending(db, cid):
+        return 2
+
+    monkeypatch.setattr(v2, "rearm_unreached", fake_rearm)
+    monkeypatch.setattr(v2, "pending_count", fake_pending)
+    dialed = {}
+
+    async def fake_dial(campaign, db, *, tenant_res, base, prefix):
+        dialed["called"] = True
+
+    monkeypatch.setattr(OutboundCampaignService, "_dial_pending", staticmethod(fake_dial))
+
+    executed = []
+
+    class _FakeDB:
+        def add(self, *_a, **_k): pass
+        async def commit(self): pass
+        async def refresh(self, *_a, **_k): pass
+        async def execute(self, stmt, params=None):
+            executed.append(str(stmt))
+
+    camp = _cancelled_bulk_campaign(contacts=None)  # V2: rows are the store
+    await OutboundCampaignService.rerun_bulk_campaign(
+        camp, _FakeDB(), tenant_res=object(), public_base_url="https://x", path_prefix="/p"
+    )
+    assert dialed.get("called") is True
+    # The status flip no longer excludes cancelled — that's the resurrect.
+    flip = next(s for s in executed if "status = 'running'" in s)
+    assert "cancelled" not in flip

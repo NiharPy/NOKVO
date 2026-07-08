@@ -236,6 +236,9 @@ export function cleanQuestions(questions) {
         gate: graded ? false : !!q.gate,
         points: clampPts(q.points),
       };
+      // Stable join key: the scorer's breakdown and the stale-translation check
+      // on EDIT both match questions by id, so round-trip it when we have one.
+      if (q.id) out.id = String(q.id);
       if (tiers.length) out.tiers = tiers;
       // Reviewed/hand-edited translations (translate-preview flow) ride along;
       // the server preserves non-empty languages and fills only the blanks.
@@ -245,6 +248,34 @@ export function cleanQuestions(questions) {
     .filter((q) => q.text);
 }
 
+// Validate the deterministic script and assemble the questionnaire object —
+// shared by create (multipart) and edit (JSON) payloads. Throws { message }.
+function buildQuestionnaire(form, fail) {
+  const cleaned = cleanQuestions(form.questions);
+  if (!(form.intro || '').trim()) fail('Add an intro — how the agent opens the call.');
+  if (!cleaned.length) fail('Add at least one question for a deterministic campaign.');
+  for (const q of cleaned) {
+    if (q.type !== 'answer') continue;
+    if (q.tiers) {
+      if (!q.tiers.length) fail(`"${q.text.slice(0, 40)}" is graded but has no scoring bands — add a band, or turn off graded scoring.`);
+    } else if (!q.desired_answer) {
+      fail('Each "Desired answer" question needs an expected answer (add one, turn on graded scoring, or switch it to Intent detection).');
+    }
+  }
+  const maxPoints = maxPointsFor(cleaned);
+  const questionnaire = {
+    intro: (form.intro || '').trim(),
+    outro: (form.outro || '').trim(),
+    questions: cleaned,
+    threshold: Math.min(maxPoints, Math.max(1, Number(form.threshold) || maxPoints)),
+  };
+  // Reviewed/hand-edited translations from the translate-preview flow. The
+  // server preserves any non-empty language and only fills the blanks.
+  if (hasI18n(form.intro_i18n)) questionnaire.intro_i18n = pruneI18n(form.intro_i18n);
+  if (hasI18n(form.outro_i18n)) questionnaire.outro_i18n = pruneI18n(form.outro_i18n);
+  return questionnaire;
+}
+
 // Build the multipart FormData for POST /bulk-calling/campaigns. `deterministic`
 // selects the path. Throws { message } on a validation failure so the caller can
 // surface it. Mirrors startBulkCallingCampaign in NokvoOneApp.vue.
@@ -252,27 +283,9 @@ export function buildBulkCampaignFormData(form, { deterministic }) {
   const fail = (message) => { throw { message }; };
   if (!(form.name || '').trim()) fail('Name the campaign.');
   if (!form.file) fail('Choose a CSV (or XLSX) of phone numbers.');
-
-  const cleaned = cleanQuestions(form.questions);
-  if (deterministic) {
-    if (!(form.intro || '').trim()) fail('Add an intro — how the agent opens the call.');
-    if (!cleaned.length) fail('Add at least one question for a deterministic campaign.');
-    for (const q of cleaned) {
-      if (q.type !== 'answer') continue;
-      if (q.tiers) {
-        if (!q.tiers.length) fail(`"${q.text.slice(0, 40)}" is graded but has no scoring bands — add a band, or turn off graded scoring.`);
-      } else if (!q.desired_answer) {
-        fail('Each "Desired answer" question needs an expected answer (add one, turn on graded scoring, or switch it to Intent detection).');
-      }
-    }
-  } else if (!(form.content || '').trim()) {
+  if (!deterministic && !(form.content || '').trim()) {
     fail('Add the campaign content — what the agent should say.');
   }
-
-  const maxPoints = maxPointsFor(cleaned);
-  const clampedThreshold = cleaned.length
-    ? Math.min(maxPoints, Math.max(1, Number(form.threshold) || maxPoints))
-    : 1;
 
   const fd = new FormData();
   fd.append('name', form.name.trim());
@@ -282,17 +295,7 @@ export function buildBulkCampaignFormData(form, { deterministic }) {
   if ((form.caller_name || '').trim()) fd.append('caller_name', form.caller_name.trim());
   if (form.language) fd.append('language', form.language);
   if (deterministic) {
-    const questionnaire = {
-      intro: (form.intro || '').trim(),
-      outro: (form.outro || '').trim(),
-      questions: cleaned,
-      threshold: clampedThreshold,
-    };
-    // Reviewed/hand-edited translations from the translate-preview flow. The
-    // server preserves any non-empty language and only fills the blanks.
-    if (hasI18n(form.intro_i18n)) questionnaire.intro_i18n = pruneI18n(form.intro_i18n);
-    if (hasI18n(form.outro_i18n)) questionnaire.outro_i18n = pruneI18n(form.outro_i18n);
-    fd.append('questionnaire', JSON.stringify(questionnaire));
+    fd.append('questionnaire', JSON.stringify(buildQuestionnaire(form, fail)));
     fd.append('working_days', String(Math.max(1, Math.min(7, Math.round(Number(form.working_days) || 5)))));
     fd.append('hours_per_day', String(Math.max(1, Math.min(10, Math.round(Number(form.hours_per_day) || 10)))));
     if (form.calls_per_day) {
@@ -301,4 +304,23 @@ export function buildBulkCampaignFormData(form, { deterministic }) {
   }
   fd.append('contacts_file', form.file);
   return fd;
+}
+
+// JSON body for PATCH /bulk-calling/campaigns/{id} — the EDIT path. No contacts
+// file (Add CSV manages the list); script, branding, and schedule only.
+// calls_per_day 0 tells the server to REMOVE the daily cap.
+export function buildBulkCampaignUpdatePayload(form) {
+  const fail = (message) => { throw { message }; };
+  if (!(form.name || '').trim()) fail('Name the campaign.');
+  return {
+    name: form.name.trim(),
+    content: (form.content || '').trim(),
+    company_name: (form.company_name || '').trim(),
+    caller_name: (form.caller_name || '').trim(),
+    language: form.language || 'en',
+    questionnaire: buildQuestionnaire(form, fail),
+    working_days: Math.max(1, Math.min(7, Math.round(Number(form.working_days) || 5))),
+    hours_per_day: Math.max(1, Math.min(10, Math.round(Number(form.hours_per_day) || 10))),
+    calls_per_day: form.calls_per_day ? Math.max(1, Math.round(Number(form.calls_per_day))) : 0,
+  };
 }

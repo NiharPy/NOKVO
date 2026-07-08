@@ -6,7 +6,8 @@
 import { inject, onMounted, ref, computed, watch } from 'vue';
 import {
   newQuestion, maxPointsFor, estCallSeconds, fmtDuration, scheduleEstimate, countCsvRows,
-  buildBulkCampaignFormData, categorizeContacts, leadCategory, campaignWindow, cleanQuestions,
+  buildBulkCampaignFormData, buildBulkCampaignUpdatePayload, categorizeContacts, leadCategory,
+  campaignWindow, cleanQuestions,
 } from '../../composables/bulkCalling.js';
 import AxIcon from '../AxIcon.vue';
 
@@ -28,7 +29,8 @@ const launchError = ref('');
 const step = ref(1);
 const STEPS = ['Details', 'Script & questions', 'Review & launch'];
 const canNext = computed(() => (step.value === 1 ? !!form.value.name.trim() : true));
-const canLaunch = computed(() => !!form.value.name.trim() && !!form.value.file);
+// Editing doesn't need a contacts file — the list is managed via Add CSV.
+const canLaunch = computed(() => !!form.value.name.trim() && (!!editingId.value || !!form.value.file));
 function goStep(n) {
   if (n === step.value) return;
   if (n < step.value) { step.value = n; return; }
@@ -68,6 +70,10 @@ function applyNovaDraft(draft) {
   fileName.value = '';
   listSize.value = null;
   step.value = 1;
+  // A Nova draft is a NEW campaign — never leave a stale edit target that would
+  // turn the submit into a PATCH of some other campaign.
+  editingId.value = null;
+  editingName.value = '';
   apex.toast('Draft from Nova applied — add your contacts file and launch when ready.');
   apex.clearNovaDraft && apex.clearNovaDraft();
 }
@@ -147,6 +153,73 @@ function redialCount(c) {
   return (c.contacts || []).filter((ct) => ct.status !== 'answered' && !ct.answered_at).length;
 }
 
+// ── edit mode ──
+// "Edit" on a campaign card loads its script/branding/schedule into the SAME
+// 3-step wizard; the launch button becomes "Save changes" (PATCH, JSON — no
+// contacts file; Add CSV manages the list). Question ids round-trip so the
+// scorer's breakdown and the server's stale-translation check stay keyed.
+const editingId = ref(null);
+const editingName = ref('');
+
+function startEdit(c) {
+  const cfg = c.agent_config || {};
+  const q = c.questionnaire || cfg.questionnaire || {};
+  const w = cfg.call_window || {};
+  form.value = {
+    ...emptyForm(),
+    name: c.name || '',
+    company_name: cfg.company_name || '',
+    caller_name: cfg.caller_name || 'Riya',
+    language: cfg.language || 'en',
+    content: cfg.agent_prompt || '',
+    intro: q.intro || '',
+    outro: q.outro || '',
+    intro_i18n: { ...(q.intro_i18n || {}) },
+    outro_i18n: { ...(q.outro_i18n || {}) },
+    threshold: Number(q.threshold) || 1,
+    working_days: Number(w.working_days) || 5,
+    hours_per_day: Number(w.hours_per_day) || 10,
+    calls_per_day: Number(w.calls_per_day) || 0,
+    questions: (q.questions || []).map((item) => ({
+      ...newQuestion(),
+      id: item.id,
+      type: item.type === 'answer' ? 'answer' : 'intent',
+      text: item.text || '',
+      desired_answer: item.desired_answer || '',
+      required: item.required === 'no' ? 'no' : 'yes',
+      points: Number(item.points) || 1,
+      graded: Array.isArray(item.tiers) && item.tiers.length > 0,
+      tiers: Array.isArray(item.tiers) ? item.tiers.map((t) => ({ ...t })) : [],
+      gate: !!item.gate,
+      text_i18n: item.text_i18n ? { ...item.text_i18n } : null,
+      // Anchor for pruneStaleI18n: translations belong to THIS text.
+      _i18nSrc: item.text_i18n ? (item.text || '').trim() : undefined,
+    })),
+    _introSrc: q.intro_i18n ? (q.intro || '').trim() : undefined,
+    _outroSrc: q.outro_i18n ? (q.outro || '').trim() : undefined,
+  };
+  editingId.value = c.id;
+  editingName.value = c.name || '';
+  translated.value = !!(q.intro_i18n || q.outro_i18n || (q.questions || []).some((x) => x.text_i18n));
+  translateError.value = '';
+  fileName.value = '';
+  listSize.value = null;
+  step.value = 1;
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+function cancelEdit() {
+  editingId.value = null;
+  editingName.value = '';
+  form.value = emptyForm();
+  fileName.value = '';
+  listSize.value = null;
+  translated.value = false;
+  translateError.value = '';
+  launchError.value = '';
+  step.value = 1;
+}
+
 // ── hi/te translation review ──
 // "Translate & review" fills the exact Hindi/Telugu lines the agent will speak
 // (same server translation that runs at creation) so the admin can hand-edit
@@ -205,6 +278,14 @@ async function submit() {
   launching.value = true;
   try {
     pruneStaleI18n();
+    if (editingId.value) {
+      const payload = buildBulkCampaignUpdatePayload(form.value);
+      await apex.updateCampaign(editingId.value, payload);
+      apex.toast('Campaign updated — changes apply from the next call.');
+      cancelEdit();
+      await apex.reload();
+      return;
+    }
     const fd = buildBulkCampaignFormData(form.value, { deterministic: true });
     const data = await apex.createCampaign(fd);
     const contacts = Array.isArray(data?.contacts) ? data.contacts : [];
@@ -334,8 +415,11 @@ async function onAddFile(e) {
     <div class="ax-card ax-card-pad">
       <div class="ax-card-head" style="align-items:flex-start;">
         <div>
-          <h2 class="ax-h2">Bulk CSV calling</h2>
-          <p class="ax-muted" style="margin:7px 0 0;">Upload a CSV of phone numbers and run a scored questionnaire on the whole list automatically.</p>
+          <h2 class="ax-h2">{{ editingId ? 'Edit campaign' : 'Bulk CSV calling' }}</h2>
+          <p v-if="editingId" class="ax-muted" style="margin:7px 0 0;">
+            Editing “{{ editingName }}” — script, details and schedule. Contacts are managed from the campaign card (Add CSV); changes apply from the next call.
+          </p>
+          <p v-else class="ax-muted" style="margin:7px 0 0;">Upload a CSV of phone numbers and run a scored questionnaire on the whole list automatically.</p>
         </div>
         <span v-if="apex.bulkStatus.value.enabled" class="ax-status-on"><span class="ax-status-dot"></span>Enabled</span>
         <span v-else class="ax-status-off">Not enabled</span>
@@ -364,12 +448,16 @@ async function onAddFile(e) {
               <label class="ax-field-label">Campaign name</label>
               <input v-model="form.name" type="text" class="ax-text" placeholder="December outreach" />
             </div>
-            <div>
+            <div v-if="!editingId">
               <label class="ax-field-label">Contacts file <span class="ax-field-hint">CSV or XLSX — phone in column A, name in B</span></label>
               <div class="ax-file">
                 <label class="ax-file-btn">Choose file<input type="file" accept=".csv,.xlsx" style="display:none;" @change="onFile" /></label>
                 <span class="ax-file-name">{{ fileName || 'No file chosen' }}</span>
               </div>
+            </div>
+            <div v-else>
+              <label class="ax-field-label">Contacts</label>
+              <p class="ax-field-hint" style="margin-top:10px;">Managed from the campaign card — use <strong>Add CSV</strong> there to add numbers. Editing here changes only the script, details and schedule.</p>
             </div>
             <div>
               <label class="ax-field-label">Business name</label>
@@ -526,7 +614,7 @@ async function onAddFile(e) {
             <p v-if="translateError" class="ax-notice ax-notice--err" style="margin-top:10px;">{{ translateError }}</p>
           </div>
 
-          <p v-if="!form.file" class="ax-rv-warn"><AxIcon name="alert" :size="14" /> No contacts file yet — add one in step 1 to launch.</p>
+          <p v-if="!editingId && !form.file" class="ax-rv-warn"><AxIcon name="alert" :size="14" /> No contacts file yet — add one in step 1 to launch.</p>
           <p v-if="!form.questions.length" class="ax-rv-warn"><AxIcon name="alert" :size="14" /> No questions added — the agent will only deliver the intro and outro.</p>
           <p v-if="launchError" class="ax-notice ax-notice--err">{{ launchError }}</p>
         </div>
@@ -535,10 +623,11 @@ async function onAddFile(e) {
       <!-- wizard nav -->
       <div class="ax-step-nav">
         <button v-if="step > 1" type="button" class="ax-btn2 ax-btn2--ghost" style="padding:13px 22px;" @click="step--"><AxIcon name="arrow-left" :size="14" /> Back</button>
+        <button v-if="editingId" type="button" class="ax-btn2 ax-btn2--ghost" style="padding:13px 22px;" @click="cancelEdit"><AxIcon name="x" :size="14" /> Cancel edit</button>
         <span style="flex:1;"></span>
         <button v-if="step < 3" type="button" class="ax-btn2 ax-btn2--accent" :disabled="!canNext" @click="step++">Continue <AxIcon name="arrow-right" :size="14" /></button>
         <button v-else type="button" class="ax-btn2 ax-btn2--accent" :disabled="launching || !canLaunch" @click="submit">
-          {{ launching ? 'Starting…' : 'Upload & start calling' }}
+          {{ launching ? (editingId ? 'Saving…' : 'Starting…') : (editingId ? 'Save changes' : 'Upload & start calling') }}
         </button>
       </div>
     </div>
@@ -561,7 +650,10 @@ async function onAddFile(e) {
         <div class="ax-camp-meta">
           <span v-if="counts(c).successful" style="color:#7FD9A8;">{{ counts(c).successful }} qualified</span>
           <span v-if="counts(c).no_pickup" style="color:#E62630;">{{ counts(c).no_pickup }} missed</span>
-          <button v-if="redialCount(c) > 0 && c.status !== 'cancelled'" type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" :disabled="rerunning === c.id" @click="rerun(c.id)">
+          <button type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" :disabled="editingId === c.id" @click="startEdit(c)" title="Edit the script, details and calling schedule">
+            <AxIcon name="edit" :size="12" /> Edit
+          </button>
+          <button v-if="redialCount(c) > 0" type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" :disabled="rerunning === c.id" @click="rerun(c.id)" :title="c.status === 'cancelled' ? 'Restart this stopped campaign — re-arms the unreached and continues pending' : 'Re-dial the unreached'">
             <AxIcon name="refresh" :size="12" /> {{ rerunning === c.id ? 'Re-running…' : `Re-run (${redialCount(c)})` }}
           </button>
           <button v-if="c.status !== 'cancelled'" type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" :disabled="addingTo === c.id || c.status === 'ingesting'" @click="pickAddCsv(c.id)" title="Add a CSV of new numbers and resume dialing">

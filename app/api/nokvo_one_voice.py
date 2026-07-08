@@ -2346,6 +2346,110 @@ async def translate_bulk_questionnaire(
     return {"questionnaire": questionnaire}
 
 
+class BulkCampaignUpdatePayload(BaseModel):
+    name: str | None = None
+    content: str | None = None
+    company_name: str | None = None
+    caller_name: str | None = None
+    language: str | None = None
+    tone: str | None = None
+    questionnaire: dict | None = None
+    working_days: int | None = None
+    hours_per_day: int | None = None
+    calls_per_day: int | None = None
+
+
+@router.patch("/bulk-calling/campaigns/{campaign_id}")
+async def update_bulk_calling_campaign(
+    campaign_id: uuid.UUID,
+    payload: BulkCampaignUpdatePayload,
+    user: OrganizationUser = Depends(_bulk_admin_dep()),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Edit a campaign in place: name, script (intro/questions/outro), branding,
+    language, and calling schedule. Only the provided fields change; contacts
+    and status are untouched (Add CSV / Stop / Resume / Re-run manage those).
+    Live calls pick the new config up on their next context load — the cache is
+    invalidated here. A question whose TEXT changed loses its pre-translated
+    lines (they describe the old text) and is re-translated; unchanged questions
+    keep their (possibly hand-edited) translations. Question ids are stable so
+    already-scored leads keep a valid score breakdown."""
+    from app.services.agent_outbound_context import (
+        _coerce_questionnaire,
+        invalidate as invalidate_outbound_context,
+    )
+    from app.services.questionnaire_translation import (
+        drop_stale_i18n,
+        translate_questionnaire,
+    )
+
+    await _require_outbound_enabled(db, user)
+    tr = await _tenant_for_user(db, user)
+    campaign = await OutboundCampaignService.get_campaign(campaign_id, tr, db)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    cfg = dict(campaign.agent_config or {})
+    if payload.name is not None:
+        if not payload.name.strip():
+            raise HTTPException(status_code=400, detail="Give the campaign a name.")
+        campaign.name = payload.name.strip()
+    for attr, key in (
+        ("content", "agent_prompt"),
+        ("company_name", "company_name"),
+        ("caller_name", "caller_name"),
+        ("language", "language"),
+        ("tone", "tone"),
+    ):
+        value = getattr(payload, attr)
+        if value is not None:
+            cfg[key] = value.strip()
+
+    if payload.questionnaire is not None:
+        try:
+            questionnaire = _coerce_questionnaire(payload.questionnaire, strict=True)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=_safe_detail(exc)) from exc
+        _deterministic = bool(cfg.get("deterministic") or cfg.get("questionnaire"))
+        if _deterministic and not questionnaire:
+            raise HTTPException(
+                status_code=422,
+                detail="A deterministic campaign needs a questionnaire with at least one question.",
+            )
+        if questionnaire:
+            drop_stale_i18n(questionnaire, cfg.get("questionnaire"))
+            if (await _org_for_user(db, user)).product_tier == "nokvo_apex":
+                questionnaire = await translate_questionnaire(questionnaire)
+            cfg["questionnaire"] = questionnaire
+
+    if any(v is not None for v in (payload.working_days, payload.hours_per_day, payload.calls_per_day)):
+        # Merge into the EXISTING window — ``dialed_today`` is the runtime
+        # daily-cap counter and must survive an edit.
+        window = dict(cfg.get("call_window") or {})
+        window.setdefault("timezone", "Asia/Kolkata")
+        window.setdefault("window_local", "09:00-19:00")
+        if payload.working_days is not None:
+            window["working_days"] = max(1, min(7, int(payload.working_days)))
+        if payload.hours_per_day is not None:
+            window["hours_per_day"] = max(1, min(10, int(payload.hours_per_day)))
+        if payload.calls_per_day is not None:
+            if payload.calls_per_day > 0:
+                window["calls_per_day"] = int(payload.calls_per_day)
+            else:
+                window.pop("calls_per_day", None)  # 0 = remove the cap
+        cfg["call_window"] = window
+
+    campaign.agent_config = cfg
+    db.add(campaign)
+    await db.commit()
+    await db.refresh(campaign)
+    # Live sessions read a cached context — drop it so the edit applies to the
+    # very next call, not whenever the TTL happens to lapse.
+    invalidate_outbound_context(campaign.id)
+    return _campaign_response(campaign)
+
+
 @router.post("/bulk-calling/campaigns/{campaign_id}/rerun")
 async def rerun_bulk_calling_campaign(
     campaign_id: uuid.UUID,

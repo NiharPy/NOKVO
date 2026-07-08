@@ -1198,8 +1198,6 @@ class OutboundCampaignService:
         # ``not contacts`` (not ``is None``): an EMPTY blob is a V2 campaign too —
         # its rows are the store, the [] is stray legacy residue. ──
         if settings.CAMPAIGN_CONTACTS_V2 and not campaign.contacts:
-            if campaign.status == CampaignStatus.cancelled:
-                raise ValueError("This campaign was cancelled — create a new one instead.")
             from app.services import campaign_contacts_v2 as v2
 
             await v2.rearm_unreached(db, campaign.id)
@@ -1207,10 +1205,14 @@ class OutboundCampaignService:
                 raise ValueError(
                     "Everyone on this list was already reached — there's no one to re-run."
                 )
+            # A CANCELLED campaign re-runs too: the operator explicitly asked, so
+            # this is the resurrect path (the one-campaign guard above already
+            # ensured the tenant's slot is free). Stop→Resume continues pending
+            # rows; Stop→Re-run additionally re-arms the unreached.
             await db.execute(
                 _sql_text(
                     "UPDATE outbound_campaigns SET status = 'running', completed_at = NULL "
-                    "WHERE id = :c AND status <> 'cancelled'"
+                    "WHERE id = :c"
                 ),
                 {"c": str(campaign.id)},
             )

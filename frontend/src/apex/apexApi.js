@@ -181,6 +181,13 @@ export async function resumeCampaign(campaignId) {
   return data;
 }
 
+// Edit a campaign in place (script / branding / schedule). Contacts and status
+// are managed separately (Add CSV / Stop / Resume / Re-run).
+export async function updateCampaign(campaignId, payload) {
+  const { data } = await agentsApi.patch(`/bulk-calling/campaigns/${campaignId}`, payload, { headers: authHeader() });
+  return data;
+}
+
 // Add a new CSV/XLSX to an existing campaign and resume dialing. Only new numbers
 // are added (deduped server-side); ingest runs in the background.
 export async function addCampaignContacts(campaignId, file) {
