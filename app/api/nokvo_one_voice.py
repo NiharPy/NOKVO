@@ -2382,6 +2382,42 @@ async def rerun_bulk_calling_campaign(
     return _campaign_response(campaign)
 
 
+@router.post("/bulk-calling/campaigns/{campaign_id}/resume")
+async def resume_bulk_calling_campaign(
+    campaign_id: uuid.UUID,
+    request: Request,
+    user: OrganizationUser = Depends(_bulk_admin_dep()),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Resume a STOPPED bulk campaign — continues dialing the contacts still
+    pending. Results are kept and nothing is re-armed (that's Re-run)."""
+    from app.services.plivo_service import PlivoService
+    from app.services.public_url import public_base_url as _pub
+
+    await _require_outbound_enabled(db, user)
+    tr = await _tenant_for_user(db, user)
+    if not PlivoService.bulk_calling_enabled(tr):
+        raise HTTPException(
+            status_code=403,
+            detail="Bulk calling isn't enabled for your account.",
+        )
+    campaign = await OutboundCampaignService.get_campaign(campaign_id, tr, db)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    try:
+        campaign = await OutboundCampaignService.resume_campaign(
+            campaign,
+            db,
+            tenant_res=tr,
+            public_base_url=_pub(request),
+            path_prefix="/api/nokvo-one/agents",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=_safe_detail(exc)) from exc
+    return _campaign_response(campaign)
+
+
 @router.post("/bulk-calling/campaigns/{campaign_id}/add-contacts")
 async def add_bulk_calling_contacts(
     campaign_id: uuid.UUID,

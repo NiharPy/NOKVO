@@ -411,3 +411,101 @@ async def test_get_by_call_link_id_resolves_v2_row_contact():
     assert got_contact["phone"] == "917569672503"
     assert got_contact["call_id"] == "CALLX"
     assert not got_contact.get("is_followup")  # never mistaken for a follow-up
+
+
+# ── resume (stop → continue) ────────────────────────────────────────────────
+
+
+class _ResumeFakeDB:
+    def add(self, *_a, **_k): pass
+    async def commit(self): pass
+    async def refresh(self, *_a, **_k): pass
+
+
+def _cancelled_bulk_campaign(**over):
+    from app.models.outbound_campaign import CampaignStatus, OutboundCampaign
+
+    kw = dict(
+        tenant_id="t1", name="stopped", status=CampaignStatus.cancelled,
+        agent_config={"bulk_csv": True}, total_count=3,
+        contacts=[
+            {"phone": "911", "status": "answered", "ended": True},
+            {"phone": "922", "status": "pending"},
+        ],
+    )
+    kw.update(over)
+    return OutboundCampaign(**kw)
+
+
+@pytest.mark.asyncio
+async def test_resume_continues_pending_and_frees_completed_at(monkeypatch):
+    from app.models.outbound_campaign import CampaignStatus
+    from app.services.outbound_campaign_service import OutboundCampaignService
+
+    guard = {}
+
+    async def _record_guard(db, tenant_id, *, exclude_id=None):
+        guard["tenant"], guard["exclude"] = tenant_id, exclude_id
+
+    monkeypatch.setattr(
+        OutboundCampaignService, "_assert_no_other_active_campaign", staticmethod(_record_guard)
+    )
+    monkeypatch.setattr(PlivoService, "bulk_calling_enabled", staticmethod(lambda tr: True))
+    dialed = {}
+
+    async def fake_dial(campaign, db, *, tenant_res, base, prefix):
+        dialed["called"] = True
+
+    monkeypatch.setattr(OutboundCampaignService, "_dial_pending", staticmethod(fake_dial))
+
+    camp = _cancelled_bulk_campaign()
+    camp.completed_at = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+    out = await OutboundCampaignService.resume_campaign(
+        camp, _ResumeFakeDB(), tenant_res=object(), public_base_url="https://x/", path_prefix="/p/"
+    )
+    assert out.status == CampaignStatus.running
+    assert out.completed_at is None
+    assert dialed.get("called") is True
+    # Resume holds the one-campaign slot rule, excluding itself (self-resume ok).
+    assert guard == {"tenant": "t1", "exclude": camp.id}
+
+
+@pytest.mark.asyncio
+async def test_resume_refuses_non_stopped_and_non_bulk(monkeypatch):
+    from app.models.outbound_campaign import CampaignStatus
+    from app.services.outbound_campaign_service import OutboundCampaignService
+
+    _stub_single_campaign_guard(monkeypatch)
+    monkeypatch.setattr(PlivoService, "bulk_calling_enabled", staticmethod(lambda tr: True))
+
+    running = _cancelled_bulk_campaign(status=CampaignStatus.running)
+    with pytest.raises(ValueError, match="stopped campaign"):
+        await OutboundCampaignService.resume_campaign(
+            running, _ResumeFakeDB(), tenant_res=object(), public_base_url="https://x"
+        )
+    non_bulk = _cancelled_bulk_campaign(agent_config={})
+    with pytest.raises(ValueError, match="bulk CSV"):
+        await OutboundCampaignService.resume_campaign(
+            non_bulk, _ResumeFakeDB(), tenant_res=object(), public_base_url="https://x"
+        )
+
+
+@pytest.mark.asyncio
+async def test_resume_v2_refuses_when_nothing_pending(monkeypatch):
+    from app.core.config import settings
+    from app.services import campaign_contacts_v2 as v2
+    from app.services.outbound_campaign_service import OutboundCampaignService
+
+    _stub_single_campaign_guard(monkeypatch)
+    monkeypatch.setattr(PlivoService, "bulk_calling_enabled", staticmethod(lambda tr: True))
+    monkeypatch.setattr(settings, "CAMPAIGN_CONTACTS_V2", True)
+
+    async def no_pending(db, cid):
+        return 0
+
+    monkeypatch.setattr(v2, "pending_count", no_pending)
+    camp = _cancelled_bulk_campaign(contacts=None)  # V2: rows are the store
+    with pytest.raises(ValueError, match="Re-run"):
+        await OutboundCampaignService.resume_campaign(
+            camp, _ResumeFakeDB(), tenant_res=object(), public_base_url="https://x"
+        )

@@ -174,6 +174,13 @@ export async function rerunCampaign(campaignId) {
   return data;
 }
 
+// Resume a STOPPED campaign — continues dialing the still-pending contacts
+// (nothing is re-armed; that's rerunCampaign).
+export async function resumeCampaign(campaignId) {
+  const { data } = await agentsApi.post(`/bulk-calling/campaigns/${campaignId}/resume`, {}, { headers: authHeader() });
+  return data;
+}
+
 // Add a new CSV/XLSX to an existing campaign and resume dialing. Only new numbers
 // are added (deduped server-side); ingest runs in the background.
 export async function addCampaignContacts(campaignId, file) {

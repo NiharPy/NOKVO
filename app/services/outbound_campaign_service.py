@@ -790,6 +790,61 @@ class OutboundCampaignService:
         return campaign
 
     @staticmethod
+    async def resume_campaign(
+        campaign: OutboundCampaign,
+        db: AsyncSession,
+        *,
+        tenant_res: TenantResources,
+        public_base_url: str,
+        path_prefix: str = "/api/nokvo-one/agents",
+    ) -> OutboundCampaign:
+        """Resume a STOPPED (cancelled) bulk campaign: flip it back to ``running``
+        and continue dialing the contacts still pending. The inverse of
+        :meth:`cancel_campaign` — Stop keeps every contact row untouched, so a
+        resume simply picks up where it left off. Nothing is re-armed (unlike
+        re-run, which re-dials the unreached); people already called stay called.
+        Subject to the one-campaign-per-tenant slot like every other launch path."""
+        if campaign.status != CampaignStatus.cancelled:
+            raise ValueError(
+                f"Only a stopped campaign can be resumed (this one is '{campaign.status}')."
+            )
+        if not OutboundCampaignService._is_bulk(campaign):
+            raise ValueError("Resume is only for bulk CSV campaigns.")
+        if not PlivoService.bulk_calling_enabled(tenant_res):
+            raise ValueError(
+                "Bulk calling isn't enabled for this account. It unlocks once the "
+                "team provisions your dedicated calling number."
+            )
+        await OutboundCampaignService._assert_no_other_active_campaign(
+            db, campaign.tenant_id, exclude_id=campaign.id
+        )
+        # V2 (per-row) campaigns: refuse a pointless resume — with nothing pending
+        # the campaign would just flip running→completed on the next tick, which
+        # reads as "resume did nothing". Point the operator at Re-run instead.
+        if settings.CAMPAIGN_CONTACTS_V2 and not campaign.contacts:
+            from app.services import campaign_contacts_v2 as v2
+
+            if await v2.pending_count(db, campaign.id) <= 0:
+                raise ValueError(
+                    "No one is left to dial on this campaign — use Re-run to "
+                    "re-contact the unreached, or add a new CSV."
+                )
+        campaign.status = CampaignStatus.running
+        campaign.completed_at = None
+        db.add(campaign)
+        await db.commit()
+        await db.refresh(campaign)
+        invalidate_outbound_context(campaign.id)
+        await OutboundCampaignService._dial_pending(
+            campaign,
+            db,
+            tenant_res=tenant_res,
+            base=public_base_url.rstrip("/"),
+            prefix=path_prefix.rstrip("/"),
+        )
+        return campaign
+
+    @staticmethod
     async def delete_campaign(
         campaign: OutboundCampaign, db: AsyncSession
     ) -> None:
