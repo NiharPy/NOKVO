@@ -1892,6 +1892,7 @@ watch(() => props.homeSignal, () => { closeAll(); loadOrganizations(); });
   letter-spacing: 3px; font-weight: 500; margin: 0 0 0.25rem 0;
 }
 .status-badge {
+  display: inline-block; white-space: nowrap;
   font-size: 0.6rem; background: rgba(16, 185, 129, 0.08);
   color: var(--success-color); border: 1px solid rgba(16, 185, 129, 0.28);
   padding: 0.16rem 0.45rem; border-radius: 4px; letter-spacing: 1.2px;
