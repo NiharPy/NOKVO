@@ -824,6 +824,32 @@ const submitApexBulk = async () => {
 
 function handleLogout() { emit('logout'); }
 
+// ── Section navigation (tab rail) ───────────────────────────
+const NAV = [
+  { id: 'list', label: 'Tenants' },
+  { id: 'tickets', label: 'Tickets' },
+  { id: 'feedback', label: 'Feedback' },
+  { id: 'todos', label: 'To-do' },
+  { id: 'bulk', label: 'Bulk calling' },
+  { id: 'broadcast', label: 'Broadcast' },
+  { id: 'langsmith', label: 'LangSmith' },
+  { id: 'llm', label: 'LLM keys' },
+];
+// Reset every section flag so tabs can jump directly between sections
+// (the per-section open* helpers only reset some of their siblings).
+const closeAll = () => {
+  detail.value = null;
+  feedbackView.value = false; ticketsView.value = false; todoView.value = false;
+  broadcastView.value = false; langsmithView.value = false; llmView.value = false; bulkView.value = false;
+};
+const go = (id) => {
+  closeAll();
+  if (id === 'list') { loadOrganizations(); return; }
+  const open = { tickets: openTickets, feedback: openFeedback, todos: openTodos, broadcast: openBroadcast, langsmith: openLangsmith, llm: openLlm, bulk: openBulk }[id];
+  if (open) open();
+};
+const activeNav = computed(() => (view.value === 'detail' ? 'list' : view.value));
+
 // ── USD→INR FX rate (per-call COGS pricing) ─────────────────────────────
 // The rate every COGS calculation converts vendor USD list prices with.
 // Editable here; applies to newly recorded calls (historical rows keep the
@@ -896,41 +922,37 @@ function cogsBars(cogs) {
 }
 
 onMounted(() => { loadOrganizations(); loadFx(); });
-watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos(); loadOrganizations(); });
+watch(() => props.homeSignal, () => { closeAll(); loadOrganizations(); });
 </script>
 
 <template>
   <div class="dashboard-container" :class="`theme-${props.theme}`">
     <div class="dashboard-header">
       <div class="header-left">
-        <Shield :size="32" color="var(--success-color)" />
+        <Shield :size="26" color="var(--success-color)" />
         <div class="header-title">
           <h2>SUPERADMIN CONSOLE</h2>
           <span class="status-badge">SECURE SESSION ACTIVE</span>
         </div>
       </div>
       <div class="header-actions">
-        <template v-if="view === 'feedback' || view === 'todos' || view === 'broadcast' || view === 'langsmith' || view === 'llm' || view === 'bulk' || view === 'tickets'">
-          <button class="ghost-btn" @click="closeFeedback(); closeTodos(); closeBroadcast(); closeLangsmith(); closeLlm(); closeBulk(); closeTickets();">← TENANTS</button>
-        </template>
-        <template v-else>
-          <button class="ghost-btn" @click="openLlm">LLM KEYS</button>
-          <button class="ghost-btn" @click="openLangsmith">LANGSMITH</button>
-          <button class="ghost-btn" @click="openBroadcast">BROADCAST</button>
-          <button class="ghost-btn" @click="openFeedback">FEEDBACK</button>
-          <button class="ghost-btn" @click="openTickets">TICKETS</button>
-          <button class="ghost-btn" @click="openBulk">BULK CALLING</button>
-          <button class="ghost-btn" @click="openTodos">TO-DO</button>
-        </template>
         <button class="theme-toggle" @click="props.toggleTheme">
           {{ props.theme === 'dark' ? 'LIGHT MODE' : 'DARK MODE' }}
         </button>
         <button class="logout-btn" @click="handleLogout">
-          <LogOut :size="16" />
+          <LogOut :size="14" />
           TERMINATE SESSION
         </button>
       </div>
     </div>
+
+    <nav class="console-nav">
+      <button
+        v-for="n in NAV" :key="n.id"
+        type="button" class="nav-tab" :class="{ 'is-active': activeNav === n.id }"
+        @click="go(n.id)"
+      >{{ n.label }}</button>
+    </nav>
 
     <p v-if="errorMsg" class="error-banner">{{ errorMsg }}</p>
 
@@ -942,40 +964,41 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
             <span class="stage-eyebrow">ORGANIZATIONS</span>
             <h3>Usage, Revenue &amp; Cost</h3>
           </div>
-          <button type="button" class="ghost-btn" :disabled="loading" @click="loadOrganizations">
-            <RefreshCw :size="14" :class="{ spin: loading }" />
-            REFRESH
-          </button>
+          <div class="panel-tools">
+            <div class="product-filter">
+              <button type="button" class="pf-btn" :class="{ 'is-on': productFilter === 'all' }" @click="productFilter = 'all'">All <span class="pf-count">{{ productCounts.all }}</span></button>
+              <button type="button" class="pf-btn" :class="{ 'is-on': productFilter === 'nokvo_one' }" @click="productFilter = 'nokvo_one'">Nokvo One <span class="pf-count">{{ productCounts.nokvo_one }}</span></button>
+              <button type="button" class="pf-btn pf-btn--apex" :class="{ 'is-on': productFilter === 'apex' }" @click="productFilter = 'apex'">APEX <span class="pf-count">{{ productCounts.apex }}</span></button>
+            </div>
+            <button type="button" class="ghost-btn" :disabled="loading" @click="loadOrganizations">
+              <RefreshCw :size="14" :class="{ spin: loading }" />
+              REFRESH
+            </button>
+          </div>
         </div>
 
-        <div class="product-filter">
-          <button type="button" class="pf-btn" :class="{ 'is-on': productFilter === 'all' }" @click="productFilter = 'all'">All <span class="pf-count">{{ productCounts.all }}</span></button>
-          <button type="button" class="pf-btn" :class="{ 'is-on': productFilter === 'nokvo_one' }" @click="productFilter = 'nokvo_one'">Nokvo One <span class="pf-count">{{ productCounts.nokvo_one }}</span></button>
-          <button type="button" class="pf-btn pf-btn--apex" :class="{ 'is-on': productFilter === 'apex' }" @click="productFilter = 'apex'">APEX <span class="pf-count">{{ productCounts.apex }}</span></button>
-        </div>
-
-        <div class="summary-strip">
-          <div class="summary-chip"><span class="summary-label">ORGS</span><strong>{{ filteredSummary.count }}</strong></div>
-          <div class="summary-chip"><span class="summary-label">MINUTES</span><strong>{{ minutes(filteredSummary.total_minutes) }}</strong></div>
-          <div class="summary-chip"><span class="summary-label">REVENUE</span><strong>{{ inr(filteredSummary.total_revenue_inr) }}</strong></div>
-          <div class="summary-chip"><span class="summary-label">COGS</span><strong>{{ inr(filteredSummary.total_cogs_inr) }}</strong></div>
-          <div class="summary-chip"><span class="summary-label">MARGIN</span><strong :class="filteredSummary.total_margin_inr < 0 ? 'neg' : 'pos'">{{ inr(filteredSummary.total_margin_inr) }}</strong></div>
+        <div class="stat-band">
+          <div class="stat"><span class="stat-label">ORGS</span><strong class="stat-value">{{ filteredSummary.count }}</strong></div>
+          <div class="stat"><span class="stat-label">MINUTES</span><strong class="stat-value">{{ minutes(filteredSummary.total_minutes) }}</strong></div>
+          <div class="stat"><span class="stat-label">REVENUE</span><strong class="stat-value">{{ inr(filteredSummary.total_revenue_inr) }}</strong></div>
+          <div class="stat"><span class="stat-label">COGS</span><strong class="stat-value">{{ inr(filteredSummary.total_cogs_inr) }}</strong></div>
+          <div class="stat"><span class="stat-label">MARGIN</span><strong class="stat-value" :class="filteredSummary.total_margin_inr < 0 ? 'neg' : 'pos'">{{ inr(filteredSummary.total_margin_inr) }}</strong></div>
           <!-- USD→INR FX: the rate COGS converts vendor USD prices with. Editable;
                applies to newly recorded calls (history keeps its frozen rate). -->
-          <div v-if="fx" class="summary-chip fx-chip" :title="fx.is_override ? `Override set by ${fx.updated_by || '?'} (default ${fx.default})` : `Config default (${fx.default})`">
-            <span class="summary-label">FX ₹/$</span>
-            <template v-if="!fxEditing">
-              <strong>{{ fx.usd_to_inr }}<span v-if="fx.is_override" class="fx-dot" title="override active">•</span></strong>
+          <div v-if="fx" class="stat stat-fx" :title="fx.is_override ? `Override set by ${fx.updated_by || '?'} (default ${fx.default})` : `Config default (${fx.default})`">
+            <span class="stat-label">FX ₹/$</span>
+            <div v-if="!fxEditing" class="stat-fx-row">
+              <strong class="stat-value">{{ fx.usd_to_inr }}<span v-if="fx.is_override" class="fx-dot" title="override active">•</span></strong>
               <button type="button" class="fx-btn" @click="openFxEditor">Edit</button>
-            </template>
-            <template v-else>
+            </div>
+            <div v-else class="stat-fx-row">
               <input v-model="fxInput" class="fx-input" type="number" step="0.1" min="10" max="500"
                      :disabled="fxBusy" @keyup.enter="saveFx" @keyup.esc="fxEditing = false" />
               <button type="button" class="fx-btn" :disabled="fxBusy" @click="saveFx">{{ fxBusy ? '…' : 'Save' }}</button>
               <button v-if="fx.is_override" type="button" class="fx-btn ghost" :disabled="fxBusy" @click="resetFx">Reset</button>
               <button type="button" class="fx-btn ghost" :disabled="fxBusy" @click="fxEditing = false">Cancel</button>
               <span v-if="fxError" class="fx-error">{{ fxError }}</span>
-            </template>
+            </div>
           </div>
         </div>
 
@@ -997,7 +1020,7 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
                 <td>
                   <button class="org-name-btn" @click="openDetail(org.organization_id)">{{ org.organization_name }}</button>
                   <div class="row-sub">
-                    <span class="org-status" :class="org.status">{{ (org.status || '—').toUpperCase() }}</span>
+                    <span class="org-status" :class="org.status">{{ (org.status || '—').replace(/_/g, ' ').toUpperCase() }}</span>
                     <span class="muted">{{ org.admin_email || '—' }}</span>
                   </div>
                 </td>
@@ -1069,7 +1092,7 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
         <template v-else>
           <div class="detail-head">
             <div>
-              <span class="stage-eyebrow">{{ (detail.status || '—').toUpperCase() }}</span>
+              <span class="stage-eyebrow">{{ (detail.status || '—').replace(/_/g, ' ').toUpperCase() }}</span>
               <h3>{{ detail.organization_name }}</h3>
               <p class="muted">{{ detail.admin_name }} · {{ detail.admin_email }} · {{ detail.region }}</p>
             </div>
@@ -1269,7 +1292,7 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
                   <td>{{ t.requested_by_email }}</td>
                   <td class="fb-msg">{{ t.subject }}</td>
                   <td>
-                    <select :value="t.status" :disabled="ticketBusy === t.id" @change="setTicketStatus(t, $event.target.value)">
+                    <select class="inline-select" :value="t.status" :disabled="ticketBusy === t.id" @change="setTicketStatus(t, $event.target.value)">
                       <option value="open">open</option>
                       <option value="in_progress">in progress</option>
                       <option value="resolved">resolved</option>
@@ -1279,8 +1302,8 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
                 </tr>
                 <tr v-if="ticketDetail === t.id">
                   <td colspan="6">
-                    <p style="white-space:pre-wrap;margin:6px 0;">{{ t.description }}</p>
-                    <pre v-if="t.diagnosis" style="max-height:280px;overflow:auto;font-size:11px;opacity:0.8;">{{ JSON.stringify(t.diagnosis, null, 2) }}</pre>
+                    <p class="ticket-desc">{{ t.description }}</p>
+                    <pre v-if="t.diagnosis" class="ticket-diag">{{ JSON.stringify(t.diagnosis, null, 2) }}</pre>
                   </td>
                 </tr>
               </template>
@@ -1318,7 +1341,7 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
               </div>
               <span
                 class="fb-tag"
-                :class="req.enabled ? 'is-feature' : (req.status === 'denied' ? 'is-feedback' : 'is-feedback')"
+                :class="req.enabled ? 'is-feedback' : (req.status === 'denied' ? 'tag-err' : 'tag-neutral')"
               >{{ req.enabled ? 'Enabled' : req.status }}</span>
             </div>
             <div v-if="req.enabled" class="bulk-enabled">
@@ -1510,7 +1533,7 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
                   <td>{{ lsDuration(r.duration_sec) }}</td>
                   <td class="ls-mono">{{ r.call_id || r.phone || '—' }}</td>
                   <td>
-                    <span v-if="r.has_error" class="fb-tag is-feature">ERROR</span>
+                    <span v-if="r.has_error" class="fb-tag tag-err">ERROR</span>
                     <span v-else class="fb-tag is-feedback">ok</span>
                   </td>
                   <td><button type="button" class="ghost-btn sm" @click="openLsDetail(r)">Diagnose</button></td>
@@ -1547,7 +1570,7 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
                   <span class="ls-turn-no">Turn {{ t.turn }}</span>
                   <span v-if="t.mode" class="ls-turn-mode">{{ t.mode }}</span>
                   <span v-if="t.latency_sec != null" class="ls-turn-lat">{{ lsDuration(t.latency_sec) }}</span>
-                  <span v-if="t.barge_in" class="fb-tag is-feature">barged in</span>
+                  <span v-if="t.barge_in" class="fb-tag tag-warn">barged in</span>
                 </div>
                 <p v-if="t.user_text" class="ls-user"><strong>USER</strong> {{ t.user_text }}</p>
                 <p v-if="t.agent_reply" class="ls-agent"><strong>AGENT</strong> {{ t.agent_reply }}</p>
@@ -1804,6 +1827,10 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
   --border-color: rgba(148, 163, 184, 0.16);
   --border-focus: rgba(96, 165, 250, 0.55);
   --bg-input: rgba(15, 23, 42, 0.82);
+  --surface: rgba(15, 23, 42, 0.88);
+  --font-data: ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, monospace;
+  --radius-box: 10px;
+  --radius-ctl: 6px;
   background: rgba(17, 24, 39, 0.7);
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
@@ -1830,6 +1857,7 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
   --border-color: rgba(15, 23, 42, 0.12);
   --border-focus: rgba(37, 99, 235, 0.38);
   --bg-input: rgba(255, 255, 255, 0.92);
+  --surface: rgba(255, 255, 255, 0.9);
   background: rgba(241, 245, 249, 0.86);
   border-color: rgba(148, 163, 184, 0.18);
   box-shadow: 0 20px 45px -18px rgba(15, 23, 42, 0.18);
@@ -1853,28 +1881,51 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
 .dashboard-header {
   display: flex;
   justify-content: space-between;
-  align-items: flex-start;
-  margin-bottom: 1.5rem;
-  padding-bottom: 1rem;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  align-items: center;
+  gap: 1rem;
+  margin-bottom: 1rem;
 }
-.header-left { display: flex; align-items: center; gap: 1rem; }
-.header-actions { display: flex; gap: 0.75rem; align-items: center; }
+.header-left { display: flex; align-items: center; gap: 0.85rem; }
+.header-actions { display: flex; gap: 0.6rem; align-items: center; }
 .header-title h2 {
-  font-size: 1.2rem; color: var(--text-primary);
-  letter-spacing: 3px; font-weight: 400; margin: 0 0 0.2rem 0;
+  font-size: 1.05rem; color: var(--text-primary);
+  letter-spacing: 3px; font-weight: 500; margin: 0 0 0.25rem 0;
 }
 .status-badge {
-  font-size: 0.65rem; background: rgba(16, 185, 129, 0.1);
-  color: var(--success-color); border: 1px solid rgba(16, 185, 129, 0.3);
-  padding: 0.2rem 0.5rem; border-radius: 4px; letter-spacing: 1px;
+  font-size: 0.6rem; background: rgba(16, 185, 129, 0.08);
+  color: var(--success-color); border: 1px solid rgba(16, 185, 129, 0.28);
+  padding: 0.16rem 0.45rem; border-radius: 4px; letter-spacing: 1.2px;
 }
 .theme-toggle, .logout-btn {
   background: transparent; border: 1px solid var(--border-color);
-  color: var(--text-secondary); padding: 0.5rem 0.9rem;
-  font-size: 0.7rem; letter-spacing: 1.4px; cursor: pointer;
+  border-radius: var(--radius-ctl);
+  color: var(--text-secondary); padding: 0.45rem 0.8rem;
+  font-size: 0.66rem; letter-spacing: 1.3px; cursor: pointer;
   transition: all 0.25s ease;
 }
+
+/* Section tab rail — one persistent channel selector under the masthead. */
+.console-nav {
+  display: flex; align-items: flex-end; gap: 0.15rem;
+  border-bottom: 1px solid var(--border-color);
+  margin-bottom: 1.4rem; overflow-x: auto; scrollbar-width: none;
+}
+.console-nav::-webkit-scrollbar { display: none; }
+.nav-tab {
+  position: relative; flex: 0 0 auto;
+  background: none; border: none; cursor: pointer;
+  color: var(--text-muted); font-size: 0.66rem; font-weight: 600;
+  letter-spacing: 1.6px; text-transform: uppercase;
+  padding: 0.55rem 0.8rem 0.7rem; white-space: nowrap;
+  transition: color 0.18s ease;
+}
+.nav-tab::after {
+  content: ''; position: absolute; left: 0.8rem; right: 0.8rem; bottom: -1px;
+  height: 2px; background: transparent; transition: background 0.18s ease;
+}
+.nav-tab:hover { color: var(--text-secondary); }
+.nav-tab.is-active { color: var(--text-primary); }
+.nav-tab.is-active::after { background: var(--accent-color); }
 .logout-btn { display: flex; align-items: center; gap: 0.5rem; }
 .theme-toggle:hover { color: var(--accent-color); border-color: var(--accent-color); box-shadow: 0 0 16px var(--accent-glow); }
 .logout-btn:hover { background: rgba(239, 68, 68, 0.1); color: var(--danger-color); border-color: var(--danger-color); }
@@ -1882,7 +1933,7 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
 .error-banner {
   margin: 0 0 1rem; padding: 0.6rem 0.9rem; font-size: 0.78rem;
   color: var(--danger-color); border: 1px solid var(--danger-color);
-  background: rgba(248, 113, 113, 0.08); border-radius: 6px;
+  background: rgba(248, 113, 113, 0.08); border-radius: var(--radius-ctl);
 }
 
 .console-swap-enter-active, .console-swap-leave-active {
@@ -1892,10 +1943,11 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
 .console-swap-leave-to { opacity: 0; transform: translateX(-18px); }
 
 .orgs-panel-header {
-  display: flex; justify-content: space-between; align-items: flex-end;
-  gap: 1rem; margin-bottom: 1rem;
+  display: flex; justify-content: space-between; align-items: center;
+  gap: 1rem; margin-bottom: 1rem; flex-wrap: wrap;
 }
-.orgs-panel-header h3 { margin: 0.2rem 0 0; font-size: 1rem; color: var(--text-primary); letter-spacing: 1px; }
+.orgs-panel-header h3 { margin: 0.25rem 0 0; font-size: 1.02rem; font-weight: 600; color: var(--text-primary); letter-spacing: 0.4px; }
+.panel-tools { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; justify-content: flex-end; }
 .stage-eyebrow { font-size: 0.62rem; letter-spacing: 2px; color: var(--text-muted); text-transform: uppercase; }
 
 .ghost-btn {
@@ -1903,39 +1955,43 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
   background: transparent; border: 1px solid var(--border-color);
   color: var(--text-secondary); padding: 0.45rem 0.8rem;
   font-size: 0.68rem; letter-spacing: 1.2px; cursor: pointer;
-  border-radius: 6px; transition: all 0.2s ease;
+  border-radius: var(--radius-ctl); transition: all 0.2s ease;
 }
 .ghost-btn:hover { color: var(--accent-color); border-color: var(--accent-color); }
 .ghost-btn:disabled { opacity: 0.5; cursor: default; }
 .back-btn { margin-bottom: 1rem; }
 .spin { animation: spin 0.9s linear infinite; }
 
-.product-filter { display: flex; gap: 0.4rem; margin-bottom: 1rem; }
+/* Segmented product filter (lives in the panel header row). */
+.product-filter { display: flex; border: 1px solid var(--border-color); border-radius: var(--radius-ctl); overflow: hidden; }
 .pf-btn {
-  display: inline-flex; align-items: center; gap: 0.4rem;
-  border: 1px solid var(--border-color); border-radius: 8px;
-  padding: 0.4rem 0.85rem; background: var(--bg-input); color: var(--text-muted);
-  font-size: 0.72rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; cursor: pointer;
+  display: inline-flex; align-items: center; gap: 0.35rem;
+  border: none; background: transparent; color: var(--text-muted);
+  padding: 0.42rem 0.75rem;
+  font-size: 0.64rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; cursor: pointer;
+  transition: color 0.15s ease, background 0.15s ease;
 }
+.pf-btn + .pf-btn { border-left: 1px solid var(--border-color); }
 .pf-btn:hover { color: var(--text-primary); }
-.pf-btn.is-on { color: var(--text-primary); border-color: var(--text-primary); background: var(--bg-hover, rgba(127,127,127,0.12)); }
-.pf-btn--apex.is-on { color: #E62630; border-color: rgba(230, 38, 48, 0.6); background: rgba(230, 38, 48, 0.08); }
-.pf-count { font-size: 0.68rem; opacity: 0.75; }
-.summary-strip { display: flex; flex-wrap: wrap; gap: 0.6rem; margin-bottom: 1.25rem; }
-.summary-chip {
-  display: flex; flex-direction: column; gap: 0.2rem;
-  border: 1px solid var(--border-color); border-radius: 8px;
-  padding: 0.55rem 0.9rem; min-width: 96px; background: var(--bg-input);
-}
-.summary-label { font-size: 0.58rem; letter-spacing: 1.5px; color: var(--text-muted); }
-.summary-chip strong { font-size: 0.95rem; color: var(--text-primary); }
+.pf-btn.is-on { color: var(--text-primary); background: rgba(96, 165, 250, 0.12); }
+.pf-btn--apex.is-on { color: #E62630; background: rgba(230, 38, 48, 0.1); }
+.pf-count { font-size: 0.62rem; opacity: 0.7; font-family: var(--font-data); }
 
-/* USD→INR FX chip: value + inline editor in the summary strip. */
-.fx-chip { flex-direction: row; align-items: center; gap: 0.55rem; }
-.fx-chip .summary-label { align-self: center; }
+/* Instrument stat band: one hairline-divided strip instead of floating chips.
+   The 1px grid gap over a border-color background draws the dividers. */
+.stat-band {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
+  gap: 1px; background: var(--border-color);
+  border: 1px solid var(--border-color); border-radius: var(--radius-box);
+  overflow: hidden; margin-bottom: 1.25rem;
+}
+.stat { background: var(--surface); padding: 0.6rem 0.9rem; display: flex; flex-direction: column; gap: 0.28rem; min-width: 0; }
+.stat-label { font-size: 0.58rem; letter-spacing: 1.5px; color: var(--text-muted); }
+.stat-value { font-family: var(--font-data); font-variant-numeric: tabular-nums; font-size: 0.95rem; font-weight: 600; color: var(--text-primary); white-space: nowrap; }
+.stat-fx-row { display: flex; align-items: center; gap: 0.45rem; flex-wrap: wrap; }
 .fx-dot { color: var(--accent-color); margin-left: 0.25rem; }
 .fx-btn {
-  border: 1px solid var(--border-color); border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--border-color); border-radius: var(--radius-ctl); cursor: pointer;
   background: var(--bg-input); color: var(--text-primary);
   font-size: 0.62rem; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
   padding: 0.25rem 0.55rem;
@@ -1944,21 +2000,22 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
 .fx-btn:disabled { opacity: 0.5; cursor: default; }
 .fx-btn.ghost { color: var(--text-muted); }
 .fx-input {
-  width: 72px; border: 1px solid var(--border-color); border-radius: 6px;
+  width: 72px; border: 1px solid var(--border-color); border-radius: var(--radius-ctl);
   background: var(--bg-input); color: var(--text-primary);
-  font-size: 0.85rem; padding: 0.25rem 0.45rem;
+  font-family: var(--font-data); font-size: 0.82rem; padding: 0.25rem 0.45rem;
 }
 .fx-error { color: #e5484d; font-size: 0.68rem; }
 
-.table-wrap { overflow-x: auto; border: 1px solid var(--border-color); border-radius: 10px; }
+.table-wrap { overflow-x: auto; border: 1px solid var(--border-color); border-radius: var(--radius-box); }
 .org-table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
 .org-table thead th {
-  text-align: left; font-weight: 500; font-size: 0.62rem; letter-spacing: 1.4px;
-  text-transform: uppercase; color: var(--text-muted);
-  padding: 0.7rem 0.85rem; border-bottom: 1px solid var(--border-color); white-space: nowrap;
+  text-align: left; font-weight: 600; font-size: 0.6rem; letter-spacing: 1.5px;
+  text-transform: uppercase; color: var(--text-muted); background: var(--surface);
+  padding: 0.6rem 0.85rem; border-bottom: 1px solid var(--border-color); white-space: nowrap;
 }
 .org-table th.num, .org-table td.num { text-align: right; }
-.org-table tbody td { padding: 0.7rem 0.85rem; border-bottom: 1px solid var(--border-color); color: var(--text-secondary); vertical-align: top; }
+.org-table td.num { font-family: var(--font-data); font-variant-numeric: tabular-nums; font-size: 0.76rem; }
+.org-table tbody td { padding: 0.65rem 0.85rem; border-bottom: 1px solid var(--border-color); color: var(--text-secondary); vertical-align: top; }
 .org-table tbody tr:last-child td { border-bottom: none; }
 .org-table tbody tr:hover { background: rgba(96, 165, 250, 0.05); }
 
@@ -1984,8 +2041,8 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
 .org-status.suspended { color: var(--danger-color); border-color: rgba(248, 113, 113, 0.4); }
 
 .plan-pill {
-  display: inline-block; font-size: 0.62rem; letter-spacing: 0.6px;
-  padding: 0.25rem 0.55rem; border-radius: 999px; white-space: nowrap;
+  display: inline-block; font-size: 0.58rem; letter-spacing: 0.8px; text-transform: uppercase;
+  padding: 0.22rem 0.5rem; border-radius: 4px; white-space: nowrap;
   border: 1px solid var(--border-color);
 }
 .plan-pill.plan-out { color: var(--success-color); border-color: rgba(52, 211, 153, 0.45); background: rgba(52, 211, 153, 0.08); }
@@ -1995,8 +2052,8 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
 
 .plan-btn {
   display: inline-flex; align-items: center; gap: 0.3rem;
-  font-size: 0.62rem; letter-spacing: 0.6px; cursor: pointer;
-  padding: 0.4rem 0.65rem; border-radius: 6px; white-space: nowrap;
+  font-size: 0.64rem; letter-spacing: 0.6px; cursor: pointer;
+  padding: 0.42rem 0.7rem; border-radius: var(--radius-ctl); white-space: nowrap;
   border: 1px solid var(--border-color); background: transparent; color: var(--text-secondary);
   transition: all 0.2s ease;
 }
@@ -2007,7 +2064,7 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
 
 .empty-orgs {
   text-align: center; padding: 3rem 1rem; color: var(--text-muted);
-  border: 1px dashed var(--border-color); border-radius: 10px;
+  border: 1px dashed var(--border-color); border-radius: var(--radius-box);
 }
 .empty-orgs p { margin: 0.5rem 0 0; }
 
@@ -2019,18 +2076,18 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
 
 .detail-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 0.75rem; margin-bottom: 1.5rem; }
 .detail-card {
-  border: 1px solid var(--border-color); border-radius: 10px;
-  padding: 0.85rem 1rem; background: var(--bg-input); display: flex; flex-direction: column; gap: 0.3rem;
+  border: 1px solid var(--border-color); border-radius: var(--radius-box);
+  padding: 0.85rem 1rem; background: var(--surface); display: flex; flex-direction: column; gap: 0.3rem;
 }
 .card-label { font-size: 0.58rem; letter-spacing: 1.5px; color: var(--text-muted); }
-.detail-card strong { font-size: 1.25rem; color: var(--text-primary); }
+.detail-card strong { font-size: 1.2rem; color: var(--text-primary); font-family: var(--font-data); font-variant-numeric: tabular-nums; }
 .card-foot { font-size: 0.62rem; color: var(--text-muted); }
 
 .cogs-breakdown { margin-bottom: 1.5rem; }
 .cogs-bars { margin-top: 0.6rem; display: flex; flex-direction: column; gap: 0.5rem; }
 .cogs-bar-row { display: grid; grid-template-columns: 48px 1fr 90px; align-items: center; gap: 0.6rem; }
 .cogs-key { font-size: 0.7rem; color: var(--text-secondary); }
-.cogs-val { font-size: 0.72rem; color: var(--text-primary); text-align: right; }
+.cogs-val { font-size: 0.72rem; color: var(--text-primary); text-align: right; font-family: var(--font-data); font-variant-numeric: tabular-nums; }
 .meter-track { height: 7px; border-radius: 999px; background: var(--border-color); overflow: hidden; }
 .meter-fill { height: 100%; border-radius: 999px; }
 .meter-fill.blue { background: #60a5fa; }
@@ -2038,9 +2095,19 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
 .meter-fill.green { background: #34d399; }
 .meter-fill.amber { background: #fbbf24; }
 
-.fb-tag { display: inline-block; padding: 2px 8px; border-radius: 6px; font-size: 0.7rem; font-weight: 700; letter-spacing: 0.02em; }
-.fb-tag.is-feature { background: rgba(96,165,250,0.15); color: #60a5fa; }
-.fb-tag.is-feedback { background: rgba(74,222,128,0.15); color: #4ade80; }
+.fb-tag { display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 0.64rem; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase; white-space: nowrap; }
+.fb-tag.is-feature { background: rgba(96,165,250,0.14); color: #60a5fa; }
+.fb-tag.is-feedback { background: rgba(74,222,128,0.14); color: #4ade80; }
+.fb-tag.tag-err { background: rgba(248,113,113,0.14); color: var(--danger-color); }
+.fb-tag.tag-warn { background: rgba(251,191,36,0.14); color: #fbbf24; }
+.fb-tag.tag-neutral { background: rgba(148,163,184,0.14); color: var(--text-muted); }
+.inline-select {
+  background: var(--bg-input); color: var(--text-primary);
+  border: 1px solid var(--border-color); border-radius: var(--radius-ctl);
+  font: inherit; font-size: 0.74rem; padding: 0.3rem 0.45rem;
+}
+.ticket-desc { white-space: pre-wrap; margin: 6px 0; color: var(--text-primary); }
+.ticket-diag { max-height: 280px; overflow: auto; margin: 6px 0 2px; font-family: var(--font-data); font-size: 11px; opacity: 0.8; }
 .fb-msg { white-space: pre-wrap; max-width: 460px; color: var(--text-primary); }
 .ghost-btn.sm { padding: 0.3rem 0.6rem; font-size: 0.7rem; white-space: nowrap; }
 .ghost-btn.sm.danger { color: #f87171; border-color: rgba(248,113,113,0.4); }
@@ -2048,7 +2115,7 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
 /* Bulk CSV calling requests */
 .bulk-help { color: var(--text-secondary, #9aa); font-size: 0.8rem; margin: 0 0 12px; max-width: 720px; }
 .bulk-list { display: flex; flex-direction: column; gap: 12px; }
-.bulk-card { border: 1px solid var(--border-color, rgba(255,255,255,0.1)); border-radius: 10px; padding: 14px 16px; }
+.bulk-card { border: 1px solid var(--border-color, rgba(255,255,255,0.1)); border-radius: var(--radius-box); padding: 14px 16px; }
 .bulk-card-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
 .bulk-card-top strong { display: block; }
 .bulk-meta { display: block; font-size: 0.75rem; color: var(--text-secondary, #9aa); margin-top: 2px; }
@@ -2059,19 +2126,19 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
 .bulk-grant-hint { flex-basis: 100%; margin: 0; font-size: 0.75rem; color: var(--text-secondary, #9aa); line-height: 1.45; }
 .bulk-or { flex-basis: 100%; margin: 2px 0; font-size: 0.66rem; letter-spacing: 0.09em; text-transform: uppercase; color: var(--text-secondary, #9aa); opacity: 0.6; }
 .bulk-input {
-  flex: 1 1 160px; min-width: 140px; padding: 0.45rem 0.6rem; border-radius: 8px;
+  flex: 1 1 160px; min-width: 140px; padding: 0.45rem 0.6rem; border-radius: var(--radius-ctl);
   border: 1px solid var(--border-color, rgba(255,255,255,0.15)); background: var(--input-bg, rgba(0,0,0,0.2));
   color: var(--text-primary, #fff); font-size: 0.8rem;
 }
 
 /* To-do tab */
-.todo-create { border: 1px solid var(--border-color); border-radius: 10px; padding: 0.9rem; margin-bottom: 1rem; display: flex; flex-direction: column; gap: 0.6rem; }
-.todo-input { width: 100%; box-sizing: border-box; padding: 0.55rem 0.7rem; border: 1px solid var(--border-color); border-radius: 8px; background: var(--bg-input, transparent); color: var(--text-primary); font: inherit; font-size: 0.82rem; }
+.todo-create { border: 1px solid var(--border-color); border-radius: var(--radius-box); padding: 0.9rem; margin-bottom: 1rem; display: flex; flex-direction: column; gap: 0.6rem; }
+.todo-input { width: 100%; box-sizing: border-box; padding: 0.55rem 0.7rem; border: 1px solid var(--border-color); border-radius: var(--radius-ctl); background: var(--bg-input, transparent); color: var(--text-primary); font: inherit; font-size: 0.82rem; }
 .todo-notes { resize: vertical; }
 .todo-create__row { display: flex; gap: 0.6rem; align-items: stretch; }
 .todo-select { flex: 1; }
 .todo-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.5rem; }
-.todo-item { display: flex; align-items: flex-start; gap: 0.7rem; padding: 0.7rem 0.85rem; border: 1px solid var(--border-color); border-radius: 10px; }
+.todo-item { display: flex; align-items: flex-start; gap: 0.7rem; padding: 0.7rem 0.85rem; border: 1px solid var(--border-color); border-radius: var(--radius-box); }
 .todo-item input[type="checkbox"] { margin-top: 0.2rem; }
 .todo-item__body { flex: 1; min-width: 0; }
 .todo-item__title { font-size: 0.85rem; font-weight: 600; color: var(--text-primary); }
@@ -2122,39 +2189,39 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
 .ls-search { flex: 1; min-width: 200px; }
 .ls-limit { width: auto; }
 .ls-check { display: flex; align-items: center; gap: 0.35rem; font-size: 0.78rem; color: var(--text-secondary); white-space: nowrap; }
-.ls-mono { font-family: var(--font-mono, ui-monospace, monospace); font-size: 0.74rem; }
+.ls-mono { font-family: var(--font-data); font-size: 0.74rem; }
 .ls-when { white-space: nowrap; }
 .ls-row-err td { background: rgba(248, 113, 113, 0.07); }
 
 .ls-detail { display: flex; flex-direction: column; gap: 1rem; }
 .ls-meta { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0.6rem; }
 @media (max-width: 700px) { .ls-meta { grid-template-columns: repeat(2, 1fr); } }
-.ls-meta > div { border: 1px solid var(--border-color); border-radius: 8px; padding: 0.6rem 0.7rem; display: flex; flex-direction: column; gap: 0.2rem; }
+.ls-meta > div { border: 1px solid var(--border-color); border-radius: var(--radius-box); background: var(--surface); padding: 0.6rem 0.7rem; display: flex; flex-direction: column; gap: 0.2rem; }
 .ls-meta-k { font-size: 0.6rem; letter-spacing: 1px; text-transform: uppercase; color: var(--text-muted); }
 .ls-meta-v { font-size: 0.85rem; color: var(--text-primary); font-weight: 600; }
-.ls-error-banner { margin: 0; padding: 0.7rem 0.9rem; border: 1px solid rgba(248,113,113,0.5); border-radius: 8px; background: rgba(248,113,113,0.1); color: #f87171; font-size: 0.82rem; font-weight: 600; }
+.ls-error-banner { margin: 0; padding: 0.7rem 0.9rem; border: 1px solid rgba(248,113,113,0.5); border-radius: var(--radius-ctl); background: rgba(248,113,113,0.1); color: #f87171; font-size: 0.82rem; font-weight: 600; }
 
-.ls-prompt { border: 1px solid var(--border-color); border-radius: 8px; padding: 0.5rem 0.8rem; }
+.ls-prompt { border: 1px solid var(--border-color); border-radius: var(--radius-box); padding: 0.5rem 0.8rem; }
 .ls-prompt summary { cursor: pointer; font-size: 0.78rem; font-weight: 600; color: var(--text-secondary); letter-spacing: 0.5px; }
 .ls-prompt pre { margin: 0.7rem 0 0; max-height: 320px; overflow: auto; white-space: pre-wrap; word-break: break-word; font-size: 0.74rem; line-height: 1.45; color: var(--text-primary); }
 
 .ls-convo { display: flex; flex-direction: column; gap: 0.6rem; }
-.ls-turn { border: 1px solid var(--border-color); border-radius: 10px; padding: 0.7rem 0.85rem; }
+.ls-turn { border: 1px solid var(--border-color); border-radius: var(--radius-box); padding: 0.7rem 0.85rem; }
 .ls-turn-head { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.4rem; flex-wrap: wrap; }
 .ls-turn-no { font-size: 0.72rem; font-weight: 700; color: var(--text-primary); }
 .ls-turn-mode { font-size: 0.62rem; text-transform: uppercase; letter-spacing: 1px; color: var(--accent-color); border: 1px solid var(--border-color); padding: 0.1rem 0.4rem; border-radius: 4px; }
-.ls-turn-lat { font-size: 0.68rem; color: var(--text-muted); font-family: var(--font-mono, monospace); }
+.ls-turn-lat { font-size: 0.68rem; color: var(--text-muted); font-family: var(--font-data); }
 .ls-user, .ls-agent { margin: 0.2rem 0; font-size: 0.84rem; line-height: 1.5; color: var(--text-primary); }
 .ls-user strong, .ls-agent strong { display: inline-block; min-width: 52px; font-size: 0.6rem; letter-spacing: 1px; color: var(--text-muted); vertical-align: top; }
 .ls-agent { color: var(--text-secondary); }
 .ls-turn-err { margin: 0.3rem 0 0; font-size: 0.78rem; color: #f87171; }
 
 /* Telephony panel (tenant detail) */
-.telephony-panel { display: flex; align-items: center; justify-content: space-between; gap: 1rem; border: 1px solid var(--border-color); border-radius: 12px; padding: 0.9rem 1.1rem; flex-wrap: wrap; }
+.telephony-panel { display: flex; align-items: center; justify-content: space-between; gap: 1rem; border: 1px solid var(--border-color); border-radius: var(--radius-box); padding: 0.9rem 1.1rem; flex-wrap: wrap; }
 .telephony-info { display: flex; flex-direction: column; gap: 0.2rem; }
 .telephony-info strong { font-size: 1.05rem; color: var(--text-primary); }
 .telephony-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; }
-.comp-error { margin: 0.5rem 0 0; padding: 0.6rem 0.8rem; font-size: 0.78rem; line-height: 1.5; color: #f87171; border: 1px solid rgba(248,113,113,0.4); border-radius: 8px; background: rgba(248,113,113,0.08); word-break: break-word; }
+.comp-error { margin: 0.5rem 0 0; padding: 0.6rem 0.8rem; font-size: 0.78rem; line-height: 1.5; color: #f87171; border: 1px solid rgba(248,113,113,0.4); border-radius: var(--radius-ctl); background: rgba(248,113,113,0.08); word-break: break-word; }
 
 /* LLM keys tab */
 .llm-form-row { display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap; }
@@ -2175,7 +2242,7 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
 }
 .modal-card {
   background: rgba(17, 24, 39, 0.97); border: 1px solid var(--border-color);
-  border-radius: 12px; padding: 1.5rem; max-width: 420px; width: 100%;
+  border-radius: var(--radius-box); padding: 1.5rem; max-width: 420px; width: 100%;
   box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.6);
 }
 .theme-light .modal-card { background: rgba(248, 250, 252, 0.98); }
@@ -2185,7 +2252,7 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
 .modal-actions { display: flex; justify-content: flex-end; gap: 0.6rem; margin-top: 1.25rem; }
 .modal-actions .plan-btn { padding: 0.5rem 1rem; }
 .modal-actions .plan-btn:disabled { opacity: 0.45; cursor: not-allowed; }
-.comp-warn { margin: 0.8rem 0 0; padding: 0.6rem 0.7rem; font-size: 0.8rem; line-height: 1.45; color: #fbbf24; border: 1px solid rgba(251,191,36,0.4); border-radius: 8px; background: rgba(251,191,36,0.08); }
+.comp-warn { margin: 0.8rem 0 0; padding: 0.6rem 0.7rem; font-size: 0.8rem; line-height: 1.45; color: #fbbf24; border: 1px solid rgba(251,191,36,0.4); border-radius: var(--radius-ctl); background: rgba(251,191,36,0.08); }
 .comp-ack { display: flex; align-items: flex-start; gap: 0.5rem; margin-top: 0.7rem; font-size: 0.8rem; color: var(--text-secondary); cursor: pointer; }
 .comp-ack input { margin-top: 0.15rem; }
 .comp-field { display: flex; flex-direction: column; gap: 0.35rem; margin-top: 0.9rem; font-size: 0.72rem; letter-spacing: 1px; text-transform: uppercase; color: var(--text-secondary); }
@@ -2193,4 +2260,11 @@ watch(() => props.homeSignal, () => { closeDetail(); closeFeedback(); closeTodos
 
 @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
 @keyframes spin { to { transform: rotate(360deg); } }
+
+@media (prefers-reduced-motion: reduce) {
+  .dashboard-container { animation: none; }
+  .console-swap-enter-active, .console-swap-leave-active,
+  .nav-tab, .nav-tab::after, .ghost-btn, .plan-btn, .pf-btn,
+  .theme-toggle, .logout-btn { transition: none; }
+}
 </style>
