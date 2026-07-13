@@ -31,7 +31,7 @@ import logging
 from typing import Any, AsyncIterator
 
 from app.core.config import settings
-from app.services.apex_micro_acks import ACK_POOLS
+from app.services.apex_micro_acks import ack_pool
 from app.services.prosody import prosody_for, stream_prosody_chunks
 from app.services.sarvam_voice_service import SarvamVoiceService
 from app.models.tenant_resources import TenantResources
@@ -69,10 +69,11 @@ async def prewarm_campaign_tts(
     """Synthesize every scripted campaign line into the TTS byte-cache, for each
     pre-translated language AND each rendition variant (``APEX_TTS_VARIANTS``;
     each variant is a distinct cache key → a distinct natural take). Also warms
-    the global micro-ack pool (``APEX_ACK_ENABLED``) — it's shared across
-    campaigns, so after the first campaign these are pure cache hits (synthesize
-    probes the cache before calling Sarvam). Serial (one request at a time —
-    this runs in the background, latency is irrelevant); never raises."""
+    the micro-ack pool for the campaign's conversation style
+    (``APEX_ACK_ENABLED``) — pools are global per style×language, so after the
+    first campaign of a style these are pure cache hits (synthesize probes the
+    cache before calling Sarvam). Serial (one request at a time — this runs in
+    the background, latency is irrelevant); never raises."""
     if not isinstance(questionnaire, dict):
         return
     warmed = failed = 0
@@ -110,10 +111,12 @@ async def prewarm_campaign_tts(
         except Exception:
             logger.debug("APEX-TTS-PREWARM: intro chunking failed lang=%s", lang, exc_info=True)
         # Micro-acks spoken before verbatim questions (warm tone at call time —
-        # mirrors _deliver_verbatim_question's ack site).
+        # mirrors _deliver_verbatim_question's ack site). The pool matches the
+        # campaign's conversation style; pools are global per style×lang, so
+        # after the first campaign of a style these are pure cache probes.
         if settings.APEX_ACK_ENABLED:
             ack_prosody = prosody_for("warm")
-            for ack in ACK_POOLS.get(lang, ()):  # pool langs == prewarm langs
+            for ack in ack_pool(questionnaire.get("style"), lang):  # pool langs == prewarm langs
                 jobs.append(
                     (
                         ack,

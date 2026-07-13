@@ -7,7 +7,7 @@ import { inject, onMounted, ref, computed, watch } from 'vue';
 import {
   newQuestion, maxPointsFor, estCallSeconds, fmtDuration, scheduleEstimate, countCsvRows,
   buildBulkCampaignFormData, buildBulkCampaignUpdatePayload, categorizeContacts, leadCategory,
-  campaignWindow, cleanQuestions,
+  campaignWindow, cleanQuestions, CONVERSATION_STYLES,
 } from '../../composables/bulkCalling.js';
 import { useNewRows } from '../../composables/axMotion.js';
 import AxIcon from '../AxIcon.vue';
@@ -21,6 +21,8 @@ const emptyForm = () => ({
   content: '', file: null, intro: '', outro: '', questions: [], threshold: 1,
   working_days: 5, hours_per_day: 10, calls_per_day: 200,
   intro_i18n: {}, outro_i18n: {}, // reviewed hi/te lines (translate-preview flow)
+  style: 'scripted', // conversation style (style-rewrite flow)
+  intro_source: '', outro_source: '', // pre-restyle originals
 });
 const form = ref(emptyForm());
 const fileName = ref('');
@@ -90,6 +92,12 @@ function applyNovaDraft(draft) {
   // turn the submit into a PATCH of some other campaign.
   editingId.value = null;
   editingName.value = '';
+  // Nova's copy is already conversational — it lands as Scripted ("speak the
+  // exact words Nova wrote"), never forcing a restyle pass over AI-written text.
+  // The admin can still pick a style; the first restyle snapshots Nova's text.
+  styledFor.value = '';
+  styleWarnings.value = [];
+  styleError.value = '';
   apex.toast('Draft from Nova applied — add your contacts file and launch when ready.');
   apex.clearNovaDraft && apex.clearNovaDraft();
 }
@@ -192,6 +200,9 @@ function startEdit(c) {
     outro: q.outro || '',
     intro_i18n: { ...(q.intro_i18n || {}) },
     outro_i18n: { ...(q.outro_i18n || {}) },
+    style: CONVERSATION_STYLES.some((s) => s.id === q.style) ? q.style : 'scripted',
+    intro_source: q.intro_source || '',
+    outro_source: q.outro_source || '',
     threshold: Number(q.threshold) || 1,
     working_days: Number(w.working_days) || 5,
     hours_per_day: Number(w.hours_per_day) || 10,
@@ -201,6 +212,7 @@ function startEdit(c) {
       id: item.id,
       type: item.type === 'answer' ? 'answer' : 'intent',
       text: item.text || '',
+      text_source: item.text_source || '',
       desired_answer: item.desired_answer || '',
       required: item.required === 'no' ? 'no' : 'yes',
       points: Number(item.points) || 1,
@@ -218,6 +230,11 @@ function startEdit(c) {
   editingName.value = c.name || '';
   translated.value = !!(q.intro_i18n || q.outro_i18n || (q.questions || []).some((x) => x.text_i18n));
   translateError.value = '';
+  // A persisted styled campaign edits WITHOUT a forced regenerate — its text is
+  // already the reviewed styled script. Restyle regenerates from *_source.
+  styledFor.value = form.value.style !== 'scripted' ? form.value.style : '';
+  styleWarnings.value = [];
+  styleError.value = '';
   fileName.value = '';
   listSize.value = null;
   step.value = 1;
@@ -232,6 +249,9 @@ function cancelEdit() {
   listSize.value = null;
   translated.value = false;
   translateError.value = '';
+  styledFor.value = '';
+  styleWarnings.value = [];
+  styleError.value = '';
   launchError.value = '';
   step.value = 1;
 }
@@ -247,7 +267,135 @@ const translating = ref(false);
 const translated = ref(false);
 const translateError = ref('');
 
+// ── conversation style (style-rewrite review) ──
+// "Generate styled script" rewrites the question/intro/outro WORDING into the
+// selected style once (server preview, nothing persisted) so the admin reviews
+// and hand-edits the exact lines before launch. Originals are kept in *_source
+// — restyle always regenerates from them, and Scripted restores them.
+const styling = ref(false);
+const styleError = ref('');
+const styledFor = ref(''); // style id the current text was generated for ('' = none)
+const styleWarnings = ref([]); // lines that KEPT their wording on the last restyle
+
+// One lock for every step-3 async action: an impatient double-click must never
+// interleave a restyle and a translate against the same form state.
+const busy = computed(() => styling.value || translating.value || launching.value);
+const styleLabel = computed(() => (CONVERSATION_STYLES.find((s) => s.id === form.value.style) || {}).label || form.value.style);
+const styleHint = computed(() => (CONVERSATION_STYLES.find((s) => s.id === form.value.style) || {}).hint || '');
+const hasStyledSources = computed(() =>
+  !!((form.value.intro_source || '').trim() || (form.value.outro_source || '').trim()
+    || form.value.questions.some((x) => (x.text_source || '').trim())));
+// The launch gate: a non-scripted style whose script hasn't been generated (or
+// was generated for a DIFFERENT style) must not launch — the admin would ship
+// wording they never reviewed.
+const stylePending = computed(() => form.value.style !== 'scripted' && styledFor.value !== form.value.style);
+const styleWarnText = computed(() => {
+  const w = styleWarnings.value || [];
+  if (!w.length) return '';
+  if (w.some((x) => x.reason === 'llm_failed')) return 'The restyle failed — no lines were changed. Try again.';
+  const parts = w.map((x) => (x.kind === 'question' ? `Q${x.index}` : x.kind === 'intro' ? 'the intro' : 'the outro'));
+  return `${parts.join(', ')} couldn't be restyled — original wording kept. Edit those lines by hand or retry.`;
+});
+
+function setStyle(id) {
+  if (busy.value || form.value.style === id) return;
+  form.value.style = id;
+  styleWarnings.value = [];
+  styleError.value = '';
+  // Back to Scripted = back to the admin's own words, immediately and locally.
+  // Between styles nothing is destroyed — the launch gate flags the pending
+  // regenerate instead.
+  if (id === 'scripted') revertToOriginal();
+}
+
+async function styleRewrite() {
+  if (busy.value) return;
+  styleError.value = '';
+  const cleaned = cleanQuestions(form.value.questions);
+  if (!cleaned.length) { styleError.value = 'Add at least one question first.'; return; }
+  styling.value = true;
+  try {
+    const res = await apex.styleRewriteQuestionnaire({
+      questionnaire: {
+        intro: (form.value.intro || '').trim(),
+        intro_source: (form.value.intro_source || '').trim(),
+        outro: (form.value.outro || '').trim(),
+        outro_source: (form.value.outro_source || '').trim(),
+        questions: cleaned,
+        threshold: Number(form.value.threshold) || 1,
+      },
+      style: form.value.style,
+      company_name: (form.value.company_name || '').trim(),
+      caller_name: (form.value.caller_name || '').trim(),
+      content: (form.value.content || '').trim(),
+    });
+    const q = res?.questionnaire || null;
+    // Map styled text back by position: cleanQuestions and the server both
+    // keep non-blank questions in order (same contract as translatePreview).
+    // A line whose text changed loses its translations — they describe the
+    // old wording; "Translate & review" refills them from the styled text.
+    const nonBlank = form.value.questions.filter((x) => (x.text || '').trim());
+    (q?.questions || []).forEach((rq, i) => {
+      if (!nonBlank[i]) return;
+      const styledText = (rq.text || '').trim();
+      if (styledText && styledText !== (nonBlank[i].text || '').trim()) {
+        nonBlank[i].text = styledText;
+        nonBlank[i].text_i18n = null;
+        nonBlank[i]._i18nSrc = undefined;
+      }
+      if ((rq.text_source || '').trim()) nonBlank[i].text_source = rq.text_source.trim();
+    });
+    for (const key of ['intro', 'outro']) {
+      const styledLine = ((q || {})[key] || '').trim();
+      if (styledLine && styledLine !== (form.value[key] || '').trim()) {
+        form.value[key] = styledLine;
+        form.value[`${key}_i18n`] = {};
+        form.value[`_${key}Src`] = undefined;
+      }
+      const src = ((q || {})[`${key}_source`] || '').trim();
+      if (src) form.value[`${key}_source`] = src;
+    }
+    translated.value = false; // hi/te review re-runs on the styled text
+    styledFor.value = form.value.style;
+    styleWarnings.value = Array.isArray(res?.warnings) ? res.warnings : [];
+    if (styleWarnings.value.length) {
+      apex.toast('Some lines couldn\'t be restyled — original wording kept. Review before launching.', 'err', 6500);
+    }
+  } catch (e) {
+    styleError.value = apex.extractError(e, 'Could not restyle the script.');
+  } finally {
+    styling.value = false;
+  }
+}
+
+// Pure client-side: restore the admin's original wording everywhere and strip
+// the styling state. Lines whose text changes lose their stale translations.
+function revertToOriginal() {
+  for (const q of form.value.questions) {
+    const src = (q.text_source || '').trim();
+    if (src && src !== (q.text || '').trim()) {
+      q.text = src;
+      q.text_i18n = null;
+      q._i18nSrc = undefined;
+    }
+    q.text_source = '';
+  }
+  for (const key of ['intro', 'outro']) {
+    const src = (form.value[`${key}_source`] || '').trim();
+    if (src && src !== (form.value[key] || '').trim()) {
+      form.value[key] = src;
+      form.value[`${key}_i18n`] = {};
+      form.value[`_${key}Src`] = undefined;
+    }
+    form.value[`${key}_source`] = '';
+  }
+  styledFor.value = '';
+  styleWarnings.value = [];
+  styleError.value = '';
+}
+
 async function translatePreview() {
+  if (busy.value) return;
   translateError.value = '';
   const cleaned = cleanQuestions(form.value.questions);
   if (!cleaned.length) { translateError.value = 'Add at least one question first.'; return; }
@@ -291,6 +439,13 @@ function pruneStaleI18n() {
 
 async function submit() {
   launchError.value = '';
+  // Compliance gate: never launch a styled campaign whose script the admin
+  // hasn't generated + reviewed for the CURRENTLY selected style. Block — an
+  // auto-run here would ship wording nobody saw.
+  if (stylePending.value) {
+    launchError.value = `Generate the ${styleLabel.value} script in this review step before launching, or switch the conversation style back to Scripted.`;
+    return;
+  }
   launching.value = true;
   try {
     pruneStaleI18n();
@@ -320,6 +475,9 @@ async function submit() {
       step.value = 1;
       translated.value = false;
       translateError.value = '';
+      styledFor.value = '';
+      styleWarnings.value = [];
+      styleError.value = '';
     }
     await apex.reload();
   } catch (e) {
@@ -516,6 +674,23 @@ async function onAddFile(e) {
               <textarea v-model="form.outro" rows="2" class="ax-text" placeholder="Thanks so much for your time — have a great day!"></textarea>
             </div>
 
+            <!-- conversation style: rewrites the WORDING of the script (once, at
+                 review) — never the questions' meaning, scoring or order -->
+            <div style="margin-top:14px;">
+              <label class="ax-field-label">Conversation style <span class="ax-field-hint">how the agent words the script — generate &amp; review it in step 3</span></label>
+              <div class="ax-styleseg" role="radiogroup" aria-label="Conversation style">
+                <button
+                  v-for="s in CONVERSATION_STYLES" :key="s.id" type="button"
+                  class="ax-styleopt" :class="{ 'is-on': form.style === s.id }"
+                  role="radio" :aria-checked="form.style === s.id" :disabled="busy"
+                  @click="setStyle(s.id)"
+                >
+                  {{ s.label }}<span v-if="s.recommended" class="ax-style-rec">Recommended</span>
+                </button>
+              </div>
+              <p class="ax-field-hint" style="margin-top:8px;font-size:12px;">{{ styleHint }}</p>
+            </div>
+
             <div v-if="form.questions.length" class="ax-qlist">
               <div v-for="(q, i) in form.questions" :key="i" class="ax-q">
                 <div class="ax-q-row">
@@ -585,7 +760,19 @@ async function onAddFile(e) {
           </div>
 
           <div class="ax-review-script">
-            <div class="ax-break-label" style="margin-bottom:16px;">Call script preview</div>
+            <div class="ax-break-label" style="margin-bottom:16px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+              <span>Call script preview</span>
+              <span v-if="form.style !== 'scripted'" class="ax-camp-mode">{{ styleLabel }} style</span>
+              <button v-if="form.style !== 'scripted'" type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" :disabled="busy" @click="styleRewrite">
+                <AxIcon name="refresh" :size="12" /> {{ styling ? 'Restyling…' : (stylePending ? `Generate ${styleLabel} script` : 'Regenerate') }}
+              </button>
+              <button v-if="hasStyledSources" type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" :disabled="busy" @click="revertToOriginal">
+                Revert to original wording
+              </button>
+            </div>
+            <p v-if="form.style !== 'scripted'" class="ax-field-hint" style="margin:-6px 0 12px;font-size:12px;">
+              The styled lines below replace your wording on calls — hand-edit any of them in step 2 before launching. Meaning, scoring and question order never change.
+            </p>
             <div class="ax-rv-bubble">{{ form.intro || `Hi, this is ${form.caller_name || 'the agent'}${form.company_name ? ' from ' + form.company_name : ''}…` }}</div>
             <ol v-if="form.questions.length" class="ax-rv-qs">
               <li v-for="(q, i) in form.questions" :key="i">
@@ -598,6 +785,8 @@ async function onAddFile(e) {
               {{ form.name || 'Untitled campaign' }} · {{ form.language || 'en' }} · dials 09:00–19:00 IST,
               {{ form.working_days }} day(s)/week, up to {{ form.calls_per_day }}/day.
             </p>
+            <p v-if="styleWarnText" class="ax-rv-warn"><AxIcon name="alert" :size="14" /> {{ styleWarnText }}</p>
+            <p v-if="styleError" class="ax-notice ax-notice--err" style="margin-top:10px;">{{ styleError }}</p>
           </div>
 
           <!-- hi/te script review: the exact lines the agent speaks when the
@@ -605,7 +794,7 @@ async function onAddFile(e) {
           <div class="ax-review-script" style="margin-top:18px;">
             <div class="ax-break-label" style="margin-bottom:6px;display:flex;align-items:center;gap:12px;">
               <span>Hindi &amp; Telugu script</span>
-              <button type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" :disabled="translating" @click="translatePreview">
+              <button type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" :disabled="busy" @click="translatePreview">
                 <AxIcon name="refresh" :size="12" /> {{ translating ? 'Translating…' : (translated ? 'Re-translate' : 'Translate & review') }}
               </button>
             </div>
@@ -617,15 +806,15 @@ async function onAddFile(e) {
                 <div class="ax-i18n-col">
                   <div class="ax-field-label" style="margin:10px 0 0;">{{ lang.label }}</div>
                   <label class="ax-field-hint" style="font-size:11.5px;">Intro
-                    <textarea v-model="form.intro_i18n[lang.code]" rows="2" class="ax-text" style="margin-top:4px;"></textarea>
+                    <textarea v-model="form.intro_i18n[lang.code]" rows="2" class="ax-text" style="margin-top:4px;" :disabled="busy"></textarea>
                   </label>
                   <template v-for="(q, i) in form.questions" :key="i">
                     <label v-if="q.text_i18n" class="ax-field-hint" style="font-size:11.5px;">Q{{ i + 1 }} · {{ (q.text || '').slice(0, 60) }}
-                      <textarea v-model="q.text_i18n[lang.code]" rows="2" class="ax-text" style="margin-top:4px;"></textarea>
+                      <textarea v-model="q.text_i18n[lang.code]" rows="2" class="ax-text" style="margin-top:4px;" :disabled="busy"></textarea>
                     </label>
                   </template>
                   <label class="ax-field-hint" style="font-size:11.5px;">Outro
-                    <textarea v-model="form.outro_i18n[lang.code]" rows="2" class="ax-text" style="margin-top:4px;"></textarea>
+                    <textarea v-model="form.outro_i18n[lang.code]" rows="2" class="ax-text" style="margin-top:4px;" :disabled="busy"></textarea>
                   </label>
                 </div>
               </template>
@@ -635,6 +824,7 @@ async function onAddFile(e) {
 
           <p v-if="!editingId && !form.file" class="ax-rv-warn"><AxIcon name="alert" :size="14" /> No contacts file yet — add one in step 1 to launch.</p>
           <p v-if="!form.questions.length" class="ax-rv-warn"><AxIcon name="alert" :size="14" /> No questions added — the agent will only deliver the intro and outro.</p>
+          <p v-if="stylePending" class="ax-rv-warn"><AxIcon name="alert" :size="14" /> {{ styleLabel }} style selected — generate the styled script above and review it before launching.</p>
           <p v-if="launchError" class="ax-notice ax-notice--err">{{ launchError }}</p>
         </div>
       </Transition>
@@ -763,6 +953,23 @@ async function onAddFile(e) {
 .ax-rv-qs li { font-size: 13.5px; color: rgba(255,255,255,0.72); line-height: 1.5; }
 .ax-rv-gate { font-family: 'JetBrains Mono', monospace; font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; color: #F0666E; border: 1px solid rgba(230,38,48,0.35); background: rgba(230,38,48,0.07); border-radius: 999px; padding: 2px 9px; margin-left: 9px; }
 .ax-rv-warn { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #D6A15C; margin: 14px 0 0; }
+
+/* ── conversation style segmented control ── */
+.ax-styleseg { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
+.ax-styleopt {
+  display: inline-flex; align-items: center; gap: 7px; font-family: 'Sora', sans-serif;
+  font-size: 12.5px; font-weight: 500; color: rgba(255,255,255,0.55);
+  background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.13);
+  border-radius: 999px; padding: 8px 16px; cursor: pointer; transition: all .18s;
+}
+.ax-styleopt:hover:not(:disabled) { color: rgba(255,255,255,0.8); border-color: rgba(255,255,255,0.22); }
+.ax-styleopt:disabled { opacity: 0.55; cursor: default; }
+.ax-styleopt.is-on { color: #fff; border-color: rgba(230,38,48,0.75); background: rgba(230,38,48,0.14); box-shadow: 0 0 14px -4px rgba(230,38,48,0.6); }
+.ax-style-rec {
+  font-family: 'JetBrains Mono', monospace; font-size: 9.5px; letter-spacing: 0.05em;
+  text-transform: uppercase; color: #7FD9A8; border: 1px solid rgba(74,200,140,0.35);
+  background: rgba(74,200,140,0.08); border-radius: 999px; padding: 1px 7px;
+}
 
 /* ── hi/te translation review ── */
 .ax-i18n-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 8px; }

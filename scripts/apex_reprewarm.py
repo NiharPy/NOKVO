@@ -9,7 +9,9 @@ scripted line and the next call per line/language pays live synthesis:
   * a tenant ``provider_status.sarvam_tts_temperature`` / speaker change,
   * enabling rendition variants (``APEX_TTS_VARIANTS`` > 1) or the pace
     spread knob,
-  * enabling micro-acks (``APEX_ACK_ENABLED`` — the ack pool wants warming).
+  * enabling micro-acks (``APEX_ACK_ENABLED`` — the ack pool wants warming),
+  * new/changed style ack pools (``apex_micro_acks.STYLE_ACK_POOLS`` — each
+    campaign warms the pool for its ``questionnaire.style``).
 
 Run this right after deploying any of those to re-fill the cache for every
 ACTIVE campaign (running/scheduled/paused — completed ones don't dial again).

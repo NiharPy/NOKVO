@@ -319,6 +319,11 @@ class OutboundCampaignContext:
     # verbatim-question flag is on, the outro is spoken from the session-language
     # entry here so it stays native; empty falls back to ``question_outro``.
     question_outro_i18n: dict = field(default_factory=dict)
+    # Conversation style the questionnaire was restyled into at creation
+    # (questionnaire_style). Drives the micro-ack pool at call time; empty =
+    # scripted/default pool. The styled question text itself already lives in
+    # ``questions[].text`` — this only selects style-matched acks.
+    questionnaire_style: str = ""
 
     @property
     def is_proactive(self) -> bool:
@@ -596,6 +601,12 @@ def _coerce_questionnaire(value: Any, *, strict: bool = False) -> dict[str, Any]
         i18n = item.get("text_i18n")
         if isinstance(i18n, dict) and i18n:
             q["text_i18n"] = {str(k): str(v) for k, v in i18n.items() if v}
+        # Preserve the pre-restyle original wording (questionnaire_style) so
+        # "revert to original" and restyle-from-source survive re-coercion.
+        # Never spoken/translated — only ``text`` is.
+        text_source = str(item.get("text_source") or "").strip()[:_MAX_QUESTION_TEXT]
+        if text_source:
+            q["text_source"] = text_source
         questions.append(q)
         if len(questions) >= _MAX_QUESTIONS:
             break
@@ -626,6 +637,20 @@ def _coerce_questionnaire(value: Any, *, strict: bool = False) -> dict[str, Any]
     outro_i18n = value.get("outro_i18n")
     if isinstance(outro_i18n, dict) and outro_i18n:
         result["outro_i18n"] = {str(k): str(v) for k, v in outro_i18n.items() if v}
+    # Conversation-style keys (questionnaire_style): the selected style plus
+    # the pre-restyle originals of intro/outro, same round-trip rationale as
+    # text_source above. Stored only when non-default so legacy questionnaires
+    # round-trip byte-identical. Lenient even in strict mode — these are
+    # machine-set, and an unknown style just degrades to scripted.
+    from app.services.questionnaire_style import normalize_style
+
+    style = normalize_style(value.get("style"))
+    if style != "scripted":
+        result["style"] = style
+    for source_key in ("intro_source", "outro_source"):
+        source = str(value.get(source_key) or "").strip()[:600]
+        if source:
+            result[source_key] = source
     return result
 
 
@@ -778,6 +803,7 @@ def _build_context(campaign: OutboundCampaign, *, goal: str | None = None) -> Ou
         question_intro_i18n=dict((agent_config.get("questionnaire") or {}).get("intro_i18n") or {}),
         question_outro=str((agent_config.get("questionnaire") or {}).get("outro") or ""),
         question_outro_i18n=dict((agent_config.get("questionnaire") or {}).get("outro_i18n") or {}),
+        questionnaire_style=str((agent_config.get("questionnaire") or {}).get("style") or ""),
     )
 
 
@@ -831,6 +857,7 @@ async def load_outbound_context(
                     question_intro_i18n=ctx.question_intro_i18n,
                     question_outro=ctx.question_outro,
                     question_outro_i18n=ctx.question_outro_i18n,
+                    questionnaire_style=ctx.questionnaire_style,
                 )
             return ctx
 

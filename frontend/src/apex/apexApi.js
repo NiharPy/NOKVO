@@ -169,6 +169,21 @@ export async function translateQuestionnaire(questionnaire) {
   return data?.questionnaire || null;
 }
 
+// Conversation-style PREVIEW for the campaign form: rewrites question/intro/
+// outro wording into the chosen style (originals kept in *_source) so the
+// admin reviews and hand-edits before launch. Returns the full response —
+// { questionnaire, style, warnings } — warnings list lines that kept their
+// current wording so the UI can flag a partially styled script. Nothing is
+// persisted.
+export async function styleRewriteQuestionnaire({ questionnaire, style, company_name, caller_name, content }) {
+  const { data } = await agentsApi.post(
+    '/bulk-calling/questionnaire/style-rewrite',
+    { questionnaire, style, company_name, caller_name, content },
+    { headers: authHeader() },
+  );
+  return data || null;
+}
+
 export async function rerunCampaign(campaignId) {
   const { data } = await agentsApi.post(`/bulk-calling/campaigns/${campaignId}/rerun`, {}, { headers: authHeader() });
   return data;

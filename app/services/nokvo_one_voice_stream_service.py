@@ -3038,6 +3038,7 @@ class NokvoOneVoiceStreamService:
                 language=language,
                 last_ack=last_ack,
                 delivered_count=len(get_delivered_questions()),
+                style=str(getattr(outbound_context, "questionnaire_style", "") or ""),
             )
             # Humanized pre-speech pause. Deliberately BEFORE mark_speaking: a
             # caller who resumes talking during the sleep lands as a NEW

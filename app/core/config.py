@@ -418,6 +418,11 @@ class Settings(BaseSettings):
     # (language_style.py) so verbatim questions match the LLM turns' register
     # instead of sounding textbook-formal.
     APEX_I18N_SPOKEN_REGISTER: bool = True
+    # Conversation-style rewrite (questionnaire_style): the wizard's
+    # style-rewrite preview endpoint. OFF = the endpoint returns the
+    # questionnaire unchanged (soft degrade, same shape as the tier gate);
+    # campaigns already styled keep speaking their styled text either way.
+    APEX_STYLE_REWRITE_ENABLED: bool = True
     # Plivo telephony (the sole provider). The MASTER account creds; each tenant
     # gets its own Plivo subaccount + DID + Application created via the API.
     PLIVO_AUTH_ID: str = ""

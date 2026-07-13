@@ -187,8 +187,20 @@ export function makeId(prefix) {
 }
 
 export function newQuestion() {
-  return { id: makeId('q'), type: 'intent', text: '', desired_answer: '', required: 'yes', gate: false, points: 1, graded: false, tiers: [] };
+  return { id: makeId('q'), type: 'intent', text: '', text_source: '', desired_answer: '', required: 'yes', gate: false, points: 1, graded: false, tiers: [] };
 }
+
+// Conversation styles for APEX deterministic campaigns (ids match the backend
+// questionnaire_style.CONVERSATION_STYLES). Scripted = the admin's exact words;
+// the rest run the style-rewrite preview so the admin reviews the styled lines
+// before launch.
+export const CONVERSATION_STYLES = [
+  { id: 'scripted', label: 'Scripted', hint: 'Your exact words, spoken verbatim.' },
+  { id: 'professional', label: 'Professional', hint: 'Polished, courteous business tone.' },
+  { id: 'human', label: 'Human', hint: 'Natural and warm — how a real rep talks.', recommended: true },
+  { id: 'luxury', label: 'Luxury', hint: 'Refined concierge tone for premium offers.' },
+  { id: 'friendly', label: 'Friendly', hint: 'Upbeat, casual, approachable.' },
+];
 
 // Max achievable lead score (top band for a graded answer, else its weight) —
 // mirrors backend questionnaire_max_points.
@@ -243,6 +255,9 @@ export function cleanQuestions(questions) {
       // Reviewed/hand-edited translations (translate-preview flow) ride along;
       // the server preserves non-empty languages and fills only the blanks.
       if (hasI18n(q.text_i18n)) out.text_i18n = pruneI18n(q.text_i18n);
+      // Pre-restyle original wording (style-rewrite flow) — rides along so
+      // "revert to original" and restyle-from-source survive an edit round-trip.
+      if ((q.text_source || '').trim()) out.text_source = q.text_source.trim();
       return out;
     })
     .filter((q) => q.text);
@@ -273,6 +288,11 @@ function buildQuestionnaire(form, fail) {
   // server preserves any non-empty language and only fills the blanks.
   if (hasI18n(form.intro_i18n)) questionnaire.intro_i18n = pruneI18n(form.intro_i18n);
   if (hasI18n(form.outro_i18n)) questionnaire.outro_i18n = pruneI18n(form.outro_i18n);
+  // Conversation style + pre-restyle originals (style-rewrite flow). Stored on
+  // the questionnaire only when styled, so scripted campaigns stay unchanged.
+  if (form.style && form.style !== 'scripted') questionnaire.style = form.style;
+  if ((form.intro_source || '').trim()) questionnaire.intro_source = form.intro_source.trim();
+  if ((form.outro_source || '').trim()) questionnaire.outro_source = form.outro_source.trim();
   return questionnaire;
 }
 

@@ -2360,6 +2360,61 @@ async def translate_bulk_questionnaire(
     return {"questionnaire": questionnaire}
 
 
+class QuestionnaireStyleRewritePayload(BaseModel):
+    questionnaire: dict
+    style: str
+    company_name: str | None = None
+    caller_name: str | None = None
+    content: str | None = None
+
+
+@router.post("/bulk-calling/questionnaire/style-rewrite")
+async def style_rewrite_bulk_questionnaire(
+    payload: QuestionnaireStyleRewritePayload,
+    user: OrganizationUser = Depends(_bulk_admin_dep()),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Conversation-style PREVIEW for the campaign form: rewrite the draft
+    questionnaire's wording (questions + any admin intro/outro) into the chosen
+    style so the admin reviews and hand-edits the exact lines before launching.
+    The styled text replaces each line's ``text`` (original kept in
+    ``*_source``), so translation/prewarm/verbatim delivery downstream run on
+    it unchanged. Nothing is persisted — the form submits the (possibly edited)
+    result with the campaign. ``warnings`` lists lines that KEPT their current
+    wording (model missed them or the rewrite failed validation) so the UI can
+    flag a partially styled script."""
+    from app.services.agent_outbound_context import _coerce_questionnaire
+    from app.services.questionnaire_style import normalize_style, rewrite_questionnaire
+
+    await _require_outbound_enabled(db, user)
+    try:
+        questionnaire = _coerce_questionnaire(payload.questionnaire, strict=True)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=_safe_detail(exc)) from exc
+    if not questionnaire:
+        raise HTTPException(
+            status_code=422,
+            detail="Add at least one question before restyling the questionnaire.",
+        )
+    style = normalize_style(payload.style)
+    if str(payload.style or "").strip() and style != str(payload.style).strip().lower():
+        raise HTTPException(status_code=422, detail="Unknown conversation style.")
+    warnings: list[dict] = []
+    if (
+        settings.APEX_STYLE_REWRITE_ENABLED
+        and (await _org_for_user(db, user)).product_tier == "nokvo_apex"
+    ):
+        questionnaire, warnings = await rewrite_questionnaire(
+            questionnaire,
+            style,
+            company_name=payload.company_name,
+            caller_name=payload.caller_name,
+            content=payload.content,
+        )
+    return {"questionnaire": questionnaire, "style": style, "warnings": warnings}
+
+
 class BulkCampaignUpdatePayload(BaseModel):
     name: str | None = None
     content: str | None = None
