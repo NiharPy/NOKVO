@@ -74,6 +74,13 @@ class Settings(BaseSettings):
     # `python -m app.scripts.download_ambience_audio`).
     NOKVO_CALL_CENTER_AMBIENCE_ENABLED: bool = True
     NOKVO_CALL_CENTER_AMBIENCE_VOLUME: float = 0.28  # 0.0 (silent) to 1.0 (full)
+    # Server-side room tone on REAL telephony calls: mixes a low-gain office bed
+    # under every agent speech chunk inside the Plivo playback adapter (the web
+    # test call keeps its client-side ambience above — separate paths, no
+    # doubling). GAIN is a linear PCM multiplier and is deliberately NOT the
+    # browser VOLUME knob: 0.28 under 8k speech would be far too hot.
+    NOKVO_AMBIENCE_TELEPHONY_ENABLED: bool = False
+    NOKVO_AMBIENCE_TELEPHONY_GAIN: float = 0.10
 
     # Nokvo Connect — public API key infrastructure that lets customers embed
     # the voice agent into their own apps. Default OFF: the surface (admin
@@ -373,6 +380,44 @@ class Settings(BaseSettings):
     # questions lack text_i18n degrade gracefully to the LLM-rephrase flow, so run
     # the translation backfill (scripts/backfill_apex_questionnaire_i18n.py) first.
     APEX_VERBATIM_QUESTIONS_ENABLED: bool = True
+    # ── APEX humanization (all defaults = current behavior; each knob is an
+    # independent env flip, rollback included) ─────────────────────────────────
+    # Gap-target response timing on the DETERMINISTIC (verbatim) path only. The
+    # cached reply otherwise lands with near-constant, unnaturally fast latency
+    # every turn. Instead of a blind delay (which would stack on the EOU silence
+    # wait and feel slow), we top up the total perceived gap — EOU tier wait +
+    # delay + fetch — toward TARGET±JITTER: after a fast-tier EOU we add a
+    # couple hundred ms; after the long continuation wait we add ZERO. 0 = off.
+    APEX_TURN_GAP_TARGET_MS: int = 0  # rollout value ~800
+    APEX_TURN_GAP_JITTER_MS: int = 120
+    APEX_VERBATIM_DELAY_MAX_MS: int = 450
+    # When a micro-ack will be spoken, the ACK is the gap-filler — clamp the
+    # pre-speech sleep hard so the ack voice lands almost immediately.
+    APEX_VERBATIM_DELAY_ACK_MAX_MS: int = 100
+    # Deterministic micro-acknowledgments before verbatim questions ("సరే.",
+    # "जी.", "Got it.") — seeded per call+question, never repeating the last
+    # one, native-script pools only (en/hi/te). Fixes the interrogation cadence
+    # without reintroducing the LLM stock-ack repetition this product banned.
+    APEX_ACK_ENABLED: bool = False
+    APEX_ACK_PROBABILITY: float = 0.45
+    APEX_ACK_GAP_MS: int = 250  # silence between ack and question (Plivo only)
+    APEX_ACK_GAP_JITTER_MS: int = 80
+    # Rendition variants for cached scripted lines: N>1 salts the TTS cache key
+    # (x_variant, stripped before the request reaches Sarvam) so each line has N
+    # distinct natural takes; a call picks one via crc32(call_id) and keeps it
+    # for the whole call. 1 = exactly today's single-rendition behavior.
+    APEX_TTS_VARIANTS: int = 1
+    # Optional audible spread across variants: variant k multiplies pace by
+    # 1 + spread*(k-(N+1)/2). 0.0 = rely on synthesis temperature alone.
+    APEX_TTS_VARIANT_PACE_SPREAD: float = 0.0
+    # Deterministic opener template variants (per-call crc32 rotation). 1 = the
+    # single current template.
+    APEX_OPENER_VARIANTS: int = 1
+    # Questionnaire translation register: when ON, the campaign-creation
+    # translation prompt carries the spoken code-switch register rules
+    # (language_style.py) so verbatim questions match the LLM turns' register
+    # instead of sounding textbook-formal.
+    APEX_I18N_SPOKEN_REGISTER: bool = True
     # Plivo telephony (the sole provider). The MASTER account creds; each tenant
     # gets its own Plivo subaccount + DID + Application created via the API.
     PLIVO_AUTH_ID: str = ""

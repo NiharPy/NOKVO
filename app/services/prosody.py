@@ -43,16 +43,23 @@ class Prosody:
 
 
 # Conservative deltas around the neutral baseline. Pushing further sounds artificial.
+# NOTE bulbul:v3 accepts ONLY pace (pitch/loudness are stripped for it in
+# sarvam_voice_service), so on the current default model pace IS the prosody —
+# hence deltas wide enough to be audible. CACHE WARNING: pace lands in the TTS
+# byte-cache key, so changing any value here rotates the key of every warmed
+# scripted line — run scripts/apex_reprewarm.py right after deploying a change.
 _PROSODY: dict[str, Prosody] = {
     "empathy":  Prosody(pace=0.92, pitch=-0.10, loudness=1.0),
     "warm":     Prosody(pace=1.0,  pitch= 0.05, loudness=1.0),
     "neutral":  Prosody(pace=1.0,  pitch= 0.0,  loudness=1.0),
     "excited":  Prosody(pace=1.08, pitch= 0.10, loudness=1.0),
-    "question": Prosody(pace=0.97, pitch= 0.05, loudness=1.0),
+    # Questions land measurably slower than statements in natural speech —
+    # 0.97 was inaudible on v3; 0.94 reads as a person actually asking.
+    "question": Prosody(pace=0.94, pitch= 0.05, loudness=1.0),
     # Hesitation / thinking-aloud: a slightly slower pace gives the natural
     # drawn-out feel of a soft filler ("um…", "well…") without letter-repetition
     # (Bulbul has no elongation markup; pace + a trailing comma/… is the lever).
-    "thinking": Prosody(pace=0.90, pitch= 0.0,  loudness=1.0),
+    "thinking": Prosody(pace=0.88, pitch= 0.0,  loudness=1.0),
 }
 
 DEFAULT_TONE = "neutral"

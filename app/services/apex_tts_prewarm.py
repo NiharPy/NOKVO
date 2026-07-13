@@ -30,6 +30,8 @@ from __future__ import annotations
 import logging
 from typing import Any, AsyncIterator
 
+from app.core.config import settings
+from app.services.apex_micro_acks import ACK_POOLS
 from app.services.prosody import prosody_for, stream_prosody_chunks
 from app.services.sarvam_voice_service import SarvamVoiceService
 from app.models.tenant_resources import TenantResources
@@ -65,11 +67,16 @@ async def prewarm_campaign_tts(
     tenant_res: TenantResources, questionnaire: dict[str, Any] | None
 ) -> None:
     """Synthesize every scripted campaign line into the TTS byte-cache, for each
-    pre-translated language. Serial (one Sarvam request at a time — this runs in
-    the background, latency is irrelevant); never raises."""
+    pre-translated language AND each rendition variant (``APEX_TTS_VARIANTS``;
+    each variant is a distinct cache key → a distinct natural take). Also warms
+    the global micro-ack pool (``APEX_ACK_ENABLED``) — it's shared across
+    campaigns, so after the first campaign these are pure cache hits (synthesize
+    probes the cache before calling Sarvam). Serial (one request at a time —
+    this runs in the background, latency is irrelevant); never raises."""
     if not isinstance(questionnaire, dict):
         return
     warmed = failed = 0
+    variants = max(1, int(settings.APEX_TTS_VARIANTS or 1))
     for lang in _PREWARM_LANGS:
         # (text, prosody kwargs) per line, mirroring each call-time site.
         jobs: list[tuple[str, dict[str, Any]]] = []
@@ -102,18 +109,40 @@ async def prewarm_campaign_tts(
                 )
         except Exception:
             logger.debug("APEX-TTS-PREWARM: intro chunking failed lang=%s", lang, exc_info=True)
+        # Micro-acks spoken before verbatim questions (warm tone at call time —
+        # mirrors _deliver_verbatim_question's ack site).
+        if settings.APEX_ACK_ENABLED:
+            ack_prosody = prosody_for("warm")
+            for ack in ACK_POOLS.get(lang, ()):  # pool langs == prewarm langs
+                jobs.append(
+                    (
+                        ack,
+                        {
+                            "pace": ack_prosody.pace,
+                            "pitch": ack_prosody.pitch,
+                            "loudness": ack_prosody.loudness,
+                        },
+                    )
+                )
 
         for line, prosody_kwargs in jobs:
-            try:
-                await SarvamVoiceService.synthesize(
-                    tenant_res, line, language=lang, cache=True, **prosody_kwargs
-                )
-                warmed += 1
-            except Exception:
-                failed += 1
-                logger.debug(
-                    "APEX-TTS-PREWARM: synthesis failed lang=%s line=%r", lang, line[:60],
-                    exc_info=True,
-                )
+            for variant in range(1, variants + 1):
+                try:
+                    await SarvamVoiceService.synthesize(
+                        tenant_res,
+                        line,
+                        language=lang,
+                        cache=True,
+                        variant=variant,
+                        **prosody_kwargs,
+                    )
+                    warmed += 1
+                except Exception:
+                    failed += 1
+                    logger.debug(
+                        "APEX-TTS-PREWARM: synthesis failed lang=%s variant=%d line=%r",
+                        lang, variant, line[:60],
+                        exc_info=True,
+                    )
     if warmed or failed:
         logger.info("APEX-TTS-PREWARM: warmed %d line(s), %d failed", warmed, failed)

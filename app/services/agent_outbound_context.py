@@ -35,6 +35,7 @@ import contextvars
 import re
 import time
 import uuid
+import zlib
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
@@ -2133,6 +2134,7 @@ def generate_outbound_opener_text(
     *,
     language: str | None = None,
     known_facts: dict[str, Any] | None = None,
+    variant_seed: str | None = None,
 ) -> str:
     """Deterministic, template-filled opener.
 
@@ -2147,9 +2149,27 @@ def generate_outbound_opener_text(
     facts (``bhk``, ``location``) and a ``returning`` flag — so the opener is
     personalised ("you'd enquired about 3 BHK in Gachibowli") instead of a cold
     one-size-fits-all line. Falls back to the campaign pitch when nothing is known.
+
+    ``variant_seed`` (usually the call id) rotates the greeting word and the
+    consent tail across ``APEX_OPENER_VARIANTS`` renditions so every call
+    doesn't open with the identical sentence — a re-dialed lead hears a
+    different opener on each attempt. Variant 0 is byte-identical to the
+    single historical template; the knob's default (1) keeps exactly that.
+    Selection uses crc32 (never the process-salted builtin ``hash``).
     """
+    from app.core.config import settings
+
     caller = (context.caller_name or "Riya").strip() or "Riya"
     company = (context.company_name or "").strip()
+    _n = max(1, int(getattr(settings, "APEX_OPENER_VARIANTS", 1) or 1))
+    _v = (
+        zlib.crc32(str(variant_seed).encode("utf-8")) % _n
+        if variant_seed and _n > 1
+        else 0
+    )
+
+    def _pick(options: tuple[str, ...]) -> str:
+        return options[_v % len(options)]
     # An admin-authored questionnaire intro overrides the template opener — the
     # operator wrote exactly how they want the call to open. Spoken from the
     # pre-translated per-language entry (lang → en → authored fallback) so a
@@ -2176,24 +2196,31 @@ def generate_outbound_opener_text(
 
     if code == "te":
         name_part = f" {lead_name}" if lead_name else ""
+        # Variant 0 = the historical strings, byte-identical (cache keys keep).
+        consent_te = _pick((
+            "ఇప్పుడు ఒక్క minute మాట్లాడగలరా?",
+            "ఒక్క రెండు నిమిషాలు time ఉందా అండి?",
+            "ఇప్పుడు మాట్లాడడానికి okay నా అండి?",
+        ))
+        greet_te = _pick(("Hello", "నమస్తే", "Hello"))
         intro_te = (
-            f"Hello{name_part}, నేను {caller}, {company} నుండి మాట్లాడుతున్నా."
+            f"{greet_te}{name_part}, నేను {caller}, {company} నుండి మాట్లాడుతున్నా."
             if company
-            else f"Hello{name_part}, నేను {caller} మాట్లాడుతున్నా."
+            else f"{greet_te}{name_part}, నేను {caller} మాట్లాడుతున్నా."
         )
         if returning:
             about_te = f"{project} గురించి " if project else "మన last conversation గురించి "
             return (
                 f"[warm]{intro_te}[/warm] "
                 f"[neutral]{about_te}follow up చేయడానికి call చేస్తున్నా.[/neutral] "
-                "[question]ఇప్పుడు ఒక్క minute మాట్లాడగలరా?[/question]"
+                f"[question]{consent_te}[/question]"
             )
         if followup:
             about_te = project or "మీరు interest చూపిన project"
             return (
                 f"[warm]{intro_te}[/warm] "
                 f"[neutral]{about_te} గురించి follow up చేయడానికి call చేస్తున్నా.[/neutral] "
-                "[question]ఇప్పుడు ఒక్క minute మాట్లాడగలరా?[/question]"
+                f"[question]{consent_te}[/question]"
             )
         if enquiry:
             reason = (
@@ -2204,13 +2231,13 @@ def generate_outbound_opener_text(
             return (
                 f"[warm]{intro_te}[/warm] "
                 f"[neutral]{reason}.[/neutral] "
-                "[question]ఇప్పుడు ఒక్క minute మాట్లాడగలరా?[/question]"
+                f"[question]{consent_te}[/question]"
             )
         if pitch:
             return (
                 f"[warm]{intro_te}[/warm] "
                 f"[neutral]{pitch} గురించి call చేస్తున్నా.[/neutral] "
-                "[question]ఇప్పుడు ఒక్క minute మాట్లాడగలరా?[/question]"
+                f"[question]{consent_te}[/question]"
             )
         reason_te = (
             f"[neutral]{company} తరఫున మీ area లో ఒక project గురించి call చేస్తున్నా.[/neutral] "
@@ -2220,29 +2247,36 @@ def generate_outbound_opener_text(
         return (
             f"[warm]{intro_te}[/warm] "
             f"{reason_te}"
-            "[question]ఇప్పుడు ఒక్క minute మాట్లాడగలరా?[/question]"
+            f"[question]{consent_te}[/question]"
         )
 
     if code == "hi":
         name_part = f" {lead_name}" if lead_name else ""
+        # Variant 0 = the historical strings, byte-identical (cache keys keep).
+        consent_hi = _pick((
+            "क्या अभी एक minute बात कर सकते हैं?",
+            "क्या अभी दो minute का time मिलेगा आपको?",
+            "अभी बात करना ठीक रहेगा क्या?",
+        ))
+        greet_hi = _pick(("नमस्ते", "Hello", "नमस्ते"))
         intro_hi = (
-            f"नमस्ते{name_part}, मैं {caller} बोल रहा हूँ, {company} से."
+            f"{greet_hi}{name_part}, मैं {caller} बोल रहा हूँ, {company} से."
             if company
-            else f"नमस्ते{name_part}, मैं {caller} बोल रहा हूँ."
+            else f"{greet_hi}{name_part}, मैं {caller} बोल रहा हूँ."
         )
         if returning:
             about_hi = f"{project} के बारे में " if project else "हमारी पिछली बात-चीत के "
             return (
                 f"[warm]{intro_hi}[/warm] "
                 f"[neutral]{about_hi}follow up के लिए call किया है.[/neutral] "
-                "[question]क्या अभी एक minute बात कर सकते हैं?[/question]"
+                f"[question]{consent_hi}[/question]"
             )
         if followup:
             about_hi = project or "जिस project में आपकी interest थी उसके"
             return (
                 f"[warm]{intro_hi}[/warm] "
                 f"[neutral]{about_hi} के बारे में follow up के लिए call किया है.[/neutral] "
-                "[question]क्या अभी एक minute बात कर सकते हैं?[/question]"
+                f"[question]{consent_hi}[/question]"
             )
         if enquiry:
             reason = (
@@ -2253,13 +2287,13 @@ def generate_outbound_opener_text(
             return (
                 f"[warm]{intro_hi}[/warm] "
                 f"[neutral]{reason}.[/neutral] "
-                "[question]क्या अभी एक minute बात कर सकते हैं?[/question]"
+                f"[question]{consent_hi}[/question]"
             )
         if pitch:
             return (
                 f"[warm]{intro_hi}[/warm] "
                 f"[neutral]{pitch} के लिए call किया है.[/neutral] "
-                "[question]क्या अभी एक minute बात कर सकते हैं?[/question]"
+                f"[question]{consent_hi}[/question]"
             )
         reason_hi = (
             f"[neutral]मैं {company} की तरफ़ से आपके area के एक project के बारे में call कर रहा हूँ.[/neutral] "
@@ -2269,14 +2303,21 @@ def generate_outbound_opener_text(
         return (
             f"[warm]{intro_hi}[/warm] "
             f"{reason_hi}"
-            "[question]क्या अभी एक minute बात कर सकते हैं?[/question]"
+            f"[question]{consent_hi}[/question]"
         )
 
     name_part = f" {lead_name}" if lead_name else ""
+    # Variant 0 = the historical strings, byte-identical (cache keys keep).
+    consent_en = _pick((
+        "Is now a good time to talk for a minute?",
+        "Do you have a quick minute right now?",
+        "Is this an okay time for a quick word?",
+    ))
+    greet_en = _pick(("Hi", "Hello", "Hi"))
     intro = (
-        f"Hi{name_part}, this is {caller} from {company}."
+        f"{greet_en}{name_part}, this is {caller} from {company}."
         if company
-        else f"Hi{name_part}, this is {caller}."
+        else f"{greet_en}{name_part}, this is {caller}."
     )
     if returning:
         # A real prior call happened (we have a note) — reference it, optionally
@@ -2285,7 +2326,7 @@ def generate_outbound_opener_text(
         return (
             f"[warm]{intro}[/warm] "
             f"[neutral]I'm calling to follow up on our last conversation{about}.[/neutral] "
-            "[question]Is now a good time to talk for a minute?[/question]"
+            f"[question]{consent_en}[/question]"
         )
     if followup:
         # Follow-up with NO prior conversation — do NOT invent one. Re-engage
@@ -2294,7 +2335,7 @@ def generate_outbound_opener_text(
         return (
             f"[warm]{intro}[/warm] "
             f"[neutral]I'm following up about {about}.[/neutral] "
-            "[question]Is now a good time to talk for a minute?[/question]"
+            f"[question]{consent_en}[/question]"
         )
     if enquiry:
         reason = (
@@ -2305,13 +2346,13 @@ def generate_outbound_opener_text(
         return (
             f"[warm]{intro}[/warm] "
             f"[neutral]I'm calling — {reason}.[/neutral] "
-            "[question]Is now a good time to talk for a minute?[/question]"
+            f"[question]{consent_en}[/question]"
         )
     if pitch:
         return (
             f"[warm]{intro}[/warm] "
             f"[neutral]I'm reaching out about {pitch}.[/neutral] "
-            "[question]Is now a good time to talk for a minute?[/question]"
+            f"[question]{consent_en}[/question]"
         )
     # No pitch summary: still give a reason so the prospect isn't left asking
     # "what is this?". Reference the company when we have it.
@@ -2323,7 +2364,7 @@ def generate_outbound_opener_text(
     return (
         f"[warm]{intro}[/warm] "
         f"{reason_line}"
-        "[question]Is now a good time to talk for a minute?[/question]"
+        f"[question]{consent_en}[/question]"
     )
 
 

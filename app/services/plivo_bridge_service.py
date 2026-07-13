@@ -94,6 +94,38 @@ class PlivoWebSocketAdapter(TwilioWebSocketAdapter):
         except Exception:  # noqa: BLE001
             pass
 
+    async def send_silence_ms(self, ms: int) -> None:
+        """Queue ``ms`` of pure L16 silence on Plivo's playback queue — the
+        APEX humanization layer uses it to shape the ack→question pause.
+        Chunked into ≤200 ms ``playAudio`` frames (each a small, valid,
+        standalone payload — never one oversized frame), sent sequentially so
+        they interleave cleanly between speech sends. Barge-in's ``clearAudio``
+        flushes queued silence with everything else. Best-effort like every
+        playback send. Callers invoke this duck-typed (``hasattr``) so the web
+        test call's raw WebSocket simply skips it."""
+        try:
+            total = min(int(ms), 5000)  # sanity cap — never queue seconds of dead air
+            if total <= 0:
+                return
+            rate_out = int(settings.PLIVO_DEFAULT_SAMPLE_RATE or 8000)
+            remaining = total
+            while remaining > 0:
+                frame_ms = min(200, remaining)
+                remaining -= frame_ms
+                payload = base64.b64encode(
+                    bytes(int(rate_out * frame_ms / 1000) * 2)
+                ).decode()
+                await self._ws.send_text(json.dumps({
+                    "event": "playAudio",
+                    "media": {
+                        "contentType": "audio/x-l16",
+                        "sampleRate": rate_out,
+                        "payload": payload,
+                    },
+                }))
+        except Exception as exc:  # noqa: BLE001 — best-effort playback
+            _log.debug("[PLIVO-WS] silence send failed: %s", exc)
+
     async def receive(self) -> dict:
         if self._pending_config is not None:
             cfg = self._pending_config

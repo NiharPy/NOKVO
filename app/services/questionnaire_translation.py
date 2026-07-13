@@ -75,7 +75,42 @@ def _merge_i18n(existing: Any, tr: dict[str, str]) -> dict[str, str]:
     return {**tr, **keep}
 
 
+# Spoken-register rules distilled from language_style.py (the LLM turns'
+# style guide) so VERBATIM lines carry the same register as the live agent —
+# without this the questions sound textbook-formal while the LLM's objection
+# handling sounds like a real metro salesperson: two voices in one call.
+# Kept short on purpose (a translation prompt, not the full few-shot blocks).
+_SPOKEN_REGISTER_RULES = (
+    "REGISTER — these lines are SPOKEN on a phone call by a salesperson, not "
+    "printed. Write them the way a real Indian phone rep talks:\n"
+    "- en: natural spoken English — contractions, direct address, light "
+    "connective flow ('And what budget do you have in mind?'), never form-"
+    "field phrasing ('Please specify your budget range'). PRESERVE every "
+    "content word: names, numbers, amounts, and domain terms (project, BHK, "
+    "site visit, budget) must survive the rewrite unchanged.\n"
+    "- hi: ~60% English / 40% Hindi — real urban metro talk, not formal or "
+    "Sanskritised. Hindi (Devanagari) is the grammatical frame (है, चाहिए, "
+    "आप, के लिए, जी); English carries the content nouns and domain terms in "
+    "LATIN letters (project, budget, location, site visit, BHK). NEVER "
+    "transliterate English words into Devanagari (WhatsApp, not व्हाट्सएप). "
+    "Polite आप form always.\n"
+    "- te: ~60% English / 40% Telugu — real Hyderabad metro talk, not "
+    "textbook Telugu. Telugu script only for genuine Telugu grammar words "
+    "(ఉంది, కావాలి, మీరు, కోసం, అండి); content nouns and domain terms stay "
+    "English in LATIN letters. NEVER transliterate English into Telugu "
+    "script (WhatsApp, not వాట్సాప్). Polite మీరు form always.\n"
+    "- All languages: numbers, ₹ amounts, phone numbers, dates and times "
+    "stay as digits (₹50L, 3 BHK, 10 AM) — the TTS layer voices them.\n"
+    "Example — authored: 'What is your budget for the apartment?' → "
+    "en: 'And what budget do you have in mind for the apartment?' | "
+    "hi: 'Apartment के लिए आपका budget कितना है?' | "
+    "te: 'Apartment కోసం మీ budget ఎంత అనుకుంటున్నారు?'"
+)
+
+
 def _build_prompt(items: list[dict[str, str]]) -> list[dict[str, str]]:
+    from app.core.config import settings
+
     payload = json.dumps([{"id": it["id"], "text": it["text"]} for it in items], ensure_ascii=False)
     system = (
         "You translate short phone-call lines for a voice agent into English (en), "
@@ -86,6 +121,8 @@ def _build_prompt(items: list[dict[str, str]]) -> list[dict[str, str]]:
         "Preserve every id exactly. If a line is already in a target language, still "
         "provide all three."
     )
+    if settings.APEX_I18N_SPOKEN_REGISTER:
+        system = f"{system}\n\n{_SPOKEN_REGISTER_RULES}"
     return [
         {"role": "system", "content": system},
         {"role": "user", "content": f"Translate these lines:\n{payload}"},

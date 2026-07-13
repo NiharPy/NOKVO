@@ -17,6 +17,13 @@ Run from repo root:
     source venv/bin/activate
     python3 scripts/backfill_apex_questionnaire_i18n.py            # apply
     python3 scripts/backfill_apex_questionnaire_i18n.py --dry-run  # report only
+
+``--force-retranslate`` clears every machine-stored i18n first and re-runs the
+translation — for adopting the spoken-register translation prompt
+(APEX_I18N_SPOKEN_REGISTER) on campaigns translated before it existed. WARNING:
+hand-edited translations are indistinguishable from machine ones and are LOST
+under --force. Combine with ``--campaign <id>`` to scope it. After a forced
+re-translation run scripts/apex_reprewarm.py — new strings mean cold TTS keys.
 """
 from __future__ import annotations
 
@@ -41,8 +48,21 @@ def _canon(questionnaire: dict) -> str:
     return json.dumps(questionnaire, sort_keys=True, ensure_ascii=False)
 
 
+def _clear_i18n(questionnaire: dict) -> None:
+    """--force-retranslate: drop every stored translation so
+    ``translate_questionnaire`` regenerates all of them (hand-edits included —
+    see the module docstring warning)."""
+    for q in questionnaire.get("questions") or []:
+        q.pop("text_i18n", None)
+    questionnaire.pop("intro_i18n", None)
+    questionnaire.pop("outro_i18n", None)
+
+
 async def main() -> int:
-    dry_run = "--dry-run" in sys.argv[1:]
+    args = sys.argv[1:]
+    dry_run = "--dry-run" in args
+    force = "--force-retranslate" in args
+    wanted_ids = {args[i + 1] for i, a in enumerate(args) if a == "--campaign" and i + 1 < len(args)}
     eng = create_async_engine(settings.SQLALCHEMY_DATABASE_URI)
     Session = async_sessionmaker(eng, class_=AsyncSession, expire_on_commit=False)
 
@@ -50,6 +70,8 @@ async def main() -> int:
     async with Session() as db:
         rows = (await db.execute(select(OutboundCampaign))).scalars().all()
         for c in rows:
+            if wanted_ids and str(c.id) not in wanted_ids:
+                continue
             cfg = dict(c.agent_config or {})
             questionnaire = cfg.get("questionnaire")
             if not isinstance(questionnaire, dict) or not questionnaire.get("questions"):
@@ -57,6 +79,8 @@ async def main() -> int:
             scanned += 1
             before = _canon(questionnaire)
             try:
+                if force:
+                    _clear_i18n(questionnaire)
                 # Mutates in place (fills text_i18n / outro_i18n where missing).
                 await translate_questionnaire(questionnaire)
             except Exception:

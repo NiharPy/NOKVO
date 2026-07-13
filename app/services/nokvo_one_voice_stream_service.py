@@ -7,6 +7,7 @@ logger = logging.getLogger(__name__)
 import asyncio
 import contextlib
 import json
+import random
 import re
 import struct
 import uuid
@@ -770,10 +771,31 @@ def _is_site_visit_confirmation_turn(text: str, history: list[dict[str, str]]) -
 
 # STRONG continuation cues: function words / fillers that almost never end a
 # complete utterance — they REQUIRE a following word, so always wait the longest.
+# Sarvam STT returns NATIVE SCRIPT for hi/te, so each set carries Devanagari +
+# Telugu-script members alongside the English/romanised ones — otherwise hi/te
+# trailing speech ("मेरा budget मतलब…") reads as neutral and gets cut off at
+# 650ms while the caller is mid-thought.
 _EOU_STRONG_CONTINUATION = {
     "a", "an", "the", "and", "but", "or", "because", "than", "as", "if", "while",
     "when", "to", "of", "for", "with", "from", "at", "by", "in", "on",
     "uh", "um", "uhm",
+    # Hindi (Devanagari) + Telugu: CONJUNCTIONS and "I mean…" lead-ins only.
+    # Postpositions/case markers ("में", "को", "के", "లో", "గురించి") are
+    # deliberately NOT here even though English prepositions are: hi/te are
+    # postpositional, so elliptical COMPLETE answers routinely end in them
+    # ("शाम को", "3 BHK के लिए") — treating them as continuation would 2300ms-
+    # stall the most common complete replies. They stay neutral. NOTE "मतलब"
+    # mirrors trailing English "because" here, NOT romanised "matlab" in the
+    # particle set — Devanagari register is real Hindi where trailing "मतलब…"
+    # is an unfinished explanation, while the Hinglish tic ("do BHK matlab")
+    # surfaces romanised.
+    "और", "या", "लेकिन", "क्योंकि", "मतलब", "अगर", "यानी", "जैसे",
+    "మరియు", "లేదా", "కానీ", "అంటే", "ఇంకా",
+    # Native-script hesitations (STT writes them out in-script). "ఊఁ" is NOT
+    # here — in final position it's overwhelmingly the Telugu affirmation
+    # ("hmm"=yes, see _EOU_YESNO_WORDS), and a mid-thought "ఊఁ…" that continues
+    # simply restarts the timer when the next segment lands.
+    "अं", "आं", "అం",
 }
 # WEAK continuation cues: auxiliaries / pronouns / determiners that OFTEN end a
 # COMPLETE utterance after real content ("…you guys have", "I'd like that") but
@@ -787,6 +809,18 @@ _EOU_WEAK_CONTINUATION = {
     "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
     "do", "does", "did", "will", "would", "shall", "should", "can", "could",
     "may", "might", "so", "then", "where", "why", "how", "like", "hmm",
+    # Hindi auxiliaries / pronouns / connectives — complete after real content
+    # ("ठीक है"), trailing in a short fragment ("मैं तो…"). "तो" lives here (not
+    # STRONG): sentence-final after content it's an emphatic particle, but a
+    # short fragment ending "तो" is an unfinished conditional.
+    "है", "हैं", "हूँ", "हूं", "था", "थी", "थे", "मैं", "हम", "वो", "वह", "ये",
+    "यह", "आप", "मेरा", "मेरी", "मेरे", "तो",
+    # Telugu equivalents. ("अभी"/"फिर"/"అయితే"/"మరి" deliberately absent: as
+    # tails they end complete "okay then"-type replies as often as they trail,
+    # and the short-fragment gate would over-wait 2300ms on those — neutral is
+    # the honest tier for them.)
+    "ఉంది", "ఉన్నాయి", "ఉన్నాను", "నేను", "మేము", "మనం", "అది", "ఇది", "నా",
+    "మా", "మీ", "హ్మ్",
 }
 _EOU_WEAK_FRAGMENT_MAXWORDS = 4
 # Closing phrases — complete by definition; never make the caller wait on these.
@@ -794,6 +828,8 @@ _EOU_CLOSER_TAILS = (
     "thank you so much", "thank you", "no thank you", "no thanks", "thanks",
     "bye", "goodbye", "good bye", "that's it", "thats it", "that's all",
     "thats all", "nothing else", "that'll be all", "thatll be all",
+    "धन्यवाद", "शुक्रिया", "बस इतना ही", "और कुछ नहीं", "ठीक है बाय",
+    "ధన్యవాదాలు", "థాంక్స్", "అంతే చాలు", "ఇంకేమీ లేదు", "సరే బై",
 )
 # Sentence-FINAL discourse particles (Indian English / Hinglish). These mark
 # completion, NOT continuation ("two BHK na" is a finished answer), so strip
@@ -802,12 +838,25 @@ _EOU_CLOSER_TAILS = (
 _EOU_DISCOURSE_PARTICLES = {
     "na", "naa", "haan", "han", "haa", "matlab", "bas", "only", "ya", "yaa",
     "re", "da", "ra",
+    # Native-script sentence-final particles that mark completion ("दो BHK ना",
+    # "రెండు BHK అంతే"). Devanagari "या" is NOT here — it's the conjunction
+    # "or" (strong continuation); romanised "ya"/"yaa" stays because Hinglish
+    # uses it as the tag-question tic.
+    "ना", "बस", "ही", "మాత్రమే", "అంతే", "కదా",
 }
 # Short yes/no/acknowledgement answers (incl. a few Hinglish) → complete.
+# Native-script members mirror the romanised ones — Sarvam STT emits Devanagari/
+# Telugu script for hi/te, so without these a crisp "हाँ"/"అవును" never reaches
+# the fast tier and waits the neutral 650ms instead of 400ms.
 _EOU_YESNO_WORDS = {
     "yes", "yeah", "yep", "yup", "ya", "no", "nope", "nah", "sure", "ok", "okay",
     "correct", "right", "exactly", "fine", "done", "perfect", "alright", "haan",
     "han", "theek", "sari", "sare", "avunu", "thanks", "thank",
+    # Hindi (Devanagari) affirmations / negations.
+    "हाँ", "हां", "जी", "नहीं", "नही", "ठीक", "बिलकुल", "बिल्कुल", "सही", "अच्छा",
+    "ओके", "हो", "चलेगा",
+    # Telugu affirmations / negations.
+    "అవును", "సరే", "లేదు", "కాదు", "ఓకే", "మంచిది", "కరెక్ట్", "వద్దు", "ఊఁ",
 }
 # Time/day tokens + the small connectors allowed inside a pure time answer.
 _EOU_TIME_WORDS = {
@@ -815,10 +864,18 @@ _EOU_TIME_WORDS = {
     "today", "yesterday", "monday", "tuesday", "wednesday", "thursday", "friday",
     "saturday", "sunday", "weekend", "weekday", "oclock", "o'clock", "am", "pm",
     "sharp", "anytime",
+    # Hindi (Devanagari) day/time answers ("कल सुबह", "आज शाम को").
+    "कल", "आज", "परसों", "सुबह", "शाम", "दोपहर", "रात", "अभी", "सोमवार",
+    "मंगलवार", "बुधवार", "गुरुवार", "शुक्रवार", "शनिवार", "रविवार", "बजे",
+    # Telugu day/time answers ("రేపు ఉదయం", "ఈరోజు సాయంత్రం").
+    "రేపు", "ఈరోజు", "ఇవాళ", "ఎల్లుండి", "ఉదయం", "మధ్యాహ్నం", "సాయంత్రం",
+    "రాత్రి", "ఇప్పుడు", "సోమవారం", "మంగళవారం", "బుధవారం", "గురువారం",
+    "శుక్రవారం", "శనివారం", "ఆదివారం", "గంటలకు",
 }
 _EOU_TIME_CONNECTORS = {
     "at", "on", "by", "around", "this", "next", "the", "in", "a", "of", "and",
     "to", "after", "before",
+    "को", "के", "में", "లో", "కి", "కు",
 }
 _EOU_NUMBER_CONTEXT_WORDS = {"number", "phone", "mobile", "contact", "whatsapp"}
 # Pronoun contractions ("it's", "I'm", "that's", "you're") trail off like their
@@ -840,20 +897,32 @@ def _eou_token_is_timeish(tok: str) -> bool:
     return False
 
 
-def _eou_completeness_tier(text: str) -> str:
+def _eou_completeness_tier(text: str, answer_kind: str | None = None) -> str:
     """Return ``"fast"`` | ``"neutral"`` | ``"continuation"`` for the EOU wait.
 
     Only HIGH-confidence-complete utterances get ``"fast"``; anything ambiguous
     falls to ``"neutral"``; trailing-off speech stays ``"continuation"``.
+
+    ``answer_kind`` is the optional expected-answer hint from the deterministic
+    questionnaire (the verbatim path KNOWS what shape of reply the question it
+    just asked invites): ``"yesno"`` promotes a short affirmation/negation to
+    fast, ``"number"`` keeps a digit-trailing reply in continuation (they're
+    mid-figure). Hints only ever PROMOTE toward the safer read for that shape —
+    they never demote a continuation classification.
     """
     low = (text or "").strip().lower()
     if not low:
         return "neutral"
+    # Normalize STT artifacts before tokenizing: zero-width (non-)joiners ride
+    # INSIDE Indic tokens ("హైదరాబాద్‌లో"), NBSP splits unlike a plain space,
+    # and trailing ellipses/danda stick to words ("हाँ…", "అవును।"). Every set
+    # membership below assumes clean tokens.
+    low = low.replace("\u200c", "").replace("\u200d", "").replace("\u00a0", " ")
     # A real '?' is a reliable completion signal (STT adds it for question
     # intonation). A trailing '.' is NOT (STT inserts it on any pause), so we
     # never fast-fire on '.' alone.
-    ended_question = low.rstrip(" .,!;:'\"`").endswith("?") or "؟" in low
-    words = [w.strip(".,!?;:'\"`।॥") for w in low.split()]
+    ended_question = low.rstrip(" .,!;:'\"`…").endswith("?") or "؟" in low
+    words = [w.strip(".,!?;:'\"`।॥…") for w in low.split()]
     words = [w for w in words if w]
     if not words:
         return "neutral"
@@ -878,6 +947,12 @@ def _eou_completeness_tier(text: str) -> str:
     # 3) Mid-number dictation ("my number is 98…") → the rest is coming.
     if last.isdigit() and len(last) < 10 and any(w in _EOU_NUMBER_CONTEXT_WORDS for w in words):
         return "continuation"
+    # 3b) Numeric-answer hint: the questionnaire just asked for a figure
+    #     (budget/quantity) and the reply ENDS on a bare digit run — they're
+    #     mid-figure ("50" … "lakhs" still coming). Must sit BEFORE the pure-
+    #     time rule, which would otherwise fast-fire on a lone "50".
+    if answer_kind == "number" and last.isdigit():
+        return "continuation"
     # 4) Trails off on a STRONG continuation word / filler → wait the longest.
     if last in _EOU_STRONG_CONTINUATION or last_base in _EOU_STRONG_CONTINUATION:
         return "continuation"
@@ -899,9 +974,83 @@ def _eou_completeness_tier(text: str) -> str:
         and any(w not in _EOU_TIME_CONNECTORS for w in words)  # ≥1 real time token, not just connectors
     ):
         return "fast"
-    # 8) Everything else (declaratives, noun phrases) → neutral: leaves room for
+    # 8) Yes/no-answer hint: the questionnaire just asked an intent (yes/no)
+    #    question and the short reply CONTAINS an affirmation/negation anywhere
+    #    ("हाँ चाहिए", "yes definitely") — complete even though the tail word
+    #    isn't itself a yes/no token. Slightly wider than rule 6 (any position,
+    #    ≤4 words) because here we KNOW the question invited exactly this shape.
+    #    Continuation classifications never reach this point, so the hint can
+    #    only promote neutral → fast.
+    if answer_kind == "yesno" and len(words) <= 4 and any(w in _EOU_YESNO_WORDS for w in words):
+        return "fast"
+    # 9) Everything else (declaratives, noun phrases) → neutral: leaves room for
     #    a self-correction ("…actually Sunday") to land and restart the timer.
     return "neutral"
+
+
+def _question_answer_kind(q: dict[str, Any] | None) -> str | None:
+    """Expected reply shape for a just-asked questionnaire question — the
+    ``answer_kind`` hint for :func:`_eou_completeness_tier`. ``intent``
+    questions invite yes/no; ``answer`` questions whose desired answer or
+    graded band labels carry digits invite a figure; anything else yields no
+    hint (generic classification)."""
+    if not isinstance(q, dict):
+        return None
+    qtype = str(q.get("type") or "").strip().lower()
+    if qtype == "intent":
+        return "yesno"
+    if qtype == "answer":
+        blobs = [str(q.get("desired_answer") or "")]
+        for t in q.get("tiers") or []:
+            if isinstance(t, dict):
+                blobs.append(str(t.get("label") or ""))
+        if any(ch.isdigit() for blob in blobs for ch in blob):
+            return "number"
+    return None
+
+
+def _verbatim_prespeech_delay_s(
+    *,
+    eou_fired_at: float | None,
+    ack_will_fire: bool = False,
+    now: float | None = None,
+    _rng: random.Random | None = None,
+) -> float:
+    """Humanized pre-speech pause (seconds) for the DETERMINISTIC reply path.
+
+    Cached verbatim replies otherwise land with near-constant, unnaturally fast
+    latency every turn — machine-gun cadence. Rather than a blind delay (which
+    would stack on the EOU silence wait and feel slow), top up the TOTAL
+    perceived gap — end-of-speech → first audio, which already includes the EOU
+    tier wait via ``eou_fired_at`` — toward ``APEX_TURN_GAP_TARGET_MS`` ±
+    jitter. After a fast-tier EOU (400ms) that adds a couple hundred ms; after
+    the long continuation wait (2300ms) it adds ZERO — the caller has already
+    experienced a long pause. Clamped to the sub-1s latency budget (less a
+    ~150ms cached-fetch estimate) and to ``APEX_VERBATIM_DELAY_MAX_MS``. When a
+    micro-ack will be spoken the ACK is the gap-filler, so the sleep clamps
+    hard to ``APEX_VERBATIM_DELAY_ACK_MAX_MS`` instead. 0.0 when the feature is
+    off (``APEX_TURN_GAP_TARGET_MS=0``) or there is no EOS anchor (manual /
+    proactive turns)."""
+    target = int(settings.APEX_TURN_GAP_TARGET_MS or 0)
+    if target <= 0 or eou_fired_at is None:
+        return 0.0
+    _now = perf_counter() if now is None else now
+    elapsed_ms = max(0.0, (_now - eou_fired_at) * 1000.0)
+    fetch_estimate_ms = 150.0
+    rng = _rng or random
+    jitter = int(settings.APEX_TURN_GAP_JITTER_MS or 0)
+    goal_ms = target + (rng.uniform(-jitter, jitter) if jitter > 0 else 0.0)
+    delay_ms = goal_ms - elapsed_ms - fetch_estimate_ms
+    budget_headroom_ms = (
+        float(settings.VOICE_LATENCY_BUDGET_MS) - elapsed_ms - fetch_estimate_ms
+    )
+    cap_ms = float(
+        settings.APEX_VERBATIM_DELAY_ACK_MAX_MS
+        if ack_will_fire
+        else settings.APEX_VERBATIM_DELAY_MAX_MS
+    )
+    delay_ms = min(delay_ms, budget_headroom_ms, cap_ms)
+    return max(0.0, delay_ms) / 1000.0
 
 
 class NokvoOneVoiceStreamService:
@@ -1398,6 +1547,7 @@ class NokvoOneVoiceStreamService:
                             campaign_context=campaign_context,
                             arbiter=arbiter,
                             turn_state=turn_state,
+                            eou_fired_at=eou_fired_at,
                         )
                         return
                     # A clean forward advance means THIS turn (verbatim or LLM) is
@@ -1427,12 +1577,20 @@ class NokvoOneVoiceStreamService:
                 outbound_context=outbound_context,
                 arbiter=arbiter,
                 turn_state=turn_state,
+                campaign_context=campaign_context,
+                eou_fired_at=eou_fired_at,
             ):
                 if after_turn is not None:
                     _r = after_turn()
                     if asyncio.iscoroutine(_r):
                         await _r
                 return
+        # This turn is going to the LLM — the expected-answer endpointing hint
+        # belongs only to a just-delivered verbatim question, so drop it (an
+        # LLM re-ask/objection reply invites free-form speech, not a known
+        # answer shape).
+        if isinstance(campaign_context, dict):
+            campaign_context.pop("_awaiting_answer_kind", None)
         if outbound_context is not None and call_id and source != "proactive_silence":
             await AgentSessionStore.merge_state(
                 tenant_res,
@@ -2751,6 +2909,7 @@ class NokvoOneVoiceStreamService:
         campaign_context: dict[str, Any] | None = None,
         arbiter: TurnArbiter | None = None,
         turn_state: dict[str, Any] | None = None,
+        eou_fired_at: float | None = None,
     ) -> None:
         """Deterministic questionnaire CLOSE: speak the campaign's closing line
         verbatim, then hang up.
@@ -2760,11 +2919,19 @@ class NokvoOneVoiceStreamService:
         closing line itself (it re-asks the last question, invents a name
         question, or loops back to an earlier one), so we close deterministically
         — no LLM turn. Mirrors :meth:`_leave_voicemail_and_end`. Never raises."""
+        from app.services.apex_micro_acks import tts_variant_for_call
+
         line = (outro or "").strip()
         if not line:
             with contextlib.suppress(Exception):
                 await websocket.close()
             return
+        # Same humanized pre-speech pause as the verbatim questions — the outro
+        # also follows a caller answer and otherwise fires unnaturally fast.
+        _delay_s = _verbatim_prespeech_delay_s(eou_fired_at=eou_fired_at)
+        if _delay_s > 0:
+            with contextlib.suppress(Exception):
+                await asyncio.sleep(_delay_s)
         # Mark speaking so a racing check-in can't barge our final line.
         if turn_state is not None:
             turn_state["speaking"] = True
@@ -2789,6 +2956,7 @@ class NokvoOneVoiceStreamService:
                 language=language,
                 purpose="outro",
                 cache=True,  # deterministic closing line — same audio every call
+                variant=tts_variant_for_call(call_id),
             )
         except Exception:
             logger.debug("NOKVO-OUTRO: outro TTS failed", exc_info=True)
@@ -2820,6 +2988,8 @@ class NokvoOneVoiceStreamService:
         outbound_context: OutboundCampaignContext,
         arbiter: TurnArbiter | None = None,
         turn_state: dict[str, Any] | None = None,
+        campaign_context: dict[str, Any] | None = None,
+        eou_fired_at: float | None = None,
     ) -> bool:
         """APEX Phase 3: speak the next questionnaire question VERBATIM from its
         pre-translated per-language string (cache=True → hits the TTS cache), skipping
@@ -2827,11 +2997,21 @@ class NokvoOneVoiceStreamService:
         fall through to the normal LLM turn (re-ask / non-answer / off-script / a
         question without a translation). Never raises. Does NOT close the call — the
         caller answers next; mirrors the opener/outro delivery but keeps the session
-        open and re-arms turn-taking (mark_done + speaking=False)."""
+        open and re-arms turn-taking (mark_done + speaking=False).
+
+        Humanization on this deterministic path (all flag-gated, see config):
+        a gap-target pre-speech pause (the cached reply otherwise lands with
+        machine-gun regularity), an optional seeded micro-ack spoken before the
+        question, a shaped silence gap between ack and question on telephony,
+        and a per-call rendition variant so the same line isn't the identical
+        waveform on every call. It also stashes the expected-answer shape on
+        ``campaign_context`` for the EOU endpointing hint."""
         from app.services.agent_outbound_context import (
+            get_delivered_questions,
             next_verbatim_question,
             verbatim_line_for_language,
         )
+        from app.services.apex_micro_acks import choose_ack, tts_variant_for_call
 
         try:
             qs = list(getattr(outbound_context, "questions", []) or [])
@@ -2844,6 +3024,32 @@ class NokvoOneVoiceStreamService:
             if not line:
                 return False
 
+            # Ack decision BEFORE the pause: when an ack fires, the ACK is the
+            # gap-filler, so the pre-speech sleep clamps hard (ACK_MAX) and the
+            # ack voice lands almost immediately after the EOU fired.
+            last_ack = (
+                campaign_context.get("_last_ack")
+                if isinstance(campaign_context, dict)
+                else None
+            )
+            ack = choose_ack(
+                call_id=call_id,
+                question_idx=idx,
+                language=language,
+                last_ack=last_ack,
+                delivered_count=len(get_delivered_questions()),
+            )
+            # Humanized pre-speech pause. Deliberately BEFORE mark_speaking: a
+            # caller who resumes talking during the sleep lands as a NEW
+            # utterance (turn cancel/replace via the arbiter), never as a
+            # barge-in against silence — the pause itself adds listen-safety.
+            delay_s = _verbatim_prespeech_delay_s(
+                eou_fired_at=eou_fired_at, ack_will_fire=bool(ack)
+            )
+            if delay_s > 0:
+                await asyncio.sleep(delay_s)
+
+            variant = tts_variant_for_call(call_id)
             if turn_state is not None:
                 turn_state["speaking"] = True
             if arbiter is not None:
@@ -2851,6 +3057,41 @@ class NokvoOneVoiceStreamService:
             turn_id = str(uuid.uuid4())[:8]
             prosody = prosody_for("question")
             try:
+                if ack:
+                    warm = prosody_for("warm")
+                    await websocket.send_json(
+                        {
+                            "type": "agent_sentence",
+                            "turn_id": turn_id,
+                            "sentence": ack,
+                            "tone": "warm",
+                            "cache_hit": False,
+                            "source": "questionnaire_ack",
+                        }
+                    )
+                    await SarvamVoiceService.stream_sentence_tts(
+                        websocket,
+                        tenant_res,
+                        ack,
+                        language=language,
+                        purpose="verbatim_ack",
+                        pace=warm.pace,
+                        pitch=warm.pitch,
+                        loudness=warm.loudness,
+                        cache=True,  # tiny global pool — prewarmed, shared across campaigns
+                        variant=variant,
+                    )
+                    # Breathing room between ack and question. Telephony
+                    # adapters queue real silence frames (flushed by barge-in's
+                    # clearAudio); the web test call's raw WS has no such
+                    # method and skips it — the browser's event gap suffices.
+                    if hasattr(websocket, "send_silence_ms"):
+                        jitter = int(settings.APEX_ACK_GAP_JITTER_MS or 0)
+                        gap_ms = int(settings.APEX_ACK_GAP_MS or 0) + (
+                            random.randint(-jitter, jitter) if jitter > 0 else 0
+                        )
+                        if gap_ms > 0:
+                            await websocket.send_silence_ms(gap_ms)
                 await websocket.send_json(
                     {
                         "type": "agent_sentence",
@@ -2871,21 +3112,37 @@ class NokvoOneVoiceStreamService:
                     pitch=prosody.pitch,
                     loudness=prosody.loudness,
                     cache=True,  # verbatim, pre-translated → same audio every call
+                    variant=variant,
                 )
             finally:
                 if arbiter is not None:
                     arbiter.mark_done()
                 if turn_state is not None:
                     turn_state["speaking"] = False
-            # Record it as the assistant turn so asked-tracking advances next turn.
+            # Record it as the assistant turn so asked-tracking advances next
+            # turn. ONE line including the ack — the transcript mirrors exactly
+            # what the caller heard, and the LLM sees the ack in history so it
+            # won't double-ack the next off-script turn. (Prepending only ADDS
+            # tokens to the assistant side of the token-overlap asked matcher,
+            # and the persisted delivered set below is authoritative anyway.)
+            spoken = f"{ack} {line}" if ack else line
             with contextlib.suppress(Exception):
-                await AgentSessionStore.append_turn(tenant_res, call_id, (cleaned or "").strip(), line)
+                await AgentSessionStore.append_turn(tenant_res, call_id, (cleaned or "").strip(), spoken)
             # AUTHORITATIVE progress: persist "Q{idx} delivered" so this question
             # can never read as unasked again (paraphrase-, language-, and
             # history-eviction-proof — the questionnaire-loop killer).
             with contextlib.suppress(Exception):
                 await NokvoOneVoiceStreamService._persist_question_delivered(tenant_res, call_id, idx)
-            logger.info("NOKVO-VERBATIM: asked Q%d verbatim call=%s lang=%s", idx, call_id, language)
+            if isinstance(campaign_context, dict):
+                if ack:
+                    campaign_context["_last_ack"] = ack
+                # Expected-answer shape for the EOU endpointing hint (read by
+                # _eou_decision; cleared when a turn falls through to the LLM).
+                campaign_context["_awaiting_answer_kind"] = _question_answer_kind(q)
+            logger.info(
+                "NOKVO-VERBATIM: asked Q%d verbatim call=%s lang=%s ack=%s variant=%d delay_ms=%d",
+                idx, call_id, language, bool(ack), variant, int(delay_s * 1000),
+            )
             return True
         except Exception:
             logger.exception("NOKVO-VERBATIM: verbatim question delivery failed")
@@ -2928,6 +3185,8 @@ class NokvoOneVoiceStreamService:
         contain prosody tags (``[warm]…[/warm] [neutral]…[/neutral]``); if
         none are present, the whole opener is voiced as ``[warm]``.
         """
+        from app.services.apex_micro_acks import tts_variant_for_call
+
         text = (opening_text or "").strip()
         if not text:
             return
@@ -2935,6 +3194,7 @@ class NokvoOneVoiceStreamService:
             text = f"[warm]{text}[/warm]"
         turn_id = str(uuid.uuid4())[:8]
         started = perf_counter()
+        _variant = tts_variant_for_call(call_id)
         await websocket.send_json({"type": "agent_thinking", "turn_id": turn_id, "query": "(opener)"})
 
         async def _single_chunk_stream():
@@ -2972,6 +3232,7 @@ class NokvoOneVoiceStreamService:
                     pitch=prosody.pitch,
                     loudness=prosody.loudness,
                     cache=True,  # verbatim, zero-LLM opener — cacheable across calls
+                    variant=_variant,
                 )
             except Exception as exc:
                 await websocket.send_json(
@@ -3683,7 +3944,15 @@ class NokvoOneVoiceStreamService:
                 if not utterance_segments:
                     return "neutral", EOU_NEUTRAL_MS
                 full = " ".join(s for s in utterance_segments if s).strip()
-                tier = _eou_completeness_tier(full)
+                # Expected-answer hint set by the verbatim questionnaire path
+                # (it knows the shape of reply the just-asked question invites);
+                # cleared whenever a turn falls through to the LLM.
+                _kind = (
+                    campaign_context.get("_awaiting_answer_kind")
+                    if isinstance(campaign_context, dict)
+                    else None
+                )
+                tier = _eou_completeness_tier(full, answer_kind=_kind)
                 if tier == "continuation":
                     return tier, EOU_DEBOUNCE_MS + EOU_CONTINUATION_BONUS_MS
                 if tier == "fast":
@@ -3854,7 +4123,12 @@ class NokvoOneVoiceStreamService:
                     db, tenant_res, campaign_context
                 )
                 outbound_opening_text = generate_outbound_opener_text(
-                    outbound_context, language=language, known_facts=opener_facts
+                    outbound_context,
+                    language=language,
+                    known_facts=opener_facts,
+                    # Per-call rotation (APEX_OPENER_VARIANTS): a re-dialed lead
+                    # hears a different greeting/consent tail on each attempt.
+                    variant_seed=call_id,
                 )
                 # Let the callee's audio path come up before we speak, so the
                 # intro isn't clipped (see _OUTBOUND_OPENER_DELAY_SECONDS). The

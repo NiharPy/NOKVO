@@ -622,12 +622,20 @@ class SarvamVoiceService:
         pitch: float | None = None,
         loudness: float | None = None,
         enable_cached_responses: bool | None = None,
+        variant: int | None = None,
     ) -> dict[str, Any]:
         """The exact Sarvam TTS REST request body for these args — the ONE
         builder, shared by :meth:`synthesize` (which POSTs it) and the local
         cache probe (which only needs its key). Any drift between builders
         would silently break cache-hit parity, so there is exactly one.
-        Normalizes ``text`` itself — callers always pass the RAW line."""
+        Normalizes ``text`` itself — callers always pass the RAW line.
+
+        ``variant`` (APEX rendition variety) salts the body with ``x_variant``
+        so the local cache stores N distinct takes of one scripted line —
+        bulbul:v3 at temperature samples a different rendition per synthesis.
+        The salt exists ONLY for the cache key: :meth:`synthesize` pops it
+        before the HTTP request, so Sarvam never sees it. Variant 1/None adds
+        no key — existing warm entries stay valid."""
         provider_status = dict(tenant_res.provider_status or {})
         model = provider_status.get("sarvam_tts_model") or provider_status.get("tts_model") or settings.SARVAM_TTS_MODEL
         body: dict[str, Any] = {
@@ -657,6 +665,21 @@ class SarvamVoiceService:
                 body["pitch"] = max(-0.75, min(0.75, float(pitch)))
             if loudness is not None:
                 body["loudness"] = max(0.1, min(3.0, float(loudness)))
+        # Rendition-variant salt: cache-key differentiation only (popped before
+        # POST). Variant 1/None deliberately adds nothing so today's warm
+        # entries keep their keys.
+        if variant is not None and int(variant) > 1:
+            body["x_variant"] = int(variant)
+        # Optional audible spread: nudge pace per variant so takes differ even
+        # beyond synthesis-temperature variation. Applied for EVERY variant
+        # (incl. 1) whenever the knob is non-zero, so prewarm/probe/call sites
+        # agree on the key for each k. NOTE flipping the knob on rotates keys
+        # (pace is in the key) — re-run the campaign prewarm after.
+        spread = float(settings.APEX_TTS_VARIANT_PACE_SPREAD or 0.0)
+        if variant is not None and spread:
+            n = max(1, int(settings.APEX_TTS_VARIANTS or 1))
+            factor = 1.0 + spread * (float(int(variant)) - (n + 1) / 2.0)
+            body["pace"] = max(0.3, min(3.0, float(body.get("pace", 1.0)) * factor))
         return body
 
     @staticmethod
@@ -668,6 +691,7 @@ class SarvamVoiceService:
         pace: float | None = None,
         pitch: float | None = None,
         loudness: float | None = None,
+        variant: int | None = None,
     ) -> bool:
         """True when the local Redis byte-cache already holds audio for EXACTLY
         this request (the key :meth:`synthesize` would compute). Lets
@@ -677,7 +701,13 @@ class SarvamVoiceService:
             return False
         try:
             body = SarvamVoiceService._tts_request_body(
-                tenant_res, text, language=language, pace=pace, pitch=pitch, loudness=loudness
+                tenant_res,
+                text,
+                language=language,
+                pace=pace,
+                pitch=pitch,
+                loudness=loudness,
+                variant=variant,
             )
             key = SarvamVoiceService._tts_cache_key(
                 {k: v for k, v in body.items() if k != "enable_cached_responses"}
@@ -699,6 +729,7 @@ class SarvamVoiceService:
         loudness: float | None = None,
         enable_cached_responses: bool | None = None,
         cache: bool = False,
+        variant: int | None = None,
     ) -> dict[str, Any]:
         if not text.strip():
             return {"audios": [], "audio_format": settings.SARVAM_TTS_AUDIO_CODEC}
@@ -713,6 +744,7 @@ class SarvamVoiceService:
             pitch=pitch,
             loudness=loudness,
             enable_cached_responses=enable_cached_responses,
+            variant=variant,
         )
         prosody_body = {k: body[k] for k in _TTS_PROSODY_KEYS if k in body}
 
@@ -735,6 +767,10 @@ class SarvamVoiceService:
                     "cached": True,
                 }
 
+        # The rendition salt differentiates the cache key ONLY — it must never
+        # reach Sarvam. Popped after key computation, before the POST (the 4xx
+        # retry_body below derives from the popped body, so it stays clean too).
+        body.pop("x_variant", None)
         client = SarvamVoiceService.http_client()
         response = await client.post(
             endpoint,
@@ -1111,6 +1147,7 @@ class SarvamVoiceService:
         loudness: float | None = None,
         enable_cached_responses: bool | None = None,
         cache: bool = False,
+        variant: int | None = None,
     ) -> dict[str, Any]:
         stream_id = f"sarvam-tts-{int(perf_counter() * 1000)}"
         started = perf_counter()
@@ -1162,7 +1199,13 @@ class SarvamVoiceService:
         cached_ready = False
         if cache:
             cached_ready = await SarvamVoiceService.tts_cached_audio_available(
-                tenant_res, text, language=language, pace=pace, pitch=pitch, loudness=loudness
+                tenant_res,
+                text,
+                language=language,
+                pace=pace,
+                pitch=pitch,
+                loudness=loudness,
+                variant=variant,
             )
 
         streaming_provider = "sarvam"
@@ -1281,6 +1324,7 @@ class SarvamVoiceService:
                 loudness=loudness,
                 enable_cached_responses=enable_cached_responses,
                 cache=cache,
+                variant=variant,
             )
             # Meter TTS chars for per-call COGS (best-effort) — but NOT on a cache
             # hit, which never billed Sarvam. Counted here (not at the top) so a hit

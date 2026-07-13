@@ -2420,6 +2420,7 @@ async def update_bulk_calling_campaign(
         if value is not None:
             cfg[key] = value.strip()
 
+    _questionnaire_changed = False
     if payload.questionnaire is not None:
         try:
             questionnaire = _coerce_questionnaire(payload.questionnaire, strict=True)
@@ -2436,6 +2437,7 @@ async def update_bulk_calling_campaign(
             if (await _org_for_user(db, user)).product_tier == "nokvo_apex":
                 questionnaire = await translate_questionnaire(questionnaire)
             cfg["questionnaire"] = questionnaire
+            _questionnaire_changed = True
 
     if any(v is not None for v in (payload.working_days, payload.hours_per_day, payload.calls_per_day)):
         # Merge into the EXISTING window — ``dialed_today`` is the runtime
@@ -2461,6 +2463,16 @@ async def update_bulk_calling_campaign(
     # Live sessions read a cached context — drop it so the edit applies to the
     # very next call, not whenever the TTL happens to lapse.
     invalidate_outbound_context(campaign.id)
+    # Re-translated lines are NEW strings → cold TTS-cache keys. Mirror the
+    # create path's fire-and-forget pre-warm so the first calls after an edit
+    # play cached audio instead of paying live synthesis per line.
+    if _questionnaire_changed:
+        try:
+            from app.services.apex_tts_prewarm import prewarm_campaign_tts
+
+            _retain_task(asyncio.create_task(prewarm_campaign_tts(tr, cfg.get("questionnaire"))))
+        except Exception:
+            logger.debug("APEX-TTS-PREWARM: failed to schedule on edit", exc_info=True)
     return _campaign_response(campaign)
 
 
