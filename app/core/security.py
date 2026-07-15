@@ -16,6 +16,12 @@ ph = PasswordHasher()
 JWT_TIER_SUPERADMIN = "superadmin"
 JWT_TIER_ORGANIZATION = "organization"
 JWT_TIER_NOKVO_ONE_SETUP = "nokvo_one_setup"
+# Affiliate-program principals. Deliberately NOT in _JWT_TIER_ENV — the tier
+# signs with the derived secret (_derive_secret("affiliate")), cryptographically
+# isolated from every other tier with zero new env surface. CAUTION: always
+# pass token_tier=JWT_TIER_AFFILIATE explicitly when minting — _infer_token_tier
+# classifies unknown principal_types as SUPERADMIN.
+JWT_TIER_AFFILIATE = "affiliate"
 
 # Product isolation. Org access tokens carry a ``product`` claim so a session can
 # be scoped to one product. NOKVO APEX (product_tier="nokvo_apex") → "apex";
@@ -229,5 +235,12 @@ def generate_totp_secret() -> str:
     return pyotp.random_base32()
 
 def verify_totp(secret: str, token: str) -> bool:
+    # valid_window=1 accepts the previous/next 30s step alongside the current
+    # one (RFC 6238's recommended tolerance; what Google/GitHub accept). With
+    # the strict window, a user who reads a code and then types 6 digits into
+    # 6 boxes routinely crosses the step boundary and gets rejected with a
+    # code that WAS correct — the affiliate-signup "incorrect code" bug. Also
+    # absorbs small phone-clock drift. Brute-force exposure grows 3× but every
+    # TOTP endpoint is rate-limited far below what 6 digits needs.
     totp = pyotp.TOTP(secret)
-    return totp.verify(token)
+    return totp.verify(token, valid_window=1)

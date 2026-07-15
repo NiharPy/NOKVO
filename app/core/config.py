@@ -49,6 +49,16 @@ class Settings(BaseSettings):
     NOKVO_ONE_EMAIL_TOKEN_TTL_HOURS: int = 24
     NOKVO_ONE_INVITE_TOKEN_TTL_HOURS: int = 72
 
+    # ── Affiliate program (APEX referrals) ──
+    # 5% of the first invoice (platform fee + minutes addon), 2% of every later
+    # monthly subscription charge. Settlement is operator-marked manual payout;
+    # a commission becomes "due" once older than the T+2 window. Affiliate
+    # sessions are a plain access token (no refresh — re-login is number+TOTP).
+    AFFILIATE_FIRST_MONTH_RATE: float = 0.05
+    AFFILIATE_RECURRING_RATE: float = 0.02
+    AFFILIATE_SETTLEMENT_DUE_HOURS: int = 48
+    AFFILIATE_ACCESS_TOKEN_EXPIRE_HOURS: int = 12
+
     # Recurring usage-invoice mailer. The internal endpoint that runs the
     # billing cycle is guarded by this shared secret (sent as the
     # ``X-Cron-Secret`` header by the scheduler). Empty in dev = endpoint

@@ -336,15 +336,24 @@ export async function novaUpload(sessionId, file) {
 }
 
 // ── Payment (one plan ₹6499/mo + minutes bundle, billed on selected, credited 1.5×) ──
-export async function createSubscription(paymentToken, minutes, legal = {}) {
+export async function createSubscription(paymentToken, minutes, legal = {}, affiliateCode = null) {
   const { data } = await api.post('/payments/create-subscription', {
     payment_token: paymentToken, plan: 'apex', minutes,
     // Server-side consent audit — required for APEX (see cancel/terms flow).
     terms_accepted: !!legal.termsAccepted,
     terms_version: legal.termsVersion || null,
     privacy_version: legal.privacyVersion || null,
+    // Optional referral (affiliate number). Server validates again; a typo
+    // never blocks payment.
+    affiliate_code: affiliateCode || null,
   });
   return data;
+}
+
+// Public referral-code check for the payment screen (no auth header).
+export async function checkAffiliateCode(code) {
+  const { data } = await api.get(`/affiliate/check-code/${encodeURIComponent(code)}`);
+  return data || { valid: false, display_name: null };
 }
 export async function verifyPayment(paymentToken, resp) {
   const { data } = await api.post('/payments/verify', {

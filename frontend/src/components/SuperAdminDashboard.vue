@@ -111,7 +111,16 @@ const APEX_AUTO_PROVISION_ENABLED = false;
 // Per-request "enable on the existing sub-account" form (numbers only), keyed by id.
 const grantExistingForms = ref({});
 
+// ── Affiliate program (referral commissions) ──
+const affiliatesView = ref(false);
+const affiliates = ref([]);
+const affiliateDue = ref([]);      // T+2 settlement queue (eligible affiliates only)
+const affiliatesLoading = ref(false);
+const affiliateBusy = ref('');     // affiliate id an action is running for
+const utrDrafts = ref({});         // per-affiliate UTR input on the due queue
+
 const view = computed(() => {
+  if (affiliatesView.value) return 'affiliates';
   if (bulkView.value) return 'bulk';
   if (llmView.value) return 'llm';
   if (langsmithView.value) return 'langsmith';
@@ -121,6 +130,88 @@ const view = computed(() => {
   if (ticketsView.value) return 'tickets';
   return detail.value ? 'detail' : 'list';
 });
+
+const loadAffiliates = async () => {
+  affiliatesLoading.value = true;
+  errorMsg.value = '';
+  try {
+    const [listRes, dueRes] = await Promise.all([
+      fetch(`${SUPERADMIN_API_BASE}/tenants/affiliates`, { headers: authHeaders() }),
+      fetch(`${SUPERADMIN_API_BASE}/tenants/affiliates/settlements/due`, { headers: authHeaders() }),
+    ]);
+    if (listRes.status === 401 || dueRes.status === 401) { emit('logout'); return; }
+    if (!listRes.ok) { errorMsg.value = `Failed to load affiliates (${listRes.status}).`; return; }
+    affiliates.value = (await listRes.json()).items || [];
+    affiliateDue.value = dueRes.ok ? (await dueRes.json()).items || [] : [];
+  } catch (e) {
+    errorMsg.value = 'Could not reach the server.';
+  } finally {
+    affiliatesLoading.value = false;
+  }
+};
+const openAffiliates = () => { affiliatesView.value = true; loadAffiliates(); };
+
+const verifyAffiliateKyc = async (a) => {
+  if (affiliateBusy.value) return;
+  affiliateBusy.value = a.id;
+  errorMsg.value = '';
+  try {
+    const res = await fetch(`${SUPERADMIN_API_BASE}/tenants/affiliates/${a.id}/kyc-verify`, {
+      method: 'POST', headers: authHeaders(),
+    });
+    if (!res.ok) { errorMsg.value = `KYC verify failed (${res.status}).`; return; }
+    await loadAffiliates();
+  } catch (e) {
+    errorMsg.value = 'Could not reach the server.';
+  } finally {
+    affiliateBusy.value = '';
+  }
+};
+
+const resetAffiliateTotp = async (a) => {
+  if (affiliateBusy.value) return;
+  if (!window.confirm(`Reset the authenticator for ${a.affiliate_number}? They'll re-enroll via the signup page with the same email (their number is kept; KYC re-review required).`)) return;
+  affiliateBusy.value = a.id;
+  errorMsg.value = '';
+  try {
+    const res = await fetch(`${SUPERADMIN_API_BASE}/tenants/affiliates/${a.id}/reset-totp`, {
+      method: 'POST', headers: authHeaders(),
+    });
+    if (!res.ok) { errorMsg.value = `TOTP reset failed (${res.status}).`; return; }
+    await loadAffiliates();
+  } catch (e) {
+    errorMsg.value = 'Could not reach the server.';
+  } finally {
+    affiliateBusy.value = '';
+  }
+};
+
+const settleAffiliate = async (d) => {
+  if (affiliateBusy.value) return;
+  const utr = (utrDrafts.value[d.affiliate_id] || '').trim();
+  if (!utr) { errorMsg.value = 'Enter the bank UTR reference before marking settled.'; return; }
+  if (!window.confirm(`Mark ₹${d.due_amount_rupees.toLocaleString('en-IN')} (${d.due_count} commission${d.due_count === 1 ? '' : 's'}) settled for ${d.affiliate_number} with UTR ${utr}? Do this AFTER the bank transfer succeeds.`)) return;
+  affiliateBusy.value = d.affiliate_id;
+  errorMsg.value = '';
+  try {
+    const res = await fetch(`${SUPERADMIN_API_BASE}/tenants/affiliates/${d.affiliate_id}/settle`, {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ utr }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      errorMsg.value = body?.detail || `Settlement failed (${res.status}).`;
+      return;
+    }
+    utrDrafts.value[d.affiliate_id] = '';
+    await loadAffiliates();
+  } catch (e) {
+    errorMsg.value = 'Could not reach the server.';
+  } finally {
+    affiliateBusy.value = '';
+  }
+};
 
 // ── APEX support tickets ────────────────────────────────────
 const loadTickets = async () => {
@@ -831,6 +922,7 @@ const NAV = [
   { id: 'feedback', label: 'Feedback' },
   { id: 'todos', label: 'To-do' },
   { id: 'bulk', label: 'Bulk calling' },
+  { id: 'affiliates', label: 'Affiliates' },
   { id: 'broadcast', label: 'Broadcast' },
   { id: 'langsmith', label: 'LangSmith' },
   { id: 'llm', label: 'LLM keys' },
@@ -841,11 +933,12 @@ const closeAll = () => {
   detail.value = null;
   feedbackView.value = false; ticketsView.value = false; todoView.value = false;
   broadcastView.value = false; langsmithView.value = false; llmView.value = false; bulkView.value = false;
+  affiliatesView.value = false;
 };
 const go = (id) => {
   closeAll();
   if (id === 'list') { loadOrganizations(); return; }
-  const open = { tickets: openTickets, feedback: openFeedback, todos: openTodos, broadcast: openBroadcast, langsmith: openLangsmith, llm: openLlm, bulk: openBulk }[id];
+  const open = { tickets: openTickets, feedback: openFeedback, todos: openTodos, broadcast: openBroadcast, langsmith: openLangsmith, llm: openLlm, bulk: openBulk, affiliates: openAffiliates }[id];
   if (open) open();
 };
 const activeNav = computed(() => (view.value === 'detail' ? 'list' : view.value));
@@ -1312,6 +1405,84 @@ watch(() => props.homeSignal, () => { closeAll(); loadOrganizations(); });
         </div>
         <div v-else-if="!ticketsLoading" class="empty-orgs"><p>No tickets raised yet.</p></div>
         <div v-else class="empty-orgs"><p>Loading tickets…</p></div>
+      </div>
+
+      <!-- ── AFFILIATE PROGRAM ────────────────────────────────────── -->
+      <div v-else-if="view === 'affiliates'" key="affiliates" class="dashboard-content">
+        <div class="orgs-panel-header">
+          <div>
+            <span class="stage-eyebrow">AFFILIATE PROGRAM</span>
+            <h3>Affiliates &amp; Settlements</h3>
+          </div>
+          <button type="button" class="ghost-btn" :disabled="affiliatesLoading" @click="loadAffiliates">
+            <RefreshCw :size="14" :class="{ spin: affiliatesLoading }" />
+            REFRESH
+          </button>
+        </div>
+
+        <!-- T+2 due-settlement queue -->
+        <div class="orgs-panel-header" style="margin-top:6px;">
+          <div><h3 style="font-size:15px;">Due for payout (T+2)</h3></div>
+        </div>
+        <div v-if="affiliateDue.length" class="table-wrap">
+          <table class="org-table">
+            <thead>
+              <tr><th>Affiliate</th><th>Due amount</th><th>Rows</th><th>Oldest</th><th>Bank</th><th>UTR</th><th></th></tr>
+            </thead>
+            <tbody>
+              <tr v-for="d in affiliateDue" :key="d.affiliate_id">
+                <td><strong>{{ d.affiliate_number }}</strong><br /><span class="fb-msg">{{ d.full_name }}</span></td>
+                <td><strong>₹{{ d.due_amount_rupees.toLocaleString('en-IN') }}</strong></td>
+                <td>{{ d.due_count }}</td>
+                <td>{{ fmtDate(d.oldest_created_at) }}</td>
+                <td class="fb-msg">{{ d.bank.account_holder }}<br />{{ d.bank.account_number }} · {{ d.bank.ifsc }}</td>
+                <td><input v-model="utrDrafts[d.affiliate_id]" type="text" class="inline-select" placeholder="Bank UTR ref" style="min-width:140px;" /></td>
+                <td>
+                  <button type="button" class="ghost-btn sm" :disabled="affiliateBusy === d.affiliate_id" @click="settleAffiliate(d)">
+                    {{ affiliateBusy === d.affiliate_id ? 'Settling…' : 'Mark settled' }}
+                  </button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div v-else class="empty-orgs"><p>Nothing due — commissions appear here 48h after accrual, once the affiliate is KYC-verified with bank details on file.</p></div>
+
+        <!-- all affiliates -->
+        <div class="orgs-panel-header" style="margin-top:18px;">
+          <div><h3 style="font-size:15px;">All affiliates</h3></div>
+        </div>
+        <div v-if="affiliates.length" class="table-wrap">
+          <table class="org-table">
+            <thead>
+              <tr><th>Number</th><th>Name / Email</th><th>Status</th><th>KYC</th><th>Referrals</th><th>Pending / Settled</th><th>Bank</th><th></th></tr>
+            </thead>
+            <tbody>
+              <tr v-for="a in affiliates" :key="a.id">
+                <td><strong>{{ a.affiliate_number }}</strong></td>
+                <td>{{ a.full_name }}<br /><span class="fb-msg">{{ a.email }}</span></td>
+                <td>{{ a.status }}</td>
+                <td>
+                  <span v-if="a.kyc_verified_at">✓ {{ fmtDate(a.kyc_verified_at) }}</span>
+                  <button v-else type="button" class="ghost-btn sm" :disabled="affiliateBusy === a.id" @click="verifyAffiliateKyc(a)">
+                    Verify KYC
+                  </button>
+                </td>
+                <td>{{ a.referred_count }}</td>
+                <td>₹{{ a.totals.pending.toLocaleString('en-IN') }} / ₹{{ a.totals.settled.toLocaleString('en-IN') }}</td>
+                <td class="fb-msg">
+                  <template v-if="a.bank">{{ a.bank.account_number }} · {{ a.bank.ifsc }}</template>
+                  <template v-else>—</template>
+                </td>
+                <td style="white-space:nowrap;">
+                  <button type="button" class="ghost-btn sm" :disabled="affiliateBusy === a.id" @click="resetAffiliateTotp(a)" title="Lost authenticator — rotate the secret; they re-enroll via signup with the same email">Reset TOTP</button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div v-else-if="!affiliatesLoading" class="empty-orgs"><p>No affiliates yet — signups land here from /affiliate.</p></div>
+        <div v-else class="empty-orgs"><p>Loading affiliates…</p></div>
       </div>
 
       <!-- ── BULK CSV CALLING REQUESTS ───────────────────────────── -->

@@ -46,6 +46,7 @@ from app.api import (
     nokvo_one_apex_auth,
     nokvo_one_apex_nova,
     nokvo_one_apex_members,
+    nokvo_one_affiliate,
     nokvo_one_payments,
     nokvo_one_onboarding,
     nokvo_one_members,
@@ -70,6 +71,7 @@ app.include_router(nokvo_one_apex_auth.router, prefix="/api/nokvo-one", tags=["n
 app.include_router(nokvo_one_apex_members.router, prefix="/api/nokvo-one", tags=["nokvo-apex-members"])
 app.include_router(nokvo_one_apex_nova.router, prefix="/api/nokvo-one", tags=["nokvo-apex-nova"])
 app.include_router(nokvo_one_payments.router, prefix="/api/nokvo-one", tags=["nokvo-one-payments"])
+app.include_router(nokvo_one_affiliate.router, prefix="/api/nokvo-one/affiliate", tags=["nokvo-affiliate"])
 app.include_router(nokvo_one_onboarding.router, prefix="/api/nokvo-one/onboarding", tags=["nokvo-one-onboarding"])
 app.include_router(nokvo_one_requests.router, prefix="/api/nokvo-one", tags=["nokvo-one-requests"])
 app.include_router(nokvo_one_outcomes.router, prefix="/api/nokvo-one", tags=["nokvo-one-outcomes"])

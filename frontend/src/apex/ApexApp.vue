@@ -31,6 +31,7 @@ import {
   getToken,
   extractError,
   createSubscription,
+  checkAffiliateCode,
   verifyPayment,
   fetchMinutesBalance,
   topupCreateOrder,
@@ -119,6 +120,32 @@ const fmtCredits = (n) => Math.round(Number(n) || 0).toLocaleString('en-IN');
 const payBill = computed(() => billFor(payMinutes.value));
 const payCredited = computed(() => creditedFor(payMinutes.value));   // ≈ minutes (display)
 const payCredits = computed(() => apexCreditFor(payMinutes.value));  // Call Credits granted
+
+// ── affiliate referral (optional code on the payment screen) ──
+// Debounced public check → inline valid/invalid indicator. Only a VALID code is
+// sent with create-subscription; a typo never blocks payment (server re-checks
+// and also ignores unknown codes).
+const affiliateCode = ref('');
+const affiliateCheck = ref({ state: 'idle', name: '' }); // idle|checking|valid|invalid
+let _affiliateTimer = null;
+watch(affiliateCode, (raw) => {
+  if (_affiliateTimer) clearTimeout(_affiliateTimer);
+  const code = (raw || '').trim();
+  if (!code) { affiliateCheck.value = { state: 'idle', name: '' }; return; }
+  affiliateCheck.value = { state: 'checking', name: '' };
+  _affiliateTimer = setTimeout(async () => {
+    try {
+      const r = await checkAffiliateCode(code.toUpperCase());
+      // Ignore stale responses after further typing.
+      if ((affiliateCode.value || '').trim() !== code) return;
+      affiliateCheck.value = r?.valid
+        ? { state: 'valid', name: r.display_name || '' }
+        : { state: 'invalid', name: '' };
+    } catch {
+      if ((affiliateCode.value || '').trim() === code) affiliateCheck.value = { state: 'idle', name: '' };
+    }
+  }, 400);
+});
 
 // ── data ──
 const campaigns = ref([]);
@@ -557,11 +584,16 @@ async function startPayment() {
   busy.value = true;
   try {
     const Rzp = await loadRazorpay();
-    const data = await createSubscription(paymentToken.value, minutes, {
-      termsAccepted: termsAccepted.value,
-      termsVersion: APEX_LEGAL_VERSIONS.terms,
-      privacyVersion: APEX_LEGAL_VERSIONS.privacy,
-    });
+    const data = await createSubscription(
+      paymentToken.value,
+      minutes,
+      {
+        termsAccepted: termsAccepted.value,
+        termsVersion: APEX_LEGAL_VERSIONS.terms,
+        privacyVersion: APEX_LEGAL_VERSIONS.privacy,
+      },
+      affiliateCheck.value.state === 'valid' ? affiliateCode.value.trim().toUpperCase() : null,
+    );
     const rzp = new Rzp({
       key: data.key_id,
       subscription_id: data.subscription_id,
@@ -809,6 +841,7 @@ watch(screen, async (s) => {
             <button type="button" class="ax-link" @click="retryGoogle">Retry</button>
           </div>
           <p class="ax-sub-cta">New to NOKVO APEX? <span class="ax-link" @click="screen = 'signup'; errorMsg = ''">Create an account</span></p>
+          <p class="ax-sub-cta ax-affiliate-cta">Want to earn by referring businesses? <span class="ax-link" @click="router.push('/affiliate')">Join the NOKVO Affiliate Program</span></p>
         </div>
       </div>
     </div>
@@ -845,6 +878,7 @@ watch(screen, async (s) => {
             <button type="button" class="ax-link" @click="retryGoogle">Retry</button>
           </div>
           <p class="ax-sub-cta">Already have an account? <span class="ax-link" @click="screen = 'login'; errorMsg = ''">Sign in</span></p>
+          <p class="ax-sub-cta ax-affiliate-cta">Want to earn by referring businesses? <span class="ax-link" @click="router.push('/affiliate')">Join the NOKVO Affiliate Program</span></p>
         </div>
       </div>
     </div>
@@ -899,6 +933,11 @@ watch(screen, async (s) => {
           <div class="ax-pay-row"><span>{{ fmtMin(payMinutes) }} minutes (one-time)</span><span>{{ fmtINR(payBill) }}</span></div>
           <div class="ax-pay-row ax-pay-row--total"><span>Pay now</span><span>{{ fmtINR(PLATFORM_FEE + payBill) }}</span></div>
         </div>
+        <label class="ax-label" style="margin-top:18px;">Affiliate code <span style="opacity:.5;font-weight:400;">(optional)</span></label>
+        <input v-model="affiliateCode" type="text" class="ax-input" placeholder="e.g. NKV7XQ2MRT" autocapitalize="characters" spellcheck="false" style="text-transform:uppercase;" />
+        <p v-if="affiliateCheck.state === 'checking'" class="ax-muted" style="margin:6px 0 0;font-size:12.5px;">Checking code…</p>
+        <p v-else-if="affiliateCheck.state === 'valid'" style="margin:6px 0 0;font-size:12.5px;color:#7FD9A8;">✓ Referred by {{ affiliateCheck.name || 'a NOKVO affiliate' }}</p>
+        <p v-else-if="affiliateCheck.state === 'invalid'" class="ax-muted" style="margin:6px 0 0;font-size:12.5px;">Code not found — you can still continue without it.</p>
         <label class="ax-terms">
           <input type="checkbox" v-model="termsAccepted" class="ax-terms-box" />
           <span>I have read and agree to the
@@ -1210,6 +1249,8 @@ watch(screen, async (s) => {
 .ax-divider > span:first-child, .ax-divider > span:last-child { flex: 1; height: 1px; background: rgba(255,255,255,0.08); }
 .ax-divider-text { font-size: 11px; color: rgba(255,255,255,0.3); letter-spacing: 0.06em; }
 .ax-sub-cta { text-align: center; font-size: 13px; color: rgba(255,255,255,0.4); margin: 0; }
+/* affiliate-program pointer — a quieter second line under the main CTA */
+.ax-affiliate-cta { margin-top: 10px; padding-top: 12px; border-top: 1px solid rgba(255,255,255,0.06); font-size: 12px; color: rgba(255,255,255,0.32); }
 .ax-link { color: #F3F2F0; cursor: pointer; background: none; border: none; padding: 0; font: inherit; text-decoration: underline; }
 .ax-google-fallback { display: flex; flex-direction: column; align-items: center; gap: 8px; margin-bottom: 26px; padding: 12px 14px; border: 1px solid rgba(255,255,255,0.12); border-radius: 8px; font-size: 12px; line-height: 1.5; color: rgba(255,255,255,0.55); text-align: center; }
 /* Feedback modal */

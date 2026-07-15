@@ -7,6 +7,10 @@ import SuperAdminDashboard from '../components/SuperAdminDashboard.vue';
 // One's accounts + token + bulk-calling backend (frontend-only product split).
 const ApexApp = () => import('../apex/ApexApp.vue');
 
+// NOKVO Affiliate Program — standalone lightweight app (own accounts: affiliate
+// number + TOTP, no password) for referral signup + commission dashboard.
+const AffiliateApp = () => import('../affiliate/AffiliateApp.vue');
+
 // Dashboard views. Each view owns one page section that used to live inside
 // NokvoOneApp.vue under v-if="currentPage === '<key>'". During the migration
 // the v-if blocks remain in NokvoOneApp.vue; a route→currentPage watcher
@@ -136,6 +140,26 @@ const routes = [
     component: ApexApp,
     props: { initialAuthState: 'invite' },
     name: 'nokvo-apex-invite',
+  },
+
+  // ── NOKVO Affiliate Program ─────────────────────────────────────
+  {
+    path: '/affiliate',
+    component: AffiliateApp,
+    props: { initialView: 'login' },
+    name: 'affiliate',
+  },
+  {
+    path: '/affiliate/signup',
+    component: AffiliateApp,
+    props: { initialView: 'signup' },
+    name: 'affiliate-signup',
+  },
+  {
+    path: '/affiliate/dashboard',
+    component: AffiliateApp,
+    props: { initialView: 'dashboard' },
+    name: 'affiliate-dashboard',
   },
 
   // ── Console / Super-Admin ───────────────────────────────────────

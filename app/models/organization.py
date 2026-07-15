@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, DateTime, Boolean
+from sqlalchemy import Column, String, DateTime, Boolean, ForeignKey
 from sqlalchemy.dialects.postgresql import UUID
 from app.db.session import Base
 from sqlalchemy.sql import func
@@ -43,5 +43,18 @@ class Organization(Base):
     # Current wizard step for resume; null once onboarding is done. Values:
     # business_details → documents → working_hours → projects → agent → terms → done.
     onboarding_step = Column(String, nullable=True)
+
+    # ── Affiliate attribution (APEX referral program) ──
+    # Stamped at create-subscription when a valid affiliate number is entered;
+    # commission accrual reads THIS (never the Razorpay notes). SET NULL so a
+    # deleted affiliate never cascades into customer orgs; the code string
+    # below survives as the audit trail.
+    affiliate_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("affiliates.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    affiliate_code_used = Column(String, nullable=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())

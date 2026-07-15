@@ -66,6 +66,10 @@ class CreateSubscriptionRequest(BaseModel):
     terms_accepted: bool = False
     terms_version: str | None = None
     privacy_version: str | None = None
+    # Optional referral: an affiliate number entered on the payment screen. A
+    # valid code stamps org.affiliate_id (commission attribution); an invalid
+    # one is logged and ignored — a typo must never block a paying customer.
+    affiliate_code: str | None = None
 
 
 # Upper bound on a single purchase — a fat-fingered / malicious request can't
@@ -108,12 +112,32 @@ async def _record_minute_purchase(
     race or a Razorpay retry). A purchase with no payment id is skipped — we only
     credit confirmed payments.
 
+    ONBOARDING bundles get a second, stronger key: at most one credit per
+    ``razorpay_ref`` (the subscription id). The bundle is charged only on the
+    subscription's FIRST invoice, but every monthly renewal webhook stamps a
+    fresh payment id onto the Subscription row before ``_bg_activate`` runs —
+    so per-payment-id idempotency alone re-credited the full bundle every
+    cycle. Keying on the subscription ref makes any later payment event for
+    the same subscription a no-op. (Top-ups keep payment-id-only dedupe: each
+    top-up is its own Order/ref.)
+
     ``minutes`` is the CREDITED amount. ``rupees``/``rate_per_minute`` default to
     the flat-bracket price of ``minutes`` (Nokvo One: credited == billed), but
     APEX overrides them — it BILLS on the selected minutes while crediting
     floor(1.5×) minutes, so it passes the selected-minutes price explicitly."""
     if not minutes or minutes <= 0 or not razorpay_payment_id:
         return
+    if source == "onboarding" and razorpay_ref:
+        already_credited = (
+            await db.execute(
+                select(MinutePurchase).where(
+                    MinutePurchase.source == "onboarding",
+                    MinutePurchase.razorpay_ref == razorpay_ref,
+                )
+            )
+        ).scalars().first()
+        if already_credited is not None:
+            return
     existing = (
         await db.execute(
             select(MinutePurchase).where(MinutePurchase.razorpay_payment_id == razorpay_payment_id)
@@ -389,6 +413,23 @@ async def create_subscription(payload: CreateSubscriptionRequest, db: AsyncSessi
             f"terms={(payload.terms_version or '?')};privacy={(payload.privacy_version or '?')}"
         )[:64]
 
+    # Affiliate attribution: stamp the org (the accrual source of truth) while
+    # it's still unpaid — the last valid code entered before the successful
+    # payment wins. The code string in the Razorpay notes below is audit only.
+    affiliate = None
+    if (payload.affiliate_code or "").strip():
+        from app.services.affiliate_service import resolve_active_affiliate_by_code
+
+        affiliate = await resolve_active_affiliate_by_code(db, payload.affiliate_code)
+        if affiliate is not None and org.status == "pending_payment":
+            org.affiliate_id = affiliate.id
+            org.affiliate_code_used = affiliate.affiliate_number
+        elif affiliate is None:
+            logger.warning(
+                "AFFILIATE: unknown/inactive code %r entered at payment for org %s — ignored",
+                payload.affiliate_code, org.id,
+            )
+
     spec = PLAN_CATALOG[payload.plan]
     minutes = _validate_minutes(payload.minutes)
     minutes_paise = cost_paise(minutes)
@@ -396,7 +437,12 @@ async def create_subscription(payload: CreateSubscriptionRequest, db: AsyncSessi
         plan_id = await RazorpayService.ensure_plan(payload.plan)
         sub = await RazorpayService.create_subscription(
             plan_id,
-            notes={"organization_id": str(org.id), "plan": payload.plan, "minutes": str(minutes)},
+            notes={
+                "organization_id": str(org.id),
+                "plan": payload.plan,
+                "minutes": str(minutes),
+                "affiliate_code": affiliate.affiliate_number if affiliate else "",
+            },
             # One-time addon on the FIRST invoice = the prepaid-minute bundle, so
             # onboarding charges platform fee + minutes together; later cycles bill
             # only the plan amount.
@@ -439,6 +485,7 @@ async def create_subscription(payload: CreateSubscriptionRequest, db: AsyncSessi
         "subscription_id": razorpay_subscription_id,
         "key_id": settings.RAZORPAY_KEY_ID,
         "plan": payload.plan,
+        "affiliate_applied": affiliate is not None,
         "amount_paise": spec["amount_paise"],
         # First-invoice total the customer pays now (platform fee + minutes bundle).
         "minutes": minutes,
@@ -489,6 +536,21 @@ async def verify_payment(
         razorpay_payment_id=payload.razorpay_payment_id,
         razorpay_ref=payload.razorpay_subscription_id,
         **_purchase_args_for_sub(sub),
+    )
+
+    # Affiliate commission for the FIRST invoice (verify only ever runs during
+    # onboarding). Amount is reconstructed server-side from our own Subscription
+    # row — plan price + the same addon expression that priced the bundle —
+    # never from the client payload. Races with the webhook resolve via the
+    # unique payment id.
+    from app.services.affiliate_service import accrue_affiliate_commission
+
+    await accrue_affiliate_commission(
+        db,
+        organization_id=organization_id,
+        razorpay_payment_id=payload.razorpay_payment_id,
+        razorpay_subscription_id=payload.razorpay_subscription_id,
+        amount_paise=int(sub.amount_paise or 0) + cost_paise(sub.minutes or 0),
     )
 
     # Issue a session so the now-active admin can drive the onboarding wizard
@@ -551,6 +613,25 @@ async def razorpay_webhook(request: Request, db: AsyncSession = Depends(deps.get
             if pay_entity.get("id"):
                 sub.razorpay_payment_id = pay_entity["id"]
             await db.commit()
+            # Affiliate commission for this confirmed charge. This branch is the
+            # ONLY path that sees recurring monthly charges, and the payment
+            # entity's `amount` is the actual charged paise — first invoice =
+            # plan + minutes addon automatically, renewals = plan only. Events
+            # without a payment entity (e.g. subscription.authenticated) are
+            # skipped by the guard; top-ups are Order payments with no
+            # subscription id and never enter this branch. Idempotent on the
+            # payment id; best-effort (never breaks the webhook 200).
+            if pay_entity.get("id") and pay_entity.get("amount"):
+                from app.services.affiliate_service import accrue_affiliate_commission
+
+                await accrue_affiliate_commission(
+                    db,
+                    organization_id=sub.organization_id,
+                    razorpay_payment_id=str(pay_entity["id"]),
+                    razorpay_subscription_id=str(razorpay_subscription_id),
+                    amount_paise=int(pay_entity["amount"]),
+                    raw_event=event,
+                )
             # Provision in the background so we return 200 fast (Razorpay retries
             # on slow/failed deliveries; our activation is idempotent). Retained
             # in a module set — an untracked task can be GC'd mid-flight.
@@ -626,6 +707,18 @@ async def payment_status(payment_token: str, db: AsyncSession = Depends(deps.get
                         razorpay_payment_id=sub.razorpay_payment_id,
                         razorpay_ref=sub.razorpay_subscription_id,
                         **_purchase_args_for_sub(sub),
+                    )
+                    # First-invoice affiliate commission on the resume path too
+                    # (client verify AND webhook both lost). Same server-side
+                    # reconstruction as verify; idempotent on the payment id.
+                    from app.services.affiliate_service import accrue_affiliate_commission
+
+                    await accrue_affiliate_commission(
+                        db,
+                        organization_id=organization_id,
+                        razorpay_payment_id=sub.razorpay_payment_id,
+                        razorpay_subscription_id=sub.razorpay_subscription_id,
+                        amount_paise=int(sub.amount_paise or 0) + cost_paise(sub.minutes or 0),
                     )
                 org = (await db.execute(select(Organization).where(Organization.id == organization_id))).scalars().first()
         except RazorpayError:

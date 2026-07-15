@@ -1178,6 +1178,340 @@ async def deny_bulk_calling_request(
     return {"id": str(req.id), "status": req.status}
 
 
+# ── Affiliate program (operator console) ────────────────────────────────────
+# List + KYC approval + the T+2 due-settlement queue + manual settle (operator
+# does the bank transfer and records the UTR). Declared BEFORE the
+# parameterized /{organization_id} routes below so the literal "affiliates"
+# segment is never captured as an org id. T+2 due-ness is a pure query filter —
+# there is deliberately no background ticker.
+
+
+def _affiliate_summary(affiliate, totals: dict, referred_count: int) -> dict:
+    from app.services.affiliate_service import bank_details_complete
+
+    return {
+        "id": str(affiliate.id),
+        "affiliate_number": affiliate.affiliate_number,
+        "full_name": affiliate.full_name,
+        "email": affiliate.email,
+        "status": affiliate.status,
+        "created_at": affiliate.created_at.isoformat() if affiliate.created_at else None,
+        "last_login_at": affiliate.last_login_at.isoformat() if affiliate.last_login_at else None,
+        "kyc_verified_at": affiliate.kyc_verified_at.isoformat() if affiliate.kyc_verified_at else None,
+        "kyc_verified_by": affiliate.kyc_verified_by,
+        # FULL bank details — the operator needs them to make the transfer.
+        "bank": (
+            {
+                "account_holder": affiliate.bank_account_holder,
+                "account_number": affiliate.bank_account_number,
+                "ifsc": affiliate.bank_ifsc,
+            }
+            if bank_details_complete(affiliate)
+            else None
+        ),
+        "totals": totals,
+        "referred_count": referred_count,
+    }
+
+
+async def _affiliate_totals(db: AsyncSession) -> dict:
+    """Per-affiliate accrued/pending/due/settled rupees in one grouped pass."""
+    from datetime import timedelta
+
+    from app.models.affiliate_commission import AffiliateCommission
+
+    due_cutoff = datetime.now(timezone.utc) - timedelta(
+        hours=settings.AFFILIATE_SETTLEMENT_DUE_HOURS
+    )
+    rows = (
+        await db.execute(
+            select(
+                AffiliateCommission.affiliate_id,
+                AffiliateCommission.amount_rupees,
+                AffiliateCommission.settlement_id,
+                AffiliateCommission.created_at,
+            )
+        )
+    ).all()
+    out: dict = {}
+    for affiliate_id, amount, settlement_id, created_at in rows:
+        t = out.setdefault(
+            affiliate_id, {"accrued": 0.0, "pending": 0.0, "due": 0.0, "settled": 0.0}
+        )
+        value = float(amount or 0)
+        t["accrued"] += value
+        if settlement_id is not None:
+            t["settled"] += value
+        else:
+            t["pending"] += value
+            created = created_at
+            if created is not None and created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            if created is not None and created <= due_cutoff:
+                t["due"] += value
+    for t in out.values():
+        for k in t:
+            t[k] = round(t[k], 2)
+    return out
+
+
+@router.get("/affiliates")
+async def list_affiliates(
+    db: AsyncSession = Depends(get_db),
+    current_user: SuperAdminUser = Depends(RequireRole(_READ_ROLES)),
+):
+    from app.models.affiliate import Affiliate
+
+    affiliates = (
+        await db.execute(select(Affiliate).order_by(Affiliate.created_at.desc()))
+    ).scalars().all()
+    totals = await _affiliate_totals(db)
+    referred = dict(
+        (
+            await db.execute(
+                select(Organization.affiliate_id, func.count(Organization.id))
+                .where(Organization.affiliate_id.is_not(None))
+                .group_by(Organization.affiliate_id)
+            )
+        ).all()
+    )
+    empty = {"accrued": 0.0, "pending": 0.0, "due": 0.0, "settled": 0.0}
+    return {
+        "items": [
+            _affiliate_summary(a, totals.get(a.id, dict(empty)), int(referred.get(a.id, 0)))
+            for a in affiliates
+        ]
+    }
+
+
+@router.get("/affiliates/settlements/due")
+async def affiliate_settlements_due(
+    db: AsyncSession = Depends(get_db),
+    current_user: SuperAdminUser = Depends(RequireRole(_READ_ROLES)),
+):
+    """The T+2 payout queue: unsettled commissions older than the due window,
+    grouped per affiliate — only affiliates the operator may actually pay
+    (active + KYC verified + bank details on file)."""
+    from datetime import timedelta
+
+    from app.models.affiliate import Affiliate
+    from app.models.affiliate_commission import AffiliateCommission
+    from app.services.affiliate_service import settlement_eligible
+
+    due_cutoff = datetime.now(timezone.utc) - timedelta(
+        hours=settings.AFFILIATE_SETTLEMENT_DUE_HOURS
+    )
+    rows = (
+        await db.execute(
+            select(AffiliateCommission)
+            .where(
+                AffiliateCommission.settlement_id.is_(None),
+                AffiliateCommission.created_at <= due_cutoff,
+            )
+            .order_by(AffiliateCommission.created_at.asc())
+        )
+    ).scalars().all()
+    by_affiliate: dict = {}
+    for c in rows:
+        by_affiliate.setdefault(c.affiliate_id, []).append(c)
+    items = []
+    for affiliate_id, commissions in by_affiliate.items():
+        affiliate = await db.get(Affiliate, affiliate_id)
+        if affiliate is None or not settlement_eligible(affiliate):
+            continue
+        items.append(
+            {
+                "affiliate_id": str(affiliate.id),
+                "affiliate_number": affiliate.affiliate_number,
+                "full_name": affiliate.full_name,
+                "bank": {
+                    "account_holder": affiliate.bank_account_holder,
+                    "account_number": affiliate.bank_account_number,
+                    "ifsc": affiliate.bank_ifsc,
+                },
+                "due_amount_rupees": round(sum(float(c.amount_rupees or 0) for c in commissions), 2),
+                "due_count": len(commissions),
+                "oldest_created_at": (
+                    commissions[0].created_at.isoformat() if commissions[0].created_at else None
+                ),
+            }
+        )
+    items.sort(key=lambda x: x["due_amount_rupees"], reverse=True)
+    return {"items": items}
+
+
+@router.post("/affiliates/{affiliate_id}/kyc-verify")
+async def verify_affiliate_kyc(
+    affiliate_id: uuid.UUID,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: SuperAdminUser = Depends(RequireRole(_WRITE_ROLES)),
+):
+    """Operator approved the affiliate's identity (verified out-of-band, e.g.
+    bank account-holder name match) — unblocks settlement (with bank details).
+    Idempotent."""
+    from app.models.affiliate import Affiliate
+
+    affiliate = await db.get(Affiliate, affiliate_id)
+    if affiliate is None:
+        raise HTTPException(status_code=404, detail="Affiliate not found")
+    if affiliate.kyc_verified_at is None:
+        affiliate.kyc_verified_at = datetime.now(timezone.utc)
+        affiliate.kyc_verified_by = current_user.email
+        db.add(
+            SuperAdminAuditLog(
+                superadmin_id=current_user.id,
+                action="affiliate_kyc_verified",
+                risk_level="low",
+                target_type="affiliate",
+                target_id=str(affiliate.id),
+                ip_address=request.client.host if request.client else None,
+                user_agent=request.headers.get("user-agent"),
+                request_id=request.headers.get("x-request-id"),
+            )
+        )
+        await db.commit()
+        await db.refresh(affiliate)
+    return {
+        "id": str(affiliate.id),
+        "kyc_verified_at": affiliate.kyc_verified_at.isoformat() if affiliate.kyc_verified_at else None,
+        "kyc_verified_by": affiliate.kyc_verified_by,
+    }
+
+
+@router.post("/affiliates/{affiliate_id}/reset-totp")
+async def reset_affiliate_totp(
+    affiliate_id: uuid.UUID,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: SuperAdminUser = Depends(RequireRole(_WRITE_ROLES)),
+):
+    """Lost-authenticator recovery (support-ticket flow): rotate the TOTP
+    secret and drop the affiliate back to ``pending_totp``. They then re-submit
+    the public signup form with the same email — the reclaim path issues a
+    fresh QR and re-activates the SAME id + affiliate number (and clears the
+    KYC approval, since the identity fields may have changed)."""
+    from app.core.secret_crypto import encrypt_secret as _encrypt
+    from app.core.security import generate_totp_secret
+    from app.models.affiliate import Affiliate
+
+    affiliate = await db.get(Affiliate, affiliate_id)
+    if affiliate is None:
+        raise HTTPException(status_code=404, detail="Affiliate not found")
+    affiliate.totp_secret_encrypted_v2 = _encrypt(generate_totp_secret())
+    affiliate.status = "pending_totp"
+    db.add(
+        SuperAdminAuditLog(
+            superadmin_id=current_user.id,
+            action="affiliate_totp_reset",
+            risk_level="medium",
+            target_type="affiliate",
+            target_id=str(affiliate.id),
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            request_id=request.headers.get("x-request-id"),
+        )
+    )
+    await db.commit()
+    return {"id": str(affiliate.id), "status": affiliate.status}
+
+
+class AffiliateSettleRequest(BaseModel):
+    utr: str = Field(min_length=1, max_length=64)
+
+
+@router.post("/affiliates/{affiliate_id}/settle")
+async def settle_affiliate_commissions(
+    affiliate_id: uuid.UUID,
+    payload: AffiliateSettleRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: SuperAdminUser = Depends(RequireRole(_WRITE_ROLES)),
+):
+    """Mark every DUE commission for this affiliate settled under one bank
+    transfer (one UTR). The affiliate row lock serializes a double-click /
+    two-operator race; rows are locked too so a concurrent settle can't stamp
+    them twice."""
+    from datetime import timedelta
+
+    from app.models.affiliate import Affiliate
+    from app.models.affiliate_commission import AffiliateCommission, AffiliateSettlement
+    from app.services.affiliate_service import settlement_eligible
+
+    utr = (payload.utr or "").strip()
+    if not utr:
+        raise HTTPException(status_code=400, detail="Enter the bank UTR reference.")
+
+    affiliate = (
+        await db.execute(
+            select(Affiliate).where(Affiliate.id == affiliate_id).with_for_update()
+        )
+    ).scalars().first()
+    if affiliate is None:
+        raise HTTPException(status_code=404, detail="Affiliate not found")
+    if not settlement_eligible(affiliate):
+        raise HTTPException(
+            status_code=409,
+            detail="Affiliate is not payable yet — verify KYC and make sure bank details are on file.",
+        )
+
+    due_cutoff = datetime.now(timezone.utc) - timedelta(
+        hours=settings.AFFILIATE_SETTLEMENT_DUE_HOURS
+    )
+    commissions = (
+        await db.execute(
+            select(AffiliateCommission)
+            .where(
+                AffiliateCommission.affiliate_id == affiliate.id,
+                AffiliateCommission.settlement_id.is_(None),
+                AffiliateCommission.created_at <= due_cutoff,
+            )
+            .with_for_update()
+        )
+    ).scalars().all()
+    if not commissions:
+        raise HTTPException(status_code=409, detail="Nothing is due for settlement yet.")
+
+    total = sum(Decimal(str(c.amount_rupees or 0)) for c in commissions)
+    settlement = AffiliateSettlement(
+        id=uuid.uuid4(),
+        affiliate_id=affiliate.id,
+        amount_rupees=total,
+        commission_count=len(commissions),
+        utr_reference=utr[:64],
+        settled_by=current_user.email,
+    )
+    db.add(settlement)
+    await db.flush()
+    for c in commissions:
+        c.settlement_id = settlement.id
+    db.add(
+        SuperAdminAuditLog(
+            superadmin_id=current_user.id,
+            action="affiliate_commissions_settled",
+            risk_level="medium",
+            target_type="affiliate",
+            target_id=str(affiliate.id),
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            request_id=request.headers.get("x-request-id"),
+            metadata_={
+                "settlement_id": str(settlement.id),
+                "amount_rupees": float(total),
+                "commission_count": len(commissions),
+                "utr": utr[:64],
+            },
+        )
+    )
+    await db.commit()
+    return {
+        "settlement_id": str(settlement.id),
+        "amount_rupees": float(total),
+        "commission_count": len(commissions),
+        "utr_reference": utr[:64],
+    }
+
+
 @router.get("/{organization_id}")
 async def get_tenant_detail(
     organization_id: str,

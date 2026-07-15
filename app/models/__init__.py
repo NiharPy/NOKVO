@@ -47,6 +47,8 @@ from app.models.real_estate_project import RealEstateProject
 from app.models.bulk_calling_request import BulkCallingRequest
 from app.models.apex_support_ticket import ApexSupportTicket
 from app.models.platform_setting import PlatformSetting
+from app.models.affiliate import Affiliate
+from app.models.affiliate_commission import AffiliateCommission, AffiliateSettlement
 
 # For Alembic to discover all models
 __all__ = [
@@ -94,4 +96,7 @@ __all__ = [
     "BulkCallingRequest",
     "ApexSupportTicket",
     "PlatformSetting",
+    "Affiliate",
+    "AffiliateCommission",
+    "AffiliateSettlement",
 ]
