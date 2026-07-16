@@ -498,6 +498,43 @@ class EmailService:
         await cls.send(to_email, mail_subject, body_text, html_body=html_body, inline_images=cls._brand_inline_images())
 
     @classmethod
+    async def send_campaign_moderation_alert(
+        cls,
+        *,
+        org_name: str,
+        actor_email: str,
+        campaign_name: str,
+        category: str,
+        reason: str,
+        mode: str,
+        content_snippet: str,
+    ) -> None:
+        """Notify the operator inbox that the campaign content guard flagged a
+        create/edit (blocked under enforce, allowed-through under warn). The
+        offending text rides along so repeat offenders are auditable from the
+        email alone — there is deliberately no review queue."""
+        to_email = "officialnokvo@nokvo.org"
+        action = "BLOCKED" if mode == "enforce" else "flagged (warn mode — allowed through)"
+        mail_subject = f"[Campaign moderation] {category}: '{campaign_name[:60]}' — {org_name[:60]}"
+        body_text = (
+            f"Organization: {org_name}\n"
+            f"Submitted by: {actor_email}\n"
+            f"Campaign: {campaign_name}\n"
+            f"Verdict: {category} — {action}\n"
+            f"Reason: {reason or '(none given)'}\n\n"
+            f"— Campaign text snapshot —\n{content_snippet.strip() or '(empty)'}"
+        )
+        html_body = cls._branded_message_html(
+            preheader=f"Campaign content guard: {category} from {org_name}",
+            eyebrow="Campaign Moderation",
+            heading=f"Campaign {action}",
+            body_html=cls._text_to_paragraphs_html(body_text),
+            cta_label=None,
+            cta_url=None,
+        )
+        await cls.send(to_email, mail_subject, body_text, html_body=html_body, inline_images=cls._brand_inline_images())
+
+    @classmethod
     async def send_broadcast_email(
         cls,
         to_email: str,

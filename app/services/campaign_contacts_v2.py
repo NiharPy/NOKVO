@@ -34,9 +34,20 @@ from app.db.session import AsyncSessionLocal
 logger = logging.getLogger(__name__)
 
 # UI bucket → SQL predicate over a contact row (mirrors the old categorizeContacts).
+# "busy" = connected, didn't qualify, but ASKED TO BE CALLED BACK (the post-call
+# classifier stamps result.callback_requested) — a re-dialable outcome, split out
+# of not_interested so true rejections stay a clean list and the busy pile can be
+# re-run from the campaign card.
 BUCKET_SQL: dict[str, str] = {
     "qualified": "qualified = true",
-    "not_interested": "status = 'completed' AND qualified = false",
+    "not_interested": (
+        "status = 'completed' AND qualified = false "
+        "AND COALESCE(result->>'callback_requested', '') <> 'true'"
+    ),
+    "busy": (
+        "status = 'completed' AND qualified = false "
+        "AND result->>'callback_requested' = 'true'"
+    ),
     "no_pickup": "status IN ('no_answer', 'failed', 'dnd_dropped')",
     "pending": "status IN ('pending', 'dialing', 'ringing', 'answered')",
     # Call Logs: every contact a call was actually PLACED for (any outcome).
@@ -380,24 +391,47 @@ async def migrate_blob_campaign(db, campaign) -> int:
     return inserted
 
 
-async def rearm_unreached(db, campaign_id: uuid.UUID) -> int:
-    """Re-arm every unreached terminal row for a re-run: ``no_answer``/``failed``
-    → ``pending`` with a FRESH ``call_link_id`` (so a stale webhook from the
-    previous attempt can never touch the retry) and the old placement id cleared.
-    ``dnd_dropped`` stays dropped (still on the register) and answered/completed
-    rows are never re-dialed. No DND scrub here — the dialer re-scrubs each
-    claimed batch at dial time. Returns rows re-armed."""
-    res = await db.execute(
-        text(
-            "UPDATE outbound_campaign_contacts SET status = 'pending', "
-            "call_link_id = CAST(gen_random_uuid() AS text), call_id = NULL, "
-            "updated_at = now() "
-            "WHERE campaign_id = :c AND status IN ('no_answer', 'failed')"
-        ),
-        {"c": str(campaign_id)},
-    )
+async def rearm_unreached(db, campaign_id: uuid.UUID, buckets: tuple[str, ...] = ("no_pickup",)) -> int:
+    """Re-arm terminal rows for a re-run, per bucket:
+
+    * ``no_pickup`` — ``no_answer``/``failed`` → ``pending`` with a FRESH
+      ``call_link_id`` (so a stale webhook from the previous attempt can never
+      touch the retry) and the old placement id cleared. ``dnd_dropped`` stays
+      dropped (still on the register).
+    * ``busy`` — connected contacts who ASKED TO BE CALLED BACK
+      (``result.callback_requested``, not qualified) → ``pending``, with the
+      previous call's verdict fields cleared so the fresh call re-stamps them
+      (and the flag removed so the row leaves the busy bucket immediately).
+
+    Qualified and plain not-interested rows are never re-dialed. No DND scrub
+    here — the dialer re-scrubs each claimed batch at dial time. Returns rows
+    re-armed across the requested buckets."""
+    rearmed = 0
+    if "no_pickup" in buckets:
+        res = await db.execute(
+            text(
+                "UPDATE outbound_campaign_contacts SET status = 'pending', "
+                "call_link_id = CAST(gen_random_uuid() AS text), call_id = NULL, "
+                "updated_at = now() "
+                "WHERE campaign_id = :c AND status IN ('no_answer', 'failed')"
+            ),
+            {"c": str(campaign_id)},
+        )
+        rearmed += int(res.rowcount or 0)
+    if "busy" in buckets:
+        res = await db.execute(
+            text(
+                "UPDATE outbound_campaign_contacts SET status = 'pending', "
+                "call_link_id = CAST(gen_random_uuid() AS text), call_id = NULL, "
+                "answered_at = NULL, duration_s = NULL, lead_score = NULL, "
+                "result = result - 'callback_requested', updated_at = now() "
+                f"WHERE campaign_id = :c AND {BUCKET_SQL['busy']}"
+            ),
+            {"c": str(campaign_id)},
+        )
+        rearmed += int(res.rowcount or 0)
     await db.commit()
-    return int(res.rowcount or 0)
+    return rearmed
 
 
 async def pending_count(db, campaign_id: uuid.UUID) -> int:
@@ -529,11 +563,19 @@ async def _summary_uncached(db, campaign_id: uuid.UUID) -> dict[str, int]:
              "WHERE campaign_id = :c AND qualified"),
         {"c": str(campaign_id)},
     )).scalar_one()
+    # Connected-but-asked-to-call-back (the "busy" bucket) — carved OUT of
+    # not_interested so the three connected outcomes stay mutually exclusive.
+    busy = (await db.execute(
+        text(f"SELECT count(*) FROM outbound_campaign_contacts "
+             f"WHERE campaign_id = :c AND {BUCKET_SQL['busy']}"),
+        {"c": str(campaign_id)},
+    )).scalar_one()
     total = sum(by_status.values())
     return {
         "total": total,
         "qualified": int(qualified),
-        "not_interested": by_status.get("completed", 0) - int(qualified),
+        "not_interested": max(0, by_status.get("completed", 0) - int(qualified) - int(busy)),
+        "busy": int(busy),
         "no_pickup": by_status.get("no_answer", 0) + by_status.get("failed", 0) + by_status.get("dnd_dropped", 0),
         "pending": total - by_status.get("completed", 0) - by_status.get("no_answer", 0)
                    - by_status.get("failed", 0) - by_status.get("dnd_dropped", 0),

@@ -1176,12 +1176,22 @@ class OutboundCampaignService:
         tenant_res: TenantResources,
         public_base_url: str,
         path_prefix: str = "/api/nokvo-one/agents",
+        buckets: list[str] | None = None,
     ) -> OutboundCampaign:
-        """Dial a bulk CSV campaign's whole list again — re-runs the same contacts
-        from scratch (fresh call_link_ids, counters reset). Useful after fixing the
-        dedicated number, or to re-contact the list. Unlike the lead-based relaunch
-        (which only dials newly-added consented leads), this re-arms EVERY contact.
+        """Re-dial a bulk CSV campaign's selected outcome buckets and resume.
+
+        ``buckets`` picks who gets re-armed (fresh call_link_ids):
+          * ``no_pickup`` (default) — contacts never connected (no_answer/failed).
+          * ``busy`` — contacts who ANSWERED but asked to be called back
+            (``callback_requested``, not qualified). Their previous verdict is
+            cleared so the fresh call re-stamps it.
+        Qualified and plain not-interested contacts are never re-dialed; rows
+        already pending resume dialing on any re-run.
         """
+        bucket_set = {str(b) for b in (buckets or ["no_pickup"])}
+        unknown = bucket_set - {"no_pickup", "busy"}
+        if unknown or not bucket_set:
+            raise ValueError("Re-run buckets must be 'no_pickup', 'busy', or both.")
         if not OutboundCampaignService._is_bulk(campaign):
             raise ValueError("Re-run is only for bulk CSV campaigns.")
         if not PlivoService.bulk_calling_enabled(tenant_res):
@@ -1208,10 +1218,11 @@ class OutboundCampaignService:
         if settings.CAMPAIGN_CONTACTS_V2 and not campaign.contacts:
             from app.services import campaign_contacts_v2 as v2
 
-            await v2.rearm_unreached(db, campaign.id)
+            await v2.rearm_unreached(db, campaign.id, buckets=tuple(bucket_set))
             if await v2.pending_count(db, campaign.id) <= 0:
                 raise ValueError(
-                    "Everyone on this list was already reached — there's no one to re-run."
+                    "No one in the selected group is left to call — they may "
+                    "already be re-armed or reached."
                 )
             # A CANCELLED campaign re-runs too: the operator explicitly asked, so
             # this is the resurrect path (the one-campaign guard above already
@@ -1251,12 +1262,44 @@ class OutboundCampaignService:
         if not existing:
             raise ValueError("This campaign has no contacts to call.")
 
-        # Don't call anyone back who was already reached — a lead who picked up
-        # (including one who answered then cut the call) is left untouched. Re-run
-        # only re-arms contacts we never connected to (no answer / failed / never
-        # dialed). Fresh call_link_ids so stale webhooks can't map onto retries.
+        # Who gets re-dialed is bucket-driven:
+        #   * no_pickup — contacts we never connected to (no answer / failed /
+        #     never dialed). A lead who picked up (including one who answered
+        #     then cut the call) is left untouched by this bucket.
+        #   * busy — connected contacts who ASKED TO BE CALLED BACK
+        #     (callback_requested, not qualified). Their verdict fields are
+        #     cleared so the fresh call re-stamps them.
+        # Fresh call_link_ids so stale webhooks can't map onto retries.
         def _reached(ct: dict) -> bool:
             return ct.get("status") == "answered" or bool(ct.get("answered_at"))
+
+        def _qualified_ct(ct: dict) -> bool:
+            return ct.get("qualified") is True or ct.get("interest_outcome") == "interested"
+
+        def _busy_ct(ct: dict) -> bool:
+            return _reached(ct) and not _qualified_ct(ct) and ct.get("callback_requested") is True
+
+        include_np = "no_pickup" in bucket_set
+        include_busy = "busy" in bucket_set
+        # Per-call verdict keys wiped on a busy re-arm — the retry call writes
+        # fresh ones; stale values would mislabel the new outcome.
+        _verdict_keys = (
+            "callback_requested", "lead_score", "max_score", "qualified",
+            "score_breakdown", "lead_score_reason", "lead_score_degraded",
+            "interest_outcome", "interest_reason", "call_note",
+            "call_note_generated_at",
+        )
+
+        def _fresh_row(canon: str, ct: dict) -> dict:
+            return {
+                "phone": canon,
+                "name": ct.get("name") or canon,
+                "status": "pending",
+                "call_id": None,
+                "call_link_id": str(uuid.uuid4()),
+                "duration_s": None,
+                "answered_at": None,
+            }
 
         # Canonicalize phones (bare 10-digit → 91…) and collapse duplicates while
         # rebuilding. Campaigns created before canonicalization existed stored RAW
@@ -1268,11 +1311,13 @@ class OutboundCampaignService:
         #   * the same person listed BOTH bare and as +91 becomes two contacts and
         #     is dialed twice ("it keeps calling me").
         # Re-run is the fix-up path for those older lists, so dial the corrected,
-        # deduped numbers. A person reached under ANY form is never re-dialed; the
-        # ``reached`` set wins so a redial twin can't resurrect an answered contact.
+        # deduped numbers. A person reached under ANY form is never re-dialed
+        # (unless deliberately re-armed via the busy bucket); the ``reached`` set
+        # wins so a redial twin can't resurrect an answered contact.
         reached_out: list[dict] = []
         reached_canon: set[str] = set()
         seen: set[str] = set()
+        rearmed: list[dict] = []
         for ct in existing:
             if not _reached(ct):
                 continue
@@ -1280,12 +1325,16 @@ class OutboundCampaignService:
             if not canon or canon in seen:
                 continue
             seen.add(canon)
+            if _busy_ct(ct) and include_busy:
+                # Deliberate re-dial: back to the pool with the verdict wiped.
+                rearmed.append(_fresh_row(canon, ct))
+                continue
             reached_canon.add(canon)
             kept = dict(ct)
             kept["phone"] = canon  # normalize the stored form for the UI
             reached_out.append(kept)
 
-        rearmed: list[dict] = []
+        kept_unreached: list[dict] = []
         for ct in existing:
             if _reached(ct):
                 continue
@@ -1295,18 +1344,21 @@ class OutboundCampaignService:
             if not canon or canon in reached_canon or canon in seen:
                 continue
             seen.add(canon)
-            rearmed.append({
-                "phone": canon,
-                "name": ct.get("name") or canon,
-                "status": "pending",
-                "call_id": None,
-                "call_link_id": str(uuid.uuid4()),
-                "duration_s": None,
-                "answered_at": None,
-            })
+            status = str(ct.get("status") or "pending")
+            if status == "pending" or include_np:
+                # Pending rows always resume; misses re-arm only when the
+                # no_pickup bucket was selected.
+                rearmed.append(_fresh_row(canon, ct))
+            else:
+                # Busy-only re-run: leave the misses untouched (still visible in
+                # Didn't pick up, still re-runnable later).
+                kept = dict(ct)
+                kept["phone"] = canon
+                kept_unreached.append(kept)
         if not rearmed:
             raise ValueError(
-                "Everyone on this list was already reached — there's no one to re-run."
+                "No one in the selected group is left to call — they may "
+                "already be re-armed or reached."
             )
         # Re-scrub the redial set against DND before re-arming — a number may have
         # opted out since the original campaign. Already-reached contacts are left
@@ -1320,7 +1372,7 @@ class OutboundCampaignService:
         cfg = dict(campaign.agent_config or {})
         cfg["dnd_dropped"] = dnd_dropped
         campaign.agent_config = cfg
-        contacts = reached_out + rearmed
+        contacts = reached_out + kept_unreached + rearmed
         campaign.contacts = contacts
         # MUST flag: contacts is a plain JSONB column and the read-modify-write
         # above mutates shared dict refs in place, so SQLAlchemy's old==new check
@@ -1332,7 +1384,8 @@ class OutboundCampaignService:
         campaign.completed_at = None
         campaign.total_count = len(contacts)
         campaign.answered_count = len(reached_out)  # keep prior answers; recount the rest
-        campaign.failed_count = 0
+        # Misses kept by a busy-only re-run retain their failed status — count them.
+        campaign.failed_count = sum(1 for ct in kept_unreached if ct.get("status") == "failed")
         campaign.from_number = caller_id  # re-resolve in case it changed on re-grant
         db.add(campaign)
         await db.commit()

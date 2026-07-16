@@ -57,6 +57,7 @@ import ApexCampaign from './views/ApexCampaign.vue';
 import ApexQualified from './views/ApexQualified.vue';
 import ApexNotInterested from './views/ApexNotInterested.vue';
 import ApexNoPickup from './views/ApexNoPickup.vue';
+import ApexBusy from './views/ApexBusy.vue';
 import ApexCallLogs from './views/ApexCallLogs.vue';
 import ApexAvailableLeads from './views/ApexAvailableLeads.vue';
 import ApexMyLeads from './views/ApexMyLeads.vue';
@@ -159,6 +160,7 @@ const TABS = [
   { id: 'qualified', label: 'Qualified Leads', is: ApexQualified },
   { id: 'notint', label: 'Not Interested', is: ApexNotInterested },
   { id: 'didnt', label: "Didn't Pick Up", is: ApexNoPickup },
+  { id: 'busy', label: 'Busy', is: ApexBusy },
   { id: 'logs', label: 'Call Logs', is: ApexCallLogs },
   { id: 'members', label: 'Members', is: ApexMembers },
 ];

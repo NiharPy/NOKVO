@@ -184,8 +184,14 @@ export async function styleRewriteQuestionnaire({ questionnaire, style, company_
   return data || null;
 }
 
-export async function rerunCampaign(campaignId) {
-  const { data } = await agentsApi.post(`/bulk-calling/campaigns/${campaignId}/rerun`, {}, { headers: authHeader() });
+// `buckets`: which outcome groups to re-dial — ["no_pickup"] (default, the
+// unreached), ["busy"] (answered but asked to be called back), or both.
+export async function rerunCampaign(campaignId, buckets = null) {
+  const { data } = await agentsApi.post(
+    `/bulk-calling/campaigns/${campaignId}/rerun`,
+    buckets && buckets.length ? { buckets } : {},
+    { headers: authHeader() },
+  );
   return data;
 }
 

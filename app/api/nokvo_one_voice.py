@@ -2218,6 +2218,7 @@ async def create_bulk_calling_campaign(
 
     await _require_outbound_enabled(db, user)
     tr = await _tenant_for_user(db, user)
+    org = await _org_for_user(db, user)
     if not PlivoService.bulk_calling_enabled(tr):
         raise HTTPException(
             status_code=403,
@@ -2268,9 +2269,7 @@ async def create_bulk_calling_campaign(
             # cache hit + native multilingual. Best-effort (falls back to authored
             # text); one LLM call. Already-filled languages (admin hand-edits from
             # the translate-preview flow) are preserved — only blanks are filled.
-            _apex_deterministic = (
-                deterministic and (await _org_for_user(db, user)).product_tier == "nokvo_apex"
-            )
+            _apex_deterministic = deterministic and org.product_tier == "nokvo_apex"
             if _apex_deterministic:
                 from app.services.questionnaire_translation import translate_questionnaire
 
@@ -2298,6 +2297,17 @@ async def create_bulk_calling_campaign(
             }
             if calls_per_day:
                 agent_config["call_window"]["calls_per_day"] = max(1, int(calls_per_day))
+        # Content guard — the FINAL config (post-translation, so hand-edited
+        # i18n is covered too) must not disparage or impersonate another
+        # company. Raises ValueError → the 400 channel below; nothing persists.
+        from app.services.campaign_moderation_service import require_campaign_content_allowed
+
+        await require_campaign_content_allowed(
+            org,
+            campaign_name=name.strip(),
+            agent_config=agent_config,
+            actor_email=user.email,
+        )
         campaign = await OutboundCampaignService.create_and_launch_bulk_campaign(
             tr,
             db,
@@ -2455,6 +2465,7 @@ async def update_bulk_calling_campaign(
 
     await _require_outbound_enabled(db, user)
     tr = await _tenant_for_user(db, user)
+    org = await _org_for_user(db, user)
     campaign = await OutboundCampaignService.get_campaign(campaign_id, tr, db)
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
@@ -2489,7 +2500,7 @@ async def update_bulk_calling_campaign(
             )
         if questionnaire:
             drop_stale_i18n(questionnaire, cfg.get("questionnaire"))
-            if (await _org_for_user(db, user)).product_tier == "nokvo_apex":
+            if org.product_tier == "nokvo_apex":
                 questionnaire = await translate_questionnaire(questionnaire)
             cfg["questionnaire"] = questionnaire
             _questionnaire_changed = True
@@ -2511,6 +2522,27 @@ async def update_bulk_calling_campaign(
                 window.pop("calls_per_day", None)  # 0 = remove the cap
         cfg["call_window"] = window
 
+    # Content guard on the MERGED result — edits land on RUNNING campaigns
+    # (live calls reload config), so "create clean → launch → PATCH in the
+    # abuse" must die here, before the commit. Schedule-only edits skip the
+    # verdict: their text was already checked when it entered.
+    _text_changed = _questionnaire_changed or payload.name is not None or any(
+        getattr(payload, attr) is not None
+        for attr in ("content", "company_name", "caller_name")
+    )
+    if _text_changed:
+        from app.services.campaign_moderation_service import require_campaign_content_allowed
+
+        try:
+            await require_campaign_content_allowed(
+                org,
+                campaign_name=campaign.name,
+                agent_config=cfg,
+                actor_email=user.email,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
+
     campaign.agent_config = cfg
     db.add(campaign)
     await db.commit()
@@ -2531,20 +2563,35 @@ async def update_bulk_calling_campaign(
     return _campaign_response(campaign)
 
 
+class BulkRerunPayload(BaseModel):
+    # Which outcome groups to re-dial: "no_pickup" (never connected — the
+    # default, matching the original Re-run) and/or "busy" (answered but asked
+    # to be called back). Pending contacts resume on any re-run.
+    buckets: list[str] | None = None
+
+
 @router.post("/bulk-calling/campaigns/{campaign_id}/rerun")
 async def rerun_bulk_calling_campaign(
     campaign_id: uuid.UUID,
     request: Request,
+    payload: BulkRerunPayload | None = None,
     user: OrganizationUser = Depends(_bulk_admin_dep()),
     _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
     db: AsyncSession = Depends(deps.get_db),
 ):
-    """Dial a bulk CSV campaign's whole list again (e.g. after the dedicated
-    number was fixed). Re-arms every contact, unlike the lead-based relaunch."""
+    """Re-dial the selected outcome groups of a bulk campaign (didn't pick up /
+    busy-call-back / both) and resume dialing. Defaults to the unreached, which
+    is the original Re-run behavior."""
     from app.services.plivo_service import PlivoService
     from app.services.public_url import public_base_url as _pub
 
     await _require_outbound_enabled(db, user)
+    buckets = list((payload.buckets if payload else None) or ["no_pickup"])
+    if not set(buckets) <= {"no_pickup", "busy"} or not buckets:
+        raise HTTPException(
+            status_code=422,
+            detail="buckets must be 'no_pickup', 'busy', or both.",
+        )
     tr = await _tenant_for_user(db, user)
     if not PlivoService.bulk_calling_enabled(tr):
         raise HTTPException(
@@ -2561,6 +2608,7 @@ async def rerun_bulk_calling_campaign(
             tenant_res=tr,
             public_base_url=_pub(request),
             path_prefix="/api/nokvo-one/agents",
+            buckets=buckets,
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=_safe_detail(exc)) from exc
@@ -2689,9 +2737,10 @@ async def create_campaign(
     the leads-list page size.
     """
     tr = await _tenant_for_user(db, user)
+    org = await _org_for_user(db, user)
     # Outbound has moved to NOKVO APEX — Nokvo One can't create outbound campaigns
     # at all (not even drafts). APEX uses the /bulk-calling endpoints, not this one.
-    if _nokvo_one_outbound_blocked(await _org_for_user(db, user)):
+    if _nokvo_one_outbound_blocked(org):
         raise HTTPException(status_code=403, detail=_NOKVO_ONE_OUTBOUND_DISABLED_DETAIL)
     # "Create & call" (launch=true): gate on the plan BEFORE creating, so we never
     # leave a campaign that can't be launched.
@@ -2744,6 +2793,17 @@ async def create_campaign(
                 # read time, so the campaign creates without follow-up
                 # rules rather than 400ing on a UI bug.
                 pass
+        # Content guard — same gate as the bulk-calling paths: no campaign that
+        # disparages or impersonates another company gets persisted, not even
+        # as a draft. Raises ValueError → the 400 channel below.
+        from app.services.campaign_moderation_service import require_campaign_content_allowed
+
+        await require_campaign_content_allowed(
+            org,
+            campaign_name=name,
+            agent_config=agent_config,
+            actor_email=user.email,
+        )
         if parsed_lead_ids:
             campaign = await OutboundCampaignService.create_campaign_from_leads(
                 tr,

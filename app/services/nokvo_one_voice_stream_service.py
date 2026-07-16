@@ -523,10 +523,26 @@ _DEFAULT_QUESTIONNAIRE_OUTROS = {
     "te": "మీ సమయానికి ధన్యవాదాలు. మీకు శుభదినం!",
 }
 
+# The BUSY dealbreaker close: the caller said "I'm busy / call me later", so
+# the agent acknowledges, promises the call-back, and hangs up — pushing the
+# next question at someone who asked to go is how campaigns get numbers
+# blocked. Native hi/te (romanised Indic mispronounces on Sarvam). Static +
+# shared across campaigns → TTS-prewarmed alongside the outros.
+_BUSY_OUTROS = {
+    "en": "No problem — we'll call you back at a better time. Have a great day!",
+    "hi": "कोई बात नहीं — हम आपको बाद में call करेंगे। आपका दिन शुभ हो!",
+    "te": "పర్వాలేదు — మేము మీకు తర్వాత call చేస్తాము. మీకు శుభదినం!",
+}
+
 
 def _default_questionnaire_outro(language: str | None) -> str:
     lang = str(language or "en").split("-")[0].lower()
     return _DEFAULT_QUESTIONNAIRE_OUTROS.get(lang, _DEFAULT_QUESTIONNAIRE_OUTROS["en"])
+
+
+def _busy_outro(language: str | None) -> str:
+    lang = str(language or "en").split("-")[0].lower()
+    return _BUSY_OUTROS.get(lang, _BUSY_OUTROS["en"])
 
 
 def _answer_is_outro(answer: str | None, outro: str | None) -> bool:
@@ -1506,6 +1522,38 @@ class NokvoOneVoiceStreamService:
             and not campaign_context.get("_outro_ended")
             and getattr(outbound_context, "has_questionnaire", False)
         ):
+            # ── BUSY dealbreaker (deterministic, before any other lane) ────────
+            # "I'm busy / call me later" ends the call NOW: play the busy close
+            # and hang up — no LLM turn, no next question. The caller's line
+            # stays in the history, so the post-call classifier stamps
+            # callback_requested and the contact lands in the re-dialable
+            # "busy" bucket (Call busy button). An opt-out in the same line
+            # ("not interested, don't call later") is NOT a busy cut —
+            # is_callback_line refuses it and the disinterest path handles it.
+            try:
+                from app.services.lead_score_service import is_callback_line
+
+                if is_callback_line(cleaned):
+                    campaign_context["_outro_ended"] = True
+                    logger.info(
+                        "NOKVO-BUSY-CUT: caller asked to be called back — closing call %s",
+                        call_id,
+                    )
+                    await NokvoOneVoiceStreamService._speak_outro_and_end(
+                        websocket,
+                        tenant_res,
+                        outro=_busy_outro(language),
+                        language=language,
+                        call_id=call_id,
+                        last_user_text=cleaned,
+                        campaign_context=campaign_context,
+                        arbiter=arbiter,
+                        turn_state=turn_state,
+                        eou_fired_at=eou_fired_at,
+                    )
+                    return
+            except Exception:
+                logger.exception("NOKVO-BUSY-CUT: busy dealbreaker check failed")
             _qoutro = (getattr(outbound_context, "question_outro", "") or "").strip()
             # Phase 3: close in the caller's language from the pre-translated outro.
             if settings.APEX_VERBATIM_QUESTIONS_ENABLED and _qoutro:
@@ -4612,6 +4660,7 @@ class NokvoOneVoiceStreamService:
                             )
                             from app.services.lead_score_service import (
                                 classify_lead_score,
+                                detect_callback_request,
                             )
                             from app.services.outbound_campaign_service import (
                                 OutboundCampaignService,
@@ -4713,6 +4762,22 @@ class NokvoOneVoiceStreamService:
                                 if _bg_questions
                                 else _outcome.outcome == "interested"
                             )
+                            # Busy / call-me-later: a connected caller who asked
+                            # to be called back is a RE-DIALABLE outcome, not a
+                            # rejection — stamp the flag so they land in the
+                            # "busy" bucket (campaign card → Call busy button)
+                            # instead of Not Interested. Qualified always wins:
+                            # a lead who qualified AND said "call me later" is
+                            # still a qualified lead.
+                            if not _surfaces_as_qualified:
+                                try:
+                                    if detect_callback_request(_turns):
+                                        _stamp["callback_requested"] = True
+                                        _log = f"{_log} callback_requested"
+                                except Exception:
+                                    logger.exception(
+                                        "NOKVO-OUTBOUND-INTEREST: callback detection failed"
+                                    )
                             if _surfaces_as_qualified and not _has_followup_target:
                                 try:
                                     from app.services.call_condenser_service import (

@@ -98,6 +98,16 @@ async def prewarm_campaign_tts(
         outro = str((questionnaire.get("outro_i18n") or {}).get(lang) or "").strip()
         if outro:
             jobs.append((outro, {}))  # the close path passes no prosody args
+        # The BUSY dealbreaker close ("I'm busy, call me later" → this line +
+        # hangup) — static per language, shared across campaigns, spoken via the
+        # same no-prosody close path. Global, so after the first campaign these
+        # are cache probes.
+        try:
+            from app.services.nokvo_one_voice_stream_service import _busy_outro
+
+            jobs.append((_busy_outro(lang), {}))
+        except Exception:
+            logger.debug("APEX-TTS-PREWARM: busy outro unavailable lang=%s", lang, exc_info=True)
         try:
             intro = str((questionnaire.get("intro_i18n") or {}).get(lang) or "")
             for sentence, tone in await _intro_lines(intro):

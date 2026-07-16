@@ -12,6 +12,9 @@
 // the Plivo answer webhook isn't wired so a connected call can read status=failed).
 export function leadCategory(ct, campaign) {
   const hasQ = !!(campaign.questionnaire && (campaign.questionnaire.questions || []).length);
+  // Connected + asked to be called back ("I'm busy, call me later") — a
+  // RE-DIALABLE outcome, not a rejection. Qualified always outranks it.
+  const busy = ct.callback_requested === true;
   if (hasQ) {
     const scored = typeof ct.lead_score === 'number' || typeof ct.qualified === 'boolean';
     if (scored) {
@@ -19,10 +22,12 @@ export function leadCategory(ct, campaign) {
       const successful =
         ct.qualified === true ||
         (typeof ct.lead_score === 'number' && ct.lead_score >= threshold);
-      return successful ? 'successful' : 'not_interested';
+      if (successful) return 'successful';
+      return busy ? 'busy' : 'not_interested';
     }
   } else if (ct.interest_outcome != null && ct.interest_outcome !== '') {
-    return ct.interest_outcome === 'interested' ? 'successful' : 'not_interested';
+    if (ct.interest_outcome === 'interested') return 'successful';
+    return busy ? 'busy' : 'not_interested';
   }
   const status = ct.status || 'pending';
   const connected = !!ct.answered_at || status === 'answered';
@@ -36,7 +41,7 @@ export function leadCategory(ct, campaign) {
 // One pass → mutually exclusive groups (each contact in exactly one). Rows carry
 // the score/breakdown/note where relevant. `byRecent` sort, most recent first.
 export function categorizeContacts(campaigns) {
-  const groups = { successful: [], not_interested: [], no_pickup: [], pending: [] };
+  const groups = { successful: [], not_interested: [], busy: [], no_pickup: [], pending: [] };
   for (const c of campaigns || []) {
     const hasQ = !!(c.questionnaire && (c.questionnaire.questions || []).length);
     const maxScore = hasQ ? (c.max_score || (c.questionnaire.questions || []).length) : null;

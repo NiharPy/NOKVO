@@ -1,6 +1,10 @@
 <script setup>
-// APEX Didn't Pick Up — no connection. V2 campaigns read paginated from the
-// server; legacy blob campaigns stay client-side.
+// APEX Busy — connected contacts who asked to be called back (the "busy"
+// bucket). Promoted out of the Didn't Pick Up tab so callbacks are a
+// first-class pile with full pagination + CSV, not a capped footnote. The
+// re-dial itself stays on the campaign card's "Call busy" button (it carries
+// the credits confirmation). V2 campaigns read paginated from the server;
+// legacy blob campaigns stay client-side.
 import { inject, ref, computed, watch, onMounted } from 'vue';
 import { categorizeContacts, exportContactsCsv } from '../../composables/bulkCalling.js';
 import { useNewRows } from '../../composables/axMotion.js';
@@ -32,11 +36,11 @@ async function loadRows(reset = true) {
     for (const c of v2) {
       const cur = reset ? null : cursors.value[c.id];
       if (!reset && cur === null) continue;
-      const { rows: page, next_cursor } = await apex.fetchCampaignContacts(c.id, 'no_pickup', cur, 100);
+      const { rows: page, next_cursor } = await apex.fetchCampaignContacts(c.id, 'busy', cur, 100);
       out.push(...(page || []).map((r) => ({ name: r.name || r.phone, raw_name: r.name || '', phone: r.phone, status: r.status, call_link_id: r.id })));
       cursors.value[c.id] = next_cursor || null;
     }
-    rows.value = reset ? [...out, ...legacyGroups.no_pickup] : out;
+    rows.value = reset ? [...out, ...legacyGroups.busy] : out;
     newRows.track(rows.value);
   } finally {
     loading.value = false;
@@ -47,9 +51,9 @@ watch(() => apex.deterministicCampaigns.value, () => loadRows(true));
 onMounted(() => loadRows(true));
 
 async function downloadCsv() {
-  const name = `apex-didnt-pick-up-${new Date().toISOString().slice(0, 10)}.csv`;
+  const name = `apex-busy-${new Date().toISOString().slice(0, 10)}.csv`;
   const one = scoped.value.length === 1 && scoped.value[0].v2 ? scoped.value[0] : null;
-  if (one) await apex.downloadCampaignContactsCsv(one.id, 'no_pickup', name);
+  if (one) await apex.downloadCampaignContactsCsv(one.id, 'busy', name);
   else exportContactsCsv(rows.value, name);
   apex.toast('CSV downloaded.');
 }
@@ -59,7 +63,7 @@ async function downloadCsv() {
   <div class="ax-card ax-card-pad ax-anim">
     <div class="ax-card-head">
       <div style="display:flex;align-items:center;gap:13px;">
-        <h2 class="ax-h2">Didn't pick up</h2>
+        <h2 class="ax-h2">Busy — asked to call back</h2>
         <span class="ax-count ax-count--grey"><AxCount :value="rows.length" />{{ hasMore ? '+' : '' }}</span>
       </div>
       <div style="display:flex;align-items:center;gap:8px;">
@@ -67,7 +71,7 @@ async function downloadCsv() {
         <button type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" @click="apex.reload().then(() => loadRows(true))"><AxIcon name="refresh" :size="13" /> Refresh</button>
       </div>
     </div>
-    <p class="ax-muted">Numbers we couldn't reach — no answer or the call didn't connect. Re-run a campaign to try its unreached numbers again.</p>
+    <p class="ax-muted">They picked up but were busy and asked to be called back — use <strong>Call busy</strong> on the campaign to re-dial them (each retry consumes Call Credits like a normal call).</p>
 
     <div v-if="apex.deterministicCampaigns.value.length > 1" class="ax-filters" style="margin-bottom:8px;">
       <button type="button" class="ax-chip" :class="{ 'is-active': filter === null }" @click="filter = null">All</button>
@@ -82,8 +86,8 @@ async function downloadCsv() {
       </div>
     </div>
     <div v-else-if="!rows.length" class="ax-empty" style="margin-top:16px;">
-      <div class="ax-empty-icon"><AxIcon name="phone-off" :size="20" /></div>
-      <p class="ax-empty-text">Everyone we dialed connected — unreached numbers will appear here.</p>
+      <div class="ax-empty-icon"><AxIcon name="clock" :size="20" /></div>
+      <p class="ax-empty-text">No callbacks requested yet — contacts who answer and ask to be called back will appear here.</p>
     </div>
     <template v-else>
       <div class="ax-thead" style="grid-template-columns:1.4fr 1.4fr auto;"><span>Name</span><span>Phone</span><span>Outcome</span></div>
@@ -95,7 +99,7 @@ async function downloadCsv() {
         >
           <span class="ax-cell-name">{{ row.name }}</span>
           <AxPhone :phone="row.phone" />
-          <span class="ax-outcome">{{ row.status === 'failed' ? 'Call failed' : 'No answer' }}</span>
+          <span class="ax-outcome" style="color:#D6A15C;">Call back later</span>
         </div>
       </TransitionGroup>
       <button v-if="hasMore" type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" style="margin-top:12px;" :disabled="loading" @click="loadRows(false)">

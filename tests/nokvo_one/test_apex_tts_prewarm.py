@@ -88,13 +88,19 @@ def test_multi_tone_intro_prewarms_one_call_per_chunk(monkeypatch):
 
 
 def test_missing_languages_are_skipped(monkeypatch):
+    from app.services.nokvo_one_voice_stream_service import _BUSY_OUTROS
+
     calls = _capture(monkeypatch)
     q = {
         "questions": [{"id": "q1", "text": "Hi?", "text_i18n": {"en": "Only EN"}}],
         "threshold": 1,
     }
     _run(pw.prewarm_campaign_tts(object(), q))
-    assert [c["text"] for c in calls] == ["Only EN"]
+    # Campaign lines missing a language are skipped; the GLOBAL busy-dealbreaker
+    # close is warmed for every language regardless (it's campaign-independent).
+    busy_lines = set(_BUSY_OUTROS.values())
+    assert [c["text"] for c in calls if c["text"] not in busy_lines] == ["Only EN"]
+    assert busy_lines <= {c["text"] for c in calls}
 
 
 def test_synthesis_failure_does_not_raise(monkeypatch):

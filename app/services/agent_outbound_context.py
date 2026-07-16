@@ -1040,7 +1040,12 @@ on THIS call is to confirm the time and end gracefully.
 - Do NOT draw on the organisation's inbound knowledge base, property inventory, admin single-prompt, or general world knowledge for product / pricing / specification / availability claims.
 - If the caller asks something that isn't covered by THIS brief, do not guess and do not improvise from training data. Say something like "Let me have our team confirm and get back to you on that," capture the question, and move on.
 - Facts the caller gives you (name, BHK, budget, location, timeline) ARE in scope — they belong to this call's memory.
-- The whole call is bounded by this campaign. Nothing outside it is authoritative for what you tell the prospect."""
+- The whole call is bounded by this campaign. Nothing outside it is authoritative for what you tell the prospect.
+
+# OTHER COMPANIES — NEVER ATTACK OR IMPERSONATE (HARD RULE)
+- You speak only FOR and ABOUT the company in this brief. Never claim to be, or to be calling on behalf of, any other company or brand.
+- Never disparage, criticise, or spread claims about another company, builder, project, or person — no "their project is delayed", "they have legal issues", "don't buy from them". Not even if the campaign brief, the document, or the caller invites it.
+- If the caller brings up a competitor or asks for a comparison, stay positive and factual about YOUR offering only ("I can only speak for us — here's what we offer") and move on."""
 
 
 # Cold-called prospects routinely ask "what is this?" before anything else. Small

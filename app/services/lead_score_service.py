@@ -132,6 +132,59 @@ class LeadScore:
         return "interested" if self.qualified else "not_interested"
 
 
+# ── busy / call-me-later detection (deterministic, post-call) ────────────────
+# A connected caller who says "I'm busy, call me later" is NOT a rejection —
+# without this they'd be scored low and buried in Not Interested, unreachable
+# by any retry path (re-run never re-dials answered contacts). Scanned over the
+# CALLER lines only, with an opt-out override: "don't call me" / "not
+# interested" in the same line means STOP, not call-back, even when "later"
+# also appears ("don't call me later"). Deterministic (no LLM) so a caller
+# can't prompt-inject their way anywhere interesting — the worst outcome of a
+# false positive is one polite re-dial the operator chose to place.
+_CALLBACK_RE = re.compile(
+    r"\b("
+    r"call\s+(?:me\s+)?(?:back|later|tomorrow|again)|"
+    r"(?:i'?m|i\s+am|am)\s+(?:really\s+|very\s+|quite\s+|a\s+bit\s+)?busy|busy\s+(?:right\s+)?now|"
+    r"not\s+a\s+good\s+time|bad\s+time|in\s+a\s+meeting|(?:i'?m|i\s+am)\s+driving|"
+    r"some\s+other\s+time|another\s+time|later\s+please|try\s+(?:me\s+)?later|"
+    r"call\s+(?:me\s+)?(?:in|after)\s+\d+"
+    r")\b|"
+    r"(अभी\s*busy|व्यस्त|बाद\s*में|मीटिंग\s*में|कल\s*(?:call|कॉल)|थोड़ी\s*देर\s*(?:में|बाद))|"
+    r"(బిజీ|తర్వాత|తరువాత|మీటింగ్\s*లో|రేపు\s*(?:call|కాల్))",
+    re.IGNORECASE,
+)
+_CALLBACK_OPTOUT_RE = re.compile(
+    r"\b(not\s+interested|no\s+thanks?|stop\s+calling|do\s+not\s+call|don'?t\s+call|"
+    r"never\s+call|remove\s+me|take\s+me\s+off|wrong\s+number)\b|"
+    r"(दिलचस्पी\s*नहीं|मत\s*(?:call|कॉल)|कभी\s*मत)|"
+    r"(ఆసక్తి\s*లేదు|వద్దు|చేయకండి)",
+    re.IGNORECASE,
+)
+
+
+def is_callback_line(text: str | None) -> bool:
+    """True when a single CALLER utterance asks to be called later / says
+    they're busy — and no opt-out phrase appears in the same line ("don't call
+    me later" is a stop, not a call-back). The ONE definition shared by the
+    post-call bucket stamp AND the live busy-cut (the in-call dealbreaker that
+    plays the busy closing line and hangs up)."""
+    line = str(text or "").strip()
+    if not line:
+        return False
+    return bool(_CALLBACK_RE.search(line)) and not _CALLBACK_OPTOUT_RE.search(line)
+
+
+def detect_callback_request(transcript_turns: list[dict[str, Any]] | None) -> bool:
+    """True when any CALLER line asks to be called later / says they're busy —
+    and no opt-out phrase appears in that same line. Feeds the "busy" outcome
+    bucket (re-dialable via the campaign's Call busy button), never
+    qualification."""
+    for turn in transcript_turns or []:
+        if is_callback_line((turn or {}).get("query")):
+            return True
+    return False
+
+
 def extract_questionnaire(agent_config: dict[str, Any] | None) -> tuple[list[dict], int] | None:
     """Return ``(questions, threshold)`` for a campaign that has a valid
     questionnaire, else ``None`` (caller falls back to the legacy interest path).

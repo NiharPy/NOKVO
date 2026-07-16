@@ -193,7 +193,7 @@ async def test_rerun_noop_when_everyone_reached(monkeypatch):
         return camp
     monkeypatch.setattr(OutboundCampaignService, "_lock_campaign", staticmethod(fake_lock))
 
-    with pytest.raises(ValueError, match="already reached"):
+    with pytest.raises(ValueError, match="selected group"):
         await OutboundCampaignService.rerun_bulk_campaign(
             camp, None, tenant_res=object(), public_base_url="https://x")
 
@@ -244,7 +244,7 @@ async def test_rerun_v2_rearms_and_resumes(monkeypatch):
     dialed, db = _v2_rerun_setup(monkeypatch)
     calls = {}
 
-    async def fake_rearm(_db, cid):
+    async def fake_rearm(_db, cid, buckets=("no_pickup",)):
         calls["rearmed"] = cid
         return 3
 
@@ -277,7 +277,7 @@ async def test_rerun_v2_noop_when_nothing_pending(monkeypatch):
 
     _dialed, db = _v2_rerun_setup(monkeypatch)
 
-    async def fake_rearm(_db, cid):
+    async def fake_rearm(_db, cid, buckets=("no_pickup",)):
         return 0
 
     async def fake_pending(_db, cid):
@@ -290,7 +290,7 @@ async def test_rerun_v2_noop_when_nothing_pending(monkeypatch):
         id=_uuid.uuid4(), tenant_id="t1", name="drained",
         status=CampaignStatus.completed, agent_config={"bulk_csv": True}, contacts=None,
     )
-    with pytest.raises(ValueError, match="already reached"):
+    with pytest.raises(ValueError, match="selected group"):
         await OutboundCampaignService.rerun_bulk_campaign(
             camp, db, tenant_res=object(), public_base_url="https://x")
 
@@ -528,7 +528,7 @@ async def test_rerun_resurrects_a_cancelled_v2_campaign(monkeypatch):
     monkeypatch.setattr(PlivoService, "bulk_calling_auth", staticmethod(lambda tr: ("SAid", "tok")))
     monkeypatch.setattr(settings, "CAMPAIGN_CONTACTS_V2", True)
 
-    async def fake_rearm(db, cid):
+    async def fake_rearm(db, cid, buckets=("no_pickup",)):
         return 2
 
     async def fake_pending(db, cid):

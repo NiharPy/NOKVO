@@ -486,6 +486,14 @@ class Settings(BaseSettings):
     CAMPAIGN_CONTACTS_V2: bool = True
     # Rows COPY-inserted per chunk during async ingestion (bounded memory).
     CAMPAIGN_INGEST_CHUNK: int = 10000
+    # Content guard on campaign create/edit (the three text-entry endpoints).
+    # off | warn | enforce. Default "enforce": an LLM verdict blocks campaigns
+    # that disparage a third party, impersonate a company that isn't the
+    # registered tenant, or harass/deceive recipients — the "company A degrades
+    # company B" abuse. "warn" runs the verdict + operator alert but allows
+    # (rollback if false positives bite); "off" skips the LLM call entirely.
+    # Fail-open on LLM outage in every mode — creation never breaks on the pool.
+    CAMPAIGN_CONTENT_MODERATION: str = "enforce"
     # X-Plivo-Signature-V2 validation on the Plivo webhook endpoints.
     # off | warn | enforce. Default "enforce": reject forged/unsigned call
     # webhooks. Auto-off when PLIVO_AUTH_TOKEN is unset (so local dev without a
@@ -814,6 +822,12 @@ def validate_security_config() -> list[str]:
         warnings.append(
             f"PLIVO_VALIDATE_SIGNATURES is '{settings.PLIVO_VALIDATE_SIGNATURES}', not "
             "'enforce' — forged Plivo call webhooks would be accepted. Set it to 'enforce'."
+        )
+    if (settings.CAMPAIGN_CONTENT_MODERATION or "").strip().lower() != "enforce":
+        warnings.append(
+            f"CAMPAIGN_CONTENT_MODERATION is '{settings.CAMPAIGN_CONTENT_MODERATION}', not "
+            "'enforce' — campaigns that disparage or impersonate another company would "
+            "be accepted. Set it to 'enforce'."
         )
     origin = settings.EXPECTED_ORIGIN or ""
     if "localhost" in origin or "127.0.0.1" in origin or not origin.strip():

@@ -5,7 +5,7 @@
 // The create form is a 3-step wizard: Details → Script & questions → Review & launch.
 import { inject, onMounted, ref, computed, watch } from 'vue';
 import {
-  newQuestion, maxPointsFor, estCallSeconds, fmtDuration, scheduleEstimate, countCsvRows,
+  newQuestion, makeId, maxPointsFor, estCallSeconds, fmtDuration, scheduleEstimate, countCsvRows,
   buildBulkCampaignFormData, buildBulkCampaignUpdatePayload, categorizeContacts, leadCategory,
   campaignWindow, cleanQuestions, CONVERSATION_STYLES,
 } from '../../composables/bulkCalling.js';
@@ -146,16 +146,16 @@ const fmtCr = (n) => Math.round(Number(n) || 0).toLocaleString('en-IN');
 function counts(c) {
   if (c.v2) {
     const s = apex.summaryFor && apex.summaryFor(c.id);
-    if (s) return { successful: s.qualified || 0, not_interested: s.not_interested || 0, no_pickup: s.no_pickup || 0, pending: s.pending || 0 };
-    return { successful: 0, not_interested: 0, no_pickup: 0, pending: 0 };
+    if (s) return { successful: s.qualified || 0, not_interested: s.not_interested || 0, busy: s.busy || 0, no_pickup: s.no_pickup || 0, pending: s.pending || 0 };
+    return { successful: 0, not_interested: 0, busy: 0, no_pickup: 0, pending: 0 };
   }
   const g = categorizeContacts([c]);
-  return { successful: g.successful.length, not_interested: g.not_interested.length, no_pickup: g.no_pickup.length, pending: g.pending.length };
+  return { successful: g.successful.length, not_interested: g.not_interested.length, busy: g.busy.length, no_pickup: g.no_pickup.length, pending: g.pending.length };
 }
 // Slim dialed-progress per row — done/total from the same counts the badges use.
 function prog(c) {
   const k = counts(c);
-  const done = k.successful + k.not_interested + k.no_pickup;
+  const done = k.successful + k.not_interested + k.busy + k.no_pickup;
   const total = (done + k.pending) || Number(c.total_count) || 0;
   return { done, total, pct: total ? Math.round((done / total) * 100) : 0 };
 }
@@ -165,16 +165,27 @@ function statusTone(s) {
   if (s === 'ingesting') return 'run';
   return 'off';
 }
-function redialCount(c) {
+// Per-bucket re-dial counts for the campaign card's call-again buttons:
+//   np      — never connected (no_answer / failed); dnd_dropped never redials.
+//   busy    — answered but asked to be called back (callback_requested).
+//   pending — rows still waiting (e.g. a just-added CSV); they resume on any
+//             re-run, and get the fallback Re-run button when they're the only
+//             group left.
+function redialBuckets(c) {
   if (c.v2) {
-    // What a re-run would dial: rows still pending (e.g. a just-added CSV) plus
-    // unreached misses it re-arms (no_answer/failed). dnd_dropped never redials.
     const s = apex.summaryFor && apex.summaryFor(c.id);
-    if (!s) return 0;
+    if (!s) return { np: 0, busy: 0, pending: 0 };
     const by = s.by_status || {};
-    return (s.pending || 0) + (by.no_answer || 0) + (by.failed || 0);
+    return { np: (by.no_answer || 0) + (by.failed || 0), busy: s.busy || 0, pending: s.pending || 0 };
   }
-  return (c.contacts || []).filter((ct) => ct.status !== 'answered' && !ct.answered_at).length;
+  const cts = c.contacts || [];
+  const reached = (ct) => ct.status === 'answered' || !!ct.answered_at;
+  const qual = (ct) => ct.qualified === true || ct.interest_outcome === 'interested';
+  return {
+    np: cts.filter((ct) => !reached(ct) && (ct.status === 'no_answer' || ct.status === 'failed' || ct.ended)).length,
+    busy: cts.filter((ct) => reached(ct) && !qual(ct) && ct.callback_requested === true).length,
+    pending: cts.filter((ct) => !reached(ct) && (ct.status || 'pending') === 'pending').length,
+  };
 }
 
 // ── edit mode ──
@@ -254,6 +265,25 @@ function cancelEdit() {
   styleError.value = '';
   launchError.value = '';
   step.value = 1;
+}
+
+// ── duplicate ──
+// "Duplicate" loads a campaign into the wizard as a NEW campaign — the same
+// field mapping as Edit (script, branding, schedule, styled wording) but with
+// no edit target, so the submit is a fresh create: the admin adds a contacts
+// file and launches. Reviewed hi/te translations ride along; identical lines
+// mean the server's blank-only translate merge keeps them verbatim and the
+// TTS byte-cache stays warm from the source campaign.
+function duplicate(c) {
+  startEdit(c);
+  editingId.value = null;
+  editingName.value = '';
+  form.value.name = `${c.name || 'Campaign'} (Copy)`;
+  // Fresh question ids — the copied ids key the SOURCE campaign's score
+  // breakdowns; a new campaign mints its own, like any other create.
+  for (const q of form.value.questions) q.id = makeId('q');
+  launchError.value = '';
+  apex.toast('Campaign duplicated — add a contacts file and launch when ready.');
 }
 
 // ── hi/te translation review ──
@@ -488,12 +518,20 @@ async function submit() {
 }
 
 const rerunning = ref(null);
-async function rerun(id) {
+// `buckets` picks who gets re-dialed: ['no_pickup'] (never connected — the
+// classic Re-run), ['busy'] (answered but asked to be called back), or both.
+async function rerun(id, buckets = ['no_pickup']) {
   if (!id || rerunning.value) return;
+  if (buckets.includes('busy')) {
+    // Busy contacts already answered once — each retry is a normal connected
+    // call and consumes credits. Make that an explicit choice.
+    const n = redialBuckets(det.value.find((c) => String(c.id) === String(id)) || {}).busy;
+    if (!window.confirm(`Re-dial ${n || 'the'} contact(s) who answered earlier and asked to be called back? Each retry consumes Call Credits like a normal call.`)) return;
+  }
   rerunning.value = id;
   try {
-    await apex.rerunCampaign(id);
-    apex.toast('Re-run started — unreached numbers will be dialed again.');
+    await apex.rerunCampaign(id, buckets);
+    apex.toast('Calling again — the selected contacts are being re-dialed.');
     await apex.reload();
   } catch (e) {
     apex.toast(apex.extractError(e, 'Re-run failed.'), 'err');
@@ -859,12 +897,27 @@ async function onAddFile(e) {
         </div>
         <div class="ax-camp-meta">
           <span v-if="counts(c).successful" style="color:#7FD9A8;"><AxCount :value="counts(c).successful" /> qualified</span>
+          <span v-if="counts(c).busy" style="color:#D6A15C;"><AxCount :value="counts(c).busy" /> busy</span>
           <span v-if="counts(c).no_pickup" style="color:#E62630;"><AxCount :value="counts(c).no_pickup" /> missed</span>
           <button type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" :disabled="editingId === c.id" @click="startEdit(c)" title="Edit the script, details and calling schedule">
             <AxIcon name="edit" :size="12" /> Edit
           </button>
-          <button v-if="redialCount(c) > 0" type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" :disabled="rerunning === c.id" @click="rerun(c.id)" :title="c.status === 'cancelled' ? 'Restart this stopped campaign — re-arms the unreached and continues pending' : 'Re-dial the unreached'">
-            <AxIcon name="refresh" :size="12" /> {{ rerunning === c.id ? 'Re-running…' : `Re-run (${redialCount(c)})` }}
+          <button type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" @click="duplicate(c)" title="Duplicate this campaign — same script, questions and schedule as a new campaign; add a contacts file and launch">
+            <AxIcon name="copy" :size="12" /> Duplicate
+          </button>
+          <!-- Targeted re-dial: didn't pick up / busy-call-back / both. The
+               fallback Re-run covers a just-appended CSV (pending rows only). -->
+          <button v-if="redialBuckets(c).np > 0" type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" :disabled="rerunning === c.id" @click="rerun(c.id, ['no_pickup'])" title="Re-dial everyone who never picked up (no answer / failed)">
+            <AxIcon name="refresh" :size="12" /> {{ rerunning === c.id ? 'Calling…' : `Call didn't pick up (${redialBuckets(c).np})` }}
+          </button>
+          <button v-if="redialBuckets(c).busy > 0" type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" :disabled="rerunning === c.id" @click="rerun(c.id, ['busy'])" title="Re-dial people who answered but asked to be called back — consumes credits like a normal call">
+            <AxIcon name="refresh" :size="12" /> {{ rerunning === c.id ? 'Calling…' : `Call busy (${redialBuckets(c).busy})` }}
+          </button>
+          <button v-if="redialBuckets(c).np > 0 && redialBuckets(c).busy > 0" type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" :disabled="rerunning === c.id" @click="rerun(c.id, ['no_pickup', 'busy'])" title="Re-dial both groups: everyone who didn't pick up and everyone who asked to be called back">
+            <AxIcon name="refresh" :size="12" /> {{ rerunning === c.id ? 'Calling…' : `Call both (${redialBuckets(c).np + redialBuckets(c).busy})` }}
+          </button>
+          <button v-if="redialBuckets(c).np === 0 && redialBuckets(c).busy === 0 && redialBuckets(c).pending > 0" type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" :disabled="rerunning === c.id" @click="rerun(c.id, ['no_pickup'])" :title="c.status === 'cancelled' ? 'Restart this stopped campaign — continues the pending contacts' : 'Resume dialing the contacts still pending'">
+            <AxIcon name="refresh" :size="12" /> {{ rerunning === c.id ? 'Re-running…' : `Re-run (${redialBuckets(c).pending})` }}
           </button>
           <button v-if="c.status !== 'cancelled'" type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" :disabled="addingTo === c.id || c.status === 'ingesting'" @click="pickAddCsv(c.id)" title="Add a CSV of new numbers and resume dialing">
             <AxIcon name="plus" :size="12" /> {{ addingTo === c.id ? 'Adding…' : 'Add CSV' }}
