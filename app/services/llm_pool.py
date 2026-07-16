@@ -155,6 +155,101 @@ class LLMPoolError(RuntimeError):
     """Raised when no pool member has capacity / is configured."""
 
 
+# ── per-deployment request-parameter profiles ────────────────────────────────
+# The gpt-5/o reasoning family and the classic gpt-4.x family want DIFFERENT
+# chat/completions params: reasoning models 400-reject `max_tokens` (need
+# `max_completion_tokens`) and any non-default `temperature`, and without
+# `reasoning_effort` they burn the whole completion budget on hidden reasoning
+# tokens and return EMPTY content. Classic models (e.g. the gpt-4.1-nano
+# summarizer) accept temperature and reject `reasoning_effort`. Each member's
+# profile is seeded from its deployment name and corrected at runtime from
+# Azure's unsupported-parameter 400s, so arbitrary deployment names still
+# converge after one failed call. Shared with the voice pipeline's builder.
+_PARAM_PROFILES: dict[str, dict] = {}
+
+
+def _looks_reasoning(deployment: str | None) -> bool:
+    d = (deployment or "").lower()
+    return d.startswith(("gpt-5", "o1", "o3", "o4"))
+
+
+def param_profile(member: PoolMember) -> dict:
+    prof = _PARAM_PROFILES.get(member.key_id)
+    if prof is None:
+        reasoning = _looks_reasoning(member.deployment)
+        prof = {
+            # max_completion_tokens is accepted by both families on our
+            # api-version; max_tokens only by classic — start with the safe one.
+            "use_max_completion_tokens": True,
+            "supports_temperature": not reasoning,
+            "reasoning_effort": reasoning,
+        }
+        _PARAM_PROFILES[member.key_id] = prof
+    return prof
+
+
+def build_chat_body(
+    member: PoolMember,
+    messages: list[dict[str, str]],
+    *,
+    max_tokens: int,
+    temperature: float | None,
+    stream: bool = False,
+) -> dict:
+    """The chat/completions body this member's deployment actually accepts."""
+    prof = param_profile(member)
+    body: dict = {"messages": messages}
+    budget = int(max_tokens)
+    if prof["reasoning_effort"]:
+        body["reasoning_effort"] = settings.AZURE_OPENAI_REASONING_EFFORT or "minimal"
+        # Reasoning tokens count against the completion budget; keep the same
+        # 512 floor the /responses branch uses so a small caller budget can't
+        # be eaten before any visible text is emitted.
+        budget = max(budget, 512)
+    if prof["use_max_completion_tokens"]:
+        body["max_completion_tokens"] = budget
+    else:
+        body["max_tokens"] = budget
+    if prof["supports_temperature"] and temperature is not None:
+        body["temperature"] = temperature
+    if stream:
+        body["stream"] = True
+    return body
+
+
+def adapt_profile_from_error(member: PoolMember, response) -> bool:
+    """Learn from an Azure 400: flip the offending flag on the member's profile.
+    Returns True when the profile changed (caller rebuilds the body + retries)."""
+    try:
+        err = (response.json() or {}).get("error") or {}
+    except Exception:
+        return False
+    param = str(err.get("param") or "")
+    message = str(err.get("message") or "")
+    prof = param_profile(member)
+    changed = False
+    if param == "max_tokens" or ("max_tokens" in message and "max_completion_tokens" in message):
+        changed = not prof["use_max_completion_tokens"]
+        prof["use_max_completion_tokens"] = True
+    elif param == "max_completion_tokens":
+        changed = prof["use_max_completion_tokens"]
+        prof["use_max_completion_tokens"] = False
+    elif param == "temperature":
+        changed = prof["supports_temperature"] or not prof["reasoning_effort"]
+        # Rejecting non-default temperature is the reasoning family's tell.
+        prof["supports_temperature"] = False
+        prof["reasoning_effort"] = True
+    elif param == "reasoning_effort":
+        changed = prof["reasoning_effort"]
+        prof["reasoning_effort"] = False
+    if changed:
+        logger.warning(
+            "LLM pool: adapted request profile for %s (%s) after 400 on %r -> %s",
+            member.key_id, member.deployment, param or message[:60], prof,
+        )
+    return changed
+
+
 class LLMPool:
     """Centralized, Redis-backed token-budget over the pool members."""
 
@@ -233,6 +328,7 @@ class LLMPool:
     def reset_cache(cls) -> None:
         """Test hook — re-read members for all pools."""
         cls._members_cache = {}
+        _PARAM_PROFILES.clear()
 
     @staticmethod
     def _window_key(key_id: str, *, pool: str = "mini", now: float | None = None) -> str:
@@ -349,11 +445,11 @@ class LLMPoolClient:
         if not members:
             raise LLMPoolError("No LLM pool members configured")
         estimate = est_tokens if est_tokens is not None else cls._estimate_tokens(messages, max_tokens)
-        body = {"messages": messages, "temperature": temperature, "max_tokens": max_tokens}
 
         tried: set[str] = set()
         deadline = time.time() + LLMPool._MAX_RETRY_WAIT
         attempt = 0
+        param_retries = 0
         while True:
             member = await LLMPool.reserve(estimate)
             if member is None:
@@ -365,6 +461,9 @@ class LLMPoolClient:
             if member.key_id in tried and len(tried) >= len(members):
                 raise LLMPoolError("LLM pool saturated — all keys failing")
             tried.add(member.key_id)
+            # Built per member: the reasoning family (gpt-5/o*) and classic
+            # deployments accept different params (see param_profile).
+            body = build_chat_body(member, messages, max_tokens=max_tokens, temperature=temperature)
             try:
                 resp = await cls.http().post(
                     cls._url(member),
@@ -387,6 +486,18 @@ class LLMPoolClient:
                 if exc.response is not None and exc.response.status_code == 429:
                     await LLMPool.cooldown(member)
                     attempt += 1
+                    continue
+                # Unsupported-parameter 400: learn the deployment's real
+                # profile and retry the SAME member with the corrected body
+                # (bounded — anything else keeps raising as before).
+                if (
+                    exc.response is not None
+                    and exc.response.status_code == 400
+                    and param_retries < 3
+                    and adapt_profile_from_error(member, exc.response)
+                ):
+                    param_retries += 1
+                    tried.discard(member.key_id)
                     continue
                 raise
             except Exception:

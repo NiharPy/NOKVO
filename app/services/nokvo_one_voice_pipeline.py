@@ -456,9 +456,14 @@ class AzureGroundedLLM:
             url = f"{endpoint}?api-version={api_version}" if "api-version=" not in endpoint else endpoint
         else:
             url = f"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version={api_version}"
-        body = {"messages": messages, "temperature": 0.2, "max_tokens": max_tokens}
+        # Shared per-deployment param profile (llm_pool): gpt-5/o chat/completions
+        # members need max_completion_tokens + reasoning_effort and reject
+        # temperature; classic members (gpt-4.1-nano summarizer) keep temperature.
+        # Same negotiation cache LLMPoolClient.chat learns from 400s.
+        from app.services.llm_pool import build_chat_body
+
+        body = build_chat_body(member, messages, max_tokens=max_tokens, temperature=0.2, stream=stream)
         if stream:
-            body["stream"] = True
             # Emit a final usage chunk (incl. prompt_tokens_details.cached_tokens)
             # so streamed turns report real + cached token counts for cost/caching
             # measurement. The usage chunk has empty choices → no extra spoken token.
