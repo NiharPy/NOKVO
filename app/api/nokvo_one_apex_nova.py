@@ -202,6 +202,20 @@ async def nova_session(
     }
 
 
+@router.get("/apex/nova/briefing")
+async def nova_briefing(
+    user: OrganizationUser = Depends(_apex_user_dep()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Deterministic panel-open highlights ("while you were away") — composed
+    server-side with zero LLM cost so the panel can call it on every open.
+    Members get an empty list (campaigns are admin domain)."""
+    from app.services.nova_diagnosis_service import build_briefing
+
+    tr = await _tenant(db, user)
+    return await build_briefing(db, tr, user.organization_id, getattr(user, "role", None))
+
+
 class NovaConfirmRequest(BaseModel):
     session_id: str = Field(min_length=1, max_length=64)
     action_id: str = Field(min_length=1, max_length=64)

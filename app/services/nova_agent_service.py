@@ -27,6 +27,7 @@ from typing import Any, Awaitable, Callable
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.models.organization_user import OrganizationUser
 from app.models.tenant_resources import TenantResources
 from app.services import nova_session_store as store
@@ -161,6 +162,64 @@ TOOLS: tuple[NovaTool, ...] = (
             "additionalProperties": False,
         },
     ),
+    NovaTool(
+        key="get_campaign_performance",
+        description=(
+            "Performance analysis of the user's recent campaigns: per-campaign "
+            "qualified/connected/no-pickup/busy rates, contact counts, schedule, "
+            "wallet, and ready-made recommendations. Use whenever the user asks "
+            "how a campaign did / is doing, what to do next, or wants results "
+            "compared. Quote the numbers as given — never recompute them."
+        ),
+        input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+        admin_only=True,
+    ),
+    NovaTool(
+        key="rerun_campaign",
+        description=(
+            "Re-dial a campaign's unfinished contacts: bucket 'no_pickup' retries "
+            "everyone who never answered (free unless they answer), 'busy' retries "
+            "contacts who answered and asked to be called back (each connected retry "
+            "consumes Call Credits). Use when the user asks to call people back, "
+            "retry missed numbers, or re-run a campaign. Requires the campaign's "
+            "name — ask if you don't know it."
+        ),
+        input_schema={
+            "type": "object",
+            "required": ["campaign_name"],
+            "properties": {
+                "campaign_name": {"type": "string", "minLength": 1, "maxLength": 200},
+                "buckets": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": ["no_pickup", "busy"]},
+                    "minItems": 1,
+                },
+            },
+            "additionalProperties": False,
+        },
+        admin_only=True,
+        side_effect=True,
+    ),
+    NovaTool(
+        key="load_campaign_into_draft",
+        description=(
+            "Copy an existing campaign's script (name, pitch, questionnaire, "
+            "schedule) into the campaign DRAFT as a starting point — the chat way "
+            "to duplicate a campaign, ideal when the user wants to tweak it "
+            "('duplicate X but change the intro'). REPLACES the current draft. "
+            "For an exact clone with translations intact, point them to the "
+            "Duplicate button on the campaign card instead."
+        ),
+        input_schema={
+            "type": "object",
+            "required": ["campaign_name"],
+            "properties": {
+                "campaign_name": {"type": "string", "minLength": 1, "maxLength": 200},
+            },
+            "additionalProperties": False,
+        },
+        admin_only=True,
+    ),
 )
 
 
@@ -184,6 +243,9 @@ NOKVO APEX platform facts (authoritative — answer from these, never invent oth
 - Calls speak English, Hindi, and Telugu, follow the caller's language, detect voicemail, and honour India's DND registry.
 - Campaigns need: a name, offer/pitch content, a questionnaire (intro, questions, outro, qualifying threshold), a schedule, and a contacts file (CSV/XLSX, phone in column A, name in B) uploaded on the Campaign tab.
 - Members (non-admin) claim and work qualified leads; only admins create or manage campaigns.
+- Campaign content is auto-reviewed at save time: anything that disparages another company, impersonates a business that isn't the account's own, or harasses/deceives recipients is BLOCKED with a reason. Campaigns may only promote the account's own offering.
+- Any campaign card has a Duplicate button: it starts a NEW campaign with the same script, questions, translations, and schedule - the admin just uploads a new contacts file and launches.
+- The Busy tab lists contacts who answered but asked to be called back. The campaign card's 'Call busy' button re-dials them (connected retries consume Call Credits); 'Call didn't pick up' re-dials unanswered numbers (costs nothing unless they answer).
 - All payments are non-refundable (see the Terms for the full policy - use lookup_legal for any refund question).
 - Support: support tickets can be raised right here in this chat; the team is also reachable at officialnokvo@nokvo.org."""
 
@@ -331,6 +393,43 @@ async def _exec_get_diagnostics(db: AsyncSession, tenant_res: TenantResources,
     return diag["llm_view"]  # the model NEVER sees the full ticket_json
 
 
+async def _exec_get_campaign_performance(db: AsyncSession, tenant_res: TenantResources,
+                                         user: OrganizationUser, args: dict) -> dict:
+    from app.services.nova_diagnosis_service import build_campaign_performance
+
+    return await build_campaign_performance(db, tenant_res, user.organization_id)
+
+
+async def _resolve_campaign_by_name(db: AsyncSession, tenant_res: TenantResources, name: str):
+    """Tenant-scoped campaign lookup by name for chat tools (the llm_view strips
+    UUIDs, so the model only ever knows names). Case-insensitive exact match,
+    most recent on a tie; → (campaign, None) or (None, recent_names) so the
+    model can ask the user to pick."""
+    from sqlalchemy import func, select as _select
+
+    from app.models.outbound_campaign import OutboundCampaign
+
+    wanted = (name or "").strip()
+    campaign = (await db.execute(
+        _select(OutboundCampaign)
+        .where(
+            OutboundCampaign.tenant_id == tenant_res.tenant_id,
+            func.lower(OutboundCampaign.name) == wanted.lower(),
+        )
+        .order_by(OutboundCampaign.created_at.desc())
+        .limit(1)
+    )).scalars().first()
+    if campaign is not None:
+        return campaign, None
+    recent = (await db.execute(
+        _select(OutboundCampaign.name)
+        .where(OutboundCampaign.tenant_id == tenant_res.tenant_id)
+        .order_by(OutboundCampaign.created_at.desc())
+        .limit(5)
+    )).scalars().all()
+    return None, list(recent)
+
+
 # ── campaign draft (admin) ────────────────────────────────────────────────────
 # Slots mirror ApexCampaign.vue's emptyForm(); the handoff card prefills that
 # form 1:1. Defaults match the form's own defaults.
@@ -461,18 +560,75 @@ async def _exec_get_campaign_draft(db: AsyncSession, tenant_res: TenantResources
     return out
 
 
+async def _exec_load_campaign_into_draft(db: AsyncSession, tenant_res: TenantResources,
+                                         user: OrganizationUser, args: dict,
+                                         *, ns: str, sid: str) -> dict:
+    """Chat-side Duplicate: copy an existing campaign's config into a FRESH
+    draft (replaces whatever was there). Translations/styling deliberately
+    don't ride along — the form's Duplicate button is the full-fidelity path;
+    this one exists so the user can remix the script conversationally."""
+    campaign, suggestions = await _resolve_campaign_by_name(db, tenant_res, str(args.get("campaign_name") or ""))
+    if campaign is None:
+        return {
+            "error": f"No campaign named '{args.get('campaign_name')}' found.",
+            "recent_campaigns": suggestions,
+            "next_step": "Ask the user which of these campaigns they meant.",
+        }
+    cfg = campaign.agent_config or {}
+    fields: dict[str, Any] = {
+        "name": f"{campaign.name} (Copy)"[:120],
+        "content": str(cfg.get("agent_prompt") or "")[:2000],
+        "company_name": str(cfg.get("company_name") or "")[:200],
+        "caller_name": str(cfg.get("caller_name") or "")[:60],
+    }
+    if cfg.get("language") in ("en", "hi", "te"):
+        fields["language"] = cfg["language"]
+    window = cfg.get("call_window") or {}
+    for key in ("working_days", "hours_per_day", "calls_per_day"):
+        if window.get(key):
+            fields[key] = int(window[key])
+    questionnaire = cfg.get("questionnaire")
+    if isinstance(questionnaire, dict):
+        fields["questionnaire"] = questionnaire
+        if questionnaire.get("threshold"):
+            fields["threshold"] = int(questionnaire["threshold"])
+
+    updated: dict[str, Any] = {}
+
+    def _replace(state: dict[str, Any]) -> None:
+        draft: dict[str, Any] = {}  # duplicate = a fresh draft, never a merge
+        merge_draft_fields(draft, fields)
+        state["draft"] = draft
+        state["pending_action"] = None
+        updated.update(draft)
+
+    await store.mutate(ns, sid, _replace)
+    missing = draft_missing(updated)
+    return {
+        "draft": _draft_with_defaults(updated),
+        "missing": missing,
+        "source_campaign": campaign.name,
+        "note": (
+            "Loaded WITHOUT the reviewed translations/styling — the Duplicate button on the "
+            "campaign card keeps those. Offer to adjust any line, then finalize when they're happy."
+        ),
+    }
+
+
 ToolExecutor = Callable[..., Awaitable[dict]]
 
 _EXECUTORS: dict[str, ToolExecutor] = {
     "get_account_status": _exec_get_account_status,
     "get_diagnostics": _exec_get_diagnostics,
     "lookup_legal": _exec_lookup_legal,
+    "get_campaign_performance": _exec_get_campaign_performance,
 }
 
 # Draft tools need the session (ns, sid) — dispatched with kwargs in the loop.
 _SESSION_EXECUTORS: dict[str, ToolExecutor] = {
     "set_campaign_fields": _exec_set_campaign_fields,
     "get_campaign_draft": _exec_get_campaign_draft,
+    "load_campaign_into_draft": _exec_load_campaign_into_draft,
 }
 
 
@@ -734,6 +890,55 @@ async def _mint_campaign_draft(db, tenant_res, user, args, ns, sid) -> tuple[dic
             {"type": "draft_incomplete", "missing": missing},
             f"Almost — I still need: {missing[0]}.",
         )
+    # Content pre-check — the SAME verdict the create endpoint will run, applied
+    # while the user is still in chat so a flagged script fails here (where Nova
+    # can help reword it) instead of as a 400 on the form. Mode-aware and
+    # fail-open, mirroring require_campaign_content_allowed.
+    moderation_warn = ""
+    mode = (settings.CAMPAIGN_CONTENT_MODERATION or "").strip().lower()
+    verdict = None
+    if mode in ("warn", "enforce"):
+        # Advisory pre-check: the create endpoint is the real gate, so any
+        # failure HERE (org lookup, plumbing) skips the check rather than
+        # breaking finalize. moderate_campaign_content itself never raises.
+        try:
+            from sqlalchemy import select as _select
+
+            from app.models.organization import Organization
+            from app.services.campaign_moderation_service import moderate_campaign_content
+
+            org = (await db.execute(
+                _select(Organization).where(Organization.id == user.organization_id)
+            )).scalars().first()
+            if org is not None:
+                verdict = await moderate_campaign_content(
+                    org,
+                    campaign_name=draft.get("name"),
+                    agent_config={
+                        "agent_prompt": draft.get("content"),
+                        "company_name": draft.get("company_name"),
+                        "caller_name": draft.get("caller_name"),
+                        "questionnaire": draft.get("questionnaire"),
+                    },
+                )
+        except Exception:
+            logger.debug("NOVA: draft moderation pre-check unavailable — skipping", exc_info=True)
+    if verdict is not None and not verdict.allowed:
+        if mode == "enforce":
+            logger.warning(
+                f"NOVA: draft flagged by content guard org={user.organization_id} "
+                f"category={verdict.category} reason={verdict.reason!r}"
+            )
+            return (
+                {"type": "draft_flagged", "category": verdict.category, "reason": verdict.reason},
+                f"I can't hand this off yet: {verdict.reason}. Campaigns may only promote "
+                "your own company — they can't disparage or impersonate another business. "
+                "Tell me what to reword and we'll fix it together.",
+            )
+        moderation_warn = (
+            f" One flag from the content review ({verdict.reason}) — the form may "
+            "block it at save time, so consider rewording."
+        )
     estimate = await draft_estimate(db, user.organization_id, draft)
     full = _draft_with_defaults(draft)
 
@@ -753,16 +958,113 @@ async def _mint_campaign_draft(db, tenant_res, user, args, ns, sid) -> tuple[dic
             "top up before launch or lower calls/day." if estimate.get("balance_warning") else "")
     return card, (
         "Here's your campaign, ready to go. Click 'Apply to campaign form', upload your "
-        f"contacts file there, and launch.{warn} If you change anything by hand in the form, "
-        "I won't see those edits here."
+        f"contacts file there, and launch.{warn}{moderation_warn} If you change anything by "
+        "hand in the form, I won't see those edits here."
+    )
+
+
+async def _mint_rerun_campaign(db, tenant_res, user, args, ns, sid) -> tuple[dict[str, Any], str]:
+    """Park a campaign re-dial as the session's pending_action and return the
+    confirm card. Nothing dials until /confirm — same contract as tickets."""
+    from app.services import campaign_contacts_v2 as v2
+
+    campaign, suggestions = await _resolve_campaign_by_name(db, tenant_res, str(args.get("campaign_name") or ""))
+    if campaign is None:
+        names = ", ".join(f"'{n}'" for n in (suggestions or [])) or "none yet"
+        return (
+            {"type": "rerun_not_found", "recent_campaigns": suggestions or []},
+            f"I couldn't find a campaign called '{args.get('campaign_name')}'. "
+            f"Your recent campaigns: {names}. Which one did you mean?",
+        )
+    buckets = [b for b in (args.get("buckets") or ["no_pickup"]) if b in ("no_pickup", "busy")] or ["no_pickup"]
+    counts: dict[str, int] = {}
+    try:
+        s = await v2.summary(db, campaign.id)
+        counts = {"no_pickup": int(s.get("no_pickup") or 0), "busy": int(s.get("busy") or 0)}
+    except Exception:
+        logger.debug("NOVA: rerun summary unavailable", exc_info=True)
+    to_dial = sum(counts.get(b, 0) for b in buckets)
+    if counts and to_dial == 0:
+        label = " or ".join(b.replace("_", " ") for b in buckets)
+        return (
+            {"type": "rerun_nothing_to_dial", "campaign_name": campaign.name, "counts": counts},
+            f"'{campaign.name}' has no {label} contacts to re-dial right now.",
+        )
+    action_id = mint_action_id()
+
+    def _park(state: dict[str, Any]) -> None:
+        state["pending_action"] = {
+            "action_id": action_id,
+            "type": "rerun_campaign",
+            "payload": {"campaign_id": str(campaign.id), "buckets": buckets},
+        }
+
+    await store.mutate(ns, sid, _park)
+    card = {
+        "type": "rerun_preview",
+        "action_id": action_id,
+        "campaign_name": campaign.name,
+        "buckets": buckets,
+        "counts": counts,
+    }
+    credit_note = (
+        " The busy contacts answered before, so each of those retries consumes Call Credits "
+        "like a normal call." if "busy" in buckets else
+        " Unanswered retries cost nothing — credits are only consumed if someone answers."
+    )
+    label = " and ".join(b.replace("_", " ") for b in buckets)
+    return card, (
+        f"Ready to re-dial the {label} contacts of '{campaign.name}'"
+        + (f" ({to_dial} number(s))" if counts else "")
+        + f".{credit_note} Confirm and calling starts."
+    )
+
+
+async def _execute_rerun_campaign(db, tenant_res, user, payload) -> tuple[dict[str, Any], str]:
+    """Confirm-time re-dial. Errors come back as friendly replies, never raises
+    for expected conflicts — the /confirm endpoint turns exceptions into a
+    generic 500, which would hide the real reason (e.g. the one-campaign slot)."""
+    import uuid as _uuid
+
+    from app.services.outbound_campaign_service import OutboundCampaignService
+    from app.services.plivo_service import PlivoService
+    from app.services.public_url import public_base_url
+
+    if not PlivoService.bulk_calling_enabled(tenant_res):
+        return ({"error": "bulk_disabled"},
+                "Bulk calling isn't enabled for this account, so I can't start the re-dial.")
+    campaign = await OutboundCampaignService.get_campaign(
+        _uuid.UUID(str(payload.get("campaign_id"))), tenant_res, db
+    )
+    if campaign is None:
+        return ({"error": "not_found"}, "That campaign doesn't exist anymore — nothing was dialed.")
+    buckets = [b for b in (payload.get("buckets") or ["no_pickup"]) if b in ("no_pickup", "busy")] or ["no_pickup"]
+    try:
+        campaign = await OutboundCampaignService.rerun_bulk_campaign(
+            campaign,
+            db,
+            tenant_res=tenant_res,
+            # No Request here (confirm executors run detached from the minting
+            # request) — the env-configured base is the prod contract anyway.
+            public_base_url=public_base_url(None),
+            path_prefix="/api/nokvo-one/agents",
+            buckets=buckets,
+        )
+    except ValueError as exc:
+        return ({"error": str(exc)[:300]}, f"I couldn't start the re-dial: {exc}")
+    return (
+        {"campaign_id": str(campaign.id), "status": str(getattr(campaign.status, "value", campaign.status))},
+        f"Done — '{campaign.name}' is re-dialing now. You'll see results land on the campaign card.",
     )
 
 
 _MINTERS: dict[str, CardMinter] = {
     "create_support_ticket": _mint_support_ticket,
     "finalize_campaign_draft": _mint_campaign_draft,
+    "rerun_campaign": _mint_rerun_campaign,
 }
 
 CONFIRM_EXECUTORS: dict[str, ConfirmExecutor] = {
     "create_ticket": _execute_create_ticket,
+    "rerun_campaign": _execute_rerun_campaign,
 }

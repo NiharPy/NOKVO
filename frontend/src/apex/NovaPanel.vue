@@ -5,7 +5,7 @@
 // cards; campaign drafts render as a preview card whose "Apply to campaign form"
 // emits the draft up to ApexApp for a ONE-WAY handoff into the Campaign tab.
 import { nextTick, onMounted, ref, watch } from 'vue';
-import { novaChat, novaConfirm, novaSession, novaUpload, extractError } from './apexApi.js';
+import { novaBriefing, novaChat, novaConfirm, novaSession, novaUpload, extractError } from './apexApi.js';
 import AxIcon from './AxIcon.vue';
 
 const props = defineProps({
@@ -24,13 +24,24 @@ const messages = ref([{ role: 'assistant', text: GREETING, cards: [] }]);
 // history back so closing the panel mid-conversation loses nothing. Cards are
 // not replayed (pending actions expire with their session state anyway).
 onMounted(async () => {
-  if (!sessionId.value) return;
+  if (sessionId.value) {
+    try {
+      const data = await novaSession(sessionId.value);
+      const restored = (data.messages || []).map((m) => ({ role: m.role, text: m.content, cards: [] }));
+      if (restored.length) messages.value = [{ role: 'assistant', text: GREETING, cards: [] }, ...restored];
+      await scrollDown();
+    } catch { sessionId.value = null; }
+  }
+  // Proactive briefing: deterministic server-composed highlights, shown as one
+  // ephemeral bubble (never persisted — the server session is history's truth).
   try {
-    const data = await novaSession(sessionId.value);
-    const restored = (data.messages || []).map((m) => ({ role: m.role, text: m.content, cards: [] }));
-    if (restored.length) messages.value = [{ role: 'assistant', text: GREETING, cards: [] }, ...restored];
-    await scrollDown();
-  } catch { sessionId.value = null; }
+    const brief = await novaBriefing();
+    const lines = brief?.highlights || [];
+    if (lines.length) {
+      messages.value.push({ role: 'assistant', text: `Right now:\n• ${lines.join('\n• ')}`, cards: [] });
+      await scrollDown();
+    }
+  } catch { /* briefing is best-effort — the panel works fine without it */ }
 });
 watch(sessionId, (v) => {
   if (v) sessionStorage.setItem('nokvo_apex_nova_session', v);
@@ -151,6 +162,31 @@ function fmtCredits(n) {
                 </button>
               </div>
               <div v-else class="nv-card-done">{{ card.resolved === 'confirm' ? '✓ Ticket raised' : 'Cancelled' }}</div>
+            </template>
+
+            <template v-else-if="card.type === 'rerun_preview'">
+              <div class="nv-card-title">Re-dial campaign</div>
+              <div class="nv-card-line"><strong>{{ card.campaign_name }}</strong></div>
+              <div class="nv-card-grid">
+                <span v-for="b in card.buckets" :key="b">
+                  {{ b === 'busy' ? 'Asked to call back' : "Didn't pick up" }}<template v-if="card.counts && card.counts[b] != null"> · {{ card.counts[b] }}</template>
+                </span>
+              </div>
+              <div v-if="(card.buckets || []).includes('busy')" class="nv-card-line nv-muted">Busy contacts answered before — each connected retry consumes Call Credits.</div>
+              <div v-if="!card.resolved" class="nv-card-actions">
+                <button type="button" class="nv-btn nv-btn--ghost" :disabled="confirmBusy === card.action_id" @click="decide(card, 'cancel')">Cancel</button>
+                <button type="button" class="nv-btn nv-btn--accent" :disabled="confirmBusy === card.action_id" @click="decide(card, 'confirm')">
+                  {{ confirmBusy === card.action_id ? 'Starting…' : 'Start re-dial' }}
+                </button>
+              </div>
+              <div v-else class="nv-card-done">{{ card.resolved === 'confirm' ? '✓ Re-dial started' : 'Cancelled' }}</div>
+            </template>
+
+            <template v-else-if="card.type === 'draft_flagged'">
+              <div class="nv-card-title">Content review</div>
+              <div class="nv-card-line"><strong>Draft blocked{{ card.category ? ` — ${String(card.category).replaceAll('_', ' ')}` : '' }}</strong></div>
+              <div v-if="card.reason" class="nv-card-line nv-muted">{{ card.reason }}</div>
+              <div class="nv-card-line nv-muted">Campaigns can only promote your own company — tell Nova what to reword.</div>
             </template>
 
             <template v-else-if="card.type === 'campaign_draft'">

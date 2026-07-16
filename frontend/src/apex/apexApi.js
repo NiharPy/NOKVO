@@ -333,6 +333,10 @@ export async function novaSession(sessionId) {
   const { data } = await api.get(`/apex/nova/session/${sessionId}`, { headers: authHeader() });
   return data; // { session_id, messages, draft }
 }
+export async function novaBriefing() {
+  const { data } = await api.get('/apex/nova/briefing', { headers: authHeader() });
+  return data; // { highlights: [strings] }
+}
 export async function novaUpload(sessionId, file) {
   const fd = new FormData();
   fd.append('session_id', sessionId || '');

@@ -79,6 +79,7 @@ async def _campaigns(db: AsyncSession, tenant_id: str) -> list[dict[str, Any]]:
                     k: v for k, v in {
                         "qualified": s.get("qualified"),
                         "not_interested": s.get("not_interested"),
+                        "busy": s.get("busy"),  # answered, asked to be called back
                         "no_pickup": s.get("no_pickup"),
                         "pending": s.get("pending"),
                     }.items() if v
@@ -167,3 +168,172 @@ async def build_tenant_diagnosis(
     }
     ticket_json = blocks
     return {"llm_view": llm_view, "ticket_json": ticket_json}
+
+
+# ─────────────────────── campaign performance (Nova analyst) ──────────────────
+
+_PERFORMANCE_CAMPAIGNS = 5
+_LOW_MINUTES_WARNING = 30
+
+
+async def _campaign_stats(db: AsyncSession, tenant_id: str, limit: int) -> list[dict[str, Any]]:
+    """Recent campaigns with per-bucket counts AND computed rates. All the math
+    happens HERE — the model narrates numbers, it never derives them (same
+    philosophy as the lead scorer's server-side point summing)."""
+    from app.models.outbound_campaign import OutboundCampaign
+    from app.services import campaign_contacts_v2 as v2
+
+    rows = (await db.execute(
+        select(OutboundCampaign)
+        .where(OutboundCampaign.tenant_id == tenant_id)
+        .order_by(OutboundCampaign.created_at.desc())
+        .limit(limit)
+    )).scalars().all()
+    out: list[dict[str, Any]] = []
+    for c in rows:
+        entry: dict[str, Any] = {
+            "name": c.name,
+            "status": str(getattr(c.status, "value", c.status)),
+            "created": _ts(c.created_at),
+            "total": c.total_count or 0,
+        }
+        try:
+            s = await v2.summary(db, c.id)
+        except Exception:
+            out.append(entry)
+            continue
+        qualified = int(s.get("qualified") or 0)
+        not_interested = int(s.get("not_interested") or 0)
+        busy = int(s.get("busy") or 0)
+        no_pickup = int(s.get("no_pickup") or 0)
+        pending = int(s.get("pending") or 0)
+        dialed = qualified + not_interested + busy + no_pickup
+        entry["counts"] = {
+            "qualified": qualified, "not_interested": not_interested,
+            "busy": busy, "no_pickup": no_pickup, "pending": pending,
+        }
+        if dialed:
+            connected = qualified + not_interested + busy
+            entry["rates_pct"] = {
+                "qualified": round(qualified / dialed * 100, 1),
+                "connected": round(connected / dialed * 100, 1),
+                "no_pickup": round(no_pickup / dialed * 100, 1),
+                "busy": round(busy / dialed * 100, 1),
+            }
+        window = (c.agent_config or {}).get("call_window") or {}
+        if window.get("working_days"):
+            entry["schedule"] = {k: window[k] for k in ("working_days", "calls_per_day") if window.get(k)}
+        out.append(entry)
+    return out
+
+
+def _performance_recommendations(campaigns: list[dict[str, Any]], wallet: dict[str, Any]) -> list[str]:
+    """Deterministic, numbers-in-place recommendations Nova relays to the user."""
+    recs: list[str] = []
+    for c in campaigns:
+        counts = c.get("counts") or {}
+        if c.get("status") == "cancelled" and counts.get("pending"):
+            recs.append(
+                f"'{c['name']}' is stopped with {counts['pending']} contacts still pending — "
+                "Resume it to finish the list."
+            )
+        if counts.get("no_pickup"):
+            recs.append(
+                f"Re-run '{c['name']}' for the {counts['no_pickup']} contacts who didn't pick up — "
+                "unanswered retries cost nothing."
+            )
+        if counts.get("busy"):
+            recs.append(
+                f"{counts['busy']} contact(s) in '{c['name']}' asked to be called back — they're on "
+                "the Busy tab; use 'Call busy' to re-dial them (connected retries consume credits)."
+            )
+    # Best performer worth cloning: completed, meaningfully sampled, top qualified rate.
+    scored = [
+        c for c in campaigns
+        if c.get("status") == "completed" and (c.get("rates_pct") or {}).get("qualified") is not None
+        and sum((c.get("counts") or {}).values()) - (c.get("counts") or {}).get("pending", 0) >= 10
+    ]
+    if scored:
+        best = max(scored, key=lambda c: c["rates_pct"]["qualified"])
+        if best["rates_pct"]["qualified"] > 0:
+            recs.append(
+                f"Your best performer is '{best['name']}' ({best['rates_pct']['qualified']}% qualified) — "
+                "the Duplicate button on its campaign card reuses the same script and questions for a new list."
+            )
+    minutes = (wallet or {}).get("estimated_minutes_remaining")
+    if isinstance(minutes, (int, float)) and minutes < _LOW_MINUTES_WARNING:
+        recs.append(
+            f"Call Credits are low (about {int(minutes)} minutes left) — top up before the next run."
+        )
+    return recs[:6]
+
+
+async def build_campaign_performance(
+    db: AsyncSession, tenant_res: TenantResources, organization_id
+) -> dict[str, Any]:
+    """→ campaign stats + rates + deterministic recommendations for the
+    get_campaign_performance tool. Never raises."""
+    try:
+        wallet = await _wallet(db, organization_id)
+    except Exception:
+        wallet = {}
+    try:
+        campaigns = await _campaign_stats(db, tenant_res.tenant_id, _PERFORMANCE_CAMPAIGNS)
+    except Exception:
+        logger.exception("NOVA-PERF: campaign stats failed")
+        return {"campaigns": [], "note": "Performance data is unavailable right now — try again shortly."}
+    return {
+        "wallet": wallet,
+        "campaigns": campaigns,
+        "recommendations": _performance_recommendations(campaigns, wallet),
+        "note": (
+            "Rates are % of contacts dialed so far. Relay the recommendations that fit "
+            "what the user asked; quote the numbers as given."
+        ),
+    }
+
+
+# ─────────────────────── panel-open briefing (no LLM) ────────────────────────
+
+async def build_briefing(
+    db: AsyncSession, tenant_res: TenantResources, organization_id, role: str | None
+) -> dict[str, Any]:
+    """Deterministic highlights for the panel-open greeting — composed strings,
+    zero LLM cost, safe to call on every open. Members get none (campaigns are
+    admin domain). Never raises."""
+    if (role or "") != "admin":
+        return {"highlights": []}
+    highlights: list[str] = []
+    try:
+        campaigns = await _campaign_stats(db, tenant_res.tenant_id, _PERFORMANCE_CAMPAIGNS)
+    except Exception:
+        logger.exception("NOVA-BRIEF: campaign stats failed")
+        campaigns = []
+    running = next((c for c in campaigns if c.get("status") in ("running", "ingesting")), None)
+    if running:
+        counts = running.get("counts") or {}
+        done = sum(counts.values()) - counts.get("pending", 0)
+        total = running.get("total") or (done + counts.get("pending", 0))
+        bit = f"'{running['name']}' is dialing — {done} of {total} contacts done"
+        if counts.get("qualified"):
+            bit += f", {counts['qualified']} qualified so far"
+        highlights.append(bit + ".")
+    else:
+        done_recent = next((c for c in campaigns if c.get("status") == "completed"), None)
+        if done_recent and done_recent.get("counts"):
+            k = done_recent["counts"]
+            highlights.append(
+                f"'{done_recent['name']}' finished: {k.get('qualified', 0)} qualified, "
+                f"{k.get('busy', 0)} callback request(s), {k.get('no_pickup', 0)} didn't pick up."
+            )
+    busy_total = sum((c.get("counts") or {}).get("busy", 0) for c in campaigns)
+    if busy_total:
+        highlights.append(f"{busy_total} contact(s) asked to be called back — they're on the Busy tab.")
+    try:
+        wallet = await _wallet(db, organization_id)
+        minutes = wallet.get("estimated_minutes_remaining")
+        if isinstance(minutes, (int, float)) and minutes < _LOW_MINUTES_WARNING:
+            highlights.append(f"Call Credits are low — about {int(minutes)} minutes left.")
+    except Exception:
+        pass
+    return {"highlights": highlights[:3]}
