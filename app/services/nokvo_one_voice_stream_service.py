@@ -139,25 +139,9 @@ from app.services.voice_stream.utterance_checks import (  # noqa: F401
     _is_site_visit_confirmation_turn,
     _is_voicemail_utterance,
 )
-
-
-
-
-async def _resolve_business_type(
-    db: AsyncSession | None,
-    tenant_res: TenantResources,
-) -> str | None:
-    """Return the org's business type (``organization.industry``) via the
-    cached runtime bundle. Best-effort — a failure returns ``None`` so the
-    memory layer falls back to its broad superset extractor."""
-    try:
-        from app.services.agent_runtime_bundle import get_bundle
-
-        bundle = await get_bundle(db, tenant_res)
-        return (bundle.organization_industry or "").strip().lower() or None
-    except Exception:
-        logger.debug("NOKVO-MEMORY: business_type resolve failed", exc_info=True)
-        return None
+# _resolve_business_type moved to voice_stream/openers.py (used by the
+# extracted opener flow too); re-exported here for the remaining callers.
+from app.services.voice_stream.openers import _resolve_business_type  # noqa: F401, E402
 
 
 async def _drain_turn(task: asyncio.Task | None) -> None:
@@ -355,12 +339,12 @@ class NokvoOneVoiceStreamService:
 
     @staticmethod
     def _inbound_opening_text(language: str | None) -> str:
-        lang = SarvamVoiceService.normalize_language(language)
-        if lang == "te":
-            return "హలో, మీరు మీకు సౌకర్యమైన భాషలో మాట్లాడండి. నేను అదే భాషలో కొనసాగిస్తాను. నేను ఎలా సహాయం చేయగలను?"
-        if lang == "hi":
-            return "नमस्ते, आप जिस भाषा में सहज हैं उसमें बात कीजिए। मैं उसी भाषा में आगे बात करूंगा। मैं कैसे मदद कर सकता हूं?"
-        return "Hello, please speak in the language you're comfortable with. I'll continue in that language. How can I help?"
+        # Body extracted to app.services.voice_stream.openers._inbound_opening_text
+        # (turn_router helpers pattern; wrapper preserves the class API
+        # and class-attribute monkeypatches).
+        from app.services.voice_stream.openers import _inbound_opening_text
+
+        return _inbound_opening_text(language)
 
     @staticmethod
     async def _load_recent_record_for_phone(
@@ -368,67 +352,12 @@ class NokvoOneVoiceStreamService:
         organization_id: Any,
         phone: str | None,
     ) -> dict[str, Any] | None:
-        """Look up the most recent open record for a returning caller. Returns
-        a small summary dict (record_type, name, reason/summary, when) or None.
-        Used to enrich the inbound opener: "Hi again — still about your eye
-        blurriness checkup, or something new?"."""
-        if db is None or not phone or organization_id is None:
-            return None
-        from app.models.nokvo_one_tool_record import NokvoOneToolRecord
-        from sqlalchemy import select
+        # Body extracted to app.services.voice_stream.openers._load_recent_record_for_phone
+        # (turn_router helpers pattern; wrapper preserves the class API
+        # and class-attribute monkeypatches).
+        from app.services.voice_stream.openers import _load_recent_record_for_phone
 
-        # Normalise the phone: keep last 10 digits since that's what most
-        # records use for Indian numbers.
-        digits = "".join(c for c in str(phone) if c.isdigit())
-        if len(digits) < 10:
-            return None
-        suffix = digits[-10:]
-        OPEN_STATUSES = ("new", "requested", "assigned", "open", "scheduled", "in_progress")
-        stmt = (
-            select(NokvoOneToolRecord)
-            .where(NokvoOneToolRecord.organization_id == organization_id)
-            .where(NokvoOneToolRecord.status.in_(OPEN_STATUSES))
-            .order_by(NokvoOneToolRecord.created_at.desc())
-            .limit(20)
-        )
-        try:
-            res = await db.execute(stmt)
-        except Exception:
-            return None
-        for rec in res.scalars().all():
-            phone_value = "".join(c for c in str(rec.contact_phone or "") if c.isdigit())
-            if not phone_value:
-                # Fall back to data.phone / data.contact_phone
-                data = rec.data or {}
-                phone_value = "".join(c for c in str(data.get("phone") or data.get("contact_phone") or "") if c.isdigit())
-            if phone_value and phone_value[-10:] == suffix:
-                data = rec.data or {}
-                return {
-                    "record_id": str(rec.id),
-                    "record_type": rec.record_type,
-                    "status": rec.status,
-                    "name": (
-                        data.get("patient_name")
-                        or data.get("name")
-                        or data.get("customer_name")
-                        or data.get("guest_name")
-                    ),
-                    "summary": (
-                        data.get("reason")
-                        or data.get("care_need")
-                        or data.get("subject")
-                        or data.get("issue_summary")
-                        or data.get("description")
-                        or data.get("notes")
-                    ),
-                    "when": (
-                        data.get("appointment_time")
-                        or data.get("visit_at")
-                        or data.get("callback_at")
-                        or data.get("requested_time")
-                    ),
-                }
-        return None
+        return await _load_recent_record_for_phone(db, organization_id, phone)
 
     @staticmethod
     def _returning_caller_opener(
@@ -437,47 +366,12 @@ class NokvoOneVoiceStreamService:
         *,
         outcome_history: list[dict[str, Any]] | None = None,
     ) -> str:
-        lang = SarvamVoiceService.normalize_language(language)
-        name = str(record.get("name") or "").strip()
-        summary = str(record.get("summary") or "").strip()
-        rt = str(record.get("record_type") or "")
-        topic = summary or {
-            "appointment": "your appointment",
-            "lead": "your enquiry",
-            "ticket": "your support ticket",
-            "callback": "the callback we have on file",
-            "request": "your previous request",
-        }.get(rt, "your previous request")
-        # Adapt tone to outcome history: if the caller no-showed last time,
-        # the opener acknowledges that gently and offers a reminder SMS.
-        last_outcome = None
-        for entry in outcome_history or []:
-            status = ((entry or {}).get("outcome") or {}).get("status")
-            if status:
-                last_outcome = status
-                break
-        if last_outcome in {"no_show", "failed_followup"}:
-            if lang == "te":
-                prefix = f"హలో {name} గారు — last time miss అయ్యింది."
-                return f"{prefix} ఈసారి appointment confirm చేయడానికి reminder pampāli ah?"
-            if lang == "hi":
-                prefix = f"नमस्ते {name} ji — पिछली बार miss हो गया था।"
-                return f"{prefix} इस बार reminder SMS भेज दूँ कन्फर्म करने के लिए?"
-            return (
-                f"Hi {name} — last time the visit got missed. "
-                "Want me to send a reminder SMS this time so it doesn't slip?"
-            )
-        if lang == "te":
-            if name:
-                return f"హలో {name} గారు — ఇది ఇంకా {topic} గురించేనా, లేక కొత్త విషయమా?"
-            return f"హలో — ఇది ఇంకా {topic} గురించేనా, లేక కొత్త విషయమా?"
-        if lang == "hi":
-            if name:
-                return f"नमस्ते {name} ji — क्या ये अभी भी {topic} के बारे में है, या कुछ नया?"
-            return f"नमस्ते — क्या ये अभी भी {topic} के बारे में है, या कुछ नया?"
-        if name:
-            return f"Hi {name} — still about {topic}, or something new?"
-        return f"Hi again — still about {topic}, or something new?"
+        # Body extracted to app.services.voice_stream.openers._returning_caller_opener
+        # (turn_router helpers pattern; wrapper preserves the class API
+        # and class-attribute monkeypatches).
+        from app.services.voice_stream.openers import _returning_caller_opener
+
+        return _returning_caller_opener(record, language, outcome_history=outcome_history)
 
     @staticmethod
     async def _outbound_opener_known_facts(
@@ -485,88 +379,12 @@ class NokvoOneVoiceStreamService:
         tenant_res: TenantResources,
         campaign_context: dict[str, Any] | None,
     ) -> dict[str, Any]:
-        """Assemble what we already know about THIS lead for a personalised
-        opener: name + enquiry / prior-call facts (bhk, location, budget) and a
-        ``returning`` flag. Two sources, best-effort: the dialer-provided
-        ``contact`` (the lead's own enquiry) and the cross-call caller-memory
-        blob (a prior call). An empty dict yields the cold template opener."""
-        facts: dict[str, Any] = {}
-        if isinstance(campaign_context, dict) and campaign_context.get("is_followup"):
-            # Flag the follow-up + the project/campaign name so the opener can
-            # re-engage grounded ("following up about <project>"). Only mark
-            # ``returning`` (the "follow up on our LAST CONVERSATION" wording)
-            # when a real prior call actually happened — i.e. a handoff_note
-            # exists. Otherwise that line is a lie.
-            facts["followup"] = True
-            project = str(campaign_context.get("goal") or "").strip()
-            if project and project.lower() != "follow-up call":
-                facts["project"] = project
-            if str(campaign_context.get("handoff_note") or "").strip():
-                facts["returning"] = True
-        contact = (campaign_context or {}).get("contact") if isinstance(campaign_context, dict) else None
-        contact = contact if isinstance(contact, dict) else {}
+        # Body extracted to app.services.voice_stream.openers._outbound_opener_known_facts
+        # (turn_router helpers pattern; wrapper preserves the class API
+        # and class-attribute monkeypatches).
+        from app.services.voice_stream.openers import _outbound_opener_known_facts
 
-        for key in ("name", "full_name", "customer_name"):
-            if contact.get(key):
-                facts["name"] = str(contact[key]).strip()
-                break
-        for src, dst in (
-            ("bhk", "bhk"),
-            ("property_type", "bhk"),
-            ("location", "location"),
-            ("location_preference", "location"),
-            ("budget", "budget"),
-        ):
-            if contact.get(src) and not facts.get(dst):
-                facts[dst] = str(contact[src]).strip()
-
-        phone = (
-            contact.get("phone")
-            or contact.get("phone_e164")
-            or (campaign_context or {}).get("from_phone")
-            or (campaign_context or {}).get("to_phone")
-        )
-        if phone:
-            try:
-                from app.services.conversational_memory import (
-                    FACT_BHK,
-                    FACT_BUDGET,
-                    FACT_LOCATION,
-                    FACT_NAME,
-                    ConversationalMemory,
-                    bootstrap_caller_memory,
-                )
-
-                business_type = await _resolve_business_type(db, tenant_res)
-                prior = ConversationalMemory()
-                await bootstrap_caller_memory(
-                    tenant_res, phone=phone, memory=prior, business_type=business_type
-                )
-                if prior.facts or prior.prior_stage:
-                    facts["returning"] = True
-                for fkey, dst in (
-                    (FACT_NAME, "name"),
-                    (FACT_BHK, "bhk"),
-                    (FACT_LOCATION, "location"),
-                    (FACT_BUDGET, "budget"),
-                ):
-                    value = prior.get(fkey)
-                    if value and not facts.get(dst):
-                        facts[dst] = str(value).strip()
-                # Carry the prior-call buying-journey context too: the stage
-                # they reached and (if any) the last objection wording — so
-                # the opener can address it by name on a returning call
-                # instead of starting cold over the same concern.
-                if prior.prior_stage:
-                    facts["prior_stage"] = prior.prior_stage
-                for entry in prior.objections:
-                    if entry.get("from_prior_call") and entry.get("text"):
-                        facts["last_objection_code"] = str(entry.get("code") or "")
-                        facts["last_objection_text"] = str(entry.get("text") or "")[:120]
-                        break
-            except Exception:
-                logger.debug("NOKVO-MEMORY: opener known-facts bootstrap failed", exc_info=True)
-        return facts
+        return await _outbound_opener_known_facts(db, tenant_res, campaign_context)
 
     @staticmethod
     async def _log_voice_call(
@@ -2043,62 +1861,12 @@ class NokvoOneVoiceStreamService:
         arbiter: TurnArbiter | None = None,
         turn_state: dict[str, Any] | None = None,
     ) -> None:
-        """Outbound voicemail reached: speak ONE short on-brand line, then hang up.
+        # Body extracted to app.services.voice_stream.call_close._leave_voicemail_and_end
+        # (turn_router helpers pattern; wrapper preserves the class API
+        # and class-attribute monkeypatches).
+        from app.services.voice_stream.call_close import _leave_voicemail_and_end
 
-        Closing the media WS ends the Plivo ``<Stream>`` and drops the call; the
-        ``call.hangup`` status webhook then closes the contact out as usual. Never
-        raises — a TTS hiccup must still let us hang up.
-        """
-        caller = ""
-        company = ""
-        if outbound_context is not None:
-            caller = (getattr(outbound_context, "caller_name", "") or "").strip()
-            company = (getattr(outbound_context, "company_name", "") or "").strip()
-        if not company:
-            company = str((campaign_context or {}).get("company_name") or "").strip()
-        line = _voicemail_message(language, caller_name=caller, company_name=company)
-
-        # Mark speaking so a racing check-in can't barge our final line.
-        if turn_state is not None:
-            turn_state["speaking"] = True
-        if arbiter is not None:
-            arbiter.mark_speaking()
-
-        turn_id = str(uuid.uuid4())[:8]
-        try:
-            await websocket.send_json(
-                {
-                    "type": "agent_sentence",
-                    "turn_id": turn_id,
-                    "sentence": line,
-                    "tone": "warm",
-                    "cache_hit": False,
-                    "source": "voicemail_drop",
-                }
-            )
-            await SarvamVoiceService.stream_sentence_tts(
-                websocket,
-                tenant_res,
-                line,
-                language=language,
-                purpose="voicemail",
-            )
-        except Exception:
-            logger.debug("NOKVO-VOICE: voicemail drop TTS failed", exc_info=True)
-        try:
-            await AgentSessionStore.append_turn(
-                tenant_res, call_id, "(voicemail detected)", line
-            )
-        except Exception:
-            pass
-        logger.info(
-            "NOKVO-VOICE: answering machine detected call=%s — left message, ending call",
-            call_id,
-        )
-        try:
-            await websocket.close()
-        except Exception:
-            pass
+        return await _leave_voicemail_and_end(websocket, tenant_res, language=language, call_id=call_id, campaign_context=campaign_context, outbound_context=outbound_context, arbiter=arbiter, turn_state=turn_state)
 
     @staticmethod
     async def _end_call_no_response(
@@ -2111,47 +1879,12 @@ class NokvoOneVoiceStreamService:
         arbiter: TurnArbiter | None = None,
         turn_state: dict[str, Any] | None = None,
     ) -> None:
-        """Picked-up caller went silent through a nudge: speak ONE short goodbye,
-        then hang up. Closing the media WS ends the Plivo ``<Stream>`` and drops
-        the call; the ``call.hangup`` status webhook closes the contact out as
-        usual. Mirrors :meth:`_leave_voicemail_and_end`. Never raises — a TTS
-        hiccup must still let us hang up."""
-        line = _no_response_goodbye_text(language)
-        # Mark speaking so a racing check-in can't barge our final line.
-        if turn_state is not None:
-            turn_state["speaking"] = True
-        if arbiter is not None:
-            arbiter.mark_speaking()
-        turn_id = str(uuid.uuid4())[:8]
-        try:
-            await websocket.send_json(
-                {
-                    "type": "agent_sentence",
-                    "turn_id": turn_id,
-                    "sentence": line,
-                    "tone": "warm",
-                    "cache_hit": False,
-                    "source": "no_response_end",
-                }
-            )
-            await SarvamVoiceService.stream_sentence_tts(
-                websocket, tenant_res, line, language=language, purpose="answer"
-            )
-        except Exception:
-            logger.debug("NOKVO-VOICE: no-response goodbye TTS failed", exc_info=True)
-        # Leave a clear marker so the post-call note reflects a silent abandon
-        # (caller answered but never engaged) rather than a stated disinterest.
-        with contextlib.suppress(Exception):
-            await AgentSessionStore.append_turn(
-                tenant_res, call_id, "(no response — caller silent)", line
-            )
-        logger.info(
-            "NOKVO-VOICE: no caller response after nudge call=%s — ending call", call_id
-        )
-        try:
-            await websocket.close()
-        except Exception:
-            pass
+        # Body extracted to app.services.voice_stream.call_close._end_call_no_response
+        # (turn_router helpers pattern; wrapper preserves the class API
+        # and class-attribute monkeypatches).
+        from app.services.voice_stream.call_close import _end_call_no_response
+
+        return await _end_call_no_response(websocket, tenant_res, language=language, call_id=call_id, campaign_context=campaign_context, arbiter=arbiter, turn_state=turn_state)
 
     @staticmethod
     async def _speak_outro_and_end(
@@ -2168,78 +1901,12 @@ class NokvoOneVoiceStreamService:
         eou_fired_at: float | None = None,
         style: str = "",
     ) -> None:
-        """Deterministic questionnaire CLOSE: speak the campaign's closing line
-        verbatim, then hang up.
+        # Body extracted to app.services.voice_stream.call_close._speak_outro_and_end
+        # (turn_router helpers pattern; wrapper preserves the class API
+        # and class-attribute monkeypatches).
+        from app.services.voice_stream.call_close import _speak_outro_and_end
 
-        Used once every question has been asked and the caller has given a real
-        answer to the last one. The model is unreliable about delivering the
-        closing line itself (it re-asks the last question, invents a name
-        question, or loops back to an earlier one), so we close deterministically
-        — no LLM turn. Mirrors :meth:`_leave_voicemail_and_end`. Never raises."""
-        from app.services.apex_micro_acks import tts_variant_for_call
-
-        line = (outro or "").strip()
-        if not line:
-            with contextlib.suppress(Exception):
-                await websocket.close()
-            return
-        # Same humanized pre-speech pause as the verbatim questions — the outro
-        # also follows a caller answer and otherwise fires unnaturally fast.
-        _delay_s = _verbatim_prespeech_delay_s(eou_fired_at=eou_fired_at)
-        if _delay_s > 0:
-            with contextlib.suppress(Exception):
-                await asyncio.sleep(_delay_s)
-        # Mark speaking so a racing check-in can't barge our final line.
-        if turn_state is not None:
-            turn_state["speaking"] = True
-        if arbiter is not None:
-            arbiter.mark_speaking()
-        turn_id = str(uuid.uuid4())[:8]
-        try:
-            await websocket.send_json(
-                {
-                    "type": "agent_sentence",
-                    "turn_id": turn_id,
-                    "sentence": line,
-                    "tone": "warm",
-                    "cache_hit": False,
-                    "source": "questionnaire_outro",
-                }
-            )
-            # Style voice overlay only — None values for an unstyled campaign
-            # keep the request body (and thus the warmed cache keys) identical
-            # to the historical no-prosody close.
-            _sp = style_prosody(style)
-            await SarvamVoiceService.stream_sentence_tts(
-                websocket,
-                tenant_res,
-                line,
-                language=language,
-                purpose="outro",
-                pace=_sp.pace if _sp else None,
-                pitch=_sp.pitch if _sp else None,
-                loudness=_sp.loudness if _sp else None,
-                cache=True,  # deterministic closing line — same audio every call
-                variant=tts_variant_for_call(call_id),
-            )
-        except Exception:
-            logger.debug("NOKVO-OUTRO: outro TTS failed", exc_info=True)
-        # Record the caller's final answer + the outro so the post-call scorer
-        # still sees the last question's answer (we paired the real reply, not a
-        # synthetic marker).
-        try:
-            await AgentSessionStore.append_turn(
-                tenant_res, call_id, (last_user_text or "").strip() or "(questionnaire complete)", line
-            )
-        except Exception:
-            pass
-        logger.info(
-            "NOKVO-OUTRO: questionnaire complete call=%s — spoke closing line, ending call",
-            call_id,
-        )
-        with contextlib.suppress(Exception):
-            await asyncio.sleep(_OUTRO_DRAIN_SECONDS)
-            await websocket.close()
+        return await _speak_outro_and_end(websocket, tenant_res, outro=outro, language=language, call_id=call_id, last_user_text=last_user_text, campaign_context=campaign_context, arbiter=arbiter, turn_state=turn_state, eou_fired_at=eou_fired_at, style=style)
 
     @staticmethod
     async def _deliver_verbatim_question(
@@ -2255,184 +1922,23 @@ class NokvoOneVoiceStreamService:
         campaign_context: dict[str, Any] | None = None,
         eou_fired_at: float | None = None,
     ) -> bool:
-        """APEX Phase 3: speak the next questionnaire question VERBATIM from its
-        pre-translated per-language string (cache=True → hits the TTS cache), skipping
-        the LLM for this turn. Returns True when it delivered a question; False to
-        fall through to the normal LLM turn (re-ask / non-answer / off-script / a
-        question without a translation). Never raises. Does NOT close the call — the
-        caller answers next; mirrors the opener/outro delivery but keeps the session
-        open and re-arms turn-taking (mark_done + speaking=False).
+        # Body extracted to app.services.voice_stream.verbatim._deliver_verbatim_question
+        # (turn_router helpers pattern; wrapper preserves the class API
+        # and class-attribute monkeypatches).
+        from app.services.voice_stream.verbatim import _deliver_verbatim_question
 
-        Humanization on this deterministic path (all flag-gated, see config):
-        a gap-target pre-speech pause (the cached reply otherwise lands with
-        machine-gun regularity), an optional seeded micro-ack spoken before the
-        question, a shaped silence gap between ack and question on telephony,
-        and a per-call rendition variant so the same line isn't the identical
-        waveform on every call. It also stashes the expected-answer shape on
-        ``campaign_context`` for the EOU endpointing hint."""
-        from app.services.agent_outbound_context import (
-            get_delivered_questions,
-            next_verbatim_question,
-            verbatim_line_for_language,
-        )
-        from app.services.apex_micro_acks import choose_ack, tts_variant_for_call
-
-        try:
-            qs = list(getattr(outbound_context, "questions", []) or [])
-            history = await AgentSessionStore.get_history(tenant_res, call_id)
-            plan = next_verbatim_question(qs, history, cleaned)
-            if plan is None:
-                return False
-            idx, q = plan
-            line = verbatim_line_for_language(q.get("text_i18n"), str(q.get("text") or ""), language)
-            if not line:
-                return False
-
-            # Ack decision BEFORE the pause: when an ack fires, the ACK is the
-            # gap-filler, so the pre-speech sleep clamps hard (ACK_MAX) and the
-            # ack voice lands almost immediately after the EOU fired.
-            last_ack = (
-                campaign_context.get("_last_ack")
-                if isinstance(campaign_context, dict)
-                else None
-            )
-            ack = choose_ack(
-                call_id=call_id,
-                question_idx=idx,
-                language=language,
-                last_ack=last_ack,
-                delivered_count=len(get_delivered_questions()),
-                style=str(getattr(outbound_context, "questionnaire_style", "") or ""),
-            )
-            # Humanized pre-speech pause. Deliberately BEFORE mark_speaking: a
-            # caller who resumes talking during the sleep lands as a NEW
-            # utterance (turn cancel/replace via the arbiter), never as a
-            # barge-in against silence — the pause itself adds listen-safety.
-            delay_s = _verbatim_prespeech_delay_s(
-                eou_fired_at=eou_fired_at, ack_will_fire=bool(ack)
-            )
-            if delay_s > 0:
-                await asyncio.sleep(delay_s)
-
-            variant = tts_variant_for_call(call_id)
-            if turn_state is not None:
-                turn_state["speaking"] = True
-            if arbiter is not None:
-                arbiter.mark_speaking()
-            turn_id = str(uuid.uuid4())[:8]
-            _vstyle = _campaign_voice_style(outbound_context)
-            prosody = prosody_for("question", _vstyle)
-            try:
-                if ack:
-                    warm = prosody_for("warm", _vstyle)
-                    await websocket.send_json(
-                        {
-                            "type": "agent_sentence",
-                            "turn_id": turn_id,
-                            "sentence": ack,
-                            "tone": "warm",
-                            "cache_hit": False,
-                            "source": "questionnaire_ack",
-                        }
-                    )
-                    await SarvamVoiceService.stream_sentence_tts(
-                        websocket,
-                        tenant_res,
-                        ack,
-                        language=language,
-                        purpose="verbatim_ack",
-                        pace=warm.pace,
-                        pitch=warm.pitch,
-                        loudness=warm.loudness,
-                        cache=True,  # tiny global pool — prewarmed, shared across campaigns
-                        variant=variant,
-                    )
-                    # Breathing room between ack and question. Telephony
-                    # adapters queue real silence frames (flushed by barge-in's
-                    # clearAudio); the web test call's raw WS has no such
-                    # method and skips it — the browser's event gap suffices.
-                    if hasattr(websocket, "send_silence_ms"):
-                        jitter = int(settings.APEX_ACK_GAP_JITTER_MS or 0)
-                        gap_ms = int(settings.APEX_ACK_GAP_MS or 0) + (
-                            random.randint(-jitter, jitter) if jitter > 0 else 0
-                        )
-                        if gap_ms > 0:
-                            await websocket.send_silence_ms(gap_ms)
-                await websocket.send_json(
-                    {
-                        "type": "agent_sentence",
-                        "turn_id": turn_id,
-                        "sentence": line,
-                        "tone": "question",
-                        "cache_hit": False,
-                        "source": "questionnaire_verbatim",
-                    }
-                )
-                await SarvamVoiceService.stream_sentence_tts(
-                    websocket,
-                    tenant_res,
-                    line,
-                    language=language,
-                    purpose="question",
-                    pace=prosody.pace,
-                    pitch=prosody.pitch,
-                    loudness=prosody.loudness,
-                    cache=True,  # verbatim, pre-translated → same audio every call
-                    variant=variant,
-                )
-            finally:
-                if arbiter is not None:
-                    arbiter.mark_done()
-                if turn_state is not None:
-                    turn_state["speaking"] = False
-            # Record it as the assistant turn so asked-tracking advances next
-            # turn. ONE line including the ack — the transcript mirrors exactly
-            # what the caller heard, and the LLM sees the ack in history so it
-            # won't double-ack the next off-script turn. (Prepending only ADDS
-            # tokens to the assistant side of the token-overlap asked matcher,
-            # and the persisted delivered set below is authoritative anyway.)
-            spoken = f"{ack} {line}" if ack else line
-            with contextlib.suppress(Exception):
-                await AgentSessionStore.append_turn(tenant_res, call_id, (cleaned or "").strip(), spoken)
-            # AUTHORITATIVE progress: persist "Q{idx} delivered" so this question
-            # can never read as unasked again (paraphrase-, language-, and
-            # history-eviction-proof — the questionnaire-loop killer).
-            with contextlib.suppress(Exception):
-                await NokvoOneVoiceStreamService._persist_question_delivered(tenant_res, call_id, idx)
-            if isinstance(campaign_context, dict):
-                if ack:
-                    campaign_context["_last_ack"] = ack
-                # Expected-answer shape for the EOU endpointing hint (read by
-                # _eou_decision; cleared when a turn falls through to the LLM).
-                campaign_context["_awaiting_answer_kind"] = _question_answer_kind(q)
-            logger.info(
-                "NOKVO-VERBATIM: asked Q%d verbatim call=%s lang=%s ack=%s variant=%d delay_ms=%d",
-                idx, call_id, language, bool(ack), variant, int(delay_s * 1000),
-            )
-            return True
-        except Exception:
-            logger.exception("NOKVO-VERBATIM: verbatim question delivery failed")
-            return False
+        return await _deliver_verbatim_question(NokvoOneVoiceStreamService, websocket, tenant_res, cleaned=cleaned, language=language, call_id=call_id, outbound_context=outbound_context, arbiter=arbiter, turn_state=turn_state, campaign_context=campaign_context, eou_fired_at=eou_fired_at)
 
     @staticmethod
     async def _persist_question_delivered(
         tenant_res: TenantResources, call_id: str | None, number: int | None
     ) -> None:
-        """Merge question ``number`` into the call's authoritative delivered set
-        (session state ``questionnaire_progress.delivered``) and refresh the
-        ambient contextvar so the SAME turn's later reads see it too."""
-        if not call_id or not number:
-            return
-        from app.services.agent_outbound_context import (
-            get_delivered_questions,
-            set_delivered_questions,
-        )
+        # Body extracted to app.services.voice_stream.verbatim._persist_question_delivered
+        # (turn_router helpers pattern; wrapper preserves the class API
+        # and class-attribute monkeypatches).
+        from app.services.voice_stream.verbatim import _persist_question_delivered
 
-        merged = sorted(set(get_delivered_questions()) | {int(number)})
-        set_delivered_questions(merged)
-        await AgentSessionStore.merge_state(
-            tenant_res, call_id, {"questionnaire_progress": {"delivered": merged}}
-        )
+        return await _persist_question_delivered(tenant_res, call_id, number)
 
     @staticmethod
     async def _play_opener(
@@ -2445,98 +1951,12 @@ class NokvoOneVoiceStreamService:
         campaign_context: dict[str, Any] | None = None,
         style: str = "",
     ) -> None:
-        """Deterministic prosody-aware opener — no LLM round-trip.
+        # Body extracted to app.services.voice_stream.openers._play_opener
+        # (turn_router helpers pattern; wrapper preserves the class API
+        # and class-attribute monkeypatches).
+        from app.services.voice_stream.openers import _play_opener
 
-        Saves ~150ms of perceived latency on outbound campaign calls vs.
-        sending the opener through ``_run_text_turn``. The opening text may
-        contain prosody tags (``[warm]…[/warm] [neutral]…[/neutral]``); if
-        none are present, the whole opener is voiced as ``[warm]``.
-        """
-        from app.services.apex_micro_acks import tts_variant_for_call
-
-        text = (opening_text or "").strip()
-        if not text:
-            return
-        if "[" not in text or "]" not in text:
-            text = f"[warm]{text}[/warm]"
-        turn_id = str(uuid.uuid4())[:8]
-        started = perf_counter()
-        _variant = tts_variant_for_call(call_id)
-        await websocket.send_json({"type": "agent_thinking", "turn_id": turn_id, "query": "(opener)"})
-
-        async def _single_chunk_stream():
-            yield text
-
-        first_sentence_ms: int | None = None
-        answer_parts: list[str] = []
-        async for chunk in stream_prosody_chunks(_single_chunk_stream()):
-            sentence = chunk.text.strip()
-            if not sentence:
-                continue
-            if first_sentence_ms is None:
-                first_sentence_ms = int((perf_counter() - started) * 1000)
-            answer_parts.append(sentence)
-            await websocket.send_json(
-                {
-                    "type": "agent_sentence",
-                    "turn_id": turn_id,
-                    "sentence": sentence,
-                    "tone": chunk.tone,
-                    "first_sentence_ms": first_sentence_ms,
-                    "cache_hit": False,
-                    "source": "campaign_opener",
-                }
-            )
-            prosody = prosody_for(chunk.tone, style)
-            try:
-                await SarvamVoiceService.stream_sentence_tts(
-                    websocket,
-                    tenant_res,
-                    sentence,
-                    language=language,
-                    purpose="opener",
-                    pace=prosody.pace,
-                    pitch=prosody.pitch,
-                    loudness=prosody.loudness,
-                    cache=True,  # verbatim, zero-LLM opener — cacheable across calls
-                    variant=_variant,
-                )
-            except Exception as exc:
-                await websocket.send_json(
-                    {
-                        "type": "tts_error",
-                        "turn_id": turn_id,
-                        "error_message": str(exc)[:240],
-                        "provider": "sarvam",
-                    }
-                )
-
-        # Record the opener as an assistant turn so the LLM sees it as
-        # context for the caller's first reply.
-        joined = " ".join(answer_parts).strip()
-        if joined:
-            await AgentSessionStore.append_turn(tenant_res, call_id, "(call opener)", joined)
-        await websocket.send_json(
-            {
-                "type": "agent_answer",
-                "turn_id": turn_id,
-                "answer": joined,
-                "refused": False,
-                "citations": [],
-                "chunks": [],
-                "runtime": {"mode": "deterministic_opener"},
-                "intent": {"type": "campaign_opener", "should_retrieve": False},
-            }
-        )
-        await websocket.send_json(
-            {
-                "type": "turn_complete",
-                "turn_id": turn_id,
-                "total_ms": int((perf_counter() - started) * 1000),
-                "context_source": "deterministic_opener",
-                "filler_played": False,
-            }
-        )
+        return await _play_opener(websocket, tenant_res, opening_text, language=language, call_id=call_id, campaign_context=campaign_context, style=style)
 
     @staticmethod
     async def run_session(
