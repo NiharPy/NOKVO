@@ -108,6 +108,22 @@ from app.services.azure_grounded_llm import (  # noqa: F401
     _meter_call_llm,
 )
 
+# Re-export shims for module-level names moved to pipeline/appointments and
+# pipeline/retrieval - this path stays canonical for tests and callers.
+from app.services.pipeline.appointments import (  # noqa: F401
+    _APPOINTMENT_LOCAL_TZ,
+    _AppointmentToolInputError,
+    _MONTH_INDEX,
+    _next_day_of_month,
+    _ORDINAL_WORDS,
+    _WEEKDAY_INDEX,
+    _WEEKDAY_RE,
+)
+from app.services.pipeline.retrieval import (  # noqa: F401
+    _SENSITIVE_OR_DYNAMIC_RE,
+)
+
+
 
 # A "." only ends a sentence when NOT preceded by a digit, so a decimal amount
 # ("₹2.45Cr", or a model-spaced "₹2. 45Cr") is never split mid-number. ! ? ।
@@ -116,10 +132,6 @@ from app.services.azure_grounded_llm import (  # noqa: F401
 _SENTENCE_RE = re.compile(r"(?:(?<!\d)\.|[!?।])\s+")
 _SMALLTALK_RE = re.compile(
     r"^(hi|hello|hey|namaste|namaskar|thanks?|thank you|okay|ok|bye|goodbye|good morning|good evening)[\s!.?]*$",
-    re.IGNORECASE,
-)
-_SENSITIVE_OR_DYNAMIC_RE = re.compile(
-    r"\b(order|ticket|payment|paid|refund status|account|phone|email|address|otp|password|card|upi|bank|delete|cancel my)\b",
     re.IGNORECASE,
 )
 _ORDER_CONTEXT_RE = re.compile(r"\b(order|delivery|shipment|ఆర్డర్|డెలివరీ)\b", re.IGNORECASE)
@@ -179,82 +191,11 @@ _FACILITY_LOCATION_RE = re.compile(
     ]),
     re.IGNORECASE,
 )
-_APPOINTMENT_LOCAL_TZ = ZoneInfo("Asia/Kolkata")
-_MONTH_INDEX = {
-    "jan": 1,
-    "january": 1,
-    "feb": 2,
-    "february": 2,
-    "mar": 3,
-    "march": 3,
-    "apr": 4,
-    "april": 4,
-    "may": 5,
-    "jun": 6,
-    "june": 6,
-    "jul": 7,
-    "july": 7,
-    "aug": 8,
-    "august": 8,
-    "sep": 9,
-    "sept": 9,
-    "september": 9,
-    "oct": 10,
-    "october": 10,
-    "nov": 11,
-    "november": 11,
-    "dec": 12,
-    "december": 12,
-}
-_WEEKDAY_INDEX = {
-    "monday": 0,
-    "tuesday": 1,
-    "wednesday": 2,
-    "thursday": 3,
-    "friday": 4,
-    "saturday": 5,
-    "sunday": 6,
-}
-_WEEKDAY_RE = re.compile(r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b")
-
-# Spoken ordinals → day-of-month, so "first of July" / "the twenty third" parse.
-_ORDINAL_WORDS: dict[str, int] = {
-    "first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "sixth": 6,
-    "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10, "eleventh": 11,
-    "twelfth": 12, "thirteenth": 13, "fourteenth": 14, "fifteenth": 15,
-    "sixteenth": 16, "seventeenth": 17, "eighteenth": 18, "nineteenth": 19,
-    "twentieth": 20, "twenty first": 21, "twenty second": 22, "twenty third": 23,
-    "twenty fourth": 24, "twenty fifth": 25, "twenty sixth": 26, "twenty seventh": 27,
-    "twenty eighth": 28, "twenty ninth": 29, "thirtieth": 30, "thirty first": 31,
-}
 
 
-def _next_day_of_month(day: int, today: "datetime.date"):
-    """Next calendar date with the given day-of-month, today or later."""
-    year, month = today.year, today.month
-    for _ in range(13):
-        try:
-            candidate = datetime(year, month, day, tzinfo=_APPOINTMENT_LOCAL_TZ).date()
-        except ValueError:
-            candidate = None
-        if candidate is not None and candidate >= today:
-            return candidate
-        month += 1
-        if month > 12:
-            month, year = 1, year + 1
-    return None
-
-
-# Canonical date/time parse error lives in app.services.datetime_parse; this
-# stays as a thin subclass so the appointment handler's existing
-# ``except _AppointmentToolInputError`` clauses keep working while the parser
-# logic is consolidated behind one module.
-class _AppointmentToolInputError(DateTimeParseError):
-    pass
-
-
-def _normalize(text: str) -> str:
-    return re.sub(r"\s+", " ", (text or "").strip())
+# _normalize moved to pipeline/text_norm.py (shared with the extracted
+# pipeline modules); re-exported here so existing references keep working.
+from app.services.pipeline.text_norm import _normalize  # noqa: F401, E402
 
 
 def _first_sentence(buffer: str) -> tuple[str, str] | None:
@@ -477,110 +418,41 @@ class NokvoOneVoicePipeline:
 
     @staticmethod
     def _cacheable(query: str, answer: str, chunks: list[dict[str, Any]]) -> bool:
-        if _SENSITIVE_OR_DYNAMIC_RE.search(query or ""):
-            return False
-        for chunk in chunks:
-            metadata = dict(chunk.get("metadata") or {})
-            if metadata.get("sensitivity") == "sensitive":
-                return False
-        return bool(answer.strip())
+        # Body extracted to app.services.pipeline.retrieval._cacheable
+        # (turn_router helpers pattern). The wrapper preserves the
+        # @staticmethod API for call sites and class-attribute monkeypatches.
+        from app.services.pipeline.retrieval import _cacheable
+
+        return _cacheable(query, answer, chunks)
 
     @staticmethod
     def _map_point(point: Any) -> dict[str, Any]:
-        payload = dict(getattr(point, "payload", {}) or {})
-        return {
-            "document_id": str(payload.get("document_id") or ""),
-            "document_name": str(payload.get("document_name") or payload.get("source_title") or "Document"),
-            "chunk_id": str(payload.get("chunk_id") or getattr(point, "id", "")),
-            "text": str(payload.get("text") or ""),
-            "score": float(getattr(point, "score", 0.0) or 0.0),
-            "metadata": {
-                "source_type": payload.get("source_type"),
-                "source_kind": payload.get("source_kind"),
-                "document_type": payload.get("document_type"),
-                "status": payload.get("status"),
-                "document_status": payload.get("document_status"),
-                "language": payload.get("language"),
-                "campaign_id": payload.get("campaign_id"),
-                "topic": payload.get("topic"),
-                "sensitivity": payload.get("sensitivity"),
-                "source_title": payload.get("source_title"),
-                "section_id": payload.get("section_id"),
-                "section_title": payload.get("section_title"),
-                "parent_section_text": payload.get("parent_section_text"),
-            },
-        }
+        # Body extracted to app.services.pipeline.retrieval._map_point
+        # (turn_router helpers pattern). The wrapper preserves the
+        # @staticmethod API for call sites and class-attribute monkeypatches.
+        from app.services.pipeline.retrieval import _map_point
+
+        return _map_point(point)
 
     @staticmethod
     def _chunks_from_outbound_doc(
         outbound_context: OutboundCampaignContext | None,
     ) -> list[dict[str, Any]]:
-        """Materialize the campaign-supplied brief as retrieval chunks.
+        # Body extracted to app.services.pipeline.retrieval._chunks_from_outbound_doc
+        # (turn_router helpers pattern). The wrapper preserves the
+        # @staticmethod API for call sites and class-attribute monkeypatches.
+        from app.services.pipeline.retrieval import _chunks_from_outbound_doc
 
-        Outbound is a different agent from inbound — its only data source
-        is whatever the operator pinned into the campaign config (the
-        ``doc_text`` field on :class:`OutboundCampaignContext`). We
-        return Qdrant-shaped chunks so the existing prompt builder
-        composes them the same way it does inbound retrievals. The
-        agent_prompt rides through the separate outbound system fragment
-        and does not need to be a chunk.
-        """
-        if outbound_context is None:
-            return []
-        text = (getattr(outbound_context, "doc_text", "") or "").strip()
-        if not text:
-            return []
-        # Split into ~350-word chunks so a long campaign brief doesn't
-        # blow the context window on a single LLM call. The reader sees
-        # them as ordered excerpts from "Campaign Brief".
-        words_per_chunk = 350
-        words = text.split()
-        out: list[dict[str, Any]] = []
-        for i in range(0, len(words), words_per_chunk):
-            slice_text = " ".join(words[i : i + words_per_chunk]).strip()
-            if not slice_text:
-                continue
-            out.append(
-                {
-                    "text": slice_text,
-                    "score": 1.0,
-                    "chunk_id": f"outbound_doc_chunk_{i // words_per_chunk}",
-                    "document_id": "outbound_campaign_brief",
-                    "document_name": "Campaign Brief",
-                    "metadata": {"source": "outbound_campaign", "approved": True},
-                }
-            )
-            if len(out) >= 6:
-                # Cap at 6 chunks so a very long brief doesn't dominate
-                # the prompt; the system fragment already carries the
-                # persona + objectives.
-                break
-        return out
+        return _chunks_from_outbound_doc(outbound_context)
 
     @staticmethod
     def _expand_parent_section(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Replace a chunk's text with its parent section when the chunk came
-        from a likely table/list section (cancellation/refund/policy). Sliced
-        rows lose the conditional structure; the parent section restores it
-        for the LLM."""
-        expanded: list[dict[str, Any]] = []
-        seen_sections: set[str] = set()
-        for chunk in chunks:
-            section_id = (chunk.get("metadata") or {}).get("section_id") if isinstance(chunk.get("metadata"), dict) else None
-            section_title = ((chunk.get("metadata") or {}).get("section_title") or "") if isinstance(chunk.get("metadata"), dict) else ""
-            parent_text = ((chunk.get("metadata") or {}).get("parent_section_text") or "") if isinstance(chunk.get("metadata"), dict) else ""
-            policy_section = bool(
-                re.search(r"cancel|refund|policy|table", section_title or "", re.IGNORECASE)
-            )
-            if policy_section and parent_text and section_id and section_id not in seen_sections:
-                seen_sections.add(section_id)
-                copied = dict(chunk)
-                copied["text"] = parent_text
-                copied["expanded_from_parent_section"] = True
-                expanded.append(copied)
-            else:
-                expanded.append(chunk)
-        return expanded
+        # Body extracted to app.services.pipeline.retrieval._expand_parent_section
+        # (turn_router helpers pattern). The wrapper preserves the
+        # @staticmethod API for call sites and class-attribute monkeypatches.
+        from app.services.pipeline.retrieval import _expand_parent_section
+
+        return _expand_parent_section(chunks)
 
     @staticmethod
     async def retrieve(
@@ -597,262 +469,12 @@ class NokvoOneVoicePipeline:
         # Knowledge-Base document retrieval is retired: the agent answers from
         # its vertical system prompt, not Qdrant/embedding retrieval. Returns an
         # empty result; callers handle ``chunks == []`` by not grounding.
-        return {
-            "query": query,
-            "chunks": [],
-            "refusal": None,
-            "sensitive": bool(intent_result and intent_result.sensitive),
-            "min_score": 0.0,
-            "top_k": top_k or 0,
-        }
-        # --- retired (unreachable below) ---
-        # LangSmith retriever span. Currently this function returns an
-        # empty chunks list because Qdrant retrieval is retired from the
-        # runtime path (see comment below). The span still posts — the
-        # zero-chunk result is itself useful debugging signal ("retrieval
-        # is disabled, answers come from prompt + memory only"). When
-        # Qdrant is re-enabled the spans populate without further work.
-        try:
-            from langsmith.run_helpers import traceable, get_current_run_tree
-            _parent = get_current_run_tree()
-        except Exception:
-            _parent = None
-        if _parent is not None:
-            try:
-                _retr_span = _parent.create_child(
-                    name="retrieval",
-                    run_type="retriever",
-                    inputs={
-                        "query": query,
-                        "top_k": top_k,
-                        "campaign_id": campaign_id,
-                        "dual": dual_retrieval,
-                    },
-                )
-                _retr_span.post()
-            except Exception:
-                _retr_span = None
-        else:
-            _retr_span = None
-        # Qdrant / KB-document retrieval has been retired from the runtime
-        # pipeline. The agent now answers from: (a) the curated per-vertical
-        # system prompt + the org's BUSINESS FACTS (see
-        # app/services/vertical_prompts.py + agent_runtime_bundle), (b) the
-        # live real-estate project inventory, (c) conversational memory, and
-        # (d) the slot FSM's deterministic flow. Returning an empty chunks
-        # list short-circuits every downstream "no chunks → refuse" gate AND
-        # keeps the LLM path active because every call site also checks
-        # ``single_prompt_guidance`` (now always present) / ``outbound_mode``
-        # before refusing. (Policy-card synthetic chunks are injected by
-        # callers separately and are unaffected.)
-        if not query.strip():
-            _result = {"query": query, "chunks": [], "refusal": "Empty query."}
-            if _retr_span is not None:
-                try:
-                    _retr_span.add_outputs({"chunks": [], "chunk_count": 0, "status": "empty_query"})
-                    _retr_span.end()
-                    _retr_span.patch()
-                except Exception:
-                    pass
-            return _result
-        _result = {"query": query, "chunks": [], "refusal": None}
-        if _retr_span is not None:
-            try:
-                _retr_span.add_outputs({
-                    "chunks": [],
-                    "chunk_count": 0,
-                    "status": "qdrant_disabled",
-                })
-                _retr_span.end()
-                _retr_span.patch()
-            except Exception:
-                pass
-        return _result
-        # Dual retrieval (code-switching path): when the call is actively
-        # code-switching between two languages, embedding only the
-        # "best" form of the query misses chunks indexed under the other
-        # form. We embed BOTH the primary and the secondary form, search
-        # in parallel, and union the chunks by chunk_id. Cost: one extra
-        # Qdrant search + one extra embedding (almost always a cache hit).
-        if (
-            dual_retrieval
-            and english_text
-            and _normalize(english_text).lower() != _normalize(query).lower()
-        ):
-            return await NokvoOneVoicePipeline._retrieve_dual(
-                tenant_res,
-                primary=query,
-                secondary=english_text,
-                db=db,
-                top_k=top_k,
-                campaign_id=campaign_id,
-                intent_result=intent_result,
-            )
-        provider_status = dict(tenant_res.provider_status or {})
-        policy_version = str(provider_status.get("agent_policy_version") or "")
+        # Body extracted to app.services.pipeline.retrieval.retrieve
+        # (turn_router helpers pattern). The wrapper preserves the
+        # @staticmethod API for call sites and class-attribute monkeypatches.
+        from app.services.pipeline.retrieval import retrieve
 
-        sensitive = bool(intent_result and intent_result.sensitive)
-        effective_top_k = top_k or (
-            settings.AGENT_RETRIEVAL_TOP_K_SENSITIVE if sensitive else settings.AGENT_RETRIEVAL_TOP_K
-        )
-        min_score = (
-            settings.AGENT_MIN_RELEVANCE_SCORE_SENSITIVE if sensitive else settings.AGENT_MIN_RELEVANCE_SCORE
-        )
-
-        # MINIMAL mandatory filter — match agent_lab's pattern. tenant_id is
-        # already enforced by QdrantService._payload_filter; we only need
-        # source_type to scope to KB chunks (the same collection holds
-        # integration tool data, embedding for other sources, etc.).
-        #
-        # active / approval_status / policy_version / topic were previously
-        # in the must-match list. Any chunk whose payload was missing one of
-        # those fields (legacy uploads, reconciled-from-Qdrant entries,
-        # custom integrations) silently disappeared. Now they're only
-        # consulted as soft signals AFTER retrieval — see _filter_unapproved
-        # below.
-        filters: dict[str, Any] = {
-            "source_type": "agent_knowledge",
-        }
-        if campaign_id:
-            filters["campaign_id"] = campaign_id
-        if sensitive and intent_result and intent_result.topic and intent_result.topic != "general":
-            filters["topic"] = intent_result.topic
-
-        vector = None  # retired: embeddings/KB retrieval removed
-        limit = max(1, min(effective_top_k, 12))
-
-        # Score floor + soft approval check. We DON'T reject a chunk just
-        # because it lacks an approval_status payload — older chunks or
-        # reconciled ones may not have one and we still want to surface them
-        # for the LLM. We only reject when approval_status is explicitly set
-        # to a rejecting value.
-        def _approved(point) -> bool:
-            payload = getattr(point, "payload", {}) or {}
-            approval = payload.get("approval_status")
-            if approval is None:
-                return True  # missing → trust it
-            return str(approval).lower() in {"approved", "active", "ok", ""}
-
-        def _chunks_from(points, floor: float, *, approval_check: bool) -> list[dict[str, Any]]:
-            return [
-                NokvoOneVoicePipeline._map_point(point)
-                for point in points
-                if float(getattr(point, "score", 0.0) or 0.0) >= floor
-                and (not approval_check or _approved(point))
-            ]
-
-        async def _search(label: str, payload_filters: dict[str, Any]) -> list[Any]:
-            started = perf_counter()
-            points = []  # retired: Qdrant/KB retrieval removed
-            # Debug-level so production stdout/log volume doesn't carry the
-            # caller's query text or per-turn retrieval stats by default; ops
-            # can flip the logger to DEBUG when actually investigating.
-            logger.debug(
-                "NOKVO-RETRIEVE: tenant=%s label=%s query=%r filters=%s min_score=%s "
-                "top_k=%s raw_results=%s scores=%s qdrant_ms=%s",
-                tenant_res.tenant_id, label, query[:60], payload_filters,
-                min_score, effective_top_k, len(points),
-                [round(float(getattr(p, 'score', 0.0) or 0.0), 3) for p in points[:5]],
-                int((perf_counter() - started) * 1000),
-            )
-            return points
-
-        primary_task = asyncio.create_task(_search("primary", filters))
-        relaxed_task: asyncio.Task[list[Any]] | None = None
-        minimal_task: asyncio.Task[list[Any]] | None = None
-        relaxed_filters: dict[str, Any] | None = None
-        minimal_filters = {"source_type": "agent_knowledge"}
-
-        if sensitive and "topic" in filters:
-            relaxed_filters = dict(filters)
-            relaxed_filters.pop("topic", None)
-            relaxed_task = asyncio.create_task(_search("relaxed_topic", relaxed_filters))
-        if minimal_filters != filters and minimal_filters != relaxed_filters:
-            minimal_task = asyncio.create_task(_search("minimal", minimal_filters))
-
-        try:
-            primary_results = await primary_task
-            chunks = _chunks_from(primary_results, min_score, approval_check=True)
-            if chunks:
-                for task in (relaxed_task, minimal_task):
-                    if task and not task.done():
-                        task.cancel()
-            elif relaxed_task is not None:
-                relaxed_results = await relaxed_task
-                chunks = _chunks_from(
-                    relaxed_results,
-                    settings.AGENT_MIN_RELEVANCE_SCORE,
-                    approval_check=False,
-                )
-                if chunks and minimal_task and not minimal_task.done():
-                    minimal_task.cancel()
-            else:
-                chunks = []
-
-            if not chunks:
-                if minimal_task is not None:
-                    minimal_results = await minimal_task
-                else:
-                    minimal_results = primary_results
-                chunks = _chunks_from(minimal_results, 0.20, approval_check=False)
-        finally:
-            for task in (relaxed_task, minimal_task):
-                if not task:
-                    continue
-                if task.done():
-                    try:
-                        task.exception()
-                    except BaseException:
-                        pass
-                else:
-                    task.cancel()
-
-        # For sensitive topics, broaden context by pulling the whole parent
-        # section when a chunk likely came from a policy table or list row.
-        if sensitive and chunks:
-            chunks = NokvoOneVoicePipeline._expand_parent_section(chunks)
-
-        # Grounding insurance for policy intents.
-        #
-        # If the utterance is about cancellation/refund — either because the
-        # intent_result said so, OR because we detected a multi-script policy
-        # keyword in the user's actual words — we ALWAYS prepend the active
-        # policy_card source_text as synthetic chunks. Even when Qdrant
-        # returned its own chunks: those may be unrelated FAQ content, and
-        # the policy text is the authoritative answer.
-        #
-        # Without this, cross-lingual queries ("నాకు రీఫండ్ దొరుకుతదా?")
-        # whose translate-STT timed out get classified as `unclear` →
-        # retrieval returns nothing or noise → LLM refuses. With it, the
-        # LLM always sees the policy matrix and can answer in the caller's
-        # language.
-        policy_keyword_hit = (
-            detect_policy_keyword(query) is not None
-            or (english_text and detect_policy_keyword(english_text) is not None)
-            or (intent_result and intent_result.topic in ("cancellation", "refund"))
-        )
-        if policy_keyword_hit:
-            policy_chunks = NokvoOneVoicePipeline._policy_card_chunks(tenant_res, policy_version)
-            if policy_chunks:
-                # Deduplicate: don't prepend a policy chunk whose text is
-                # already present in a Qdrant result.
-                existing_text = {(c.get("text") or "").strip()[:200] for c in chunks}
-                new_policy = [
-                    pc for pc in policy_chunks
-                    if (pc.get("text") or "").strip()[:200] not in existing_text
-                ]
-                # Policy text goes FIRST so the LLM sees it before any
-                # marginally-relevant Qdrant chunks.
-                chunks = new_policy + chunks
-
-        return {
-            "query": query,
-            "chunks": chunks,
-            "refusal": None if chunks else "No indexed tenant context matched this question.",
-            "sensitive": sensitive,
-            "min_score": min_score,
-            "top_k": effective_top_k,
-        }
+        return await retrieve(NokvoOneVoicePipeline, tenant_res, query, db=db, top_k=top_k, campaign_id=campaign_id, intent_result=intent_result, english_text=english_text, dual_retrieval=dual_retrieval)
 
     @staticmethod
     async def _retrieve_dual(
@@ -865,125 +487,21 @@ class NokvoOneVoicePipeline:
         campaign_id: str | None,
         intent_result: IntentResult | None,
     ) -> dict[str, Any]:
-        """Code-switch retrieval helper.
+        # Body extracted to app.services.pipeline.retrieval._retrieve_dual
+        # (turn_router helpers pattern). The wrapper preserves the
+        # @staticmethod API for call sites and class-attribute monkeypatches.
+        from app.services.pipeline.retrieval import _retrieve_dual
 
-        Runs the primary and secondary queries against Qdrant in parallel
-        and unions the chunks by ``chunk_id``, keeping the higher score
-        for any duplicates. Limits the merged set to a reasonable
-        ``top_k`` so the LLM prompt stays bounded.
-        """
-        # We deliberately recurse into ``retrieve`` with dual_retrieval=
-        # False so each side does its own single-query search.
-        primary_task = asyncio.create_task(
-            NokvoOneVoicePipeline.retrieve(
-                tenant_res,
-                primary,
-                db=db,
-                top_k=top_k,
-                campaign_id=campaign_id,
-                intent_result=intent_result,
-                english_text=None,
-                dual_retrieval=False,
-            )
-        )
-        secondary_task = asyncio.create_task(
-            NokvoOneVoicePipeline.retrieve(
-                tenant_res,
-                secondary,
-                db=db,
-                top_k=top_k,
-                campaign_id=campaign_id,
-                intent_result=intent_result,
-                english_text=None,
-                dual_retrieval=False,
-            )
-        )
-        primary_raw, secondary_raw = await asyncio.gather(
-            primary_task, secondary_task, return_exceptions=True
-        )
-        # When one side fails (e.g., embedding service blip on the code-switch
-        # arm), keep whichever results did come back rather than losing the turn.
-        primary_res = primary_raw if not isinstance(primary_raw, BaseException) else {}
-        secondary_res = secondary_raw if not isinstance(secondary_raw, BaseException) else {}
-
-        merged: dict[str, dict[str, Any]] = {}
-        for source_label, res in (("primary", primary_res), ("secondary", secondary_res)):
-            for chunk in res.get("chunks") or []:
-                key = str(chunk.get("chunk_id") or chunk.get("document_id") or "")
-                if not key:
-                    continue
-                if key not in merged or float(chunk.get("score") or 0.0) > float(
-                    merged[key].get("score") or 0.0
-                ):
-                    merged[key] = chunk
-        chunks = sorted(
-            merged.values(),
-            key=lambda c: float(c.get("score") or 0.0),
-            reverse=True,
-        )
-        # Bound the merged list to a sensible cap — code-switch retrieval
-        # naturally inflates the chunk count and we don't want to pay
-        # the prompt-size cost.
-        effective_top_k = top_k or settings.AGENT_RETRIEVAL_TOP_K
-        chunks = chunks[: max(effective_top_k, 4)]
-        sensitive = bool(intent_result and intent_result.sensitive)
-        return {
-            "query": primary,
-            "secondary_query": secondary,
-            "chunks": chunks,
-            "refusal": None if chunks else "No indexed tenant context matched this question.",
-            "sensitive": sensitive,
-            "min_score": primary_res.get("min_score") or secondary_res.get("min_score"),
-            "top_k": effective_top_k,
-            "dual_retrieval": True,
-        }
+        return await _retrieve_dual(NokvoOneVoicePipeline, tenant_res, primary=primary, secondary=secondary, db=db, top_k=top_k, campaign_id=campaign_id, intent_result=intent_result)
 
     @staticmethod
     def _policy_card_chunks(tenant_res: TenantResources, policy_version: str) -> list[dict[str, Any]]:
-        """Synthesize retrieval chunks from active policy cards.
+        # Body extracted to app.services.pipeline.prompt_blocks._policy_card_chunks
+        # (turn_router helpers pattern). The wrapper preserves the
+        # @staticmethod API for call sites and class-attribute monkeypatches.
+        from app.services.pipeline.prompt_blocks import _policy_card_chunks
 
-        These aren't real Qdrant results — they're the policy's own
-        ``source_text``, formatted to look like a chunk so the existing
-        ``_messages`` builder treats them as grounding context. Used as a
-        last-resort when Qdrant retrieval came up empty on a sensitive
-        cancellation/refund intent.
-        """
-        provider_status = dict(tenant_res.provider_status or {})
-        cards = provider_status.get(AGENT_POLICY_CARDS_KEY) or []
-        out: list[dict[str, Any]] = []
-        for card in cards:
-            if card.get("approval_status") not in (None, "approved"):
-                continue
-            if card.get("status") not in (None, "active", "ok"):
-                continue
-            if policy_version and card.get("policy_version") and card.get("policy_version") != policy_version:
-                continue
-            text = (card.get("source_text") or "").strip()
-            if not text:
-                # Build text from the structured conditions when source_text
-                # isn't preserved.
-                conds = card.get("conditions") or []
-                lines = [str(cond.get("customer_message") or "").strip() for cond in conds]
-                text = "\n".join(line for line in lines if line)
-            if not text:
-                continue
-            out.append(
-                {
-                    "document_id": str(card.get("document_id") or ""),
-                    "document_name": str(card.get("source_section_title") or "Policy"),
-                    "chunk_id": str(card.get("id") or ""),
-                    "text": text[:4000],
-                    "score": 1.0,
-                    "metadata": {
-                        "source_type": "agent_policy_card",
-                        "topic": card.get("topic"),
-                        "policy_version": card.get("policy_version"),
-                        "sensitivity": "sensitive",
-                        "source_title": card.get("source_section_title") or "Policy",
-                    },
-                }
-            )
-        return out
+        return _policy_card_chunks(tenant_res, policy_version)
 
     @staticmethod
     def _single_prompt_guidance(tenant_res: TenantResources) -> str:
@@ -994,392 +512,107 @@ class NokvoOneVoicePipeline:
         # (``agent_runtime_bundle._single_prompt_guidance``). Returning "" when
         # no legacy override is configured (the normal case now) lets the
         # built-in FSMs run.
-        provider_status = dict(tenant_res.provider_status or {})
-        config = provider_status.get(AGENT_SINGLE_PROMPT_CONFIG_KEY) or {}
-        if not isinstance(config, dict) or not config.get("enabled"):
-            return ""
-        prompt = str(config.get("prompt") or "").strip()
-        return prompt[:8000]
+        # Body extracted to app.services.pipeline.prompt_blocks._single_prompt_guidance
+        # (turn_router helpers pattern). The wrapper preserves the
+        # @staticmethod API for call sites and class-attribute monkeypatches.
+        from app.services.pipeline.prompt_blocks import _single_prompt_guidance
+
+        return _single_prompt_guidance(tenant_res)
 
     @staticmethod
     def _single_prompt_enabled(tenant_res: TenantResources) -> bool:
-        return bool(NokvoOneVoicePipeline._single_prompt_guidance(tenant_res))
+        # Body extracted to app.services.pipeline.prompt_blocks._single_prompt_enabled
+        # (turn_router helpers pattern). The wrapper preserves the
+        # @staticmethod API for call sites and class-attribute monkeypatches.
+        from app.services.pipeline.prompt_blocks import _single_prompt_enabled
+
+        return _single_prompt_enabled(NokvoOneVoicePipeline, tenant_res)
 
     @staticmethod
     async def _projects_block_for_bundle(
         db: AsyncSession | None,
         bundle: "RuntimeBundle",
     ) -> tuple[str, list]:
-        """Return ``(inventory_block, active_projects)`` for a real-estate org,
-        or ``("", [])`` otherwise.
+        # Body extracted to app.services.pipeline.prompt_blocks._projects_block_for_bundle
+        # (turn_router helpers pattern). The wrapper preserves the
+        # @staticmethod API for call sites and class-attribute monkeypatches.
+        from app.services.pipeline.prompt_blocks import _projects_block_for_bundle
 
-        The block is injected as its own top-level system section by the
-        voice prompt builder so the live agent treats it as the source of
-        truth for inventory questions (overriding any project names the
-        admin may have hardcoded into their single-prompt text). The project
-        list is handed back so callers can reuse it (project-name hints,
-        objection focus) without a second round-trip — the underlying
-        ``load_active_projects`` is uncached."""
-        if (bundle.organization_industry or "").lower() != "real_estate":
-            return "", []
-        organization_id = getattr(bundle.organization, "id", None)
-        if organization_id is None:
-            return "", []
-        try:
-            from app.services.real_estate_project_service import (
-                load_active_projects,
-                projects_prompt_section,
-            )
-
-            projects = await load_active_projects(db, organization_id)
-        except Exception:
-            return "", []
-        block = projects_prompt_section(projects)
-        # Append the org-wide site-visit working window so the live agent can
-        # refuse out-of-hours requests conversationally (the booking step also
-        # enforces it deterministically via the out-of-hours guard).
-        try:
-            from app.services.nokvo_one_assignment_service import working_hours_prompt_line
-
-            org_defaults = await NokvoOneAssignmentService.resolve_org_working_window(db, organization_id)
-            hours_line = working_hours_prompt_line(org_defaults)
-            if hours_line:
-                block = f"{block}\n\n{hours_line}" if block else hours_line
-        except Exception:
-            pass
-        return block, projects
+        return await _projects_block_for_bundle(db, bundle)
 
     @staticmethod
     async def _services_block_for_bundle(
         db: AsyncSession | None,
         bundle: "RuntimeBundle",
     ) -> str:
-        """Authoritative clinic SERVICES catalog block (services + which doctors
-        + price/duration) for a clinic org, else "". Injected as its own system
-        section so the agent quotes real services/doctors and routes booking
-        service-first. Loaded per-call (uncached) so edits reflect immediately."""
-        if (bundle.organization_industry or "").lower() != "clinics":
-            return ""
-        organization_id = getattr(bundle.organization, "id", None)
-        if organization_id is None:
-            return ""
-        try:
-            from app.services.clinic_service_service import (
-                load_services_with_providers,
-                services_prompt_section,
-            )
+        # Body extracted to app.services.pipeline.prompt_blocks._services_block_for_bundle
+        # (turn_router helpers pattern). The wrapper preserves the
+        # @staticmethod API for call sites and class-attribute monkeypatches.
+        from app.services.pipeline.prompt_blocks import _services_block_for_bundle
 
-            services = await load_services_with_providers(db, organization_id)
-        except Exception:
-            return ""
-        return services_prompt_section(services)
+        return await _services_block_for_bundle(db, bundle)
 
     @staticmethod
     def _focus_project_summary(
         projects: list,
         conversational_memory: Any,
     ) -> str | None:
-        """One-line summary of the project the caller named (matched from
-        FACT_PROPERTY), for the strategy layer's price/competitor objection
-        focus. ``None`` when no property is known or no confident match exists."""
-        if conversational_memory is None or not projects:
-            return None
-        try:
-            from app.services.conversational_memory import FACT_PROPERTY
-            from app.services.real_estate_project_service import (
-                find_project_match,
-                project_summary_lines,
-            )
+        # Body extracted to app.services.pipeline.prompt_blocks._focus_project_summary
+        # (turn_router helpers pattern). The wrapper preserves the
+        # @staticmethod API for call sites and class-attribute monkeypatches.
+        from app.services.pipeline.prompt_blocks import _focus_project_summary
 
-            spoken = conversational_memory.get(FACT_PROPERTY)
-            if not spoken:
-                return None
-            project = find_project_match(projects, project_name=str(spoken))
-            if project is None:
-                return None
-            lines = project_summary_lines([project])
-            return lines[0] if lines else None
-        except Exception:
-            return None
+        return _focus_project_summary(projects, conversational_memory)
 
     @staticmethod
     async def _voice_business_context(
         db: AsyncSession | None,
         tenant_res: TenantResources,
     ) -> tuple[Organization, dict[str, Any], list[dict[str, Any]]] | None:
-        """Resolve the ``(organization, overrides, custom_tabs)`` tuple via
-        the per-tenant :class:`RuntimeBundle` cache so repeat turns avoid a
-        DB round-trip and a custom_tabs rebuild."""
-        bundle = await get_runtime_bundle(db, tenant_res)
-        return bundle.as_business_context_tuple()
+        # Body extracted to app.services.pipeline.prompt_blocks._voice_business_context
+        # (turn_router helpers pattern). The wrapper preserves the
+        # @staticmethod API for call sites and class-attribute monkeypatches.
+        from app.services.pipeline.prompt_blocks import _voice_business_context
+
+        return await _voice_business_context(db, tenant_res)
 
     @staticmethod
     def _parse_appointment_date(value: Any, *, now: datetime | None = None) -> datetime.date:
-        raw = re.sub(r"\s+", " ", normalize_relative_datetime_text(str(value or "")).strip().lower())
-        local_now = (now or datetime.now(timezone.utc)).astimezone(_APPOINTMENT_LOCAL_TZ)
-        today = local_now.date()
-        if not raw:
-            raise _AppointmentToolInputError("preferred_date", "Which date should I note for the appointment?")
-        # ISO `YYYY-MM-DD` (or `YYYY-MM-DDTHH:MM:SS…`) — emitted by the
-        # slot-acceptance path and by any external integration. The legacy
-        # numeric regex below treats this as DD/MM and produces month=20
-        # nonsense, hence the explicit branch.
-        iso_match = re.match(r"^\s*(\d{4})-(\d{1,2})-(\d{1,2})", raw)
-        if iso_match:
-            try:
-                year = int(iso_match.group(1))
-                month = int(iso_match.group(2))
-                day = int(iso_match.group(3))
-                return datetime(year, month, day, tzinfo=_APPOINTMENT_LOCAL_TZ).date()
-            except ValueError:
-                pass
-        if "day after tomorrow" in raw:
-            return today + timedelta(days=2)
-        if "tomorrow" in raw:
-            return today + timedelta(days=1)
-        if "today" in raw:
-            return today
-        # "in/after N days" → concrete offset.
-        rel_days = re.search(r"\b(?:in|after)\s+(\d{1,2})\s+days?\b", raw)
-        if rel_days:
-            n = int(rel_days.group(1))
-            if 0 < n <= 60:
-                return today + timedelta(days=n)
-        # "this/next weekend" → the upcoming Saturday.
-        if "weekend" in raw:
-            delta = (5 - today.weekday()) % 7
-            return today + timedelta(days=delta or 7)
-        # Weekday name — word-boundary match (so "mondayish" doesn't match) and
-        # ALWAYS the upcoming occurrence, never today (fixes "Monday"/"next
-        # Monday" resolving to today when today is that weekday).
-        weekday_match = _WEEKDAY_RE.search(raw)
-        if weekday_match:
-            target = _WEEKDAY_INDEX[weekday_match.group(1)]
-            delta = (target - today.weekday()) % 7
-            if delta == 0:
-                delta = 7
-            return today + timedelta(days=delta)
+        # Body extracted to app.services.pipeline.appointments._parse_appointment_date
+        # (turn_router helpers pattern). The wrapper preserves the
+        # @staticmethod API for call sites and class-attribute monkeypatches.
+        from app.services.pipeline.appointments import _parse_appointment_date
 
-        numeric = re.search(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b", raw)
-        if numeric:
-            day = int(numeric.group(1))
-            month = int(numeric.group(2))
-            year = int(numeric.group(3) or today.year)
-            if year < 100:
-                year += 2000
-            try:
-                parsed = datetime(year, month, day, tzinfo=_APPOINTMENT_LOCAL_TZ).date()
-            except ValueError as exc:
-                raise _AppointmentToolInputError(
-                    "preferred_date",
-                    "That date does not look valid. Which date should I note?",
-                    clear_date=True,
-                ) from exc
-            return parsed if parsed >= today or numeric.group(3) else parsed.replace(year=parsed.year + 1)
-
-        named = re.search(r"\b(\d{1,2})(?:st|nd|rd|th)?\s+([a-z]+)(?:\s+(\d{2,4}))?\b", raw)
-        if not named:
-            named = re.search(r"\b([a-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s+(\d{2,4}))?\b", raw)
-            if named:
-                month_token, day_token, year_token = named.group(1), named.group(2), named.group(3)
-            else:
-                month_token = day_token = year_token = None
-        else:
-            day_token, month_token, year_token = named.group(1), named.group(2), named.group(3)
-        if day_token and month_token:
-            month = _MONTH_INDEX.get(month_token[:3], _MONTH_INDEX.get(month_token))
-            if month:
-                year = int(year_token or today.year)
-                if year < 100:
-                    year += 2000
-                try:
-                    parsed = datetime(year, month, int(day_token), tzinfo=_APPOINTMENT_LOCAL_TZ).date()
-                except ValueError as exc:
-                    raise _AppointmentToolInputError(
-                        "preferred_date",
-                        "That date does not look valid. Which date should I note?",
-                        clear_date=True,
-                    ) from exc
-                return parsed if parsed >= today or year_token else parsed.replace(year=parsed.year + 1)
-
-        # Bare day-of-month with an ordinal suffix: "the 15th", "15th", "on the 3rd".
-        # (Requires the suffix so a stray "15" isn't mistaken for a date.)
-        bare_dom = re.search(r"\b(?:on\s+the\s+|the\s+)?(\d{1,2})(?:st|nd|rd|th)\b", raw)
-        if bare_dom:
-            cand = _next_day_of_month(int(bare_dom.group(1)), today)
-            if cand is not None:
-                return cand
-            raise _AppointmentToolInputError(
-                "preferred_date",
-                "That date does not look valid. Which date should I note?",
-                clear_date=True,
-            )
-
-        # Spoken word ordinals: "first of July", "the twenty third". Longest
-        # phrase first so "twenty first" beats "first".
-        for word in sorted(_ORDINAL_WORDS, key=len, reverse=True):
-            if re.search(rf"\b{word}\b", raw):
-                day = _ORDINAL_WORDS[word]
-                month_for_word = None
-                for mname, mnum in _MONTH_INDEX.items():
-                    if re.search(rf"\b{mname}\b", raw):
-                        month_for_word = mnum
-                        break
-                if month_for_word is not None:
-                    try:
-                        cand = datetime(today.year, month_for_word, day, tzinfo=_APPOINTMENT_LOCAL_TZ).date()
-                    except ValueError:
-                        cand = None
-                    if cand is not None:
-                        return cand if cand >= today else cand.replace(year=cand.year + 1)
-                cand = _next_day_of_month(day, today)
-                if cand is not None:
-                    return cand
-                break
-
-        raise _AppointmentToolInputError(
-            "preferred_date",
-            "I need the appointment date clearly. Which date should I note?",
-            clear_date=True,
-        )
+        return _parse_appointment_date(value, now=now)
 
     @staticmethod
     def _parse_appointment_time(value: Any) -> time:
-        raw = re.sub(r"\s+", " ", normalize_relative_datetime_text(str(value or "")).strip().lower())
-        # STT often emits dotted meridiems ("8 p.m.", "9 a. m."). Collapse them to
-        # bare "pm"/"am" so the AM/PM matcher below (which needs a contiguous
-        # token) fires — otherwise "8 p.m." falls through and raises, and callers
-        # silently lose the time (e.g. the out-of-hours guard couldn't see 8 PM).
-        raw = re.sub(r"\b([ap])\.\s*m\.?", r"\1m", raw)
-        if not raw:
-            raise _AppointmentToolInputError("preferred_time", "What time should I note for the appointment?")
-        # Midnight is out of booking hours — clarify instead of resolving it (it
-        # used to substring-match "night" and book 7 PM).
-        if re.search(r"\bmidnight\b", raw):
-            raise _AppointmentToolInputError(
-                "preferred_time",
-                "We don't book at midnight — what daytime works for you?",
-                clear_time=True,
-            )
+        # Body extracted to app.services.pipeline.appointments._parse_appointment_time
+        # (turn_router helpers pattern). The wrapper preserves the
+        # @staticmethod API for call sites and class-attribute monkeypatches.
+        from app.services.pipeline.appointments import _parse_appointment_time
 
-        def _daytime_hour(h: int) -> int | None:
-            """Map a 1–12 spoken hour to 24h assuming a daytime booking
-            (8–11 → AM, 12 → noon, 1–7 → PM). Returns None when ambiguous."""
-            if h == 12:
-                return 12
-            if 8 <= h <= 11:
-                return h
-            if 1 <= h <= 7:
-                return h + 12
-            return None
-
-        # Spoken fractions: "half past 4", "quarter past 4", "quarter to 5".
-        half = re.search(r"\bhalf\s*past\s+(\d{1,2})\b", raw)
-        if half:
-            hh = _daytime_hour(int(half.group(1)))
-            if hh is not None:
-                return time(hh, 30)
-        qpast = re.search(r"\bquarter\s*past\s+(\d{1,2})\b", raw)
-        if qpast:
-            hh = _daytime_hour(int(qpast.group(1)))
-            if hh is not None:
-                return time(hh, 15)
-        qto = re.search(r"\bquarter\s*to\s+(\d{1,2})\b", raw)
-        if qto:
-            base = int(qto.group(1)) - 1
-            hh = _daytime_hour(base if base >= 1 else 12)
-            if hh is not None:
-                return time(hh, 45)
-
-        named_times = {
-            "morning": time(9, 0),
-            "afternoon": time(14, 0),
-            "evening": time(17, 0),
-            "night": time(19, 0),
-            "noon": time(12, 0),
-        }
-        for label, parsed in named_times.items():
-            if re.search(rf"\b{label}\b", raw):
-                return parsed
-        ampm = re.search(r"\b(\d{1,2})(?::([0-5]\d))?\s*(am|pm)\b", raw)
-        if ampm:
-            hour = int(ampm.group(1))
-            minute = int(ampm.group(2) or 0)
-            suffix = ampm.group(3)
-            if hour < 1 or hour > 12:
-                raise _AppointmentToolInputError(
-                    "preferred_time",
-                    "That time does not look valid. What time should I note?",
-                    clear_time=True,
-                )
-            if suffix == "pm" and hour != 12:
-                hour += 12
-            if suffix == "am" and hour == 12:
-                hour = 0
-            return time(hour, minute)
-        twenty_four = re.search(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", raw)
-        if twenty_four:
-            return time(int(twenty_four.group(1)), int(twenty_four.group(2)))
-        bare = re.fullmatch(r"(?:at\s+)?(\d{1,2})(?:\s*ish)?", raw)
-        if bare:
-            hour = int(bare.group(1))
-            if 13 <= hour <= 23:
-                return time(hour, 0)
-            inferred = _daytime_hour(hour)
-            if inferred is not None:
-                return time(inferred, 0)
-            raise _AppointmentToolInputError(
-                "preferred_time",
-                f"Just to confirm, is that {hour} AM or {hour} PM?",
-                clear_time=True,
-            )
-        raise _AppointmentToolInputError(
-            "preferred_time",
-            "I need the appointment time clearly. What time should I note?",
-            clear_time=True,
-        )
+        return _parse_appointment_time(value)
 
     @staticmethod
     def _appointment_datetime_iso(appointment: dict[str, Any]) -> str:
         # Fast path: caller already accepted a proposed slot, which left a
         # canonical UTC ISO on the appointment. Trust it and skip re-parsing.
-        proposed = appointment.get("appointment_time")
-        if isinstance(proposed, str) and proposed:
-            try:
-                parsed = datetime.fromisoformat(proposed.replace("Z", "+00:00"))
-                if parsed.tzinfo is None:
-                    parsed = parsed.replace(tzinfo=timezone.utc)
-                if parsed.astimezone(_APPOINTMENT_LOCAL_TZ) > datetime.now(_APPOINTMENT_LOCAL_TZ):
-                    return parsed.astimezone(timezone.utc).isoformat()
-            except ValueError:
-                pass
-        local_date = NokvoOneVoicePipeline._parse_appointment_date(appointment.get("preferred_date"))
-        local_time = NokvoOneVoicePipeline._parse_appointment_time(appointment.get("preferred_time"))
-        local_dt = datetime.combine(local_date, local_time, tzinfo=_APPOINTMENT_LOCAL_TZ)
-        if local_dt <= datetime.now(_APPOINTMENT_LOCAL_TZ):
-            raise _AppointmentToolInputError(
-                "preferred_date",
-                "That appointment time is already past. Which future date and time should I note?",
-                clear_date=True,
-                clear_time=True,
-            )
-        return local_dt.astimezone(timezone.utc).isoformat()
+        # Body extracted to app.services.pipeline.appointments._appointment_datetime_iso
+        # (turn_router helpers pattern). The wrapper preserves the
+        # @staticmethod API for call sites and class-attribute monkeypatches.
+        from app.services.pipeline.appointments import _appointment_datetime_iso
+
+        return _appointment_datetime_iso(NokvoOneVoicePipeline, appointment)
 
     @staticmethod
     def _should_offer_sms_confirmation(tenant_res: TenantResources | None) -> bool:
-        """Return True only when the tenant has explicitly opted into the
-        end-of-booking SMS confirmation offer. The platform default is False
-        because SMS dispatch isn't wired in yet — offering a confirmation
-        that never arrives is a worse caller experience than offering
-        nothing. Tenants enable it via
-        ``provider_status['agent_offer_sms_confirmation'] = True`` once
-        their SMS gateway is connected."""
-        if tenant_res is None:
-            return bool(settings.NOKVO_AGENT_OFFER_SMS_CONFIRMATION)
-        override = (tenant_res.provider_status or {}).get("agent_offer_sms_confirmation")
-        if override is None:
-            return bool(settings.NOKVO_AGENT_OFFER_SMS_CONFIRMATION)
-        return bool(override)
+        # Body extracted to app.services.pipeline.appointments._should_offer_sms_confirmation
+        # (turn_router helpers pattern). The wrapper preserves the
+        # @staticmethod API for call sites and class-attribute monkeypatches.
+        from app.services.pipeline.appointments import _should_offer_sms_confirmation
+
+        return _should_offer_sms_confirmation(tenant_res)
 
     @staticmethod
     def _appointment_tool_answer(
@@ -1389,59 +622,12 @@ class NokvoOneVoicePipeline:
         language: str | None = None,
         offer_sms: bool = False,
     ) -> str:
-        patient = str(args.get("patient_name") or "the patient")
-        when = str(args.get("appointment_time") or "the requested time")
-        try:
-            parsed = datetime.fromisoformat(when.replace("Z", "+00:00"))
-            local_when = parsed.astimezone(_APPOINTMENT_LOCAL_TZ).strftime("%d %b %Y at %I:%M %p")
-        except Exception:
-            local_when = when
-        assignment_status = result.get("assignment_status")
-        assigned_name = result.get("assigned_member_name")
-        lang = SarvamVoiceService.normalize_language(language)
-        if lang == "te":
-            if assignment_status == "assigned" and assigned_name:
-                return (
-                    f"Appointment request create అయ్యింది for {patient} on {local_when}. "
-                    f"It has been assigned to {assigned_name}."
-                )
-            if assignment_status == "no_available_member":
-                return (
-                    f"Appointment request create అయ్యింది for {patient} on {local_when}. "
-                    "That slot note చేశాను, కానీ available doctor system లో కనిపించలేదు. "
-                    "Clinic team availability confirm చేస్తారు."
-                )
-            return (
-                f"Appointment request create అయ్యింది for {patient} on {local_when}. "
-                "Clinic team exact availability confirm చేస్తారు."
-            )
-        phone = str(args.get("phone") or "").strip()
-        # End-of-call SMS offer is opt-in: empty unless the tenant has
-        # wired SMS dispatch and toggled ``agent_offer_sms_confirmation``.
-        sms_offer = ""
-        if offer_sms and phone:
-            spoken_phone = " ".join(list(phone[-10:])) if phone[-10:].isdigit() else phone
-            if lang == "te":
-                sms_offer = f" {spoken_phone} కి confirmation SMS పంపాలా?"
-            elif lang == "hi":
-                sms_offer = f" क्या {spoken_phone} पर confirmation SMS भेज दूँ?"
-            else:
-                sms_offer = f" Want me to send a confirmation SMS to {spoken_phone}?"
-        if assignment_status == "assigned" and assigned_name:
-            return (
-                f"I have created the appointment request for {patient} on {local_when}. "
-                f"It has been assigned to {assigned_name}.{sms_offer}"
-            )
-        if assignment_status == "no_available_member":
-            return (
-                f"I have created the appointment request for {patient} on {local_when}. "
-                "That time is noted, but I could not find an available doctor in the system for that slot, "
-                f"so the clinic team will confirm availability.{sms_offer}"
-            )
-        return (
-            f"I have created the appointment request for {patient} on {local_when}. "
-            f"The clinic team can confirm exact availability.{sms_offer}"
-        )
+        # Body extracted to app.services.pipeline.appointments._appointment_tool_answer
+        # (turn_router helpers pattern). The wrapper preserves the
+        # @staticmethod API for call sites and class-attribute monkeypatches.
+        from app.services.pipeline.appointments import _appointment_tool_answer
+
+        return _appointment_tool_answer(result, args, language=language, offer_sms=offer_sms)
 
     @staticmethod
     async def _handle_availability_check(
@@ -1449,258 +635,12 @@ class NokvoOneVoicePipeline:
         db: AsyncSession | None,
         turn_policy: dict[str, Any],
     ) -> dict[str, Any] | None:
-        """Consult the scheduler when the caller asks "is X available?" /
-        "when can you book me?". Works across business types — picks the
-        right request_type from the active flow or the industry default.
-        Returns ``None`` when no scheduling-shaped flow applies (e.g.,
-        ecommerce ticket creation), so the pipeline can fall back to RAG."""
+        # Body extracted to app.services.pipeline.appointments._handle_availability_check
+        # (turn_router helpers pattern). The wrapper preserves the
+        # @staticmethod API for call sites and class-attribute monkeypatches.
+        from app.services.pipeline.appointments import _handle_availability_check
 
-        def _first_truthy(mapping: dict[str, Any], keys: tuple[str, ...]) -> Any:
-            for key in keys:
-                value = mapping.get(key)
-                if value:
-                    return value
-            return None
-
-        from app.services.nokvo_one_assignment_service import (
-            NokvoOneAssignmentService,
-            _aware_utc,
-        )
-
-        if db is None:
-            return None
-        context = await NokvoOneVoicePipeline._voice_business_context(db, tenant_res)
-        if context is None:
-            return None
-        organization, _overrides, _custom_tabs = context
-
-        # Identify the request_type to schedule against. Priority:
-        #   1) the active appointment FSM (clinics) → "appointment"
-        #   2) the active generic tool_flow → derived from flow_key
-        #   3) industry default
-        # If no scheduling-shaped flow applies, return None.
-        state_patch = turn_policy.get("state_patch") or {}
-        appointment = dict(state_patch.get("appointment") or {})
-        tool_flow_state = dict(state_patch.get("tool_flow") or {})
-        flow_key = str(tool_flow_state.get("flow_key") or "")
-        industry = (organization.industry or "").lower()
-        _FLOW_TO_REQUEST_TYPE = {
-            "real_estate_site_visit": "site_visit",
-        }
-        _INDUSTRY_DEFAULT = {
-            "clinics": "appointment",
-            "real_estate": "site_visit",
-            "hospitality": "callback",
-        }
-        request_type = _FLOW_TO_REQUEST_TYPE.get(flow_key) or _INDUSTRY_DEFAULT.get(industry)
-        if not request_type:
-            return None
-
-        entities = turn_policy.get("entities") or {}
-        language = turn_policy.get("language")
-
-        # Resolve the candidate datetime in priority order:
-        #   1) this turn's spoken date+time
-        #   2) the in-progress appointment slot values
-        #   3) "now" — caller asked "when can you book?" with no time
-        # Source of the requested time: this turn's entities, or the in-progress
-        # appointment / tool_flow slots, depending on which flow is active.
-        collected = dict(tool_flow_state.get("collected") or {})
-        date_slot_value = (
-            entities.get("date_text")
-            or appointment.get("preferred_date")
-            or _first_truthy(collected, ("visit_date", "callback_date", "preferred_date", "date"))
-        )
-        time_slot_value = (
-            entities.get("time_text")
-            or appointment.get("preferred_time")
-            or _first_truthy(collected, ("visit_time", "callback_time", "preferred_time", "time"))
-        )
-
-        # Tool_flow flows often store a combined "visit_at" / "callback_at" ISO
-        # string instead of split date/time — try those before falling back.
-        requested_at: datetime | None = None
-        if not (date_slot_value and time_slot_value):
-            for combined_key in ("visit_at", "callback_at", "confirm_at", "scheduled_at"):
-                combined = collected.get(combined_key)
-                if combined:
-                    try:
-                        parsed_combined = datetime.fromisoformat(
-                            str(combined).replace("Z", "+00:00")
-                        )
-                        requested_at = parsed_combined.astimezone(timezone.utc)
-                    except Exception:
-                        pass
-                    break
-
-        # Track whether the caller actually specified a time — used below to
-        # decide between "X is taken — next free is Y" (specific) and a
-        # cleaner "The next available slot is Y" (open-ended).
-        caller_specified_time = False
-        if requested_at is None and date_slot_value and time_slot_value:
-            try:
-                local_date = NokvoOneVoicePipeline._parse_appointment_date(date_slot_value)
-                local_time = NokvoOneVoicePipeline._parse_appointment_time(time_slot_value)
-                local_dt = datetime.combine(local_date, local_time, tzinfo=_APPOINTMENT_LOCAL_TZ)
-                requested_at = local_dt.astimezone(timezone.utc)
-                caller_specified_time = True
-            except (_AppointmentToolInputError, Exception):
-                requested_at = None
-        # Adaptive disambiguation: caller gave a date but no time. Use
-        # start-of-working-day (9 AM local) as the anchor so the scheduler
-        # surfaces the first free slot on that date.
-        if requested_at is None and date_slot_value and not time_slot_value:
-            try:
-                local_date = NokvoOneVoicePipeline._parse_appointment_date(date_slot_value)
-                local_dt = datetime.combine(local_date, time(9, 0), tzinfo=_APPOINTMENT_LOCAL_TZ)
-                requested_at = local_dt.astimezone(timezone.utc)
-            except Exception:
-                requested_at = None
-        if requested_at is None:
-            now_local = datetime.now(_APPOINTMENT_LOCAL_TZ)
-            # Round up to the next 15-minute mark — feels less robotic than
-            # "available at 14:37". Caller can refine afterwards.
-            minute = (now_local.minute // 15 + 1) * 15
-            if minute >= 60:
-                now_local = now_local.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-            else:
-                now_local = now_local.replace(minute=minute, second=0, microsecond=0)
-            requested_at = now_local.astimezone(timezone.utc)
-
-        # Load members + scheduling state.
-        members = await NokvoOneAssignmentService._load_members(db, organization.id)
-        settings_map = await NokvoOneAssignmentService._load_assignment_settings(db, organization.id)
-        clinic_map = await NokvoOneAssignmentService._load_clinic_settings(db, organization.id)
-        blocked_map = await NokvoOneAssignmentService._load_blocked_slots(db, organization.id)
-        records = await NokvoOneAssignmentService._load_request_records(db, organization.id)
-
-        _ROLE_LABEL = {
-            "clinics": "doctor",
-            "real_estate": "agent",
-            "hospitality": "host",
-        }
-        member_role_label = _ROLE_LABEL.get(industry, "team member")
-
-        # Walk every assignable member and collect their next available
-        # slot. We do NOT short-circuit on the first member: we explicitly
-        # want the slot CLOSEST to the caller's requested time, regardless
-        # of which member it belongs to. So "Member 2 at 10am" beats
-        # "Member 1 at 11am" when the caller asked for 10am — the second
-        # member's same-time slot is strictly preferred over the first
-        # member's next-time slot. Ties on shift_minutes are broken by
-        # active_load so a less-busy member wins, then by member creation
-        # order for full determinism.
-        candidates: list[tuple[int, int, datetime, str]] = []
-        for member in members:
-            settings = settings_map.get(member.id)
-            if settings is None or not settings.is_assignable:
-                continue
-            if request_type not in set(settings.request_types or []):
-                continue
-            member_blocks = list(blocked_map.get(member.id, []))
-            member_blocks.extend(blocked_map.get("_org_wide", []))  # type: ignore[arg-type]
-            slot = NokvoOneAssignmentService._find_next_available_slot(
-                member_id=member.id,
-                requested_at=_aware_utc(requested_at),
-                settings=settings,
-                clinic_settings=clinic_map.get(member.id) if industry == "clinics" else None,
-                blocked_slots=member_blocks,
-                records=records,
-                exclude_record_id=None,
-            )
-            if slot is None:
-                continue
-            when_utc, shift_min = slot
-            active_load = NokvoOneAssignmentService._active_load(records, member.id)
-            candidates.append(
-                (
-                    shift_min,
-                    active_load,
-                    when_utc,
-                    member.full_name or f"the on-call {member_role_label}",
-                )
-            )
-
-        best: tuple[datetime, int, str] | None = None
-        if candidates:
-            # Time-first ordering. Same as the canonical sort in
-            # assign_request, so the slot we propose to the caller
-            # matches what the booking would actually pick.
-            candidates.sort(key=lambda c: (c[0], c[1]))
-            shift_min, _load, when_utc, member_name = candidates[0]
-            best = (when_utc, shift_min, member_name)
-
-        if best is None:
-            answer = (
-                "I checked the calendar and nothing fits within the working hours. "
-                "Could you share another date or time?"
-            )
-            patch: dict[str, Any] = {}
-            if appointment:
-                patch["appointment"] = appointment
-            if tool_flow_state:
-                patch["tool_flow"] = tool_flow_state
-            return {
-                "answer": answer,
-                "state_patch": patch,
-                "state_slot": "availability_check_empty",
-                "route_reason": "scheduler returned no slot",
-                "tool_calls": [],
-            }
-
-        when_utc, shift_min, member_name = best
-        when_local = when_utc.astimezone(_APPOINTMENT_LOCAL_TZ)
-        when_label = when_local.strftime("%d %b at %I:%M %p").lstrip("0")
-        if shift_min == 0:
-            answer = (
-                f"Yes, {when_label} is open with {member_name}. "
-                "Want me to lock that in?"
-            )
-            slot_label = "availability_exact"
-        elif caller_specified_time:
-            # Caller named a specific time — acknowledge it's taken and
-            # propose the next free slot.
-            requested_local = requested_at.astimezone(_APPOINTMENT_LOCAL_TZ)
-            requested_label = requested_local.strftime("%d %b at %I:%M %p").lstrip("0")
-            answer = (
-                f"{requested_label} is taken — the next free slot is {when_label} with {member_name}. "
-                "Want me to book that?"
-            )
-            slot_label = "availability_next"
-        else:
-            # Caller asked open-endedly ("when is it available?"). The
-            # "X is taken" preamble makes no sense here — just lead with
-            # the proposal.
-            answer = (
-                f"The next available slot is {when_label} with {member_name}. "
-                "Want me to book that?"
-            )
-            slot_label = "availability_next"
-
-        # Stash the offered slot on whichever flow is active. The follow-up
-        # turn's policy looks at awaiting_slot_confirm in both shapes.
-        if appointment or industry == "clinics":
-            appointment["proposed_slot_utc"] = when_utc.isoformat()
-            appointment["proposed_slot_label"] = when_label
-            appointment["awaiting_slot_confirm"] = True
-            appointment["active"] = True
-        elif tool_flow_state:
-            tool_flow_state["proposed_slot_utc"] = when_utc.isoformat()
-            tool_flow_state["proposed_slot_label"] = when_label
-            tool_flow_state["awaiting_slot_confirm"] = True
-            tool_flow_state["active"] = True
-        patch: dict[str, Any] = {}
-        if appointment:
-            patch["appointment"] = appointment
-        if tool_flow_state:
-            patch["tool_flow"] = tool_flow_state
-        return {
-            "answer": answer,
-            "state_patch": patch,
-            "state_slot": slot_label,
-            "route_reason": "scheduler answered availability question",
-            "tool_calls": [],
-        }
+        return await _handle_availability_check(NokvoOneVoicePipeline, tenant_res, db, turn_policy)
 
     @staticmethod
     async def _maybe_execute_turn_policy_action(
@@ -1709,207 +649,12 @@ class NokvoOneVoicePipeline:
         db: AsyncSession | None,
         turn_policy: dict[str, Any],
     ) -> dict[str, Any] | None:
-        if turn_policy.get("intent") == "availability_check":
-            return await NokvoOneVoicePipeline._handle_availability_check(
-                tenant_res, db, turn_policy
-            )
-        if turn_policy.get("intent") != "appointment_flow" or turn_policy.get("state_slot") != "complete":
-            return None
-        appointment = dict(((turn_policy.get("state_patch") or {}).get("appointment") or {}))
-        if appointment.get("created_record_id"):
-            return None
+        # Body extracted to app.services.pipeline.appointments._maybe_execute_turn_policy_action
+        # (turn_router helpers pattern). The wrapper preserves the
+        # @staticmethod API for call sites and class-attribute monkeypatches.
+        from app.services.pipeline.appointments import _maybe_execute_turn_policy_action
 
-        context = await NokvoOneVoicePipeline._voice_business_context(db, tenant_res)
-        if context is None:
-            return None
-        organization, overrides, custom_tabs = context
-        if organization.industry != "clinics":
-            return None
-        catalog = resolve_index(organization.industry, overrides, custom_tabs)
-        tool = catalog.get("appointments_create")
-        if tool is None:
-            return None
-
-        # Snapshot the FK primitive now (tenant_res is still fresh — nothing has
-        # committed/rolled back yet). The fresh-session retry below rolls back on
-        # failure, which expires tenant_res's attributes; re-reading them would
-        # trigger a sync ORM reload outside the greenlet (MissingGreenlet).
-        org_id = getattr(tenant_res, "organization_id")
-
-        try:
-            appointment_time = NokvoOneVoicePipeline._appointment_datetime_iso(appointment)
-        except _AppointmentToolInputError as exc:
-            appointment["completed"] = False
-            appointment["pending_slot"] = exc.slot
-            if exc.clear_date:
-                appointment["preferred_date"] = None
-            if exc.clear_time:
-                appointment["preferred_time"] = None
-            return {
-                "answer": exc.answer,
-                "state_patch": {"appointment": appointment},
-                "state_slot": exc.slot,
-                "route_reason": "appointment needs exact scheduling detail",
-                "tool_calls": [],
-            }
-
-        args = {
-            "patient_name": appointment["patient_name"],
-            "phone": appointment["phone"],
-            "appointment_time": appointment_time,
-            "reason": appointment["reason"],
-        }
-        # Service-first routing (clinics): the captured service text is passed
-        # to the booking tool, which resolves it to the doctors who provide it
-        # and constrains assignment to them. Optional — omitted when not asked.
-        _svc = appointment.get("service")
-        if isinstance(_svc, str) and _svc.strip():
-            args["service"] = _svc.strip()[:200]
-        # Confirmation / audit metadata is patched onto the created record
-        # *after* execution (it'd be rejected by the tool's strict
-        # additionalProperties:false schema if passed as args).
-        record_metadata: dict[str, Any] = {}
-        for key in ("confirmations", "audit_trail", "proposed_slot_accepted"):
-            value = appointment.get(key)
-            if value:
-                record_metadata[key] = value
-        # Inline retry + graceful fallback. Retry count + delay come from the
-        # canonical agent spec (:class:`RetryPolicy`) — not hardcoded.
-        from app.services.agent_spec import RETRY_POLICY
-        from app.db.session import AsyncSessionLocal
-
-        result = None
-        last_exc: Exception | None = None
-        max_inline_attempts = 1 + RETRY_POLICY.inline_retries
-        for attempt in range(max_inline_attempts):
-            # First attempt uses the shared call session (tests assert
-            # on its commit flag). Retries use a fresh AsyncSession to
-            # sidestep greenlet_spawn / session-corruption issues that
-            # the long-lived call session can accumulate across many turns.
-            use_fresh_session = attempt > 0
-            try:
-                if use_fresh_session:
-                    async with AsyncSessionLocal() as tool_db:
-                        result = await PredefinedToolsService.execute(
-                            tool_db,
-                            org_id,
-                            None,
-                            tool,
-                            args,
-                            session_id=call_id,
-                        )
-                        await tool_db.commit()
-                else:
-                    result = await PredefinedToolsService.execute(
-                        db,
-                        org_id,
-                        None,
-                        tool,
-                        args,
-                        session_id=call_id,
-                    )
-                    await db.commit()
-                last_exc = None
-                break
-            except Exception as exc:  # noqa: BLE001 — voice tool entry, broad catch by design
-                last_exc = exc
-                logger.warning(
-                    "NOKVO-APPT: %s failed (attempt %s/%s, fresh_session=%s): %r",
-                    tool.key,
-                    attempt + 1,
-                    max_inline_attempts,
-                    use_fresh_session,
-                    exc,
-                    exc_info=True,
-                )
-                if not use_fresh_session and db is not None:
-                    try:
-                        await db.rollback()
-                    except Exception:
-                        pass
-                if attempt < max_inline_attempts - 1:
-                    await asyncio.sleep(RETRY_POLICY.inline_delay_seconds)
-        if result is None:
-            # Inline retries exhausted — persist to the retry queue so a
-            # worker / admin / cron can pick it back up once the underlying
-            # issue clears. The caller's data is *not* lost.
-            try:
-                from app.services.tool_retry_service import ToolRetryService
-
-                await ToolRetryService.enqueue(
-                    db,
-                    organization_id=org_id,
-                    tool_key=tool.key,
-                    arguments=args,
-                    context={
-                        "call_id": call_id,
-                        "language": turn_policy.get("language"),
-                        "intent": "appointment",
-                    },
-                    last_error=str(last_exc) if last_exc else None,
-                )
-            except Exception:
-                pass
-            appointment["completed"] = False
-            appointment["pending_slot"] = None
-            appointment["needs_callback"] = True
-            from app.services.flow_session import append_audit_trail
-            append_audit_trail(appointment, "tool_retry_enqueued", detail=str(last_exc)[:200] if last_exc else None)
-            lang = SarvamVoiceService.normalize_language(turn_policy.get("language"))
-            if lang == "te":
-                fallback = (
-                    "I have all the details, kāni system temporarily unavailable. "
-                    "Clinic team mīkū call back chestāru same number ki."
-                )
-            elif lang == "hi":
-                fallback = (
-                    "मेरे पास सारी जानकारी है, पर सिस्टम अभी temporarily unavailable है. "
-                    "Clinic team आपके इसी नंबर पर call back करेगी."
-                )
-            else:
-                fallback = (
-                    "I have all your details, but I'm having trouble saving them right now. "
-                    "The clinic team will call you back on this number to confirm — your booking won't be missed."
-                )
-            return {
-                "answer": fallback,
-                "state_patch": {"appointment": appointment},
-                "state_slot": "tool_error",
-                "route_reason": "appointment tool failed after retry",
-                "tool_calls": [
-                    {"tool": tool.key, "arguments": args, "ok": False, "error": str(last_exc)[:240]},
-                ],
-            }
-
-        appointment.update(
-            {
-                "active": False,
-                "completed": True,
-                "pending_slot": None,
-                "appointment_time": appointment_time,
-                "created_record_id": result.get("id"),
-                "assignment_status": result.get("assignment_status"),
-                "assigned_member_name": result.get("assigned_member_name"),
-            }
-        )
-        # Patch the persisted record with confirmation/audit metadata so
-        # downstream consumers see what the caller actually confirmed.
-        if record_metadata and result.get("id") and db is not None:
-            await NokvoOneVoicePipeline._patch_record_metadata(
-                db, result["id"], record_metadata
-            )
-        return {
-            "answer": NokvoOneVoicePipeline._appointment_tool_answer(
-                result,
-                args,
-                language=turn_policy.get("language"),
-                offer_sms=NokvoOneVoicePipeline._should_offer_sms_confirmation(tenant_res),
-            ),
-            "state_patch": {"appointment": appointment},
-            "state_slot": "complete",
-            "route_reason": "appointment tool executed",
-            "tool_calls": [{"tool": tool.key, "arguments": args, "result": result}],
-        }
+        return await _maybe_execute_turn_policy_action(NokvoOneVoicePipeline, tenant_res, call_id, db, turn_policy)
 
     @staticmethod
     def _map_lead_data_to_ticket_shape(data: dict[str, Any], industry: str | None) -> dict[str, Any]:
@@ -4437,26 +3182,12 @@ class NokvoOneVoicePipeline:
         language: str,
         project_names: list[str] | None = None,
     ) -> str:
-        """Build the "use these exact phrasings" prompt block from the
-        per-tenant runtime bundle. Empty string when no record-creation
-        fields are configured — keeps the prompt lean for inbound calls
-        that aren't collecting structured records.
+        # Body extracted to app.services.pipeline.prompt_blocks._field_questions_prompt_for_bundle
+        # (turn_router helpers pattern). The wrapper preserves the
+        # @staticmethod API for call sites and class-attribute monkeypatches.
+        from app.services.pipeline.prompt_blocks import _field_questions_prompt_for_bundle
 
-        ``project_names`` (real-estate only) is the live DB list and is
-        substituted into the Project slot's question so the LLM can't fall
-        back to a project list baked into the admin's single prompt.
-        """
-        try:
-            catalog = build_tool_flow_questions(
-                bundle.organization_industry,
-                bundle.overrides,
-                bundle.custom_tabs,
-            )
-        except Exception:
-            return ""
-        return format_field_questions_prompt(
-            catalog, language=language, project_names=project_names
-        )
+        return _field_questions_prompt_for_bundle(bundle, language=language, project_names=project_names)
 
     @staticmethod
     async def stream_answer_sentences(
