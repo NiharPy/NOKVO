@@ -122,6 +122,9 @@ from app.services.pipeline.appointments import (  # noqa: F401
 from app.services.pipeline.retrieval import (  # noqa: F401
     _SENSITIVE_OR_DYNAMIC_RE,
 )
+from app.services.pipeline.real_estate_leads import (  # noqa: F401
+    _MULTILINGUAL_DISINTEREST_PHRASES,
+)
 
 
 
@@ -135,23 +138,6 @@ _SMALLTALK_RE = re.compile(
     re.IGNORECASE,
 )
 _ORDER_CONTEXT_RE = re.compile(r"\b(order|delivery|shipment|ఆర్డర్|డెలివరీ)\b", re.IGNORECASE)
-
-# Unambiguous "not interested / don't want it" phrases for the multilingual
-# capture-block backstop (``_real_estate_opt_out``). STT emits native script for
-# te/hi, so we substring-match those directly; romanized forms cover transliteration.
-# A disinterested prospect must NEVER be captured as a lead, in any language.
-_MULTILINGUAL_DISINTEREST_PHRASES = (
-    # Hindi (native)
-    "नहीं चाहिए", "नही चाहिए", "इंटरेस्ट नहीं", "interest नहीं", "ज़रूरत नहीं",
-    "जरूरत नहीं", "रहने दो", "मत करो", "मत कीजिए", "नहीं भाई",
-    # Hindi (romanized)
-    "nahi chahiye", "nahin chahiye", "interest nahi", "zaroorat nahi",
-    "zarurat nahi", "rehne do", "mat karo",
-    # Telugu (native)
-    "వద్దు", "ఇంటరెస్ట్ లేదు", "interest లేదు", "అవసరం లేదు", "అక్కర్లేదు",
-    # Telugu (romanized)
-    "vaddu", "interest ledu", "avasaram ledu", "akkarledu",
-)
 _LOCATION_EXPLICIT_RE = re.compile(
     "|".join([
         r"\b(location|address|directions?|area|branch|clinic|hospital|where\s+(?:are|is)\s+(?:you|it|the))\b",
@@ -658,55 +644,12 @@ class NokvoOneVoicePipeline:
 
     @staticmethod
     def _map_lead_data_to_ticket_shape(data: dict[str, Any], industry: str | None) -> dict[str, Any]:
-        """Project the lead-shaped fields onto the keys the ticket schema
-        expects so the Tickets tab renders populated cells rather than blank
-        ones. Per business-template:
+        # Body extracted to app.services.pipeline.real_estate_leads._map_lead_data_to_ticket_shape
+        # (turn_router helpers pattern; wrapper preserves the class API
+        # and class-attribute monkeypatches).
+        from app.services.pipeline.real_estate_leads import _map_lead_data_to_ticket_shape
 
-        * real_estate tickets need ``customer``, ``issue_type``, ``priority``
-          (the lead has ``name``, ``phone``, ``visit_date``).
-        * clinics tickets need ``subject``, ``customer``, ``priority``.
-        * ecommerce / hospitality follow the same name → customer convention.
-
-        We only ADD; existing data is preserved so anything downstream that
-        was looking for the old keys still finds them.
-        """
-        merged = dict(data or {})
-        ind = (industry or "").lower()
-
-        # Common "customer" alias from whatever name-like field the lead had.
-        customer = (
-            merged.get("customer")
-            or merged.get("name")
-            or merged.get("customer_name")
-            or merged.get("patient_name")
-            or merged.get("guest_name")
-            or merged.get("contact_name")
-        )
-        if customer and not merged.get("customer"):
-            merged["customer"] = customer
-
-        # Default priority / issue_type / subject so the required ticket
-        # columns aren't empty. We err on the safe side ("normal") and let
-        # the operator re-classify in the dashboard if needed.
-        merged.setdefault("priority", "normal")
-        if ind == "real_estate":
-            merged.setdefault("issue_type", "site_visit")
-            # "Property" column → prefer the matched project name (what the
-            # caller is actually visiting); fall back to the free-text area.
-            if not merged.get("property_id"):
-                property_value = merged.get("project_name") or merged.get("location")
-                if property_value:
-                    merged["property_id"] = property_value
-        elif ind == "clinics":
-            merged.setdefault("subject", merged.get("care_need") or merged.get("reason") or "Patient request")
-            merged.setdefault("priority", "normal")
-        elif ind == "ecommerce":
-            merged.setdefault("subject", merged.get("subject") or merged.get("issue_summary") or "Customer inquiry")
-            merged.setdefault("issue_type", merged.get("issue_type") or "support_request")
-        elif ind == "hospitality":
-            merged.setdefault("subject", merged.get("subject") or "Guest inquiry")
-            merged.setdefault("reservation_id", merged.get("reservation_id") or merged.get("booking_id"))
-        return merged
+        return _map_lead_data_to_ticket_shape(data, industry)
 
     @staticmethod
     async def _route_record_by_surface(
@@ -717,99 +660,42 @@ class NokvoOneVoicePipeline:
         industry: str | None = None,
         force_ticket: bool = False,
     ) -> None:
-        """Decide which tab a macro-created record belongs in.
+        # Body extracted to app.services.pipeline.real_estate_leads._route_record_by_surface
+        # (turn_router helpers pattern; wrapper preserves the class API
+        # and class-attribute monkeypatches).
+        from app.services.pipeline.real_estate_leads import _route_record_by_surface
 
-        Two rules, in priority order:
-
-        * ``force_ticket`` — the *action* is tab-defining. A booked site
-          visit always belongs in the Site Visits (tickets) tab no matter
-          who placed the call, so callers set this for action-routed flows
-          (e.g. ``real_estate_site_visit``). This is what the operator means
-          by "site visits go to the Site Visits tab" — it's about what the
-          caller booked, not the call direction.
-        * Otherwise fall back to the call-direction heuristic: inbound
-          callers reached out for help → tickets tab; outbound calls we
-          initiated → leads tab (the macro already creates leads there, so
-          outbound needs no rewrite).
-
-        When we do rewrite, we flip ``record_type`` from ``lead`` to
-        ``ticket`` AND project the data dict onto the ticket schema's
-        expected field keys so the UI renders populated cells (otherwise the
-        row looks blank and the operator thinks no record was created)."""
-        if not record_ids:
-            return
-        rewrite_to_ticket = force_ticket or call_surface == "voice_inbound"
-        if not rewrite_to_ticket:
-            return
-        from app.models.nokvo_one_tool_record import NokvoOneToolRecord
-        from app.services.nokvo_one_business_templates import STATUS_VOCABULARIES
-        from sqlalchemy import select
-        import uuid as _uuid
-
-        ticket_status = (
-            (STATUS_VOCABULARIES.get((industry or "").lower(), {}).get("tickets") or {}).get("initial")
-            or "open"
-        )
-        for rid in record_ids:
-            try:
-                rid_uuid = _uuid.UUID(str(rid))
-            except (TypeError, ValueError):
-                continue
-            try:
-                res = await db.execute(
-                    select(NokvoOneToolRecord).where(NokvoOneToolRecord.id == rid_uuid)
-                )
-                rec = res.scalars().first()
-                if rec is None or rec.record_type != "lead":
-                    continue
-                rec.record_type = "ticket"
-                rec.status = ticket_status
-                projected = NokvoOneVoicePipeline._map_lead_data_to_ticket_shape(rec.data or {}, industry)
-                projected["routed_from"] = "lead"
-                if call_surface:
-                    projected["call_surface"] = call_surface
-                rec.data = projected
-                db.add(rec)
-                await db.commit()
-            except Exception:
-                try:
-                    await db.rollback()
-                except Exception:
-                    pass
+        return await _route_record_by_surface(NokvoOneVoicePipeline, db, record_ids, call_surface=call_surface, industry=industry, force_ticket=force_ticket)
 
     @staticmethod
     def _campaign_contact(campaign_context: dict[str, Any] | None) -> dict[str, Any]:
-        contact = (campaign_context or {}).get("contact")
-        return contact if isinstance(contact, dict) else {}
+        # Body extracted to app.services.pipeline.real_estate_leads._campaign_contact
+        # (turn_router helpers pattern; wrapper preserves the class API
+        # and class-attribute monkeypatches).
+        from app.services.pipeline.real_estate_leads import _campaign_contact
+
+        return _campaign_contact(campaign_context)
 
     @staticmethod
     def _phone_from_call_context(
         memory: dict[str, Any],
         campaign_context: dict[str, Any] | None,
     ) -> str:
-        contact = NokvoOneVoicePipeline._campaign_contact(campaign_context)
-        raw = (
-            memory.get("phone")
-            or contact.get("phone")
-            or contact.get("phone_e164")
-            or (campaign_context or {}).get("from_phone")
-            or (campaign_context or {}).get("to_phone")
-            or ""
-        )
-        digits = re.sub(r"\D", "", str(raw))
-        if len(digits) >= 10:
-            return digits[-10:]
-        return str(raw).strip()
+        # Body extracted to app.services.pipeline.real_estate_leads._phone_from_call_context
+        # (turn_router helpers pattern; wrapper preserves the class API
+        # and class-attribute monkeypatches).
+        from app.services.pipeline.real_estate_leads import _phone_from_call_context
+
+        return _phone_from_call_context(NokvoOneVoicePipeline, memory, campaign_context)
 
     @staticmethod
     def _budget_number(value: Any) -> float | None:
-        match = re.search(r"([0-9]+(?:\.[0-9]+)?)", str(value or "").replace(",", ""))
-        if not match:
-            return None
-        try:
-            return float(match.group(1))
-        except ValueError:
-            return None
+        # Body extracted to app.services.pipeline.real_estate_leads._budget_number
+        # (turn_router helpers pattern; wrapper preserves the class API
+        # and class-attribute monkeypatches).
+        from app.services.pipeline.real_estate_leads import _budget_number
+
+        return _budget_number(value)
 
     @staticmethod
     @staticmethod
@@ -818,31 +704,12 @@ class NokvoOneVoicePipeline:
         memory: dict[str, Any],
         history: list[dict[str, str]],
     ) -> bool:
-        """True when the caller explicitly opted out — wrong number / do-not-call
-        / not interested. Such callers must NEVER become a follow-up-eligible
-        lead (DND/TRAI). Checks both the extracted objection and recent caller
-        utterances."""
-        blob = str(memory.get("objection") or "").lower()
-        user_text = " ".join(
-            str(turn.get("content") or "")
-            for turn in (history or [])[-12:]
-            if turn.get("role") == "user"
-        ).lower()
-        combined = f"{blob} {user_text}"
-        if re.search(
-            r"\b(not interested|don'?t call|do not call|do-not-call|remove me|"
-            r"wrong number|stop calling|take me off|unsubscribe|not looking|"
-            r"don'?t need|do not need|not needed|leave me alone)\b",
-            combined,
-        ):
-            return True
-        # Multilingual disinterest backstop: STT emits NATIVE script for te/hi, so
-        # match those directly (``\b`` is unreliable on non-ASCII). Romanized forms
-        # too, in case the caller's words were transliterated. Kept to UNAMBIGUOUS
-        # refusal phrases — we'd rather not-capture a borderline case than capture a
-        # disinterested one (an explicit product requirement). ``combined`` is
-        # already lowercased; native script is unaffected by ``.lower()``.
-        return any(p in combined for p in _MULTILINGUAL_DISINTEREST_PHRASES)
+        # Body extracted to app.services.pipeline.real_estate_leads._real_estate_opt_out
+        # (turn_router helpers pattern; wrapper preserves the class API
+        # and class-attribute monkeypatches).
+        from app.services.pipeline.real_estate_leads import _real_estate_opt_out
+
+        return _real_estate_opt_out(memory=memory, history=history)
 
     def _real_estate_interest_signal(
         *,
@@ -851,50 +718,24 @@ class NokvoOneVoicePipeline:
         call_surface: str | None,
         outbound_context: OutboundCampaignContext | None,
     ) -> bool:
-        objection = str(memory.get("objection") or "").lower()
-        if re.search(r"\b(not interested|don't call|do not call|remove me|wrong number)\b", objection):
-            return False
-        if any(memory.get(key) for key in (
-            "purpose", "bhk", "budget", "timeline", "location_preference",
-            "visit_preference", "requested_info",
-        )):
-            return True
-        user_text = " ".join(
-            str(turn.get("content") or "")
-            for turn in history[-12:]
-            if turn.get("role") == "user"
-        ).lower()
-        if re.search(
-            r"\b(property|flat|apartment|villa|plot|bhk|site\s+visit|brochure|"
-            r"pricing|price|cost|floor\s*plan|details?|rera|interested|investment|self[-\s]?use)\b",
-            user_text,
-        ):
-            return True
-        # Outbound calls should not create a lead just because the opener ran.
-        # Require at least one customer utterance beyond a tiny permission reply.
-        if call_surface == "voice_outbound" and outbound_context is not None:
-            substantial_user_turns = [
-                str(turn.get("content") or "").strip()
-                for turn in history[-12:]
-                if turn.get("role") == "user" and len(str(turn.get("content") or "").split()) > 2
-            ]
-            return bool(substantial_user_turns)
-        return False
+        # Body extracted to app.services.pipeline.real_estate_leads._real_estate_interest_signal
+        # (turn_router helpers pattern; wrapper preserves the class API
+        # and class-attribute monkeypatches).
+        from app.services.pipeline.real_estate_leads import _real_estate_interest_signal
+
+        return _real_estate_interest_signal(memory=memory, history=history, call_surface=call_surface, outbound_context=outbound_context)
 
     @staticmethod
     def _real_estate_memory_from_history(
         memory: dict[str, Any],
         history: list[dict[str, str]],
     ) -> dict[str, Any]:
-        merged = dict(memory or {})
-        for turn in (history or [])[-16:]:
-            if turn.get("role") != "user":
-                continue
-            merged = update_outbound_memory(
-                merged,
-                caller_text=str(turn.get("content") or ""),
-            )
-        return merged
+        # Body extracted to app.services.pipeline.real_estate_leads._real_estate_memory_from_history
+        # (turn_router helpers pattern; wrapper preserves the class API
+        # and class-attribute monkeypatches).
+        from app.services.pipeline.real_estate_leads import _real_estate_memory_from_history
+
+        return _real_estate_memory_from_history(memory, history)
 
     @staticmethod
     def _lead_args_from_call_memory(
@@ -903,23 +744,12 @@ class NokvoOneVoicePipeline:
         campaign_context: dict[str, Any] | None,
         outbound_context: OutboundCampaignContext | None,
     ) -> dict[str, Any]:
-        contact = NokvoOneVoicePipeline._campaign_contact(campaign_context)
-        name = (
-            memory.get("name")
-            or contact.get("name")
-            or contact.get("full_name")
-            or contact.get("customer_name")
-            or "Property inquiry"
-        )
-        phone = NokvoOneVoicePipeline._phone_from_call_context(memory, campaign_context)
-        # A lead is name + phone only. The rest of the conversation (BHK, budget,
-        # area, intent) is captured in the post-call "call notes"
-        # (data.handoff_note), not as structured lead fields.
-        args: dict[str, Any] = {
-            "name": str(name).strip()[:200] or "Property inquiry",
-            "phone": phone,
-        }
-        return {key: value for key, value in args.items() if value not in (None, "")}
+        # Body extracted to app.services.pipeline.real_estate_leads._lead_args_from_call_memory
+        # (turn_router helpers pattern; wrapper preserves the class API
+        # and class-attribute monkeypatches).
+        from app.services.pipeline.real_estate_leads import _lead_args_from_call_memory
+
+        return _lead_args_from_call_memory(NokvoOneVoicePipeline, memory=memory, campaign_context=campaign_context, outbound_context=outbound_context)
 
     @staticmethod
     def _site_visit_args_from_call_state(
@@ -931,119 +761,12 @@ class NokvoOneVoicePipeline:
         memory: dict[str, Any],
         campaign_context: dict[str, Any] | None,
     ) -> dict[str, Any] | None:
-        """Build ``qualify_lead_and_schedule_visit`` args when the call holds a
-        FIRM site-visit booking — name + phone + a parseable visit date AND
-        time. Returns ``None`` for enquiry / vague calls (no firm date/time) so
-        those stay leads. Used by the end-of-call safety net so a booking the
-        deterministic flow didn't capture is filed as a Site Visit, not a Lead."""
-        try:
-            from app.services.conversational_memory import (
-                ConversationalMemory as _CM,
-                FACT_NAME as _FACT_NAME,
-                FACT_PHONE as _FACT_PHONE,
-                FACT_PROPERTY as _FACT_PROPERTY,
-                FACT_VISIT_DATE as _FACT_VISIT_DATE,
-                FACT_VISIT_TIME as _FACT_VISIT_TIME,
-            )
+        # Body extracted to app.services.pipeline.real_estate_leads._site_visit_args_from_call_state
+        # (turn_router helpers pattern; wrapper preserves the class API
+        # and class-attribute monkeypatches).
+        from app.services.pipeline.real_estate_leads import _site_visit_args_from_call_state
 
-            cm = _CM.from_state_blob((state or {}).get("memory") or {})
-        except Exception:
-            return None
-
-        collected = dict((state.get("tool_flow") or {}).get("collected") or {})
-
-        def _collected_by(predicate) -> Any:
-            for key, value in collected.items():
-                if value not in (None, "") and predicate(key):
-                    return value
-            return None
-
-        date_raw = cm.get(_FACT_VISIT_DATE) or _collected_by(lambda k: "date" in k.lower())
-        time_raw = cm.get(_FACT_VISIT_TIME) or _collected_by(lambda k: "time" in k.lower())
-        if not (date_raw and time_raw):
-            return None
-        # A firm booking needs a concrete date AND time. Vague input ("morning",
-        # "sometime next week") raises here, which correctly keeps it a lead.
-        try:
-            visit_date = NokvoOneVoicePipeline._parse_appointment_date(date_raw)
-            visit_time = NokvoOneVoicePipeline._parse_appointment_time(time_raw)
-        except Exception:
-            return None
-
-        name_val = (
-            cm.get(_FACT_NAME)
-            or memory.get("name")
-            or _collected_by(lambda k: "name" in k.lower())
-        )
-        phone_val = (
-            cm.get(_FACT_PHONE)
-            or NokvoOneVoicePipeline._phone_from_call_context(memory, campaign_context)
-        )
-        if not (name_val and phone_val):
-            return None
-
-        project_val = (
-            cm.get(_FACT_PROPERTY)
-            or _collected_by(lambda k: "project" in k.lower())
-            or collected.get("property_id")
-        )
-
-        visit_at = datetime.combine(
-            visit_date, visit_time, tzinfo=_APPOINTMENT_LOCAL_TZ
-        ).astimezone(timezone.utc).isoformat()
-
-        # Project record_data onto the org's configured Site Visit Fields so the
-        # Site Visits tab renders populated cells, mirroring the deterministic
-        # flow's construction.
-        canonical = {
-            "date": visit_date.isoformat(),
-            "time": visit_time.strftime("%I:%M %p").lstrip("0"),
-            # Combined "Date and Time" field (a single datetime slot) renders one
-            # human-readable cell. Mirrors the split date/time formatting above so
-            # the Site Visits tab shows the same values, just in one column.
-            "datetime": f"{visit_date.isoformat()} {visit_time.strftime('%I:%M %p').lstrip('0')}",
-            "name": str(name_val),
-            "phone": str(phone_val),
-            "project": str(project_val) if project_val else None,
-        }
-        record_data: dict[str, Any] = {}
-        try:
-            from app.services.tool_flow_questions import build_tool_flow_questions
-
-            sv_bundle = build_tool_flow_questions(
-                getattr(organization, "industry", None), overrides, custom_tabs
-            )
-            flow_slots = (
-                ((sv_bundle.get("flows") or {}).get("real_estate_site_visit") or {}).get("slots") or []
-            )
-            for slot in flow_slots:
-                kind = str(slot.get("kind") or "")
-                fkey = str(slot.get("source_field") or slot.get("key") or "")
-                value = canonical.get(kind)
-                if fkey and value not in (None, ""):
-                    record_data[fkey] = value
-        except Exception:
-            record_data = {}
-        if not record_data:
-            # Default real_estate Site Visit Fields.
-            record_data = {
-                "name": str(name_val),
-                "phone": str(phone_val),
-                "visit_date": canonical["date"],
-                "visit_time": canonical["time"],
-            }
-            if project_val:
-                record_data["project_name"] = str(project_val)
-
-        args: dict[str, Any] = {
-            "name": str(name_val),
-            "phone": str(phone_val),
-            "visit_at": visit_at,
-            "record_data": record_data,
-        }
-        if project_val not in (None, ""):
-            args["project_name"] = str(project_val)
-        return args
+        return _site_visit_args_from_call_state(NokvoOneVoicePipeline, state=state, organization=organization, overrides=overrides, custom_tabs=custom_tabs, memory=memory, campaign_context=campaign_context)
 
     @staticmethod
     async def _send_brochure_and_location_sms(
@@ -1053,86 +776,21 @@ class NokvoOneVoicePipeline:
         call_id: str,
         state: dict[str, Any],
     ) -> None:
-        """At call end, text the caller (their ANI) the project's brochure +
-        location links in ONE SMS. This is the inbound-real-estate delivery channel
-        while WhatsApp is off — the number is the one they're calling from, so
-        nothing is asked. Idempotent per call (``sms_sent``); best-effort — callers
-        wrap it so an SMS failure never affects the lead."""
-        ani = str((state or {}).get("caller_phone") or "").strip()
-        if not ani:
-            return
-        if state.get("sms_sent"):
-            return
-        from app.services.real_estate_project_service import (
-            find_project_match,
-            load_active_projects,
-        )
-        from app.services.sms_service import SmsService
+        # Body extracted to app.services.pipeline.real_estate_leads._send_brochure_and_location_sms
+        # (turn_router helpers pattern; wrapper preserves the class API
+        # and class-attribute monkeypatches).
+        from app.services.pipeline.real_estate_leads import _send_brochure_and_location_sms
 
-        projects = await load_active_projects(db, org_id)
-        if not projects:
-            return
-        # Resolve which project to send: the one the caller discussed (memory
-        # FACT_PROPERTY), else the sole active project. Never guess across many —
-        # the QUERY prompt asks which project before promising when there's >1.
-        captured = None
-        try:
-            from app.services.conversational_memory import (
-                ConversationalMemory as _CM,
-                FACT_PROPERTY as _FACT_PROPERTY,
-            )
-
-            captured = _CM.from_state_blob((state or {}).get("memory") or {}).get(_FACT_PROPERTY)
-        except Exception:
-            captured = None
-        matched = find_project_match(
-            projects, project_name=str(captured) if captured else None
-        )
-        if matched is None and len(projects) == 1:
-            matched = projects[0]
-        if matched is None:
-            return
-
-        # The two links: brochure (a column) + location maps URL (lives in the
-        # project's whatsapp.location config — reused as the SMS map link).
-        brochure_url = str(getattr(matched, "brochure_url", None) or "").strip()
-        wa_cfg = getattr(matched, "whatsapp", None) or {}
-        maps_url = str(((wa_cfg.get("location") or {}).get("maps_url")) or "").strip()
-        if not brochure_url and not maps_url:
-            return  # nothing to send
-
-        name = getattr(matched, "name", None) or "your enquiry"
-        parts = [f"Hi! Details for {name}:"]
-        if brochure_url:
-            parts.append(f"Brochure: {brochure_url}")
-        if maps_url:
-            parts.append(f"Location: {maps_url}")
-        text = " ".join(parts)
-
-        res = await SmsService.send_for_org(db, org_id, to_number=ani, text=text)
-        if res.get("ok"):
-            await AgentSessionStore.merge_state(tenant_res, call_id, {"sms_sent": True})
+        return await _send_brochure_and_location_sms(db, org_id, tenant_res, call_id, state)
 
     @staticmethod
     def _captured_project(state: dict[str, Any] | None, memory: dict[str, Any] | None) -> str | None:
-        """Project the caller is talking about, for the call note. Prefers the
-        outbound-memory dict, then the durable ConversationalMemory
-        FACT_PROPERTY (set by single-project auto-fill or a matched project
-        name) — the same state blob the name fallback reads."""
-        proj = str((memory or {}).get("property") or "").strip()
-        if proj:
-            return proj
-        try:
-            from app.services.conversational_memory import (
-                ConversationalMemory as _CM,
-                FACT_PROPERTY as _FACT_PROPERTY,
-            )
+        # Body extracted to app.services.pipeline.real_estate_leads._captured_project
+        # (turn_router helpers pattern; wrapper preserves the class API
+        # and class-attribute monkeypatches).
+        from app.services.pipeline.real_estate_leads import _captured_project
 
-            return str(
-                _CM.from_state_blob((state or {}).get("memory") or {}).get(_FACT_PROPERTY) or ""
-            ).strip() or None
-        except Exception:
-            return None
+        return _captured_project(state, memory)
 
     @staticmethod
     async def _resolve_inbound_project(
@@ -1142,41 +800,12 @@ class NokvoOneVoicePipeline:
         candidate: str | None,
         history: list[dict[str, str]] | None,
     ) -> tuple[str | None, str | None]:
-        """Resolve the site-visit's project to a REAL registered project, returning
-        ``(canonical_name, project_id)``.
+        # Body extracted to app.services.pipeline.real_estate_leads._resolve_inbound_project
+        # (turn_router helpers pattern; wrapper preserves the class API
+        # and class-attribute monkeypatches).
+        from app.services.pipeline.real_estate_leads import _resolve_inbound_project
 
-        The captured ``FACT_PROPERTY`` is heuristic and frequently grabs agent /
-        caller phrasing ("Show You The Site", "Or Did You Mean Another") rather
-        than a real project — storing that as the project is worse than storing
-        nothing. So we (1) fuzzy-match the candidate against the catalog, then
-        (2) scan recent caller turns for a real project mention, and only return
-        a project when it actually matches a registered one. Returns
-        ``(None, None)`` rather than echo garbage back onto the ticket."""
-        try:
-            from app.services.real_estate_project_service import (
-                find_project_match,
-                load_active_projects,
-            )
-
-            projects = await load_active_projects(db, org_id)
-        except Exception:
-            return None, None
-        if not projects:
-            cand = str(candidate or "").strip()
-            return (cand or None), None
-        matched = find_project_match(projects, project_name=candidate) if candidate else None
-        if matched is None:
-            for turn in reversed((history or [])[-12:]):
-                if turn.get("role") != "user":
-                    continue
-                matched = find_project_match(projects, project_name=str(turn.get("content") or ""))
-                if matched is not None:
-                    break
-        if matched is None and len(projects) == 1:
-            matched = projects[0]
-        if matched is not None:
-            return matched.name, str(matched.id)
-        return None, None
+        return await _resolve_inbound_project(db, org_id, candidate=candidate, history=history)
 
     @staticmethod
     def _deterministic_call_note(
@@ -1188,50 +817,12 @@ class NokvoOneVoicePipeline:
         history: list[dict[str, str]],
         project: str | None = None,
     ) -> str:
-        """Plain-prose fallback call note built deterministically from captured
-        facts, written SYNCHRONOUSLY at record creation so a flaky post-call LLM
-        condenser can never leave the record noteless. The background condenser
-        overwrites this with a richer summary when it succeeds. Shaped so
-        ``REAgentScheduler``'s extractor can still read the visit date/time."""
-        from app.services.voice_turn_policy import extract_datetime_phrase
+        # Body extracted to app.services.pipeline.real_estate_leads._deterministic_call_note
+        # (turn_router helpers pattern; wrapper preserves the class API
+        # and class-attribute monkeypatches).
+        from app.services.pipeline.real_estate_leads import _deterministic_call_note
 
-        mem = memory or {}
-        parts: list[str] = [
-            "Caller agreed to a site visit."
-            if kind == "site_visit"
-            else "Caller enquired about properties."
-        ]
-        # Which project the visit/enquiry is about — the single most useful
-        # routing fact for the sales team. Resolved from the captured property
-        # fact (conversational memory FACT_PROPERTY / outbound memory).
-        proj = str(project or mem.get("property") or "").strip()
-        if proj:
-            parts.append(f"Project: {proj}.")
-        # Visit date/time — scan recent caller turns, normalising hi/te relative
-        # tokens so a Telugu "రేపు 10" still yields "tomorrow 10 AM".
-        when = ""
-        for turn in reversed((history or [])[-12:]):
-            if turn.get("role") != "user":
-                continue
-            when = extract_datetime_phrase(str(turn.get("content") or ""))
-            if when:
-                break
-        if when:
-            parts.append(f"Proposed visit time: {when}.")
-        if mem.get("bhk"):
-            parts.append(f"Configuration: {mem['bhk']}.")
-        if mem.get("location_preference"):
-            parts.append(f"Preferred area: {mem['location_preference']}.")
-        if mem.get("purpose"):
-            parts.append(f"Purpose: {mem['purpose']}.")
-        if mem.get("budget"):
-            parts.append(f"Budget: {mem['budget']}.")
-        if mem.get("requested_info"):
-            parts.append(f"Asked for: {mem['requested_info']}.")
-        who = [bit for bit in (f"Name: {name}" if name else "", f"Phone: {ani}" if ani else "") if bit]
-        if who:
-            parts.append("; ".join(who) + ".")
-        return " ".join(parts)
+        return _deterministic_call_note(kind=kind, name=name, ani=ani, memory=memory, history=history, project=project)
 
     @staticmethod
     async def _create_inbound_site_visit(
@@ -1244,106 +835,12 @@ class NokvoOneVoicePipeline:
         memory: dict[str, Any],
         history: list[dict[str, str]] | None = None,
     ) -> dict[str, Any] | None:
-        """Create a minimal inbound site-visit TICKET when the caller agreed to
-        come — ANI + name (if captured) only. NO structured date/time/project
-        fields: the date/time the agent clarified rides in the post-call note.
-        We write a DETERMINISTIC ``data.handoff_note`` here synchronously (so the
-        record is never noteless if the post-call LLM condenser fails); the
-        condenser later overwrites it with a richer summary when it succeeds.
-        Mirrors the phoneless-lead direct write; best-effort."""
-        from app.models.nokvo_one_tool_record import NokvoOneToolRecord
-        from app.services.nokvo_one_business_templates import STATUS_VOCABULARIES
+        # Body extracted to app.services.pipeline.real_estate_leads._create_inbound_site_visit
+        # (turn_router helpers pattern; wrapper preserves the class API
+        # and class-attribute monkeypatches).
+        from app.services.pipeline.real_estate_leads import _create_inbound_site_visit
 
-        ani = str((state or {}).get("caller_phone") or "").strip() or None
-        name = str((memory or {}).get("name") or "").strip() or None
-        if not name:
-            # Fall back to the durable captured name (ConversationalMemory
-            # FACT_NAME) — the same source the structured booking path reads.
-            try:
-                from app.services.conversational_memory import (
-                    ConversationalMemory as _CM,
-                    FACT_NAME as _FACT_NAME,
-                )
-
-                name = str(
-                    _CM.from_state_blob((state or {}).get("memory") or {}).get(_FACT_NAME) or ""
-                ).strip() or None
-            except Exception:
-                name = None
-        status = (
-            (STATUS_VOCABULARIES.get("real_estate", {}).get("tickets") or {}).get("initial")
-            or "open"
-        )
-        data: dict[str, Any] = {
-            "source": "voice_inbound",
-            "auto_created_from_call": True,
-            "request_type": "site_visit",
-            "issue_type": "site_visit",
-            "agent_mode_final": "site_visit",
-            "call_id": call_id,
-        }
-        if name:
-            data["name"] = name
-        if ani:
-            data["phone"] = ani
-        # Resolve the project to a REAL registered one (catalog-validated) and
-        # store it as a structured field up front — so the Ticket Board shows the
-        # correct project even when the heuristic FACT_PROPERTY captured garbage.
-        project_name, project_id = await NokvoOneVoicePipeline._resolve_inbound_project(
-            db, org_id,
-            candidate=NokvoOneVoicePipeline._captured_project(state, memory),
-            history=history or [],
-        )
-        if project_name:
-            data["project_name"] = project_name
-        if project_id:
-            data["project_id"] = project_id
-        # Deterministic note up front — guarantees the ticket always carries a
-        # readable note (with the visit date/time for RE_agent_scheduler) even
-        # if the post-call condenser returns None. Uses the resolved real project
-        # (never the raw heuristic capture).
-        data["handoff_note"] = NokvoOneVoicePipeline._deterministic_call_note(
-            kind="site_visit", name=name, ani=ani, memory=memory, history=history or [],
-            project=project_name,
-        )
-        data["handoff_note_generated_at"] = datetime.now(timezone.utc).isoformat()
-        data["handoff_note_source"] = "deterministic"
-        record = NokvoOneToolRecord(
-            id=uuid.uuid4(),
-            organization_id=org_id,
-            record_type="ticket",
-            status=status,
-            data=data,
-            contact_phone=ani,
-        )
-        try:
-            db.add(record)
-            await db.commit()
-        except Exception:
-            logger.exception("NOKVO-SITE-VISIT: failed to persist inbound site visit")
-            try:
-                await db.rollback()
-            except Exception:
-                pass
-            return None
-        # auto_lead_created=True keeps the function idempotent and stops a
-        # duplicate lead; auto_site_visit_id is what the post-call condenser
-        # loop attaches the call note (with the clarified date/time) to.
-        await AgentSessionStore.merge_state(
-            tenant_res,
-            call_id,
-            {
-                "auto_lead_created": True,
-                "auto_site_visit_created": True,
-                "auto_site_visit_id": str(record.id),
-                "agent_mode_final": "site_visit",
-            },
-        )
-        return {
-            "tool": "site_visit_create_minimal",
-            "arguments": data,
-            "result": {"ok": True, "id": str(record.id)},
-        }
+        return await _create_inbound_site_visit(NokvoOneVoicePipeline, db, org_id, tenant_res, call_id, state=state, memory=memory, history=history)
 
     @staticmethod
     async def maybe_create_real_estate_lead_from_call(
@@ -1354,273 +851,12 @@ class NokvoOneVoicePipeline:
         campaign_context: dict[str, Any] | None = None,
         outbound_context: OutboundCampaignContext | None = None,
     ) -> dict[str, Any] | None:
-        """Create a real-estate lead at call end when interest was expressed.
+        # Body extracted to app.services.pipeline.real_estate_leads.maybe_create_real_estate_lead_from_call
+        # (turn_router helpers pattern; wrapper preserves the class API
+        # and class-attribute monkeypatches).
+        from app.services.pipeline.real_estate_leads import maybe_create_real_estate_lead_from_call
 
-        This catches short calls that never complete the slot-filling flow:
-        inbound property inquiries and outbound leads who ask for details /
-        pricing / brochure and then hang up. It is idempotent per call and
-        deliberately requires a phone number because ``leads_create`` does.
-        """
-        # Snapshot the FK primitive (see _maybe_execute_turn_policy_action) so a
-        # later commit/rollback can't force a sync ORM reload → MissingGreenlet.
-        org_id = getattr(tenant_res, "organization_id")
-        if db is None or not call_id:
-            return None
-        state = await AgentSessionStore.get_state(tenant_res, call_id) or {}
-        if state.get("auto_lead_created"):
-            return None
-        tool_flow = dict(state.get("tool_flow") or {})
-        if tool_flow.get("created_record_id") or tool_flow.get("completed"):
-            return None
-        context = await NokvoOneVoicePipeline._voice_business_context(db, tenant_res)
-        if context is None:
-            return None
-        organization, overrides, custom_tabs = context
-        if str(getattr(organization, "industry", "") or "").lower() != "real_estate":
-            return None
-        history = await AgentSessionStore.get_history(tenant_res, call_id)
-        memory = NokvoOneVoicePipeline._real_estate_memory_from_history(
-            dict(state.get("outbound_memory") or {}),
-            history,
-        )
-        call_surface = str(state.get("call_surface") or "")
-        # Lead overhaul: ANY inbound real-estate call that didn't book a site
-        # visit becomes a lead (ANI + call summary + name-if-known). We no longer
-        # require a positive "interest" signal — the caller engaging at all is
-        # enough. The ONE hard exclusion is an explicit opt-out (wrong number /
-        # do-not-call / not interested): turning that into a follow-up-eligible
-        # lead would be a DND/TRAI violation.
-        if NokvoOneVoicePipeline._real_estate_opt_out(memory=memory, history=history):
-            return None
-        # Outbound keeps its engagement gate (don't lead-ify a call where only
-        # the opener ran — the outbound outcome classifier owns those). Inbound
-        # always proceeds.
-        if call_surface == "voice_outbound" and not NokvoOneVoicePipeline._real_estate_interest_signal(
-            memory=memory,
-            history=history,
-            call_surface=call_surface,
-            outbound_context=outbound_context,
-        ):
-            return None
-
-        # End-of-call SMS push (inbound real-estate). Replaces the old in-call
-        # lead/site-visit interrogation: text the project brochure + location links
-        # to the caller's own number (the ANI we already have). Placed after the
-        # opt-out gate so we never message someone who opted out; bounded +
-        # best-effort so a slow/failed send never delays or breaks the lead
-        # creation below. Idempotent via the sms_sent state flag.
-        if call_surface == "voice_inbound":
-            try:
-                await asyncio.wait_for(
-                    NokvoOneVoicePipeline._send_brochure_and_location_sms(
-                        db, org_id, tenant_res, call_id, state
-                    ),
-                    timeout=25,
-                )
-            except Exception:
-                logger.debug(
-                    "NOKVO-SMS: end-of-call brochure/location send failed", exc_info=True
-                )
-
-        catalog = resolve_index(organization.industry, overrides, custom_tabs)
-
-        if call_surface == "voice_inbound":
-            # INBOUND: a site visit is created the moment the caller agrees to
-            # come — no field interrogation. The record is just ANI + name (if
-            # captured); the date/time the agent clarified rides in the post-call
-            # note (condenser → data.handoff_note on auto_site_visit_id). We do
-            # NOT run the structured date/time path for inbound, so a clarified
-            # date/time never gets persisted as fields.
-            from app.services.tool_flow_policy import caller_agreed_to_site_visit
-
-            if caller_agreed_to_site_visit(history):
-                sv = await NokvoOneVoicePipeline._create_inbound_site_visit(
-                    db, org_id, tenant_res, call_id, state=state, memory=memory, history=history,
-                )
-                if sv is not None:
-                    return sv
-            # No visit agreement → capture as a lead below.
-        else:
-            # OUTBOUND: a firm booking (date + time + name + phone) the
-            # deterministic flow didn't capture must still file as a SITE VISIT,
-            # not a lead. Outbound keeps the structured visit_at it needs to
-            # schedule / assign the visit.
-            site_visit_args = NokvoOneVoicePipeline._site_visit_args_from_call_state(
-                state=state,
-                organization=organization,
-                overrides=overrides,
-                custom_tabs=custom_tabs,
-                memory=memory,
-                campaign_context=campaign_context,
-            )
-            sv_tool = catalog.get("qualify_lead_and_schedule_visit") if site_visit_args else None
-            if site_visit_args and sv_tool is not None:
-                sv_result = None
-                try:
-                    sv_result = await PredefinedToolsService.execute(
-                        db,
-                        org_id,
-                        None,
-                        sv_tool,
-                        site_visit_args,
-                        session_id=f"{call_id}:auto_real_estate_site_visit",
-                    )
-                    await db.commit()
-                except Exception:
-                    if db is not None:
-                        try:
-                            await db.rollback()
-                        except Exception:
-                            pass
-                    sv_result = None
-                if sv_result and sv_result.get("ok"):
-                    await AgentSessionStore.merge_state(
-                        tenant_res,
-                        call_id,
-                        {
-                            "auto_lead_created": True,
-                            "auto_site_visit_created": True,
-                            "auto_site_visit_id": sv_result.get("ticket_id") or sv_result.get("id"),
-                            # FSM terminal mode marker. Booking landed — call
-                            # ended in site_visit, not inbound_lead.
-                            "agent_mode_final": "site_visit",
-                        },
-                    )
-                    return {
-                        "tool": "qualify_lead_and_schedule_visit",
-                        "arguments": site_visit_args,
-                        "result": sv_result,
-                    }
-                # Site-visit creation unavailable or failed — fall through to lead
-                # so the prospect is still captured.
-
-        args = NokvoOneVoicePipeline._lead_args_from_call_memory(
-            memory=memory,
-            campaign_context=campaign_context,
-            outbound_context=outbound_context,
-        )
-        # Phone-less inbound lead: caller showed interest but hung up before
-        # giving a number. By spec they still belong in the Leads → Uncategorized
-        # tab so the operator can see the engagement. The ``leads_create`` tool
-        # requires phone, so we write a NokvoOneToolRecord directly with whatever
-        # facts we did capture.
-        if not args.get("phone") and call_surface == "voice_inbound":
-            from app.models.nokvo_one_tool_record import NokvoOneToolRecord
-
-            # A lead is intentionally minimal: name + phone + the post-call
-            # "call notes" (data.handoff_note, written by the condenser at end of
-            # call). We deliberately do NOT persist structured facts (budget,
-            # purpose, timeline, objection, property type, location) — the notes
-            # carry that context in prose. Only name + routing markers here.
-            direct_data: dict[str, Any] = {
-                "source": "voice_inbound",
-                "auto_created_from_call": True,
-                "uncategorized": True,
-                "agent_mode_final": "inbound_lead",
-                "no_phone": True,
-                "call_id": call_id,
-                "name": str(args.get("name") or "Property inquiry"),
-            }
-            # Deterministic note up front so the lead is never noteless if the
-            # post-call condenser fails (it overwrites this on success).
-            direct_data["handoff_note"] = NokvoOneVoicePipeline._deterministic_call_note(
-                kind="lead", name=args.get("name"), ani=None, memory=memory, history=history,
-                project=NokvoOneVoicePipeline._captured_project(state, memory),
-            )
-            direct_data["handoff_note_generated_at"] = datetime.now(timezone.utc).isoformat()
-            direct_data["handoff_note_source"] = "deterministic"
-            direct_data = {k: v for k, v in direct_data.items() if v not in (None, "")}
-            record = NokvoOneToolRecord(
-                id=uuid.uuid4(),
-                organization_id=org_id,
-                record_type="lead",
-                status="new",
-                data=direct_data,
-            )
-            try:
-                db.add(record)
-                await db.commit()
-                await AgentSessionStore.merge_state(
-                    tenant_res,
-                    call_id,
-                    {
-                        "auto_lead_created": True,
-                        "auto_lead_id": str(record.id),
-                        "agent_mode_final": "inbound_lead",
-                    },
-                )
-                return {
-                    "tool": "leads_create_phoneless",
-                    "arguments": direct_data,
-                    "result": {"ok": True, "id": str(record.id)},
-                }
-            except Exception:
-                logger.exception(
-                    "NOKVO-INBOUND-LEAD: failed to persist phoneless uncategorized lead"
-                )
-                try:
-                    await db.rollback()
-                except Exception:
-                    pass
-                return None
-        if not args.get("phone"):
-            return None
-        tool = catalog.get("leads_create")
-        if tool is None:
-            return None
-        result = await PredefinedToolsService.execute(
-            db,
-            org_id,
-            None,
-            tool,
-            args,
-            session_id=f"{call_id}:auto_real_estate_lead",
-        )
-        await db.commit()
-        lead_id = result.get("id") or result.get("lead_id")
-
-        # Inbound real-estate FSM terminal state. Caller showed interest
-        # (asked questions, mentioned BHK/budget/location, maybe even
-        # started a booking but didn't confirm) and hung up. By spec, the
-        # auto-created lead lands in the Leads page's Uncategorized tab
-        # (data.uncategorized=true is what the frontend filters on).
-        #
-        # We DO NOT mark outbound auto-leads as uncategorized — those have
-        # their own outcome classifier that decides interested vs
-        # partial vs not_interested for tab routing.
-        is_inbound = (call_surface == "voice_inbound")
-        # A lead is name + phone + post-call notes only. We keep routing markers
-        # (source / uncategorized / agent_mode_final / campaign linkage) but
-        # deliberately drop the structured facts (budget, purpose, timeline,
-        # objection, project, partial visit slots) — that context now lives in
-        # the prose "call notes" the condenser writes after the call ends.
-        metadata = {
-            "source": call_surface or "voice_call",
-            "auto_created_from_call": True,
-            "campaign_id": (campaign_context or {}).get("campaign_id"),
-            # FSM terminal mode marker. The frontend Uncategorized tab
-            # filters on ``data.uncategorized === true``; setting it here
-            # is what routes the row off the campaign tab and into the
-            # uncategorized bucket.
-            "uncategorized": True if is_inbound else None,
-            "agent_mode_final": "inbound_lead" if is_inbound else None,
-        }
-        if lead_id:
-            await NokvoOneVoicePipeline._patch_record_metadata(
-                db,
-                lead_id,
-                {k: v for k, v in metadata.items() if v not in (None, "")},
-            )
-        await AgentSessionStore.merge_state(
-            tenant_res,
-            call_id,
-            {
-                "auto_lead_created": True,
-                "auto_lead_id": lead_id,
-                "agent_mode_final": "inbound_lead" if is_inbound else "query",
-            },
-        )
-        return {"tool": "leads_create", "arguments": args, "result": result}
+        return await maybe_create_real_estate_lead_from_call(NokvoOneVoicePipeline, tenant_res, db, call_id, campaign_context=campaign_context, outbound_context=outbound_context)
 
     @staticmethod
     async def _patch_record_metadata(
@@ -1628,77 +864,21 @@ class NokvoOneVoicePipeline:
         record_id: Any,
         metadata: dict[str, Any],
     ) -> None:
-        """Merge ``metadata`` keys into a NokvoOneToolRecord.data after the
-        tool has created it. Used to attach confirmation status, audit trail,
-        proposed-slot acceptance — fields we can't pass in tool args because
-        the tool schemas reject unknown properties."""
-        from app.models.nokvo_one_tool_record import NokvoOneToolRecord
-        from sqlalchemy import select
-        import uuid as _uuid
+        # Body extracted to app.services.pipeline.real_estate_leads._patch_record_metadata
+        # (turn_router helpers pattern; wrapper preserves the class API
+        # and class-attribute monkeypatches).
+        from app.services.pipeline.real_estate_leads import _patch_record_metadata
 
-        try:
-            rid = _uuid.UUID(str(record_id))
-        except (TypeError, ValueError):
-            return
-        try:
-            res = await db.execute(select(NokvoOneToolRecord).where(NokvoOneToolRecord.id == rid))
-            record = res.scalars().first()
-            if record is None:
-                return
-            merged = dict(record.data or {})
-            for key, value in metadata.items():
-                merged[key] = value
-            record.data = merged
-            db.add(record)
-            await db.commit()
-        except Exception:
-            try:
-                await db.rollback()
-            except Exception:
-                pass
+        return await _patch_record_metadata(db, record_id, metadata)
 
     @staticmethod
     def _tool_flow_success_answer(result: dict[str, Any], args: dict[str, Any], *, flow_key: str, language: str | None, offer_sms: bool = False) -> str:
-        lang = SarvamVoiceService.normalize_language(language)
-        assigned_name = result.get("assigned_member_name")
-        assignment_status = result.get("assignment_status")
-        name = str(args.get("name") or args.get("customer_name") or args.get("phone") or "the customer")
-        phone = str(args.get("phone") or args.get("contact_phone") or "").strip()
-        # End-of-call SMS offer is opt-in (mirrors clinic flow). Disabled
-        # by default because SMS dispatch isn't wired in yet.
-        sms_offer = ""
-        if offer_sms and phone:
-            spoken_phone = " ".join(list(phone[-10:])) if phone[-10:].isdigit() else phone
-            if lang == "te":
-                sms_offer = f" {spoken_phone} కి confirmation SMS పంపాలా?"
-            elif lang == "hi":
-                sms_offer = f" क्या {spoken_phone} पर confirmation SMS भेज दूँ?"
-            else:
-                sms_offer = f" Want me to send a confirmation SMS to {spoken_phone}?"
-        if flow_key == "real_estate_site_visit":
-            when = str(args.get("visit_at") or "the requested time")
-            try:
-                parsed = datetime.fromisoformat(when.replace("Z", "+00:00"))
-                local_when = parsed.astimezone(_APPOINTMENT_LOCAL_TZ).strftime("%d %b %Y at %I:%M %p")
-            except Exception:
-                local_when = when
-            if lang == "te":
-                if assignment_status == "assigned" and assigned_name:
-                    return f"Site visit request create అయ్యింది for {name} on {local_when}. It has been assigned to {assigned_name}.{sms_offer}"
-                return f"Site visit request create అయ్యింది for {name} on {local_when}. Team availability confirm చేస్తారు.{sms_offer}"
-            if lang == "hi":
-                if assignment_status == "assigned" and assigned_name:
-                    return f"Site visit request create हो गया for {name} on {local_when}. It has been assigned to {assigned_name}.{sms_offer}"
-                return f"Site visit request create हो गया for {name} on {local_when}. Team availability confirm करेगी.{sms_offer}"
-            if assignment_status == "assigned" and assigned_name:
-                return f"I have created the site visit request for {name} on {local_when}. It has been assigned to {assigned_name}.{sms_offer}"
-            return f"I have created the site visit request for {name} on {local_when}. The team will confirm availability.{sms_offer}"
+        # Body extracted to app.services.pipeline.tool_flows._tool_flow_success_answer
+        # (turn_router helpers pattern; wrapper preserves the class API
+        # and class-attribute monkeypatches).
+        from app.services.pipeline.tool_flows import _tool_flow_success_answer
 
-        if lang == "te":
-            return f"Lead create అయ్యింది for {name}. Team follow up చేస్తారు.{sms_offer}"
-        if lang == "hi":
-            return f"Lead create हो गया for {name}. Team follow up करेगी.{sms_offer}"
-        return f"I have created the lead for {name}. The team will follow up.{sms_offer}"
+        return _tool_flow_success_answer(result, args, flow_key=flow_key, language=language, offer_sms=offer_sms)
 
     @staticmethod
     def _site_visit_hours_reprompt(
@@ -1708,40 +888,12 @@ class NokvoOneVoicePipeline:
         defaults: Any,
         language: str | None,
     ) -> str:
-        """Spoken rejection for an out-of-hours site-visit time: states the org
-        working window, says the requested time isn't available, and offers the
-        closest valid slot (when one could be computed)."""
-        lang = SarvamVoiceService.normalize_language(language)
+        # Body extracted to app.services.pipeline.tool_flows._site_visit_hours_reprompt
+        # (turn_router helpers pattern; wrapper preserves the class API
+        # and class-attribute monkeypatches).
+        from app.services.pipeline.tool_flows import _site_visit_hours_reprompt
 
-        def _fmt_time(value: time | None) -> str:
-            if value is None:
-                return ""
-            return value.strftime("%I:%M %p").lstrip("0")
-
-        def _fmt_dt(value: datetime | None) -> str:
-            if value is None:
-                return ""
-            return value.astimezone(_APPOINTMENT_LOCAL_TZ).strftime("%I:%M %p").lstrip("0")
-
-        start = _fmt_time(defaults.start_time)
-        end = _fmt_time(defaults.end_time)
-        requested = _fmt_dt(requested_dt)
-        suggestion = _fmt_dt(suggestion_dt)
-
-        if lang == "te":
-            base = f"మా site visits {start} నుంచి {end} వరకు మాత్రమే. {requested} కి కుదరదు."
-            if suggestion:
-                return f"{base} దగ్గరగా {suggestion} కి కుదురుతుంది. అది ok నా?"
-            return f"{base} working hours లో వేరే time చెప్పగలరా?"
-        if lang == "hi":
-            base = f"हमारी site visits {start} से {end} तक होती हैं. {requested} संभव नहीं है."
-            if suggestion:
-                return f"{base} सबसे करीब {suggestion} पर हो सकता है. क्या यह ठीक है?"
-            return f"{base} कृपया working hours के अंदर कोई और time बताइए."
-        base = f"Our site visits run {start} to {end}, so {requested} isn't possible."
-        if suggestion:
-            return f"{base} The closest I can do is {suggestion}. Does that work?"
-        return f"{base} Could you pick a time within working hours?"
+        return _site_visit_hours_reprompt(requested_dt=requested_dt, suggestion_dt=suggestion_dt, defaults=defaults, language=language)
 
     @staticmethod
     async def _maybe_execute_tool_flow_action(
@@ -1755,309 +907,12 @@ class NokvoOneVoicePipeline:
     ) -> dict[str, Any] | None:
         # Snapshot the FK primitive (see _maybe_execute_turn_policy_action) so the
         # fresh-session retry below can't force a sync ORM reload → MissingGreenlet.
-        org_id = getattr(tenant_res, "organization_id")
-        if tool_flow.get("intent") != "tool_flow" or tool_flow.get("state_slot") != "complete":
-            return None
-        action = tool_flow.get("action") if isinstance(tool_flow.get("action"), dict) else None
-        if not action:
-            return None
-        context = business_context or await NokvoOneVoicePipeline._voice_business_context(db, tenant_res)
-        if context is None:
-            return None
-        organization, overrides, custom_tabs = context
-        catalog = resolve_index(organization.industry, overrides, custom_tabs)
-        tool_key = str(action.get("tool_key") or "")
-        tool = catalog.get(tool_key)
-        if tool is None:
-            return None
-        raw_args = dict(action.get("arguments") or {})
-        flow_key = str(action.get("flow_key") or tool_flow.get("flow_key") or "")
-        args: dict[str, Any] = {}
-        if flow_key == "real_estate_site_visit":
-            # Resolve the flow's slots so we can (a) find date/time/name/phone/
-            # project slots by KIND (slot keys equal the admin's Site Visit
-            # Field keys, which are arbitrary), and (b) store each captured
-            # value back under its configured field key (``source_field``) so
-            # the Site Visits tab renders the admin's Site Visit Fields.
-            from app.services.tool_flow_questions import build_tool_flow_questions
+        # Body extracted to app.services.pipeline.tool_flows._maybe_execute_tool_flow_action
+        # (turn_router helpers pattern; wrapper preserves the class API
+        # and class-attribute monkeypatches).
+        from app.services.pipeline.tool_flows import _maybe_execute_tool_flow_action
 
-            sv_bundle = build_tool_flow_questions(
-                getattr(organization, "industry", None), overrides, custom_tabs
-            )
-            flow_slots = (
-                ((sv_bundle.get("flows") or {}).get("real_estate_site_visit") or {}).get("slots") or []
-            )
-
-            def _slot_keys(kind: str) -> list[str]:
-                return [str(s.get("key")) for s in flow_slots if s.get("kind") == kind]
-
-            date_keys = _slot_keys("date") or ["visit_date"]
-            time_keys = _slot_keys("time") or ["visit_time"]
-            date_raw = next((raw_args.get(k) for k in date_keys if raw_args.get(k)), None)
-            time_raw = next((raw_args.get(k) for k in time_keys if raw_args.get(k)), None)
-            try:
-                visit_date = NokvoOneVoicePipeline._parse_appointment_date(date_raw)
-                visit_time = NokvoOneVoicePipeline._parse_appointment_time(time_raw)
-            except _AppointmentToolInputError as exc:
-                flow_state = dict(((tool_flow.get("state_patch") or {}).get("tool_flow") or {}))
-                flow_state["active"] = True
-                flow_state["completed"] = False
-                flow_state["pending_slot"] = (
-                    date_keys[0] if exc.slot == "preferred_date" else time_keys[0]
-                )
-                return {
-                    "answer": exc.answer,
-                    "state_patch": {"tool_flow": flow_state},
-                    "state_slot": flow_state["pending_slot"],
-                    "route_reason": "tool flow needs exact scheduling detail",
-                    "tool_calls": [],
-                }
-            visit_at_dt = datetime.combine(visit_date, visit_time, tzinfo=_APPOINTMENT_LOCAL_TZ).astimezone(timezone.utc)
-            visit_at = visit_at_dt.isoformat()
-
-            # Out-of-hours guard: site visits must fall inside the org-wide
-            # working window. If the caller asked for a time outside it (e.g.
-            # 8 PM when hours are 9 AM–7 PM), don't book — re-prompt with the
-            # window stated and the closest valid slot offered. Only enforced
-            # when the org has actually configured hours; otherwise no limit.
-            from app.services.nokvo_one_assignment_service import (
-                _within_working_window,
-                suggest_within_working_hours,
-            )
-
-            org_defaults = await NokvoOneAssignmentService.resolve_org_working_window(db, organization.id)
-            if (
-                org_defaults is not None
-                and not _within_working_window(org_defaults, visit_at_dt)
-            ):
-                suggestion_dt = suggest_within_working_hours(org_defaults, visit_at_dt)
-                reprompt = NokvoOneVoicePipeline._site_visit_hours_reprompt(
-                    requested_dt=visit_at_dt,
-                    suggestion_dt=suggestion_dt,
-                    defaults=org_defaults,
-                    language=language,
-                )
-                flow_state = dict(((tool_flow.get("state_patch") or {}).get("tool_flow") or {}))
-                flow_state["active"] = True
-                flow_state["completed"] = False
-                flow_state["pending_slot"] = time_keys[0]
-                return {
-                    "answer": reprompt,
-                    "state_patch": {"tool_flow": flow_state},
-                    "state_slot": time_keys[0],
-                    "route_reason": "site visit time is outside working hours",
-                    "tool_calls": [],
-                }
-
-            # Field-keyed site-visit data for the Site Visits tab.
-            record_data: dict[str, Any] = {}
-            for slot in flow_slots:
-                skey = str(slot.get("key") or "")
-                fkey = str(slot.get("source_field") or skey)
-                value = raw_args.get(skey)
-                if value in (None, ""):
-                    continue
-                kind = slot.get("kind")
-                if kind == "date":
-                    record_data[fkey] = visit_date.isoformat()
-                elif kind == "time":
-                    record_data[fkey] = visit_time.strftime("%I:%M %p").lstrip("0")
-                else:
-                    record_data[fkey] = value
-
-            name_val = next((raw_args.get(k) for k in _slot_keys("name") if raw_args.get(k)), None) or raw_args.get("name")
-            phone_val = next((raw_args.get(k) for k in _slot_keys("phone") if raw_args.get(k)), None) or raw_args.get("phone")
-            project_val = next((raw_args.get(k) for k in _slot_keys("project") if raw_args.get(k)), None) or raw_args.get("project_name")
-
-            args = {
-                "name": name_val,
-                "phone": phone_val,
-                "visit_at": visit_at,
-                "record_data": record_data,
-            }
-            if project_val not in (None, ""):
-                args["project_name"] = project_val
-            if raw_args.get("project_id") not in (None, ""):
-                args["project_id"] = raw_args["project_id"]
-        else:
-            args = {k: v for k, v in raw_args.items() if v not in (None, "")}
-        # Same retry shape as the clinic appointment path — reads from spec.
-        from app.services.agent_spec import RETRY_POLICY
-        from app.db.session import AsyncSessionLocal
-
-        result = None
-        last_exc: Exception | None = None
-        max_inline_attempts = 1 + RETRY_POLICY.inline_retries
-        for attempt in range(max_inline_attempts):
-            # First attempt uses the shared call session (matches the
-            # historical behaviour the tests cover). Retries fall back to
-            # a fresh AsyncSession because the long-lived WS-bound session
-            # can sit in a state where ``await db.commit()`` raises
-            # ``greenlet_spawn has not been called`` — a one-shot session
-            # sidesteps that entire class of session-corruption issues.
-            use_fresh_session = attempt > 0
-            try:
-                if use_fresh_session:
-                    async with AsyncSessionLocal() as tool_db:
-                        result = await PredefinedToolsService.execute(
-                            tool_db,
-                            org_id,
-                            None,
-                            tool,
-                            args,
-                            session_id=call_id,
-                        )
-                        await tool_db.commit()
-                else:
-                    result = await PredefinedToolsService.execute(
-                        db,
-                        org_id,
-                        None,
-                        tool,
-                        args,
-                        session_id=call_id,
-                    )
-                    await db.commit()
-                last_exc = None
-                break
-            except Exception as exc:  # noqa: BLE001 — voice tool entry, broad catch by design
-                last_exc = exc
-                logger.warning(
-                    "NOKVO-TOOL-FLOW: %s failed (attempt %s/%s, fresh_session=%s) args=%s: %r",
-                    tool.key,
-                    attempt + 1,
-                    max_inline_attempts,
-                    use_fresh_session,
-                    {k: v for k, v in args.items() if k != "record_data"},
-                    exc,
-                    exc_info=True,
-                )
-                # Only roll back the shared session — the fresh session's
-                # ``async with`` block already rolls itself back on
-                # exception.
-                if not use_fresh_session and db is not None:
-                    try:
-                        await db.rollback()
-                    except Exception:
-                        logger.exception(
-                            "NOKVO-TOOL-FLOW: rollback after %s failure crashed", tool.key
-                        )
-                if attempt < max_inline_attempts - 1:
-                    await asyncio.sleep(RETRY_POLICY.inline_delay_seconds)
-        if result is None:
-            try:
-                from app.services.tool_retry_service import ToolRetryService
-
-                await ToolRetryService.enqueue(
-                    db,
-                    organization_id=org_id,
-                    tool_key=tool.key,
-                    arguments=args,
-                    context={
-                        "call_id": call_id,
-                        "language": language,
-                        "intent": "tool_flow",
-                        "flow_key": flow_key,
-                    },
-                    last_error=str(last_exc) if last_exc else None,
-                )
-            except Exception:
-                pass
-            flow_state = dict(((tool_flow.get("state_patch") or {}).get("tool_flow") or {}))
-            flow_state["active"] = False
-            flow_state["tool_error"] = str(last_exc)[:180]
-            flow_state["needs_callback"] = True
-            from app.services.flow_session import append_audit_trail
-            append_audit_trail(flow_state, "tool_retry_enqueued", detail=str(last_exc)[:200] if last_exc else None)
-            lang = SarvamVoiceService.normalize_language(language)
-            phone_hint = str(args.get("phone") or args.get("contact_phone") or "this number")
-            spoken_phone = " ".join(list(phone_hint[-10:])) if phone_hint[-10:].isdigit() else phone_hint
-            if lang == "te":
-                fallback = (
-                    f"Details అన్నీ note చేశాను, kāni system temporarily unavailable. "
-                    f"Team మీకు {spoken_phone} mīda call back chestāru — booking miss avadu."
-                )
-            elif lang == "hi":
-                fallback = (
-                    f"मेरे पास सारी जानकारी है, पर system अभी temporarily unavailable है. "
-                    f"Team {spoken_phone} पर call back करेगी — booking miss नहीं होगी."
-                )
-            else:
-                fallback = (
-                    f"I have all your details, but I'm having trouble saving them right now. "
-                    f"The team will call you back on {spoken_phone} to confirm — your request won't be missed."
-                )
-            return {
-                "answer": fallback,
-                "state_patch": {"tool_flow": flow_state},
-                "state_slot": "tool_error",
-                "route_reason": "tool flow tool failed after retry",
-                "tool_calls": [{"tool": tool.key, "arguments": args, "ok": False, "error": str(last_exc)[:240]}],
-            }
-
-        flow_state = dict(((tool_flow.get("state_patch") or {}).get("tool_flow") or {}))
-        flow_state.update(
-            {
-                "active": False,
-                "completed": True,
-                "created_record_id": result.get("id") or result.get("lead_id") or result.get("callback_id"),
-                "assignment_status": result.get("assignment_status"),
-                "assigned_member_name": result.get("assigned_member_name"),
-            }
-        )
-        # Same as the clinic path: patch confirmation/audit metadata onto the
-        # persisted record now that we have its id.
-        record_metadata: dict[str, Any] = {}
-        for key in ("confirmations", "audit_trail", "proposed_slot_accepted"):
-            value = flow_state.get(key)
-            if value:
-                record_metadata[key] = value
-        created_id = flow_state.get("created_record_id")
-        if record_metadata and created_id and db is not None:
-            await NokvoOneVoicePipeline._patch_record_metadata(db, created_id, record_metadata)
-
-        # Record routing. A completed site-visit booking is tab-defining: it
-        # always belongs in the Site Visits (tickets) tab regardless of who
-        # placed the call (force_ticket below). Other macros fall back to the
-        # call-direction heuristic — inbound → tickets, outbound → leads. The
-        # macro defaults to creating leads, so a rewrite only happens when the
-        # destination is the tickets tab.
-        if db is not None and call_id is not None:
-            try:
-                session_state = await AgentSessionStore.get_state(tenant_res, call_id) or {}
-                surface = session_state.get("call_surface")
-                ids_to_route = [
-                    rid
-                    for rid in (
-                        result.get("lead_id"),
-                        result.get("id"),
-                    )
-                    if rid
-                ]
-                if ids_to_route:
-                    await NokvoOneVoicePipeline._route_record_by_surface(
-                        db,
-                        ids_to_route,
-                        call_surface=surface,
-                        industry=organization.industry,
-                        force_ticket=(flow_key == "real_estate_site_visit"),
-                    )
-            except Exception:
-                pass
-
-        return {
-            "answer": NokvoOneVoicePipeline._tool_flow_success_answer(
-                result,
-                args,
-                flow_key=flow_key,
-                language=language,
-                offer_sms=NokvoOneVoicePipeline._should_offer_sms_confirmation(tenant_res),
-            ),
-            "state_patch": {"tool_flow": flow_state},
-            "state_slot": "complete",
-            "route_reason": "tool flow tool executed",
-            "tool_calls": [{"tool": tool.key, "arguments": args, "result": result}],
-        }
+        return await _maybe_execute_tool_flow_action(NokvoOneVoicePipeline, tenant_res, call_id, db, tool_flow, business_context=business_context, language=language)
 
     @staticmethod
     async def _apply_route_state(
