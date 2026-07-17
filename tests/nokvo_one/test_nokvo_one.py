@@ -2160,7 +2160,14 @@ def test_pipeline_retry_loop_reads_max_attempts_from_spec():
     """If anyone replaces RETRY_POLICY.inline_retries the pipeline must
     follow — this test fails if the pipeline reverts to range(2)."""
     import re
-    pipeline_source = open("app/services/nokvo_one_voice_pipeline.py").read()
+    # The two failure paths (clinic + tool_flow) live in the extracted
+    # pipeline/ modules since the voice-modularization; scan them together
+    # with the orchestrator.
+    pipeline_source = (
+        open("app/services/nokvo_one_voice_pipeline.py").read()
+        + open("app/services/pipeline/appointments.py").read()
+        + open("app/services/pipeline/tool_flows.py").read()
+    )
     # Two failure paths (clinic + tool_flow) should both compute inline
     # attempts from the spec, not hardcode `range(2)`.
     assert "RETRY_POLICY.inline_retries" in pipeline_source
@@ -2436,7 +2443,12 @@ def test_route_record_by_surface_rewrites_lead_to_ticket_for_inbound():
     Site Visits tab) when the call is inbound OR when the action is
     tab-defining (force_ticket, e.g. a booked site visit). A plain outbound
     macro lead is left in the leads tab."""
-    pipeline_source = open("app/services/nokvo_one_voice_pipeline.py").read()
+    # The body lives in pipeline/real_estate_leads.py since the
+    # voice-modularization (the class keeps a delegating wrapper).
+    pipeline_source = (
+        open("app/services/nokvo_one_voice_pipeline.py").read()
+        + open("app/services/pipeline/real_estate_leads.py").read()
+    )
     assert "_route_record_by_surface" in pipeline_source
     # The rewrite fires on the inbound surface OR an explicit force_ticket.
     assert 'force_ticket or call_surface == "voice_inbound"' in pipeline_source
@@ -2448,7 +2460,9 @@ def test_route_record_by_surface_rewrites_lead_to_ticket_for_inbound():
 def test_pipeline_guards_site_visit_against_org_hours():
     """The real_estate_site_visit branch must validate visit_at against the
     org working window and re-prompt (not execute) when it's outside."""
-    pipeline_source = open("app/services/nokvo_one_voice_pipeline.py").read()
+    # The tool-flow FSM lives in pipeline/tool_flows.py since the
+    # voice-modularization.
+    pipeline_source = open("app/services/pipeline/tool_flows.py").read()
     branch = pipeline_source.split('if flow_key == "real_estate_site_visit":', 1)[1]
     guard_region = branch.split("Field-keyed site-visit data", 1)[0]
     assert "resolve_org_working_window" in guard_region
@@ -2459,7 +2473,9 @@ def test_pipeline_guards_site_visit_against_org_hours():
 
 
 def test_pipeline_calls_route_after_tool_flow_execution():
-    pipeline_source = open("app/services/nokvo_one_voice_pipeline.py").read()
+    # The tool-flow FSM lives in pipeline/tool_flows.py since the
+    # voice-modularization.
+    pipeline_source = open("app/services/pipeline/tool_flows.py").read()
     # The success path of _maybe_execute_tool_flow_action must invoke the
     # routing helper with both result['lead_id'] and result['id'], and force
     # the Site Visits tab for a completed site-visit booking.
