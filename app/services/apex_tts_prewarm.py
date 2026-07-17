@@ -12,12 +12,18 @@ Cache-key parity is the whole game: each line must be synthesized with the
 SAME text/language/prosody args its call-time site uses, or the keys won't
 match and the warm entry is dead weight:
 
-  * questions  → one call per line with ``prosody_for("question")``
+  * questions  → one call per line with ``prosody_for("question", style)``
                  (mirrors ``_deliver_verbatim_question``);
-  * outro      → one call, NO prosody args (mirrors ``_speak_outro_and_end``);
+  * outro      → one call with the style voice overlay (``style_prosody``) or
+                 NO prosody args when the style has none — either way mirrors
+                 ``_speak_outro_and_end``;
   * intro      → wrapped ``[warm]…[/warm]`` when untagged, split with
                  ``stream_prosody_chunks``, one call PER CHUNK with that
-                 chunk's ``prosody_for(tone)`` (mirrors ``_play_opener``).
+                 chunk's ``prosody_for(tone, style)`` (mirrors ``_play_opener``).
+
+``style`` is the campaign's conversation style (``questionnaire["style"]``):
+every call-time site composes its per-tone prosody with the style's voice
+overlay, so the prewarm must too.
 
 Raw text goes straight in — ``synthesize`` normalizes internally, and
 normalizing here too would change the text and thus the key.
@@ -32,7 +38,7 @@ from typing import Any, AsyncIterator
 
 from app.core.config import settings
 from app.services.apex_micro_acks import ack_pool
-from app.services.prosody import prosody_for, stream_prosody_chunks
+from app.services.prosody import prosody_for, stream_prosody_chunks, style_prosody
 from app.services.sarvam_voice_service import SarvamVoiceService
 from app.models.tenant_resources import TenantResources
 
@@ -78,10 +84,19 @@ async def prewarm_campaign_tts(
         return
     warmed = failed = 0
     variants = max(1, int(settings.APEX_TTS_VARIANTS or 1))
+    # The campaign's conversation style shapes the voice at every call-time
+    # site (prosody style overlay) — compose it here identically or the keys
+    # won't match. Empty/scripted/professional = no overlay = legacy keys.
+    style = str(questionnaire.get("style") or "")
+    _sp = style_prosody(style)
+    # What _speak_outro_and_end passes: the style baseline, or nothing.
+    close_kwargs: dict[str, Any] = (
+        {"pace": _sp.pace, "pitch": _sp.pitch, "loudness": _sp.loudness} if _sp else {}
+    )
     for lang in _PREWARM_LANGS:
         # (text, prosody kwargs) per line, mirroring each call-time site.
         jobs: list[tuple[str, dict[str, Any]]] = []
-        question_prosody = prosody_for("question")
+        question_prosody = prosody_for("question", style)
         for q in questionnaire.get("questions") or []:
             line = str((q.get("text_i18n") or {}).get(lang) or "").strip()
             if line:
@@ -97,21 +112,22 @@ async def prewarm_campaign_tts(
                 )
         outro = str((questionnaire.get("outro_i18n") or {}).get(lang) or "").strip()
         if outro:
-            jobs.append((outro, {}))  # the close path passes no prosody args
+            jobs.append((outro, dict(close_kwargs)))
         # The BUSY dealbreaker close ("I'm busy, call me later" → this line +
-        # hangup) — static per language, shared across campaigns, spoken via the
-        # same no-prosody close path. Global, so after the first campaign these
-        # are cache probes.
+        # hangup) — static per language, spoken via the same close path (which
+        # applies the campaign's style overlay), so it warms with the same
+        # kwargs. Global per style×language: after the first campaign of a
+        # style these are cache probes.
         try:
             from app.services.nokvo_one_voice_stream_service import _busy_outro
 
-            jobs.append((_busy_outro(lang), {}))
+            jobs.append((_busy_outro(lang), dict(close_kwargs)))
         except Exception:
             logger.debug("APEX-TTS-PREWARM: busy outro unavailable lang=%s", lang, exc_info=True)
         try:
             intro = str((questionnaire.get("intro_i18n") or {}).get(lang) or "")
             for sentence, tone in await _intro_lines(intro):
-                prosody = prosody_for(tone)
+                prosody = prosody_for(tone, style)
                 jobs.append(
                     (
                         sentence,
@@ -125,7 +141,7 @@ async def prewarm_campaign_tts(
         # campaign's conversation style; pools are global per style×lang, so
         # after the first campaign of a style these are pure cache probes.
         if settings.APEX_ACK_ENABLED:
-            ack_prosody = prosody_for("warm")
+            ack_prosody = prosody_for("warm", style)
             for ack in ack_pool(questionnaire.get("style"), lang):  # pool langs == prewarm langs
                 jobs.append(
                     (

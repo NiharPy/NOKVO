@@ -65,8 +65,46 @@ _PROSODY: dict[str, Prosody] = {
 DEFAULT_TONE = "neutral"
 
 
-def prosody_for(tone: str) -> Prosody:
-    return _PROSODY.get(tone, _PROSODY[DEFAULT_TONE])
+# Per-conversation-style voice baseline (APEX ``questionnaire_style``). Picking
+# a style restyles the WORDING at campaign creation (questionnaire_style
+# service); this overlay gives the same selection a matching VOICE, composed
+# with the per-tone prosody above (pace multiplies, pitch adds, loudness
+# multiplies). Styles with no entry — scripted, professional — speak at the
+# neutral baseline: byte-identical to the unstyled path, so their warmed TTS
+# cache keys never rotate. Same bulbul:v3 caveat as the tone table: on the
+# default model only pace is audible (pitch/loudness are stripped for v3 in
+# sarvam_voice_service); pitch takes effect on models that accept it.
+# CACHE WARNING: adding/changing an entry rotates the byte-cache key of every
+# warmed line of campaigns with that style — re-run the campaign prewarm
+# (scripts/apex_reprewarm.py) right after deploying a change.
+_STYLE_PROSODY: dict[str, Prosody] = {
+    # A person, not a reader: a touch unhurried and slightly brighter.
+    "human":    Prosody(pace=0.97, pitch=0.06,  loudness=1.0),
+    # Concierge register: measurably slower, lower, softer.
+    "luxury":   Prosody(pace=0.92, pitch=-0.12, loudness=0.95),
+    # Upbeat: brisker and brighter.
+    "friendly": Prosody(pace=1.06, pitch=0.12,  loudness=1.05),
+}
+
+
+def style_prosody(style: str | None) -> Prosody | None:
+    """The style's baseline voice overlay, or ``None`` when the style doesn't
+    modulate the voice (scripted / professional / unknown). Callers that pass
+    no prosody args today MUST keep passing none on ``None`` — an explicit
+    neutral (pace=1.0) lands in the request body and rotates cache keys."""
+    return _STYLE_PROSODY.get(str(style or "").strip().lower())
+
+
+def prosody_for(tone: str, style: str | None = None) -> Prosody:
+    base = _PROSODY.get(tone, _PROSODY[DEFAULT_TONE])
+    overlay = style_prosody(style)
+    if overlay is None:
+        return base
+    return Prosody(
+        pace=max(0.3, min(3.0, base.pace * overlay.pace)),
+        pitch=max(-0.75, min(0.75, base.pitch + overlay.pitch)),
+        loudness=max(0.1, min(3.0, base.loudness * overlay.loudness)),
+    )
 
 
 def known_tones() -> list[str]:

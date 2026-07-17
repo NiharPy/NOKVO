@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 
 import app.services.apex_tts_prewarm as pw
-from app.services.prosody import prosody_for
+from app.services.prosody import prosody_for, style_prosody
 
 
 def _run(coro):
@@ -101,6 +101,47 @@ def test_missing_languages_are_skipped(monkeypatch):
     busy_lines = set(_BUSY_OUTROS.values())
     assert [c["text"] for c in calls if c["text"] not in busy_lines] == ["Only EN"]
     assert busy_lines <= {c["text"] for c in calls}
+
+
+def test_styled_campaign_prewarms_with_style_voice_overlay(monkeypatch):
+    """A campaign with a conversation style must warm every line with the
+    style-composed prosody its call-time sites now use — including the outro,
+    which switches from no-prosody to the style baseline."""
+    calls = _capture(monkeypatch)
+    q = _questionnaire()
+    q["style"] = "luxury"
+    _run(pw.prewarm_campaign_tts(object(), q))
+
+    qp = prosody_for("question", "luxury")
+    q_te = next(c for c in calls if c["text"] == "Q1 TE")
+    assert (q_te["pace"], q_te["pitch"], q_te["loudness"]) == (qp.pace, qp.pitch, qp.loudness)
+    # Composition actually changed the values vs the unstyled question prosody.
+    assert qp != prosody_for("question")
+
+    # The close path now carries the style baseline (mirrors _speak_outro_and_end).
+    sp = style_prosody("luxury")
+    out_hi = next(c for c in calls if c["text"] == "OUT HI")
+    assert (out_hi["pace"], out_hi["pitch"], out_hi["loudness"]) == (sp.pace, sp.pitch, sp.loudness)
+
+    warm = prosody_for("warm", "luxury")
+    chunk1 = next(c for c in calls if c["text"] == "Hello there." and c["language"] == "en")
+    assert (chunk1["pace"], chunk1["pitch"], chunk1["loudness"]) == (warm.pace, warm.pitch, warm.loudness)
+
+
+def test_professional_style_keeps_legacy_keys(monkeypatch):
+    """Professional (and scripted) have no voice overlay: the warmed params —
+    and therefore the byte-cache keys — must be identical to an unstyled
+    campaign, outro still passing NO prosody args."""
+    calls = _capture(monkeypatch)
+    q = _questionnaire()
+    q["style"] = "professional"
+    _run(pw.prewarm_campaign_tts(object(), q))
+
+    qp = prosody_for("question")
+    q_te = next(c for c in calls if c["text"] == "Q1 TE")
+    assert (q_te["pace"], q_te["pitch"], q_te["loudness"]) == (qp.pace, qp.pitch, qp.loudness)
+    out_hi = next(c for c in calls if c["text"] == "OUT HI")
+    assert "pace" not in out_hi and "pitch" not in out_hi and "loudness" not in out_hi
 
 
 def test_synthesis_failure_does_not_raise(monkeypatch):

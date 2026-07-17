@@ -132,7 +132,13 @@ from app.services.language_intent import (
 )
 from app.services.nokvo_one_voice_pipeline import NokvoOneVoicePipeline
 from app.services.predefined_tools_service import PredefinedToolsService, get_tool
-from app.services.prosody import DEFAULT_TONE, ProsodyChunk, prosody_for, stream_prosody_chunks
+from app.services.prosody import (
+    DEFAULT_TONE,
+    ProsodyChunk,
+    prosody_for,
+    stream_prosody_chunks,
+    style_prosody,
+)
 from app.services.sarvam_voice_service import SarvamVoiceService
 
 
@@ -242,6 +248,15 @@ async def _drain_turn(task: asyncio.Task | None) -> None:
         pass
 
 
+def _campaign_voice_style(outbound_context: Any) -> str:
+    """The campaign's selected conversation style (``questionnaire_style``) —
+    feeds the style voice overlay (``prosody.style_prosody``) at every scripted
+    and LLM TTS site, so the selected style shapes the agent's pitch/pace, not
+    just its wording. Empty for inbound calls and unstyled campaigns (identity
+    overlay: those paths stay byte-identical, warmed cache keys included)."""
+    return str(getattr(outbound_context, "questionnaire_style", "") or "")
+
+
 def _scaled_pace(base_pace: float | None, factor: float) -> float | None:
     """Scale a TTS pace by ``factor``, clamped to Sarvam's 0.3–3.0 range.
 
@@ -281,6 +296,7 @@ class _TtsPump:
         purpose: str = "answer",
         speaking_mark: Any | None = None,
         pace_factor: float = 1.0,
+        style: str = "",
     ) -> None:
         self._websocket = websocket
         self._tenant_res = tenant_res
@@ -292,6 +308,10 @@ class _TtsPump:
         # slow outbound delivery slightly; composes with the per-language pace
         # factor inside stream_sentence_tts.
         self._pace_factor = pace_factor
+        # Campaign conversation style (questionnaire_style): composes the style
+        # voice overlay into every sentence's prosody so LLM off-script turns
+        # sound like the scripted lines. Empty = no overlay (unchanged).
+        self._style = style
         self._queue: asyncio.Queue[tuple[str, str, bool] | None] = asyncio.Queue()
         self._worker: asyncio.Task[None] | None = None
         self._first_audio_fired = False
@@ -359,8 +379,16 @@ class _TtsPump:
             return
         # Use the tone of the first sentence in the batch for prosody —
         # adjacent sentences from the same LLM completion almost always
-        # carry the same emotional register.
-        prosody = None if not self._first_audio_fired else prosody_for(batch[0][1] or DEFAULT_TONE)
+        # carry the same emotional register. The first sentence of a turn
+        # skips tone prosody (fast path) but still carries the campaign's
+        # style overlay, so a styled agent's voice doesn't flip register
+        # between its first and second sentence (None when unstyled — the
+        # inbound/unstyled path stays byte-identical).
+        prosody = (
+            style_prosody(self._style)
+            if not self._first_audio_fired
+            else prosody_for(batch[0][1] or DEFAULT_TONE, self._style)
+        )
         if self._speaking_mark is not None:
             try:
                 self._speaking_mark()
@@ -1550,6 +1578,7 @@ class NokvoOneVoiceStreamService:
                         arbiter=arbiter,
                         turn_state=turn_state,
                         eou_fired_at=eou_fired_at,
+                        style=_campaign_voice_style(outbound_context),
                     )
                     return
             except Exception:
@@ -1596,6 +1625,7 @@ class NokvoOneVoiceStreamService:
                             arbiter=arbiter,
                             turn_state=turn_state,
                             eou_fired_at=eou_fired_at,
+                            style=_campaign_voice_style(outbound_context),
                         )
                         return
                     # A clean forward advance means THIS turn (verbatim or LLM) is
@@ -1710,7 +1740,7 @@ class NokvoOneVoiceStreamService:
                         "source": "language_switch_ack",
                     }
                 )
-                prosody = prosody_for("warm")
+                prosody = prosody_for("warm", _campaign_voice_style(outbound_context))
                 _mark_speaking()
                 try:
                     await SarvamVoiceService.stream_sentence_tts(
@@ -1977,6 +2007,7 @@ class NokvoOneVoiceStreamService:
                 purpose="answer",
                 speaking_mark=_mark_speaking,
                 pace_factor=_pace_factor,
+                style=_campaign_voice_style(outbound_context),
             )
             tts_pump.start()
             if arbiter is not None:
@@ -2958,6 +2989,7 @@ class NokvoOneVoiceStreamService:
         arbiter: TurnArbiter | None = None,
         turn_state: dict[str, Any] | None = None,
         eou_fired_at: float | None = None,
+        style: str = "",
     ) -> None:
         """Deterministic questionnaire CLOSE: speak the campaign's closing line
         verbatim, then hang up.
@@ -2997,12 +3029,19 @@ class NokvoOneVoiceStreamService:
                     "source": "questionnaire_outro",
                 }
             )
+            # Style voice overlay only — None values for an unstyled campaign
+            # keep the request body (and thus the warmed cache keys) identical
+            # to the historical no-prosody close.
+            _sp = style_prosody(style)
             await SarvamVoiceService.stream_sentence_tts(
                 websocket,
                 tenant_res,
                 line,
                 language=language,
                 purpose="outro",
+                pace=_sp.pace if _sp else None,
+                pitch=_sp.pitch if _sp else None,
+                loudness=_sp.loudness if _sp else None,
                 cache=True,  # deterministic closing line — same audio every call
                 variant=tts_variant_for_call(call_id),
             )
@@ -3104,10 +3143,11 @@ class NokvoOneVoiceStreamService:
             if arbiter is not None:
                 arbiter.mark_speaking()
             turn_id = str(uuid.uuid4())[:8]
-            prosody = prosody_for("question")
+            _vstyle = _campaign_voice_style(outbound_context)
+            prosody = prosody_for("question", _vstyle)
             try:
                 if ack:
-                    warm = prosody_for("warm")
+                    warm = prosody_for("warm", _vstyle)
                     await websocket.send_json(
                         {
                             "type": "agent_sentence",
@@ -3226,6 +3266,7 @@ class NokvoOneVoiceStreamService:
         language: str,
         call_id: str | None = None,
         campaign_context: dict[str, Any] | None = None,
+        style: str = "",
     ) -> None:
         """Deterministic prosody-aware opener — no LLM round-trip.
 
@@ -3269,7 +3310,7 @@ class NokvoOneVoiceStreamService:
                     "source": "campaign_opener",
                 }
             )
-            prosody = prosody_for(chunk.tone)
+            prosody = prosody_for(chunk.tone, style)
             try:
                 await SarvamVoiceService.stream_sentence_tts(
                     websocket,
@@ -3677,6 +3718,7 @@ class NokvoOneVoiceStreamService:
                     language=language,
                     call_id=call_id,
                     campaign_context=campaign_context,
+                    style=_campaign_voice_style(outbound_context),
                 )
 
             # Per-utterance audio buffer (separate from the call-long ``audio_buffer``).
@@ -4161,6 +4203,7 @@ class NokvoOneVoiceStreamService:
                     language=language,
                     call_id=call_id,
                     campaign_context=campaign_context,
+                    style=_campaign_voice_style(outbound_context),
                 )
                 await _arm_proactive_watchdog()
             elif outbound_context is not None:
@@ -4193,6 +4236,7 @@ class NokvoOneVoiceStreamService:
                     language=language,
                     call_id=call_id,
                     campaign_context=campaign_context,
+                    style=_campaign_voice_style(outbound_context),
                 )
                 await _arm_proactive_watchdog()
             else:

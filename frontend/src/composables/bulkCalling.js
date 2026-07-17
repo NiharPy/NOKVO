@@ -198,13 +198,14 @@ export function newQuestion() {
 // Conversation styles for APEX deterministic campaigns (ids match the backend
 // questionnaire_style.CONVERSATION_STYLES). Scripted = the admin's exact words;
 // the rest run the style-rewrite preview so the admin reviews the styled lines
-// before launch.
+// before launch. Human / Luxury / Friendly also adjust the agent's voice
+// delivery (pitch and pace) to match the register.
 export const CONVERSATION_STYLES = [
   { id: 'scripted', label: 'Scripted', hint: 'Your exact words, spoken verbatim.' },
   { id: 'professional', label: 'Professional', hint: 'Polished, courteous business tone.' },
-  { id: 'human', label: 'Human', hint: 'Natural and warm — how a real rep talks.', recommended: true },
-  { id: 'luxury', label: 'Luxury', hint: 'Refined concierge tone for premium offers.' },
-  { id: 'friendly', label: 'Friendly', hint: 'Upbeat, casual, approachable.' },
+  { id: 'human', label: 'Human', hint: 'Natural and warm — how a real rep talks, with a softer voice.', recommended: true },
+  { id: 'luxury', label: 'Luxury', hint: 'Refined concierge tone for premium offers — lower, unhurried voice.' },
+  { id: 'friendly', label: 'Friendly', hint: 'Upbeat, casual, approachable — brighter, livelier voice.' },
 ];
 
 // Max achievable lead score (top band for a graded answer, else its weight) —
