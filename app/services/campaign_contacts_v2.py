@@ -118,6 +118,53 @@ async def ingest_rows(campaign_id: uuid.UUID, rows: Iterable[dict[str, str]]) ->
     return inserted
 
 
+async def ingest_api_rows(
+    db, campaign_id: uuid.UUID, rows: list[dict[str, Any]]
+) -> tuple[int, int]:
+    """CRM/API ingest: small batches (≤ hundreds) of already-normalized
+    ``{phone, name, external_id, meta}`` rows → pending contact rows. One
+    multi-VALUES INSERT … ON CONFLICT DO NOTHING on ``(campaign_id, phone)``,
+    so a CRM re-firing its webhook is a harmless no-op (idempotent ingest).
+    Returns ``(inserted, duplicates)``. NOT the CSV COPY path — that one is
+    for 1M-row files and needs a raw asyncpg connection."""
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    from app.models.outgoing_lead import OutboundCampaignContact
+
+    values: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for r in rows:
+        phone = (r.get("phone") or "").strip()
+        if not phone or phone in seen:
+            continue
+        seen.add(phone)
+        snapshot: dict[str, Any] = {"source": "api"}
+        if r.get("meta"):
+            snapshot["meta"] = r["meta"]
+        values.append({
+            "id": uuid.uuid4(),
+            "campaign_id": campaign_id,
+            "phone": phone,
+            "name": (r.get("name") or None),
+            "external_id": (r.get("external_id") or None),
+            "call_link_id": str(uuid.uuid4()),
+            "status": "pending",
+            "attempt": 0,
+            "qualified": False,
+            "result": {},
+            "snapshot": snapshot,
+        })
+    if not values:
+        return 0, 0
+    stmt = pg_insert(OutboundCampaignContact).values(values).on_conflict_do_nothing(
+        constraint="uq_outbound_campaign_contact_phone"
+    )
+    res = await db.execute(stmt)
+    await db.commit()
+    inserted = int(res.rowcount or 0)
+    return inserted, len(values) - inserted
+
+
 # ── dial claim (advisory-locked, no network I/O under the lock) ──────────────
 async def _bump_dialed_today(db, campaign_id: uuid.UUID, today: str, n: int) -> None:
     """Atomically advance the per-day placement counter on ``agent_config``,

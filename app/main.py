@@ -29,7 +29,10 @@ app.add_middleware(SlowAPIMiddleware)
 # from arbitrary local pages.
 _cors_origins = {settings.EXPECTED_ORIGIN.rstrip("/")}
 if not settings.is_production:
-    _cors_origins |= {"http://localhost:5173", "http://127.0.0.1:5173"}
+    _cors_origins |= {
+        "http://localhost:5173", "http://127.0.0.1:5173",
+        "http://localhost:5174", "http://127.0.0.1:5174",
+    }
 
 app.add_middleware(
     CORSMiddleware,
@@ -62,6 +65,7 @@ from app.api import (
     nokvo_one_voice,
     connect_admin,
     connect_public,
+    apex_public,
 )
 
 app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
@@ -114,6 +118,11 @@ app.include_router(
 if settings.NOKVO_CONNECT_ENABLED:
     app.include_router(connect_admin.router, prefix="/api/nokvo-one/connect", tags=["connect-admin"])
     app.include_router(connect_public.router, prefix="/api/voice", tags=["connect-public"])
+
+# APEX CRM API — campaign-key-scoped lead ingest + verdict reads. Namespace-
+# neutral short prefix because the ingest URL is pasted verbatim into CRM
+# webhook boxes (the token in the path is the whole credential).
+app.include_router(apex_public.router, prefix="/apex/v1", tags=["apex-crm-api"])
 
 # Serve CC0 call-center ambience clips bundled in app/assets/audio/ so the
 # frontend can mix them under the live agent voice. Path is public — the
@@ -236,6 +245,10 @@ from app.services.outbound_campaign_ticker import (  # noqa: E402
     start_outbound_campaign_ticker,
     stop_outbound_campaign_ticker,
 )
+from app.services.crm_webhook_drainer import (  # noqa: E402
+    start_crm_webhook_drainer,
+    stop_crm_webhook_drainer,
+)
 from app.services.llm_pool import (  # noqa: E402
     start_llm_pool_refresher,
     stop_llm_pool_refresher,
@@ -268,6 +281,7 @@ async def _start_retry_scheduler() -> None:
     start_followup_scheduler()
     start_plivo_number_poller()
     start_outbound_campaign_ticker()
+    start_crm_webhook_drainer()
     start_llm_pool_refresher()
     # Load the SuperAdmin-set USD→INR FX override (per-call COGS pricing)
     # before the first call records, then keep it fresh across replicas.
@@ -328,5 +342,6 @@ async def _stop_retry_scheduler() -> None:
     await stop_followup_scheduler()
     await stop_plivo_number_poller()
     await stop_outbound_campaign_ticker()
+    await stop_crm_webhook_drainer()
     await stop_llm_pool_refresher()
     await stop_platform_settings_refresher()

@@ -31,9 +31,18 @@ from argon2.exceptions import VerifyMismatchError
 _ALPHABET = string.ascii_letters + string.digits  # base62
 _PREFIX_LEN = 6
 _SECRET_LEN = 36
-_KEY_RE = re.compile(rf"^nk_(?P<mode>live|test)_(?P<prefix>[A-Za-z0-9]{{{_PREFIX_LEN}}})(?P<secret>[A-Za-z0-9]{{{_SECRET_LEN}}})$")
+# Two key families share the format, the hashing and the ``key_prefix`` lookup:
+# ``nk`` (org-wide Nokvo Connect) and ``nkap`` (APEX campaign-scoped — the key
+# resolves to exactly one campaign). ``nkap_live_`` + 6 chars = 16 chars, the
+# ``key_prefix`` column's full width.
+_KEY_RE = re.compile(
+    rf"^(?P<family>nk|nkap)_(?P<mode>live|test)_"
+    rf"(?P<prefix>[A-Za-z0-9]{{{_PREFIX_LEN}}})(?P<secret>[A-Za-z0-9]{{{_SECRET_LEN}}})$"
+)
 
 _hasher = PasswordHasher()
+
+KeyFamily = Literal["nk", "nkap"]
 
 
 @dataclass
@@ -49,16 +58,19 @@ class MintedApiKey:
 
     mode: Literal["live", "test"]
 
+    family: KeyFamily = "nk"
 
-def mint(mode: Literal["live", "test"] = "live") -> MintedApiKey:
+
+def mint(mode: Literal["live", "test"] = "live", family: KeyFamily = "nk") -> MintedApiKey:
     prefix = "".join(secrets.choice(_ALPHABET) for _ in range(_PREFIX_LEN))
     secret = "".join(secrets.choice(_ALPHABET) for _ in range(_SECRET_LEN))
-    raw = f"nk_{mode}_{prefix}{secret}"
+    raw = f"{family}_{mode}_{prefix}{secret}"
     return MintedApiKey(
         raw=raw,
-        key_prefix=f"nk_{mode}_{prefix}",
+        key_prefix=f"{family}_{mode}_{prefix}",
         secret_hash=_hasher.hash(secret),
         mode=mode,
+        family=family,
     )
 
 
@@ -67,6 +79,7 @@ class ParsedApiKey:
     mode: Literal["live", "test"]
     key_prefix: str
     secret: str
+    family: KeyFamily = "nk"
 
 
 def parse(raw: str | None) -> ParsedApiKey | None:
@@ -78,10 +91,13 @@ def parse(raw: str | None) -> ParsedApiKey | None:
     match = _KEY_RE.match(raw.strip())
     if not match:
         return None
+    family = match.group("family")
+    mode = match.group("mode")
     return ParsedApiKey(
-        mode=match.group("mode"),  # type: ignore[arg-type]
-        key_prefix=f"nk_{match.group('mode')}_{match.group('prefix')}",
+        mode=mode,  # type: ignore[arg-type]
+        key_prefix=f"{family}_{mode}_{match.group('prefix')}",
         secret=match.group("secret"),
+        family=family,  # type: ignore[arg-type]
     )
 
 

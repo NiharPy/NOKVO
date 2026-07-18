@@ -375,7 +375,9 @@ async def get_api_key_record(
     organization, tenant_resources) triple every downstream call needs."""
     raw = await _resolve_api_key_from_request(request)
     parsed = api_key_utils.parse(raw)
-    if parsed is None:
+    # Family guard: campaign-scoped ``nkap_`` keys never authenticate the
+    # org-wide Connect surface (and vice versa — see get_campaign_api_key).
+    if parsed is None or parsed.family != "nk":
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing or malformed API key",
@@ -435,3 +437,79 @@ async def get_api_key_record(
             pass
 
     return record, organization, tenant_res
+
+
+async def get_campaign_api_key(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Authenticate an APEX campaign-scoped ``nkap_…`` key and return the
+    ``(api_key, organization, tenant_resources, campaign)`` tuple. The key IS
+    the campaign context: /apex/v1/* routes carry no campaign id.
+
+    The key may arrive in the usual headers (Authorization: Bearer /
+    X-Nokvo-API-Key) or as the ``{token}`` path parameter — the catch-hook
+    style CRM webhook boxes need, since many can't set headers."""
+    from app.models.outbound_campaign import CampaignStatus, OutboundCampaign
+
+    raw = request.path_params.get("token") or await _resolve_api_key_from_request(request)
+    parsed = api_key_utils.parse(raw)
+    if parsed is None or parsed.family != "nkap":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or malformed API key",
+            headers={"WWW-Authenticate": 'ApiKey realm="nokvo-apex"'},
+        )
+    result = await db.execute(
+        select(OrganizationApiKey).where(OrganizationApiKey.key_prefix == parsed.key_prefix)
+    )
+    record = result.scalars().first()
+    if record is None or record.status != "active" or record.campaign_id is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
+    if record.expires_at is not None and record.expires_at <= datetime.now(timezone.utc):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="API key has expired")
+    if not api_key_utils.verify(parsed, record.secret_hash):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
+
+    org_res = await db.execute(select(Organization).where(Organization.id == record.organization_id))
+    organization = org_res.scalars().first()
+    if organization is None or organization.status not in {"active"}:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Organization is not active")
+    if (organization.product_tier or "nokvo_prime") != "nokvo_apex":
+        # Campaign keys are a NOKVO APEX surface; refuse defensively in case a
+        # key outlives a tier change (mirrors the Connect dep's nokvo_one gate).
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This API is available only on NOKVO APEX organizations",
+        )
+
+    camp_res = await db.execute(
+        select(OutboundCampaign).where(OutboundCampaign.id == record.campaign_id)
+    )
+    campaign = camp_res.scalars().first()
+    if campaign is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
+    if campaign.status == CampaignStatus.cancelled:
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="This campaign was cancelled — create a new campaign and use its key.",
+        )
+
+    tr_res = await db.execute(
+        select(TenantResources).where(TenantResources.organization_id == organization.id)
+    )
+    tenant_res = tr_res.scalars().first()
+    if tenant_res is None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Tenant resources not provisioned")
+
+    try:
+        record.last_used_at = datetime.now(timezone.utc)
+        db.add(record)
+        await db.commit()
+    except Exception:
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+
+    return record, organization, tenant_res, campaign

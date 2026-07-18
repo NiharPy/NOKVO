@@ -1169,6 +1169,63 @@ class OutboundCampaignService:
         return campaign
 
     @staticmethod
+    async def create_webhook_bulk_campaign(
+        tenant_res: TenantResources,
+        db: AsyncSession,
+        *,
+        name: str,
+        agent_config: dict[str, Any] | None = None,
+    ) -> OutboundCampaign:
+        """CRM/Webhook lead source: same bulk campaign, no file. Created RUNNING
+        with zero contacts — dialing is lead-driven, so an empty campaign simply
+        idles until the CRM pushes its first lead through ``/apex/v1/leads``
+        (the ingest kicks the dialer; drain → ``maybe_complete`` → the next
+        push resumes it: the evergreen loop). V2-only — API leads land as
+        per-row contacts."""
+        if not PlivoService.bulk_calling_enabled(tenant_res):
+            raise ValueError(
+                "Bulk calling isn't enabled for this account yet. It unlocks once "
+                "the team provisions your dedicated calling number."
+            )
+        if not settings.CAMPAIGN_CONTACTS_V2:
+            raise ValueError("CRM/Webhook campaigns aren't available right now.")
+        # An idle webhook campaign HOLDS the tenant's single active slot — that's
+        # deliberate (it's the tenant's live lead-intake line).
+        await OutboundCampaignService._assert_no_other_active_campaign(db, tenant_res.tenant_id)
+        cfg = build_agent_config(**dict(agent_config or {}))
+        cfg["bulk_csv"] = True
+        cfg["followup_rules"] = {"enabled": False}
+        cfg["deterministic"] = bool((agent_config or {}).get("deterministic"))
+        cfg["lead_source"] = "webhook"
+        if not str(cfg.get("agent_prompt") or "").strip() and not cfg.get("questionnaire"):
+            raise ValueError(
+                "Bulk campaigns need either offer details (what to say) or a "
+                "questionnaire. Add one and try again."
+            )
+        caller_id = PlivoService.bulk_calling_caller_id(tenant_res)
+        auth_override = PlivoService.bulk_calling_auth(tenant_res)
+        if not caller_id or not auth_override:
+            raise ValueError(
+                "Your dedicated bulk calling number isn't fully configured. "
+                "Contact support to finish setup."
+            )
+        campaign = OutboundCampaign(
+            id=uuid.uuid4(),
+            tenant_id=tenant_res.tenant_id,
+            name=name,
+            status=CampaignStatus.running,
+            agent_config=cfg,
+            from_number=caller_id,
+            total_count=0,
+            started_at=datetime.now(timezone.utc),
+        )
+        db.add(campaign)
+        await db.commit()
+        await db.refresh(campaign)
+        invalidate_outbound_context(campaign.id)
+        return campaign
+
+    @staticmethod
     async def rerun_bulk_campaign(
         campaign: OutboundCampaign,
         db: AsyncSession,
@@ -2041,9 +2098,16 @@ class OutboundCampaignService:
 
         placed = 0
         failures = 0
+        # CRM result webhook for terminals decided right here (DND scrub /
+        # placement failure) — no Plivo webhook will ever come for these rows,
+        # so this is their only notification seam. Fail-soft, no-op unless the
+        # campaign has a Result Webhook URL.
+        from app.services.crm_webhook_service import enqueue_for_link as _crm_enqueue
+
         for i, row in enumerate(claimed):
             if result is not None and result.is_blocked(row["phone"]):
                 await v2.mark_contact(row["id"], "dnd_dropped")
+                await _crm_enqueue(db, row["call_link_id"])
                 continue
             chosen = pool[i % len(pool)]  # round-robin fan-out across the DID pool
             contact = {"call_link_id": row["call_link_id"], "phone": row["phone"]}
@@ -2056,6 +2120,7 @@ class OutboundCampaignService:
                 placed += 1
             else:
                 await v2.mark_contact(row["id"], "failed")
+                await _crm_enqueue(db, row["call_link_id"])
                 failures += 1
 
         # Counters (best-effort): total dialed, placement failures (terminal with
@@ -2127,6 +2192,14 @@ class OutboundCampaignService:
             if new_status in ("failed", "no_answer"):
                 await v2.bump_campaign_counter(db, camp_id, "failed_count")
             await db.commit()
+            if new_status in ("failed", "no_answer"):
+                # CRM result webhook: never-connected terminal → lead.unreachable
+                # (a COMPLETED transition is not enqueued here — its verdict
+                # arrives from the post-call scorer, which enqueues after the
+                # stamp). Fail-soft; no-op without a configured webhook URL.
+                from app.services.crm_webhook_service import enqueue_for_link
+
+                await enqueue_for_link(db, call_link_id)
             # Last call in the list just ended → completed (frees the tenant's
             # single campaign slot). No-op while anything is pending or live.
             await v2.maybe_complete(db, campaign.id)

@@ -27,6 +27,10 @@ class OrganizationApiKey(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     organization_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False, index=True)
+    # NULL → org-wide Nokvo Connect key. Set → APEX campaign-scoped ``nkap_…``
+    # key: every /apex/v1/* request resolves its one campaign from the key, so
+    # no endpoint carries a campaign id (and a leaked key exposes one campaign).
+    campaign_id = Column(UUID(as_uuid=True), ForeignKey("outbound_campaigns.id"), nullable=True, index=True)
     label = Column(String, nullable=False)
     key_prefix = Column(String(16), nullable=False, unique=True, index=True)
     secret_hash = Column(String, nullable=False)

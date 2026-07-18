@@ -305,16 +305,20 @@ function buildQuestionnaire(form, fail) {
 // Build the multipart FormData for POST /bulk-calling/campaigns. `deterministic`
 // selects the path. Throws { message } on a validation failure so the caller can
 // surface it. Mirrors startBulkCallingCampaign in NokvoOneApp.vue.
+// form.lead_source === 'webhook' → no contacts file: the campaign starts
+// running-idle and dials as the CRM pushes leads to its ingest URL.
 export function buildBulkCampaignFormData(form, { deterministic }) {
   const fail = (message) => { throw { message }; };
+  const webhookSource = form.lead_source === 'webhook';
   if (!(form.name || '').trim()) fail('Name the campaign.');
-  if (!form.file) fail('Choose a CSV (or XLSX) of phone numbers.');
+  if (!webhookSource && !form.file) fail('Choose a CSV (or XLSX) of phone numbers.');
   if (!deterministic && !(form.content || '').trim()) {
     fail('Add the campaign content — what the agent should say.');
   }
 
   const fd = new FormData();
   fd.append('name', form.name.trim());
+  fd.append('lead_source', webhookSource ? 'webhook' : 'csv');
   fd.append('deterministic', deterministic ? 'true' : 'false');
   fd.append('content', (form.content || '').trim());
   if ((form.company_name || '').trim()) fd.append('company_name', form.company_name.trim());
@@ -328,7 +332,7 @@ export function buildBulkCampaignFormData(form, { deterministic }) {
       fd.append('calls_per_day', String(Math.max(1, Math.round(Number(form.calls_per_day)))));
     }
   }
-  fd.append('contacts_file', form.file);
+  if (!webhookSource) fd.append('contacts_file', form.file);
   return fd;
 }
 

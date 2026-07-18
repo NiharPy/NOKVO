@@ -2087,6 +2087,15 @@ class NokvoOneVoiceStreamService:
                                                 "NOKVO-OUTBOUND-INTEREST: %s for call %s (v2 row)",
                                                 _log, _bg_call_id,
                                             )
+                                            # CRM result webhook: the verdict is
+                                            # final on the row → queue delivery
+                                            # (no-op unless the campaign has a
+                                            # Result Webhook URL). Fail-soft.
+                                            from app.services.crm_webhook_service import (
+                                                enqueue_for_link,
+                                            )
+
+                                            await enqueue_for_link(_rdb, _bg_call_link_id)
                                 except Exception:
                                     logger.exception("NOKVO-OUTBOUND-INTEREST: v2 row write failed")
 

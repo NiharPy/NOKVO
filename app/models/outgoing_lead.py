@@ -194,6 +194,10 @@ class OutboundCampaignContact(Base):
     duration_s = Column(Numeric(12, 4), nullable=True)
     qualified = Column(Boolean, nullable=False, server_default="false", default=False)
     lead_score = Column(Integer, nullable=True)
+    # The pushing CRM's own record id (API-ingested contacts only). Echoed back
+    # on result webhooks so the CRM maps verdicts to its record; lookup only —
+    # phone stays the dedupe key (a CRM may legitimately resend an id).
+    external_id = Column(Text, nullable=True)
     # claim pool (APEX members): who has claimed this qualified lead, when.
     claimed_by = Column(UUID(as_uuid=True), nullable=True)
     claimed_at = Column(DateTime(timezone=True), nullable=True)
@@ -222,4 +226,6 @@ class OutboundCampaignContact(Base):
         ),
         # Live-call count (concurrency cap) + per-bucket summary.
         Index("ix_occ_campaign_status", "campaign_id", "status"),
+        # CRM record lookup (GET /apex/v1/leads/{external_id}).
+        Index("ix_occ_campaign_external_id", "campaign_id", "external_id"),
     )

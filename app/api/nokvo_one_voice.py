@@ -2184,7 +2184,11 @@ async def request_bulk_calling(
 async def create_bulk_calling_campaign(
     request: Request,
     name: str = Form(...),
-    contacts_file: UploadFile = File(...),
+    # Lead source: "csv" (upload, the default) or "webhook" (CRM push via the
+    # campaign-scoped API — no file; the campaign starts running-idle and dials
+    # as leads arrive at POST /apex/v1/leads/{key}).
+    lead_source: str = Form("csv"),
+    contacts_file: UploadFile | None = File(None),
     content: str = Form(...),
     company_name: str | None = Form(None),
     caller_name: str | None = Form(None),
@@ -2308,15 +2312,30 @@ async def create_bulk_calling_campaign(
             agent_config=agent_config,
             actor_email=user.email,
         )
-        campaign = await OutboundCampaignService.create_and_launch_bulk_campaign(
-            tr,
-            db,
-            name=name.strip(),
-            contacts_file=contacts_file,
-            agent_config=agent_config,
-            public_base_url=_pub(request),
-            path_prefix="/api/nokvo-one/agents",
-        )
+        if lead_source == "webhook":
+            campaign = await OutboundCampaignService.create_webhook_bulk_campaign(
+                tr,
+                db,
+                name=name.strip(),
+                agent_config=agent_config,
+            )
+        else:
+            if contacts_file is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Attach a contacts file (CSV or XLSX), or switch the lead source to CRM / Webhook.",
+                )
+            campaign = await OutboundCampaignService.create_and_launch_bulk_campaign(
+                tr,
+                db,
+                name=name.strip(),
+                contacts_file=contacts_file,
+                agent_config=agent_config,
+                public_base_url=_pub(request),
+                path_prefix="/api/nokvo-one/agents",
+            )
+    except HTTPException:
+        raise
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=_safe_detail(exc)) from exc
     except Exception as exc:
@@ -2332,7 +2351,24 @@ async def create_bulk_calling_campaign(
             _retain_task(asyncio.create_task(prewarm_campaign_tts(tr, parsed_questionnaire)))
         except Exception:
             logger.debug("APEX-TTS-PREWARM: failed to schedule", exc_info=True)
-    return _campaign_response(campaign)
+    resp = _campaign_response(campaign)
+    if lead_source == "webhook":
+        # Auto-mint the campaign's API key so the creation response IS the
+        # integration panel: ingest URL + key, shown once (Reveal re-fetches
+        # from KeyVault later). The key is the whole credential — the operator
+        # pastes ingest_url into their CRM's webhook box and is integrated.
+        from app.services import apex_campaign_key_service as keysvc
+
+        record, raw_key = await keysvc.mint_for_campaign(
+            db, org, campaign, tr, created_by_user_id=user.id
+        )
+        await db.commit()
+        resp["api"] = {
+            "ingest_url": f"{_pub(request)}/apex/v1/leads/{raw_key}",
+            "api_key": raw_key,
+            "key_prefix": record.key_prefix,
+        }
+    return resp
 
 
 class QuestionnaireTranslatePayload(BaseModel):
@@ -2682,6 +2718,173 @@ async def add_bulk_calling_contacts(
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=_safe_detail(exc)) from exc
     return {"ok": True, "campaign_id": str(campaign.id), "status": "adding"}
+
+
+# ── campaign API config (CRM in / CRM out) ───────────────────────────────────
+async def _api_config_campaign(campaign_id: uuid.UUID, user, db):
+    tr = await _tenant_for_user(db, user)
+    campaign = await OutboundCampaignService.get_campaign(campaign_id, tr, db)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    return tr, campaign
+
+
+@router.get("/bulk-calling/campaigns/{campaign_id}/api-config")
+async def get_campaign_api_config(
+    campaign_id: uuid.UUID,
+    request: Request,
+    user: OrganizationUser = Depends(_bulk_viewer_dep()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Everything the campaign card's API panel shows: key state (masked),
+    result-webhook config, the live ingest feed and recent delivery attempts."""
+    from sqlalchemy import select as _select
+
+    from app.models.crm_webhook_outbox import CrmWebhookOutbox
+    from app.services import apex_campaign_key_service as keysvc
+    from app.services import crm_webhook_service
+    from app.services.public_url import public_base_url as _pub
+
+    tr, campaign = await _api_config_campaign(campaign_id, user, db)
+    record = await keysvc.active_key_for_campaign(db, campaign.id)
+    whcfg = keysvc.webhook_config(campaign)
+    deliveries = (
+        (
+            await db.execute(
+                _select(CrmWebhookOutbox)
+                .where(CrmWebhookOutbox.campaign_id == campaign.id)
+                .order_by(CrmWebhookOutbox.created_at.desc())
+                .limit(20)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return {
+        "lead_source": (campaign.agent_config or {}).get("lead_source") or "csv",
+        "has_key": record is not None,
+        "key_prefix": record.key_prefix if record else None,
+        "ingest_url_masked": (
+            f"{_pub(request)}/apex/v1/leads/{record.key_prefix}{'•' * 8}" if record else None
+        ),
+        "webhook_url": whcfg.get("url"),
+        "has_webhook_secret": bool(whcfg.get("secret_name") or whcfg.get("secret_fallback")),
+        "feed": await crm_webhook_service.read_ingest_feed(campaign.id),
+        "deliveries": [
+            {
+                "event": d.event,
+                "status": d.status,
+                "attempt": int(d.attempt or 0),
+                "last_status_code": d.last_status_code,
+                "last_error": d.last_error,
+                "created_at": d.created_at.isoformat() if d.created_at else None,
+                "delivered_at": d.delivered_at.isoformat() if d.delivered_at else None,
+            }
+            for d in deliveries
+        ],
+    }
+
+
+class CampaignApiConfigPayload(BaseModel):
+    # None/"" clears the result webhook.
+    webhook_url: str | None = None
+
+
+@router.put("/bulk-calling/campaigns/{campaign_id}/api-config")
+async def put_campaign_api_config(
+    campaign_id: uuid.UUID,
+    payload: CampaignApiConfigPayload,
+    user: OrganizationUser = Depends(_bulk_admin_dep()),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Set/clear the Result Webhook URL. First set generates the ``whsec_…``
+    signing secret and returns it (retrievable again — it lives in KeyVault)."""
+    from app.services import apex_campaign_key_service as keysvc
+
+    tr, campaign = await _api_config_campaign(campaign_id, user, db)
+    url = (payload.webhook_url or "").strip() or None
+    if url and not url.startswith("https://") and not url.startswith("http://localhost"):
+        raise HTTPException(status_code=400, detail="The result webhook URL must be https.")
+    raw_secret = await keysvc.set_result_webhook(db, campaign, tr, url=url)
+    await db.commit()
+    return {"ok": True, "webhook_url": url, "webhook_secret": raw_secret}
+
+
+@router.post("/bulk-calling/campaigns/{campaign_id}/api-key/reveal")
+async def reveal_campaign_api_key(
+    campaign_id: uuid.UUID,
+    request: Request,
+    user: OrganizationUser = Depends(_bulk_admin_dep()),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    from app.services import apex_campaign_key_service as keysvc
+    from app.services.public_url import public_base_url as _pub
+
+    tr, campaign = await _api_config_campaign(campaign_id, user, db)
+    if await keysvc.active_key_for_campaign(db, campaign.id) is None:
+        raise HTTPException(status_code=404, detail="This campaign has no API key yet — rotate to create one.")
+    raw = await keysvc.reveal(tr, campaign)
+    if not raw:
+        raise HTTPException(
+            status_code=409,
+            detail="The key can't be revealed in this environment — rotate to get a new one.",
+        )
+    return {"api_key": raw, "ingest_url": f"{_pub(request)}/apex/v1/leads/{raw}"}
+
+
+@router.post("/bulk-calling/campaigns/{campaign_id}/api-key/rotate")
+async def rotate_campaign_api_key(
+    campaign_id: uuid.UUID,
+    request: Request,
+    user: OrganizationUser = Depends(_bulk_admin_dep()),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Rotate (or first-mint — this is also how a CSV campaign turns on API
+    access) the campaign key. The old key stops working immediately."""
+    from app.services import apex_campaign_key_service as keysvc
+    from app.services.public_url import public_base_url as _pub
+
+    tr, campaign = await _api_config_campaign(campaign_id, user, db)
+    org = await _org_for_user(db, user)
+    record, raw = await keysvc.rotate(db, org, campaign, tr, created_by_user_id=user.id)
+    await db.commit()
+    return {
+        "api_key": raw,
+        "key_prefix": record.key_prefix,
+        "ingest_url": f"{_pub(request)}/apex/v1/leads/{raw}",
+    }
+
+
+@router.post("/bulk-calling/campaigns/{campaign_id}/webhook-test")
+async def test_campaign_webhook(
+    campaign_id: uuid.UUID,
+    user: OrganizationUser = Depends(_bulk_admin_dep()),
+    _mfa: OrganizationUser = Depends(deps.RequireMFACompleted()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """[Send Test Webhook]: POST a signed sample ``lead.completed`` to the
+    configured Result Webhook URL synchronously and echo what came back — the
+    operator's 'did my hookup work?' button."""
+    from app.services import apex_campaign_key_service as keysvc
+    from app.services import crm_webhook_service
+
+    tr, campaign = await _api_config_campaign(campaign_id, user, db)
+    whcfg = keysvc.webhook_config(campaign)
+    url = whcfg.get("url")
+    if not url:
+        raise HTTPException(status_code=400, detail="Set a Result Webhook URL first.")
+    secret = await keysvc.signing_secret(campaign)
+    status_code, error = await crm_webhook_service.post_signed(
+        url, secret, crm_webhook_service.build_test_payload(campaign)
+    )
+    return {
+        "ok": bool(status_code and 200 <= status_code < 300),
+        "status_code": status_code,
+        "error": error,
+    }
 
 
 @router.get("/campaigns")

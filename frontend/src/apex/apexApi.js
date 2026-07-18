@@ -184,6 +184,44 @@ export async function styleRewriteQuestionnaire({ questionnaire, style, company_
   return data || null;
 }
 
+// ── Campaign CRM API panel (webhook lead source) ────────────────────────────
+// Key state (masked), result-webhook config, live ingest feed + delivery log.
+export async function fetchCampaignApiConfig(campaignId) {
+  const { data } = await agentsApi.get(`/bulk-calling/campaigns/${campaignId}/api-config`, { headers: authHeader() });
+  return data;
+}
+
+// Set (https) or clear (null/'') the Result Webhook URL. First set returns the
+// webhook_secret — show it; it stays retrievable via this same call cycle.
+export async function setCampaignApiConfig(campaignId, webhookUrl) {
+  const { data } = await agentsApi.put(
+    `/bulk-calling/campaigns/${campaignId}/api-config`,
+    { webhook_url: webhookUrl || null },
+    { headers: authHeader() },
+  );
+  return data;
+}
+
+// Returns { api_key, ingest_url } — the current key fetched from the vault.
+export async function revealCampaignApiKey(campaignId) {
+  const { data } = await agentsApi.post(`/bulk-calling/campaigns/${campaignId}/api-key/reveal`, {}, { headers: authHeader() });
+  return data;
+}
+
+// Mints a fresh key (also first-mint for a CSV campaign turning on API access).
+// The old key stops working immediately.
+export async function rotateCampaignApiKey(campaignId) {
+  const { data } = await agentsApi.post(`/bulk-calling/campaigns/${campaignId}/api-key/rotate`, {}, { headers: authHeader() });
+  return data;
+}
+
+// POSTs a signed sample lead.completed to the configured Result Webhook URL and
+// returns { ok, status_code, error }.
+export async function testCampaignWebhook(campaignId) {
+  const { data } = await agentsApi.post(`/bulk-calling/campaigns/${campaignId}/webhook-test`, {}, { headers: authHeader() });
+  return data;
+}
+
 // `buckets`: which outcome groups to re-dial — ["no_pickup"] (default, the
 // unreached), ["busy"] (answered but asked to be called back), or both.
 export async function rerunCampaign(campaignId, buckets = null) {

@@ -3,7 +3,7 @@
 // threshold + working window) and the deterministic campaign list with outcome
 // counts. Reuses the shared bulkCalling.js logic + the existing endpoints.
 // The create form is a 3-step wizard: Details → Script & questions → Review & launch.
-import { inject, onMounted, ref, computed, watch } from 'vue';
+import { inject, onMounted, onUnmounted, ref, computed, watch } from 'vue';
 import {
   newQuestion, makeId, maxPointsFor, estCallSeconds, fmtDuration, scheduleEstimate, countCsvRows,
   buildBulkCampaignFormData, buildBulkCampaignUpdatePayload, categorizeContacts, leadCategory,
@@ -23,6 +23,7 @@ const emptyForm = () => ({
   intro_i18n: {}, outro_i18n: {}, // reviewed hi/te lines (translate-preview flow)
   style: 'scripted', // conversation style (style-rewrite flow)
   intro_source: '', outro_source: '', // pre-restyle originals
+  lead_source: 'csv', // 'csv' (upload a list) | 'webhook' (CRM pushes leads via the API)
 });
 const form = ref(emptyForm());
 const fileName = ref('');
@@ -35,7 +36,9 @@ const step = ref(1);
 const STEPS = ['Details', 'Script & questions', 'Review & launch'];
 const canNext = computed(() => (step.value === 1 ? !!form.value.name.trim() : true));
 // Editing doesn't need a contacts file — the list is managed via Add CSV.
-const canLaunch = computed(() => !!form.value.name.trim() && (!!editingId.value || !!form.value.file));
+// A CRM/Webhook campaign never has one: it goes live idle and dials as leads arrive.
+const isWebhookSource = computed(() => form.value.lead_source === 'webhook');
+const canLaunch = computed(() => !!form.value.name.trim() && (!!editingId.value || isWebhookSource.value || !!form.value.file));
 // Direction-aware step transition: forward slides in from the right, back from
 // the left — the wizard reads as a physical strip you move along.
 const stepDir = ref('fwd');
@@ -103,6 +106,7 @@ function applyNovaDraft(draft) {
 }
 onMounted(() => applyNovaDraft(apex.novaDraft?.value));
 watch(() => apex.novaDraft?.value, (d) => applyNovaDraft(d));
+onUnmounted(() => clearInterval(apiPoll));
 
 const det = computed(() => apex.deterministicCampaigns.value);
 
@@ -489,6 +493,38 @@ async function submit() {
     }
     const fd = buildBulkCampaignFormData(form.value, { deterministic: true });
     const data = await apex.createCampaign(fd);
+    if (data?.api) {
+      // CRM/Webhook campaign: the line is live but idle — the payoff screen is
+      // the integration panel (ingest URL + key, shown once here; Reveal
+      // re-fetches later), not the launch ceremony.
+      integration.value = {
+        campaignId: data.id,
+        campaignName: data.name,
+        ingestUrl: data.api.ingest_url,
+        apiKey: data.api.api_key,
+        webhookUrl: '',
+        webhookSecret: null,
+        testResult: null,
+        recipe: 'zoho',
+      };
+      apex.toast('Campaign is live — connect your CRM below and leads will start dialing.');
+      // Live feed starts polling right away: the "waiting for your first
+      // lead…" state flipping to a green row is the did-it-work moment.
+      clearInterval(apiPoll);
+      apiPoll = setInterval(() => { if (integration.value) refreshApiCfg(integration.value.campaignId); }, 5000);
+      refreshApiCfg(data.id);
+      form.value = emptyForm();
+      fileName.value = '';
+      listSize.value = null;
+      step.value = 1;
+      translated.value = false;
+      translateError.value = '';
+      styledFor.value = '';
+      styleWarnings.value = [];
+      styleError.value = '';
+      await apex.reload();
+      return;
+    }
     const contacts = Array.isArray(data?.contacts) ? data.contacts : [];
     const failed = contacts.filter((c) => c.status === 'failed');
     if (failed.length && failed.length >= contacts.length) {
@@ -515,6 +551,137 @@ async function submit() {
   } finally {
     launching.value = false;
   }
+}
+
+// ── CRM integration panel ───────────────────────────────────────────────────
+// `integration` is the post-create payoff screen (key shown once) AND the
+// campaign-card API panel (opened via openApi — key masked, Reveal fetches it).
+const integration = ref(null);
+const apiBusy = ref(false);
+const apiCfg = ref(null);       // GET api-config payload (feed + deliveries)
+let apiPoll = null;             // live-feed polling handle
+
+const RECIPES = [
+  { id: 'zoho', label: 'Zoho CRM', steps: [
+    'In Zoho CRM open Setup → Automation → Workflow Rules and create a rule on the Leads module (e.g. "on create").',
+    'Add the action Webhook → New Webhook. Method POST, URL: paste your Lead Webhook URL below.',
+    'Body: choose JSON and include the fields Phone (as "phone"), Full Name (as "name") and Lead Id (as "external_id").',
+    'Save and activate the rule — every new Zoho lead now dials automatically.',
+  ] },
+  { id: 'hubspot', label: 'HubSpot', steps: [
+    'In HubSpot open Automations → Workflows and create a Contact-based workflow (e.g. trigger: contact created).',
+    'Add the action "Send a webhook" (Operations Hub) or "Trigger a webhook". Method POST, URL: paste your Lead Webhook URL below.',
+    'Include the properties phone, firstname, lastname and the Record ID — the field names are recognised automatically.',
+    'Turn the workflow on.',
+  ] },
+  { id: 'zapier', label: 'Zapier / Make', steps: [
+    'Create a Zap (or Make scenario) with your CRM\'s "New Lead" trigger.',
+    'Add the action Webhooks → POST. URL: paste your Lead Webhook URL below.',
+    'Map phone, name and the record id (as external_id) into the payload — any common field names work.',
+    'Turn the Zap on.',
+  ] },
+  { id: 'other', label: 'Any other system', steps: [
+    'POST JSON to your Lead Webhook URL — no headers or auth setup needed (the URL itself is the credential).',
+    'Body: {"phone": "+91 98765 43210", "name": "Asha", "external_id": "your-record-id"} — or a {"leads": [...]} batch.',
+    'Common field aliases (mobile, phone_number, full_name, lead_id…) are recognised automatically.',
+    'Results come back to your Result Webhook URL as signed lead.completed / lead.unreachable events.',
+  ] },
+];
+
+async function copyText(t) {
+  try { await navigator.clipboard.writeText(t || ''); apex.toast('Copied.'); }
+  catch { apex.toast('Could not copy — select and copy manually.', 'err'); }
+}
+
+function isCrmCampaign(c) { return (c.agent_config || {}).lead_source === 'webhook'; }
+
+async function refreshApiCfg(campaignId) {
+  try { apiCfg.value = await apex.fetchCampaignApiConfig(campaignId); } catch { /* panel shows stale */ }
+}
+
+// Open the API panel from a campaign card (works for CSV campaigns too — rotate
+// first-mints a key, turning API access on for an existing campaign).
+async function openApi(c) {
+  integration.value = {
+    campaignId: c.id, campaignName: c.name,
+    ingestUrl: null, apiKey: null, // masked until Reveal
+    webhookUrl: '', webhookSecret: null, testResult: null, recipe: 'zoho',
+  };
+  apiCfg.value = null;
+  await refreshApiCfg(c.id);
+  if (apiCfg.value?.webhook_url) integration.value.webhookUrl = apiCfg.value.webhook_url;
+  clearInterval(apiPoll);
+  apiPoll = setInterval(() => { if (integration.value) refreshApiCfg(integration.value.campaignId); }, 5000);
+}
+function closeIntegration() {
+  integration.value = null;
+  apiCfg.value = null;
+  clearInterval(apiPoll);
+  apiPoll = null;
+}
+
+async function revealKey() {
+  if (!integration.value || apiBusy.value) return;
+  apiBusy.value = true;
+  try {
+    const data = await apex.revealCampaignApiKey(integration.value.campaignId);
+    integration.value.apiKey = data.api_key;
+    integration.value.ingestUrl = data.ingest_url;
+  } catch (e) {
+    apex.toast(apex.extractError(e, 'Could not reveal the key.'), 'err');
+  } finally { apiBusy.value = false; }
+}
+
+async function rotateKey() {
+  if (!integration.value || apiBusy.value) return;
+  // First mint (CSV campaign turning on API access) needs no scary confirm —
+  // there is no old key to break.
+  const firstMint = apiCfg.value && apiCfg.value.has_key === false;
+  if (!firstMint && !window.confirm('Rotate the API key? The old key (and the old Lead Webhook URL) stops working immediately — update your CRM with the new URL.')) return;
+  apiBusy.value = true;
+  try {
+    const data = await apex.rotateCampaignApiKey(integration.value.campaignId);
+    integration.value.apiKey = data.api_key;
+    integration.value.ingestUrl = data.ingest_url;
+    apex.toast('New key minted — update the URL in your CRM.');
+    await refreshApiCfg(integration.value.campaignId);
+  } catch (e) {
+    apex.toast(apex.extractError(e, 'Could not rotate the key.'), 'err');
+  } finally { apiBusy.value = false; }
+}
+
+async function saveWebhookUrl() {
+  if (!integration.value || apiBusy.value) return;
+  apiBusy.value = true;
+  try {
+    const data = await apex.setCampaignApiConfig(integration.value.campaignId, integration.value.webhookUrl.trim());
+    if (data.webhook_secret) integration.value.webhookSecret = data.webhook_secret;
+    apex.toast(data.webhook_url ? 'Result webhook saved — call verdicts will be delivered there.' : 'Result webhook cleared.');
+    await refreshApiCfg(integration.value.campaignId);
+  } catch (e) {
+    apex.toast(apex.extractError(e, 'Could not save the webhook URL.'), 'err');
+  } finally { apiBusy.value = false; }
+}
+
+function agoLabel(ts) {
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return '';
+  const s = Math.max(0, (Date.now() - d.getTime()) / 1000);
+  if (s < 60) return 'just now';
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return d.toLocaleDateString('en-IN', { day: 'numeric', month: 'short' });
+}
+
+async function sendTestWebhook() {
+  if (!integration.value || apiBusy.value) return;
+  apiBusy.value = true;
+  integration.value.testResult = null;
+  try {
+    integration.value.testResult = await apex.testCampaignWebhook(integration.value.campaignId);
+  } catch (e) {
+    integration.value.testResult = { ok: false, error: apex.extractError(e, 'Test failed.') };
+  } finally { apiBusy.value = false; }
 }
 
 const rerunning = ref(null);
@@ -664,11 +831,25 @@ async function onAddFile(e) {
               <input v-model="form.name" type="text" class="ax-text" placeholder="December outreach" />
             </div>
             <div v-if="!editingId">
-              <label class="ax-field-label">Contacts file <span class="ax-field-hint">CSV or XLSX — phone in column A, name in B</span></label>
-              <div class="ax-file">
-                <label class="ax-file-btn">Choose file<input type="file" accept=".csv,.xlsx" style="display:none;" @change="onFile" /></label>
-                <span class="ax-file-name">{{ fileName || 'No file chosen' }}</span>
+              <label class="ax-field-label">Lead source</label>
+              <div class="ax-styleseg" role="radiogroup" aria-label="Lead source">
+                <button type="button" class="ax-styleopt" :class="{ 'is-on': !isWebhookSource }" role="radio" :aria-checked="!isWebhookSource" @click="form.lead_source = 'csv'">
+                  <AxIcon name="file" :size="12" /> CSV upload
+                </button>
+                <button type="button" class="ax-styleopt" :class="{ 'is-on': isWebhookSource }" role="radio" :aria-checked="isWebhookSource" @click="form.lead_source = 'webhook'">
+                  <AxIcon name="zap" :size="12" /> CRM / Webhook
+                </button>
               </div>
+              <template v-if="!isWebhookSource">
+                <label class="ax-field-label" style="margin-top:12px;">Contacts file <span class="ax-field-hint">CSV or XLSX — phone in column A, name in B</span></label>
+                <div class="ax-file">
+                  <label class="ax-file-btn">Choose file<input type="file" accept=".csv,.xlsx" style="display:none;" @change="onFile" /></label>
+                  <span class="ax-file-name">{{ fileName || 'No file chosen' }}</span>
+                </div>
+              </template>
+              <p v-else class="ax-field-hint" style="margin-top:12px;">
+                No file needed — after launch you'll get a <strong>Lead Webhook URL</strong> to paste into Zoho, HubSpot, Zapier or any system. Every lead it sends is called automatically, and the verdict is pushed back.
+              </p>
             </div>
             <div v-else>
               <label class="ax-field-label">Contacts</label>
@@ -860,7 +1041,8 @@ async function onAddFile(e) {
             <p v-if="translateError" class="ax-notice ax-notice--err" style="margin-top:10px;">{{ translateError }}</p>
           </div>
 
-          <p v-if="!editingId && !form.file" class="ax-rv-warn"><AxIcon name="alert" :size="14" /> No contacts file yet — add one in step 1 to launch.</p>
+          <p v-if="!editingId && !form.file && !isWebhookSource" class="ax-rv-warn"><AxIcon name="alert" :size="14" /> No contacts file yet — add one in step 1 to launch.</p>
+          <p v-if="!editingId && isWebhookSource" class="ax-rv-warn" style="color:#7FD9A8;"><AxIcon name="zap" :size="14" /> CRM / Webhook source — the campaign goes live idle and dials each lead your CRM sends. You'll get the webhook URL right after launch.</p>
           <p v-if="!form.questions.length" class="ax-rv-warn"><AxIcon name="alert" :size="14" /> No questions added — the agent will only deliver the intro and outro.</p>
           <p v-if="stylePending" class="ax-rv-warn"><AxIcon name="alert" :size="14" /> {{ styleLabel }} style selected — generate the styled script above and review it before launching.</p>
           <p v-if="launchError" class="ax-notice ax-notice--err">{{ launchError }}</p>
@@ -874,7 +1056,7 @@ async function onAddFile(e) {
         <span style="flex:1;"></span>
         <button v-if="step < 3" type="button" class="ax-btn2 ax-btn2--accent" :disabled="!canNext" @click="stepNext">Continue <AxIcon name="arrow-right" :size="14" /></button>
         <button v-else type="button" class="ax-btn2 ax-btn2--accent" :class="{ 'is-arming': launching }" :disabled="launching || !canLaunch" @click="submit">
-          {{ launching ? (editingId ? 'Saving…' : 'Starting…') : (editingId ? 'Save changes' : 'Upload & start calling') }}
+          {{ launching ? (editingId ? 'Saving…' : 'Starting…') : (editingId ? 'Save changes' : (isWebhookSource ? 'Go live & connect CRM' : 'Upload & start calling')) }}
         </button>
       </div>
     </div>
@@ -893,6 +1075,7 @@ async function onAddFile(e) {
           <span class="ax-camp-status" :class="`is-${statusTone(c.status)}`">{{ c.status }}</span>
           <span v-if="c.status === 'running'" class="ax-eq" aria-hidden="true"><span></span><span></span><span></span></span>
           <span class="ax-camp-mode">Deterministic</span>
+          <span v-if="isCrmCampaign(c)" class="ax-camp-mode" style="color:#8FB8E8;">CRM connected</span>
           <span v-if="campaignWindow(c)" class="ax-camp-mode">{{ campaignWindow(c) }}</span>
         </div>
         <div class="ax-camp-meta">
@@ -922,6 +1105,9 @@ async function onAddFile(e) {
           <button v-if="c.status !== 'cancelled'" type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" :disabled="addingTo === c.id || c.status === 'ingesting'" @click="pickAddCsv(c.id)" title="Add a CSV of new numbers and resume dialing">
             <AxIcon name="plus" :size="12" /> {{ addingTo === c.id ? 'Adding…' : 'Add CSV' }}
           </button>
+          <button v-if="c.status !== 'cancelled'" type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" @click="openApi(c)" :title="isCrmCampaign(c) ? 'CRM connection: webhook URLs, key, live lead feed and delivery log' : 'Turn on API access — let a CRM push leads into this campaign'">
+            <AxIcon name="zap" :size="12" /> API
+          </button>
           <button v-if="c.status === 'running' || c.status === 'ingesting'" type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm ax-camp-del" :disabled="stopping === c.id" @click="stop(c.id, c.name)" title="Stop dialing — in-flight calls finish, results are kept, you can resume later">
             <AxIcon name="stop" :size="12" /> {{ stopping === c.id ? 'Stopping…' : 'Stop' }}
           </button>
@@ -944,6 +1130,96 @@ async function onAddFile(e) {
     <!-- shared hidden picker for "Add CSV" (one per list; target set on click) -->
     <input ref="addFileInput" type="file" accept=".csv,.xlsx" style="display:none" @change="onAddFile" />
 
+    <!-- CRM integration panel — post-create payoff screen AND the per-campaign
+         API panel (card → API). One URL in, one URL out, live feed below. -->
+    <Transition name="axlfx">
+      <div v-if="integration" class="ax-api-overlay" @click.self="closeIntegration()">
+        <div class="ax-api-panel ax-card">
+          <div class="ax-api-head">
+            <div>
+              <h2 class="ax-h2" style="display:flex;align-items:center;gap:10px;"><AxIcon name="zap" :size="18" /> Connect your CRM</h2>
+              <p class="ax-muted" style="margin:6px 0 0;">{{ integration.campaignName }} — paste one URL into your CRM and every lead it sends gets called.</p>
+            </div>
+            <button type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" @click="closeIntegration()"><AxIcon name="x" :size="13" /> Close</button>
+          </div>
+
+          <!-- 1 · leads IN -->
+          <div class="ax-api-sec">
+            <label class="ax-field-label"><AxIcon name="link" :size="12" /> Lead Webhook URL <span class="ax-field-hint">your CRM POSTs new leads here — the URL is the credential, no headers needed</span></label>
+            <div v-if="integration.ingestUrl" class="ax-api-row">
+              <code class="ax-api-code">{{ integration.ingestUrl }}</code>
+              <button type="button" class="ax-btn2 ax-btn2--accent ax-btn2--sm" @click="copyText(integration.ingestUrl)"><AxIcon name="copy" :size="12" /> Copy</button>
+            </div>
+            <div v-else class="ax-api-row">
+              <code class="ax-api-code is-masked">{{ apiCfg?.ingest_url_masked || (apiCfg && apiCfg.has_key === false ? 'No API key yet' : 'Loading…') }}</code>
+              <button v-if="apiCfg && apiCfg.has_key === false" type="button" class="ax-btn2 ax-btn2--accent ax-btn2--sm" :disabled="apiBusy" @click="rotateKey()"><AxIcon name="key" :size="12" /> Generate key</button>
+              <button v-else type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" :disabled="apiBusy || !apiCfg?.has_key" @click="revealKey()"><AxIcon name="eye" :size="12" /> Reveal</button>
+            </div>
+            <div class="ax-api-row" style="margin-top:8px;">
+              <span class="ax-field-hint" style="flex:1;">API key <template v-if="integration.apiKey">— also usable as <code style="font-size:11px;">Authorization: Bearer …</code></template></span>
+              <code v-if="integration.apiKey" class="ax-api-code" style="flex:2;">{{ integration.apiKey }}</code>
+              <code v-else class="ax-api-code is-masked" style="flex:2;">{{ apiCfg?.key_prefix ? apiCfg.key_prefix + '••••••••' : '—' }}</code>
+              <button type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" :disabled="apiBusy || !apiCfg?.has_key" @click="rotateKey()"><AxIcon name="refresh" :size="12" /> Rotate</button>
+            </div>
+          </div>
+
+          <!-- 2 · verdicts OUT -->
+          <div class="ax-api-sec">
+            <label class="ax-field-label"><AxIcon name="arrow-right" :size="12" /> Result Webhook URL <span class="ax-field-hint">optional — we POST each call's verdict (qualified / not qualified / unreachable) back here, signed</span></label>
+            <div class="ax-api-row">
+              <input v-model="integration.webhookUrl" type="url" class="ax-text" placeholder="https://your-crm.example.com/hooks/nokvo" style="flex:1;" />
+              <button type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" :disabled="apiBusy" @click="saveWebhookUrl()"><AxIcon name="check" :size="12" /> Save</button>
+              <button type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" :disabled="apiBusy || !apiCfg?.webhook_url" @click="sendTestWebhook()"><AxIcon name="zap" :size="12" /> Send test webhook</button>
+            </div>
+            <p v-if="integration.webhookSecret" class="ax-notice" style="margin-top:8px;">
+              Signing secret (verify <code>X-Nokvo-Signature</code> with it): <code class="ax-api-code" style="display:inline;padding:2px 8px;">{{ integration.webhookSecret }}</code>
+              <button type="button" class="ax-btn2 ax-btn2--ghost ax-btn2--sm" style="margin-left:8px;" @click="copyText(integration.webhookSecret)"><AxIcon name="copy" :size="11" /> Copy</button>
+            </p>
+            <p v-if="integration.testResult" class="ax-notice" :class="integration.testResult.ok ? '' : 'ax-notice--err'" style="margin-top:8px;">
+              <template v-if="integration.testResult.ok">✓ Delivered — your endpoint answered {{ integration.testResult.status_code }}.</template>
+              <template v-else>Delivery failed{{ integration.testResult.status_code ? ` (HTTP ${integration.testResult.status_code})` : '' }}{{ integration.testResult.error ? ` — ${integration.testResult.error}` : '' }}.</template>
+            </p>
+          </div>
+
+          <!-- 3 · live feed -->
+          <div class="ax-api-sec">
+            <label class="ax-field-label"><AxIcon name="clock" :size="12" /> Live lead feed</label>
+            <div v-if="!(apiCfg?.feed || []).length" class="ax-api-wait">
+              <span class="ax-eq" aria-hidden="true"><span></span><span></span><span></span></span>
+              Waiting for your first lead… send one from your CRM (or hit the URL with curl) and it appears here.
+            </div>
+            <ul v-else class="ax-api-feed">
+              <li v-for="(f, fi) in apiCfg.feed" :key="fi" :class="{ 'is-err': f.kind === 'error' }">
+                <template v-if="f.kind === 'accepted'">✓ Received: {{ f.name || 'Lead' }}, {{ f.phone_masked }} <span class="ax-api-ago">{{ agoLabel(f.ts) }}</span></template>
+                <template v-else-if="f.kind === 'duplicate'">↺ Duplicate skipped: {{ f.phone_masked }} <span class="ax-api-ago">{{ agoLabel(f.ts) }}</span></template>
+                <template v-else>⚠ {{ f.error || 'Rejected lead' }} <span class="ax-api-ago">{{ agoLabel(f.ts) }}</span></template>
+              </li>
+            </ul>
+            <div v-if="(apiCfg?.deliveries || []).length" style="margin-top:12px;">
+              <label class="ax-field-label" style="font-size:11px;">Recent result deliveries</label>
+              <ul class="ax-api-feed">
+                <li v-for="(d, di) in apiCfg.deliveries" :key="di" :class="{ 'is-err': d.status === 'dead' }">
+                  {{ d.event }} — {{ d.status }}<template v-if="d.last_status_code"> (HTTP {{ d.last_status_code }})</template>
+                  <span class="ax-api-ago">{{ agoLabel(d.delivered_at || d.created_at) }}</span>
+                </li>
+              </ul>
+            </div>
+          </div>
+
+          <!-- 4 · where are your leads? -->
+          <div class="ax-api-sec">
+            <label class="ax-field-label">Where are your leads?</label>
+            <div class="ax-styleseg" role="radiogroup" aria-label="CRM recipes">
+              <button v-for="r in RECIPES" :key="r.id" type="button" class="ax-styleopt" :class="{ 'is-on': integration.recipe === r.id }" role="radio" :aria-checked="integration.recipe === r.id" @click="integration.recipe = r.id">{{ r.label }}</button>
+            </div>
+            <ol class="ax-api-steps">
+              <li v-for="(s, si) in (RECIPES.find((r) => r.id === integration.recipe) || RECIPES[3]).steps" :key="si">{{ s }}</li>
+            </ol>
+          </div>
+        </div>
+      </div>
+    </Transition>
+
     <!-- "LINE LIVE" — the launch ceremony after a successful create -->
     <Transition name="axlfx">
       <AxLaunchFx v-if="launchFx" :contacts="launchFx.contacts" @done="launchFx = null" />
@@ -952,6 +1228,21 @@ async function onAddFile(e) {
 </template>
 
 <style scoped>
+/* ── CRM integration panel ── */
+.ax-api-overlay { position: fixed; inset: 0; z-index: 60; display: flex; align-items: flex-start; justify-content: center; padding: 6vh 20px 40px; overflow-y: auto; background: rgba(8,8,10,0.72); backdrop-filter: blur(6px); }
+.ax-api-panel { width: min(760px, 100%); padding: 30px 36px 34px; }
+.ax-api-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.ax-api-sec { margin-top: 26px; padding-top: 22px; border-top: 1px solid rgba(255,255,255,0.07); }
+.ax-api-row { display: flex; align-items: center; gap: 10px; margin-top: 8px; flex-wrap: wrap; }
+.ax-api-code { flex: 1; min-width: 0; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #E8E6E1; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 10px 13px; word-break: break-all; }
+.ax-api-code.is-masked { color: rgba(255,255,255,0.45); }
+.ax-api-wait { display: flex; align-items: center; gap: 10px; margin-top: 10px; font-size: 13px; color: rgba(255,255,255,0.5); }
+.ax-api-feed { list-style: none; margin: 10px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; max-height: 180px; overflow-y: auto; }
+.ax-api-feed li { font-size: 12.5px; color: #9FD9B8; font-family: 'JetBrains Mono', monospace; background: rgba(74,200,140,0.06); border: 1px solid rgba(74,200,140,0.14); border-radius: 7px; padding: 7px 11px; display: flex; align-items: center; gap: 8px; }
+.ax-api-feed li.is-err { color: #E8A0A4; background: rgba(230,38,48,0.07); border-color: rgba(230,38,48,0.2); }
+.ax-api-ago { margin-left: auto; color: rgba(255,255,255,0.35); font-size: 11px; }
+.ax-api-steps { margin: 12px 0 0; padding-left: 20px; display: flex; flex-direction: column; gap: 8px; font-size: 13px; color: rgba(255,255,255,0.68); line-height: 1.5; }
+
 .ax-status-on { display: inline-flex; align-items: center; gap: 7px; font-size: 11.5px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: #7FD9A8; background: rgba(74,200,140,0.09); border: 1px solid rgba(74,200,140,0.24); padding: 5px 13px; border-radius: 999px; box-shadow: inset 0 1px 0 rgba(255,255,255,0.04); }
 @keyframes axPulse { 0% { box-shadow: 0 0 0 0 rgba(127,217,168,0.4); } 70% { box-shadow: 0 0 0 5px rgba(127,217,168,0); } 100% { box-shadow: 0 0 0 0 rgba(127,217,168,0); } }
 .ax-status-dot { width: 6px; height: 6px; border-radius: 50%; background: #7FD9A8; animation: axPulse 2.2s ease-out infinite; }

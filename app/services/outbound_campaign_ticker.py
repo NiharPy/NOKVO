@@ -55,6 +55,48 @@ async def _tick_once() -> None:
             with suppress(Exception):
                 await db.rollback()
 
+        # CRM-fed (webhook lead-source) campaigns: leads can land while the
+        # campaign sits ``completed`` and another campaign holds the tenant's
+        # single active slot (ingest then can't resume it). Once the slot frees,
+        # nothing else would ever wake it — so the ticker retries the slot-safe
+        # resume for any completed webhook campaign with pending rows.
+        try:
+            from app.services import campaign_contacts_v2 as v2c
+
+            stranded = (
+                (
+                    await db.execute(
+                        select(OutboundCampaign).where(
+                            OutboundCampaign.status == CampaignStatus.completed,
+                            OutboundCampaign.agent_config["lead_source"].astext == "webhook",
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for campaign in stranded:
+                if await v2c.pending_count(db, campaign.id) <= 0:
+                    continue
+                try:
+                    await OutboundCampaignService._assert_no_other_active_campaign(
+                        db, campaign.tenant_id, exclude_id=campaign.id
+                    )
+                    campaign.status = CampaignStatus.running
+                    campaign.completed_at = None
+                    db.add(campaign)
+                    await db.commit()
+                    logger.info(
+                        "CAMPAIGN-TICKER: resumed webhook campaign %s (queued leads)",
+                        campaign.id,
+                    )
+                except ValueError:
+                    await db.rollback()  # slot still busy — retry next tick
+        except Exception:
+            logger.exception("CAMPAIGN-TICKER: webhook-campaign resume sweep failed")
+            with suppress(Exception):
+                await db.rollback()
+
         try:
             rows = (
                 (
@@ -72,9 +114,12 @@ async def _tick_once() -> None:
             return
         base = public_base_url()
         for campaign in rows:
-            # Only SCHEDULED campaigns need a timed wake-up — webhook-driven ones
-            # already refill themselves one-for-one as calls end.
-            if not ((campaign.agent_config or {}).get("call_window")):
+            # SCHEDULED campaigns need a timed wake-up (call-end webhooks stop
+            # while paused), and so do CRM-fed ones: leads can arrive while no
+            # call is live (nothing refills one-for-one) and the ingest-time
+            # dial kick is best-effort — the tick is their safety net.
+            cfg = campaign.agent_config or {}
+            if not (cfg.get("call_window") or cfg.get("lead_source") == "webhook"):
                 continue
             try:
                 await OutboundCampaignService.dial_next_pending(

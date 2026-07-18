@@ -36,6 +36,7 @@ from app.models.member_assignment import (
 from app.models.customer_base import CustomerBase
 from app.models.connect_api_key import OrganizationApiKey
 from app.models.connect_session import ConnectSession
+from app.models.crm_webhook_outbox import CrmWebhookOutbox
 from app.models.call_cost import CallCost
 from app.models.subscription import Subscription
 from app.models.minute_purchase import MinutePurchase
@@ -79,6 +80,7 @@ __all__ = [
     "NokvoOneAssignmentAuditLog",
     "OrganizationApiKey",
     "ConnectSession",
+    "CrmWebhookOutbox",
     "CallCost",
     "Subscription",
     "MinutePurchase",
