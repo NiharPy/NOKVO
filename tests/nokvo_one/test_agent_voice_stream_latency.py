@@ -21,7 +21,9 @@ from app.services.sarvam_voice_service import SarvamVoiceService
 
 # Every language NOKVO One supports — the sub-1s budget must hold on all of them.
 _ALL_LANGUAGES = ["en", "hi", "ta", "te", "bn", "kn", "ml", "mr", "gu", "pa", "ur", "od"]
-_LATENCY_LOGGER = "app.services.nokvo_one_voice_stream_service"
+# The turn dispatcher (and its NOKVO-LATENCY-* records) lives in
+# voice_stream/text_turn.py since the voice-modularization.
+_LATENCY_LOGGER = "app.services.voice_stream.text_turn"
 
 
 def _run(coro):
