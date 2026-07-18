@@ -99,9 +99,11 @@ def test_busy_cut_is_wired_before_the_other_lanes():
     # question again.
     import inspect
 
-    from app.services.nokvo_one_voice_stream_service import NokvoOneVoiceStreamService
+    # The dispatcher body lives in voice_stream/text_turn.py since the
+    # voice-modularization (the class keeps a delegating wrapper).
+    from app.services.voice_stream.text_turn import _run_text_turn
 
-    src = inspect.getsource(NokvoOneVoiceStreamService._run_text_turn)
+    src = inspect.getsource(_run_text_turn)
     assert "is_callback_line(cleaned)" in src
     assert "_busy_outro(language)" in src
     busy_pos = src.index("is_callback_line(cleaned)")
