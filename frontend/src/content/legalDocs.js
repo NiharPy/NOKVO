@@ -17,7 +17,7 @@ export const TERMS_OF_SERVICE_HTML = `
 <h3>Nokvo Terms of Service</h3>
 <p class="legal-meta">Last Updated: July 4, 2026</p>
 
-<p>Welcome to Nokvo! These Terms of Service ("Terms") govern your access to and use of the Nokvo One platform, website, APIs, and related services (collectively, the "Services") provided by NEEDLES COUTURE AND COLLECTIVE PRIVATE LIMITED ("Nokvo," "we," "us," or "our").</p>
+<p>Welcome to Nokvo! These Terms of Service ("Terms") govern your access to and use of the Nokvo One platform, website, APIs, and related services (collectively, the "Services") provided by NOKVO AI LLP ("Nokvo," "we," "us," or "our").</p>
 
 <p>By registering for an account, executing an Order Form that references these Terms, or otherwise accessing or using the Services, you ("Customer," "you," or "your") agree to be bound by these Terms. If you are entering into these Terms on behalf of a company or other legal entity, you represent that you have the authority to bind such entity to these Terms. If you do not agree to these Terms, you may not use the Services.</p>
 
@@ -109,7 +109,7 @@ export const TERMS_OF_SERVICE_HTML = `
 <p><strong>13.9 Updates to Terms.</strong> Nokvo may modify these Terms from time to time. If we make material changes, we will provide reasonable notice through the Services, email, or other appropriate means. Continued use of the Services after the effective date of the revised Terms constitutes acceptance of the updated Terms.</p>
 
 <h4>14. Contact</h4>
-<p>Questions about these Terms may be directed to NEEDLES COUTURE AND COLLECTIVE PRIVATE LIMITED at <a href="mailto:officialnokvo@nokvo.org">officialnokvo@nokvo.org</a>.</p>
+<p>Questions about these Terms may be directed to NOKVO AI LLP at <a href="mailto:officialnokvo@nokvo.org">officialnokvo@nokvo.org</a>.</p>
 `;
 
 export const PRIVACY_POLICY_HTML = `
@@ -212,5 +212,5 @@ export const PRIVACY_POLICY_HTML = `
 <p>We may update this Privacy Policy from time to time to reflect changes in our platform infrastructure, new third-party integrations, or legal requirements. We will notify you of significant changes by emailing the primary contact on your account or displaying a prominent notice within the Nokvo One portal.</p>
 
 <h4>18. Contact &amp; Grievance Officer</h4>
-<p>For any questions, privacy requests, or grievances regarding this Privacy Policy or your personal data, please contact NEEDLES COUTURE AND COLLECTIVE PRIVATE LIMITED at <a href="mailto:officialnokvo@nokvo.org">officialnokvo@nokvo.org</a>. In accordance with the DPDP Act, you may address grievances to our designated point of contact at the same email; we will respond within the timelines required by applicable law.</p>
+<p>For any questions, privacy requests, or grievances regarding this Privacy Policy or your personal data, please contact NOKVO AI LLP at <a href="mailto:officialnokvo@nokvo.org">officialnokvo@nokvo.org</a>. In accordance with the DPDP Act, you may address grievances to our designated point of contact at the same email; we will respond within the timelines required by applicable law.</p>
 `;

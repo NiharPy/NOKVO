@@ -5,7 +5,7 @@
 
 Last Updated: July 6, 2026
 
-These Terms & Conditions ("Terms") govern your access to and use of NOKVO APEX ("APEX," the "Service"), an automated outbound AI voice-calling and lead-qualification platform provided by NEEDLES COUTURE AND COLLECTIVE PRIVATE LIMITED ("Nokvo," "we," "us," or "our").
+These Terms & Conditions ("Terms") govern your access to and use of NOKVO APEX ("APEX," the "Service"), an automated outbound AI voice-calling and lead-qualification platform provided by NOKVO AI LLP ("Nokvo," "we," "us," or "our").
 
 By creating an APEX account, making payment, or otherwise accessing or using the Service, you ("Customer," "you," or "your") agree to be bound by these Terms. If you are accepting on behalf of a business, you represent that you are authorised to bind that business. If you do not agree, do not use the Service.
 
@@ -115,4 +115,4 @@ We may update these Terms and will give reasonable notice of material changes; c
 
 ## 15. Contact
 
-Questions about these Terms may be sent to NEEDLES COUTURE AND COLLECTIVE PRIVATE LIMITED at officialnokvo@nokvo.org.
+Questions about these Terms may be sent to NOKVO AI LLP at officialnokvo@nokvo.org.

@@ -24,7 +24,7 @@ export const APEX_TERMS_OF_SERVICE_HTML = `
 <h3>NOKVO APEX — Terms &amp; Conditions</h3>
 <p class="legal-meta">Last Updated: July 6, 2026</p>
 
-<p>These Terms &amp; Conditions ("Terms") govern your access to and use of NOKVO APEX ("APEX," the "Service"), an automated outbound AI voice-calling and lead-qualification platform provided by NEEDLES COUTURE AND COLLECTIVE PRIVATE LIMITED ("Nokvo," "we," "us," or "our").</p>
+<p>These Terms &amp; Conditions ("Terms") govern your access to and use of NOKVO APEX ("APEX," the "Service"), an automated outbound AI voice-calling and lead-qualification platform provided by NOKVO AI LLP ("Nokvo," "we," "us," or "our").</p>
 <p>By creating an APEX account, making payment, or otherwise accessing or using the Service, you ("Customer," "you," or "your") agree to be bound by these Terms. If you are accepting on behalf of a business, you represent that you are authorised to bind that business. If you do not agree, do not use the Service.</p>
 
 <h4>1. The Service</h4>
@@ -94,14 +94,14 @@ export const APEX_TERMS_OF_SERVICE_HTML = `
 <p>We may update these Terms and will give reasonable notice of material changes; continued use after the effective date is acceptance. You may not assign these Terms without our consent; we may assign them in a merger or sale of assets. If any provision is unenforceable, the rest remains in effect. These Terms and the APEX Privacy Policy are the entire agreement for APEX. We may send notices electronically (email or in-product). Neither party is liable for delays caused by events beyond its reasonable control.</p>
 
 <h4>15. Contact</h4>
-<p>Questions about these Terms may be sent to NEEDLES COUTURE AND COLLECTIVE PRIVATE LIMITED at <a href="mailto:officialnokvo@nokvo.org">officialnokvo@nokvo.org</a>.</p>
+<p>Questions about these Terms may be sent to NOKVO AI LLP at <a href="mailto:officialnokvo@nokvo.org">officialnokvo@nokvo.org</a>.</p>
 `;
 
 export const APEX_PRIVACY_POLICY_HTML = `
 <h3>NOKVO APEX — Privacy Policy</h3>
 <p class="legal-meta">Last Updated: July 6, 2026</p>
 
-<p>This Privacy Policy explains how NEEDLES COUTURE AND COLLECTIVE PRIVATE LIMITED ("Nokvo," "we," "us") collects, uses, and protects information in connection with NOKVO APEX ("APEX"), our automated outbound AI voice-calling and lead-qualification service. It distinguishes between data we collect about our direct business customers (Account Data) and data we process on our customers' behalf about the people they call (Customer Data).</p>
+<p>This Privacy Policy explains how NOKVO AI LLP ("Nokvo," "we," "us") collects, uses, and protects information in connection with NOKVO APEX ("APEX"), our automated outbound AI voice-calling and lead-qualification service. It distinguishes between data we collect about our direct business customers (Account Data) and data we process on our customers' behalf about the people they call (Customer Data).</p>
 
 <h4>1. Our Roles</h4>
 <ul>
@@ -182,5 +182,5 @@ export const APEX_PRIVACY_POLICY_HTML = `
 <p>We may update this Policy to reflect changes in the Service, providers, or law, and will notify you of significant changes by email or in-product notice.</p>
 
 <h4>13. Contact &amp; Grievances</h4>
-<p>For privacy questions, requests, or grievances under the Digital Personal Data Protection Act, 2023, contact NEEDLES COUTURE AND COLLECTIVE PRIVATE LIMITED at <a href="mailto:officialnokvo@nokvo.org">officialnokvo@nokvo.org</a>. We will respond within the timelines required by applicable law.</p>
+<p>For privacy questions, requests, or grievances under the Digital Personal Data Protection Act, 2023, contact NOKVO AI LLP at <a href="mailto:officialnokvo@nokvo.org">officialnokvo@nokvo.org</a>. We will respond within the timelines required by applicable law.</p>
 `;

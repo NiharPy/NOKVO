@@ -5,7 +5,7 @@
 
 Last Updated: July 6, 2026
 
-This Privacy Policy explains how NEEDLES COUTURE AND COLLECTIVE PRIVATE LIMITED ("Nokvo," "we," "us") collects, uses, and protects information in connection with NOKVO APEX ("APEX"), our automated outbound AI voice-calling and lead-qualification service. It distinguishes between data we collect about our direct business customers (Account Data) and data we process on our customers' behalf about the people they call (Customer Data).
+This Privacy Policy explains how NOKVO AI LLP ("Nokvo," "we," "us") collects, uses, and protects information in connection with NOKVO APEX ("APEX"), our automated outbound AI voice-calling and lead-qualification service. It distinguishes between data we collect about our direct business customers (Account Data) and data we process on our customers' behalf about the people they call (Customer Data).
 
 ## 1. Our Roles
 
@@ -113,4 +113,4 @@ We may update this Policy to reflect changes in the Service, providers, or law, 
 
 ## 13. Contact & Grievances
 
-For privacy questions, requests, or grievances under the Digital Personal Data Protection Act, 2023, contact NEEDLES COUTURE AND COLLECTIVE PRIVATE LIMITED at officialnokvo@nokvo.org. We will respond within the timelines required by applicable law.
+For privacy questions, requests, or grievances under the Digital Personal Data Protection Act, 2023, contact NOKVO AI LLP at officialnokvo@nokvo.org. We will respond within the timelines required by applicable law.

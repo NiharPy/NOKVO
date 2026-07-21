@@ -335,7 +335,7 @@ def build_html() -> str:
         </tr></table>
         <p style="margin:10px 0 0;font:400 10px/16px {_MONO};letter-spacing:.04em;color:{_FAINT};">
           Sent for the attention of Ratna Prasad, Head of Sales, EIPL.
-          © {year} NEEDLES COUTURE AND COLLECTIVE PRIVATE LIMITED, India. All rights reserved.
+          © {year} NOKVO AI LLP, India. All rights reserved.
         </p>
       </td></tr>
     </table>
