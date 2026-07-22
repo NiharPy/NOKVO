@@ -243,7 +243,7 @@ NOKVO APEX platform facts (authoritative — answer from these, never invent oth
 - Calls speak English, Hindi, and Telugu, follow the caller's language, detect voicemail, and honour India's DND registry.
 - Campaigns need: a name, offer/pitch content, a questionnaire (intro, questions, outro, qualifying threshold), a schedule, and a contacts file (CSV/XLSX, phone in column A, name in B) uploaded on the Campaign tab.
 - Members (non-admin) claim and work qualified leads; only admins create or manage campaigns.
-- Campaign content is auto-reviewed at save time: anything that disparages another company, impersonates a business that isn't the account's own, or harasses/deceives recipients is BLOCKED with a reason. Campaigns may only promote the account's own offering.
+- Campaign content is auto-reviewed at save time: anything that disparages/attacks another company or harasses/deceives recipients is BLOCKED with a reason. Naming the brands the account sells, its dealership/showroom name, or project/JV partners is fine and allowed - a company's registered name, brand, and partners can all differ.
 - Any campaign card has a Duplicate button: it starts a NEW campaign with the same script, questions, translations, and schedule - the admin just uploads a new contacts file and launches.
 - The Busy tab lists contacts who answered but asked to be called back. The campaign card's 'Call busy' button re-dials them (connected retries consume Call Credits); 'Call didn't pick up' re-dials unanswered numbers (costs nothing unless they answer).
 - All payments are non-refundable (see the Terms for the full policy - use lookup_legal for any refund question).
@@ -924,20 +924,27 @@ async def _mint_campaign_draft(db, tenant_res, user, args, ns, sid) -> tuple[dic
         except Exception:
             logger.debug("NOVA: draft moderation pre-check unavailable — skipping", exc_info=True)
     if verdict is not None and not verdict.allowed:
-        if mode == "enforce":
+        # Mirror require_campaign_content_allowed: only a HARD-BLOCK category
+        # (disparagement / scam) stops the handoff in enforce mode. A possible-
+        # impersonation flag (dealership / brand-reseller / JV-partner cases) is
+        # advisory — hand off with a gentle note, don't wall the user.
+        from app.services.campaign_moderation_service import _HARD_BLOCK_CATEGORIES
+
+        if mode == "enforce" and verdict.category in _HARD_BLOCK_CATEGORIES:
             logger.warning(
                 f"NOVA: draft flagged by content guard org={user.organization_id} "
                 f"category={verdict.category} reason={verdict.reason!r}"
             )
             return (
                 {"type": "draft_flagged", "category": verdict.category, "reason": verdict.reason},
-                f"I can't hand this off yet: {verdict.reason}. Campaigns may only promote "
-                "your own company — they can't disparage or impersonate another business. "
-                "Tell me what to reword and we'll fix it together.",
+                f"I can't hand this off yet: {verdict.reason}. Campaigns can't disparage "
+                "another business or mislead the people you call — naming the brands you "
+                "sell or your project partners is fine. Tell me what to reword and we'll "
+                "fix it together.",
             )
         moderation_warn = (
-            f" One flag from the content review ({verdict.reason}) — the form may "
-            "block it at save time, so consider rewording."
+            f" One note from the content review ({verdict.reason}) — worth a quick look "
+            "and rewording if it's off, though it won't block you."
         )
     estimate = await draft_estimate(db, user.organization_id, draft)
     full = _draft_with_defaults(draft)

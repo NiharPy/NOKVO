@@ -233,26 +233,55 @@ async def test_gate_enforce_blocks_flagged_campaign_and_alerts(monkeypatch):
     from app.core.config import settings
 
     monkeypatch.setattr(settings, "CAMPAIGN_CONTENT_MODERATION", "enforce")
+    # A hard-block category (disparagement) walls the campaign in enforce mode.
     _chat_recorder(
         monkeypatch,
-        '{"allowed": false, "category": "impersonation", "reason": "claims to be Aparna"}',
+        '{"allowed": false, "category": "third_party_disparagement", '
+        '"reason": "attacks Aparna\'s projects"}',
     )
     sent = _alert_recorder(monkeypatch)
     with pytest.raises(ValueError) as exc:
         await require_campaign_content_allowed(
             _Org(),
             campaign_name="Aparna update",
-            agent_config={"company_name": "Aparna"},
+            agent_config={"agent_prompt": "Aparna towers are all delayed, buy from us"},
             actor_email="admin@myhome.example",
         )
     # Tenant-showable, routes through the endpoints' ValueError→400 channel.
-    assert "claims to be Aparna" in str(exc.value)
-    assert "impersonate" in str(exc.value)
+    assert "attacks Aparna's projects" in str(exc.value)
+    assert "disparage" in str(exc.value)
     await _drain_bg_tasks()
-    assert sent["category"] == "impersonation"
+    assert sent["category"] == "third_party_disparagement"
     assert sent["actor_email"] == "admin@myhome.example"
     assert sent["mode"] == "enforce"
     assert "Aparna" in sent["content_snippet"]
+
+
+@pytest.mark.asyncio
+async def test_gate_enforce_impersonation_allows_and_alerts(monkeypatch):
+    """A possible-impersonation flag no longer walls the tenant (dealership /
+    brand-reseller / JV-partner false positives live here): it's allowed through
+    with an ops alert for spot-review. Disparagement/scams still hard-block."""
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "CAMPAIGN_CONTENT_MODERATION", "enforce")
+    _chat_recorder(
+        monkeypatch,
+        '{"allowed": false, "category": "impersonation", "reason": "names Toyota"}',
+    )
+    sent = _alert_recorder(monkeypatch)
+    # No raise — the campaign saves.
+    verdict = await require_campaign_content_allowed(
+        _Org(),
+        campaign_name="Toyota festive offers",
+        agent_config={"company_name": "Toyota"},
+        actor_email="admin@sunrisemotors.example",
+    )
+    assert verdict.allowed is False  # flag reported, not enforced
+    assert verdict.category == "impersonation"
+    await _drain_bg_tasks()
+    assert sent["category"] == "impersonation"  # ops still gets the spot-review alert
+    assert sent["mode"] == "enforce"
 
 
 @pytest.mark.asyncio

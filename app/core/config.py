@@ -826,8 +826,8 @@ def validate_security_config() -> list[str]:
     if (settings.CAMPAIGN_CONTENT_MODERATION or "").strip().lower() != "enforce":
         warnings.append(
             f"CAMPAIGN_CONTENT_MODERATION is '{settings.CAMPAIGN_CONTENT_MODERATION}', not "
-            "'enforce' — campaigns that disparage or impersonate another company would "
-            "be accepted. Set it to 'enforce'."
+            "'enforce' — campaigns that disparage/attack another company or scam "
+            "recipients would be accepted. Set it to 'enforce'."
         )
     origin = settings.EXPECTED_ORIGIN or ""
     if "localhost" in origin or "127.0.0.1" in origin or not origin.strip():

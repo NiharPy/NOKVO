@@ -96,7 +96,7 @@ def test_platform_facts_cover_new_features():
     prompt = nova.build_system_prompt("admin", store.empty_state())
     assert "Busy tab" in prompt
     assert "Duplicate button" in prompt
-    assert "disparages another company" in prompt
+    assert "disparages/attacks another company" in prompt
 
 
 def test_new_tools_registered_with_right_flags():
@@ -393,6 +393,28 @@ async def test_finalize_blocked_when_flagged_in_enforce(monkeypatch):
     assert not sessions["ns:sid"]["draft"].get("handed_off")  # draft stays editable
     # Moderation saw the draft's full text surface, questionnaire included.
     assert calls and calls[0]["agent_config"]["questionnaire"]["questions"]
+
+
+@pytest.mark.asyncio
+async def test_finalize_impersonation_hands_off_in_enforce(monkeypatch):
+    """Even in enforce mode, a possible-impersonation flag is advisory only —
+    Nova hands the draft off (the dealership / JV-partner false-positive case)
+    with a gentle note rather than blocking."""
+    from app.services.campaign_moderation_service import ModerationVerdict
+
+    sessions = _mock_store(monkeypatch)
+    _prime_draft(sessions, _COMPLETE_DRAFT)
+    monkeypatch.setattr(nova.settings, "CAMPAIGN_CONTENT_MODERATION", "enforce")
+    _patch_estimate(monkeypatch)
+    _patch_moderation(monkeypatch, ModerationVerdict(
+        allowed=False, category="impersonation", reason="names Toyota"
+    ))
+    card, reply = await nova._mint_campaign_draft(
+        _FakeDb(_FakeOrg()), _FakeTenantRes(), _FakeUser(), {}, "ns", "sid"
+    )
+    assert card["type"] == "campaign_draft"  # handed off, not draft_flagged
+    assert "names Toyota" in reply
+    assert sessions["ns:sid"]["draft"]["handed_off"] is True
 
 
 @pytest.mark.asyncio
