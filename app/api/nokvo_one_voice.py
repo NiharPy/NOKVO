@@ -1855,7 +1855,20 @@ async def plivo_outbound_media_websocket(websocket: WebSocket, call_link_id: str
             POOL_INBOUND_FOLLOWUP,
         )
         _out_pool = POOL_INBOUND_FOLLOWUP if is_followup else POOL_OUTBOUND
-        _out_call_token = await _acquire_call_slot(tr.tenant_id, pool=_out_pool)
+        # Per-plan outbound concurrency for NOKVO APEX (Core=1, Growth=2, Pinnacle=4,
+        # Enterprise per-deal). Non-APEX products keep the global cap (limit=None).
+        _out_limit = None
+        if _out_pool == POOL_OUTBOUND:
+            try:
+                from app.models.organization import Organization as _Org
+                from app.services.apex_plans import get_apex_concurrency as _apex_conc
+
+                _org = await db.get(_Org, tr.organization_id)
+                if _org is not None and (_org.product_tier or "") == "nokvo_apex":
+                    _out_limit = _apex_conc(_org)
+            except Exception:
+                logger.warning("APEX per-plan concurrency lookup failed; using global cap", exc_info=True)
+        _out_call_token = await _acquire_call_slot(tr.tenant_id, pool=_out_pool, limit=_out_limit)
         if _out_call_token is None:
             logger.info(
                 "PLIVO-OUTBOUND at-capacity tenant=%s call_link_id=%s → hangup",

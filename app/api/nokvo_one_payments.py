@@ -324,8 +324,47 @@ def _subscription_is_paid(remote: dict) -> bool:
     return str((remote or {}).get("status") or "") in {"active", "authenticated"}
 
 
+async def _apex_credit_cycle(db: AsyncSession, org: Organization, sub: Subscription, cycle_key: str | None) -> None:
+    """NOKVO APEX plan subscription — credit THIS billing cycle's included minutes to the
+    Call Credits wallet (plan rate + billed bonus, per-cycle idempotent), and on the FIRST
+    paid invoice move the account to ``pending_activation`` (SuperAdmin then activates). We
+    do NOT provision/onboard here — number provisioning + go-live are the manual activate."""
+    from app.services.apex_billing_service import credit_apex_wallet
+    from app.services.apex_plans import get_apex_rate, resolve_plan
+
+    included = int(getattr(org, "apex_included_minutes", 0) or 0)
+    rate = get_apex_rate(org)
+    bonus = getattr(org, "apex_billed_bonus_pct", None)
+    if bonus is None:
+        bonus = resolve_plan(getattr(org, "apex_plan_code", None)).billed_bonus_pct
+    # Only credit against a concrete per-cycle INVOICE key (money-safety: never create an
+    # unkeyed monthly credit that a later invoice-keyed event would duplicate). An event with
+    # no invoice id still advances status below; the charged event credits the cycle.
+    credited = False
+    if cycle_key:
+        credited = await credit_apex_wallet(
+            db,
+            organization_id=org.id,
+            minutes=included,
+            rate=rate,
+            bonus_pct=bonus,
+            source="monthly_grant",
+            razorpay_payment_id=getattr(sub, "razorpay_payment_id", None),
+            razorpay_ref=sub.razorpay_subscription_id,
+            razorpay_invoice_id=cycle_key,
+        )
+    if sub.status != "active":
+        sub.status = "active"
+    if org.status == "pending_payment":
+        org.status = "pending_activation"
+    db.add(org)
+    db.add(sub)
+    await db.commit()
+    logger.info("APEX-PLAN cycle processed org=%s credited=%s status=%s", org.id, credited, org.status)
+
+
 async def _bg_activate(
-    organization_id: uuid.UUID, razorpay_subscription_id: str | None = None
+    organization_id: uuid.UUID, razorpay_subscription_id: str | None = None, cycle_key: str | None = None
 ) -> None:
     """Webhook's background activation on a fresh session — never blocks the 200.
 
@@ -371,6 +410,20 @@ async def _bg_activate(
                     "RAZORPAY: bg-activate — subscription %s status=%r not paid; NOT granting",
                     sub.razorpay_subscription_id, remote.get("status"),
                 )
+                return
+            # NOKVO APEX plan accounts take the plan-driven path: credit the cycle's minutes
+            # and move to pending_activation (SuperAdmin activates manually). They are NEVER
+            # auto-provisioned/onboarded here.
+            org = (
+                await db.execute(select(Organization).where(Organization.id == organization_id))
+            ).scalars().first()
+            if (
+                settings.ENABLE_APEX_PLANS
+                and org is not None
+                and (org.product_tier or "") == "nokvo_apex"
+                and org.apex_plan_code
+            ):
+                await _apex_credit_cycle(db, org, sub, cycle_key)
                 return
             await activate_and_provision(db, organization_id)
             # Credit the onboarding minutes once the webhook has stamped the
@@ -600,7 +653,37 @@ async def razorpay_webhook(request: Request, db: AsyncSession = Depends(deps.get
     entity = (event.get("payload") or {})
     sub_entity = ((entity.get("subscription") or {}).get("entity")) or {}
     pay_entity = ((entity.get("payment") or {}).get("entity")) or {}
+    inv_entity = ((entity.get("invoice") or {}).get("entity")) or {}
     razorpay_subscription_id = sub_entity.get("id") or pay_entity.get("subscription_id")
+    # Per-cycle idempotency key for the APEX monthly grant: the INVOICE id (one per billing
+    # cycle). Keyed strictly on the invoice — NOT the payment id — so that different events
+    # for the SAME cycle (subscription.activated without a payment, then subscription.charged
+    # with one) never resolve to different keys and double-credit. An event that carries no
+    # invoice id simply doesn't credit here; the charged event (which always does) credits
+    # once, and a missed cycle is recoverable via the SuperAdmin resync.
+    cycle_key = inv_entity.get("id") or pay_entity.get("invoice_id")
+
+    # Durable audit of every verified webhook — a failed/dropped handler can be replayed
+    # from the SuperAdmin console (best-effort; never breaks the 200).
+    try:
+        from app.models.razorpay_webhook_event import RazorpayWebhookEvent
+
+        db.add(
+            RazorpayWebhookEvent(
+                id=uuid.uuid4(),
+                event_id=request.headers.get("x-razorpay-event-id"),
+                event_type=event_type,
+                subscription_id=razorpay_subscription_id,
+                payment_id=pay_entity.get("id"),
+                invoice_id=cycle_key,
+                status="received",
+                payload=event,
+            )
+        )
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        logger.debug("RAZORPAY: webhook audit persist failed (best-effort)", exc_info=True)
 
     if event_type in {"subscription.activated", "subscription.charged", "subscription.authenticated", "payment.captured"} and razorpay_subscription_id:
         sub = (
@@ -636,7 +719,7 @@ async def razorpay_webhook(request: Request, db: AsyncSession = Depends(deps.get
             # on slow/failed deliveries; our activation is idempotent). Retained
             # in a module set — an untracked task can be GC'd mid-flight.
             _task = asyncio.create_task(
-                _bg_activate(sub.organization_id, razorpay_subscription_id)
+                _bg_activate(sub.organization_id, razorpay_subscription_id, cycle_key)
             )
             _bg_tasks.add(_task)
             _task.add_done_callback(_bg_tasks.discard)
@@ -991,6 +1074,171 @@ async def apex_topup_verify(
         "credited_minutes": credited_minutes(selected),
         **summary,
     }
+
+
+# ─────────── NOKVO APEX plan billing (plan-driven; ENABLE_APEX_PLANS) ───────────
+# Rate/bonus come from the org's stamped plan (not the quantity slab). Cancel reuses
+# /payments/cancel-subscription (shared). GET /apex/plans is public for the request form.
+
+def _apex_topup_paise(selected: int, rate) -> int:
+    from decimal import ROUND_HALF_UP, Decimal
+
+    return int((Decimal(int(selected)) * Decimal(str(rate)) * Decimal("100")).to_integral_value(rounding=ROUND_HALF_UP))
+
+
+@router.get("/apex/plans")
+async def apex_plans_catalog():
+    """Public NOKVO APEX plan catalog (pricing/limits) — for the request-access form and
+    the dashboard billing panel. Pricing is public info; no auth required."""
+    from app.services.apex_plans import APEX_PLANS, plan_public_view
+
+    return {"plans": [plan_public_view(p) for p in APEX_PLANS.values()]}
+
+
+@router.get("/apex/billing")
+async def apex_billing_summary(
+    user: OrganizationUser = Depends(_apex_topup_dep()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """The APEX dashboard billing panel: plan config, monthly amount, subscription status,
+    and the Call Credits wallet (with plan-rate estimated minutes)."""
+    if not settings.ENABLE_APEX_PLANS:
+        raise HTTPException(status_code=404, detail="APEX plans are not enabled")
+    from app.services.apex_plans import get_apex_rate, get_topup_bonus_pct, resolve_plan
+    from app.services.minute_balance_service import consumed_rupees, purchased_rupees
+
+    org = await db.get(Organization, user.organization_id)
+    plan = resolve_plan(getattr(org, "apex_plan_code", None))
+    rate = get_apex_rate(org)
+    purchased = await purchased_rupees(db, org.id)
+    consumed = await consumed_rupees(db, org.id)
+    remaining = purchased - consumed
+    est_minutes = int(remaining / rate) if rate and remaining > 0 else 0
+
+    sub = (
+        await db.execute(
+            select(Subscription)
+            .where(Subscription.organization_id == org.id)
+            .order_by((Subscription.status == "active").desc(), Subscription.created_at.desc())
+            .limit(1)
+        )
+    ).scalars().first()
+
+    return {
+        "plan_code": org.apex_plan_code,
+        "plan_label": plan.label,
+        "rate_per_minute": float(rate),
+        "concurrency": int(getattr(org, "apex_concurrency", None) or plan.concurrency or 1),
+        "included_minutes": int(getattr(org, "apex_included_minutes", 0) or 0),
+        "platform_fee_inr": int(getattr(org, "apex_platform_fee_paise", 0) or 0) / 100,
+        "monthly_inr": int(sub.amount_paise) / 100 if sub else None,
+        "support_tier": org.apex_support_tier,
+        "topup_bonus_pct": float(get_topup_bonus_pct(org)),
+        "billed_bonus_pct": float(getattr(org, "apex_billed_bonus_pct", 0) or 0),
+        "subscription_status": sub.status if sub else None,
+        "cancel_at_period_end": bool(sub.cancel_at_period_end) if sub else False,
+        "current_period_end": sub.current_period_end.isoformat() if sub and sub.current_period_end else None,
+        "credits_purchased": float(purchased),
+        "credits_used": float(consumed),
+        "credits_remaining": float(remaining),
+        "estimated_minutes_remaining": est_minutes,
+        "org_status": org.status,
+    }
+
+
+@router.post("/apex/billing/topup/create-order")
+async def apex_plan_topup_create_order(
+    payload: TopupOrderRequest,
+    user: OrganizationUser = Depends(_apex_topup_dep()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Buy a top-up at the org's PLAN rate (not the quantity slab). The wallet is credited
+    with the plan's top-up bonus; the customer is billed selected × plan rate."""
+    if not settings.ENABLE_APEX_PLANS:
+        raise HTTPException(status_code=404, detail="APEX plans are not enabled")
+    from app.services.apex_plans import get_apex_rate, get_topup_bonus_pct, wallet_credit_for
+
+    org = await db.get(Organization, user.organization_id)
+    rate = get_apex_rate(org)
+    selected = _validate_minutes(payload.minutes)
+    amount_paise = _apex_topup_paise(selected, rate)
+    bonus = get_topup_bonus_pct(org)
+    try:
+        order = await RazorpayService.create_order(
+            amount_paise,
+            notes={"organization_id": str(org.id), "minutes": str(selected), "kind": "apex_plan_topup"},
+            receipt=f"apexptop-{org.id.hex[:15]}",
+        )
+    except RazorpayError as exc:
+        logger.error("RAZORPAY: APEX plan top-up create-order failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Could not start the top-up. Please try again.")
+    order_id = str(order.get("id") or "")
+    if not order_id:
+        raise HTTPException(status_code=500, detail="Razorpay returned no order id")
+    credit = wallet_credit_for(selected, rate, bonus)
+    return {
+        "order_id": order_id,
+        "key_id": settings.RAZORPAY_KEY_ID,
+        "minutes": selected,
+        "credits": float(credit),
+        "amount_paise": amount_paise,
+        "name": "NOKVO APEX",
+        "description": (
+            f"{float(credit):,.0f} Call Credits"
+            + (f" (incl. {float(bonus):.0f}% bonus)" if bonus and bonus > 0 else "")
+        ),
+    }
+
+
+@router.post("/apex/billing/topup/verify")
+async def apex_plan_topup_verify(
+    payload: TopupVerifyRequest,
+    user: OrganizationUser = Depends(_apex_topup_dep()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Verify a plan top-up order and credit the wallet at the plan rate + top-up bonus.
+    Quantity/amount are taken from the SERVER-SIDE order (the client can't inflate it)."""
+    if not settings.ENABLE_APEX_PLANS:
+        raise HTTPException(status_code=404, detail="APEX plans are not enabled")
+    from app.services.apex_billing_service import credit_apex_wallet
+    from app.services.apex_plans import get_apex_rate, get_topup_bonus_pct
+
+    if not RazorpayService.verify_order_signature(
+        payload.razorpay_order_id, payload.razorpay_payment_id, payload.razorpay_signature
+    ):
+        raise HTTPException(status_code=400, detail="Payment signature verification failed")
+    try:
+        order = await RazorpayService.fetch_order(payload.razorpay_order_id)
+    except RazorpayError as exc:
+        logger.error("RAZORPAY: APEX plan top-up order fetch failed: %s", exc)
+        raise HTTPException(status_code=502, detail="Could not confirm the order. Please try again.")
+
+    notes = order.get("notes") or {}
+    if str(notes.get("organization_id") or "") != str(user.organization_id):
+        raise HTTPException(status_code=403, detail="This order does not belong to your organization.")
+    if str(order.get("status") or "") != "paid":
+        raise HTTPException(status_code=400, detail="Order is not paid.")
+
+    org = await db.get(Organization, user.organization_id)
+    rate = get_apex_rate(org)
+    bonus = get_topup_bonus_pct(org)
+    selected = _validate_minutes(int(notes.get("minutes") or 0))
+    if int(order.get("amount") or -1) != _apex_topup_paise(selected, rate):
+        raise HTTPException(status_code=400, detail="Order amount mismatch.")
+
+    await credit_apex_wallet(
+        db,
+        organization_id=org.id,
+        minutes=selected,
+        rate=rate,
+        bonus_pct=bonus,
+        source="topup",
+        razorpay_payment_id=payload.razorpay_payment_id,
+        razorpay_ref=payload.razorpay_order_id,
+    )
+    from app.services.apex_plans import wallet_credit_for
+
+    return {"ok": True, "credits_added": float(wallet_credit_for(selected, rate, bonus))}
 
 
 # ─────────── cancel subscription ───────────

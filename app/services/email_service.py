@@ -402,6 +402,43 @@ class EmailService:
         await cls.send(to_email, subject, text, html_body=html_body, inline_images=cls._brand_inline_images())
 
     @classmethod
+    async def send_apex_payment_link_email(
+        cls,
+        to_email: str,
+        admin_name: str | None,
+        org_name: str,
+        plan_label: str,
+        monthly_paise: int,
+        payment_url: str,
+    ) -> None:
+        """APEX onboarding — email the Razorpay subscription payment link. Once paid, the
+        account is activated by our team (within 6 hours; 24 hours for Free Trial)."""
+        greeting = admin_name.strip() if admin_name and admin_name.strip() else "there"
+        monthly_inr = f"₹{monthly_paise / 100:,.2f}"
+        subject = f"Activate your NOKVO APEX account — {plan_label}"
+        text = (
+            f"Hi {greeting},\n\n"
+            f"Your NOKVO APEX account for {org_name} is ready on the {plan_label} plan.\n"
+            f"Complete your monthly subscription ({monthly_inr}/month) to get started:\n\n"
+            f"{payment_url}\n\n"
+            f"Once payment is received, your account is activated within 6 hours.\n"
+        )
+        html_body = cls._branded_email_html(
+            preheader=f"Complete payment to activate {org_name} on NOKVO APEX.",
+            eyebrow="Activate your account",
+            heading=f"{plan_label} plan — {monthly_inr}/month",
+            intro_html=(
+                f"Your NOKVO APEX account for <strong style=\"color:{_INK};\">{html.escape(org_name)}</strong> "
+                f"is ready. Complete your monthly subscription to activate — once payment is received, "
+                f"your account goes live within 6 hours."
+            ),
+            cta_label="Complete payment",
+            cta_url=payment_url,
+            note_html="Questions? Just reply to this email.",
+        )
+        await cls.send(to_email, subject, text, html_body=html_body, inline_images=cls._brand_inline_images())
+
+    @classmethod
     async def send_usage_invoice_email(
         cls,
         to_email: str,

@@ -97,6 +97,30 @@ class RazorpayService:
         return plan_id
 
     @staticmethod
+    async def ensure_monthly_plan(name: str, amount_paise: int) -> str:
+        """Lazily create (and per-process cache) a monthly Razorpay plan for an arbitrary
+        ``amount_paise`` — used by NOKVO APEX plan-driven subscriptions whose monthly
+        amount varies by plan (and per deal for Enterprise), so it can't reuse a single
+        pinned plan id. Cached by amount so repeat creates of the same tier reuse one plan."""
+        cache_key = f"apex_monthly_{int(amount_paise)}"
+        if cache_key in _PLAN_CACHE:
+            return _PLAN_CACHE[cache_key]
+        created = await RazorpayService._request(
+            "POST",
+            "plans",
+            json_body={
+                "period": "monthly",
+                "interval": 1,
+                "item": {"name": name, "amount": int(amount_paise), "currency": "INR"},
+            },
+        )
+        plan_id = str(created.get("id") or "")
+        if not plan_id:
+            raise RazorpayError(f"Razorpay plan creation returned no id: {created}")
+        _PLAN_CACHE[cache_key] = plan_id
+        return plan_id
+
+    @staticmethod
     async def create_subscription(
         plan_id: str,
         *,

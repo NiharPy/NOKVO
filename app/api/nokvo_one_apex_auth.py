@@ -20,6 +20,7 @@ from datetime import timedelta
 
 import jwt
 from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -32,9 +33,14 @@ from app.api.nokvo_one_auth import (
     _safe_detail,
 )
 from app.core import security
+from app.core.config import settings
 from app.core.email_policy import extract_email_domain, normalize_email
 from app.core.rate_limit import limiter
 from app.core.totp_crypto import TOTPDecryptionError, decrypt_totp_secret
+from app.models.apex_access_request import (
+    APEX_REQUEST_OPEN_STATUSES,
+    ApexAccessRequest,
+)
 from app.models.organization import Organization
 from app.models.organization_user import OrganizationUser
 from app.schemas.nokvo_one import (
@@ -70,7 +76,62 @@ async def _resolve_apex_user(db: AsyncSession, email: str) -> tuple[Organization
     return row[0], row[1]
 
 
-# ─────────── Signup ───────────
+# ─────────── Request access (replaces self-serve signup) ───────────
+class ApexAccessRequestPayload(BaseModel):
+    company_name: str | None = None
+    contact_name: str | None = None
+    email: str
+    phone: str | None = None
+    requested_plan: str | None = None
+    notes: str | None = None
+    # Opaque CAPTCHA/verification token — only checked when APEX_REQUEST_CAPTCHA is on.
+    captcha_token: str | None = None
+
+
+@router.post("/apex/request-access")
+@limiter.limit("5/hour")
+async def apex_request_access(
+    request: Request,
+    payload: ApexAccessRequestPayload,
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Public 'request access' form (APEX has no self-serve signup). Persists an
+    ``ApexAccessRequest`` for SuperAdmin to review + create the account. Rate-limited,
+    per-email deduped (one open request per email), with an optional CAPTCHA gate."""
+    email = normalize_email(payload.email)
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="A valid email is required")
+    if settings.APEX_REQUEST_CAPTCHA and not (payload.captcha_token or "").strip():
+        raise HTTPException(status_code=400, detail="Please complete the verification challenge")
+
+    # Dedupe: if this email already has an OPEN request, don't stack another.
+    existing = (
+        await db.execute(
+            select(ApexAccessRequest.id).where(
+                ApexAccessRequest.email == email,
+                ApexAccessRequest.status.in_(list(APEX_REQUEST_OPEN_STATUSES)),
+            ).limit(1)
+        )
+    ).first()
+    if existing is None:
+        db.add(
+            ApexAccessRequest(
+                id=uuid.uuid4(),
+                company_name=(payload.company_name or "").strip() or None,
+                contact_name=(payload.contact_name or "").strip() or None,
+                email=email,
+                phone=(payload.phone or "").strip() or None,
+                requested_plan=(payload.requested_plan or "").strip().lower() or None,
+                notes=(payload.notes or "").strip()[:4000] or None,
+                status="new",
+            )
+        )
+        await db.commit()
+    # Always the same response (don't leak whether an open request already exists).
+    return {"code": "request_received", "message": "Thanks — our team will reach out shortly."}
+
+
+# ─────────── Signup (DISABLED under ENABLE_APEX_PLANS — request-gated now) ───────────
 @router.post("/apex/signup")
 @limiter.limit("5/hour")
 async def apex_signup(
@@ -78,11 +139,14 @@ async def apex_signup(
     payload: NokvoOneSignupRequest,
     db: AsyncSession = Depends(deps.get_db),
 ):
-    """Create an APEX account, then send the user to the COMPULSORY ₹6499 payment
-    screen (always — there is no dev short-circuit; only the SuperAdmin
-    bypass-payment endpoint can clear pending_payment without a charge). The same
-    email may already own a Nokvo One account — only an existing APEX account for
-    this email is a conflict."""
+    """Legacy self-serve APEX signup. Under ``ENABLE_APEX_PLANS`` this is CLOSED — APEX is
+    request-gated (SuperAdmin creates accounts); the frontend routes to the request form.
+    Kept (flag-off) only for the rollout window."""
+    if settings.ENABLE_APEX_PLANS:
+        raise HTTPException(
+            status_code=403,
+            detail="Self-serve signup is closed. Please request access and our team will set you up.",
+        )
     email = normalize_email(payload.admin_email)
     domain = extract_email_domain(email)
     await _enforce_signup_attempt_quotas(db, email, domain)
@@ -170,6 +234,17 @@ async def apex_login(
         return {
             "code": "payment_required",
             "payment_token": _issue_setup_token(user.id, organization.id, stage="payment", ttl_minutes=60),
+            "organization_id": str(organization.id),
+            "email": email,
+            "org_status": organization.status,
+        }
+
+    # Paid but awaiting SuperAdmin activation (request-gated APEX). No session yet — the
+    # account isn't usable until it's activated (within 6h; 24h for Free Trial).
+    if organization.status == "pending_activation":
+        return {
+            "code": "pending_activation",
+            "message": "Payment received — your account is being activated (within 6 hours).",
             "organization_id": str(organization.id),
             "email": email,
             "org_status": organization.status,
@@ -278,7 +353,13 @@ async def apex_google_login(
     resolved = await _resolve_apex_user(db, email)
 
     if resolved is None:
-        # New APEX org via Google.
+        # New APEX org via Google. CLOSED under ENABLE_APEX_PLANS — APEX is request-gated,
+        # so Google can only LOG IN an existing account, never create one.
+        if settings.ENABLE_APEX_PLANS:
+            raise HTTPException(
+                status_code=403,
+                detail="No APEX account found for this Google email. Please request access to get set up.",
+            )
         await _enforce_signup_attempt_quotas(db, email, domain)
         organization = Organization(
             id=uuid.uuid4(),

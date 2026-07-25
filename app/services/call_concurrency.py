@@ -87,13 +87,19 @@ def _limit(pool: str) -> int:
         return 5
 
 
-async def acquire(tenant_id, *, pool: str = POOL_INBOUND_FOLLOWUP) -> str | None:
+async def acquire(tenant_id, *, pool: str = POOL_INBOUND_FOLLOWUP, limit: int | None = None) -> str | None:
     """Reserve a concurrency slot for ``tenant_id`` in ``pool``.
+
+    ``limit`` is the per-tenant cap for this pool (e.g. an APEX org's plan
+    concurrency). When ``None`` the global ``_limit(pool)`` setting is used — so
+    non-APEX callers keep the platform default and only APEX outbound passes a
+    per-plan value.
 
     Returns an opaque token to be passed to :func:`release` (with the SAME
     ``pool``), or ``None`` if that pool is already at its cap. Fails open
     (returns a token) on any Redis error so a cache blip never blocks calls.
     """
+    eff_limit = _limit(pool) if limit is None else max(1, int(limit))
     token = uuid.uuid4().hex
     now = time.time()
     try:
@@ -101,7 +107,7 @@ async def acquire(tenant_id, *, pool: str = POOL_INBOUND_FOLLOWUP) -> str | None
             _ACQUIRE_LUA,
             1,
             _key(tenant_id, pool),
-            _limit(pool),
+            eff_limit,
             now,
             _MAX_CALL_SECONDS,
             token,

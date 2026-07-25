@@ -433,6 +433,14 @@ class Settings(BaseSettings):
     # questionnaire unchanged (soft degrade, same shape as the tier gate);
     # campaigns already styled keep speaking their styled text either way.
     APEX_STYLE_REWRITE_ENABLED: bool = True
+    # NOKVO APEX plan-driven pricing (Core/Growth/Pinnacle/Enterprise/Free Trial) +
+    # request-gated onboarding (no self-serve signup; SuperAdmin creates accounts). When
+    # OFF the new create/activate/plan-pricing surfaces are gated and the legacy slab path
+    # is unaffected — deploy OFF in prod, run the migration, verify, then flip ON.
+    ENABLE_APEX_PLANS: bool = False
+    # Optional CAPTCHA/verification gate on the public APEX request-access form. OFF by
+    # default (rate-limit + per-email dedupe still apply); wire a provider before enabling.
+    APEX_REQUEST_CAPTCHA: bool = False
     # Plivo telephony (the sole provider). The MASTER account creds; each tenant
     # gets its own Plivo subaccount + DID + Application created via the API.
     PLIVO_AUTH_ID: str = ""

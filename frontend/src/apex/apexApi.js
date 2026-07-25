@@ -42,6 +42,7 @@ export function extractError(err, fallback) {
 function _sessionResult(data) {
   if (data.mfa_pending) return { kind: 'mfa', tempToken: data.access_token };
   if (data.code === 'payment_required') return { kind: 'payment', paymentToken: data.payment_token };
+  if (data.code === 'pending_activation') return { kind: 'pending_activation', message: data.message };
   if (data.access_token) persistToken(data.access_token);
   if (data.code === 'onboarding_required') {
     return { kind: 'onboarding', user: data.user || null, step: data.onboarding_step || 'business_details' };
@@ -71,6 +72,41 @@ export async function login(email, password) {
 export async function signup({ org_name, admin_name, admin_email, password }) {
   const { data } = await api.post('/apex/signup', { org_name, admin_name, admin_email, password });
   return _sessionResult(data);
+}
+
+// APEX is request-gated — the public form submits a request; SuperAdmin creates the
+// account and emails a payment link.
+export async function requestAccess({ company_name, contact_name, email, phone, requested_plan, notes }) {
+  const { data } = await api.post('/apex/request-access', {
+    company_name, contact_name, email, phone, requested_plan, notes,
+  });
+  return data;
+}
+
+// Public plan catalog (pricing/limits) — for the request form + billing panel.
+export async function fetchApexPlans() {
+  const { data } = await api.get('/apex/plans');
+  return data.plans || [];
+}
+
+// Dashboard billing panel (plan, monthly amount, subscription status, wallet).
+export async function fetchApexBilling() {
+  const { data } = await api.get('/apex/billing', { headers: authHeader() });
+  return data;
+}
+
+// Plan-rate top-up (bills at the plan's ₹/min, credits the plan top-up bonus).
+export async function planTopupCreateOrder(minutes) {
+  const { data } = await api.post('/apex/billing/topup/create-order', { minutes }, { headers: authHeader() });
+  return data;
+}
+export async function planTopupVerify(payload) {
+  const { data } = await api.post('/apex/billing/topup/verify', payload, { headers: authHeader() });
+  return data;
+}
+export async function cancelSubscription() {
+  const { data } = await api.post('/payments/cancel-subscription', {}, { headers: authHeader() });
+  return data;
 }
 
 export async function googleLogin(idToken) {

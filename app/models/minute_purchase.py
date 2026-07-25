@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import Column, DateTime, ForeignKey, Index, Integer, Numeric, String, UniqueConstraint
+from sqlalchemy import Column, DateTime, ForeignKey, Index, Integer, Numeric, String, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.sql import func
 
@@ -41,10 +41,22 @@ class MinutePurchase(Base):
     razorpay_payment_id = Column(String, nullable=True, unique=True, index=True)
     # The subscription_id (onboarding) or order_id (top-up) this purchase came from.
     razorpay_ref = Column(String, nullable=True)
+    # NOKVO APEX monthly-grant idempotency: the Razorpay INVOICE id of the cycle this
+    # credit belongs to (one invoice per billing cycle). A partial unique index on
+    # (organization_id, razorpay_invoice_id) makes a webhook retry a no-op while still
+    # crediting each new cycle. NULL for Nokvo One / top-ups.
+    razorpay_invoice_id = Column(String, nullable=True)
     raw_event = Column(JSONB, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
         UniqueConstraint("razorpay_payment_id", name="uq_minute_purchases_rzp_payment_id"),
         Index("ix_minute_purchases_org_created", "organization_id", "created_at"),
+        Index(
+            "uq_minute_purchases_org_invoice",
+            "organization_id",
+            "razorpay_invoice_id",
+            unique=True,
+            postgresql_where=text("razorpay_invoice_id IS NOT NULL"),
+        ),
     )

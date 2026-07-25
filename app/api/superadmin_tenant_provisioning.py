@@ -378,6 +378,212 @@ async def update_apex_ticket(
     return {"id": str(ticket.id), "status": ticket.status}
 
 
+# ── NOKVO APEX plan accounts: access requests + create + activate ────────────
+# APEX has no self-serve signup — prospects submit an access request (public form) and
+# SuperAdmin creates the account here (stamps the plan, provisions except numbers, emails
+# the Razorpay payment link), then manually activates once paid. Gated on ENABLE_APEX_PLANS.
+
+def _require_apex_plans_enabled() -> None:
+    if not settings.ENABLE_APEX_PLANS:
+        raise HTTPException(status_code=404, detail="APEX plans are not enabled")
+
+
+class ApexCreateAccountRequest(BaseModel):
+    plan_code: str
+    company_name: str
+    admin_email: str
+    admin_name: str | None = None
+    phone: str | None = None
+    admin_password: str | None = None
+    # Required only for the enterprise plan (negotiated per deal).
+    enterprise_rate: float | None = None
+    enterprise_concurrency: int | None = None
+    # Optional link back to the access request being converted.
+    request_id: uuid.UUID | None = None
+
+
+@router.get("/apex/access-requests")
+async def list_apex_access_requests(
+    status: str | None = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: SuperAdminUser = Depends(RequireRole(_WRITE_ROLES)),
+):
+    """Public APEX access requests, newest first. Optional ``status`` filter."""
+    _require_apex_plans_enabled()
+    from app.models.apex_access_request import ApexAccessRequest
+
+    q = select(ApexAccessRequest).order_by(ApexAccessRequest.created_at.desc())
+    if status:
+        q = q.where(ApexAccessRequest.status == status.strip().lower())
+    rows = (await db.execute(q.limit(500))).scalars().all()
+    return [
+        {
+            "id": str(r.id),
+            "company_name": r.company_name,
+            "contact_name": r.contact_name,
+            "email": r.email,
+            "phone": r.phone,
+            "requested_plan": r.requested_plan,
+            "notes": r.notes,
+            "status": r.status,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+            "converted_org_id": str(r.converted_org_id) if r.converted_org_id else None,
+        }
+        for r in rows
+    ]
+
+
+@router.post("/apex/accounts")
+async def create_apex_account_endpoint(
+    payload: ApexCreateAccountRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: SuperAdminUser = Depends(RequireRole(_WRITE_ROLES)),
+):
+    """Create an APEX account on a plan, provision (except numbers), and email the payment
+    link. High-risk: opens a recurring subscription + provisions resources."""
+    _require_apex_plans_enabled()
+    from app.services.apex_account_service import ApexAccountError, create_apex_account
+
+    email = (payload.admin_email or "").strip().lower()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="A valid admin_email is required")
+    try:
+        result = await create_apex_account(
+            db,
+            plan_code=payload.plan_code,
+            company_name=payload.company_name,
+            admin_email=email,
+            admin_name=payload.admin_name,
+            phone=payload.phone,
+            admin_password=payload.admin_password,
+            enterprise_rate=payload.enterprise_rate,
+            enterprise_concurrency=payload.enterprise_concurrency,
+            request_id=payload.request_id,
+        )
+    except ApexAccountError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    db.add(
+        SuperAdminAuditLog(
+            superadmin_id=current_user.id,
+            action="apex_account_created",
+            risk_level="high",
+            target_type="organization",
+            target_id=result["organization_id"],
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            request_id=request.headers.get("x-request-id"),
+            metadata_={"plan_code": result["plan_code"], "status": result["status"]},
+        )
+    )
+    await db.commit()
+    return result
+
+
+@router.post("/apex/accounts/{organization_id}/activate")
+async def activate_apex_account_endpoint(
+    organization_id: uuid.UUID,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: SuperAdminUser = Depends(RequireRole(_WRITE_ROLES)),
+):
+    """Manually activate a paid APEX account (→ active, provisions numbers best-effort)."""
+    _require_apex_plans_enabled()
+    from app.services.apex_account_service import ApexAccountError, activate_apex_account
+
+    try:
+        result = await activate_apex_account(db, organization_id)
+    except ApexAccountError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    db.add(
+        SuperAdminAuditLog(
+            superadmin_id=current_user.id,
+            action="apex_account_activated",
+            risk_level="medium",
+            target_type="organization",
+            target_id=str(organization_id),
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            request_id=request.headers.get("x-request-id"),
+            metadata_={"numbers_provisioned": result.get("numbers_provisioned")},
+        )
+    )
+    await db.commit()
+    return result
+
+
+@router.get("/apex/webhook-events")
+async def list_razorpay_webhook_events(
+    status: str | None = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: SuperAdminUser = Depends(RequireRole(_WRITE_ROLES)),
+):
+    """Recent Razorpay webhook events (audit) — newest first, optional status filter, so a
+    dropped/failed payment event can be found and replayed."""
+    _require_apex_plans_enabled()
+    from app.models.razorpay_webhook_event import RazorpayWebhookEvent
+
+    q = select(RazorpayWebhookEvent).order_by(RazorpayWebhookEvent.created_at.desc())
+    if status:
+        q = q.where(RazorpayWebhookEvent.status == status.strip().lower())
+    rows = (await db.execute(q.limit(200))).scalars().all()
+    return [
+        {
+            "id": str(r.id),
+            "event_type": r.event_type,
+            "subscription_id": r.subscription_id,
+            "payment_id": r.payment_id,
+            "invoice_id": r.invoice_id,
+            "status": r.status,
+            "error": r.error,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        }
+        for r in rows
+    ]
+
+
+@router.post("/apex/webhook-events/{event_id}/resync")
+async def resync_razorpay_webhook_event(
+    event_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: SuperAdminUser = Depends(RequireRole(_WRITE_ROLES)),
+):
+    """Replay a stored webhook event's activation (idempotent downstream). Use when a
+    payment event failed to credit/advance an account."""
+    _require_apex_plans_enabled()
+    from app.models.razorpay_webhook_event import RazorpayWebhookEvent
+    from app.api.nokvo_one_payments import _bg_activate
+
+    ev = (
+        await db.execute(select(RazorpayWebhookEvent).where(RazorpayWebhookEvent.id == event_id))
+    ).scalars().first()
+    if ev is None:
+        raise HTTPException(status_code=404, detail="Webhook event not found")
+    if not ev.subscription_id:
+        raise HTTPException(status_code=400, detail="Event has no subscription id to replay")
+    sub = (
+        await db.execute(select(Subscription).where(Subscription.razorpay_subscription_id == ev.subscription_id))
+    ).scalars().first()
+    if sub is None:
+        raise HTTPException(status_code=404, detail="No subscription found for this event")
+    try:
+        await _bg_activate(sub.organization_id, ev.subscription_id, ev.invoice_id)
+        ev.status = "processed"
+        ev.processed_at = datetime.now(timezone.utc)
+        ev.error = None
+    except Exception as exc:  # keep the audit row; surface the failure
+        ev.status = "failed"
+        ev.error = str(exc)[:2000]
+        db.add(ev)
+        await db.commit()
+        raise HTTPException(status_code=500, detail="Resync failed — see event error") from exc
+    db.add(ev)
+    await db.commit()
+    return {"id": str(ev.id), "status": ev.status}
+
+
 # ── SuperAdmin to-do list (optionally tagged to a feedback row) ──────────────
 # All defined BEFORE "/{organization_id}" so the path words aren't treated as ids.
 

@@ -179,6 +179,24 @@ def apex_call_cost(seconds, bundle_minutes: int) -> Decimal:
     return cost.quantize(_LEDGER_Q, rounding=ROUND_HALF_UP)
 
 
+def apex_call_cost_at_rate(seconds, rate) -> Decimal:
+    """PLAN-DRIVEN APEX call cost (NOKVO APEX plans — Core/Growth/Pinnacle/Enterprise).
+
+    Same connect-fee shape as :func:`apex_call_cost`, but the per-minute ``rate`` is the
+    org's FIXED plan rate (``apex_plans.get_apex_rate``), not the quantity slab:
+        ``1.5 + max(rate − 1.5, 0)/60 × seconds``
+    A full 60s call equals the plan rate exactly. The ``max(…, 0)`` clamps the talk rate at
+    0 so a rate below the ₹1.5 connect fee can never produce a negative per-second charge
+    (``stamp_org_from_plan`` also refuses to stamp a sub-connect-fee rate). A non-positive
+    duration (never connected) costs 0. Quantised to the 4-dp ledger."""
+    s = Decimal(str(seconds))
+    if s <= 0:
+        return Decimal("0").quantize(_LEDGER_Q)
+    per_second = max(Decimal(str(rate)) - APEX_CONNECT_FEE, Decimal("0")) / Decimal("60")
+    cost = APEX_CONNECT_FEE + per_second * s
+    return cost.quantize(_LEDGER_Q, rounding=ROUND_HALF_UP)
+
+
 def slab_ladder() -> list[dict]:
     """The published bracket ladder, for the onboarding/top-up UI fine print."""
     rows: list[dict] = []

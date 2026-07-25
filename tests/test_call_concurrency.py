@@ -92,6 +92,29 @@ async def test_pools_are_independent(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_per_tenant_limit_overrides_global(monkeypatch):
+    """An explicit ``limit`` (e.g. an APEX plan's concurrency) wins over the global
+    setting, and ``None`` falls back to the global cap."""
+    if not await _redis_up():
+        pytest.skip("Redis not reachable")
+
+    # Global outbound cap is high; the per-tenant limit of 1 is what must bind.
+    monkeypatch.setattr(cc.settings, "NOKVO_MAX_CONCURRENT_OUTBOUND_PER_TENANT", 9, raising=False)
+    tenant = f"test-{uuid.uuid4().hex[:8]}"
+    toks = []
+    try:
+        first = await cc.acquire(tenant, pool=cc.POOL_OUTBOUND, limit=1)
+        assert first is not None
+        toks.append(first)
+        # Second call at a per-tenant cap of 1 is rejected despite the global cap of 9.
+        assert await cc.acquire(tenant, pool=cc.POOL_OUTBOUND, limit=1) is None
+    finally:
+        for tok in toks:
+            await cc.release(tenant, tok, pool=cc.POOL_OUTBOUND)
+        assert await cc.active_count(tenant, pool=cc.POOL_OUTBOUND) == 0
+
+
+@pytest.mark.asyncio
 async def test_release_is_idempotent_and_safe(monkeypatch):
     if not await _redis_up():
         pytest.skip("Redis not reachable")

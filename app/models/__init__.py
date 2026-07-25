@@ -50,6 +50,8 @@ from app.models.apex_support_ticket import ApexSupportTicket
 from app.models.platform_setting import PlatformSetting
 from app.models.affiliate import Affiliate
 from app.models.affiliate_commission import AffiliateCommission, AffiliateSettlement
+from app.models.apex_access_request import ApexAccessRequest
+from app.models.razorpay_webhook_event import RazorpayWebhookEvent
 
 # For Alembic to discover all models
 __all__ = [
@@ -101,4 +103,6 @@ __all__ = [
     "Affiliate",
     "AffiliateCommission",
     "AffiliateSettlement",
+    "ApexAccessRequest",
+    "RazorpayWebhookEvent",
 ]

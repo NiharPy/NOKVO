@@ -2,7 +2,7 @@
 import { computed, onMounted, ref, watch } from 'vue';
 import { Shield, LogOut, ArrowLeft, RefreshCw, ArrowUpRight, ArrowDownRight } from 'lucide-vue-next';
 
-import { SUPERADMIN_API_BASE } from '../config.js';
+import { SUPERADMIN_API_BASE, NOKVO_ONE_API_BASE } from '../config.js';
 
 const props = defineProps({
   theme: { type: String, required: true },
@@ -119,7 +119,22 @@ const affiliatesLoading = ref(false);
 const affiliateBusy = ref('');     // affiliate id an action is running for
 const utrDrafts = ref({});         // per-affiliate UTR input on the due queue
 
+// ── NOKVO APEX plan accounts (request-gated onboarding) ──
+const apexAccountsView = ref(false);
+const apexRequests = ref([]);
+const apexAccountsLoading = ref(false);
+const apexPlanCatalog = ref([]);
+const apexCreateForm = ref({
+  request_id: null, plan_code: 'core', company_name: '', admin_name: '',
+  admin_email: '', phone: '', admin_password: '', enterprise_rate: null, enterprise_concurrency: null,
+});
+const apexCreateBusy = ref(false);
+const apexCreateResult = ref(null);
+const apexCreateError = ref('');
+const apexActivateBusy = ref('');   // org id being activated
+
 const view = computed(() => {
+  if (apexAccountsView.value) return 'apex-accounts';
   if (affiliatesView.value) return 'affiliates';
   if (bulkView.value) return 'bulk';
   if (llmView.value) return 'llm';
@@ -916,8 +931,84 @@ const submitApexBulk = async () => {
 function handleLogout() { emit('logout'); }
 
 // ── Section navigation (tab rail) ───────────────────────────
+// ── APEX plan accounts: load requests + catalog, create, activate ──
+const loadApexAccounts = async () => {
+  apexAccountsLoading.value = true;
+  errorMsg.value = '';
+  try {
+    const [reqRes, planRes] = await Promise.all([
+      fetch(`${SUPERADMIN_API_BASE}/tenants/apex/access-requests`, { headers: authHeaders() }),
+      fetch(`${NOKVO_ONE_API_BASE}/apex/plans`),
+    ]);
+    if (reqRes.ok) apexRequests.value = await reqRes.json();
+    else if (reqRes.status === 404) errorMsg.value = 'APEX plans are not enabled (ENABLE_APEX_PLANS is off).';
+    if (planRes.ok) apexPlanCatalog.value = (await planRes.json()).plans || [];
+  } catch {
+    errorMsg.value = 'Could not load APEX accounts.';
+  } finally {
+    apexAccountsLoading.value = false;
+  }
+};
+const openApexAccounts = () => { apexAccountsView.value = true; apexCreateResult.value = null; loadApexAccounts(); };
+const useApexRequest = (r) => {
+  apexCreateResult.value = null; apexCreateError.value = '';
+  apexCreateForm.value = {
+    request_id: r.id, plan_code: r.requested_plan || 'core',
+    company_name: r.company_name || '', admin_name: r.contact_name || '',
+    admin_email: r.email || '', phone: r.phone || '', admin_password: '',
+    enterprise_rate: null, enterprise_concurrency: null,
+  };
+};
+const submitApexAccount = async () => {
+  apexCreateError.value = ''; apexCreateResult.value = null;
+  const f = apexCreateForm.value;
+  if (!f.company_name.trim() || !f.admin_email.trim()) { apexCreateError.value = 'Company name and admin email are required.'; return; }
+  if (f.plan_code === 'enterprise' && (!f.enterprise_rate || !f.enterprise_concurrency)) {
+    apexCreateError.value = 'Enterprise needs a rate (< ₹5) and concurrency (≥ 5).'; return;
+  }
+  apexCreateBusy.value = true;
+  try {
+    const res = await fetch(`${SUPERADMIN_API_BASE}/tenants/apex/accounts`, {
+      method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({
+        plan_code: f.plan_code, company_name: f.company_name.trim(), admin_email: f.admin_email.trim(),
+        admin_name: f.admin_name.trim() || null, phone: f.phone.trim() || null,
+        admin_password: f.admin_password || null, request_id: f.request_id,
+        enterprise_rate: f.plan_code === 'enterprise' ? Number(f.enterprise_rate) : null,
+        enterprise_concurrency: f.plan_code === 'enterprise' ? Number(f.enterprise_concurrency) : null,
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) { apexCreateError.value = data.detail || 'Could not create the account.'; return; }
+    apexCreateResult.value = data;
+    loadApexAccounts();
+  } catch {
+    apexCreateError.value = 'Could not create the account.';
+  } finally {
+    apexCreateBusy.value = false;
+  }
+};
+const activateApexAccount = async (orgId) => {
+  if (!orgId) return;
+  apexActivateBusy.value = orgId;
+  errorMsg.value = '';
+  try {
+    const res = await fetch(`${SUPERADMIN_API_BASE}/tenants/apex/accounts/${orgId}/activate`, {
+      method: 'POST', headers: authHeaders(),
+    });
+    const data = await res.json();
+    if (!res.ok) { errorMsg.value = data.detail || 'Could not activate.'; return; }
+    errorMsg.value = data.numbers_provisioned ? 'Activated (numbers provisioned).' : 'Activated — numbers pending (provision from Bulk calling once compliance is ready).';
+  } catch {
+    errorMsg.value = 'Could not activate.';
+  } finally {
+    apexActivateBusy.value = '';
+  }
+};
+
 const NAV = [
   { id: 'list', label: 'Tenants' },
+  { id: 'apex-accounts', label: 'APEX Accounts' },
   { id: 'tickets', label: 'Tickets' },
   { id: 'feedback', label: 'Feedback' },
   { id: 'todos', label: 'To-do' },
@@ -933,12 +1024,12 @@ const closeAll = () => {
   detail.value = null;
   feedbackView.value = false; ticketsView.value = false; todoView.value = false;
   broadcastView.value = false; langsmithView.value = false; llmView.value = false; bulkView.value = false;
-  affiliatesView.value = false;
+  affiliatesView.value = false; apexAccountsView.value = false;
 };
 const go = (id) => {
   closeAll();
   if (id === 'list') { loadOrganizations(); return; }
-  const open = { tickets: openTickets, feedback: openFeedback, todos: openTodos, broadcast: openBroadcast, langsmith: openLangsmith, llm: openLlm, bulk: openBulk, affiliates: openAffiliates }[id];
+  const open = { 'apex-accounts': openApexAccounts, tickets: openTickets, feedback: openFeedback, todos: openTodos, broadcast: openBroadcast, langsmith: openLangsmith, llm: openLlm, bulk: openBulk, affiliates: openAffiliates }[id];
   if (open) open();
 };
 const activeNav = computed(() => (view.value === 'detail' ? 'list' : view.value));
@@ -1359,6 +1450,81 @@ watch(() => props.homeSignal, () => { closeAll(); loadOrganizations(); });
       </div>
 
       <!-- ── APEX SUPPORT TICKETS (raised via Nova) ──────────────── -->
+      <!-- ── NOKVO APEX PLAN ACCOUNTS ─────────────────────────────── -->
+      <div v-else-if="view === 'apex-accounts'" key="apex-accounts" class="dashboard-content">
+        <div class="orgs-panel-header">
+          <div>
+            <span class="stage-eyebrow">NOKVO APEX</span>
+            <h3>Accounts &amp; Access Requests</h3>
+          </div>
+          <button type="button" class="ghost-btn" :disabled="apexAccountsLoading" @click="loadApexAccounts">
+            <RefreshCw :size="14" :class="{ spin: apexAccountsLoading }" />
+            REFRESH
+          </button>
+        </div>
+
+        <!-- Create account -->
+        <div class="recent-section">
+          <span class="stage-eyebrow">CREATE ACCOUNT</span>
+          <div class="apex-create-grid">
+            <label class="apex-fld"><span>Plan</span>
+              <select v-model="apexCreateForm.plan_code" class="inline-select">
+                <option v-for="p in apexPlanCatalog" :key="p.code" :value="p.code">
+                  {{ p.label }}<template v-if="p.monthly_inr"> — ₹{{ Math.round(p.monthly_inr).toLocaleString('en-IN') }}/mo</template>
+                </option>
+              </select>
+            </label>
+            <label class="apex-fld"><span>Company</span><input v-model="apexCreateForm.company_name" class="fx-input apex-input" placeholder="Raghava Estates" /></label>
+            <label class="apex-fld"><span>Admin name</span><input v-model="apexCreateForm.admin_name" class="fx-input apex-input" placeholder="Preeth" /></label>
+            <label class="apex-fld"><span>Admin email</span><input v-model="apexCreateForm.admin_email" type="email" class="fx-input apex-input" placeholder="preeth@raghava.com" /></label>
+            <label class="apex-fld"><span>Phone</span><input v-model="apexCreateForm.phone" class="fx-input apex-input" placeholder="+91…" /></label>
+            <label class="apex-fld"><span>Initial password <small>(blank = auto)</small></span><input v-model="apexCreateForm.admin_password" class="fx-input apex-input" placeholder="optional" /></label>
+            <template v-if="apexCreateForm.plan_code === 'enterprise'">
+              <label class="apex-fld"><span>Rate ₹/min (&lt; 5)</span><input v-model="apexCreateForm.enterprise_rate" type="number" step="0.1" min="1.5" max="4.99" class="fx-input apex-input" /></label>
+              <label class="apex-fld"><span>Concurrency (≥ 5)</span><input v-model="apexCreateForm.enterprise_concurrency" type="number" min="5" class="fx-input apex-input" /></label>
+            </template>
+          </div>
+          <p v-if="apexCreateError" class="error-banner">{{ apexCreateError }}</p>
+          <div v-if="apexCreateResult" class="apex-result">
+            <p>✓ Account created — status <strong>{{ apexCreateResult.status }}</strong>, monthly ₹{{ Math.round(apexCreateResult.monthly_inr).toLocaleString('en-IN') }}.</p>
+            <p v-if="apexCreateResult.payment_url">Payment link emailed. <a :href="apexCreateResult.payment_url" target="_blank" rel="noopener">Open link</a></p>
+            <p v-if="apexCreateResult.generated_password">Generated admin password: <code>{{ apexCreateResult.generated_password }}</code> — share securely.</p>
+          </div>
+          <button type="button" class="ghost-btn" style="margin-top:10px;" :disabled="apexCreateBusy" @click="submitApexAccount">
+            {{ apexCreateBusy ? 'Creating…' : 'Create account + send payment link' }}
+          </button>
+        </div>
+
+        <!-- Access requests -->
+        <div class="recent-section" style="margin-top:1.4rem;">
+          <span class="stage-eyebrow">ACCESS REQUESTS</span>
+          <div v-if="apexRequests.length" class="table-wrap">
+            <table class="org-table">
+              <thead><tr><th>Date</th><th>Company</th><th>Contact</th><th>Email</th><th>Phone</th><th>Plan</th><th>Status</th><th></th></tr></thead>
+              <tbody>
+                <tr v-for="r in apexRequests" :key="r.id">
+                  <td>{{ fmtDate(r.created_at) }}</td>
+                  <td>{{ r.company_name || '—' }}</td>
+                  <td>{{ r.contact_name || '—' }}</td>
+                  <td>{{ r.email }}</td>
+                  <td>{{ r.phone || '—' }}</td>
+                  <td>{{ r.requested_plan || '—' }}</td>
+                  <td><span class="plan-pill">{{ r.status }}</span></td>
+                  <td class="apex-req-actions">
+                    <button v-if="r.status !== 'converted'" type="button" class="ghost-btn sm" @click="useApexRequest(r)">Use</button>
+                    <button v-if="r.converted_org_id" type="button" class="ghost-btn sm" :disabled="apexActivateBusy === r.converted_org_id" @click="activateApexAccount(r.converted_org_id)">
+                      {{ apexActivateBusy === r.converted_org_id ? '…' : 'Activate' }}
+                    </button>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div v-else-if="!apexAccountsLoading" class="empty-orgs"><p>No access requests yet.</p></div>
+          <div v-else class="empty-orgs"><p>Loading…</p></div>
+        </div>
+      </div>
+
       <div v-else-if="view === 'tickets'" key="tickets" class="dashboard-content">
         <div class="orgs-panel-header">
           <div>
@@ -2319,6 +2485,14 @@ watch(() => props.homeSignal, () => { closeAll(); loadOrganizations(); });
 .todo-item__fb { display: inline-block; margin-top: 0.35rem; font-size: 0.72rem; color: #60a5fa; }
 .recent-section { margin-top: 0.5rem; }
 .recent-section .table-wrap { margin-top: 0.6rem; }
+/* APEX plan accounts create form */
+.apex-create-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 0.75rem; margin-top: 0.7rem; }
+.apex-fld { display: flex; flex-direction: column; gap: 0.3rem; font-size: 0.72rem; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.04em; }
+.apex-fld small { text-transform: none; letter-spacing: 0; opacity: 0.6; }
+.apex-input { width: 100%; }
+.apex-result { margin-top: 0.7rem; padding: 0.7rem 0.9rem; border: 1px solid rgba(52, 211, 153, 0.4); background: rgba(52, 211, 153, 0.07); border-radius: 8px; font-size: 0.82rem; }
+.apex-result code { background: rgba(255,255,255,0.08); padding: 0.1rem 0.35rem; border-radius: 4px; }
+.apex-req-actions { display: flex; gap: 0.4rem; justify-content: flex-end; }
 .calls-table { font-size: 0.74rem; }
 .call-kind {
   display: inline-block; font-size: 0.56rem; letter-spacing: 1px; text-transform: uppercase;

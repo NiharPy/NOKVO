@@ -6,6 +6,8 @@ import { useRouter, useRoute } from 'vue-router';
 import {
   login as apexLogin,
   signup as apexSignup,
+  requestAccess as apexRequestAccess,
+  fetchApexPlans,
   googleLogin as apexGoogleLogin,
   verifyTotp,
   fetchMe,
@@ -39,6 +41,10 @@ import {
   checkAffiliateCode,
   verifyPayment,
   fetchMinutesBalance,
+  fetchApexBilling,
+  planTopupCreateOrder,
+  planTopupVerify,
+  cancelSubscription,
   topupCreateOrder,
   topupVerify,
   fetchOnboardingState,
@@ -104,6 +110,14 @@ watch(errorMsg, (v) => {
 // ── auth ──
 const form = ref({ email: '', password: '' });
 const signupForm = ref({ org_name: '', admin_name: '', admin_email: '', password: '' });
+// APEX is request-gated: the public form submits an access request (SuperAdmin then
+// creates the account + emails a payment link).
+const requestForm = ref({ company_name: '', contact_name: '', email: '', phone: '', requested_plan: '', notes: '' });
+const requestSubmitted = ref(false);
+const apexPlans = ref([]);
+async function loadApexPlans() {
+  try { apexPlans.value = await fetchApexPlans(); } catch { apexPlans.value = []; }
+}
 const mfaDigits = ref(['', '', '', '', '', '']);
 const mfaTempToken = ref('');
 const user = ref(null);
@@ -249,6 +263,44 @@ const topupBill = computed(() => billFor(topupMinutes.value));            // ₹
 const topupCredits = computed(() => apexCreditFor(topupMinutes.value));   // Call Credits granted
 const topupCreditedMin = computed(() => creditedFor(topupMinutes.value)); // ≈ minutes incl. 50% bonus
 async function loadBalance() { wallet.value = await fetchMinutesBalance(); }
+
+// ── Plan billing (ENABLE_APEX_PLANS) — plan config, subscription, plan-rate top-up ──
+const billing = ref(null);         // null when plan model is off (404) → legacy top-up
+const cancelBusy = ref(false);
+const cancelNote = ref('');
+async function loadBilling() {
+  try { billing.value = await fetchApexBilling(); }
+  catch { billing.value = null; }  // flag off / not an apex admin → silent, legacy path stays
+}
+const planActive = computed(() => !!(billing.value && billing.value.plan_code));
+const planRate = computed(() => Number(billing.value?.rate_per_minute) || 0);
+const planTopupBonus = computed(() => Number(billing.value?.topup_bonus_pct) || 0);
+// Plan-rate top-up preview (bills selected × plan rate; credits +topup bonus).
+const topupBillPlan = computed(() => Math.round(Math.max(0, Math.floor(Number(topupMinutes.value) || 0)) * planRate.value));
+const topupCreditsPlan = computed(() => topupBillPlan.value * (1 + planTopupBonus.value / 100));
+const topupCreditedMinPlan = computed(() => planRate.value > 0 ? Math.floor(topupCreditsPlan.value / planRate.value) : 0);
+// Display switches: plan-aware when the plan model is on, else the legacy slab values.
+const topupBillDisp = computed(() => planActive.value ? topupBillPlan.value : topupBill.value);
+const topupCreditsDisp = computed(() => planActive.value ? topupCreditsPlan.value : topupCredits.value);
+const topupCreditedMinDisp = computed(() => planActive.value ? topupCreditedMinPlan.value : topupCreditedMin.value);
+const topupBonusLabel = computed(() => planActive.value
+  ? (planTopupBonus.value > 0 ? `incl. ${planTopupBonus.value}% bonus` : 'no bonus on top-ups')
+  : 'incl. 50% bonus');
+
+async function doCancelSubscription() {
+  if (cancelBusy.value) return;
+  if (!window.confirm('Cancel your subscription at the end of the current billing cycle? Service continues until then.')) return;
+  cancelBusy.value = true; cancelNote.value = '';
+  try {
+    const r = await cancelSubscription();
+    cancelNote.value = r.message || 'Cancellation scheduled.';
+    await loadBilling();
+  } catch (e) {
+    cancelNote.value = extractError(e, 'Could not cancel the subscription.');
+  } finally {
+    cancelBusy.value = false;
+  }
+}
 // Spend meter: how much of the purchased credit pool is left (0..1). Shifts to
 // the accent red when it runs low, so a draining wallet is visible at a glance.
 const walletPct = computed(() => {
@@ -391,7 +443,7 @@ async function enterApp(u) {
     await reloadLeads();
   } else {
     bulkStatus.value = await fetchBulkStatus();
-    await Promise.all([reload(), loadBalance()]);
+    await Promise.all([reload(), loadBalance(), loadBilling()]);
   }
 }
 
@@ -404,15 +456,29 @@ async function startTopup() {
   isToppingUp.value = true;
   try {
     const Rzp = await loadRazorpay();
-    const data = await topupCreateOrder(minutes);
+    // Plan model on → plan-rate top-up (bills at the plan ₹/min, credits the plan bonus);
+    // else the legacy slab top-up.
+    const usePlan = planActive.value;
+    const data = usePlan ? await planTopupCreateOrder(minutes) : await topupCreateOrder(minutes);
     const rzp = new Rzp({
       key: data.key_id, order_id: data.order_id, amount: data.amount_paise, currency: 'INR',
       name: data.name, description: data.description, theme: { color: '#E62630' },
       handler: async (resp) => {
         try {
-          const vr = await topupVerify(minutes, resp);
-          await loadBalance();
-          setTopupNote(`Added ${fmtCredits(apexCreditFor(minutes))} Call Credits (≈${fmtMin(creditedFor(minutes))} min, incl. 50% bonus).`, true);
+          if (usePlan) {
+            const vr = await planTopupVerify({
+              minutes,
+              razorpay_order_id: resp.razorpay_order_id,
+              razorpay_payment_id: resp.razorpay_payment_id,
+              razorpay_signature: resp.razorpay_signature,
+            });
+            await Promise.all([loadBalance(), loadBilling()]);
+            setTopupNote(`Added ${fmtCredits(vr.credits_added)} Call Credits.`, true);
+          } else {
+            await topupVerify(minutes, resp);
+            await loadBalance();
+            setTopupNote(`Added ${fmtCredits(apexCreditFor(minutes))} Call Credits (≈${fmtMin(creditedFor(minutes))} min, incl. 50% bonus).`, true);
+          }
         } catch (e) { setTopupNote(extractError(e, 'Top-up verification failed.'), false); }
         finally { isToppingUp.value = false; }
       },
@@ -474,6 +540,9 @@ async function routeAuthResult(res) {
     user.value = res.user || user.value;
     onboardingStep.value = res.step || 'business_details';
     screen.value = 'onboarding';
+  } else if (res.kind === 'pending_activation') {
+    // Paid, awaiting SuperAdmin activation — not usable yet. Show a clear message.
+    errorMsg.value = res.message || 'Payment received — your account is being activated (within 6 hours).';
   } else {
     await enterApp(res.user);
   }
@@ -495,23 +564,35 @@ async function doLogin() {
   }
 }
 
-async function doSignup() {
+async function doRequestAccess() {
   errorMsg.value = '';
-  const f = signupForm.value;
-  if (!f.org_name.trim() || !f.admin_email.trim() || !f.password) {
-    errorMsg.value = 'Fill in the workspace name, email, and password.';
+  const f = requestForm.value;
+  const email = f.email.trim();
+  if (!f.company_name.trim() || !email) {
+    errorMsg.value = 'Please enter your company name and email.';
+    return;
+  }
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    errorMsg.value = 'Please enter a valid email address.';
+    return;
+  }
+  if (f.phone && !/^[+0-9()\-\s]{6,20}$/.test(f.phone.trim())) {
+    errorMsg.value = 'Please enter a valid phone number.';
     return;
   }
   busy.value = true;
   try {
-    await routeAuthResult(await apexSignup({
-      org_name: f.org_name.trim(),
-      admin_name: f.admin_name.trim() || null,
-      admin_email: f.admin_email.trim(),
-      password: f.password,
-    }));
+    await apexRequestAccess({
+      company_name: f.company_name.trim(),
+      contact_name: f.contact_name.trim() || null,
+      email,
+      phone: f.phone.trim() || null,
+      requested_plan: f.requested_plan || null,
+      notes: f.notes.trim() || null,
+    });
+    requestSubmitted.value = true;
   } catch (e) {
-    errorMsg.value = extractError(e, 'Could not create your account.');
+    errorMsg.value = extractError(e, 'Could not submit your request. Please try again.');
   } finally {
     busy.value = false;
   }
@@ -808,6 +889,7 @@ onMounted(async () => {
     }
   }
   screen.value = props.initialAuthState === 'signup' ? 'signup' : 'login';
+  if (screen.value === 'signup') loadApexPlans();
   initGoogle();
 });
 
@@ -852,13 +934,13 @@ watch(screen, async (s) => {
             <span>Google sign-in isn't loading here — this site's origin may not be authorized for the OAuth client.</span>
             <button type="button" class="ax-link" @click="retryGoogle">Retry</button>
           </div>
-          <p class="ax-sub-cta">New to NOKVO APEX? <span class="ax-link" @click="screen = 'signup'; errorMsg = ''">Create an account</span></p>
+          <p class="ax-sub-cta">New to NOKVO APEX? <span class="ax-link" @click="screen = 'signup'; errorMsg = ''; loadApexPlans()">Request access</span></p>
           <p class="ax-sub-cta ax-affiliate-cta">Want to earn by referring businesses? <span class="ax-link" @click="router.push('/affiliate')">Join the NOKVO Affiliate Program</span></p>
         </div>
       </div>
     </div>
 
-    <!-- ============ SIGNUP ============ -->
+    <!-- ============ REQUEST ACCESS (replaces self-serve signup) ============ -->
     <div v-else-if="screen === 'signup'" class="ax-auth">
       <div class="ax-glow"></div>
       <div class="ax-grid"></div>
@@ -868,27 +950,49 @@ watch(screen, async (s) => {
           <div class="ax-brand-name">NOKVO</div>
           <div class="ax-brand-apex"><span class="ax-rule"></span><span class="ax-apex-text">APEX</span><span class="ax-rule"></span></div>
         </div>
-        <div class="ax-form">
-          <div class="ax-eyebrow">Get started</div>
-          <h1 class="ax-h1">Create your workspace</h1>
-          <label class="ax-label">Workspace name</label>
-          <input v-model="signupForm.org_name" type="text" class="ax-input" placeholder="Raghava Estates" />
-          <label class="ax-label" style="margin-top:18px;">Your name</label>
-          <input v-model="signupForm.admin_name" type="text" class="ax-input" placeholder="Preeth" />
-          <label class="ax-label" style="margin-top:18px;">Work email</label>
-          <input v-model="signupForm.admin_email" type="email" class="ax-input" autocomplete="email" />
-          <label class="ax-label" style="margin-top:18px;">Password</label>
-          <input v-model="signupForm.password" type="password" class="ax-input" autocomplete="new-password" @keyup.enter="doSignup" />
-          <p v-if="errorMsg" class="ax-error">{{ errorMsg }}</p>
-          <button type="button" class="ax-btn ax-btn--accent ax-btn--full" :disabled="busy" @click="doSignup">
-            {{ busy ? 'Creating…' : 'Create account' }}
+
+        <!-- success state -->
+        <div v-if="requestSubmitted" class="ax-form" style="text-align:center;">
+          <div class="ax-eyebrow">Request received</div>
+          <h1 class="ax-h1">We'll be in touch</h1>
+          <p class="ax-muted" style="margin:10px 0 22px;">
+            Thanks — our team will review your request and reach out shortly to set up your
+            NOKVO APEX account. Once your account is created and payment is received, it's
+            activated within 6 hours (24 hours for Free Trial).
+          </p>
+          <button type="button" class="ax-btn ax-btn--accent ax-btn--full" @click="screen = 'login'; requestSubmitted = false; errorMsg = ''">
+            Back to sign in
           </button>
-          <div class="ax-divider"><span></span><span class="ax-divider-text">OR</span><span></span></div>
-          <div v-show="googleState !== 'error'" id="apex-google-btn" class="ax-google"></div>
-          <div v-if="googleState === 'error'" class="ax-google-fallback">
-            <span>Google sign-in isn't loading here — this site's origin may not be authorized for the OAuth client.</span>
-            <button type="button" class="ax-link" @click="retryGoogle">Retry</button>
-          </div>
+        </div>
+
+        <!-- request form -->
+        <div v-else class="ax-form">
+          <div class="ax-eyebrow">Get started</div>
+          <h1 class="ax-h1">Request access</h1>
+          <p class="ax-muted" style="margin:2px 0 16px;font-size:13px;">
+            NOKVO APEX is set up for you by our team — tell us about your business and we'll reach out.
+          </p>
+          <label class="ax-label">Company name</label>
+          <input v-model="requestForm.company_name" type="text" class="ax-input" placeholder="Raghava Estates" />
+          <label class="ax-label" style="margin-top:16px;">Your name</label>
+          <input v-model="requestForm.contact_name" type="text" class="ax-input" placeholder="Preeth" />
+          <label class="ax-label" style="margin-top:16px;">Work email</label>
+          <input v-model="requestForm.email" type="email" class="ax-input" autocomplete="email" @keyup.enter="doRequestAccess" />
+          <label class="ax-label" style="margin-top:16px;">Phone <span style="opacity:.5;font-weight:400;">(optional)</span></label>
+          <input v-model="requestForm.phone" type="tel" class="ax-input" placeholder="+91 98765 43210" />
+          <label class="ax-label" style="margin-top:16px;">Plan you're interested in <span style="opacity:.5;font-weight:400;">(optional)</span></label>
+          <select v-model="requestForm.requested_plan" class="ax-input">
+            <option value="">Not sure yet</option>
+            <option v-for="p in apexPlans" :key="p.code" :value="p.code">
+              {{ p.label }}<template v-if="p.monthly_inr"> — ₹{{ Math.round(p.monthly_inr).toLocaleString('en-IN') }}/mo</template>
+            </option>
+          </select>
+          <label class="ax-label" style="margin-top:16px;">Anything else? <span style="opacity:.5;font-weight:400;">(optional)</span></label>
+          <textarea v-model="requestForm.notes" class="ax-input" rows="2" placeholder="Tell us about your calling needs…"></textarea>
+          <p v-if="errorMsg" class="ax-error">{{ errorMsg }}</p>
+          <button type="button" class="ax-btn ax-btn--accent ax-btn--full" :disabled="busy" @click="doRequestAccess">
+            {{ busy ? 'Submitting…' : 'Request access' }}
+          </button>
           <p class="ax-sub-cta">Already have an account? <span class="ax-link" @click="screen = 'login'; errorMsg = ''">Sign in</span></p>
           <p class="ax-sub-cta ax-affiliate-cta">Want to earn by referring businesses? <span class="ax-link" @click="router.push('/affiliate')">Join the NOKVO Affiliate Program</span></p>
         </div>
@@ -1112,6 +1216,27 @@ watch(screen, async (s) => {
             <h1 class="ax-title ax-cas--blur" style="--d:120ms;">{{ isMember ? 'Your leads' : 'Apex Engine' }}</h1>
             <p class="ax-page-sub ax-cas" style="--d:180ms;">{{ isMember ? 'Claim qualified leads from the pool and work each one through to a result.' : 'Upload a contact list, let the agent dial it, and track the leads and calls it produces.' }}</p>
           </div>
+          <div v-if="planActive && !isMember" class="ax-plan ax-cas--x" style="--d:200ms;">
+            <div class="ax-plan-head">
+              <div>
+                <div class="ax-plan-name">{{ billing.plan_label }}</div>
+                <div class="ax-plan-sub">{{ fmtINR(billing.rate_per_minute) }}/min · {{ billing.concurrency }} concurrent · {{ billing.support_tier?.replace(/_/g, ' ') }}</div>
+              </div>
+              <div class="ax-plan-price" v-if="billing.monthly_inr">{{ fmtINR(billing.monthly_inr) }}<small>/mo</small></div>
+            </div>
+            <div class="ax-plan-meta">
+              <span v-if="billing.subscription_status" class="ax-plan-chip" :class="billing.cancel_at_period_end ? 'is-warn' : 'is-ok'">
+                {{ billing.cancel_at_period_end ? 'Cancels at cycle end' : billing.subscription_status }}
+              </span>
+              <span v-if="billing.current_period_end" class="ax-plan-till">until {{ new Date(billing.current_period_end).toLocaleDateString('en-IN') }}</span>
+              <button
+                v-if="billing.subscription_status && !billing.cancel_at_period_end"
+                type="button" class="ax-plan-cancel" :disabled="cancelBusy" @click="doCancelSubscription"
+              >{{ cancelBusy ? 'Cancelling…' : 'Cancel subscription' }}</button>
+            </div>
+            <div v-if="cancelNote" class="ax-topup-note is-ok" style="margin-top:8px;">{{ cancelNote }}</div>
+          </div>
+
           <div v-if="wallet && !isMember" class="ax-wallet ax-cas--x" style="--d:220ms;">
             <div class="ax-wallet-head">
               <div>
@@ -1141,12 +1266,12 @@ watch(screen, async (s) => {
                 >{{ fmtKMin(m) }}</button>
               </div>
               <div v-if="topupValid" class="ax-topup-preview">
-                <strong>≈ {{ fmtMin(topupCreditedMin) }} min</strong>
-                <span class="ax-topup-bonus">incl. 50% bonus</span>
-                <span class="ax-topup-sep">·</span>{{ fmtCredits(topupCredits) }} credits
+                <strong>≈ {{ fmtMin(topupCreditedMinDisp) }} min</strong>
+                <span class="ax-topup-bonus">{{ topupBonusLabel }}</span>
+                <span class="ax-topup-sep">·</span>{{ fmtCredits(topupCreditsDisp) }} credits
               </div>
               <button type="button" class="ax-btn2 ax-btn2--accent ax-topup-btn" :disabled="isToppingUp || !topupValid" @click="startTopup">
-                {{ isToppingUp ? 'Opening checkout…' : `Top up · pay ${fmtINR(topupBill)}` }}
+                {{ isToppingUp ? 'Opening checkout…' : `Top up · pay ${fmtINR(topupBillDisp)}` }}
               </button>
               <div v-if="topupNote" class="ax-topup-note" :class="topupOk ? 'is-ok' : 'is-err'">{{ topupNote }}</div>
               <div v-else-if="!topupValid" class="ax-topup-hint">100 – {{ MINUTES_MAX.toLocaleString('en-IN') }} minutes per purchase.</div>
@@ -1379,6 +1504,20 @@ watch(screen, async (s) => {
 
 /* balance widget */
 .ax-page-head--row { display: flex; justify-content: space-between; align-items: flex-start; gap: 24px; flex-wrap: wrap; }
+.ax-plan { border: 1px solid rgba(255,255,255,0.1); border-radius: 16px; padding: 16px 20px; min-width: 320px; max-width: 360px; margin-bottom: 14px; background: linear-gradient(160deg, rgba(230,38,48,0.06), rgba(255,255,255,0.012) 70%); box-shadow: inset 0 1px 0 rgba(255,255,255,0.06); }
+.ax-plan-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.ax-plan-name { font-size: 16px; font-weight: 700; letter-spacing: 0.01em; }
+.ax-plan-sub { font-size: 12px; color: rgba(255,255,255,0.55); margin-top: 3px; text-transform: capitalize; }
+.ax-plan-price { font-size: 18px; font-weight: 700; white-space: nowrap; }
+.ax-plan-price small { font-size: 11px; font-weight: 500; opacity: 0.6; }
+.ax-plan-meta { display: flex; align-items: center; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
+.ax-plan-chip { font-size: 11px; padding: 3px 9px; border-radius: 999px; border: 1px solid rgba(255,255,255,0.16); text-transform: capitalize; }
+.ax-plan-chip.is-ok { color: #7FD9A8; border-color: rgba(127,217,168,0.4); }
+.ax-plan-chip.is-warn { color: #F0B657; border-color: rgba(240,182,87,0.4); }
+.ax-plan-till { font-size: 11.5px; color: rgba(255,255,255,0.5); }
+.ax-plan-cancel { margin-left: auto; font-size: 12px; color: rgba(255,255,255,0.6); background: none; border: 1px solid rgba(255,255,255,0.16); border-radius: 8px; padding: 5px 11px; cursor: pointer; transition: color .15s, border-color .15s; }
+.ax-plan-cancel:hover:not(:disabled) { color: #E62630; border-color: rgba(230,38,48,0.5); }
+.ax-plan-cancel:disabled { opacity: 0.5; cursor: default; }
 .ax-wallet { border: 1px solid rgba(255,255,255,0.1); border-radius: 16px; padding: 18px 20px; min-width: 320px; max-width: 360px; background: linear-gradient(160deg, rgba(255,255,255,0.045), rgba(255,255,255,0.012) 60%, rgba(230,38,48,0.03)); box-shadow: inset 0 1px 0 rgba(255,255,255,0.06), 0 20px 44px -22px rgba(0,0,0,0.6); }
 .ax-wallet-head { display: flex; justify-content: space-between; align-items: flex-end; gap: 16px; }
 .ax-wallet-num { font-size: 32px; font-weight: 700; font-family: 'JetBrains Mono', monospace; line-height: 1; letter-spacing: -0.01em; }

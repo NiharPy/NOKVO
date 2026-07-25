@@ -182,9 +182,27 @@ async def record_call_cost(
 
             bundle_minutes = await current_bundle_minutes(db, org_uuid)
             if _is_apex:
-                from app.services.minute_pricing import apex_call_cost
+                # Plan-driven APEX (ENABLE_APEX_PLANS + a stamped plan): bill at the org's
+                # FIXED plan rate, not the quantity slab. Only load the full org when the
+                # flag is on; falls back to the slab cost for a legacy/unstamped account.
+                from app.core.config import settings as _settings
 
-                prepaid_rupees = apex_call_cost(duration_seconds, bundle_minutes)
+                _apex_org = None
+                if _settings.ENABLE_APEX_PLANS:
+                    from app.models.organization import Organization as _Org
+
+                    _apex_org = (
+                        await db.execute(select(_Org).where(_Org.id == org_uuid))
+                    ).scalars().first()
+                if _apex_org is not None and _apex_org.apex_plan_code:
+                    from app.services.apex_plans import get_apex_rate
+                    from app.services.minute_pricing import apex_call_cost_at_rate
+
+                    prepaid_rupees = apex_call_cost_at_rate(duration_seconds, get_apex_rate(_apex_org))
+                else:
+                    from app.services.minute_pricing import apex_call_cost
+
+                    prepaid_rupees = apex_call_cost(duration_seconds, bundle_minutes)
             else:
                 from app.services.minute_pricing import call_usage_cost
 
