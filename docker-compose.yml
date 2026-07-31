@@ -1,0 +1,80 @@
+# Local development stack: API + Postgres (TLS on) + Redis.
+#
+#   docker compose up --build
+#
+# The app's DB DSN is hardcoded with `?ssl=require` (prod uses managed Azure
+# Postgres, which mandates TLS). A vanilla `postgres` container doesn't speak
+# SSL, so the `db` service below generates a self-signed cert on start and runs
+# with `ssl=on` — that's what makes `ssl=require` connect locally.
+#
+# Provide the required app secrets in a repo-root `.env` (see README). Compose
+# OVERRIDES POSTGRES_SERVER and REDIS_URL to point at the service names below,
+# so your .env values for those two don't matter here.
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: nokvo
+      POSTGRES_PASSWORD: nokvo
+      POSTGRES_DB: nokvo
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # Generate a self-signed cert, lock down the key, then start Postgres with
+    # TLS enabled so the app's `ssl=require` DSN can connect.
+    command: >
+      bash -c "
+      openssl req -new -x509 -days 365 -nodes -text
+        -out /var/lib/postgresql/server.crt
+        -keyout /var/lib/postgresql/server.key -subj '/CN=localhost' &&
+      chmod 600 /var/lib/postgresql/server.key &&
+      chown postgres:postgres /var/lib/postgresql/server.key /var/lib/postgresql/server.crt &&
+      exec docker-entrypoint.sh postgres
+        -c ssl=on
+        -c ssl_cert_file=/var/lib/postgresql/server.crt
+        -c ssl_key_file=/var/lib/postgresql/server.key"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nokvo -d nokvo"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build:
+      context: .
+    env_file:
+      - .env
+    environment:
+      # Point the app at the compose services (override whatever's in .env).
+      POSTGRES_SERVER: db
+      POSTGRES_USER: nokvo
+      POSTGRES_PASSWORD: nokvo
+      POSTGRES_DB: nokvo
+      REDIS_URL: redis://redis:6379/0
+      ENVIRONMENT: development
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # Run migrations against the freshly-healthy DB, then serve.
+    command: >
+      sh -c "alembic upgrade head &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips '*'"
+
+volumes:
+  pgdata:
