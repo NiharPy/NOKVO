@@ -19,6 +19,7 @@ import logging
 import secrets
 import uuid
 from datetime import datetime, timezone
+from decimal import Decimal
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -116,6 +117,7 @@ async def create_apex_account(
     admin_password: str | None = None,
     enterprise_rate=None,
     enterprise_concurrency=None,
+    complimentary_minutes: int = 0,
     request_id: uuid.UUID | None = None,
     region: str = "southindia",
     language: str = "en-IN",
@@ -123,7 +125,10 @@ async def create_apex_account(
 ) -> dict:
     """Create an APEX account on ``plan_code``. Returns a summary incl. the payment link
     (``short_url``) for chargeable plans. Raises :class:`ApexAccountError` on a bad plan,
-    a duplicate APEX email, or missing enterprise overrides."""
+    a duplicate APEX email, or missing enterprise overrides.
+
+    ``complimentary_minutes`` grants free minutes on top of whatever the plan includes —
+    credited at the org's own rate with NO bonus, and never billed. Applies to any plan."""
     plan_code = (plan_code or "").strip().lower()
     if plan_code not in VALID_PLAN_CODES:
         raise ApexAccountError(f"Unknown plan '{plan_code}'")
@@ -237,6 +242,18 @@ async def create_apex_account(
             source="monthly_grant", razorpay_invoice_id=f"dev_{org.id}_cycle1",
         )
 
+    # Complimentary minutes — a goodwill grant on top of the plan's own credit. Priced at
+    # the org's rate with NO bonus (the operator entered the minutes they mean to give) and
+    # tagged with its own source, so the ledger separates gifted minutes from paid ones.
+    # credit_apex_wallet dedupes non-payment grants per (org, source): one grant per account.
+    complimentary_minutes = max(0, int(complimentary_minutes or 0))
+    if complimentary_minutes:
+        await credit_apex_wallet(
+            db, organization_id=org.id, minutes=complimentary_minutes,
+            rate=resolved.rate_per_minute, bonus_pct=Decimal("0"),
+            source="complimentary_grant",
+        )
+
     if request_id is not None:
         req = (
             await db.execute(select(ApexAccessRequest).where(ApexAccessRequest.id == request_id))
@@ -263,6 +280,9 @@ async def create_apex_account(
         "plan_code": plan_code,
         "status": org.status,
         "monthly_inr": monthly_paise / 100 if monthly_paise else 0,
+        "chargeable": plan.chargeable,
+        "included_minutes": resolved.included_minutes,
+        "complimentary_minutes": complimentary_minutes,
         "payment_url": payment_url,
         "razorpay_subscription_id": subscription_id,
         "generated_password": generated_password,  # non-null only when SuperAdmin didn't set one

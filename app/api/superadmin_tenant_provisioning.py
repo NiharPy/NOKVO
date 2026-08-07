@@ -398,6 +398,9 @@ class ApexCreateAccountRequest(BaseModel):
     # Required only for the enterprise plan (negotiated per deal).
     enterprise_rate: float | None = None
     enterprise_concurrency: int | None = None
+    # Free minutes granted on top of the plan's own credit. Never billed. Capped so a
+    # slipped digit can't gift a fortune (the wallet is real money at the org's rate).
+    complimentary_minutes: int = Field(default=0, ge=0, le=100_000)
     # Optional link back to the access request being converted.
     request_id: uuid.UUID | None = None
 
@@ -459,6 +462,7 @@ async def create_apex_account_endpoint(
             admin_password=payload.admin_password,
             enterprise_rate=payload.enterprise_rate,
             enterprise_concurrency=payload.enterprise_concurrency,
+            complimentary_minutes=payload.complimentary_minutes,
             request_id=payload.request_id,
         )
     except ApexAccountError as exc:
@@ -474,7 +478,12 @@ async def create_apex_account_endpoint(
             ip_address=request.client.host if request.client else None,
             user_agent=request.headers.get("user-agent"),
             request_id=request.headers.get("x-request-id"),
-            metadata_={"plan_code": result["plan_code"], "status": result["status"]},
+            metadata_={
+                "plan_code": result["plan_code"],
+                "status": result["status"],
+                # Gifted minutes are real wallet money — keep them on the audit record.
+                "complimentary_minutes": result.get("complimentary_minutes", 0),
+            },
         )
     )
     await db.commit()

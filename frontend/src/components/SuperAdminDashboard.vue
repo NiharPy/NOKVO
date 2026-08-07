@@ -127,11 +127,44 @@ const apexPlanCatalog = ref([]);
 const apexCreateForm = ref({
   request_id: null, plan_code: 'core', company_name: '', admin_name: '',
   admin_email: '', phone: '', admin_password: '', enterprise_rate: null, enterprise_concurrency: null,
+  complimentary_minutes: 0,
 });
 const apexCreateBusy = ref(false);
 const apexCreateResult = ref(null);
 const apexCreateError = ref('');
 const apexActivateBusy = ref('');   // org id being activated
+
+const apexSelectedPlan = computed(
+  () => apexPlanCatalog.value.find((p) => p.code === apexCreateForm.value.plan_code) || null,
+);
+
+// What creating this account actually does — money charged vs. credit granted. Shown before
+// the operator commits, because creating an account opens a real subscription and moves
+// real wallet money. Enterprise rate comes from the form (the plan row leaves it null).
+const apexCreatePreview = computed(() => {
+  const plan = apexSelectedPlan.value;
+  if (!plan) return null;
+  const isEnterprise = plan.code === 'enterprise';
+  const rate = isEnterprise ? Number(apexCreateForm.value.enterprise_rate) || 0 : Number(plan.rate_per_minute) || 0;
+  const free = Math.max(0, Math.floor(Number(apexCreateForm.value.complimentary_minutes) || 0));
+  const included = Number(plan.included_minutes) || 0;
+  const bonusPct = Number(plan.billed_bonus_pct) || 0;
+  const monthly = isEnterprise
+    ? (Number(plan.platform_fee_inr) || 0) + rate * included
+    : Number(plan.monthly_inr) || 0;
+  return {
+    chargeable: !!plan.chargeable,
+    charged: plan.chargeable ? monthly : 0,
+    includedMinutes: included,
+    planCredit: included * rate * (1 + bonusPct / 100),
+    freeMinutes: free,
+    freeCredit: free * rate,
+    rate,
+    rateKnown: rate > 0,
+  };
+});
+
+const fmtINR = (n) => `₹${Math.round(Number(n) || 0).toLocaleString('en-IN')}`;
 
 const view = computed(() => {
   if (apexAccountsView.value) return 'apex-accounts';
@@ -956,7 +989,7 @@ const useApexRequest = (r) => {
     request_id: r.id, plan_code: r.requested_plan || 'core',
     company_name: r.company_name || '', admin_name: r.contact_name || '',
     admin_email: r.email || '', phone: r.phone || '', admin_password: '',
-    enterprise_rate: null, enterprise_concurrency: null,
+    enterprise_rate: null, enterprise_concurrency: null, complimentary_minutes: 0,
   };
 };
 const submitApexAccount = async () => {
@@ -976,6 +1009,7 @@ const submitApexAccount = async () => {
         admin_password: f.admin_password || null, request_id: f.request_id,
         enterprise_rate: f.plan_code === 'enterprise' ? Number(f.enterprise_rate) : null,
         enterprise_concurrency: f.plan_code === 'enterprise' ? Number(f.enterprise_concurrency) : null,
+        complimentary_minutes: Math.max(0, Math.floor(Number(f.complimentary_minutes) || 0)),
       }),
     });
     const data = await res.json();
@@ -1465,33 +1499,98 @@ watch(() => props.homeSignal, () => { closeAll(); loadOrganizations(); });
 
         <!-- Create account -->
         <div class="recent-section">
-          <span class="stage-eyebrow">CREATE ACCOUNT</span>
+          <span class="stage-eyebrow">CHOOSE A PLAN</span>
+          <div class="apex-plan-rail" role="radiogroup" aria-label="APEX plan">
+            <button
+              v-for="p in apexPlanCatalog" :key="p.code" type="button" role="radio"
+              class="apex-plan-card" :class="{ 'is-selected': apexCreateForm.plan_code === p.code, 'is-free': !p.chargeable }"
+              :aria-checked="apexCreateForm.plan_code === p.code"
+              @click="apexCreateForm.plan_code = p.code"
+            >
+              <span class="apex-plan-name">{{ p.label }}</span>
+              <span class="apex-plan-price">
+                <template v-if="!p.chargeable">No charge</template>
+                <template v-else-if="p.monthly_inr == null">Custom</template>
+                <template v-else>{{ fmtINR(p.monthly_inr) }}<small>/mo</small></template>
+              </span>
+              <span class="apex-plan-meta">
+                <template v-if="p.rate_per_minute != null">₹{{ p.rate_per_minute }}/min</template>
+                <template v-else>Rate per deal</template>
+                ·
+                <template v-if="p.concurrency != null">{{ p.concurrency }} line{{ p.concurrency === 1 ? '' : 's' }}</template>
+                <template v-else>Custom lines</template>
+              </span>
+              <span class="apex-plan-meta">{{ Number(p.included_minutes).toLocaleString('en-IN') }} min included</span>
+            </button>
+          </div>
+
+          <span class="stage-eyebrow apex-group-label">ACCOUNT</span>
           <div class="apex-create-grid">
-            <label class="apex-fld"><span>Plan</span>
-              <select v-model="apexCreateForm.plan_code" class="inline-select">
-                <option v-for="p in apexPlanCatalog" :key="p.code" :value="p.code">
-                  {{ p.label }}<template v-if="p.monthly_inr"> — ₹{{ Math.round(p.monthly_inr).toLocaleString('en-IN') }}/mo</template>
-                </option>
-              </select>
-            </label>
             <label class="apex-fld"><span>Company</span><input v-model="apexCreateForm.company_name" class="fx-input apex-input" placeholder="Raghava Estates" /></label>
             <label class="apex-fld"><span>Admin name</span><input v-model="apexCreateForm.admin_name" class="fx-input apex-input" placeholder="Preeth" /></label>
             <label class="apex-fld"><span>Admin email</span><input v-model="apexCreateForm.admin_email" type="email" class="fx-input apex-input" placeholder="preeth@raghava.com" /></label>
             <label class="apex-fld"><span>Phone</span><input v-model="apexCreateForm.phone" class="fx-input apex-input" placeholder="+91…" /></label>
             <label class="apex-fld"><span>Initial password <small>(blank = auto)</small></span><input v-model="apexCreateForm.admin_password" class="fx-input apex-input" placeholder="optional" /></label>
+          </div>
+
+          <span class="stage-eyebrow apex-group-label">CREDIT &amp; TERMS</span>
+          <div class="apex-create-grid apex-create-grid--tight">
+            <label class="apex-fld apex-fld--gift">
+              <span>Free minutes <small>(on top of the plan)</small></span>
+              <input v-model="apexCreateForm.complimentary_minutes" type="number" min="0" max="100000" step="50" class="fx-input apex-input" placeholder="0" />
+              <small v-if="apexCreatePreview && apexCreatePreview.freeMinutes" class="apex-fld-hint">
+                Worth {{ apexCreatePreview.rateKnown ? fmtINR(apexCreatePreview.freeCredit) : '—' }} of Call Credits. Never billed.
+              </small>
+              <small v-else class="apex-fld-hint">Leave at 0 to grant nothing extra.</small>
+            </label>
             <template v-if="apexCreateForm.plan_code === 'enterprise'">
               <label class="apex-fld"><span>Rate ₹/min (&lt; 5)</span><input v-model="apexCreateForm.enterprise_rate" type="number" step="0.1" min="1.5" max="4.99" class="fx-input apex-input" /></label>
               <label class="apex-fld"><span>Concurrency (≥ 5)</span><input v-model="apexCreateForm.enterprise_concurrency" type="number" min="5" class="fx-input apex-input" /></label>
             </template>
           </div>
+
+          <!-- What pressing the button actually does: money out, credit in. -->
+          <div v-if="apexCreatePreview" class="apex-summary">
+            <div class="apex-summary-row">
+              <span class="apex-summary-key">Charged now</span>
+              <span class="apex-summary-val" :class="{ 'is-zero': !apexCreatePreview.chargeable }">
+                <template v-if="!apexCreatePreview.chargeable">Nothing — free trial</template>
+                <template v-else-if="!apexCreatePreview.rateKnown">Set a rate to price this</template>
+                <template v-else>{{ fmtINR(apexCreatePreview.charged) }} <small>per month</small></template>
+              </span>
+            </div>
+            <div class="apex-summary-row">
+              <span class="apex-summary-key">Credited on create</span>
+              <span class="apex-summary-val">
+                <template v-if="apexCreatePreview.rateKnown">
+                  {{ apexCreatePreview.includedMinutes.toLocaleString('en-IN') }} min
+                  <small>({{ fmtINR(apexCreatePreview.planCredit) }})</small>
+                  <template v-if="apexCreatePreview.freeMinutes">
+                    <span class="apex-gift">+ {{ apexCreatePreview.freeMinutes.toLocaleString('en-IN') }} free ({{ fmtINR(apexCreatePreview.freeCredit) }})</span>
+                  </template>
+                </template>
+                <template v-else>—</template>
+              </span>
+            </div>
+          </div>
+
           <p v-if="apexCreateError" class="error-banner">{{ apexCreateError }}</p>
           <div v-if="apexCreateResult" class="apex-result">
-            <p>✓ Account created — status <strong>{{ apexCreateResult.status }}</strong>, monthly ₹{{ Math.round(apexCreateResult.monthly_inr).toLocaleString('en-IN') }}.</p>
+            <p>
+              Account created — status <strong>{{ apexCreateResult.status }}</strong>,
+              <template v-if="apexCreateResult.chargeable === false">no charge (free trial).</template>
+              <template v-else>monthly {{ fmtINR(apexCreateResult.monthly_inr) }}.</template>
+            </p>
+            <p v-if="apexCreateResult.complimentary_minutes">
+              Granted {{ Number(apexCreateResult.complimentary_minutes).toLocaleString('en-IN') }} free minutes.
+            </p>
             <p v-if="apexCreateResult.payment_url">Payment link emailed. <a :href="apexCreateResult.payment_url" target="_blank" rel="noopener">Open link</a></p>
             <p v-if="apexCreateResult.generated_password">Generated admin password: <code>{{ apexCreateResult.generated_password }}</code> — share securely.</p>
           </div>
-          <button type="button" class="ghost-btn" style="margin-top:10px;" :disabled="apexCreateBusy" @click="submitApexAccount">
-            {{ apexCreateBusy ? 'Creating…' : 'Create account + send payment link' }}
+          <button type="button" class="ghost-btn apex-create-btn" :disabled="apexCreateBusy" @click="submitApexAccount">
+            <template v-if="apexCreateBusy">Creating…</template>
+            <template v-else-if="apexCreatePreview && !apexCreatePreview.chargeable">Create account + grant trial minutes</template>
+            <template v-else>Create account + send payment link</template>
           </button>
         </div>
 
@@ -1509,9 +1608,9 @@ watch(() => props.homeSignal, () => { closeAll(); loadOrganizations(); });
                   <td>{{ r.email }}</td>
                   <td>{{ r.phone || '—' }}</td>
                   <td>{{ r.requested_plan || '—' }}</td>
-                  <td><span class="plan-pill">{{ r.status }}</span></td>
+                  <td><span class="plan-pill" :class="`apex-status-${r.status}`">{{ r.status }}</span></td>
                   <td class="apex-req-actions">
-                    <button v-if="r.status !== 'converted'" type="button" class="ghost-btn sm" @click="useApexRequest(r)">Use</button>
+                    <button v-if="r.status !== 'converted'" type="button" class="ghost-btn sm" @click="useApexRequest(r)">Use details</button>
                     <button v-if="r.converted_org_id" type="button" class="ghost-btn sm" :disabled="apexActivateBusy === r.converted_org_id" @click="activateApexAccount(r.converted_org_id)">
                       {{ apexActivateBusy === r.converted_org_id ? '…' : 'Activate' }}
                     </button>
@@ -1520,7 +1619,9 @@ watch(() => props.homeSignal, () => { closeAll(); loadOrganizations(); });
               </tbody>
             </table>
           </div>
-          <div v-else-if="!apexAccountsLoading" class="empty-orgs"><p>No access requests yet.</p></div>
+          <div v-else-if="!apexAccountsLoading" class="empty-orgs">
+            <p>No access requests yet. Requests from the APEX site land here — or create an account above.</p>
+          </div>
           <div v-else class="empty-orgs"><p>Loading…</p></div>
         </div>
       </div>
@@ -2493,6 +2594,105 @@ watch(() => props.homeSignal, () => { closeAll(); loadOrganizations(); });
 .apex-result { margin-top: 0.7rem; padding: 0.7rem 0.9rem; border: 1px solid rgba(52, 211, 153, 0.4); background: rgba(52, 211, 153, 0.07); border-radius: 8px; font-size: 0.82rem; }
 .apex-result code { background: rgba(255,255,255,0.08); padding: 0.1rem 0.35rem; border-radius: 4px; }
 .apex-req-actions { display: flex; gap: 0.4rem; justify-content: flex-end; }
+
+/* ── APEX plan picker ────────────────────────────────────────────────────────
+   Cards, not a <select>: choosing a plan sets rate, concurrency, included
+   minutes and the monthly charge, so those numbers belong in the choice. */
+.apex-plan-rail {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(158px, 1fr));
+  gap: 0.6rem;
+  margin-top: 0.7rem;
+}
+.apex-plan-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.18rem;
+  padding: 0.7rem 0.8rem;
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+  color: var(--text-secondary);
+  background: var(--bg-input);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-box);
+  transition: border-color 0.15s ease, background 0.15s ease, transform 0.15s ease;
+}
+.apex-plan-card:hover { border-color: rgba(230, 38, 48, 0.4); transform: translateY(-1px); }
+.apex-plan-card:focus-visible { outline: 2px solid var(--border-focus); outline-offset: 2px; }
+.apex-plan-card.is-selected {
+  border-color: #E62630;
+  background: rgba(230, 38, 48, 0.08);
+  color: var(--text-primary);
+}
+.apex-plan-name {
+  font-size: 0.7rem;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+.apex-plan-card.is-selected .apex-plan-name { color: #E62630; }
+.apex-plan-price {
+  font-family: var(--font-data);
+  font-size: 1.02rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  line-height: 1.25;
+}
+.apex-plan-price small { font-size: 0.66rem; font-weight: 400; color: var(--text-muted); }
+.apex-plan-card.is-free .apex-plan-price { color: var(--success-color); font-size: 0.92rem; }
+.apex-plan-meta { font-size: 0.68rem; color: var(--text-muted); }
+
+.apex-group-label { display: block; margin-top: 1.15rem; }
+.apex-fld-hint { text-transform: none; letter-spacing: 0; font-size: 0.68rem; color: var(--text-muted); opacity: 1; }
+.apex-fld--gift .fx-input { border-color: rgba(52, 211, 153, 0.34); }
+/* Short numeric inputs: a minutes box stretched across the full row reads as a text
+   field. Cap the track so these stay the size of the value they hold. */
+.apex-create-grid--tight {
+  grid-template-columns: repeat(auto-fit, minmax(190px, 230px));
+  justify-content: start;
+}
+
+/* Consequence strip — creating an account charges money and moves wallet credit,
+   so state both before the button is pressed. */
+.apex-summary {
+  margin-top: 0.95rem;
+  max-width: 560px;      /* reads as a receipt, not a full-bleed banner */
+  border: 1px solid var(--border-color);
+  border-left: 2px solid #E62630;
+  border-radius: var(--radius-ctl);
+  background: var(--surface);
+  overflow: hidden;
+}
+.apex-summary-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.5rem 0.85rem;
+  font-size: 0.8rem;
+}
+.apex-summary-row + .apex-summary-row { border-top: 1px solid var(--border-color); }
+.apex-summary-key {
+  font-size: 0.65rem;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+.apex-summary-val { font-family: var(--font-data); color: var(--text-primary); text-align: right; }
+.apex-summary-val small { color: var(--text-muted); font-size: 0.7rem; }
+.apex-summary-val.is-zero { color: var(--success-color); }
+.apex-gift { color: var(--success-color); margin-left: 0.3rem; }
+
+.apex-create-btn { margin-top: 0.9rem; }
+.plan-pill.apex-status-converted { color: var(--success-color); border-color: rgba(52, 211, 153, 0.45); background: rgba(52, 211, 153, 0.08); }
+.plan-pill.apex-status-pending { color: var(--text-secondary); }
+
+@media (prefers-reduced-motion: reduce) {
+  .apex-plan-card { transition: none; }
+  .apex-plan-card:hover { transform: none; }
+}
 .calls-table { font-size: 0.74rem; }
 .call-kind {
   display: inline-block; font-size: 0.56rem; letter-spacing: 1px; text-transform: uppercase;

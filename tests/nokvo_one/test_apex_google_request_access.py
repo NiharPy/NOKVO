@@ -123,8 +123,13 @@ async def test_existing_pending_payment_account_still_reaches_payment(client, mo
 
 
 @pytest.mark.asyncio
-async def test_self_serve_signup_is_closed(client):
+async def test_self_serve_signup_is_closed(client, monkeypatch):
     """Same payment screen was reachable by POSTing the legacy signup endpoint directly."""
+    # /apex/signup is rate-limited to 5/hour, and the limiter's counter is process-wide, so
+    # repeated runs would return 429 and mask what this test is actually asserting.
+    from app.core.rate_limit import limiter
+
+    monkeypatch.setattr(limiter, "enabled", False)
     email = f"stranger-{uuid.uuid4().hex[:10]}@gmail.com"
     try:
         resp = await client.post(

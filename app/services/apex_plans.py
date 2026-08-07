@@ -215,8 +215,19 @@ def plan_public_view(plan: ApexPlan) -> dict:
         "support_tier": plan.support_tier,
         "activation_sla_hours": plan.activation_sla_hours,
         "chargeable": plan.chargeable,
+        # A non-chargeable plan (Free Trial) costs nothing — it must never advertise a
+        # monthly figure. Computing rate × included_minutes regardless of `chargeable` made
+        # Free Trial read as ₹9,000/mo in the UI while billing nothing.
         "monthly_inr": (
-            monthly_subscription_paise(plan.rate_per_minute, plan.included_minutes, plan.platform_fee_paise) / 100
-            if plan.rate_per_minute is not None else None
+            0.0
+            if not plan.chargeable
+            else (
+                monthly_subscription_paise(
+                    plan.rate_per_minute, plan.included_minutes, plan.platform_fee_paise
+                )
+                / 100
+                if plan.rate_per_minute is not None
+                else None
+            )
         ),
     }
