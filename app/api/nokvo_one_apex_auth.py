@@ -130,7 +130,7 @@ async def apex_request_access(
     return {"code": "request_received", "message": "Thanks — our team will reach out shortly."}
 
 
-# ─────────── Signup (DISABLED under ENABLE_APEX_PLANS — request-gated now) ───────────
+# ─────────── Signup (DISABLED unconditionally — APEX is request-gated) ───────────
 @router.post("/apex/signup")
 @limiter.limit("5/hour")
 async def apex_signup(
@@ -139,10 +139,10 @@ async def apex_signup(
     db: AsyncSession = Depends(deps.get_db),
 ):
     """Legacy self-serve APEX signup — CLOSED. APEX is request-gated (SuperAdmin creates
-    accounts); the frontend routes to the request form. The close is UNCONDITIONAL: gating
-    it on ``ENABLE_APEX_PLANS`` (off by default) left this endpoint minting
-    ``pending_payment`` orgs, so an unregistered caller could still reach the payment
-    screen by hitting the API directly."""
+    accounts); the frontend routes to the request form. The close is UNCONDITIONAL: it used
+    to be gated on ``ENABLE_APEX_PLANS``, which defaulted to OFF (and was unset in prod), so
+    the gate never ran and this endpoint kept minting ``pending_payment`` orgs — an
+    unregistered caller could reach the payment screen by hitting the API directly."""
     raise HTTPException(
         status_code=403,
         detail="Self-serve signup is closed. Please request access and our team will set you up.",
@@ -298,7 +298,8 @@ async def apex_google_login(
         # request. Google may only LOG IN an existing account — it must NEVER create one.
         # Creating one here handed an unregistered user a payment token and dropped them
         # straight onto the payment screen. Send them to the request-access form instead.
-        # Unconditional: this must not depend on ENABLE_APEX_PLANS, which is off by default.
+        # Unconditional: this must NOT depend on ENABLE_APEX_PLANS. That flag defaulted to
+        # OFF (and was unset in prod), which is precisely why the gate never ran.
         return {
             "code": "request_access_required",
             "email": email,

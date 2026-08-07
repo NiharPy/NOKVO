@@ -436,8 +436,11 @@ class Settings(BaseSettings):
     # NOKVO APEX plan-driven pricing (Core/Growth/Pinnacle/Enterprise/Free Trial) +
     # request-gated onboarding (no self-serve signup; SuperAdmin creates accounts). When
     # OFF the new create/activate/plan-pricing surfaces are gated and the legacy slab path
-    # is unaffected — deploy OFF in prod, run the migration, verify, then flip ON.
-    ENABLE_APEX_PLANS: bool = False
+    # is unaffected. Rollout completed 2026-08-07: `apex_plans_v1` applied to prod, then
+    # flipped ON here (prod also carries an explicit ENABLE_APEX_PLANS=true env var).
+    # NOTE: the self-serve signup + unknown-Google-login gates are now UNCONDITIONAL and no
+    # longer keyed to this flag — turning it OFF re-opens plan pricing only, not signup.
+    ENABLE_APEX_PLANS: bool = True
     # Optional CAPTCHA/verification gate on the public APEX request-access form. OFF by
     # default (rate-limit + per-email dedupe still apply); wire a provider before enabling.
     APEX_REQUEST_CAPTCHA: bool = False

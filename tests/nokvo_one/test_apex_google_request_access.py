@@ -3,7 +3,7 @@
 Regression cover for the bug where signing in with Google using an email that has no
 APEX account silently CREATED a ``pending_payment`` org and handed back a payment token,
 dropping a stranger straight onto the payment page. The request-access gate existed but
-was conditional on ``ENABLE_APEX_PLANS``, which is off by default (and unset in prod), so
+was conditional on ``ENABLE_APEX_PLANS``, which defaulted to OFF (and was unset in prod), so
 the gate never ran.
 
 Both entry points are covered — Google OAuth and the legacy self-serve signup endpoint —

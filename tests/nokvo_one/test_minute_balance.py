@@ -159,6 +159,12 @@ def test_apex_tester_call_never_deducts(monkeypatch):
                 def scalar_one_or_none(self):
                     return "nokvo_apex"  # the org-tier probe
 
+                def scalars(self):
+                    # Under ENABLE_APEX_PLANS the recorder loads the org to read its
+                    # stamped plan rate. No org here → the legacy/unstamped fallback,
+                    # which is the slab path this test measures via apex_call_cost.
+                    return self
+
                 def first(self):
                     return None  # insert: ON CONFLICT path → early return
 
