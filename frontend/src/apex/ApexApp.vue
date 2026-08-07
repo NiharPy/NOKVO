@@ -536,6 +536,14 @@ async function routeAuthResult(res) {
   } else if (res.kind === 'payment') {
     paymentToken.value = res.paymentToken;
     screen.value = 'payment';
+  } else if (res.kind === 'request_access') {
+    // Google verified the email but there's no APEX account for it. APEX is
+    // request-gated, so send them to the request form (prefilled) — never payment.
+    requestForm.value.email = res.email || requestForm.value.email;
+    if (res.fullName) requestForm.value.contact_name = res.fullName;
+    requestSubmitted.value = false;
+    errorMsg.value = res.message || 'No APEX account found for this Google email — request access below.';
+    screen.value = 'signup';
   } else if (res.kind === 'onboarding') {
     user.value = res.user || user.value;
     onboardingStep.value = res.step || 'business_details';

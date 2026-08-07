@@ -37,11 +37,22 @@ export function extractError(err, fallback) {
 // login/signup/google return one of:
 //   { kind: 'mfa', tempToken }
 //   { kind: 'payment', paymentToken }            — open the payment screen
+//   { kind: 'request_access', email, fullName }  — no APEX account; open the request form
 //   { kind: 'onboarding', user, step }           — signed in, finish onboarding
 //   { kind: 'session', user }                    — signed in, ready
 function _sessionResult(data) {
   if (data.mfa_pending) return { kind: 'mfa', tempToken: data.access_token };
   if (data.code === 'payment_required') return { kind: 'payment', paymentToken: data.payment_token };
+  // Google signed in fine, but there is no APEX account for that email. APEX is
+  // request-gated, so this must NOT fall through to the payment screen.
+  if (data.code === 'request_access_required') {
+    return {
+      kind: 'request_access',
+      email: data.email || '',
+      fullName: data.full_name || '',
+      message: data.message || '',
+    };
+  }
   if (data.code === 'pending_activation') return { kind: 'pending_activation', message: data.message };
   if (data.access_token) persistToken(data.access_token);
   if (data.code === 'onboarding_required') {

@@ -26,7 +26,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api import deps
 from app.api.nokvo_one_auth import (
-    _enforce_signup_attempt_quotas,
     _issue_full_session,
     _issue_login_temp_token,
     _issue_setup_token,
@@ -34,7 +33,7 @@ from app.api.nokvo_one_auth import (
 )
 from app.core import security
 from app.core.config import settings
-from app.core.email_policy import extract_email_domain, normalize_email
+from app.core.email_policy import normalize_email
 from app.core.rate_limit import limiter
 from app.core.totp_crypto import TOTPDecryptionError, decrypt_totp_secret
 from app.models.apex_access_request import (
@@ -139,72 +138,15 @@ async def apex_signup(
     payload: NokvoOneSignupRequest,
     db: AsyncSession = Depends(deps.get_db),
 ):
-    """Legacy self-serve APEX signup. Under ``ENABLE_APEX_PLANS`` this is CLOSED — APEX is
-    request-gated (SuperAdmin creates accounts); the frontend routes to the request form.
-    Kept (flag-off) only for the rollout window."""
-    if settings.ENABLE_APEX_PLANS:
-        raise HTTPException(
-            status_code=403,
-            detail="Self-serve signup is closed. Please request access and our team will set you up.",
-        )
-    email = normalize_email(payload.admin_email)
-    domain = extract_email_domain(email)
-    await _enforce_signup_attempt_quotas(db, email, domain)
-
-    if await _resolve_apex_user(db, email) is not None:
-        raise HTTPException(status_code=409, detail="An APEX account with this email already exists")
-
-    organization = Organization(
-        id=uuid.uuid4(),
-        name=(payload.org_name or "").strip() or domain.split(".")[0].capitalize(),
-        admin_email=email,
-        admin_name=payload.admin_name,
-        email_domain=domain,
-        region=payload.region or "southindia",
-        environment="staging",
-        call_type="outbound",
-        language=payload.language or "en-IN",
-        plan_type=None,
-        product_tier=APEX_TIER,
-        status="pending_payment",
-        calling_enabled=True,  # APEX is the outbound product
-        stores_pii=True,
-        record_calls=False,
-        create_resource_group=False,
-        twilio_auto_provision=False,
-        industry=None,
-        country_code=payload.country_code,
+    """Legacy self-serve APEX signup — CLOSED. APEX is request-gated (SuperAdmin creates
+    accounts); the frontend routes to the request form. The close is UNCONDITIONAL: gating
+    it on ``ENABLE_APEX_PLANS`` (off by default) left this endpoint minting
+    ``pending_payment`` orgs, so an unregistered caller could still reach the payment
+    screen by hitting the API directly."""
+    raise HTTPException(
+        status_code=403,
+        detail="Self-serve signup is closed. Please request access and our team will set you up.",
     )
-    db.add(organization)
-    await db.flush()
-
-    admin_user = OrganizationUser(
-        id=uuid.uuid4(),
-        organization_id=organization.id,
-        email=email,
-        full_name=payload.admin_name,
-        role="admin",
-        status="pending_payment",
-        auth_provider="password",
-        password_hash=security.get_password_hash(payload.password),
-        mfa_required=True,
-        email_verified=False,
-    )
-    db.add(admin_user)
-    await db.commit()
-    await db.refresh(organization)
-    await db.refresh(admin_user)
-
-    # APEX payment (₹6499/mo + minutes bundle) is COMPULSORY before onboarding —
-    # ALWAYS open the payment screen, regardless of the global PAYMENTS_ENABLED dev
-    # flag. The ONLY way to skip it is the SuperAdmin bypass-payment endpoint.
-    return {
-        "code": "payment_required",
-        "payment_token": _issue_setup_token(admin_user.id, organization.id, stage="payment", ttl_minutes=60),
-        "organization_id": str(organization.id),
-        "email": email,
-        "org_status": organization.status,
-    }
 
 
 # ─────────── Password login ───────────
@@ -349,66 +291,22 @@ async def apex_google_login(
         raise HTTPException(status_code=401, detail=_safe_detail(exc)) from exc
 
     email = normalize_email(identity["email"])
-    domain = extract_email_domain(email)
     resolved = await _resolve_apex_user(db, email)
 
     if resolved is None:
-        # New APEX org via Google. CLOSED under ENABLE_APEX_PLANS — APEX is request-gated,
-        # so Google can only LOG IN an existing account, never create one.
-        if settings.ENABLE_APEX_PLANS:
-            raise HTTPException(
-                status_code=403,
-                detail="No APEX account found for this Google email. Please request access to get set up.",
-            )
-        await _enforce_signup_attempt_quotas(db, email, domain)
-        organization = Organization(
-            id=uuid.uuid4(),
-            name=identity.get("full_name") or domain.split(".")[0].capitalize(),
-            admin_email=email,
-            admin_name=identity.get("full_name"),
-            email_domain=domain,
-            region="southindia",
-            environment="staging",
-            call_type="outbound",
-            language="en-IN",
-            plan_type=None,
-            product_tier=APEX_TIER,
-            status="pending_payment",
-            calling_enabled=True,
-            stores_pii=True,
-            record_calls=False,
-            create_resource_group=False,
-            twilio_auto_provision=False,
-            industry=None,
-            country_code="IN",
-        )
-        db.add(organization)
-        await db.flush()
-        user = OrganizationUser(
-            id=uuid.uuid4(),
-            organization_id=organization.id,
-            email=email,
-            full_name=identity.get("full_name"),
-            role="admin",
-            status="active",
-            auth_provider="google",
-            mfa_required=False,
-            email_verified=True,
-        )
-        db.add(user)
-        await db.commit()
-        await db.refresh(organization)
-        await db.refresh(user)
-
-        # APEX payment is COMPULSORY — always the payment screen (only the
-        # SuperAdmin bypass can skip it).
+        # APEX is request-gated: accounts are created by the SuperAdmin after an access
+        # request. Google may only LOG IN an existing account — it must NEVER create one.
+        # Creating one here handed an unregistered user a payment token and dropped them
+        # straight onto the payment screen. Send them to the request-access form instead.
+        # Unconditional: this must not depend on ENABLE_APEX_PLANS, which is off by default.
         return {
-            "code": "payment_required",
-            "created_via_google": True,
-            "payment_token": _issue_setup_token(user.id, organization.id, stage="payment", ttl_minutes=60),
-            "organization_id": str(organization.id),
+            "code": "request_access_required",
             "email": email,
-            "org_status": organization.status,
+            "full_name": identity.get("full_name"),
+            "message": (
+                "No APEX account found for this Google email. "
+                "Please request access and our team will set you up."
+            ),
         }
 
     # Existing APEX account → sign in (or back to payment if still pending).
