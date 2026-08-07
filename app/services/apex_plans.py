@@ -86,6 +86,9 @@ DEFAULT_PLAN_CODE = "core"
 # within these bounds (and the rate must at least cover the per-call connect fee).
 ENTERPRISE_RATE_CEILING = Decimal("5")
 ENTERPRISE_MIN_CONCURRENCY = 5
+# Free Trial concurrency is operator-adjustable (some pilots need parallel lines), but it
+# is capped — a trial burns real telephony capacity and nobody has paid for it yet.
+TRIAL_MAX_CONCURRENCY = 10
 
 
 def resolve_plan(code: str | None) -> ApexPlan:
@@ -128,13 +131,18 @@ def stamp_org_from_plan(
     *,
     enterprise_rate=None,
     enterprise_concurrency=None,
+    trial_concurrency=None,
 ) -> ApexPlan:
     """Resolve ``code`` and write the concrete plan config onto ``org``'s columns.
 
     For ``enterprise`` the caller MUST pass ``enterprise_rate`` (< ₹5, ≥ the connect fee)
     and ``enterprise_concurrency`` (≥ 5) — they are negotiated per deal and there is no
-    catalog default. Every stamped row therefore has a non-null rate/concurrency. Returns
-    the resolved plan (with enterprise overrides applied) for the caller's convenience."""
+    catalog default. Every stamped row therefore has a non-null rate/concurrency.
+
+    ``trial_concurrency`` optionally overrides Free Trial's concurrency (1..
+    ``TRIAL_MAX_CONCURRENCY``); omit it to keep the catalog default. It is ignored for
+    every other plan, whose concurrency is fixed by what the customer pays for. Returns
+    the resolved plan (with overrides applied) for the caller's convenience."""
     code = (code or "").strip().lower()
     if code not in APEX_PLANS:
         raise ValueError(f"Unknown APEX plan: {code!r}")
@@ -151,6 +159,12 @@ def stamp_org_from_plan(
             raise ValueError(f"Enterprise rate must be > 0 and < ₹{ENTERPRISE_RATE_CEILING}")
         if concurrency < ENTERPRISE_MIN_CONCURRENCY:
             raise ValueError(f"Enterprise concurrency must be ≥ {ENTERPRISE_MIN_CONCURRENCY}")
+    elif code == "free_trial" and trial_concurrency is not None:
+        concurrency = int(trial_concurrency)
+        if not (1 <= concurrency <= TRIAL_MAX_CONCURRENCY):
+            raise ValueError(
+                f"Free Trial concurrency must be between 1 and {TRIAL_MAX_CONCURRENCY}"
+            )
 
     if rate is None or rate < APEX_CONNECT_FEE:
         raise ValueError(f"APEX rate must be ≥ the connect fee (₹{APEX_CONNECT_FEE})")

@@ -117,6 +117,7 @@ async def create_apex_account(
     admin_password: str | None = None,
     enterprise_rate=None,
     enterprise_concurrency=None,
+    trial_concurrency=None,
     complimentary_minutes: int = 0,
     request_id: uuid.UUID | None = None,
     region: str = "southindia",
@@ -161,7 +162,10 @@ async def create_apex_account(
     # requires the per-deal overrides).
     try:
         resolved = stamp_org_from_plan(
-            org, plan_code, enterprise_rate=enterprise_rate, enterprise_concurrency=enterprise_concurrency
+            org, plan_code,
+            enterprise_rate=enterprise_rate,
+            enterprise_concurrency=enterprise_concurrency,
+            trial_concurrency=trial_concurrency,
         )
     except ValueError as exc:
         raise ApexAccountError(str(exc)) from exc
@@ -281,6 +285,7 @@ async def create_apex_account(
         "status": org.status,
         "monthly_inr": monthly_paise / 100 if monthly_paise else 0,
         "chargeable": plan.chargeable,
+        "concurrency": resolved.concurrency,
         "included_minutes": resolved.included_minutes,
         "complimentary_minutes": complimentary_minutes,
         "payment_url": payment_url,

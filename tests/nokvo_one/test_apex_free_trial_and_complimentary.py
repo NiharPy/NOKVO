@@ -135,6 +135,36 @@ async def test_complimentary_grant_is_separable_from_the_trial_grant():
         await _cleanup(org_id)
 
 
+def test_free_trial_concurrency_is_operator_adjustable():
+    """Free Trial concurrency is settable like Enterprise's, and bounded."""
+    from app.services.apex_plans import TRIAL_MAX_CONCURRENCY
+
+    class _Org:
+        pass
+
+    default = _Org()
+    stamp_org_from_plan(default, "free_trial")
+    assert default.apex_concurrency == 1  # catalog default when not overridden
+
+    bumped = _Org()
+    stamp_org_from_plan(bumped, "free_trial", trial_concurrency=4)
+    assert bumped.apex_concurrency == 4
+
+    for bad in (0, TRIAL_MAX_CONCURRENCY + 1):
+        with pytest.raises(ValueError):
+            stamp_org_from_plan(_Org(), "free_trial", trial_concurrency=bad)
+
+
+def test_trial_override_does_not_leak_into_paid_plans():
+    """A paid plan's concurrency is what the customer bought — not operator-settable here."""
+    class _Org:
+        pass
+
+    org = _Org()
+    stamp_org_from_plan(org, "core", trial_concurrency=9)
+    assert org.apex_concurrency == APEX_PLANS["core"].concurrency == 1
+
+
 def test_create_request_caps_complimentary_minutes():
     """A slipped digit must not gift a fortune; negatives are rejected outright."""
     import pydantic

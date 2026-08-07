@@ -52,6 +52,7 @@ from app.models.superadmin_todo import SuperAdminTodo
 from app.models.subscription import Subscription
 from app.models.tenant_resources import TenantResources
 from app.models.user import SuperAdminUser
+from app.services.apex_plans import TRIAL_MAX_CONCURRENCY
 from app.services.email_service import EmailService
 from app.services.langsmith_diagnostics import LangSmithDiagnostics
 from app.services.llm_pool import LLMPool
@@ -398,6 +399,8 @@ class ApexCreateAccountRequest(BaseModel):
     # Required only for the enterprise plan (negotiated per deal).
     enterprise_rate: float | None = None
     enterprise_concurrency: int | None = None
+    # Optional Free Trial concurrency override; omit to keep the plan default of 1.
+    trial_concurrency: int | None = Field(default=None, ge=1, le=TRIAL_MAX_CONCURRENCY)
     # Free minutes granted on top of the plan's own credit. Never billed. Capped so a
     # slipped digit can't gift a fortune (the wallet is real money at the org's rate).
     complimentary_minutes: int = Field(default=0, ge=0, le=100_000)
@@ -462,6 +465,7 @@ async def create_apex_account_endpoint(
             admin_password=payload.admin_password,
             enterprise_rate=payload.enterprise_rate,
             enterprise_concurrency=payload.enterprise_concurrency,
+            trial_concurrency=payload.trial_concurrency,
             complimentary_minutes=payload.complimentary_minutes,
             request_id=payload.request_id,
         )

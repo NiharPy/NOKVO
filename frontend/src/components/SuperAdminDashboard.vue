@@ -127,7 +127,7 @@ const apexPlanCatalog = ref([]);
 const apexCreateForm = ref({
   request_id: null, plan_code: 'core', company_name: '', admin_name: '',
   admin_email: '', phone: '', admin_password: '', enterprise_rate: null, enterprise_concurrency: null,
-  complimentary_minutes: 0,
+  trial_concurrency: null, complimentary_minutes: 0,
 });
 const apexCreateBusy = ref(false);
 const apexCreateResult = ref(null);
@@ -165,6 +165,20 @@ const apexCreatePreview = computed(() => {
 });
 
 const fmtINR = (n) => `₹${Math.round(Number(n) || 0).toLocaleString('en-IN')}`;
+
+// Concurrency a plan card should show. Free Trial and Enterprise are operator-adjustable,
+// so the card must reflect what's actually being set rather than the catalog default —
+// otherwise the card says "1 line" while the field below it says 3.
+const apexPlanConcurrency = (p) => {
+  const f = apexCreateForm.value;
+  if (p.code === 'free_trial' && f.plan_code === 'free_trial' && f.trial_concurrency) {
+    return Number(f.trial_concurrency);
+  }
+  if (p.code === 'enterprise') {
+    return f.plan_code === 'enterprise' && f.enterprise_concurrency ? Number(f.enterprise_concurrency) : null;
+  }
+  return p.concurrency ?? null;
+};
 
 const view = computed(() => {
   if (apexAccountsView.value) return 'apex-accounts';
@@ -989,7 +1003,8 @@ const useApexRequest = (r) => {
     request_id: r.id, plan_code: r.requested_plan || 'core',
     company_name: r.company_name || '', admin_name: r.contact_name || '',
     admin_email: r.email || '', phone: r.phone || '', admin_password: '',
-    enterprise_rate: null, enterprise_concurrency: null, complimentary_minutes: 0,
+    enterprise_rate: null, enterprise_concurrency: null, trial_concurrency: null,
+    complimentary_minutes: 0,
   };
 };
 const submitApexAccount = async () => {
@@ -1009,6 +1024,7 @@ const submitApexAccount = async () => {
         admin_password: f.admin_password || null, request_id: f.request_id,
         enterprise_rate: f.plan_code === 'enterprise' ? Number(f.enterprise_rate) : null,
         enterprise_concurrency: f.plan_code === 'enterprise' ? Number(f.enterprise_concurrency) : null,
+        trial_concurrency: f.plan_code === 'free_trial' && f.trial_concurrency ? Number(f.trial_concurrency) : null,
         complimentary_minutes: Math.max(0, Math.floor(Number(f.complimentary_minutes) || 0)),
       }),
     });
@@ -1517,7 +1533,7 @@ watch(() => props.homeSignal, () => { closeAll(); loadOrganizations(); });
                 <template v-if="p.rate_per_minute != null">₹{{ p.rate_per_minute }}/min</template>
                 <template v-else>Rate per deal</template>
                 ·
-                <template v-if="p.concurrency != null">{{ p.concurrency }} line{{ p.concurrency === 1 ? '' : 's' }}</template>
+                <template v-if="apexPlanConcurrency(p) != null">{{ apexPlanConcurrency(p) }} line{{ apexPlanConcurrency(p) === 1 ? '' : 's' }}</template>
                 <template v-else>Custom lines</template>
               </span>
               <span class="apex-plan-meta">{{ Number(p.included_minutes).toLocaleString('en-IN') }} min included</span>
@@ -1542,6 +1558,11 @@ watch(() => props.homeSignal, () => { closeAll(); loadOrganizations(); });
                 Worth {{ apexCreatePreview.rateKnown ? fmtINR(apexCreatePreview.freeCredit) : '—' }} of Call Credits. Never billed.
               </small>
               <small v-else class="apex-fld-hint">Leave at 0 to grant nothing extra.</small>
+            </label>
+            <label v-if="apexCreateForm.plan_code === 'free_trial'" class="apex-fld">
+              <span>Concurrency <small>(1–10)</small></span>
+              <input v-model="apexCreateForm.trial_concurrency" type="number" min="1" max="10" class="fx-input apex-input" placeholder="1" />
+              <small class="apex-fld-hint">Parallel lines for the trial. Blank = 1.</small>
             </label>
             <template v-if="apexCreateForm.plan_code === 'enterprise'">
               <label class="apex-fld"><span>Rate ₹/min (&lt; 5)</span><input v-model="apexCreateForm.enterprise_rate" type="number" step="0.1" min="1.5" max="4.99" class="fx-input apex-input" /></label>
