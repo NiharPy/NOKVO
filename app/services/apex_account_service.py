@@ -294,6 +294,248 @@ async def create_apex_account(
     }
 
 
+def plan_snapshot(org: Organization) -> dict:
+    """The org's stamped plan config, for the before/after of a plan change (and the
+    SuperAdmin console's plan panel)."""
+    return {
+        "plan_code": org.apex_plan_code,
+        "rate_per_minute": float(org.apex_rate_per_minute) if org.apex_rate_per_minute is not None else None,
+        "concurrency": int(org.apex_concurrency) if org.apex_concurrency is not None else None,
+        "included_minutes": int(org.apex_included_minutes) if org.apex_included_minutes is not None else None,
+        "platform_fee_inr": (int(org.apex_platform_fee_paise) / 100) if org.apex_platform_fee_paise is not None else None,
+        "billed_bonus_pct": float(org.apex_billed_bonus_pct) if org.apex_billed_bonus_pct is not None else None,
+        "topup_bonus_pct": float(org.apex_topup_bonus_pct) if org.apex_topup_bonus_pct is not None else None,
+        "support_tier": org.apex_support_tier,
+    }
+
+
+# A subscription in one of these states is still billable at Razorpay — it's the one a
+# plan change has to replace.
+_LIVE_SUB_STATUSES = {"created", "authenticated", "active", "pending", "halted"}
+
+
+async def _live_apex_subscription(db: AsyncSession, org_id: uuid.UUID) -> Subscription | None:
+    """The org's current billable APEX subscription (newest live one), if any."""
+    rows = (
+        await db.execute(
+            select(Subscription)
+            .where(Subscription.organization_id == org_id, Subscription.plan == "apex")
+            .order_by(Subscription.created_at.desc())
+        )
+    ).scalars().all()
+    for sub in rows:
+        if (sub.status or "") in _LIVE_SUB_STATUSES:
+            return sub
+    return None
+
+
+async def change_apex_plan(
+    db: AsyncSession,
+    organization_id: uuid.UUID,
+    *,
+    plan_code: str,
+    enterprise_rate=None,
+    enterprise_concurrency=None,
+    trial_concurrency=None,
+    rebill: bool = True,
+) -> dict:
+    """Move an existing APEX account onto ``plan_code`` (upgrade, downgrade, or a re-stamp
+    of the same plan to repair drift).
+
+    Re-stamps EVERY plan column from the catalog — the same write path as creation — so the
+    new rate, concurrency, included minutes, platform fee, bonuses and support tier all take
+    effect together. Rate and concurrency apply to the very next call; the included minutes
+    are granted by the paid invoice of the new subscription, exactly as they are at creation.
+
+    THE WALLET IS NEVER TOUCHED. Existing Call Credits were bought at the old rate and stay
+    exactly as they are (they simply buy more or fewer minutes at the new rate); a plan
+    change neither grants nor claws back credit. Use the SuperAdmin grant action for goodwill.
+
+    ``rebill`` (default True) handles the money side when the monthly amount changes: the
+    live Razorpay subscription is replaced — a new one is opened at the new amount and its
+    link emailed, then the old one is cancelled (at cycle end if it was paid, so the customer
+    keeps the month they already bought). Pass ``rebill=False`` to re-stamp the plan and
+    leave Razorpay untouched (comped accounts, or when billing is settled out of band).
+
+    The new subscription is created BEFORE anything is written, so a Razorpay failure leaves
+    the account exactly as it was. If cancelling the OLD subscription then fails, the change
+    still lands and ``old_subscription_cancel_error`` is returned — the operator must cancel
+    it in the Razorpay dashboard or the customer is billed twice.
+    """
+    plan_code = (plan_code or "").strip().lower()
+    if plan_code not in VALID_PLAN_CODES:
+        raise ApexAccountError(f"Unknown plan '{plan_code}'")
+
+    org = (
+        await db.execute(
+            select(Organization).where(Organization.id == organization_id).with_for_update()
+        )
+    ).scalars().first()
+    if org is None:
+        raise ApexAccountError("Organization not found")
+    if (org.product_tier or "") != APEX_TIER:
+        raise ApexAccountError("Not an APEX organization")
+
+    before = plan_snapshot(org)
+
+    # Validate + compute the target config WITHOUT mutating the org yet: stamp onto a
+    # detached probe so a bad enterprise/trial override raises before anything changes.
+    class _Probe:
+        pass
+
+    try:
+        resolved = stamp_org_from_plan(
+            _Probe(), plan_code,
+            enterprise_rate=enterprise_rate,
+            enterprise_concurrency=enterprise_concurrency,
+            trial_concurrency=trial_concurrency,
+        )
+    except ValueError as exc:
+        raise ApexAccountError(str(exc)) from exc
+
+    after = {
+        "plan_code": resolved.code,
+        "rate_per_minute": float(resolved.rate_per_minute),
+        "concurrency": int(resolved.concurrency),
+        "included_minutes": int(resolved.included_minutes),
+        "platform_fee_inr": resolved.platform_fee_paise / 100,
+        "billed_bonus_pct": float(resolved.billed_bonus_pct),
+        "topup_bonus_pct": float(resolved.topup_bonus_pct),
+        "support_tier": resolved.support_tier,
+    }
+    changed = before != after
+
+    monthly_paise = (
+        monthly_subscription_paise(
+            resolved.rate_per_minute, resolved.included_minutes, resolved.platform_fee_paise
+        )
+        if resolved.chargeable
+        else 0
+    )
+
+    old_sub = await _live_apex_subscription(db, org.id)
+    old_monthly_paise = int(old_sub.amount_paise or 0) if old_sub is not None else 0
+    # Replace the mandate when the recurring amount actually moves, or when the account
+    # leaves/enters a chargeable plan. Re-stamping an identical plan bills nothing.
+    needs_rebill = rebill and (monthly_paise != old_monthly_paise)
+
+    payment_url: str | None = None
+    new_subscription_id: str | None = None
+    new_plan_id: str | None = None
+    cancel_error: str | None = None
+    billing_note: str | None = None
+
+    if needs_rebill and monthly_paise > 0:
+        if not _razorpay_configured():
+            billing_note = "Razorpay is not configured — the plan was re-stamped but no new subscription was opened."
+        else:
+            # Create FIRST: a failure here must leave the account untouched.
+            try:
+                new_plan_id = await RazorpayService.ensure_monthly_plan(
+                    f"NOKVO APEX — {resolved.label}", monthly_paise
+                )
+                sub = await RazorpayService.create_subscription(
+                    new_plan_id,
+                    notes={
+                        "organization_id": str(org.id),
+                        "apex_plan": plan_code,
+                        "kind": "apex_monthly",
+                        "plan_change_from": before.get("plan_code") or "",
+                    },
+                )
+            except Exception as exc:
+                raise ApexAccountError(f"Could not open the new subscription: {exc}") from exc
+            new_subscription_id = str(sub.get("id") or "")
+            if not new_subscription_id:
+                raise ApexAccountError("Razorpay returned no subscription id")
+            payment_url = sub.get("short_url")
+    elif needs_rebill and monthly_paise == 0:
+        billing_note = "Free Trial is not charged — the existing subscription was cancelled."
+
+    # ── Everything below is the committed change ──
+    stamp_org_from_plan(
+        org, plan_code,
+        enterprise_rate=enterprise_rate,
+        enterprise_concurrency=enterprise_concurrency,
+        trial_concurrency=trial_concurrency,
+    )
+    db.add(org)
+
+    if needs_rebill and old_sub is not None:
+        # Cancel at cycle end for a PAID subscription (the customer keeps the month they
+        # bought); immediately for one that was never charged.
+        at_cycle_end = (old_sub.status or "") not in {"created", "pending"}
+        if _razorpay_configured() and old_sub.razorpay_subscription_id:
+            try:
+                await RazorpayService.cancel_subscription(
+                    old_sub.razorpay_subscription_id, cancel_at_cycle_end=at_cycle_end
+                )
+            except Exception as exc:
+                cancel_error = str(exc)
+                logger.error(
+                    "APEX plan change: could not cancel old subscription %s for org=%s — "
+                    "CANCEL IT MANUALLY or the customer is double-billed: %s",
+                    old_sub.razorpay_subscription_id, org.id, exc,
+                )
+            # Mirror the remote state locally ONLY when the remote cancel actually ran —
+            # a row marked cancelled while the mandate is still live at Razorpay would hide
+            # a double-billing account from the next operator.
+            if cancel_error is None:
+                old_sub.cancel_at_period_end = at_cycle_end
+                if not at_cycle_end:
+                    old_sub.status = "cancelled"
+                db.add(old_sub)
+
+    if new_subscription_id:
+        db.add(
+            Subscription(
+                id=uuid.uuid4(),
+                organization_id=org.id,
+                plan="apex",
+                amount_paise=monthly_paise,
+                minutes=resolved.included_minutes,
+                razorpay_plan_id=new_plan_id,
+                razorpay_subscription_id=new_subscription_id,
+                status="created",
+            )
+        )
+
+    await db.commit()
+
+    # Notify the customer (best-effort — a mail failure must not undo a committed change).
+    # Also mail when only the BILLING moved (``changed`` is False but a new subscription was
+    # opened, e.g. putting a comped account on a real mandate) — that link is the whole point.
+    if changed or payment_url:
+        try:
+            await EmailService.send_apex_plan_change_email(
+                org.admin_email, org.admin_name, org.name,
+                resolve_plan(before.get("plan_code")).label if before.get("plan_code") else "—",
+                resolved.label, monthly_paise, payment_url,
+            )
+        except Exception:
+            logger.warning("APEX plan change: notification email failed for org=%s", org.id, exc_info=True)
+
+    logger.info(
+        "APEX plan change org=%s %s → %s rebill=%s new_sub=%s",
+        org.id, before.get("plan_code"), plan_code, needs_rebill, new_subscription_id,
+    )
+    return {
+        "organization_id": str(org.id),
+        "changed": changed,
+        "before": before,
+        "after": after,
+        "status": org.status,
+        "monthly_inr": monthly_paise / 100,
+        "previous_monthly_inr": old_monthly_paise / 100,
+        "rebilled": bool(new_subscription_id),
+        "payment_url": payment_url,
+        "razorpay_subscription_id": new_subscription_id,
+        "old_subscription_cancel_error": cancel_error,
+        "billing_note": billing_note,
+        "wallet_unchanged": True,
+    }
+
+
 async def activate_apex_account(db: AsyncSession, organization_id: uuid.UUID) -> dict:
     """Manually activate a paid APEX account. Locks the org, asserts it's an APEX org in
     ``pending_activation`` with a funded wallet, then flips it to ``active`` and provisions

@@ -439,6 +439,55 @@ class EmailService:
         await cls.send(to_email, subject, text, html_body=html_body, inline_images=cls._brand_inline_images())
 
     @classmethod
+    async def send_apex_plan_change_email(
+        cls,
+        to_email: str,
+        admin_name: str | None,
+        org_name: str,
+        old_plan_label: str,
+        new_plan_label: str,
+        monthly_paise: int,
+        payment_url: str | None,
+    ) -> None:
+        """APEX plan change — tell the customer what moved and, when the new plan needs a
+        fresh mandate, link the new subscription. ``payment_url=None`` means the operator
+        left billing alone (comped / handled manually), so this is a notice only."""
+        greeting = admin_name.strip() if admin_name and admin_name.strip() else "there"
+        monthly_inr = f"₹{monthly_paise / 100:,.2f}"
+        subject = f"Your NOKVO APEX plan is now {new_plan_label}"
+        move = f"{old_plan_label} → {new_plan_label}"
+        if payment_url:
+            text = (
+                f"Hi {greeting},\n\n"
+                f"{org_name} has moved from {move} on NOKVO APEX.\n"
+                f"Your new monthly subscription is {monthly_inr}/month — set it up here:\n\n"
+                f"{payment_url}\n\n"
+                f"Your previous subscription has been cancelled; service continues uninterrupted.\n"
+            )
+            html_body = cls._branded_email_html(
+                preheader=f"{org_name} is now on the {new_plan_label} plan.",
+                eyebrow="Plan updated",
+                heading=f"{new_plan_label} — {monthly_inr}/month",
+                intro_html=(
+                    f"<strong style=\"color:{_INK};\">{html.escape(org_name)}</strong> has moved from "
+                    f"{html.escape(move)}. Set up the new monthly subscription below — your previous "
+                    f"subscription has been cancelled and your service continues uninterrupted."
+                ),
+                cta_label="Set up subscription",
+                cta_url=payment_url,
+                note_html="Questions? Just reply to this email.",
+            )
+            await cls.send(to_email, subject, text, html_body=html_body, inline_images=cls._brand_inline_images())
+            return
+
+        text = (
+            f"Hi {greeting},\n\n"
+            f"{org_name} has moved from {move} on NOKVO APEX.\n"
+            f"Your new plan limits and per-minute rate are live now. No action is needed.\n"
+        )
+        await cls.send(to_email, subject, text)
+
+    @classmethod
     async def send_usage_invoice_email(
         cls,
         to_email: str,

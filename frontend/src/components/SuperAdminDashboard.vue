@@ -2,7 +2,7 @@
 import { computed, onMounted, ref, watch } from 'vue';
 import { Shield, LogOut, ArrowLeft, RefreshCw, ArrowUpRight, ArrowDownRight } from 'lucide-vue-next';
 
-import { SUPERADMIN_API_BASE, NOKVO_ONE_API_BASE } from '../config.js';
+import { SUPERADMIN_API_BASE } from '../config.js';
 
 const props = defineProps({
   theme: { type: String, required: true },
@@ -983,13 +983,12 @@ const loadApexAccounts = async () => {
   apexAccountsLoading.value = true;
   errorMsg.value = '';
   try {
-    const [reqRes, planRes] = await Promise.all([
+    const [reqRes] = await Promise.all([
       fetch(`${SUPERADMIN_API_BASE}/tenants/apex/access-requests`, { headers: authHeaders() }),
-      fetch(`${NOKVO_ONE_API_BASE}/apex/plans`),
+      loadApexPlanCatalog(),
     ]);
     if (reqRes.ok) apexRequests.value = await reqRes.json();
     else if (reqRes.status === 404) errorMsg.value = 'APEX plans are not enabled (ENABLE_APEX_PLANS is off).';
-    if (planRes.ok) apexPlanCatalog.value = (await planRes.json()).plans || [];
   } catch {
     errorMsg.value = 'Could not load APEX accounts.';
   } finally {
@@ -1038,6 +1037,104 @@ const submitApexAccount = async () => {
     apexCreateBusy.value = false;
   }
 };
+// ── Change an APEX org's plan (upgrade / downgrade / re-stamp) ──
+// Re-prices a LIVE account: the new rate + concurrency apply to the next call and, unless
+// the operator opts out, the Razorpay mandate is replaced at the new monthly amount. The
+// wallet is never touched, so the modal says so out loud.
+const apexPlanTarget = ref(null);   // { org_id, name, current, plan_code, …overrides }
+const apexPlanBusy = ref(false);
+const apexPlanResult = ref(null);
+const apexPlanError = ref('');
+
+const loadApexPlanCatalog = async () => {
+  if (apexPlanCatalog.value.length) return;
+  try {
+    const res = await fetch(`${SUPERADMIN_API_BASE}/tenants/apex/plans`, { headers: authHeaders() });
+    if (res.ok) apexPlanCatalog.value = (await res.json()).plans || [];
+  } catch { /* the picker just stays empty; the modal says so */ }
+};
+
+function openApexPlanChange(d) {
+  apexPlanResult.value = null; apexPlanError.value = '';
+  const cur = d.apex_plan || {};
+  apexPlanTarget.value = {
+    org_id: d.organization_id,
+    name: d.organization_name,
+    current: cur,
+    plan_code: cur.plan_code || 'core',
+    enterprise_rate: cur.plan_code === 'enterprise' ? cur.rate_per_minute : null,
+    enterprise_concurrency: cur.plan_code === 'enterprise' ? cur.concurrency : null,
+    trial_concurrency: cur.plan_code === 'free_trial' ? cur.concurrency : null,
+    rebill: true,
+    ack: false,
+  };
+  loadApexPlanCatalog();
+}
+function cancelApexPlanChange() { apexPlanTarget.value = null; }
+
+const apexPlanTargetPlan = computed(
+  () => apexPlanCatalog.value.find((p) => p.code === (apexPlanTarget.value || {}).plan_code) || null,
+);
+
+// The before/after the operator is committing to: monthly charge, rate and lines.
+const apexPlanPreview = computed(() => {
+  const t = apexPlanTarget.value;
+  const plan = apexPlanTargetPlan.value;
+  if (!t || !plan) return null;
+  const isEnterprise = plan.code === 'enterprise';
+  const rate = isEnterprise ? Number(t.enterprise_rate) || 0 : Number(plan.rate_per_minute) || 0;
+  const lines = isEnterprise
+    ? Number(t.enterprise_concurrency) || 0
+    : (plan.code === 'free_trial' && t.trial_concurrency ? Number(t.trial_concurrency) : Number(plan.concurrency) || 0);
+  const monthly = !plan.chargeable
+    ? 0
+    : (isEnterprise ? (Number(plan.platform_fee_inr) || 0) + rate * (Number(plan.included_minutes) || 0) : Number(plan.monthly_inr) || 0);
+  const currentMonthly = Number((t.current || {}).monthly_inr) || 0;
+  return {
+    samePlan: plan.code === (t.current || {}).plan_code,
+    chargeable: !!plan.chargeable,
+    rate, lines, monthly, currentMonthly,
+    includedMinutes: Number(plan.included_minutes) || 0,
+    // A re-bill only happens when the recurring amount actually moves.
+    rebills: !!t.rebill && monthly !== currentMonthly,
+    delta: monthly - currentMonthly,
+    priced: !isEnterprise || (rate > 0 && lines > 0),
+  };
+});
+
+const submitApexPlanChange = async () => {
+  const t = apexPlanTarget.value;
+  const pv = apexPlanPreview.value;
+  if (!t || !pv || !t.ack) return;
+  if (t.plan_code === 'enterprise' && !(Number(t.enterprise_rate) > 0 && Number(t.enterprise_concurrency) >= 5)) {
+    apexPlanError.value = 'Enterprise needs a rate (< ₹5) and concurrency (≥ 5).'; return;
+  }
+  apexPlanBusy.value = true; apexPlanError.value = '';
+  try {
+    const res = await fetch(`${SUPERADMIN_API_BASE}/tenants/apex/accounts/${t.org_id}/plan`, {
+      method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({
+        plan_code: t.plan_code,
+        enterprise_rate: t.plan_code === 'enterprise' ? Number(t.enterprise_rate) : null,
+        enterprise_concurrency: t.plan_code === 'enterprise' ? Number(t.enterprise_concurrency) : null,
+        trial_concurrency: t.plan_code === 'free_trial' && t.trial_concurrency ? Number(t.trial_concurrency) : null,
+        rebill: !!t.rebill,
+        acknowledge: true,
+      }),
+    });
+    if (res.status === 401) { emit('logout'); return; }
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) { apexPlanError.value = data.detail || `Plan change failed (${res.status}).`; return; }
+    apexPlanResult.value = data;
+    // Re-read the org so the drawer shows the newly stamped plan.
+    if (detail.value && detail.value.organization_id === t.org_id) await openDetail(t.org_id);
+  } catch {
+    apexPlanError.value = 'Network error while changing the plan.';
+  } finally {
+    apexPlanBusy.value = false;
+  }
+};
+
 const activateApexAccount = async (orgId) => {
   if (!orgId) return;
   apexActivateBusy.value = orgId;
@@ -1370,6 +1467,33 @@ watch(() => props.homeSignal, () => { closeAll(); loadOrganizations(); });
               <span class="card-label">MARGIN</span>
               <strong :class="detail.totals.margin_inr < 0 ? 'neg' : 'pos'">{{ inr(detail.totals.margin_inr) }}</strong>
               <span class="card-foot">revenue − COGS</span>
+            </div>
+          </div>
+
+          <!-- APEX plan: what this account is actually billed and capped at (the
+               STAMPED columns, not the catalog) + the upgrade/downgrade action. -->
+          <div v-if="detail.is_apex && detail.apex_plan" class="telephony-panel">
+            <div class="telephony-info">
+              <span class="stage-eyebrow">APEX PLAN</span>
+              <strong>
+                {{ detail.apex_plan.plan_label || detail.apex_plan.plan_code || 'Not stamped' }}
+                <template v-if="detail.apex_plan.monthly_inr"> · {{ inr(detail.apex_plan.monthly_inr) }}/mo</template>
+              </strong>
+              <span class="card-foot">
+                <template v-if="detail.apex_plan.rate_per_minute != null">₹{{ detail.apex_plan.rate_per_minute }}/min</template>
+                <template v-else>no rate stamped</template>
+                · {{ detail.apex_plan.concurrency ?? '—' }} line{{ detail.apex_plan.concurrency === 1 ? '' : 's' }}
+                · {{ Number(detail.apex_plan.included_minutes || 0).toLocaleString('en-IN') }} min included
+                · fee {{ inr(detail.apex_plan.platform_fee_inr || 0) }}
+                <template v-if="detail.apex_plan.topup_bonus_pct"> · +{{ detail.apex_plan.topup_bonus_pct }}% top-up bonus</template>
+                · {{ detail.apex_plan.support_tier || '—' }}
+              </span>
+            </div>
+            <div class="telephony-actions">
+              <button type="button" class="plan-btn upgrade" @click="openApexPlanChange(detail)">
+                <ArrowUpRight :size="13" />
+                Change plan
+              </button>
             </div>
           </div>
 
@@ -2247,6 +2371,125 @@ watch(() => props.homeSignal, () => { closeAll(); loadOrganizations(); });
       </div>
     </div>
 
+    <!-- ── Change APEX plan (upgrade / downgrade / re-stamp) ─────── -->
+    <div v-if="apexPlanTarget" class="modal-overlay" @click.self="cancelApexPlanChange">
+      <div class="modal-card modal-card--wide">
+        <span class="stage-eyebrow">CHANGE APEX PLAN</span>
+        <h4>{{ apexPlanTarget.name }}</h4>
+        <p class="muted">
+          Currently <strong>{{ apexPlanTarget.current.plan_label || apexPlanTarget.current.plan_code || 'unstamped' }}</strong>
+          <template v-if="apexPlanTarget.current.rate_per_minute != null"> · ₹{{ apexPlanTarget.current.rate_per_minute }}/min</template>
+          <template v-if="apexPlanTarget.current.concurrency != null"> · {{ apexPlanTarget.current.concurrency }} line(s)</template>
+          <template v-if="apexPlanTarget.current.monthly_inr"> · {{ inr(apexPlanTarget.current.monthly_inr) }}/mo</template>
+        </p>
+
+        <div class="apex-plan-rail" role="radiogroup" aria-label="New APEX plan">
+          <button
+            v-for="p in apexPlanCatalog" :key="p.code" type="button" role="radio"
+            class="apex-plan-card"
+            :class="{ 'is-selected': apexPlanTarget.plan_code === p.code, 'is-free': !p.chargeable, 'is-current': p.code === apexPlanTarget.current.plan_code }"
+            :aria-checked="apexPlanTarget.plan_code === p.code"
+            @click="apexPlanTarget.plan_code = p.code"
+          >
+            <span class="apex-plan-name">{{ p.label }}<small v-if="p.code === apexPlanTarget.current.plan_code"> · current</small></span>
+            <span class="apex-plan-price">
+              <template v-if="!p.chargeable">No charge</template>
+              <template v-else-if="p.monthly_inr == null">Custom</template>
+              <template v-else>{{ fmtINR(p.monthly_inr) }}<small>/mo</small></template>
+            </span>
+            <span class="apex-plan-meta">
+              <template v-if="p.rate_per_minute != null">₹{{ p.rate_per_minute }}/min</template>
+              <template v-else>Rate per deal</template>
+              ·
+              <template v-if="p.concurrency != null">{{ p.concurrency }} line{{ p.concurrency === 1 ? '' : 's' }}</template>
+              <template v-else>Custom lines</template>
+            </span>
+            <span class="apex-plan-meta">{{ Number(p.included_minutes).toLocaleString('en-IN') }} min included</span>
+          </button>
+        </div>
+        <p v-if="!apexPlanCatalog.length" class="muted">Plan catalog unavailable (is ENABLE_APEX_PLANS on?).</p>
+
+        <div class="apex-create-grid apex-create-grid--tight">
+          <label v-if="apexPlanTarget.plan_code === 'free_trial'" class="apex-fld">
+            <span>Concurrency <small>(1–10)</small></span>
+            <input v-model="apexPlanTarget.trial_concurrency" type="number" min="1" max="10" class="fx-input apex-input" placeholder="1" />
+          </label>
+          <template v-if="apexPlanTarget.plan_code === 'enterprise'">
+            <label class="apex-fld"><span>Rate ₹/min (&lt; 5)</span><input v-model="apexPlanTarget.enterprise_rate" type="number" step="0.1" min="1.5" max="4.99" class="fx-input apex-input" /></label>
+            <label class="apex-fld"><span>Concurrency (≥ 5)</span><input v-model="apexPlanTarget.enterprise_concurrency" type="number" min="5" class="fx-input apex-input" /></label>
+          </template>
+        </div>
+
+        <!-- Exactly what this button does to the account and to the customer's card. -->
+        <div v-if="apexPlanPreview" class="apex-summary">
+          <div class="apex-summary-row">
+            <span class="apex-summary-key">Monthly charge</span>
+            <span class="apex-summary-val" :class="{ 'is-zero': !apexPlanPreview.chargeable }">
+              <template v-if="!apexPlanPreview.priced">Set a rate and concurrency to price this</template>
+              <template v-else>
+                {{ inr(apexPlanPreview.currentMonthly) }} → <strong>{{ apexPlanPreview.chargeable ? inr(apexPlanPreview.monthly) : 'no charge' }}</strong>
+                <small v-if="apexPlanPreview.delta"> ({{ apexPlanPreview.delta > 0 ? '+' : '' }}{{ inr(apexPlanPreview.delta) }})</small>
+              </template>
+            </span>
+          </div>
+          <div class="apex-summary-row">
+            <span class="apex-summary-key">New limits</span>
+            <span class="apex-summary-val">
+              ₹{{ apexPlanPreview.rate || '—' }}/min · {{ apexPlanPreview.lines || '—' }} line(s)
+              · {{ apexPlanPreview.includedMinutes.toLocaleString('en-IN') }} min/cycle
+            </span>
+          </div>
+          <div class="apex-summary-row">
+            <span class="apex-summary-key">Call Credits</span>
+            <span class="apex-summary-val is-zero">Untouched — the existing balance stays as it is</span>
+          </div>
+        </div>
+
+        <label class="ls-check" style="margin-top:0.6rem;">
+          <input type="checkbox" v-model="apexPlanTarget.rebill" />
+          Replace the Razorpay subscription — cancel the old one and email a link for the new amount
+        </label>
+        <p class="comp-warn" v-if="apexPlanPreview && apexPlanPreview.rebills">
+          ⚠ The customer's current mandate is cancelled ({{ apexPlanTarget.current.monthly_inr ? 'at the end of the paid cycle' : 'immediately' }})
+          and a new {{ inr(apexPlanPreview.monthly) }}/mo subscription link is emailed. Rate and concurrency change immediately.
+        </p>
+        <p class="comp-warn" v-else-if="apexPlanPreview && !apexPlanPreview.samePlan">
+          ⚠ Billing is left untouched — the account moves to the new rate and concurrency while continuing
+          to pay {{ inr(apexPlanPreview.currentMonthly) }}/mo. Settle the difference out of band.
+        </p>
+
+        <p v-if="apexPlanError" class="error-banner">{{ apexPlanError }}</p>
+        <p v-if="apexPlanResult" class="bc-result">
+          <template v-if="apexPlanResult.changed">
+            <span style="color:#67c23a;">Plan updated</span> — {{ apexPlanResult.before.plan_code || '—' }} → {{ apexPlanResult.after.plan_code }}
+            · ₹{{ apexPlanResult.after.rate_per_minute }}/min · {{ apexPlanResult.after.concurrency }} line(s).
+          </template>
+          <template v-else>No change — the account already matched this plan.</template>
+          <template v-if="apexPlanResult.payment_url">
+            <br />New subscription link emailed. <a :href="apexPlanResult.payment_url" target="_blank" rel="noopener">Open link</a>
+          </template>
+          <template v-if="apexPlanResult.billing_note"><br />{{ apexPlanResult.billing_note }}</template>
+          <template v-if="apexPlanResult.old_subscription_cancel_error">
+            <br /><span style="color:#e6a23c;">⚠ The OLD subscription could not be cancelled — cancel it in the Razorpay dashboard or the customer is billed twice:</span>
+            {{ apexPlanResult.old_subscription_cancel_error }}
+          </template>
+        </p>
+
+        <label class="comp-ack">
+          <input type="checkbox" v-model="apexPlanTarget.ack" />
+          I understand this re-prices a live account{{ apexPlanPreview && apexPlanPreview.rebills ? ' and changes what the customer is charged' : '' }}.
+        </label>
+        <div class="modal-actions">
+          <button class="ghost-btn" @click="cancelApexPlanChange">{{ apexPlanResult ? 'CLOSE' : 'CANCEL' }}</button>
+          <button
+            class="plan-btn upgrade"
+            :disabled="apexPlanBusy || !apexPlanTarget.ack || !apexPlanPreview || !apexPlanPreview.priced"
+            @click="submitApexPlanChange"
+          >{{ apexPlanBusy ? 'Applying…' : 'Apply plan change' }}</button>
+        </div>
+      </div>
+    </div>
+
     <!-- ── Assign APEX bulk numbers (sub-account pool) ───────────── -->
     <div v-if="apexBulkTarget" class="modal-overlay" @click.self="cancelApexBulk">
       <div class="modal-card">
@@ -2813,6 +3056,14 @@ watch(() => props.homeSignal, () => { closeAll(); loadOrganizations(); });
   box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.6);
 }
 .theme-light .modal-card { background: rgba(248, 250, 252, 0.98); }
+/* The plan picker needs room for five cards and a receipt; a tall list is scrolled
+   inside the card so the page behind it never scrolls. */
+.modal-card--wide { max-width: 720px; max-height: 88vh; overflow-y: auto; }
+.modal-card--wide .apex-summary { max-width: none; }
+/* The plan the account is on today — outlined so the operator can see what they are
+   moving away from even when a different card is selected. */
+.apex-plan-card.is-current:not(.is-selected) { border-style: dashed; border-color: var(--text-muted); }
+.apex-plan-name small { text-transform: none; letter-spacing: 0; color: var(--text-muted); }
 .modal-card h4 { margin: 0.4rem 0 0.6rem; color: var(--text-primary); font-size: 1.05rem; }
 .modal-card p { margin: 0; font-size: 0.82rem; color: var(--text-secondary); line-height: 1.5; }
 .modal-card strong { color: var(--text-primary); }

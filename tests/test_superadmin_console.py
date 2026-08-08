@@ -286,3 +286,130 @@ async def test_apex_bulk_numbers_errors_without_subaccount(client):
         assert "sub-account" in res.json()["detail"].lower()
     finally:
         await _cleanup(org_id)
+
+
+# ── APEX plan change (upgrade / downgrade from the console) ─────────────────
+
+
+async def test_apex_plan_catalog_is_served_to_the_console(client):
+    headers = await _founder_headers()
+    res = await client.get("/superadmin/tenants/apex/plans", headers=headers)
+    assert res.status_code == 200
+    codes = {p["code"] for p in res.json()["plans"]}
+    assert {"free_trial", "core", "growth", "pinnacle", "enterprise"} <= codes
+
+
+async def test_detail_exposes_the_stamped_apex_plan(client):
+    """The console shows what the account is ACTUALLY billed at (its stamped columns),
+    which is what the plan-change modal opens with."""
+    from app.services.apex_plans import stamp_org_from_plan
+
+    headers = await _founder_headers()
+    org_id, _ = await _seed_apex_org()
+    try:
+        async with db_session.AsyncSessionLocal() as db:
+            org = (await db.execute(select(Organization).where(Organization.id == org_id))).scalars().first()
+            stamp_org_from_plan(org, "growth")
+            await db.commit()
+
+        body = (await client.get(f"/superadmin/tenants/{org_id}", headers=headers)).json()
+        assert body["apex_plan"]["plan_code"] == "growth"
+        assert body["apex_plan"]["plan_label"] == "Growth"
+        assert body["apex_plan"]["rate_per_minute"] == pytest.approx(7.5)
+        assert body["apex_plan"]["concurrency"] == 2
+        assert body["apex_plan"]["included_minutes"] == 5000
+    finally:
+        await _cleanup(org_id)
+
+
+async def test_detail_has_no_apex_plan_for_a_nokvo_one_org(client):
+    headers = await _founder_headers()
+    org_id, _ = await _seed_org()
+    try:
+        body = (await client.get(f"/superadmin/tenants/{org_id}", headers=headers)).json()
+        assert body["apex_plan"] is None
+    finally:
+        await _cleanup(org_id)
+
+
+async def test_change_plan_requires_an_explicit_acknowledgement(client):
+    from app.services.apex_plans import stamp_org_from_plan
+
+    headers = await _founder_headers()
+    org_id, _ = await _seed_apex_org()
+    try:
+        async with db_session.AsyncSessionLocal() as db:
+            org = (await db.execute(select(Organization).where(Organization.id == org_id))).scalars().first()
+            stamp_org_from_plan(org, "core")
+            await db.commit()
+
+        res = await client.post(
+            f"/superadmin/tenants/apex/accounts/{org_id}/plan", headers=headers,
+            json={"plan_code": "growth", "rebill": False},
+        )
+        assert res.status_code == 400
+        async with db_session.AsyncSessionLocal() as db:
+            org = (await db.execute(select(Organization).where(Organization.id == org_id))).scalars().first()
+            assert org.apex_plan_code == "core"  # nothing moved
+    finally:
+        await _cleanup(org_id)
+
+
+async def test_change_plan_upgrades_and_writes_an_audit_row(client, monkeypatch):
+    from app.models.audit import SuperAdminAuditLog
+    from app.services import apex_account_service
+    from app.services.apex_plans import stamp_org_from_plan
+
+    monkeypatch.setattr(apex_account_service, "_razorpay_configured", lambda: False)
+
+    async def _no_mail(*a, **k):
+        return None
+
+    monkeypatch.setattr(apex_account_service.EmailService, "send_apex_plan_change_email", _no_mail)
+
+    headers = await _founder_headers()
+    org_id, _ = await _seed_apex_org()
+    try:
+        async with db_session.AsyncSessionLocal() as db:
+            org = (await db.execute(select(Organization).where(Organization.id == org_id))).scalars().first()
+            stamp_org_from_plan(org, "core")
+            await db.commit()
+
+        res = await client.post(
+            f"/superadmin/tenants/apex/accounts/{org_id}/plan", headers=headers,
+            json={"plan_code": "pinnacle", "rebill": False, "acknowledge": True},
+        )
+        assert res.status_code == 200, res.text
+        body = res.json()
+        assert body["changed"] is True
+        assert body["after"]["plan_code"] == "pinnacle"
+        assert body["after"]["concurrency"] == 4
+        assert body["wallet_unchanged"] is True
+
+        async with db_session.AsyncSessionLocal() as db:
+            org = (await db.execute(select(Organization).where(Organization.id == org_id))).scalars().first()
+            assert org.apex_plan_code == "pinnacle"
+            assert float(org.apex_rate_per_minute) == pytest.approx(5.5)
+            assert org.apex_support_tier == "level_a"
+            audits = (await db.execute(
+                select(SuperAdminAuditLog).where(SuperAdminAuditLog.target_id == str(org_id))
+            )).scalars().all()
+        assert any(a.action == "apex_plan_changed" for a in audits)
+    finally:
+        async with db_session.AsyncSessionLocal() as db:
+            await db.execute(delete(SuperAdminAuditLog).where(SuperAdminAuditLog.target_id == str(org_id)))
+            await db.commit()
+        await _cleanup(org_id)
+
+
+async def test_change_plan_rejects_a_non_apex_org(client):
+    headers = await _founder_headers()
+    org_id, _ = await _seed_org()  # nokvo_one
+    try:
+        res = await client.post(
+            f"/superadmin/tenants/apex/accounts/{org_id}/plan", headers=headers,
+            json={"plan_code": "growth", "rebill": False, "acknowledge": True},
+        )
+        assert res.status_code == 409
+    finally:
+        await _cleanup(org_id)

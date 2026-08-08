@@ -527,6 +527,91 @@ async def activate_apex_account_endpoint(
     return result
 
 
+class ApexChangePlanRequest(BaseModel):
+    plan_code: str
+    # Required only when moving TO the enterprise plan (negotiated per deal).
+    enterprise_rate: float | None = None
+    enterprise_concurrency: int | None = None
+    # Optional Free Trial concurrency override; omit to keep the plan default of 1.
+    trial_concurrency: int | None = Field(default=None, ge=1, le=TRIAL_MAX_CONCURRENCY)
+    # Replace the Razorpay mandate when the monthly amount changes (open the new
+    # subscription + email the link, cancel the old one). False re-stamps the plan only.
+    rebill: bool = True
+    # The operator must confirm they understand a re-bill charges the customer a new amount.
+    acknowledge: bool = False
+
+
+@router.get("/apex/plans")
+async def apex_plan_catalog_for_console(
+    current_user: SuperAdminUser = Depends(RequireRole(_READ_ROLES)),
+):
+    """The APEX plan catalog, for the console's plan picker (same data as the public
+    endpoint — served here so the console needs no unauthenticated call)."""
+    _require_apex_plans_enabled()
+    from app.services.apex_plans import APEX_PLANS, plan_public_view
+
+    return {"plans": [plan_public_view(p) for p in APEX_PLANS.values()]}
+
+
+@router.post("/apex/accounts/{organization_id}/plan")
+async def change_apex_account_plan(
+    organization_id: uuid.UUID,
+    payload: ApexChangePlanRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: SuperAdminUser = Depends(RequireRole(_WRITE_ROLES)),
+):
+    """Upgrade / downgrade an APEX account's plan (or re-stamp the same plan to repair a
+    drifted row). Re-stamps rate, concurrency, included minutes, platform fee, bonuses and
+    support tier; the wallet is never touched. High-risk: with ``rebill`` it cancels the
+    live Razorpay subscription and opens one at the new monthly amount."""
+    _require_apex_plans_enabled()
+    from app.services.apex_account_service import ApexAccountError, change_apex_plan
+
+    if not payload.acknowledge:
+        raise HTTPException(
+            status_code=400,
+            detail="Confirm the plan change (acknowledge=true) — it re-prices the account.",
+        )
+    try:
+        result = await change_apex_plan(
+            db,
+            organization_id,
+            plan_code=payload.plan_code,
+            enterprise_rate=payload.enterprise_rate,
+            enterprise_concurrency=payload.enterprise_concurrency,
+            trial_concurrency=payload.trial_concurrency,
+            rebill=payload.rebill,
+        )
+    except ApexAccountError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    db.add(
+        SuperAdminAuditLog(
+            superadmin_id=current_user.id,
+            action="apex_plan_changed",
+            risk_level="high",
+            target_type="organization",
+            target_id=str(organization_id),
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            request_id=request.headers.get("x-request-id"),
+            metadata_={
+                "from": result["before"],
+                "to": result["after"],
+                "rebilled": result["rebilled"],
+                "monthly_inr": result["monthly_inr"],
+                "previous_monthly_inr": result["previous_monthly_inr"],
+                # Surfaced on the audit trail too: an uncancelled old subscription
+                # double-bills the customer until someone kills it by hand.
+                "old_subscription_cancel_error": result.get("old_subscription_cancel_error"),
+            },
+        )
+    )
+    await db.commit()
+    return result
+
+
 @router.get("/apex/webhook-events")
 async def list_razorpay_webhook_events(
     status: str | None = None,
@@ -1785,6 +1870,19 @@ async def get_tenant_detail(
     revenue_inr = round(subscription_inr + usage_inr, 2)
     cogs_inr = at.get("cogs_inr", 0.0)
 
+    # The APEX org's STAMPED plan config (what it is actually billed and capped at) plus
+    # the catalog label — this is what the console's plan panel shows and changes.
+    apex_plan = None
+    if (org.product_tier or "") == "nokvo_apex":
+        from app.services.apex_account_service import plan_snapshot
+        from app.services.apex_plans import resolve_plan
+
+        apex_plan = plan_snapshot(org)
+        apex_plan["plan_label"] = resolve_plan(org.apex_plan_code).label if org.apex_plan_code else None
+        apex_plan["activated_at"] = org.apex_activated_at.isoformat() if org.apex_activated_at else None
+        # The live monthly charge (the subscription row), so an upgrade shows what changes.
+        apex_plan["monthly_inr"] = subscription_inr
+
     return {
         "organization_id": oid,
         "organization_name": org.name,
@@ -1793,6 +1891,7 @@ async def get_tenant_detail(
         "status": org.status,
         "product_tier": org.product_tier,
         "is_apex": (org.product_tier or "") == "nokvo_apex",
+        "apex_plan": apex_plan,
         "plan_type": org.plan_type,
         "plan_label": _plan_label(org.plan_type),
         "calling_enabled": bool(org.calling_enabled),
