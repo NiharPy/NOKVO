@@ -798,7 +798,7 @@ def _start_flow_key(text: str, business_type: str | None, history: list[dict[str
         _VISIT_INTENT_RE.search(text) or (_YES_RE.search(text) and _last_assistant_offered_visit(history))
     ):
         return "real_estate_site_visit"
-    if normalize_business_type(business_type) == "clinics" and (
+    if normalize_business_type(business_type) in ("clinics", "services") and (
         _APPOINTMENT_INTENT_RE.search(text) or (_YES_RE.search(text) and _last_assistant_offered_appointment(history))
     ):
         return "clinic_appointment"

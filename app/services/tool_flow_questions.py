@@ -295,10 +295,11 @@ def build_tool_flow_questions(
             "tab": "tickets",
             "slots": _real_estate_visit_slots(site_visit_fields),
         }
-    if normalized_business_type == "clinics":
-        appointment_fields = _writable_fields(
-            ((resolved or {}).get("schemas") or {}).get("appointments") or []
-        )
+    # Any vertical with an appointments schema gets the (generic) appointment
+    # booking flow — clinics AND services (interior design, home services, …).
+    appointment_schema = ((resolved or {}).get("schemas") or {}).get("appointments")
+    if appointment_schema:
+        appointment_fields = _writable_fields(appointment_schema)
         flows["clinic_appointment"] = {
             "flow": "clinic_appointment",
             "tool_key": "book_appointment_with_lead_capture",

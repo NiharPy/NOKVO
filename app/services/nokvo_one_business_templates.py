@@ -71,6 +71,23 @@ STATUS_VOCABULARIES: dict[str, dict[str, dict[str, Any]]] = {
             "forward": ["open", "in_progress", "resolved", "closed"],
         },
     },
+    "services": {
+        "leads": {
+            "initial": "new",
+            "all": ["new", "contacted", "qualified", "quoted", "won", "lost"],
+            "forward": ["new", "contacted", "qualified", "quoted", "won"],
+        },
+        "appointments": {
+            "initial": "requested",
+            "all": ["requested", "assigned", "confirmed", "completed", "cancelled", "no_show", "rescheduled"],
+            "forward": ["requested", "assigned", "confirmed", "completed"],
+        },
+        "tickets": {
+            "initial": "open",
+            "all": ["open", "in_progress", "waiting_on_customer", "resolved", "closed", "escalated"],
+            "forward": ["open", "in_progress", "resolved", "closed"],
+        },
+    },
     "other": {
         "leads": {
             "initial": "new",
@@ -199,6 +216,7 @@ BUSINESS_TYPE_LABELS = {
     "clinics": "Clinics",
     "ecommerce": "E-commerce",
     "hospitality": "Hospitality",
+    "services": "Services",
     "other": "Other",
 }
 
@@ -369,6 +387,61 @@ BUSINESS_TYPE_CONFIGS: dict[str, dict[str, Any]] = {
         "prompt": (
             "Business Type: Hospitality. Prioritize guest inquiries, booking leads, reservation support, "
             "amenity questions, check-in/check-out coordination, complaints, and service recovery tickets."
+        ),
+    },
+    "services": {
+        "value": "services",
+        "label": "Services",
+        "member_label": "Consultants / Staff",
+        "tabs": ["tickets", "appointments", "leads"],
+        "request_types": [
+            {"value": "consultation", "label": "Consultation"},
+            {"value": "quote_request", "label": "Quote Request"},
+            {"value": "site_visit", "label": "Site Visit / Measurement"},
+            {"value": "callback", "label": "Callback"},
+            {"value": "complaint", "label": "Complaint"},
+            {"value": "general_query", "label": "General Query"},
+        ],
+        "consultation_types": [
+            {"value": "design_consultation", "label": "Design Consultation"},
+            {"value": "site_visit", "label": "Site Visit / Measurement"},
+            {"value": "quote_review", "label": "Quote Review"},
+            {"value": "follow_up", "label": "Follow-up"},
+        ],
+        "schemas": {
+            "leads": [
+                {"key": "name", "label": "Customer Name", "type": "text", "required": True},
+                {"key": "phone", "label": "Phone", "type": "phone", "required": True},
+                {"key": "service_interest", "label": "Service Wanted", "type": "text", "required": False},
+                {"key": "budget", "label": "Budget", "type": "currency", "required": False},
+                {"key": "timeline", "label": "Timeline", "type": "text", "required": False},
+                {"key": "status", "label": "Status", "type": "select", "required": True},
+            ],
+            "appointments": [
+                {"key": "name", "label": "Customer Name", "type": "text", "required": True},
+                {"key": "phone", "label": "Phone", "type": "phone", "required": True},
+                {"key": "service", "label": "Service", "type": "text", "required": False},
+                {"key": "appointment_time", "label": "Date & Time", "type": "datetime", "required": True},
+                {"key": "site_address", "label": "Site Address", "type": "text", "required": False},
+                {"key": "reason", "label": "Notes", "type": "text", "required": False},
+                {"key": "status", "label": "Status", "type": "select", "required": True},
+            ],
+            "tickets": [
+                {"key": "subject", "label": "Subject", "type": "text", "required": False},
+                {"key": "customer_name", "label": "Customer Name", "type": "text", "required": True},
+                {"key": "issue_type", "label": "Request Type", "type": "select", "required": True},
+                {"key": "priority", "label": "Urgency", "type": "select", "required": True},
+                {"key": "status", "label": "Status", "type": "select", "required": True},
+            ],
+        },
+        "prompt": (
+            "Business Type: Services (e.g. interior design, home services, consultants). Two primary "
+            "outcomes: (1) book a CONSULTATION or site visit — capture name, phone, the service they "
+            "want, and a date/time — which goes to the Appointments tab; or (2) if the caller only "
+            "enquires or wants a quote and does not book, capture a LEAD (name, phone, what they want, "
+            "and budget/timeline if volunteered) which goes to the Leads tab. Support tickets are for "
+            "issues with existing work. Answer questions from the business's services/portfolio; do not "
+            "quote firm prices or timelines without approved information — offer to have the team confirm."
         ),
     },
     "other": {
