@@ -137,6 +137,8 @@ async def create_project(
         created_by_user_id=user.id,
     )
     db.add(project)
+    from app.services.offering_sync import sync_project_offering
+    await sync_project_offering(db, project)  # dual-write mirror (no-op unless OFFERINGS_DUAL_WRITE)
     await db.commit()
     await db.refresh(project)
     return _serialize(project)
@@ -206,6 +208,8 @@ async def update_project(
     for field, value in updates.items():
         setattr(project, field, value)
     db.add(project)
+    from app.services.offering_sync import sync_project_offering
+    await sync_project_offering(db, project)  # dual-write mirror (no-op unless OFFERINGS_DUAL_WRITE)
     await db.commit()
     await db.refresh(project)
     return _serialize(project)
@@ -227,5 +231,7 @@ async def delete_project(
     project = res.scalars().first()
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found")
+    from app.services.offering_sync import delete_offering
+    await delete_offering(db, project.id)  # dual-write mirror (no-op unless OFFERINGS_DUAL_WRITE)
     await db.delete(project)
     await db.commit()
