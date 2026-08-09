@@ -421,18 +421,36 @@ def normalize_business_type(value: str | None) -> str | None:
     return None
 
 
+def enabled_business_types() -> set[str]:
+    """Business types selectable at onboarding: the always-on base
+    (``ALLOWED_BUSINESS_TYPES``) plus any added via
+    ``settings.ENABLED_BUSINESS_TYPES`` (comma-separated), intersected with what
+    actually has a config. Staged rollout (P3): default = real_estate only, so
+    behaviour is unchanged until the env var is set.
+    """
+    from app.core.config import settings
+
+    extra = {
+        t.strip().lower().replace("-", "_").replace(" ", "_")
+        for t in (settings.ENABLED_BUSINESS_TYPES or "").split(",")
+        if t.strip()
+    }
+    return (set(ALLOWED_BUSINESS_TYPES) | extra) & set(BUSINESS_TYPE_CONFIGS.keys())
+
+
 def validate_business_type(value: str) -> str:
-    # Real-estate is the only selectable vertical — reject everything else.
     normalized = normalize_business_type(value)
-    if normalized not in ALLOWED_BUSINESS_TYPES:
-        allowed = ", ".join(sorted(ALLOWED_BUSINESS_TYPES))
-        raise ValueError(f"Business type must be one of: {allowed}")
+    allowed = enabled_business_types()
+    if normalized not in allowed:
+        raise ValueError(f"Business type must be one of: {', '.join(sorted(allowed))}")
     return normalized
 
 
 def business_type_options() -> list[dict[str, Any]]:
-    # Real-estate only — no other vertical is offered during onboarding.
-    return [deepcopy(BUSINESS_TYPE_CONFIGS["real_estate"])]
+    # The enabled verticals, in config order (real_estate first). Staged via
+    # settings.ENABLED_BUSINESS_TYPES; default = real_estate only.
+    enabled = enabled_business_types()
+    return [deepcopy(cfg) for bt, cfg in BUSINESS_TYPE_CONFIGS.items() if bt in enabled]
 
 
 def business_type_config(value: str | None) -> dict[str, Any] | None:

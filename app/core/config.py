@@ -740,6 +740,12 @@ class Settings(BaseSettings):
     OFFERINGS_DUAL_WRITE: bool = False  # CRUD also mirrors projects/services into `offerings`
     OFFERINGS_READ: bool = False        # loaders read the catalog from `offerings` via adapters
 
+    # ── NOKVO ONE SDK — P3 staged sector enablement ──
+    # Comma-separated business types to OFFER at onboarding in addition to
+    # real_estate (always on). Empty = real_estate only (unchanged). Flip one
+    # sector at a time, e.g. "clinics" then "clinics,ecommerce".
+    ENABLED_BUSINESS_TYPES: str = ""
+
 
     # Provider APIs
     QDRANT_URL: str = ":memory:"
