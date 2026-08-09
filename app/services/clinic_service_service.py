@@ -30,6 +30,24 @@ async def load_active_services(
 ) -> list[ClinicService]:
     if db is None or organization_id is None:
         return []
+    # P2 Option-B read swap: catalog from `offerings` via the byte-parity adapter. Off by default.
+    from app.core.config import settings
+    if settings.OFFERINGS_READ:
+        from app.models.offering import Offering
+        from app.services.offering_adapters import offering_to_clinic_service
+        try:
+            res = await db.execute(
+                select(Offering)
+                .where(
+                    Offering.organization_id == organization_id,
+                    Offering.kind == "service",
+                    Offering.status == "active",
+                )
+                .order_by(Offering.name.asc())
+            )
+        except Exception:
+            return []
+        return [offering_to_clinic_service(o) for o in res.scalars().all()]
     try:
         res = await db.execute(
             select(ClinicService)
