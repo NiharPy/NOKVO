@@ -45,6 +45,7 @@ from app.models.llm_pool_key import LlmPoolKey
 from app.models.call_transcript import CallTranscript
 from app.models.notification import Notification
 from app.models.real_estate_project import RealEstateProject
+from app.models.offering import Offering
 from app.models.bulk_calling_request import BulkCallingRequest
 from app.models.apex_support_ticket import ApexSupportTicket
 from app.models.platform_setting import PlatformSetting
@@ -91,6 +92,7 @@ __all__ = [
     "CallTranscript",
     "Notification",
     "RealEstateProject",
+    "Offering",
     "FollowupReason",
     "FollowupStatus",
     "LeadFollowupSchedule",

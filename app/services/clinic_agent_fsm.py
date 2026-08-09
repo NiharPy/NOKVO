@@ -63,7 +63,18 @@ _URGENT_RE = re.compile(
     r"not\s*breathing|turning\s*blue|blue\s*lips|"
     r"emergency|ambulance|"
     r"high\s*fever\s*(?:and|with)\s*(?:fits|seizure)|"
-    r"pregnan\w*\s*bleeding)\b",
+    r"pregnan\w*\s*bleeding|"
+    # Eye/ophthalmology emergencies — merged from
+    # voice_turn_policy._URGENT_SYMPTOM_RE so the engine-independent detector
+    # stays a SUPERSET of the retiring bespoke path. Without this, flipping
+    # unified_booking_engine ON at an eye clinic would silently drop
+    # eye-emergency triage (P1 booking-unification safety invariant).
+    r"sudden\s+(?:vision\s+loss|blurred\s+vision|blindness)|"
+    r"vision\s+loss|severe\s+eye\s+pain|eye\s+injury|chemical\s+(?:splash|exposure|entered)|"
+    r"object\s+stuck|blood\s+in\s+(?:my\s+)?eye|flashes\s+of\s+light|"
+    r"sudden\s+(?:increase\s+in\s+)?floaters|curtain[-\s]?like\s+shadow|"
+    r"swelling\s+around\s+(?:my\s+)?eye\s+with\s+fever|"
+    r"contact\s+lens(?:es)?\s+.*(?:pain|redness|blurred))\b",
     re.IGNORECASE,
 )
 

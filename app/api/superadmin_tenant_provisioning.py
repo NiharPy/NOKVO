@@ -1282,6 +1282,59 @@ async def grant_bulk_calling_request(
     return {"id": str(req.id), "status": req.status, "enabled": True, "bulk_number": number}
 
 
+class UnifiedBookingEnginePayload(BaseModel):
+    enabled: bool = True
+
+
+@router.post("/tenants/{tenant_id}/unified-booking-engine")
+async def set_unified_booking_engine(
+    tenant_id: str,
+    payload: UnifiedBookingEnginePayload,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: SuperAdminUser = Depends(RequireRole(_WRITE_ROLES)),
+):
+    """P1 booking-unification: flip a tenant onto the unified tool-flow engine.
+
+    Sets ``provider_status["unified_booking_engine"]`` (read by
+    ``pipeline/booking_shadow.unified_booking_engine_enabled``). Only takes effect
+    for clinic orgs — the runtime gate is ``is_clinic_org and
+    unified_booking_engine_enabled``; real-estate already runs the unified engine.
+    Staged per-tenant canary: flip a few, watch the ``booking_shadow`` ``agree=``
+    logs, then widen. Reversible — POST ``enabled=false`` to fall back to the
+    bespoke appointment FSM (still present until Stage 4).
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+
+    tr = (
+        await db.execute(select(TenantResources).where(TenantResources.tenant_id == tenant_id))
+    ).scalars().first()
+    if tr is None:
+        raise HTTPException(status_code=404, detail="Tenant resources not found")
+
+    provider_status = dict(tr.provider_status or {})
+    provider_status["unified_booking_engine"] = bool(payload.enabled)
+    tr.provider_status = provider_status
+    flag_modified(tr, "provider_status")
+    db.add(tr)
+
+    db.add(
+        SuperAdminAuditLog(
+            superadmin_id=current_user.id,
+            action="unified_booking_engine_set",
+            risk_level="medium",  # changes the live booking-engine path for clinics
+            target_type="tenant",
+            target_id=tenant_id,
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            request_id=request.headers.get("x-request-id"),
+            metadata_={"enabled": bool(payload.enabled)},
+        )
+    )
+    await db.commit()
+    return {"tenant_id": tenant_id, "unified_booking_engine": bool(payload.enabled)}
+
+
 @router.post("/bulk-calling-requests/{request_id}/auto-provision")
 async def auto_provision_bulk_calling(
     request_id: uuid.UUID,
