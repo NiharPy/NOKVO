@@ -204,6 +204,8 @@ async def create_service(
     db.add(svc)
     await db.flush()
     await _set_doctors(db, user.organization_id, svc.id, payload.doctor_ids)
+    from app.services.offering_sync import sync_service_offering
+    await sync_service_offering(db, svc)  # dual-write mirror (no-op unless OFFERINGS_DUAL_WRITE)
     await db.commit()
     await db.refresh(svc)
     return await _serialize(db, svc)
@@ -234,6 +236,8 @@ async def update_service(
     for field, value in payload.model_dump(exclude_unset=True).items():
         setattr(svc, field, value)
     db.add(svc)
+    from app.services.offering_sync import sync_service_offering
+    await sync_service_offering(db, svc)  # dual-write mirror (no-op unless OFFERINGS_DUAL_WRITE)
     await db.commit()
     await db.refresh(svc)
     return await _serialize(db, svc)
@@ -262,5 +266,7 @@ async def delete_service(
 ):
     await _ensure_clinics(db, user.organization_id)
     svc = await _load_owned(db, user.organization_id, service_id)
+    from app.services.offering_sync import delete_offering
+    await delete_offering(db, svc.id)  # dual-write mirror (no-op unless OFFERINGS_DUAL_WRITE)
     await db.delete(svc)
     await db.commit()

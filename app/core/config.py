@@ -721,7 +721,7 @@ class Settings(BaseSettings):
     # figures shown in the SuperAdmin console slowly decouple from the actual
     # USD Azure/Sarvam/Plivo invoices as the rate drifts. Revisit with a live
     # FX feed or INR-native vendor rates if call volume scales up.
-    USD_TO_INR: float = 86.0
+    USD_TO_INR: float = 96.0
 
     # Blended COGS per BILLED minute (INR), used by the SuperAdmin console to
     # compute margin as ``revenue − (COGS_PER_MINUTE_INR × billed_minutes)``.
@@ -731,6 +731,14 @@ class Settings(BaseSettings):
     # fixed STT+telephony floor (~₹2.15/min) plus typical LLM+TTS (~₹1/min);
     # tune as vendor rates / call density change.
     COGS_PER_MINUTE_INR: float = 3.2
+
+    # ── NOKVO ONE SDK — P2 generic Offering catalog (staged Option B rollout) ──
+    # Both default OFF → zero behaviour change. Operational sequence:
+    #   enable DUAL_WRITE → run offering_backfill_v1 → verify → enable READ
+    #   (gated by the byte-parity tests in test_offering_adapters.py) → later,
+    #   stop writing the legacy real_estate_projects / clinic_services tables.
+    OFFERINGS_DUAL_WRITE: bool = False  # CRUD also mirrors projects/services into `offerings`
+    OFFERINGS_READ: bool = False        # loaders read the catalog from `offerings` via adapters
 
 
     # Provider APIs

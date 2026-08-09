@@ -70,6 +70,25 @@ async def load_active_projects(
 ) -> list[RealEstateProject]:
     if db is None or organization_id is None:
         return []
+    # P2 Option-B read swap: when enabled, the catalog comes from `offerings`
+    # (via the byte-parity adapter) instead of the legacy table. Off by default.
+    from app.core.config import settings
+    if settings.OFFERINGS_READ:
+        from app.models.offering import Offering
+        from app.services.offering_adapters import offering_to_real_estate_project
+        try:
+            res = await db.execute(
+                select(Offering)
+                .where(
+                    Offering.organization_id == organization_id,
+                    Offering.kind == "project",
+                    Offering.status == "active",
+                )
+                .order_by(Offering.name.asc())
+            )
+        except Exception:
+            return []
+        return [offering_to_real_estate_project(o) for o in res.scalars().all()]
     try:
         res = await db.execute(
             select(RealEstateProject)
