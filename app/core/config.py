@@ -721,7 +721,7 @@ class Settings(BaseSettings):
     # figures shown in the SuperAdmin console slowly decouple from the actual
     # USD Azure/Sarvam/Plivo invoices as the rate drifts. Revisit with a live
     # FX feed or INR-native vendor rates if call volume scales up.
-    USD_TO_INR: float = 86.0
+    USD_TO_INR: float = 96.0
 
     # Blended COGS per BILLED minute (INR), used by the SuperAdmin console to
     # compute margin as ``revenue − (COGS_PER_MINUTE_INR × billed_minutes)``.
