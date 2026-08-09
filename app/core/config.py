@@ -732,6 +732,14 @@ class Settings(BaseSettings):
     # tune as vendor rates / call density change.
     COGS_PER_MINUTE_INR: float = 3.2
 
+    # ── NOKVO ONE SDK — P2 generic Offering catalog (staged Option B rollout) ──
+    # Both default OFF → zero behaviour change. Operational sequence:
+    #   enable DUAL_WRITE → run offering_backfill_v1 → verify → enable READ
+    #   (gated by the byte-parity tests in test_offering_adapters.py) → later,
+    #   stop writing the legacy real_estate_projects / clinic_services tables.
+    OFFERINGS_DUAL_WRITE: bool = False  # CRUD also mirrors projects/services into `offerings`
+    OFFERINGS_READ: bool = False        # loaders read the catalog from `offerings` via adapters
+
 
     # Provider APIs
     QDRANT_URL: str = ":memory:"
