@@ -31,8 +31,8 @@ param pgAdminLogin string = 'nokvoadmin'
 @description('PostgreSQL admin password.')
 param pgAdminPassword string
 
-@description('Postgres SKU — Burstable to start; upsize to a GP D-series on CPU-credit depletion.')
-param pgSkuName string = 'Standard_B2ms'
+@description('Postgres SKU — Burstable B2s (right-sized 2026-08-09; DB was ~6% CPU / 1.5GB on B2ms). Upsize to B2ms/GP D-series on sustained CPU>70%, mem>80%, or CPU-credit depletion.')
+param pgSkuName string = 'Standard_B2s'
 
 @description('Postgres storage (GB).')
 param pgStorageGB int = 32
