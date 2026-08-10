@@ -156,3 +156,73 @@ async def perform_lookup(
     fields = redact(map_response(raw, spec.response_map), spec.pii_fields)
     spoken = render_template(spec.speak_template, fields) if spec.speak_template else ""
     return {"ok": True, "fields": fields, "spoken": spoken}
+
+
+# ── config loading + production fetch ────────────────────────────────────────
+
+def specs_from_provider_status(provider_status: dict[str, Any] | None) -> list[BackendLookupSpec]:
+    """Load configured endpoints from ``provider_status["backend_lookups"]``
+    (a list of dicts). Malformed / keyless / urlless entries are skipped, so a
+    bad config can never crash a call — it just yields no lookup tools."""
+    out: list[BackendLookupSpec] = []
+    raw = (provider_status or {}).get("backend_lookups")
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        if not isinstance(item, dict) or not item.get("key") or not item.get("url"):
+            continue
+        try:
+            out.append(
+                BackendLookupSpec(
+                    key=str(item["key"]),
+                    url=str(item["url"]),
+                    method=str(item.get("method") or "GET").upper(),
+                    auth_secret_ref=item.get("auth_secret_ref"),
+                    auth_header=str(item.get("auth_header") or "Authorization"),
+                    auth_scheme=str(item.get("auth_scheme") or "Bearer"),
+                    request_template=dict(item.get("request_template") or {}),
+                    response_map=dict(item.get("response_map") or {}),
+                    identity_gate=list(item.get("identity_gate") or []),
+                    speak_template=str(item.get("speak_template") or ""),
+                    pii_fields=list(item.get("pii_fields") or []),
+                    cache_ttl_s=int(item.get("cache_ttl_s") or 60),
+                )
+            )
+        except Exception:
+            continue
+    return out
+
+
+async def default_fetch(
+    url: str,
+    *,
+    method: str = "GET",
+    headers: dict[str, str] | None = None,
+    params: dict[str, str] | None = None,
+    timeout: int = 8,
+) -> Any:
+    """Production fetch: GET/POST JSON via stdlib urllib in a worker thread
+    (mirrors ``crm_integration_service``), with a hard timeout so a slow backend
+    can't stall the sub-1s voice loop. Injected into ``perform_lookup`` in prod;
+    tests pass a fake fetch instead. NOTE: ``perform_lookup`` runs the SSRF guard
+    before calling this; pair with the per-tenant ``allowed_hosts`` allowlist to
+    close the DNS-rebinding (TOCTOU) gap."""
+    import asyncio
+    import json
+    from urllib import parse as _parse, request as _req
+
+    def _blocking() -> Any:
+        target = url
+        data: bytes | None = None
+        hdrs = dict(headers or {})
+        if method.upper() == "GET" and params:
+            target = f"{url}?{_parse.urlencode(params)}"
+        elif params:
+            data = json.dumps(params).encode()
+            hdrs.setdefault("Content-Type", "application/json")
+        req = _req.Request(target, data=data, headers=hdrs, method=method.upper())
+        with _req.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (guarded by is_safe_lookup_url)
+            body = resp.read().decode() or "null"
+        return json.loads(body)
+
+    return await asyncio.to_thread(_blocking)

@@ -11,6 +11,7 @@ from app.services.backend_lookup import (
     redact,
     render_request,
     render_template,
+    specs_from_provider_status,
 )
 
 
@@ -113,3 +114,26 @@ def test_fetch_failure_is_graceful():
 
     res = _run(perform_lookup(spec, {}, identity_verified=True, fetch=fetch))
     assert res["ok"] is False and res["reason"] == "fetch_failed"
+
+
+# ── config loading ──
+
+def test_specs_from_provider_status_parses_and_skips_malformed():
+    ps = {"backend_lookups": [
+        {"key": "order_status", "url": "https://api.shop.com/orders", "response_map": {"s": "a.b"}},
+        {"url": "https://x/y"},   # no key → skipped
+        {"key": "nourl"},         # no url → skipped
+        "not a dict",             # skipped
+        {"key": "acct", "url": "https://api.shop.com/acct", "method": "post", "identity_gate": ["last4"]},
+    ]}
+    specs = specs_from_provider_status(ps)
+    assert [s.key for s in specs] == ["order_status", "acct"]
+    assert specs[1].method == "POST"        # normalized to upper
+    assert specs[1].identity_gate == ["last4"]
+    assert specs[0].cache_ttl_s == 60       # default applied
+
+
+def test_specs_from_provider_status_empty_or_bad():
+    assert specs_from_provider_status(None) == []
+    assert specs_from_provider_status({}) == []
+    assert specs_from_provider_status({"backend_lookups": "nope"}) == []
