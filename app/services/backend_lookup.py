@@ -226,3 +226,42 @@ async def default_fetch(
         return json.loads(body)
 
     return await asyncio.to_thread(_blocking)
+
+
+def lookup_tools_from_specs(specs: list["BackendLookupSpec"]) -> list[Any]:
+    """Build a ``lookup_<key>`` PredefinedTool per configured spec so a tenant's
+    agent can invoke the lookup. ``handler_name='backend_lookup'``; read-only, so
+    no confirmation. The tool's inputs are the ``{{ slots.X }}`` variables the
+    request templates reference, plus the identity-gate slots (which are required).
+    """
+    from app.services.predefined_tools_service import PredefinedTool
+
+    tools: list[Any] = []
+    for spec in specs or []:
+        slots: list[str] = list(spec.identity_gate or [])
+        for value in (spec.request_template or {}).values():
+            for m in _SLOT_RE.finditer(str(value)):
+                slots.append(m.group(1))
+        slots = list(dict.fromkeys(slots))  # dedupe, preserve order
+        props = {k: {"type": "string", "maxLength": 200} for k in slots}
+        tools.append(
+            PredefinedTool(
+                key=f"lookup_{spec.key}",
+                display_name=f"Lookup: {str(spec.key).replace('_', ' ').title()}",
+                description=(
+                    f"Fetch live '{spec.key}' from the business's own system (READ-ONLY). "
+                    "Only call after verifying the caller's identity when required."
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": props,
+                    "required": list(spec.identity_gate or []),
+                    "additionalProperties": False,
+                },
+                record_type=None,
+                handler_name="backend_lookup",
+                requires_confirmation=False,
+                metadata={"lookup_key": spec.key},
+            )
+        )
+    return tools

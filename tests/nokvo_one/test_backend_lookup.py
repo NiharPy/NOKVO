@@ -137,3 +137,33 @@ def test_specs_from_provider_status_empty_or_bad():
     assert specs_from_provider_status(None) == []
     assert specs_from_provider_status({}) == []
     assert specs_from_provider_status({"backend_lookups": "nope"}) == []
+
+
+# ── tool registration ──
+
+def test_lookup_tools_from_specs_builds_agent_tools():
+    from app.services.backend_lookup import lookup_tools_from_specs
+
+    specs = [BackendLookupSpec(
+        key="order_status", url="https://api.shop.com/o",
+        request_template={"name": "{{ slots.order_id }}"},
+        identity_gate=["phone_last4"],
+    )]
+    tools = lookup_tools_from_specs(specs)
+    assert len(tools) == 1
+    t = tools[0]
+    assert t.key == "lookup_order_status"
+    assert t.handler_name == "backend_lookup"
+    assert t.requires_confirmation is False
+    # inputs = the {{ slots.X }} vars referenced by templates + the identity gate
+    assert set(t.input_schema["properties"].keys()) == {"order_id", "phone_last4"}
+    assert t.input_schema["required"] == ["phone_last4"]
+    assert t.metadata["lookup_key"] == "order_status"
+
+
+def test_resolve_catalog_registers_lookup_tools_only_when_configured():
+    from app.services.dynamic_tool_resolver import resolve_index
+
+    specs = [BackendLookupSpec(key="order_status", url="https://api.shop.com/o", identity_gate=["last4"])]
+    assert "lookup_order_status" in resolve_index("ecommerce", None, None, backend_lookup_specs=specs)
+    assert "lookup_order_status" not in resolve_index("ecommerce", None, None)

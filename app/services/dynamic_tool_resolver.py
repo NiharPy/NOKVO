@@ -495,6 +495,7 @@ def resolve_catalog(
     business_type: str | None,
     schema_overrides: dict[str, Any] | None = None,
     custom_tabs: list[dict[str, Any]] | None = None,
+    backend_lookup_specs: list[Any] | None = None,
 ) -> list[PredefinedTool]:
     """Return the full ordered catalog for an org."""
     config = business_type_config(business_type)
@@ -517,6 +518,12 @@ def resolve_catalog(
     for spec in custom_tabs or []:
         tools.extend(_resolve_custom_tab_tools(spec, business_type))
 
+    # P5: per-tenant Backend Lookup tools — only when the org has configured
+    # endpoints in provider_status["backend_lookups"]; otherwise nothing added.
+    if backend_lookup_specs:
+        from app.services.backend_lookup import lookup_tools_from_specs
+        tools.extend(lookup_tools_from_specs(backend_lookup_specs))
+
     tools.extend(CROSS_CUTTING_CATALOG)
     return tools
 
@@ -525,8 +532,12 @@ def resolve_index(
     business_type: str | None,
     schema_overrides: dict[str, Any] | None = None,
     custom_tabs: list[dict[str, Any]] | None = None,
+    backend_lookup_specs: list[Any] | None = None,
 ) -> dict[str, PredefinedTool]:
-    return {tool.key: tool for tool in resolve_catalog(business_type, schema_overrides, custom_tabs)}
+    return {
+        tool.key: tool
+        for tool in resolve_catalog(business_type, schema_overrides, custom_tabs, backend_lookup_specs)
+    }
 
 
 def default_tool_keys(
