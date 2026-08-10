@@ -167,3 +167,56 @@ def test_resolve_catalog_registers_lookup_tools_only_when_configured():
     specs = [BackendLookupSpec(key="order_status", url="https://api.shop.com/o", identity_gate=["last4"])]
     assert "lookup_order_status" in resolve_index("ecommerce", None, None, backend_lookup_specs=specs)
     assert "lookup_order_status" not in resolve_index("ecommerce", None, None)
+
+
+# ── handler dispatch (fake DB → no network; both paths return before fetch) ──
+
+class _FakeExecResult:
+    def __init__(self, obj):
+        self._obj = obj
+
+    def scalars(self):
+        return self
+
+    def first(self):
+        return self._obj
+
+
+class _FakeDB:
+    def __init__(self, tr):
+        self._tr = tr
+
+    async def execute(self, *a, **k):
+        return _FakeExecResult(self._tr)
+
+
+class _FakeTR:
+    def __init__(self, ps):
+        self.provider_status = ps
+
+
+def _lookup_tool(lookup_key="order_status"):
+    from app.services.predefined_tools_service import PredefinedTool
+    return PredefinedTool(
+        key=f"lookup_{lookup_key}", display_name="x", description="x", input_schema={},
+        record_type=None, handler_name="backend_lookup", metadata={"lookup_key": lookup_key},
+    )
+
+
+def test_handler_not_configured_returns_graceful():
+    from app.services.predefined_tools_service import PredefinedToolsService
+    db = _FakeDB(_FakeTR({}))  # no backend_lookups configured
+    res = _run(PredefinedToolsService._handle_backend_lookup(db, "org1", "u1", _lookup_tool(), {}))
+    assert res["ok"] is False and res["reason"] == "not_configured"
+
+
+def test_handler_identity_gate_blocks_before_fetch():
+    from app.services.predefined_tools_service import PredefinedToolsService
+    ps = {"backend_lookups": [{
+        "key": "order_status", "url": "https://api.shop.com/o",
+        "identity_gate": ["last4"], "speak_template": "ok",
+    }]}
+    db = _FakeDB(_FakeTR(ps))
+    # no last4 in args → identity gate fails → returns before any network fetch
+    res = _run(PredefinedToolsService._handle_backend_lookup(db, "org1", "u1", _lookup_tool(), {}))
+    assert res["ok"] is False and res["reason"] == "identity_unverified"
