@@ -71,6 +71,23 @@ STATUS_VOCABULARIES: dict[str, dict[str, dict[str, Any]]] = {
             "forward": ["open", "in_progress", "resolved", "closed"],
         },
     },
+    "services": {
+        "leads": {
+            "initial": "new",
+            "all": ["new", "contacted", "qualified", "quoted", "won", "lost"],
+            "forward": ["new", "contacted", "qualified", "quoted", "won"],
+        },
+        "appointments": {
+            "initial": "requested",
+            "all": ["requested", "assigned", "confirmed", "completed", "cancelled", "no_show", "rescheduled"],
+            "forward": ["requested", "assigned", "confirmed", "completed"],
+        },
+        "tickets": {
+            "initial": "open",
+            "all": ["open", "in_progress", "waiting_on_customer", "resolved", "closed", "escalated"],
+            "forward": ["open", "in_progress", "resolved", "closed"],
+        },
+    },
     "other": {
         "leads": {
             "initial": "new",
@@ -199,6 +216,7 @@ BUSINESS_TYPE_LABELS = {
     "clinics": "Clinics",
     "ecommerce": "E-commerce",
     "hospitality": "Hospitality",
+    "services": "Services",
     "other": "Other",
 }
 
@@ -371,6 +389,61 @@ BUSINESS_TYPE_CONFIGS: dict[str, dict[str, Any]] = {
             "amenity questions, check-in/check-out coordination, complaints, and service recovery tickets."
         ),
     },
+    "services": {
+        "value": "services",
+        "label": "Services",
+        "member_label": "Consultants / Staff",
+        "tabs": ["tickets", "appointments", "leads"],
+        "request_types": [
+            {"value": "consultation", "label": "Consultation"},
+            {"value": "quote_request", "label": "Quote Request"},
+            {"value": "site_visit", "label": "Site Visit / Measurement"},
+            {"value": "callback", "label": "Callback"},
+            {"value": "complaint", "label": "Complaint"},
+            {"value": "general_query", "label": "General Query"},
+        ],
+        "consultation_types": [
+            {"value": "design_consultation", "label": "Design Consultation"},
+            {"value": "site_visit", "label": "Site Visit / Measurement"},
+            {"value": "quote_review", "label": "Quote Review"},
+            {"value": "follow_up", "label": "Follow-up"},
+        ],
+        "schemas": {
+            "leads": [
+                {"key": "name", "label": "Customer Name", "type": "text", "required": True},
+                {"key": "phone", "label": "Phone", "type": "phone", "required": True},
+                {"key": "service_interest", "label": "Service Wanted", "type": "text", "required": False},
+                {"key": "budget", "label": "Budget", "type": "currency", "required": False},
+                {"key": "timeline", "label": "Timeline", "type": "text", "required": False},
+                {"key": "status", "label": "Status", "type": "select", "required": True},
+            ],
+            "appointments": [
+                {"key": "name", "label": "Customer Name", "type": "text", "required": True},
+                {"key": "phone", "label": "Phone", "type": "phone", "required": True},
+                {"key": "service", "label": "Service", "type": "text", "required": False},
+                {"key": "appointment_time", "label": "Date & Time", "type": "datetime", "required": True},
+                {"key": "site_address", "label": "Site Address", "type": "text", "required": False},
+                {"key": "reason", "label": "Notes", "type": "text", "required": False},
+                {"key": "status", "label": "Status", "type": "select", "required": True},
+            ],
+            "tickets": [
+                {"key": "subject", "label": "Subject", "type": "text", "required": False},
+                {"key": "customer_name", "label": "Customer Name", "type": "text", "required": True},
+                {"key": "issue_type", "label": "Request Type", "type": "select", "required": True},
+                {"key": "priority", "label": "Urgency", "type": "select", "required": True},
+                {"key": "status", "label": "Status", "type": "select", "required": True},
+            ],
+        },
+        "prompt": (
+            "Business Type: Services (e.g. interior design, home services, consultants). Two primary "
+            "outcomes: (1) book a CONSULTATION or site visit — capture name, phone, the service they "
+            "want, and a date/time — which goes to the Appointments tab; or (2) if the caller only "
+            "enquires or wants a quote and does not book, capture a LEAD (name, phone, what they want, "
+            "and budget/timeline if volunteered) which goes to the Leads tab. Support tickets are for "
+            "issues with existing work. Answer questions from the business's services/portfolio; do not "
+            "quote firm prices or timelines without approved information — offer to have the team confirm."
+        ),
+    },
     "other": {
         "value": "other",
         "label": "Other",
@@ -421,18 +494,36 @@ def normalize_business_type(value: str | None) -> str | None:
     return None
 
 
+def enabled_business_types() -> set[str]:
+    """Business types selectable at onboarding: the always-on base
+    (``ALLOWED_BUSINESS_TYPES``) plus any added via
+    ``settings.ENABLED_BUSINESS_TYPES`` (comma-separated), intersected with what
+    actually has a config. Staged rollout (P3): default = real_estate only, so
+    behaviour is unchanged until the env var is set.
+    """
+    from app.core.config import settings
+
+    extra = {
+        t.strip().lower().replace("-", "_").replace(" ", "_")
+        for t in (settings.ENABLED_BUSINESS_TYPES or "").split(",")
+        if t.strip()
+    }
+    return (set(ALLOWED_BUSINESS_TYPES) | extra) & set(BUSINESS_TYPE_CONFIGS.keys())
+
+
 def validate_business_type(value: str) -> str:
-    # Real-estate is the only selectable vertical — reject everything else.
     normalized = normalize_business_type(value)
-    if normalized not in ALLOWED_BUSINESS_TYPES:
-        allowed = ", ".join(sorted(ALLOWED_BUSINESS_TYPES))
-        raise ValueError(f"Business type must be one of: {allowed}")
+    allowed = enabled_business_types()
+    if normalized not in allowed:
+        raise ValueError(f"Business type must be one of: {', '.join(sorted(allowed))}")
     return normalized
 
 
 def business_type_options() -> list[dict[str, Any]]:
-    # Real-estate only — no other vertical is offered during onboarding.
-    return [deepcopy(BUSINESS_TYPE_CONFIGS["real_estate"])]
+    # The enabled verticals, in config order (real_estate first). Staged via
+    # settings.ENABLED_BUSINESS_TYPES; default = real_estate only.
+    enabled = enabled_business_types()
+    return [deepcopy(cfg) for bt, cfg in BUSINESS_TYPE_CONFIGS.items() if bt in enabled]
 
 
 def business_type_config(value: str | None) -> dict[str, Any] | None:
