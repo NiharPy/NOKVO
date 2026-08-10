@@ -382,27 +382,34 @@ async def route_turn(
         # NOT auto-start (and vice versa). ``allowed_flow_keys=None`` for
         # inbound = all flows allowed.
         allowed_flow_keys_for_call: list[str] | None = None
-        if (
-            _outbound_active
-            and outbound_context is not None
-            and str(organization.industry or "").lower() == "real_estate"
-        ):
+        if _outbound_active and outbound_context is not None:
+            _industry = str(organization.industry or "").lower()
+            _raw_objs = getattr(outbound_context, "objectives", None)
             try:
-                from app.services.real_estate_outbound_agent_fsm import (
-                    OBJECTIVE_LEAD,
-                    OBJECTIVE_SITE_VISIT,
-                    normalize_objectives,
-                )
-                _objs = normalize_objectives(getattr(outbound_context, "objectives", None))
-                allowed_flow_keys_for_call = []
-                if OBJECTIVE_SITE_VISIT in _objs:
-                    allowed_flow_keys_for_call.append("real_estate_site_visit")
-                if OBJECTIVE_LEAD in _objs:
-                    allowed_flow_keys_for_call.append("leads_create")
-                # If the campaign carries no structured objectives (legacy
-                # free-text), don't gate anything — keep the old behaviour.
-                if not allowed_flow_keys_for_call:
-                    allowed_flow_keys_for_call = None
+                if _industry == "real_estate":
+                    from app.services.real_estate_outbound_agent_fsm import (
+                        OBJECTIVE_LEAD,
+                        OBJECTIVE_SITE_VISIT,
+                        normalize_objectives,
+                    )
+                    _objs = normalize_objectives(_raw_objs)
+                    allowed_flow_keys_for_call = []
+                    if OBJECTIVE_SITE_VISIT in _objs:
+                        allowed_flow_keys_for_call.append("real_estate_site_visit")
+                    if OBJECTIVE_LEAD in _objs:
+                        allowed_flow_keys_for_call.append("leads_create")
+                    # If the campaign carries no structured objectives (legacy
+                    # free-text), don't gate anything — keep the old behaviour.
+                    if not allowed_flow_keys_for_call:
+                        allowed_flow_keys_for_call = None
+                else:
+                    # P4: generic objective gate for every other sector (clinic,
+                    # services, …). No recognised objectives → None = all flows,
+                    # i.e. unchanged for the common case today.
+                    from app.services.outbound_objectives import (
+                        allowed_flow_keys_for_objectives,
+                    )
+                    allowed_flow_keys_for_call = allowed_flow_keys_for_objectives(_raw_objs)
             except Exception:
                 allowed_flow_keys_for_call = None
         tool_flow = evaluate_tool_flow_policy(
