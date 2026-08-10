@@ -584,6 +584,68 @@ class PredefinedToolsService:
         )
         return result
 
+    @staticmethod
+    async def _handle_backend_lookup(db, org_id, user_id, tool, args):
+        """P5 — execute a configured ``lookup_<key>`` tool → speak live backend data.
+
+        Safe-by-default: the tool only exists when the org has a matching endpoint
+        in ``provider_status["backend_lookups"]``. A missing/unsafe config returns a
+        graceful spoken fallback and never raises. Read-only; host-locked to the
+        configured endpoint; identity-gated; PII-redacted (see backend_lookup.py).
+        """
+        from urllib.parse import urlparse
+
+        from app.models.tenant_resources import TenantResources
+        from app.services.backend_lookup import (
+            default_fetch,
+            perform_lookup,
+            specs_from_provider_status,
+        )
+
+        lookup_key = (tool.metadata or {}).get("lookup_key")
+        provider_status: dict = {}
+        try:
+            tr = (
+                await db.execute(
+                    select(TenantResources).where(TenantResources.organization_id == org_id)
+                )
+            ).scalars().first()
+            if tr is not None:
+                provider_status = dict(tr.provider_status or {})
+        except Exception:
+            provider_status = {}
+
+        spec = next(
+            (s for s in specs_from_provider_status(provider_status) if s.key == lookup_key),
+            None,
+        )
+        if spec is None:
+            return {"ok": False, "reason": "not_configured",
+                    "spoken": "I couldn't reach that system right now."}
+
+        # Identity gate: the agent must have collected every required field.
+        identity_verified = all(
+            str((args or {}).get(k) or "").strip() for k in spec.identity_gate
+        )
+
+        async def _secret_resolver(ref):
+            try:
+                from app.services.azure_keyvault_service import AzureKeyVaultService
+                name = str(ref).split("://", 1)[-1].rsplit("/", 1)[-1]
+                return await AzureKeyVaultService.get_secret_value(name)
+            except Exception:
+                return None
+
+        allowed = [h for h in [urlparse(spec.url).hostname] if h]
+        return await perform_lookup(
+            spec,
+            dict(args or {}),
+            identity_verified=identity_verified,
+            fetch=default_fetch,
+            secret_resolver=_secret_resolver if spec.auth_secret_ref else None,
+            allowed_hosts=allowed,
+        )
+
     # ─────────── Generic resource handlers ───────────
 
     @staticmethod

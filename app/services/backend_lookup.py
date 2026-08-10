@@ -1,0 +1,267 @@
+"""Backend Lookup capability (P5) — fetch live data from a business's own systems
+and speak it back, SAFELY. See NOKVOSDK/docs/05.
+
+This module is the security core + orchestration. It is inert until a tenant has a
+configured endpoint (``retrieval.py`` stops deflecting only when one exists), and
+it is **read-only** — any write (cancel/refund) goes through the existing
+confirm→ticket/escalation path, never a silent external mutation.
+
+Everything here is pure/testable except the actual HTTP call, which is injected as
+a ``fetch`` callable so the SSRF guard, templating, mapping and PII redaction can
+be verified without network.
+"""
+from __future__ import annotations
+
+import ipaddress
+import re
+import socket
+from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable
+from urllib.parse import urlparse
+
+
+@dataclass
+class BackendLookupSpec:
+    key: str                                    # → tool ``lookup_<key>``
+    url: str
+    method: str = "GET"
+    auth_secret_ref: str | None = None          # e.g. "kv://tenant/<id>/shopify_token"
+    auth_header: str = "Authorization"
+    auth_scheme: str = "Bearer"
+    request_template: dict[str, str] = field(default_factory=dict)   # param → "{{ slots.x }}"
+    response_map: dict[str, str] = field(default_factory=dict)       # spoken field → dotted path
+    identity_gate: list[str] = field(default_factory=list)          # slots that MUST be verified first
+    speak_template: str = ""
+    pii_fields: list[str] = field(default_factory=list)             # never spoken/logged
+    cache_ttl_s: int = 60
+
+
+# ── SSRF guard ───────────────────────────────────────────────────────────────
+
+def _ip_blocked(ip: ipaddress._BaseAddress) -> bool:
+    return (
+        ip.is_private or ip.is_loopback or ip.is_link_local
+        or ip.is_reserved or ip.is_multicast or ip.is_unspecified
+    )
+
+
+def is_safe_lookup_url(url: str, *, allowed_hosts: list[str] | None = None) -> bool:
+    """https-only; host must resolve to PUBLIC IP(s) — no private / loopback /
+    link-local / cloud-metadata — and, if an allowlist is given, be on it."""
+    try:
+        p = urlparse(url)
+    except Exception:
+        return False
+    if p.scheme != "https" or not p.hostname:
+        return False
+    host = p.hostname
+    if host in ("metadata.google.internal",):
+        return False
+    if allowed_hosts is not None and host.lower() not in {h.lower() for h in allowed_hosts}:
+        return False
+    # IP literal → check directly (no DNS); hostname → resolve every A/AAAA.
+    try:
+        ips = [ipaddress.ip_address(host)]
+    except ValueError:
+        try:
+            ips = [ipaddress.ip_address(info[4][0]) for info in socket.getaddrinfo(host, p.port or 443)]
+        except Exception:
+            return False
+    return bool(ips) and all(not _ip_blocked(ip) for ip in ips)
+
+
+# ── templating / mapping / redaction (pure) ──────────────────────────────────
+
+_SLOT_RE = re.compile(r"\{\{\s*slots\.([a-zA-Z0-9_]+)\s*\}\}")
+
+
+def render_template(text: str, slots: dict[str, Any]) -> str:
+    return _SLOT_RE.sub(lambda m: str((slots or {}).get(m.group(1), "")), text or "")
+
+
+def render_request(template: dict[str, str], slots: dict[str, Any]) -> dict[str, str]:
+    return {k: render_template(v, slots) for k, v in (template or {}).items()}
+
+
+def _get_path(obj: Any, path: str) -> Any:
+    cur = obj
+    for part in path.split("."):
+        if not part:
+            continue
+        name, _, rest = part.partition("[")
+        if name:
+            cur = cur.get(name) if isinstance(cur, dict) else None
+        while rest:
+            idx, _, rest = rest.partition("]")
+            rest = rest.lstrip("[")
+            try:
+                cur = cur[int(idx)]
+            except Exception:
+                return None
+        if cur is None:
+            return None
+    return cur
+
+
+def map_response(obj: Any, response_map: dict[str, str]) -> dict[str, Any]:
+    return {field_name: _get_path(obj, path) for field_name, path in (response_map or {}).items()}
+
+
+def redact(fields: dict[str, Any], pii_fields: list[str]) -> dict[str, Any]:
+    blocked = set(pii_fields or [])
+    return {k: v for k, v in (fields or {}).items() if k not in blocked}
+
+
+# ── orchestration ────────────────────────────────────────────────────────────
+
+FetchFn = Callable[..., Awaitable[Any]]  # (url, method, headers, params) -> parsed JSON
+
+
+async def perform_lookup(
+    spec: BackendLookupSpec,
+    slots: dict[str, Any],
+    *,
+    identity_verified: bool,
+    fetch: FetchFn,
+    secret_resolver: Callable[[str], Awaitable[str | None]] | None = None,
+    allowed_hosts: list[str] | None = None,
+) -> dict[str, Any]:
+    """Run one lookup → ``{"ok": bool, "spoken": str, "fields": {...}}``.
+
+    Guards, in order: identity gate → SSRF → fetch → map → redact PII → speak.
+    Never raises; a failure returns ``ok=False`` with a graceful spoken fallback.
+    """
+    if spec.identity_gate and not identity_verified:
+        return {"ok": False, "reason": "identity_unverified",
+                "spoken": "I can help, but first I need to verify a couple of details."}
+
+    if not is_safe_lookup_url(spec.url, allowed_hosts=allowed_hosts):
+        return {"ok": False, "reason": "unsafe_url", "spoken": "I couldn't reach that system right now."}
+
+    headers: dict[str, str] = {}
+    if spec.auth_secret_ref and secret_resolver is not None:
+        try:
+            token = await secret_resolver(spec.auth_secret_ref)
+        except Exception:
+            token = None
+        if token:
+            headers[spec.auth_header] = f"{spec.auth_scheme} {token}".strip()
+
+    params = render_request(spec.request_template, slots)
+    try:
+        raw = await fetch(spec.url, method=spec.method, headers=headers, params=params)
+    except Exception:
+        return {"ok": False, "reason": "fetch_failed", "spoken": "I couldn't reach that system right now."}
+
+    fields = redact(map_response(raw, spec.response_map), spec.pii_fields)
+    spoken = render_template(spec.speak_template, fields) if spec.speak_template else ""
+    return {"ok": True, "fields": fields, "spoken": spoken}
+
+
+# ── config loading + production fetch ────────────────────────────────────────
+
+def specs_from_provider_status(provider_status: dict[str, Any] | None) -> list[BackendLookupSpec]:
+    """Load configured endpoints from ``provider_status["backend_lookups"]``
+    (a list of dicts). Malformed / keyless / urlless entries are skipped, so a
+    bad config can never crash a call — it just yields no lookup tools."""
+    out: list[BackendLookupSpec] = []
+    raw = (provider_status or {}).get("backend_lookups")
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        if not isinstance(item, dict) or not item.get("key") or not item.get("url"):
+            continue
+        try:
+            out.append(
+                BackendLookupSpec(
+                    key=str(item["key"]),
+                    url=str(item["url"]),
+                    method=str(item.get("method") or "GET").upper(),
+                    auth_secret_ref=item.get("auth_secret_ref"),
+                    auth_header=str(item.get("auth_header") or "Authorization"),
+                    auth_scheme=str(item.get("auth_scheme") or "Bearer"),
+                    request_template=dict(item.get("request_template") or {}),
+                    response_map=dict(item.get("response_map") or {}),
+                    identity_gate=list(item.get("identity_gate") or []),
+                    speak_template=str(item.get("speak_template") or ""),
+                    pii_fields=list(item.get("pii_fields") or []),
+                    cache_ttl_s=int(item.get("cache_ttl_s") or 60),
+                )
+            )
+        except Exception:
+            continue
+    return out
+
+
+async def default_fetch(
+    url: str,
+    *,
+    method: str = "GET",
+    headers: dict[str, str] | None = None,
+    params: dict[str, str] | None = None,
+    timeout: int = 8,
+) -> Any:
+    """Production fetch: GET/POST JSON via stdlib urllib in a worker thread
+    (mirrors ``crm_integration_service``), with a hard timeout so a slow backend
+    can't stall the sub-1s voice loop. Injected into ``perform_lookup`` in prod;
+    tests pass a fake fetch instead. NOTE: ``perform_lookup`` runs the SSRF guard
+    before calling this; pair with the per-tenant ``allowed_hosts`` allowlist to
+    close the DNS-rebinding (TOCTOU) gap."""
+    import asyncio
+    import json
+    from urllib import parse as _parse, request as _req
+
+    def _blocking() -> Any:
+        target = url
+        data: bytes | None = None
+        hdrs = dict(headers or {})
+        if method.upper() == "GET" and params:
+            target = f"{url}?{_parse.urlencode(params)}"
+        elif params:
+            data = json.dumps(params).encode()
+            hdrs.setdefault("Content-Type", "application/json")
+        req = _req.Request(target, data=data, headers=hdrs, method=method.upper())
+        with _req.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (guarded by is_safe_lookup_url)
+            body = resp.read().decode() or "null"
+        return json.loads(body)
+
+    return await asyncio.to_thread(_blocking)
+
+
+def lookup_tools_from_specs(specs: list["BackendLookupSpec"]) -> list[Any]:
+    """Build a ``lookup_<key>`` PredefinedTool per configured spec so a tenant's
+    agent can invoke the lookup. ``handler_name='backend_lookup'``; read-only, so
+    no confirmation. The tool's inputs are the ``{{ slots.X }}`` variables the
+    request templates reference, plus the identity-gate slots (which are required).
+    """
+    from app.services.predefined_tools_service import PredefinedTool
+
+    tools: list[Any] = []
+    for spec in specs or []:
+        slots: list[str] = list(spec.identity_gate or [])
+        for value in (spec.request_template or {}).values():
+            for m in _SLOT_RE.finditer(str(value)):
+                slots.append(m.group(1))
+        slots = list(dict.fromkeys(slots))  # dedupe, preserve order
+        props = {k: {"type": "string", "maxLength": 200} for k in slots}
+        tools.append(
+            PredefinedTool(
+                key=f"lookup_{spec.key}",
+                display_name=f"Lookup: {str(spec.key).replace('_', ' ').title()}",
+                description=(
+                    f"Fetch live '{spec.key}' from the business's own system (READ-ONLY). "
+                    "Only call after verifying the caller's identity when required."
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": props,
+                    "required": list(spec.identity_gate or []),
+                    "additionalProperties": False,
+                },
+                record_type=None,
+                handler_name="backend_lookup",
+                requires_confirmation=False,
+                metadata={"lookup_key": spec.key},
+            )
+        )
+    return tools
