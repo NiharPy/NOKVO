@@ -488,7 +488,27 @@ class NokvoOneAgentRuntime:
         custom_tabs: list[dict[str, Any]] | None = None,
         session_id: str | None = None,
     ) -> dict[str, Any]:
-        catalog_index = resolve_index(business_type, schema_overrides, custom_tabs)
+        # P5: load the tenant's configured Backend Lookup endpoints so their
+        # lookup_<key> tools are both in the catalog AND auto-enabled — configuring
+        # an endpoint IS the opt-in, so no separate tool_keys toggle is needed.
+        _backend_lookup_specs: list[Any] = []
+        try:
+            from app.models.tenant_resources import TenantResources
+            from app.services.backend_lookup import specs_from_provider_status
+            _tr = (
+                await db.execute(
+                    select(TenantResources).where(TenantResources.organization_id == organization_id)
+                )
+            ).scalars().first()
+            if _tr is not None:
+                _backend_lookup_specs = specs_from_provider_status(dict(_tr.provider_status or {}))
+        except Exception:
+            _backend_lookup_specs = []
+
+        catalog_index = resolve_index(
+            business_type, schema_overrides, custom_tabs,
+            backend_lookup_specs=_backend_lookup_specs,
+        )
         enabled: list[PredefinedTool] = []
         enabled_keys: set[str] = set()
         for raw_key in tool_keys or []:
@@ -497,6 +517,12 @@ class NokvoOneAgentRuntime:
             if tool is not None and tool.key not in enabled_keys:
                 enabled.append(tool)
                 enabled_keys.add(tool.key)
+        # Auto-enable configured Backend Lookup tools (opt-in = the endpoint config).
+        for _spec in _backend_lookup_specs:
+            _lt = catalog_index.get(f"lookup_{_spec.key}")
+            if _lt is not None and _lt.key not in enabled_keys:
+                enabled.append(_lt)
+                enabled_keys.add(_lt.key)
 
         projects_section = ""
         working_hours_section = ""
