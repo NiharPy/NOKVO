@@ -97,10 +97,54 @@ def test_missing_languages_are_skipped(monkeypatch):
     }
     _run(pw.prewarm_campaign_tts(object(), q))
     # Campaign lines missing a language are skipped; the GLOBAL busy-dealbreaker
-    # close is warmed for every language regardless (it's campaign-independent).
+    # close is warmed for every language regardless (it's campaign-independent),
+    # as is the micro-ack pool for the languages allowed to speak one.
     busy_lines = set(_BUSY_OUTROS.values())
-    assert [c["text"] for c in calls if c["text"] not in busy_lines] == ["Only EN"]
+    from app.services.apex_micro_acks import _enabled_ack_languages, ack_pool
+
+    ack_lines = {a for lg in _enabled_ack_languages() for a in ack_pool(None, lg)}
+    campaign_lines = {
+        c["text"] for c in calls if c["text"] not in busy_lines and c["text"] not in ack_lines
+    }
+    assert campaign_lines == {"Only EN"}
     assert busy_lines <= {c["text"] for c in calls}
+
+
+def test_ack_pools_are_only_warmed_for_reviewed_languages(monkeypatch):
+    """APEX_ACK_LANGUAGES gates which acks a call can speak; warming the others
+    would pay Sarvam for renditions of lines no call can ever reach."""
+    from app.core.config import settings
+    from app.services.apex_micro_acks import ack_pool
+
+    monkeypatch.setattr(settings, "APEX_ACK_ENABLED", True, raising=False)
+    monkeypatch.setattr(settings, "APEX_ACK_LANGUAGES", "en", raising=False)
+    calls = _capture(monkeypatch)
+    q = {
+        "questions": [{"id": "q1", "text": "Hi?",
+                       "text_i18n": {"en": "EN q", "hi": "HI q", "te": "TE q"}}],
+        "threshold": 1,
+    }
+    _run(pw.prewarm_campaign_tts(object(), q))
+    warmed = {c["text"] for c in calls}
+    assert set(ack_pool(None, "en")) <= warmed          # reviewed → warmed
+    assert not (set(ack_pool(None, "hi")) & warmed)     # drafts → never synthesized
+    assert not (set(ack_pool(None, "te")) & warmed)
+
+
+def test_every_rendition_variant_is_warmed(monkeypatch):
+    """Raising APEX_TTS_VARIANTS rotates cache keys per variant — each take has
+    to be synthesized or early calls pay live synthesis on scripted lines."""
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "APEX_TTS_VARIANTS", 3, raising=False)
+    monkeypatch.setattr(settings, "APEX_ACK_ENABLED", False, raising=False)
+    calls = _capture(monkeypatch)
+    q = {
+        "questions": [{"id": "q1", "text": "Hi?", "text_i18n": {"en": "Only EN"}}],
+        "threshold": 1,
+    }
+    _run(pw.prewarm_campaign_tts(object(), q))
+    assert len([c for c in calls if c["text"] == "Only EN"]) == 3
 
 
 def test_styled_campaign_prewarms_with_style_voice_overlay(monkeypatch):

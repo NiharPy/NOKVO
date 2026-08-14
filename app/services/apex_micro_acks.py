@@ -93,6 +93,20 @@ def ack_pool(style: str | None, lang_key: str) -> tuple[str, ...]:
     return STYLE_ACK_POOLS["default"].get(lang_key, ())
 
 
+def _enabled_ack_languages() -> frozenset[str]:
+    """Languages allowed to speak a micro-ack, from ``APEX_ACK_LANGUAGES``.
+
+    Separate from ``APEX_ACK_ENABLED`` because the two decisions are different:
+    the flag is "is this feature on", this is "whose words have been signed off".
+    The hi/te pools in :data:`STYLE_ACK_POOLS` are marked in-code as drafts
+    pending native-speaker review, and an unreviewed register going out to a
+    prospect is worse than no ack at all — an English "Got it." between Telugu
+    questions worse still. Add languages here as they're reviewed.
+    """
+    raw = str(getattr(settings, "APEX_ACK_LANGUAGES", "") or "")
+    return frozenset(p.strip().lower() for p in raw.split(",") if p.strip())
+
+
 def choose_ack(
     *,
     call_id: str,
@@ -104,22 +118,26 @@ def choose_ack(
 ) -> str | None:
     """The ack to speak before question ``question_idx``, or ``None`` to skip.
 
-    ``None`` when: the feature flag is off; the language has no pool; nothing
-    has been delivered yet (``delivered_count == 0`` — never ack the reply to
-    the opener/consent, and Q1 therefore never gets one); or the seeded
-    probability gate (``APEX_ACK_PROBABILITY``) doesn't fire for this
-    call+question. The RNG seed is ``"{call_id}:{question_idx}"`` so the
-    decision is reproducible per turn in debugging yet varied across calls,
-    and independent of the rendition-variant seed (ack pattern and voice take
-    don't correlate). ``last_ack`` is excluded so the same ack never plays
-    twice running. ``style`` (the campaign's conversation style) selects the
-    style-matched pool; scripted/unknown/empty uses the default pool.
+    ``None`` when: the feature flag is off; the language isn't in
+    ``APEX_ACK_LANGUAGES``; the language has no pool; nothing has been delivered
+    yet (``delivered_count == 0`` — never ack the reply to the opener/consent,
+    and Q1 therefore never gets one); or the seeded probability gate
+    (``APEX_ACK_PROBABILITY``) doesn't fire for this call+question. The RNG seed
+    is ``"{call_id}:{question_idx}"`` so the decision is reproducible per turn in
+    debugging yet varied across calls, and independent of the rendition-variant
+    seed (ack pattern and voice take don't correlate). ``last_ack`` is excluded
+    so the same ack never plays twice running. ``style`` (the campaign's
+    conversation style) selects the style-matched pool; scripted/unknown/empty
+    uses the default pool.
     """
     if not settings.APEX_ACK_ENABLED:
         return None
     if delivered_count <= 0:
         return None
-    pool = ack_pool(style, _lang_key(language))
+    lang = _lang_key(language)
+    if lang not in _enabled_ack_languages():
+        return None
+    pool = ack_pool(style, lang)
     if not pool:
         return None
     rng = random.Random(f"{call_id}:{question_idx}")

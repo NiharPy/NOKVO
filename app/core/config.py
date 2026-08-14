@@ -398,7 +398,10 @@ class Settings(BaseSettings):
     # wait and feel slow), we top up the total perceived gap — EOU tier wait +
     # delay + fetch — toward TARGET±JITTER: after a fast-tier EOU we add a
     # couple hundred ms; after the long continuation wait we add ZERO. 0 = off.
-    APEX_TURN_GAP_TARGET_MS: int = 0  # rollout value ~800
+    # ROLLOUT 2026-08-14: was 0 (off). The cached verbatim reply otherwise lands
+    # with near-constant, unnaturally fast latency on every single turn — the
+    # machine-gun cadence this knob was written for and then never switched on.
+    APEX_TURN_GAP_TARGET_MS: int = 800
     APEX_TURN_GAP_JITTER_MS: int = 120
     APEX_VERBATIM_DELAY_MAX_MS: int = 450
     # When a micro-ack will be spoken, the ACK is the gap-filler — clamp the
@@ -408,7 +411,14 @@ class Settings(BaseSettings):
     # "जी.", "Got it.") — seeded per call+question, never repeating the last
     # one, native-script pools only (en/hi/te). Fixes the interrogation cadence
     # without reintroducing the LLM stock-ack repetition this product banned.
-    APEX_ACK_ENABLED: bool = False
+    # ROLLOUT 2026-08-14: was False.
+    APEX_ACK_ENABLED: bool = True
+    # Which languages may actually speak an ack. ENGLISH ONLY for now: the hi/te
+    # pools in apex_micro_acks.STYLE_ACK_POOLS are drafts pending native-speaker
+    # review, and shipping an unreviewed register to a prospect is worse than
+    # staying silent. Widen to "en,hi,te" once someone has sounded them out
+    # through Sarvam. Comma-separated.
+    APEX_ACK_LANGUAGES: str = "en"
     APEX_ACK_PROBABILITY: float = 0.45
     APEX_ACK_GAP_MS: int = 250  # silence between ack and question (Plivo only)
     APEX_ACK_GAP_JITTER_MS: int = 80
@@ -416,13 +426,20 @@ class Settings(BaseSettings):
     # (x_variant, stripped before the request reaches Sarvam) so each line has N
     # distinct natural takes; a call picks one via crc32(call_id) and keeps it
     # for the whole call. 1 = exactly today's single-rendition behavior.
-    APEX_TTS_VARIANTS: int = 1
+    # ROLLOUT 2026-08-14: was 1 — i.e. every APEX call was the byte-identical
+    # waveform, which is both audibly robotic and trivially fingerprintable by
+    # carrier-side spam classifiers. Raising this ROTATES EVERY CACHE KEY: run
+    # scripts/apex_reprewarm.py before the first traffic or early calls pay live
+    # synthesis on every scripted line.
+    APEX_TTS_VARIANTS: int = 4
     # Optional audible spread across variants: variant k multiplies pace by
-    # 1 + spread*(k-(N+1)/2). 0.0 = rely on synthesis temperature alone.
+    # 1 + spread*(k-(N+1)/2). 0.0 = rely on synthesis temperature alone, which is
+    # real here — bulbul:v3 samples at temperature 0.6 and Sarvam's server-side
+    # response cache is off, so each variant is a genuinely different take.
     APEX_TTS_VARIANT_PACE_SPREAD: float = 0.0
     # Deterministic opener template variants (per-call crc32 rotation). 1 = the
-    # single current template.
-    APEX_OPENER_VARIANTS: int = 1
+    # single current template. ROLLOUT 2026-08-14: was 1.
+    APEX_OPENER_VARIANTS: int = 3
     # Wait up to this long after connect for the callee to finish their opening
     # "Hello?" before the agent speaks. Indian callers almost always speak first,
     # and the fixed 0.7s hold simply talked over them. Falls through the instant

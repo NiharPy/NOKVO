@@ -37,7 +37,7 @@ import logging
 from typing import Any, AsyncIterator
 
 from app.core.config import settings
-from app.services.apex_micro_acks import ack_pool
+from app.services.apex_micro_acks import _enabled_ack_languages, ack_pool
 from app.services.prosody import prosody_for, stream_prosody_chunks, style_prosody
 from app.services.sarvam_voice_service import SarvamVoiceService
 from app.models.tenant_resources import TenantResources
@@ -140,7 +140,11 @@ async def prewarm_campaign_tts(
         # mirrors _deliver_verbatim_question's ack site). The pool matches the
         # campaign's conversation style; pools are global per style×lang, so
         # after the first campaign of a style these are pure cache probes.
-        if settings.APEX_ACK_ENABLED:
+        # Only warm the languages that will actually SPEAK an ack: choose_ack
+        # gates on APEX_ACK_LANGUAGES (hi/te pools are drafts pending native-
+        # speaker review), so warming them would synthesize — and pay for —
+        # variants of lines no call can ever reach.
+        if settings.APEX_ACK_ENABLED and lang in _enabled_ack_languages():
             ack_prosody = prosody_for("warm", style)
             for ack in ack_pool(questionnaire.get("style"), lang):  # pool langs == prewarm langs
                 jobs.append(

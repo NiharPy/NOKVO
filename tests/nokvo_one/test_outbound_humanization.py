@@ -91,3 +91,54 @@ def test_outbound_eou_defaults_match_global():
         settings.VOICE_EOU_CONTINUATION_BONUS_MS_OUTBOUND
         == settings.VOICE_EOU_CONTINUATION_BONUS_MS
     )
+
+
+# ── the humanization layer is actually ON ────────────────────────────────────
+# All of this was built, tested and then shipped with every knob at its off/zero
+# default — one of them still carried "# rollout value ~800" beside a live 0. The
+# audible result was that every APEX call was the byte-identical waveform after a
+# near-constant response gap: robotic to a human, and a trivial fingerprint for a
+# carrier-side spam classifier.
+
+
+def test_humanization_layer_is_enabled():
+    assert settings.APEX_TURN_GAP_TARGET_MS > 0, "response gap shaping is off"
+    assert settings.APEX_TTS_VARIANTS > 1, "every call would share one waveform"
+    assert settings.APEX_OPENER_VARIANTS > 1, "every call would open identically"
+    assert settings.APEX_ACK_ENABLED is True
+
+
+def test_acks_are_english_only_until_the_indic_pools_are_reviewed():
+    """The hi/te pools are marked in-code as drafts pending native-speaker
+    review. Enabling the feature must not ship them."""
+    from app.services.apex_micro_acks import _enabled_ack_languages
+
+    langs = _enabled_ack_languages()
+    assert "en" in langs
+    assert "hi" not in langs and "te" not in langs
+
+
+def test_choose_ack_respects_the_language_gate(monkeypatch):
+    from app.services import apex_micro_acks as ma
+
+    monkeypatch.setattr(settings, "APEX_ACK_ENABLED", True, raising=False)
+    monkeypatch.setattr(settings, "APEX_ACK_PROBABILITY", 1.0, raising=False)
+    monkeypatch.setattr(settings, "APEX_ACK_LANGUAGES", "en", raising=False)
+
+    def ack(lang):
+        return ma.choose_ack(call_id="c1", question_idx=2, language=lang, delivered_count=1)
+
+    assert ack("en")            # reviewed language speaks
+    assert ack("hi") is None    # unreviewed stays silent
+    assert ack("te") is None
+    # Silence, never a fallback: an English "Got it." between Telugu questions
+    # would be worse than no ack at all.
+
+
+def test_widening_the_gate_re_enables_a_language(monkeypatch):
+    from app.services import apex_micro_acks as ma
+
+    monkeypatch.setattr(settings, "APEX_ACK_ENABLED", True, raising=False)
+    monkeypatch.setattr(settings, "APEX_ACK_PROBABILITY", 1.0, raising=False)
+    monkeypatch.setattr(settings, "APEX_ACK_LANGUAGES", "en,hi,te", raising=False)
+    assert ma.choose_ack(call_id="c1", question_idx=2, language="te", delivered_count=1)
