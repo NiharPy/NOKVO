@@ -2233,7 +2233,9 @@ class OutboundCampaignService:
                     dur_val = float(dur)
                 except (TypeError, ValueError):
                     dur_val = None
-            outcome = await v2.finalize_terminal_by_link(db, call_link_id, final, duration_s=dur_val)
+            outcome = await v2.finalize_terminal_by_link(
+                db, call_link_id, final, duration_s=dur_val, hangup_cause=(cause or None)
+            )
             if outcome is None:
                 return  # already terminal / unknown → idempotent no-op
             new_status, camp_id = outcome

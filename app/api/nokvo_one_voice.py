@@ -3263,6 +3263,26 @@ async def campaign_summary(
     return await v2.summary(db, campaign_id)
 
 
+@router.get("/campaigns/{campaign_id}/diagnostics")
+async def campaign_diagnostics_view(
+    campaign_id: uuid.UUID,
+    user: OrganizationUser = Depends(_bulk_viewer_dep()),
+    db: AsyncSession = Depends(deps.get_db),
+):
+    """Why this campaign performed the way it did.
+
+    Answer rate by hour and weekday, the hangup-cause histogram (which splits one
+    "no pickup" bucket back into the four different problems it was hiding), talk-
+    time distribution incl. the early-hangup share that distinguishes an opener
+    problem from a list problem, outcomes by opener/TTS rendition, per-question
+    drop-off, and the retry-readiness block that the retry cadence's offsets are
+    set from. All server-side aggregates — never loads rows."""
+    await _resolve_bulk_campaign(campaign_id, user, db)
+    from app.services.campaign_diagnostics import campaign_diagnostics
+
+    return await campaign_diagnostics(db, campaign_id)
+
+
 @router.get("/campaigns/{campaign_id}/contacts")
 async def campaign_contacts_page(
     campaign_id: uuid.UUID,

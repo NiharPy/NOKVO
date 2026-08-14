@@ -2191,14 +2191,13 @@ def generate_outbound_opener_text(
     """
     from app.core.config import settings
 
+    from app.services.apex_micro_acks import opener_variant_for_call
+
     caller = (context.caller_name or "Riya").strip() or "Riya"
     company = (context.company_name or "").strip()
-    _n = max(1, int(getattr(settings, "APEX_OPENER_VARIANTS", 1) or 1))
-    _v = (
-        zlib.crc32(str(variant_seed).encode("utf-8")) % _n
-        if variant_seed and _n > 1
-        else 0
-    )
+    # Shared with the answered-stamp so the recorded variant is always the one
+    # actually spoken (see apex_micro_acks.opener_variant_for_call).
+    _v = opener_variant_for_call(variant_seed)
 
     def _pick(options: tuple[str, ...]) -> str:
         return options[_v % len(options)]

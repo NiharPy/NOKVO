@@ -360,21 +360,37 @@ async def stamp_answered_by_link(db, call_link_id: str, ts: datetime) -> uuid.UU
     ``answered_count`` exactly once. A duplicate/late answered event matches
     nothing (idempotent) and, unlike the old unguarded write, can never re-open a
     ``completed`` row and re-bump the counter. Caller commits."""
+    # Which renditions this call speaks. Both are pure crc32(call_link_id), so
+    # they are recomputed here rather than threaded down through the voice stream
+    # — and they come from the SAME helpers the speech paths call, so the recorded
+    # variant cannot drift from the audio the callee actually heard. Recorded on
+    # answer because an unanswered call spoke nothing worth attributing.
+    from app.services.apex_micro_acks import opener_variant_for_call, tts_variant_for_call
+
     row = (await db.execute(
         text(
             "UPDATE outbound_campaign_contacts "
             "SET status = 'answered', answered_at = COALESCE(answered_at, CAST(:ts AS timestamptz)), "
-            "updated_at = now() "
+            "tts_variant = :tts_v, opener_variant = :op_v, updated_at = now() "
             "WHERE call_link_id = :clid AND status IN ('dialing', 'ringing') "
             "RETURNING campaign_id"
         ),
-        {"clid": call_link_id, "ts": ts.isoformat()},
+        {
+            "clid": call_link_id,
+            "ts": ts.isoformat(),
+            "tts_v": tts_variant_for_call(call_link_id),
+            "op_v": opener_variant_for_call(call_link_id),
+        },
     )).first()
     return row[0] if row else None
 
 
 async def finalize_terminal_by_link(
-    db, call_link_id: str, final: str, duration_s: float | None = None
+    db,
+    call_link_id: str,
+    final: str,
+    duration_s: float | None = None,
+    hangup_cause: str | None = None,
 ) -> tuple[str, uuid.UUID] | None:
     """GUARDED terminal transition, one statement: an ``answered`` row completes;
     a still-live pre-answer row lands on ``final`` (failed/no_answer). Race-safe
@@ -390,11 +406,16 @@ async def finalize_terminal_by_link(
         text(
             "UPDATE outbound_campaign_contacts "
             "SET status = CASE WHEN status = 'answered' THEN 'completed' ELSE :final END, "
-            "duration_s = COALESCE(CAST(:dur AS numeric), duration_s), updated_at = now() "
+            "duration_s = COALESCE(CAST(:dur AS numeric), duration_s), "
+            # The carrier's verbatim cause. Kept because 'no_answer' collapses four
+            # problems with four different fixes — invalid number, phone off, call
+            # rejected, genuinely nobody home — and the retry policy needs to tell
+            # them apart before it can decide what is worth dialing again.
+            "hangup_cause = COALESCE(:cause, hangup_cause), updated_at = now() "
             "WHERE call_link_id = :clid AND status IN ('dialing', 'ringing', 'answered') "
             "RETURNING status, campaign_id"
         ),
-        {"final": final, "dur": duration_s, "clid": call_link_id},
+        {"final": final, "dur": duration_s, "cause": hangup_cause, "clid": call_link_id},
     )).first()
     return (str(row[0]), row[1]) if row else None
 
@@ -548,7 +569,7 @@ async def requeue_abandoned(db, call_link_id: str) -> uuid.UUID | None:
         text(
             "UPDATE outbound_campaign_contacts "
             "SET status = 'pending', call_link_id = CAST(gen_random_uuid() AS text), "
-            "    call_id = NULL, answered_at = NULL, "
+            "    call_id = NULL, answered_at = NULL, abandoned = true, "
             "    result = COALESCE(result, '{}'::jsonb) "
             "             || jsonb_build_object('abandoned_at', to_jsonb(now())), "
             "    updated_at = now() "
@@ -654,7 +675,7 @@ async def bump_campaign_counter(db, campaign_id: uuid.UUID, field: str, n: int =
 _SUMMARY_TTL_S = 5  # dashboard tiles may be a few seconds stale; avoids re-scanning 1M
 
 
-async def summary(db, campaign_id: uuid.UUID) -> dict[str, int]:
+async def summary(db, campaign_id: uuid.UUID) -> dict[str, Any]:
     """Per-status counts + qualified via one indexed GROUP BY. Cached in Redis for
     a few seconds so the dashboard never re-scans a large table on every poll.
     Best-effort cache — a Redis hiccup just recomputes."""
@@ -677,7 +698,7 @@ async def summary(db, campaign_id: uuid.UUID) -> dict[str, int]:
     return out
 
 
-async def _summary_uncached(db, campaign_id: uuid.UUID) -> dict[str, int]:
+async def _summary_uncached(db, campaign_id: uuid.UUID) -> dict[str, Any]:
     rows = (await db.execute(
         text("SELECT status, count(*) n FROM outbound_campaign_contacts "
              "WHERE campaign_id = :c GROUP BY status"),
@@ -696,9 +717,22 @@ async def _summary_uncached(db, campaign_id: uuid.UUID) -> dict[str, int]:
              f"WHERE campaign_id = :c AND {BUCKET_SQL['busy']}"),
         {"c": str(campaign_id)},
     )).scalar_one()
+    # Retries scheduled but not yet due. Surfaced so a completed campaign that
+    # will start dialing again tomorrow reads as "23 retries scheduled, next
+    # 4:10 PM" rather than a finished campaign inexplicably coming back to life.
+    retry_row = (await db.execute(
+        text("SELECT count(*), min(next_attempt_at) FROM outbound_campaign_contacts "
+             "WHERE campaign_id = :c AND status = 'no_answer' AND next_attempt_at IS NOT NULL"),
+        {"c": str(campaign_id)},
+    )).first()
+    retry_scheduled = int(retry_row[0] or 0)
+    next_retry_at = retry_row[1].isoformat() if retry_row and retry_row[1] else None
+
     total = sum(by_status.values())
     return {
         "total": total,
+        "retry_scheduled": retry_scheduled,
+        "next_retry_at": next_retry_at,
         "qualified": int(qualified),
         "not_interested": max(0, by_status.get("completed", 0) - int(qualified) - int(busy)),
         "busy": int(busy),

@@ -2024,6 +2024,26 @@ class NokvoOneVoiceStreamService:
                                     "interest_outcome": _ls.interest_outcome,
                                     "interest_reason": _ls.reason,
                                 }
+                                # How far through the questionnaire this caller
+                                # actually got, from the authoritative delivered
+                                # set the verbatim path persists. Kept on the row
+                                # because it's the ONLY record of which questions
+                                # were ASKED (as opposed to scored), and a per-
+                                # question drop-off curve is what tells an operator
+                                # which question is losing them callers. The
+                                # session state is gone once the call is reaped, so
+                                # it has to be copied here or not at all.
+                                with contextlib.suppress(Exception):
+                                    _prog = (
+                                        await AgentSessionStore.get_state(
+                                            _bg_tenant_res, _bg_call_id
+                                        )
+                                        or {}
+                                    ).get("questionnaire_progress") or {}
+                                    _delivered = [
+                                        int(n) for n in (_prog.get("delivered") or [])
+                                    ]
+                                    _stamp["questions_delivered"] = sorted(set(_delivered))
                                 _log = (
                                     f"lead_score {_ls.score}/{_ls.max_score} "
                                     f"qualified={_ls.qualified}"

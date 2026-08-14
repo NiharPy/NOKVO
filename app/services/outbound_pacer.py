@@ -17,10 +17,10 @@ Two numbers, both measured per campaign from rows the dialer already writes:
 * **answer rate** — connects over completed dial attempts. The multiplier is its
   reciprocal, so ``free_slots × multiplier`` lines ringing produces, in
   expectation, exactly ``free_slots`` answers.
-* **abandon rate** — how often a connect found no free slot
-  (``result.abandoned_at``, stamped by ``campaign_contacts_v2.requeue_abandoned``).
-  Over ``APEX_PACER_MAX_ABANDON_PCT`` the multiplier drops to 1.0 until it
-  recovers.
+* **abandon rate** — how often a connect found no free slot (the ``abandoned``
+  column, set by ``campaign_contacts_v2.requeue_abandoned``; ``result.abandoned_at``
+  carries the timestamp). Over ``APEX_PACER_MAX_ABANDON_PCT`` the multiplier drops
+  to 1.0 until it recovers.
 
 Both are Redis-cached on the same short TTL as the dashboard summary — the
 dialer reads them on every refill and they move slowly. Every failure path
@@ -59,7 +59,7 @@ async def _stats(db, campaign_id: uuid.UUID) -> dict[str, int]:
             "SELECT "
             "  count(*) FILTER (WHERE status = ANY(:connected)) AS connected, "
             "  count(*) FILTER (WHERE status = ANY(:attempted)) AS attempted, "
-            "  count(*) FILTER (WHERE result ? 'abandoned_at')  AS abandoned "
+            "  count(*) FILTER (WHERE abandoned)               AS abandoned "
             "FROM outbound_campaign_contacts WHERE campaign_id = :c"
         ),
         {"c": str(campaign_id), "connected": list(_CONNECTED), "attempted": list(_ATTEMPTED)},

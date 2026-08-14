@@ -163,3 +163,22 @@ def tts_variant_for_call(call_id: str | None, n: int | None = None) -> int:
     if count <= 1 or not call_id:
         return 1
     return (zlib.crc32(str(call_id).encode("utf-8")) % count) + 1
+
+
+def opener_variant_for_call(call_id: str | None, n: int | None = None) -> int:
+    """Which opener template rendition (0..N-1) this call speaks.
+
+    The ONE definition, shared by ``generate_outbound_opener_text`` (which picks
+    the line) and the answered-stamp (which records what was picked), so the
+    reported variant can never drift from the words actually spoken. crc32 like
+    its sibling, NEVER the builtin ``hash()`` — that is process-salted, so
+    workers would disagree about the same call.
+
+    Note the range differs from :func:`tts_variant_for_call` on purpose: opener
+    variants index a template tuple from 0, TTS variants are 1-based because 1 is
+    the legacy no-salt cache key.
+    """
+    count = max(1, int(n if n is not None else (settings.APEX_OPENER_VARIANTS or 1)))
+    if count <= 1 or not call_id:
+        return 0
+    return zlib.crc32(str(call_id).encode("utf-8")) % count
