@@ -464,6 +464,27 @@ class Settings(BaseSettings):
     APEX_PACER_MAX_RING_AHEAD: int = 10
     # Finished dial attempts required before the measured answer rate is trusted.
     APEX_PACER_MIN_SAMPLE: int = 25
+    # ── APEX retry cadence ─────────────────────────────────────────────────────
+    # A no-answer is currently terminal: the only retry is an operator pressing
+    # Re-run. First-attempt connect rates on Indian mobile lists sit around
+    # 20-35%, so most of a paid-for list is simply never reached.
+    #
+    # SHIPS DARK at 1 attempt (no retries scheduled, exactly today's behaviour).
+    # The offsets cannot be chosen blind — a list of disconnected numbers wants no
+    # retry at all while a list of busy people wants a different hour — so enable
+    # this only after reading GET /campaigns/{id}/diagnostics `retry_readiness`
+    # on a week of real hangup-cause data.
+    APEX_RETRY_ATTEMPTS: int = 1
+    # Hours after a failed attempt to try again, one entry per retry: "3,26" =
+    # attempt 2 three hours later (different time of day), attempt 3 the next day
+    # (different day AND time). Empty = schedule nothing, whatever ATTEMPTS says.
+    APEX_RETRY_OFFSETS_HOURS: str = ""
+    # Hangup causes never worth re-dialing, matched as case-insensitive
+    # substrings. Deliberately only the UNAMBIGUOUSLY permanent ones: a number
+    # that does not exist will not start existing. BUSY / REJECTED / CONGESTION
+    # are POINTEDLY absent — whether those are worth a second call is exactly the
+    # judgement the cause histogram should settle, not a guess baked in here.
+    APEX_RETRY_SKIP_CAUSES: str = "INVALID,UNALLOCATED,DOES_NOT_EXIST,NUMBER_CHANGED"
     # Questionnaire translation register: when ON, the campaign-creation
     # translation prompt carries the spoken code-switch register rules
     # (language_style.py) so verbatim questions match the LLM turns' register

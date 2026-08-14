@@ -55,6 +55,67 @@ async def _tick_once() -> None:
             with suppress(Exception):
                 await db.rollback()
 
+        # Retry cadence: re-arm contacts whose scheduled second/third attempt has
+        # come due. A campaign COMPLETES as soon as its last row goes terminal
+        # (maybe_complete counts only pending + live rows, and a row waiting on
+        # next_attempt_at is neither), which is the right behaviour — it frees the
+        # tenant's single campaign slot instead of pinning it for days. So the
+        # sweep resumes the campaign the same way the stranded-webhook branch
+        # below does, and the same slot guard applies: a campaign whose retries
+        # are due simply waits its turn if another campaign is running.
+        #
+        # No-op while APEX_RETRY_ATTEMPTS is 1 — nothing ever gets scheduled.
+        try:
+            from app.services import campaign_contacts_v2 as v2r
+
+            for campaign_id in await v2r.campaigns_with_due_retries(db):
+                campaign = await db.get(OutboundCampaign, campaign_id)
+                if campaign is None or campaign.status not in (
+                    CampaignStatus.running, CampaignStatus.completed
+                ):
+                    continue
+                # Respect the campaign's calling window — a retry must not fire at
+                # 2 AM just because that's when it came due.
+                cfg = campaign.agent_config or {}
+                if cfg.get("call_window"):
+                    from app.services.outbound_campaign_service import (
+                        _ist_now,
+                        call_window_allows,
+                    )
+
+                    allowed, _reason = call_window_allows(cfg.get("call_window"), _ist_now())
+                    if not allowed:
+                        continue
+                rearmed = await v2r.rearm_due_retries(db, campaign_id)
+                if not rearmed:
+                    await db.commit()
+                    continue
+                if campaign.status == CampaignStatus.completed:
+                    try:
+                        await OutboundCampaignService._assert_no_other_active_campaign(
+                            db, campaign.tenant_id, exclude_id=campaign.id
+                        )
+                        campaign.status = CampaignStatus.running
+                        campaign.completed_at = None
+                        db.add(campaign)
+                    except ValueError:
+                        # Slot busy — the rows stay pending and this campaign is
+                        # picked up on a later tick, exactly like a stranded
+                        # webhook campaign.
+                        logger.info(
+                            "CAMPAIGN-RETRY: %s has %d retries armed but the tenant "
+                            "slot is busy — will resume later", campaign_id, rearmed,
+                        )
+                await db.commit()
+                logger.info(
+                    "CAMPAIGN-RETRY: re-armed %d due retries on campaign %s (status=%s)",
+                    rearmed, campaign_id, campaign.status,
+                )
+        except Exception:
+            logger.exception("CAMPAIGN-TICKER: retry sweep failed")
+            with suppress(Exception):
+                await db.rollback()
+
         # CRM-fed (webhook lead-source) campaigns: leads can land while the
         # campaign sits ``completed`` and another campaign holds the tenant's
         # single active slot (ingest then can't resume it). Once the slot frees,

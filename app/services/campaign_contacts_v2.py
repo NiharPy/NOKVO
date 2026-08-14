@@ -306,7 +306,13 @@ async def claim_pending(
                     "updated_at=now() WHERE id IN ("
                     "  SELECT id FROM outbound_campaign_contacts "
                     "  WHERE campaign_id = :c AND status = 'pending' "
-                    "  ORDER BY created_at LIMIT :k FOR UPDATE SKIP LOCKED"
+                    # attempt-then-age: a contact nobody has called yet always
+                    # outranks a retry, so a freshly-ingested CRM lead is never
+                    # queued behind a retry backlog. Served in index order by
+                    # ix_occ_campaign_claim (campaign_id, attempt, created_at)
+                    # partial on pending — the old campaign_id-only index made
+                    # this LIMIT sort every pending row in the campaign.
+                    "  ORDER BY attempt ASC, created_at ASC LIMIT :k FOR UPDATE SKIP LOCKED"
                     ") RETURNING id, phone, call_link_id"
                 ),
                 {"c": str(campaign_id), "k": k},
@@ -401,7 +407,46 @@ async def finalize_terminal_by_link(
     stale snapshot — a self-join loser would double-transition.) Replaces the
     SELECT-then-UPDATE that let concurrent Plivo retries double-bump counters.
     Returns (new_status, campaign_id) when this call transitioned the row, else
-    None (already terminal / unknown). Caller commits."""
+    None (already terminal / unknown). Caller commits.
+
+    A row that lands ``no_answer`` also gets its ``next_attempt_at`` stamped by
+    the retry policy — in the SAME guarded statement, so exactly one webhook can
+    schedule a retry no matter how many duplicates Plivo sends. The stamp is
+    computed from the row's OWN post-increment ``attempt``, inside SQL, because
+    the caller doesn't know it. With retries off (the shipped default) the policy
+    returns no offsets and the expression is a constant NULL."""
+    from app.services import outbound_retry
+
+    # Offsets as a SQL array indexed by attempt number, so the schedule reads the
+    # row's real attempt count rather than anything the caller passes in.
+    offsets = outbound_retry._offsets() if final == "no_answer" else []
+    limit = outbound_retry.max_attempts()
+    skip = list(outbound_retry._skip_causes())
+    retry_expr = "NULL"
+    if offsets and limit > 1:
+        retry_expr = (
+            "CASE WHEN :final = 'no_answer' "
+            # The row's PRE-update status, same as the status CASE above. Without
+            # it an answered call schedules a retry: its hangup carries a normal
+            # cause, so `final` is computed as 'no_answer' even though the row
+            # actually lands 'completed' — and we would re-dial someone who had
+            # already had the whole conversation.
+            "      AND status <> 'answered' "
+            "      AND attempt < :retry_limit "
+            "      AND attempt >= 1 AND attempt <= :n_offsets "
+            "      AND NOT EXISTS (SELECT 1 FROM unnest(CAST(:skip AS text[])) s "
+            "                      WHERE upper(COALESCE(:cause, '')) LIKE '%' || s || '%') "
+            "     THEN now() + (CAST(:offsets AS float8[]))[attempt] * interval '1 hour' "
+            "     ELSE NULL END"
+        )
+    params: dict[str, Any] = {
+        "final": final, "dur": duration_s, "cause": hangup_cause, "clid": call_link_id,
+    }
+    if retry_expr != "NULL":
+        params.update({
+            "retry_limit": limit, "n_offsets": len(offsets),
+            "skip": skip or [""], "offsets": offsets,
+        })
     row = (await db.execute(
         text(
             "UPDATE outbound_campaign_contacts "
@@ -411,11 +456,12 @@ async def finalize_terminal_by_link(
             # problems with four different fixes — invalid number, phone off, call
             # rejected, genuinely nobody home — and the retry policy needs to tell
             # them apart before it can decide what is worth dialing again.
-            "hangup_cause = COALESCE(:cause, hangup_cause), updated_at = now() "
+            "hangup_cause = COALESCE(:cause, hangup_cause), "
+            f"next_attempt_at = {retry_expr}, updated_at = now() "
             "WHERE call_link_id = :clid AND status IN ('dialing', 'ringing', 'answered') "
             "RETURNING status, campaign_id"
         ),
-        {"final": final, "dur": duration_s, "cause": hangup_cause, "clid": call_link_id},
+        params,
     )).first()
     return (str(row[0]), row[1]) if row else None
 
@@ -579,6 +625,54 @@ async def requeue_abandoned(db, call_link_id: str) -> uuid.UUID | None:
         {"clid": call_link_id},
     )).first()
     return row[0] if row else None
+
+
+async def rearm_due_retries(db, campaign_id: uuid.UUID, limit: int = 500) -> int:
+    """Re-arm contacts whose scheduled retry has come due.
+
+    Same shape as :func:`rearm_unreached`'s no_pickup branch — back to
+    ``pending`` with a FRESH ``call_link_id`` so a late webhook from the previous
+    attempt can never touch the retry — plus clearing ``next_attempt_at`` so the
+    row can't be re-armed twice. ``attempt`` is deliberately preserved: it is the
+    budget counter the policy reads, and the claim's ``ORDER BY attempt`` uses it
+    to keep first attempts ahead of retries.
+
+    Bounded per sweep so one enormous campaign can't monopolise a tick."""
+    res = await db.execute(
+        text(
+            "UPDATE outbound_campaign_contacts SET status = 'pending', "
+            "call_link_id = CAST(gen_random_uuid() AS text), call_id = NULL, "
+            "next_attempt_at = NULL, updated_at = now() "
+            "WHERE id IN ("
+            "  SELECT id FROM outbound_campaign_contacts "
+            "  WHERE campaign_id = :c AND status = 'no_answer' "
+            "    AND next_attempt_at IS NOT NULL AND next_attempt_at <= now() "
+            "  ORDER BY next_attempt_at LIMIT :lim FOR UPDATE SKIP LOCKED"
+            ")"
+        ),
+        {"c": str(campaign_id), "lim": max(1, int(limit))},
+    )
+    return int(res.rowcount or 0)
+
+
+async def campaigns_with_due_retries(db, limit: int = 100) -> list[uuid.UUID]:
+    """Campaigns holding at least one contact whose retry is due — running OR
+    completed. A campaign completes the moment its last row goes terminal, so by
+    the time a retry falls due the campaign it belongs to is almost always
+    ``completed``; the sweep resumes it (slot permitting) rather than the
+    campaign being held open for days waiting."""
+    rows = (await db.execute(
+        text(
+            "SELECT DISTINCT occ.campaign_id FROM outbound_campaign_contacts occ "
+            "JOIN outbound_campaigns c ON c.id = occ.campaign_id "
+            "WHERE occ.status = 'no_answer' AND occ.next_attempt_at IS NOT NULL "
+            "  AND occ.next_attempt_at <= now() "
+            "  AND c.status IN ('running', 'completed') "
+            "LIMIT :lim"
+        ),
+        {"lim": max(1, int(limit))},
+    )).all()
+    return [r[0] for r in rows]
 
 
 async def pending_count(db, campaign_id: uuid.UUID) -> int:
