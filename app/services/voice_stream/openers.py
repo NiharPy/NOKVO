@@ -8,6 +8,8 @@ working). The service class keeps delegating wrappers - no API change.
 """
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 from time import perf_counter
 from typing import Any
@@ -18,11 +20,38 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.tenant_resources import TenantResources
+from app.services.agent_robustness import TurnArbiter
 from app.services.agent_session_store import AgentSessionStore
 from app.services.prosody import DEFAULT_TONE, ProsodyChunk, prosody_for, stream_prosody_chunks, style_prosody
 from app.services.sarvam_voice_service import SarvamVoiceService
 
 logger = logging.getLogger(__name__)
+
+# Never hold the speaking flag longer than this, however the playout clock reads.
+# A wedged clock must not leave the arbiter believing the agent is mid-sentence
+# for the rest of the call — that would classify every later utterance as a
+# barge-in. Comfortably longer than any opener.
+_MAX_PLAYOUT_WAIT_S = 30.0
+
+
+async def _await_playout(websocket: WebSocket) -> None:
+    """Block until audio already handed to the telephony adapter has finished
+    playing. No-op on transports without a playback queue (the web test call's
+    raw WebSocket), which is why it is reached duck-typed.
+
+    Polls rather than sleeping once: the remaining time grows as later sentences
+    are queued, and a ``clearAudio`` on barge-in resets the clock to now, so this
+    returns promptly when the caller interrupts."""
+    remaining = getattr(websocket, "playout_remaining_s", None)
+    if remaining is None:
+        return
+    deadline = asyncio.get_running_loop().time() + _MAX_PLAYOUT_WAIT_S
+    with contextlib.suppress(Exception):
+        while asyncio.get_running_loop().time() < deadline:
+            left = float(remaining())
+            if left <= 0:
+                return
+            await asyncio.sleep(min(left, 0.2))
 
 
 async def _resolve_business_type(
@@ -266,6 +295,8 @@ async def _play_opener(
     call_id: str | None = None,
     campaign_context: dict[str, Any] | None = None,
     style: str = "",
+    arbiter: TurnArbiter | None = None,
+    turn_state: dict[str, Any] | None = None,
 ) -> None:
     """Deterministic prosody-aware opener — no LLM round-trip.
 
@@ -273,6 +304,21 @@ async def _play_opener(
     sending the opener through ``_run_text_turn``. The opening text may
     contain prosody tags (``[warm]…[/warm] [neutral]…[/neutral]``); if
     none are present, the whole opener is voiced as ``[warm]``.
+
+    ``arbiter``/``turn_state`` put the opener inside the turn-taking state
+    machine, exactly like every other utterance the agent produces
+    (:func:`_deliver_verbatim_question`, ``_speak_outro_and_end``). This used to
+    be the ONE speech path that skipped it, which mattered most precisely where
+    it hurt: the opener is the first six-to-eight seconds of an outbound call, so
+    the arbiter read IDLE while the agent was greeting a stranger. A "Hello?" over
+    the intro was classified as a fresh turn rather than a barge-in, nothing
+    flushed the queued audio, and the agent's reply stacked up behind an opener
+    still playing. Callers heard it talk over them and then answer a question
+    from ten seconds ago.
+
+    The speaking flag is held for the audio's REAL duration (the adapter's playout
+    clock), not until the last byte is handed to the telephony socket — those
+    differ by the whole length of the greeting.
     """
     from app.services.apex_micro_acks import tts_variant_for_call
 
@@ -284,6 +330,10 @@ async def _play_opener(
     turn_id = str(uuid.uuid4())[:8]
     started = perf_counter()
     _variant = tts_variant_for_call(call_id)
+    # THINKING → SPEAKING mirrors a normal turn. mark_speaking only advances from
+    # THINKING, so the turn must be begun before the first audio goes out.
+    if arbiter is not None and not arbiter.is_active:
+        arbiter.begin(turn_id=f"opener-{turn_id}")
     await websocket.send_json({"type": "agent_thinking", "turn_id": turn_id, "query": "(opener)"})
 
     async def _single_chunk_stream():
@@ -297,6 +347,12 @@ async def _play_opener(
             continue
         if first_sentence_ms is None:
             first_sentence_ms = int((perf_counter() - started) * 1000)
+            # First audio is about to go out — from here a caller utterance is a
+            # genuine interruption, not a new turn.
+            if turn_state is not None:
+                turn_state["speaking"] = True
+            if arbiter is not None:
+                arbiter.mark_speaking()
         answer_parts.append(sentence)
         await websocket.send_json(
             {
@@ -333,6 +389,12 @@ async def _play_opener(
                 }
             )
 
+    # Every byte is on the socket, but the callee is still LISTENING. Hold the
+    # speaking flag for the audio's real remaining duration so a barge-in during
+    # the greeting is classified as one; a caller who interrupts cancels this
+    # task, which is what makes the wait interruptible rather than a dead sleep.
+    await _await_playout(websocket)
+
     # Record the opener as an assistant turn so the LLM sees it as
     # context for the caller's first reply.
     joined = " ".join(answer_parts).strip()
@@ -359,3 +421,7 @@ async def _play_opener(
             "filler_played": False,
         }
     )
+    if turn_state is not None:
+        turn_state["speaking"] = False
+    if arbiter is not None:
+        arbiter.mark_done()

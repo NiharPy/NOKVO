@@ -14,6 +14,7 @@ import asyncio
 import base64
 import json
 import logging
+import time
 
 from fastapi import WebSocket
 
@@ -55,6 +56,15 @@ class PlivoWebSocketAdapter(TwilioWebSocketAdapter):
             except Exception:
                 self._denoiser = None
         self._audio_chunks = 0  # for periodic level logging
+        # PLAYOUT CLOCK — monotonic timestamp at which everything handed to Plivo
+        # so far will have finished being heard. Sends are fire-and-forget: a
+        # `playAudio` returns as soon as the bytes are on the socket, while the
+        # callee is still listening to them seconds later. Without this the caller
+        # of a speech helper has no way to know the agent is still talking, which
+        # is how the outbound opener came to run outside the turn arbiter entirely
+        # — the arbiter read IDLE through the whole greeting, so a "Hello?" over
+        # the intro was treated as a fresh turn instead of a barge-in.
+        self._playout_until = 0.0
 
     async def accept(self) -> None:
         try:
@@ -74,7 +84,8 @@ class PlivoWebSocketAdapter(TwilioWebSocketAdapter):
         samples, rate = _parse_tts_audio(audio_bytes)
         rate_out = settings.PLIVO_DEFAULT_SAMPLE_RATE or 8000
         pcm = _resample(samples, rate, rate_out)
-        pcm_b64 = base64.b64encode(pcm.tobytes()).decode()
+        pcm_bytes = pcm.tobytes()
+        pcm_b64 = base64.b64encode(pcm_bytes).decode()
         try:
             await self._ws.send_text(json.dumps({
                 "event": "playAudio",
@@ -84,15 +95,34 @@ class PlivoWebSocketAdapter(TwilioWebSocketAdapter):
                     "payload": pcm_b64,
                 },
             }))
+            self._extend_playout(len(pcm_bytes) / 2 / max(1, rate_out))
         except Exception as exc:  # noqa: BLE001 — best-effort playback
             _log.debug("[PLIVO-WS] playAudio send failed: %s", exc)
 
+    def _extend_playout(self, seconds: float) -> None:
+        """Queue ``seconds`` of audio behind whatever is already playing."""
+        if seconds <= 0:
+            return
+        self._playout_until = max(self._playout_until, time.monotonic()) + seconds
+
+    def playout_remaining_s(self) -> float:
+        """Seconds of already-sent audio the callee has still to hear. 0 when the
+        line is quiet. Callers reach this duck-typed (``hasattr``) — the web test
+        call's raw WebSocket has no playback queue and simply skips it."""
+        return max(0.0, self._playout_until - time.monotonic())
+
     async def clear_playback(self) -> None:
-        """Stop buffered playback on barge-in (Plivo `clearAudio`)."""
+        """Stop buffered playback on barge-in (Plivo `clearAudio`).
+
+        Cancelling the LLM stream and the TTS pump stops us GENERATING more
+        speech, but everything already handed to Plivo keeps playing — so without
+        this the agent talked over the caller for the rest of the queued sentence
+        after they interrupted. The playout clock resets with it."""
         try:
             await self._ws.send_text(json.dumps({"event": "clearAudio"}))
         except Exception:  # noqa: BLE001
             pass
+        self._playout_until = time.monotonic()
 
     async def send_silence_ms(self, ms: int) -> None:
         """Queue ``ms`` of pure L16 silence on Plivo's playback queue — the
@@ -123,6 +153,7 @@ class PlivoWebSocketAdapter(TwilioWebSocketAdapter):
                         "payload": payload,
                     },
                 }))
+                self._extend_playout(frame_ms / 1000)
         except Exception as exc:  # noqa: BLE001 — best-effort playback
             _log.debug("[PLIVO-WS] silence send failed: %s", exc)
 

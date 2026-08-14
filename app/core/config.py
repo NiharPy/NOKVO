@@ -423,6 +423,12 @@ class Settings(BaseSettings):
     # Deterministic opener template variants (per-call crc32 rotation). 1 = the
     # single current template.
     APEX_OPENER_VARIANTS: int = 1
+    # Wait up to this long after connect for the callee to finish their opening
+    # "Hello?" before the agent speaks. Indian callers almost always speak first,
+    # and the fixed 0.7s hold simply talked over them. Falls through the instant
+    # they stop, so a silent pickup costs nothing beyond the window. 0 = today's
+    # behaviour (fixed hold, then speak); rollout value ~1500.
+    APEX_OPENER_LISTEN_MS: int = 0
     # ── APEX dial pacing ───────────────────────────────────────────────────────
     # The conversation cap (plan concurrency) is always enforced. The pacer only
     # decides how many lines may RING to fill those slots. OFF = one line per free

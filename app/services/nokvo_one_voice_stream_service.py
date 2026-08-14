@@ -556,13 +556,15 @@ class NokvoOneVoiceStreamService:
         call_id: str | None = None,
         campaign_context: dict[str, Any] | None = None,
         style: str = "",
+        arbiter: TurnArbiter | None = None,
+        turn_state: dict[str, Any] | None = None,
     ) -> None:
         # Body extracted to app.services.voice_stream.openers._play_opener
         # (turn_router helpers pattern; wrapper preserves the class API
         # and class-attribute monkeypatches).
         from app.services.voice_stream.openers import _play_opener
 
-        return await _play_opener(websocket, tenant_res, opening_text, language=language, call_id=call_id, campaign_context=campaign_context, style=style)
+        return await _play_opener(websocket, tenant_res, opening_text, language=language, call_id=call_id, campaign_context=campaign_context, style=style, arbiter=arbiter, turn_state=turn_state)
 
     @staticmethod
     async def run_session(
@@ -709,6 +711,28 @@ class NokvoOneVoiceStreamService:
                     )
                     outbound_context = None
             proactive_watchdog: ProactiveSilenceWatchdog | None = None
+            # Set by the receive loop the first time the callee's speech ENDS, so
+            # the outbound opener can wait for their "Hello?" instead of talking
+            # over it. An Event, not a flag: the opener awaits it directly.
+            callee_spoke_first = asyncio.Event()
+
+            async def _wait_before_opener() -> None:
+                """Hold the opener until the line is ready to be spoken into.
+
+                Always waits ``_OUTBOUND_OPENER_DELAY_SECONDS`` so the callee's
+                audio path is up and the intro isn't clipped. Then, when
+                ``APEX_OPENER_LISTEN_MS`` is set, waits up to that long for the
+                callee to finish their opening word — Indian callers almost always
+                speak first, and a fixed delay simply talks over them. Falls
+                through the moment they stop speaking, or when the window expires
+                if they never do."""
+                if _OUTBOUND_OPENER_DELAY_SECONDS > 0:
+                    await asyncio.sleep(_OUTBOUND_OPENER_DELAY_SECONDS)
+                listen_ms = int(getattr(settings, "APEX_OPENER_LISTEN_MS", 0) or 0)
+                if listen_ms <= 0:
+                    return
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(callee_spoke_first.wait(), timeout=listen_ms / 1000)
 
             async def _arm_proactive_watchdog() -> None:
                 if proactive_watchdog is not None:
@@ -1204,6 +1228,15 @@ class NokvoOneVoiceStreamService:
                 # at the next await and abort the barge mid-way.
                 pending_barge_task = None
                 await robustness.arbiter.cancel()
+                # Cancelling the turn stops us GENERATING more speech; audio
+                # already handed to the carrier keeps playing regardless. Without
+                # this flush the agent talked over the caller for the rest of the
+                # queued sentence after they interrupted — clear_playback existed
+                # for exactly this and had no callers.
+                _flush = getattr(websocket, "clear_playback", None)
+                if _flush is not None:
+                    with contextlib.suppress(Exception):
+                        await _flush()
                 _cancel_eou_timer()
                 utterance_segments.clear()
                 utterance_audio.clear()
@@ -1340,6 +1373,9 @@ class NokvoOneVoiceStreamService:
                                 if pending_barge_task is not None:
                                     _cancel_pending_barge()
                                     logger.info("NOKVO-BARGEIN: suppressed:blip call=%s", call_id)
+                                # Releases an outbound opener waiting on the
+                                # callee's "Hello?" (APEX_OPENER_LISTEN_MS).
+                                callee_spoke_first.set()
                                 if utterance_segments:
                                     _restart_eou_timer()
                                 continue
@@ -1396,52 +1432,70 @@ class NokvoOneVoiceStreamService:
             # verbatim (zero LLM latency). Otherwise we kick the outbound agent
             # off with PROACTIVE_OPENER_PROMPT so it generates a campaign-aware
             # opener from the system fragment + brief.
-            if opening:
-                # A pre-generated, ready-to-speak opener (real text, NOT an
-                # instruction — see the call sites). Played verbatim, zero LLM.
-                await NokvoOneVoiceStreamService._play_opener(
-                    websocket,
-                    tenant_res,
-                    opening,
-                    language=language,
-                    call_id=call_id,
-                    campaign_context=campaign_context,
-                    style=_campaign_voice_style(outbound_context),
-                )
-                await _arm_proactive_watchdog()
-            elif outbound_context is not None:
-                # Use the deterministic, template-filled opener — no LLM call,
-                # ~150ms faster first audio. The LLM takes over from turn 2.
-                # Personalise from what we already know about this lead (enquiry
-                # details + any prior call) so it opens warm, not one-size-fits-all.
-                opener_facts = await NokvoOneVoiceStreamService._outbound_opener_known_facts(
-                    db, tenant_res, campaign_context
-                )
-                outbound_opening_text = generate_outbound_opener_text(
-                    outbound_context,
-                    language=language,
-                    known_facts=opener_facts,
-                    # Per-call rotation (APEX_OPENER_VARIANTS): a re-dialed lead
-                    # hears a different greeting/consent tail on each attempt.
-                    variant_seed=call_id,
-                )
-                # Let the callee's audio path come up before we speak, so the
-                # intro isn't clipped (see _OUTBOUND_OPENER_DELAY_SECONDS). The
-                # opener still plays before the receive loop starts, so it always
-                # leads — we just hold it a beat. Any media arriving during the
-                # pause buffers and is drained once we start reading the socket.
-                if _OUTBOUND_OPENER_DELAY_SECONDS > 0:
-                    await asyncio.sleep(_OUTBOUND_OPENER_DELAY_SECONDS)
-                await NokvoOneVoiceStreamService._play_opener(
-                    websocket,
-                    tenant_res,
-                    outbound_opening_text,
-                    language=language,
-                    call_id=call_id,
-                    campaign_context=campaign_context,
-                    style=_campaign_voice_style(outbound_context),
-                )
-                await _arm_proactive_watchdog()
+            if opening or outbound_context is not None:
+                # OUTBOUND OPENER — runs as an arbiter-registered TASK, not inline.
+                #
+                # It used to be awaited here, before the receive loop started, so
+                # the agent was deaf for the whole greeting and the arbiter read
+                # IDLE while it spoke. A callee's "Hello?" over the intro could not
+                # be a barge-in (nothing was "speaking"), nothing flushed the queued
+                # audio, and their first real reply queued behind an opener still
+                # playing. As a task the receive loop starts immediately and the
+                # existing barge-in machinery — sustained-speech gate, arbiter
+                # cancel, clearAudio flush — covers the opener like any other turn.
+                if opening:
+                    # A pre-generated, ready-to-speak opener (real text, NOT an
+                    # instruction — see the call sites). Played verbatim, zero LLM.
+                    outbound_opening_text = opening
+                else:
+                    # Deterministic, template-filled opener — no LLM call, ~150ms
+                    # faster first audio. The LLM takes over from turn 2. Personalise
+                    # from what we already know about this lead (enquiry details +
+                    # any prior call) so it opens warm, not one-size-fits-all.
+                    opener_facts = await NokvoOneVoiceStreamService._outbound_opener_known_facts(
+                        db, tenant_res, campaign_context
+                    )
+                    outbound_opening_text = generate_outbound_opener_text(
+                        outbound_context,
+                        language=language,
+                        known_facts=opener_facts,
+                        # Per-call rotation (APEX_OPENER_VARIANTS): a re-dialed lead
+                        # hears a different greeting/consent tail on each attempt.
+                        variant_seed=call_id,
+                    )
+
+                _opener_state: dict[str, Any] = {"speaking": False}
+                turn_state = _opener_state
+
+                async def _outbound_opener_task(text=outbound_opening_text, st=_opener_state) -> None:
+                    try:
+                        # Hold for the callee's audio path to come up so the intro
+                        # isn't clipped, and (when APEX_OPENER_LISTEN_MS is set) for
+                        # their opening "Hello?" — answering that before launching
+                        # into the pitch is what a person does, and it doubles as
+                        # free human-vs-IVR evidence. The receive loop is already
+                        # running, so their speech lands as a normal utterance.
+                        await _wait_before_opener()
+                        await NokvoOneVoiceStreamService._play_opener(
+                            websocket,
+                            tenant_res,
+                            text,
+                            language=language,
+                            call_id=call_id,
+                            campaign_context=campaign_context,
+                            style=_campaign_voice_style(outbound_context),
+                            arbiter=robustness.arbiter,
+                            turn_state=st,
+                        )
+                        # Armed only once the greeting has actually been HEARD —
+                        # arming at send time started the silence timer while the
+                        # agent was still talking.
+                        await _arm_proactive_watchdog()
+                    except asyncio.CancelledError:
+                        pass
+
+                current_turn = asyncio.create_task(_outbound_opener_task())
+                robustness.arbiter.begin(turn_id="opener", task=current_turn)
             else:
                 async def _delayed_inbound_opener() -> None:
                     try:
