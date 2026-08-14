@@ -346,8 +346,83 @@ async def test_rerun_canonicalizes_and_dedupes_old_raw_contacts(monkeypatch):
 
 
 def test_bulk_dial_concurrency_is_five():
+    """Non-APEX bulk keeps the platform default — APEX overrides it per plan."""
     from app.services.outbound_campaign_service import OutboundCampaignService
     assert OutboundCampaignService.BULK_DIAL_CONCURRENCY == 5
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tier,plan,stamped,expected",
+    [
+        ("nokvo_apex", "core", 1, 1),        # Core sells ONE conversation
+        ("nokvo_apex", "growth", 2, 2),
+        ("nokvo_apex", "pinnacle", 4, 4),
+        ("nokvo_apex", "core", None, 1),     # legacy row → catalog fallback
+        ("nokvo_one", None, None, 5),        # non-APEX bulk unchanged
+    ],
+)
+async def test_dial_cap_follows_the_plan_not_a_constant(monkeypatch, tier, plan, stamped, expected):
+    """The dialer must claim against the CONVERSATION cap the customer bought.
+
+    Regression for the defect where the dialer placed BULK_DIAL_CONCURRENCY (5)
+    calls regardless of plan while the media WS admitted only `concurrency` of
+    them — so on Core four out of every five people who picked up were hung up on.
+    """
+    import uuid as _uuid
+    from types import SimpleNamespace
+    from app.models.outbound_campaign import CampaignStatus, OutboundCampaign
+    from app.services.outbound_campaign_service import OutboundCampaignService
+
+    seen = {}
+
+    async def fake_v2(campaign, db, **kw):
+        seen["cap"] = kw.get("conversation_cap")
+
+    monkeypatch.setattr(OutboundCampaignService, "_dial_pending_v2", staticmethod(fake_v2))
+
+    class _OrgDB:
+        def __init__(self):
+            self._row = (tier, True, stamped, plan)
+
+        async def execute(self, stmt, params=None):
+            row = self._row
+
+            class _R:
+                def first(self):
+                    return row
+
+            return _R()
+
+    camp = OutboundCampaign(
+        id=_uuid.uuid4(), tenant_id="t1", name="c", status=CampaignStatus.running,
+        agent_config={"bulk_csv": True}, contacts=None,
+    )
+    tr = SimpleNamespace(tenant_id="t1", organization_id=_uuid.uuid4(), provider_status={})
+    monkeypatch.setattr(
+        "app.services.minute_balance_service.has_balance",
+        _AsyncReturn(True),
+        raising=False,
+    )
+    # The non-APEX case would otherwise stop at the Nokvo One outbound kill switch
+    # before reaching the dialer at all; this test is about the cap, not the gate.
+    from app.core.config import settings as _settings
+
+    monkeypatch.setattr(_settings, "NOKVO_ONE_OUTBOUND_ENABLED", True, raising=False)
+    await OutboundCampaignService._dial_pending(
+        camp, _OrgDB(), tenant_res=tr, base="https://x", prefix="/api"
+    )
+    assert seen["cap"] == expected
+
+
+class _AsyncReturn:
+    """Callable returning a fixed value from an awaited call."""
+
+    def __init__(self, value):
+        self._value = value
+
+    async def __call__(self, *a, **kw):
+        return self._value
 
 
 @pytest.mark.asyncio
@@ -585,7 +660,9 @@ async def test_dial_pending_stops_when_calling_disabled(monkeypatch):
 
     class _OrgDB:
         def __init__(self, calling_enabled):
-            self._row = ("nokvo_apex", calling_enabled)
+            # (product_tier, calling_enabled, apex_concurrency, apex_plan_code) —
+            # the dialer resolves the plan's CONVERSATION cap from the same read.
+            self._row = ("nokvo_apex", calling_enabled, 1, "core")
 
         async def execute(self, stmt, params=None):
             row = self._row

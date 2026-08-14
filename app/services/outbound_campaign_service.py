@@ -1839,18 +1839,39 @@ class OutboundCampaignService:
         _org_tier: str | None = None
         _calling_enabled = True
         _tier_resolved = False
+        # CONVERSATION cap for this campaign. For APEX this is the plan's
+        # concurrency (Core 1 / Growth 2 / Pinnacle 4) — the number the customer
+        # actually bought, and the same value the answer webhook admits against.
+        # The dialer used to ignore it entirely and place BULK_DIAL_CONCURRENCY
+        # calls regardless, so every answer past the plan's limit was hung up on.
+        # Non-APEX bulk keeps the platform default.
+        _conv_cap = OutboundCampaignService.BULK_DIAL_CONCURRENCY
         if tenant_res is not None:
             try:
                 _org_row = (
                     await db.execute(
-                        select(Organization.product_tier, Organization.calling_enabled).where(
-                            Organization.id == tenant_res.organization_id
-                        )
+                        select(
+                            Organization.product_tier,
+                            Organization.calling_enabled,
+                            Organization.apex_concurrency,
+                            Organization.apex_plan_code,
+                        ).where(Organization.id == tenant_res.organization_id)
                     )
                 ).first()
                 if _org_row is not None:
                     _org_tier = _org_row[0]
                     _calling_enabled = bool(_org_row[1])
+                    if (_org_tier or "") == "nokvo_apex":
+                        from types import SimpleNamespace
+
+                        from app.services.apex_plans import get_apex_concurrency
+
+                        # get_apex_concurrency reads by getattr (stamped column,
+                        # catalog fallback) — no need to hydrate the whole ORM row
+                        # on a path that runs on every call-end refill.
+                        _conv_cap = max(1, int(get_apex_concurrency(SimpleNamespace(
+                            apex_concurrency=_org_row[2], apex_plan_code=_org_row[3]
+                        ))))
                 _tier_resolved = True
             except Exception:
                 logger.exception("NOKVO-CAMPAIGN: product-tier lookup failed for %s", campaign.id)
@@ -1937,6 +1958,7 @@ class OutboundCampaignService:
                 campaign, db,
                 tenant_res=tenant_res, base=base, prefix=prefix,
                 call_window=(_cfg.get("call_window") if _apex_scheduled else None),
+                conversation_cap=_conv_cap,
             )
             return
 
@@ -1961,10 +1983,14 @@ class OutboundCampaignService:
             logger.warning("NOKVO-CAMPAIGN: %s hit daily cap %d — not dialing", campaign.id, _calls_per_day)
             await db.commit()  # release the FOR UPDATE lock
             return
-        # Bulk CSV campaigns always fan out up to BULK_DIAL_CONCURRENCY (5) lines
-        # at once, independent of the global per-tenant dial concurrency.
+        # Bulk CSV campaigns fan out up to the CONVERSATION cap resolved above —
+        # the APEX plan's concurrency, or BULK_DIAL_CONCURRENCY (5) for non-APEX —
+        # independent of the global per-tenant dial concurrency. The blob path
+        # has no ring-ahead: _inflight_count counts placed-and-not-ended contacts,
+        # so this cap already bounds answered calls. (The pacer is V2-only; legacy
+        # blob campaigns are a shrinking rollback path, not worth the complexity.)
         if OutboundCampaignService._is_bulk(campaign):
-            cap = OutboundCampaignService.BULK_DIAL_CONCURRENCY
+            cap = _conv_cap
         else:
             cap = max(1, int(settings.OUTBOUND_DIAL_CONCURRENCY or 5))
         caller_id, auth_override = OutboundCampaignService._dial_params(campaign, tenant_res)
@@ -2045,14 +2071,20 @@ class OutboundCampaignService:
         base: str,
         prefix: str,
         call_window: dict | None = None,
+        conversation_cap: int | None = None,
     ) -> None:
         """V2 dialer: two-phase claim. Phase 1 = advisory-locked indexed claim
         (``campaign_contacts_v2.claim_pending``, holds no network I/O). Phase 2 =
         dial-time DND scrub + Plivo placement, with NO lock held. Concurrency cap +
-        daily cap are enforced in the claim; per-row status is updated O(1)."""
+        daily cap are enforced in the claim; per-row status is updated O(1).
+
+        ``conversation_cap`` is the number of simultaneous CONVERSATIONS allowed —
+        the APEX plan's concurrency, resolved by the caller. Ring-ahead (how many
+        lines may be ringing to fill those slots) is the pacer's job and defaults
+        to 1:1, i.e. never place a call that couldn't be answered."""
         from app.services import campaign_contacts_v2 as v2
 
-        cap = OutboundCampaignService.BULK_DIAL_CONCURRENCY
+        cap = int(conversation_cap or OutboundCampaignService.BULK_DIAL_CONCURRENCY)
         caller_id, auth_override = OutboundCampaignService._dial_params(campaign, tenant_res)
         pool = await OutboundCampaignService._resolve_caller_pool(
             campaign, tenant_res, auth_override=auth_override, fallback=caller_id
@@ -2073,11 +2105,27 @@ class OutboundCampaignService:
             if calls_per_day > 0:
                 today_str = _ist_now().strftime("%Y-%m-%d")
 
+        # Ring-ahead. Default 1:1 (one line rung per free conversation slot →
+        # zero abandons). With the pacer on, ask it how many lines this campaign's
+        # measured answer rate justifies; it backs off on its own the moment the
+        # abandon rate creeps up. Fail-soft: any pacer error keeps the safe 1:1.
+        ring_multiplier = 1.0
+        max_ring_ahead = None
+        if settings.APEX_PACER_ENABLED:
+            try:
+                from app.services.outbound_pacer import ring_multiplier_for
+
+                ring_multiplier, max_ring_ahead = await ring_multiplier_for(db, campaign.id)
+            except Exception:
+                logger.exception("NOKVO-PACER: multiplier lookup failed for %s", campaign.id)
+
         claimed = await v2.claim_pending(
             campaign.id,
             cap,
             daily_cap=calls_per_day if calls_per_day > 0 else None,
             today=today_str,
+            ring_multiplier=ring_multiplier,
+            max_ring_ahead=max_ring_ahead,
         )
         if not claimed:
             # Nothing claimable: drained, cap-hit, or cancelled mid-refill. The

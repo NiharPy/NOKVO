@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import uuid
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Iterable
@@ -210,7 +211,13 @@ async def refund_dialed_today(db, campaign_id: uuid.UUID, today: str, n: int) ->
 
 
 async def claim_pending(
-    campaign_id: uuid.UUID, cap: int, *, daily_cap: int | None = None, today: str = ""
+    campaign_id: uuid.UUID,
+    cap: int,
+    *,
+    daily_cap: int | None = None,
+    today: str = "",
+    ring_multiplier: float = 1.0,
+    max_ring_ahead: int | None = None,
 ) -> list[dict[str, Any]]:
     """Phase 1: under a short ``pg_advisory_xact_lock`` transaction, verify the
     campaign is still RUNNING, compute the concurrency headroom AND the daily-cap
@@ -222,9 +229,34 @@ async def claim_pending(
     place OUTSIDE any lock; the caller REFUNDS the counter for claims that didn't
     become placements (:func:`refund_dialed_today`).
 
+    Two live populations, bounded separately — they are not the same thing:
+
+    * ``cap`` is the CONVERSATION cap (an APEX org's plan concurrency). Only rows
+      in ``answered`` hold a conversation slot, so only those count against it.
+      It is the promise sold to the customer and is never exceeded.
+    * ringing rows (``dialing``/``ringing``) are calls placed in the hope they
+      connect. Their ceiling is ``free_slots × ring_multiplier``, clamped by
+      ``max_ring_ahead``.
+
+    ``ring_multiplier`` is "lines to ring per free conversation slot". At the
+    default 1.0 every ringing call has a slot reserved for it, so a connect can
+    never be abandoned. The pacer passes ``1 / answer_rate`` so that the EXPECTED
+    number of simultaneous answers is the plan's concurrency — throughput without
+    abandonment.
+
+    The bug this replaces: a single ``live`` count of dialing+ringing+answered
+    against a hardcoded 5, while the plan sold 1. The dialer placed five calls,
+    the media WS admitted one, and the other four humans were hung up on the
+    moment they said hello.
+
     The status check kills the cancel-vs-refill race: a cancel that committed
     after the caller loaded its campaign snapshot wins here (``cancel_campaign``
     takes the same advisory key), so a stale refill claims nothing."""
+    conv_cap = max(0, int(cap))
+    try:
+        multiplier = max(1.0, float(ring_multiplier))
+    except (TypeError, ValueError):
+        multiplier = 1.0
     async with AsyncSessionLocal() as db:
         async with db.begin():  # single short txn; advisory lock auto-releases on commit
             await db.execute(
@@ -240,12 +272,26 @@ async def claim_pending(
             )).first()
             if row is None or str(row[0]) != "running":
                 return []  # cancelled/completed since the caller's snapshot — claim nothing
-            live = (await db.execute(
-                text("SELECT count(*) FROM outbound_campaign_contacts "
-                     "WHERE campaign_id = :c AND status = ANY(:s)"),
+            # One scan, two counts: conversations in progress vs calls still ringing.
+            live_row = (await db.execute(
+                text(
+                    "SELECT "
+                    "  count(*) FILTER (WHERE status = 'answered') AS in_conversation, "
+                    "  count(*) FILTER (WHERE status IN ('dialing', 'ringing')) AS ringing "
+                    "FROM outbound_campaign_contacts "
+                    "WHERE campaign_id = :c AND status = ANY(:s)"
+                ),
                 {"c": str(campaign_id), "s": list(_LIVE_STATUSES)},
-            )).scalar_one()
-            k = max(0, int(cap) - int(live))
+            )).first()
+            in_conversation = int(live_row[0] or 0)
+            ringing = int(live_row[1] or 0)
+            free_slots = max(0, conv_cap - in_conversation)
+            # How many lines may be ringing right now. At multiplier 1.0 this is
+            # exactly the free slot count, so every connect has somewhere to land.
+            ring_target = int(math.ceil(free_slots * multiplier))
+            if max_ring_ahead is not None:
+                ring_target = min(ring_target, max(0, int(max_ring_ahead)))
+            k = max(0, ring_target - ringing)
             if daily_cap is not None and daily_cap > 0:
                 try:
                     today_count = int(row[2]) if (row[1] == today and row[2] is not None) else 0
@@ -479,6 +525,39 @@ async def rearm_unreached(db, campaign_id: uuid.UUID, buckets: tuple[str, ...] =
         rearmed += int(res.rowcount or 0)
     await db.commit()
     return rearmed
+
+
+async def requeue_abandoned(db, call_link_id: str) -> uuid.UUID | None:
+    """The callee picked up but no conversation slot was free — put the row
+    straight back to ``pending`` for a fresh dial.
+
+    This is the safety net behind the conversation cap, not a normal path: with
+    ``ring_multiplier`` at 1.0 it should never fire at all, and the pacer treats
+    every occurrence as abandon-rate signal to back off. It exists because the
+    alternative — what the code did before — was to let the person say "hello"
+    into a socket we then closed, and file them as a missed call.
+
+    ``attempt`` is deliberately NOT rolled back and no retry is scheduled: this
+    was our failure, not an unreachable contact, so it must not consume one of
+    the contact's attempts. A fresh ``call_link_id`` keeps any late webhook from
+    the abandoned placement off the requeued row (same reasoning as
+    :func:`rearm_unreached`). ``result.abandoned_at`` is the audit trail and the
+    pacer's input. Guarded on the pre-answer statuses so a racing hangup webhook
+    can't be undone. Returns the campaign_id when this call requeued the row."""
+    row = (await db.execute(
+        text(
+            "UPDATE outbound_campaign_contacts "
+            "SET status = 'pending', call_link_id = CAST(gen_random_uuid() AS text), "
+            "    call_id = NULL, answered_at = NULL, "
+            "    result = COALESCE(result, '{}'::jsonb) "
+            "             || jsonb_build_object('abandoned_at', to_jsonb(now())), "
+            "    updated_at = now() "
+            "WHERE call_link_id = :clid AND status IN ('dialing', 'ringing') "
+            "RETURNING campaign_id"
+        ),
+        {"clid": call_link_id},
+    )).first()
+    return row[0] if row else None
 
 
 async def pending_count(db, campaign_id: uuid.UUID) -> int:

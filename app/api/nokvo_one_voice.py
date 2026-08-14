@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import hashlib
 import hmac
 import json
@@ -1700,12 +1701,91 @@ async def plivo_inbound_media_websocket(websocket: WebSocket, link_id: str):
 # ────────────────────────── Plivo outbound ──────────────────────────
 
 
+# Sentinel distinguishing "at capacity, decline this call" from "proceed" — both
+# of which would otherwise be a bare None.
+_SLOT_DENIED = object()
+
+
+async def _abandon_and_requeue(call_link_id: str, campaign_id, db: AsyncSession) -> None:
+    """Put a connected-but-unservable contact back in the dial queue and let the
+    pacer see it. Best-effort; never raises into a call path."""
+    try:
+        from app.services import campaign_contacts_v2 as v2
+
+        if await v2.requeue_abandoned(db, call_link_id) is not None:
+            await db.commit()
+            from app.services.outbound_pacer import invalidate as _pacer_invalidate
+
+            await _pacer_invalidate(campaign_id)
+    except Exception:
+        logger.exception("PLIVO-OUTBOUND: requeue after abandon failed for %s", call_link_id)
+        with contextlib.suppress(Exception):
+            await db.rollback()
+
+
+async def _outbound_capacity_available(call_link_id: str, db: AsyncSession):
+    """Is there room for one more conversation on this campaign's tenant?
+
+    Returns ``None`` to proceed (room available, or this call isn't slot-managed)
+    or :data:`_SLOT_DENIED` when the org is already at its plan concurrency — the
+    caller then hangs up before any audio and requeues the contact.
+
+    This deliberately CHECKS rather than reserves. The slot is acquired on the
+    media WebSocket, which is also what releases it in its ``finally``; splitting
+    acquire and release across the two would leak a slot for the full stale-token
+    window whenever Plivo never opens the stream — and on a Core plan (one slot)
+    a single leak wedges the whole campaign. The check closes the structural hole
+    (the dialer used to place five calls into a one-slot plan) while the paired
+    acquire/release on the WS stays the authority and catches the rare simultaneous
+    -answer race.
+
+    Fail-OPEN on any error: a lookup blip must never drop a live call."""
+    try:
+        campaign, contact = await OutboundCampaignService.get_by_call_link_id(call_link_id, db)
+        if not contact or campaign is None or contact.get("is_followup"):
+            return None
+        tr = await _tenant_by_tenant_id(db, campaign.tenant_id)
+        if tr is None:
+            return None
+
+        from app.services.apex_plans import get_apex_concurrency as _apex_conc
+        from app.services.call_concurrency import active_count as _active, POOL_OUTBOUND
+
+        org = await db.get(Organization, tr.organization_id)
+        if org is None or (org.product_tier or "") != "nokvo_apex":
+            return None  # non-APEX keeps the global cap, enforced on the WS
+        limit = _apex_conc(org)
+        if await _active(tr.tenant_id, pool=POOL_OUTBOUND) < limit:
+            return None
+
+        # At capacity. With the dialer's 1:1 ring-ahead this should not happen; when
+        # it does it is the pacer over-reaching, so make it loud and feed it back as
+        # abandon-rate signal rather than silently losing the contact.
+        logger.warning(
+            "PLIVO-OUTBOUND at-capacity on answer tenant=%s limit=%s call_link_id=%s "
+            "→ hangup + requeue",
+            tr.tenant_id, limit, call_link_id,
+        )
+        await _abandon_and_requeue(call_link_id, campaign.id, db)
+        return _SLOT_DENIED
+    except Exception:
+        logger.exception("PLIVO-OUTBOUND: capacity check failed for %s — proceeding", call_link_id)
+        return None
+
+
 @router.post("/plivo/outbound-answer/{call_link_id}", response_class=PlainTextResponse)
 async def plivo_outbound_answer(
     call_link_id: str, request: Request, db: AsyncSession = Depends(deps.get_db)
 ):
     """Plivo fetches this when the outbound call connects → returns the <Stream> XML
-    that bridges audio to the agent's outbound media WS."""
+    that bridges audio to the agent's outbound media WS.
+
+    This is the FIRST moment we know a human picked up, and the last moment we can
+    decline without them hearing anything. So capacity is checked HERE: at the plan's
+    concurrency the ring is cut before a single audio frame and the contact goes back
+    in the dial queue. Previously the only check was on the media WebSocket, which
+    closed the socket after the callee had already said "hello" — dead air, then a
+    hangup, filed as a missed call."""
     from app.services.public_url import ws_base_url
 
     _sig_token = await _outbound_signing_token(call_link_id, db)
@@ -1713,6 +1793,13 @@ async def plivo_outbound_answer(
         return PlainTextResponse(
             "<Response><Hangup/></Response>", media_type="application/xml", status_code=403
         )
+
+    if await _outbound_capacity_available(call_link_id, db) is _SLOT_DENIED:
+        # A cut ring reads to the callee as a dropped call rather than dead air.
+        return PlainTextResponse(
+            "<Response><Hangup/></Response>", media_type="application/xml"
+        )
+
     media_url = f"{ws_base_url(request)}/api/nokvo-one/agents/plivo/outbound-media/{call_link_id}"
     return PlainTextResponse(_plivo_stream_xml(media_url), media_type="application/xml")
 
@@ -1847,8 +1934,7 @@ async def plivo_outbound_media_websocket(websocket: WebSocket, call_link_id: str
             return
         # Concurrency pool: a follow-up call draws from the shared INBOUND pool
         # (so disabling follow-up frees that pool for inbound callers); a campaign
-        # call draws from the dedicated OUTBOUND pool. At cap → hang up; the dialer
-        # / follow-up scheduler retries on a later tick.
+        # call draws from the dedicated OUTBOUND pool.
         from app.services.call_concurrency import (
             acquire as _acquire_call_slot,
             POOL_OUTBOUND,
@@ -1857,13 +1943,18 @@ async def plivo_outbound_media_websocket(websocket: WebSocket, call_link_id: str
         _out_pool = POOL_INBOUND_FOLLOWUP if is_followup else POOL_OUTBOUND
         # Per-plan outbound concurrency for NOKVO APEX (Core=1, Growth=2, Pinnacle=4,
         # Enterprise per-deal). Non-APEX products keep the global cap (limit=None).
+        # This acquire is the authority — and it is PAIRED with the release in the
+        # finally below, which is why the reservation was not moved to the answer
+        # webhook: a split acquire/release leaks the slot for the whole stale-token
+        # window whenever Plivo never opens the stream. The answer webhook does a
+        # cheap capacity CHECK instead, so reaching the cap here now means a genuine
+        # simultaneous-answer race rather than the dialer structurally over-placing.
         _out_limit = None
         if _out_pool == POOL_OUTBOUND:
             try:
-                from app.models.organization import Organization as _Org
                 from app.services.apex_plans import get_apex_concurrency as _apex_conc
 
-                _org = await db.get(_Org, tr.organization_id)
+                _org = await db.get(Organization, tr.organization_id)
                 if _org is not None and (_org.product_tier or "") == "nokvo_apex":
                     _out_limit = _apex_conc(_org)
             except Exception:
@@ -1871,9 +1962,13 @@ async def plivo_outbound_media_websocket(websocket: WebSocket, call_link_id: str
         _out_call_token = await _acquire_call_slot(tr.tenant_id, pool=_out_pool, limit=_out_limit)
         if _out_call_token is None:
             logger.info(
-                "PLIVO-OUTBOUND at-capacity tenant=%s call_link_id=%s → hangup",
+                "PLIVO-OUTBOUND at-capacity tenant=%s call_link_id=%s → hangup + requeue",
                 tr.tenant_id, call_link_id,
             )
+            # The callee already picked up, so this contact must go back in the
+            # queue rather than be filed as a miss they never answered.
+            if campaign is not None and not is_followup:
+                await _abandon_and_requeue(call_link_id, campaign.id, db)
             await websocket.close(code=1013)
             return
         # Outbound campaigns can be authored in any supported language —

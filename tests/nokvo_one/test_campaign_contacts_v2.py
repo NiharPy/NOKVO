@@ -287,11 +287,24 @@ async def test_finalize_terminal_completes_answered_and_reports_old_state():
 class _ClaimSession:
     """Fake AsyncSession for claim_pending: dispatches on statement text."""
 
-    def __init__(self, *, status="running", date=None, count=None, live=0, pending_rows=()):
+    def __init__(
+        self,
+        *,
+        status="running",
+        date=None,
+        count=None,
+        live=0,
+        in_conversation=0,
+        pending_rows=(),
+    ):
         self._status = status
         self._date = date
         self._count = count
-        self._live = live
+        # The claim reads two live populations separately: rows holding a
+        # CONVERSATION slot (answered) and rows still RINGING. ``live`` keeps its
+        # original meaning — calls already placed and not yet connected.
+        self._ringing = live
+        self._in_conversation = in_conversation
         self._pending = list(pending_rows)
         self.bumped = None  # (today, n) when _bump_dialed_today ran
 
@@ -339,8 +352,10 @@ class _ClaimSession:
             return _R()
         if "SELECT status" in s:
             return _R(first=(outer._status, outer._date, outer._count))
+        if "in_conversation" in s:
+            return _R(first=(outer._in_conversation, outer._ringing))
         if "count(*)" in s:
-            return _R(scalar=outer._live)
+            return _R(scalar=outer._ringing)
         if "SET status='dialing'" in s:
             k = params["k"]
             return _R(rows=outer._pending[:k])
@@ -424,3 +439,76 @@ def test_lead_row_from_rec_weighted_max_score_without_stored_max():
         "claimed_at": None,
     }
     assert v2._lead_row_from_rec(rec)["max_score"] == 9  # 5 + 3 + 1
+
+
+# ── conversation slots vs ring-ahead ─────────────────────────────────────────
+# The claim bounds two DIFFERENT live populations. Only `answered` rows hold a
+# conversation slot; `dialing`/`ringing` rows are calls placed in the hope they
+# connect. Conflating them behind one hardcoded 5 is what let the dialer place
+# five calls on a plan that sold one conversation — four of every five people who
+# picked up were hung up on the moment they said hello.
+
+
+@pytest.mark.asyncio
+async def test_claim_stops_while_a_conversation_holds_the_only_slot(monkeypatch):
+    """Core (concurrency 1) with a live conversation claims NOTHING."""
+    import uuid as _uuid
+
+    session = _ClaimSession(
+        status="running", in_conversation=1, live=0,
+        pending_rows=[{"id": 1, "phone": "919", "call_link_id": "a"}],
+    )
+    _patch_claim_session(monkeypatch, session)
+    assert await v2.claim_pending(_uuid.uuid4(), 1) == []
+
+
+@pytest.mark.asyncio
+async def test_claim_rings_one_line_per_free_slot_by_default(monkeypatch):
+    """Default multiplier 1.0 → never place a call that couldn't be answered."""
+    import uuid as _uuid
+
+    rows = [{"id": i, "phone": f"91{i}", "call_link_id": f"L{i}"} for i in range(5)]
+    session = _ClaimSession(status="running", in_conversation=1, live=0, pending_rows=rows)
+    _patch_claim_session(monkeypatch, session)
+    # Growth: 2 slots, 1 busy → exactly 1 line may ring.
+    assert len(await v2.claim_pending(_uuid.uuid4(), 2)) == 1
+
+
+@pytest.mark.asyncio
+async def test_claim_ring_ahead_multiplies_free_slots(monkeypatch):
+    """The pacer rings 1/answer_rate lines per free slot so the EXPECTED number
+    of simultaneous answers is the plan concurrency."""
+    import uuid as _uuid
+
+    rows = [{"id": i, "phone": f"91{i}", "call_link_id": f"L{i}"} for i in range(10)]
+    session = _ClaimSession(status="running", in_conversation=0, live=0, pending_rows=rows)
+    _patch_claim_session(monkeypatch, session)
+    # 1 free slot at a 25% answer rate → 4 lines ringing.
+    assert len(await v2.claim_pending(_uuid.uuid4(), 1, ring_multiplier=4.0)) == 4
+
+
+@pytest.mark.asyncio
+async def test_claim_ring_ahead_respects_ceiling_and_lines_already_ringing(monkeypatch):
+    import uuid as _uuid
+
+    rows = [{"id": i, "phone": f"91{i}", "call_link_id": f"L{i}"} for i in range(10)]
+    session = _ClaimSession(status="running", in_conversation=0, live=2, pending_rows=rows)
+    _patch_claim_session(monkeypatch, session)
+    # multiplier wants 8, ceiling caps at 3, two are already ringing → 1 more.
+    assert len(await v2.claim_pending(
+        _uuid.uuid4(), 1, ring_multiplier=8.0, max_ring_ahead=3
+    )) == 1
+
+
+@pytest.mark.asyncio
+async def test_claim_never_exceeds_the_plan_even_with_a_huge_multiplier(monkeypatch):
+    """A conversation cap of 0 free slots claims nothing no matter what the pacer
+    asks for — the sold concurrency is a hard ceiling, not a hint."""
+    import uuid as _uuid
+
+    rows = [{"id": i, "phone": f"91{i}", "call_link_id": f"L{i}"} for i in range(10)]
+    session = _ClaimSession(status="running", in_conversation=2, live=0, pending_rows=rows)
+    _patch_claim_session(monkeypatch, session)
+    assert await v2.claim_pending(
+        _uuid.uuid4(), 2, ring_multiplier=99.0, max_ring_ahead=50
+    ) == []

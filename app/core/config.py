@@ -423,6 +423,24 @@ class Settings(BaseSettings):
     # Deterministic opener template variants (per-call crc32 rotation). 1 = the
     # single current template.
     APEX_OPENER_VARIANTS: int = 1
+    # ── APEX dial pacing ───────────────────────────────────────────────────────
+    # The conversation cap (plan concurrency) is always enforced. The pacer only
+    # decides how many lines may RING to fill those slots. OFF = one line per free
+    # slot, which cannot abandon a call but leaves the slot idle through every
+    # unanswered ring. ON = ring 1/answer_rate lines so expected simultaneous
+    # answers equals the plan concurrency, backing off to 1:1 whenever the measured
+    # abandon rate breaches the ceiling. See app/services/outbound_pacer.py.
+    APEX_PACER_ENABLED: bool = False
+    # Hard ceiling on abandons (a connect that found no free slot) as a percentage
+    # of connects. Breaching it collapses the pacer to 1:1 until it recovers.
+    APEX_PACER_MAX_ABANDON_PCT: float = 3.0
+    # Floor on the estimated answer rate — bounds the multiplier at 1/this, so a
+    # dead list can never make the pacer ask for hundreds of lines.
+    APEX_PACER_MIN_ANSWER_RATE: float = 0.10
+    # Absolute ceiling on simultaneously-ringing rows per campaign.
+    APEX_PACER_MAX_RING_AHEAD: int = 10
+    # Finished dial attempts required before the measured answer rate is trusted.
+    APEX_PACER_MIN_SAMPLE: int = 25
     # Questionnaire translation register: when ON, the campaign-creation
     # translation prompt carries the spoken code-switch register rules
     # (language_style.py) so verbatim questions match the LLM turns' register
